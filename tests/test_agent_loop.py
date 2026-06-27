@@ -1,7 +1,8 @@
 """B4 — LLM agent loop (Agno). Offline TDD suite — NO real LLM call; agno is mocked.
 
-`emit_agent_action` is the ONLY veridex module that imports `agno`, and it imports it
-LAZILY (inside the call, behind an injectable factory/model seam) so that:
+`emit_agent_action` / `emit_agent_action_async` are the ONLY veridex functions that import
+`agno`, and they import it LAZILY (inside the call, behind an injectable factory/model seam)
+so that:
   * `import veridex.runtime.agent` works WITHOUT agno installed,
   * the offline suite never imports an LLM SDK and never hits the network,
   * the import-audited trust path (`checks/ verifier/ law/ ingest/`) stays clean.
@@ -53,6 +54,18 @@ class _FakeAgent:
         return _FakeResponse(self._content)
 
 
+class _FakeAsyncAgent:
+    """Async stand-in for Agno's Agent; exposes `arun` for use by emit_agent_action_async."""
+
+    def __init__(self, content):
+        self._content = content
+        self.arun_prompts: list = []
+
+    async def arun(self, prompt, **kwargs):
+        self.arun_prompts.append(prompt)
+        return _FakeResponse(self._content)
+
+
 def _spy_factory(content, recorder: dict | None = None):
     """Return an agent_factory that records its construction kwargs and yields a FakeAgent."""
 
@@ -64,8 +77,24 @@ def _spy_factory(content, recorder: dict | None = None):
     return factory
 
 
+def _async_spy_factory(content, recorder: dict | None = None):
+    """Return an agent_factory that records its construction kwargs and yields a FakeAsyncAgent."""
+
+    def factory(**kwargs):
+        if recorder is not None:
+            recorder["construct_kwargs"] = kwargs
+        return _FakeAsyncAgent(content)
+
+    return factory
+
+
 # Sentinel model so the default (agno-importing) model builder is never reached offline.
 _SENTINEL_MODEL = object()
+
+
+# ---------------------------------------------------------------------------
+# SYNC tests (emit_agent_action)
+# ---------------------------------------------------------------------------
 
 
 # 1 — structured path: response.content is already an AgentAction -> returned as-is.
@@ -223,3 +252,103 @@ def test_live_emit_agent_action_smoke():
     action = emit_agent_action(_market_state())
     assert isinstance(action, AgentAction)
     assert action.type in set(SportsActionType)
+
+
+# ---------------------------------------------------------------------------
+# ASYNC tests (emit_agent_action_async) — B4-async (Bit B4)
+# ---------------------------------------------------------------------------
+
+
+# A1 — structured path: response.content is already an AgentAction -> returned as-is.
+async def test_async_emit_returns_agent_action_when_content_is_typed():
+    from veridex.runtime.agent import emit_agent_action_async
+
+    expected = AgentAction(type=SportsActionType.FLAG_VALUE, params={"market": "OU_2_5"})
+    action = await emit_agent_action_async(
+        _market_state(), model=_SENTINEL_MODEL, agent_factory=_async_spy_factory(expected)
+    )
+    assert isinstance(action, AgentAction)
+    assert action is expected
+    assert action.type == SportsActionType.FLAG_VALUE
+
+
+# A2 — fallback path: provider returns raw JSON text -> parse_agent_action_json validates it.
+async def test_async_emit_falls_back_to_json_parse_when_content_is_text():
+    from veridex.runtime.agent import emit_agent_action_async
+
+    raw = json.dumps({"type": "WAIT", "params": {"reason": "quiet", "confidence": 0.4}})
+    action = await emit_agent_action_async(
+        _market_state(), model=_SENTINEL_MODEL, agent_factory=_async_spy_factory(raw)
+    )
+    assert isinstance(action, AgentAction)
+    assert action.type == SportsActionType.WAIT
+    assert action.params["confidence"] == 0.4
+
+
+# A3 — dict path: provider returns a raw dict -> isinstance(content, dict) -> model_validate.
+async def test_async_emit_validates_dict_content():
+    from veridex.runtime.agent import emit_agent_action_async
+
+    raw = {"type": "WAIT", "params": {"confidence": 0.4}}
+    action = await emit_agent_action_async(
+        _market_state(), model=_SENTINEL_MODEL, agent_factory=_async_spy_factory(raw)
+    )
+    assert isinstance(action, AgentAction)
+    assert action.type == SportsActionType.WAIT
+    assert action.params["confidence"] == 0.4
+
+
+# A4 — clean error: content is None (or non-str/non-dict) -> ValueError, not TypeError.
+async def test_async_emit_raises_clean_value_error_on_none_content():
+    from veridex.runtime.agent import emit_agent_action_async
+
+    with pytest.raises(ValueError, match="no parseable content"):
+        await emit_agent_action_async(_market_state(), model=_SENTINEL_MODEL, agent_factory=_async_spy_factory(None))
+
+
+# A5 — HARD invariant: the Agent is constructed with tools=[] (decision-only, no execution).
+async def test_async_emit_constructs_agent_with_empty_tools():
+    from veridex.runtime.agent import emit_agent_action_async
+
+    recorder: dict = {}
+    expected = AgentAction(type=SportsActionType.WAIT)
+    await emit_agent_action_async(
+        _market_state(),
+        model=_SENTINEL_MODEL,
+        agent_factory=_async_spy_factory(expected, recorder),
+    )
+    kwargs = recorder["construct_kwargs"]
+    assert kwargs["tools"] == []
+    assert kwargs["model"] is _SENTINEL_MODEL
+    assert kwargs["output_schema"] is AgentAction
+
+
+# A6 — model_id resolves from config when not passed; the resolved id flows to _default_model.
+async def test_async_model_id_resolves_from_config(monkeypatch):
+    from veridex.runtime import agent as agent_mod
+    from veridex.runtime.agent import emit_agent_action_async
+
+    # Patch get_settings to return a fake with a distinctive model_id.
+    class _FakeSettings:
+        model_id = "test-model-from-config"
+
+    monkeypatch.setattr(agent_mod, "get_settings", lambda: _FakeSettings())
+
+    # Patch _default_model to capture the resolved model_id without importing agno.
+    captured: dict = {}
+
+    def _fake_default_model(model_id: str):
+        captured["model_id"] = model_id
+        return _SENTINEL_MODEL
+
+    monkeypatch.setattr(agent_mod, "_default_model", _fake_default_model)
+
+    expected = AgentAction(type=SportsActionType.WAIT)
+    # model=None (default) triggers _default_model with the config-resolved id.
+    await emit_agent_action_async(
+        _market_state(),
+        agent_factory=_async_spy_factory(expected),
+        # model_id intentionally omitted — must resolve from patched get_settings().
+    )
+
+    assert captured["model_id"] == "test-model-from-config"
