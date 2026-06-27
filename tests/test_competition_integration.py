@@ -236,8 +236,24 @@ async def test_default_checks_summary_shape() -> None:
     assert set(checks) == {"clv", "evidence_integrity", "llm_boundary"}
     assert checks["clv"]["result"] in ("pass", "fail")
     assert isinstance(checks["clv"]["scored_actions"], int)
-    assert checks["evidence_integrity"] == "pass"  # evidence_hash present
-    assert checks["llm_boundary"] == "pass"  # import audit guarantees the boundary
+
+    # evidence_integrity is a self-describing dict (method + note), not a bare string.
+    assert checks["evidence_integrity"]["result"] == "pass"  # evidence_hash present
+    assert checks["evidence_integrity"]["method"] == "sha256_evidence_hash"
+    assert isinstance(checks["evidence_integrity"]["note"], str)
+
+    # llm_boundary is self-describing: a judge can see WHAT was proven and OVER WHAT.
+    assert checks["llm_boundary"]["result"] == "pass"  # import audit guarantees the boundary
+    assert checks["llm_boundary"]["method"] == "static_import_audit"
+    assert checks["llm_boundary"]["scope"] == [
+        "checks/",
+        "verifier/",
+        "law/",
+        "ingest/",
+        "scoring.py",
+        "leaderboard.py",
+    ]
+    assert isinstance(checks["llm_boundary"]["note"], str)
 
 
 async def test_checks_fn_is_injectable() -> None:

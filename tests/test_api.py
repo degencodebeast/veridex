@@ -220,20 +220,18 @@ def test_cli_main_stdout_contains_valid_json_objects() -> None:
         main()
 
     output = captured.getvalue()
-    # Find JSON objects/arrays by scanning for balanced { } or [ ]
+    # Find JSON objects/arrays by attempting a balanced decode at every `{`/`[` start.
+    # (A naive first-bracket-to-last-bracket slice is unsafe: the proof card itself now
+    # contains nested arrays/objects, so the span across both printed blocks isn't valid
+    # JSON.  ``raw_decode`` consumes exactly one well-formed value from a start position.)
     assert "{" in output, "no JSON object found in stdout"
-    # Try parsing substrings that look like JSON objects
+    decoder = json.JSONDecoder()
     parsed_any = False
-    for start_ch, end_ch in [("{", "}"), ("[", "]")]:
-        start = output.find(start_ch)
-        if start == -1:
+    for index, char in enumerate(output):
+        if char not in "{[":
             continue
-        end = output.rfind(end_ch)
-        if end == -1:
-            continue
-        chunk = output[start : end + 1]
         try:
-            json.loads(chunk)
+            decoder.raw_decode(output[index:])
             parsed_any = True
             break
         except json.JSONDecodeError:
