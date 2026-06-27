@@ -317,13 +317,24 @@ async def test_evidence_hash_deterministic_for_same_inputs() -> None:
 
 
 def test_orchestrator_and_store_import_without_agno_or_psycopg() -> None:
-    import sys
+    # AST check on the MODULE-LEVEL imports: neither module eagerly imports agno/psycopg
+    # (both are lazy, inside functions). sys.modules is unreliable here — a prior test in
+    # the same process may have lazily imported psycopg (e.g. the gated Postgres round-trip).
+    import ast
+    from pathlib import Path
 
-    import veridex.runtime.orchestrator  # noqa: F401
-    import veridex.store  # noqa: F401
+    import veridex.runtime.orchestrator as orch
+    import veridex.store as store
 
-    assert "agno" not in sys.modules
-    assert "psycopg" not in sys.modules
+    forbidden = {"agno", "psycopg"}
+    for mod in (orch, store):
+        tree = ast.parse(Path(mod.__file__).read_text())
+        for stmt in tree.body:  # module top-level only — not function-body (lazy) imports
+            if isinstance(stmt, ast.Import):
+                for alias in stmt.names:
+                    assert alias.name.split(".")[0] not in forbidden, f"{mod.__name__} eagerly imports {alias.name}"
+            elif isinstance(stmt, ast.ImportFrom) and stmt.level == 0 and stmt.module:
+                assert stmt.module.split(".")[0] not in forbidden, f"{mod.__name__} eagerly imports from {stmt.module}"
 
 
 # ---------------------------------------------------------------------------

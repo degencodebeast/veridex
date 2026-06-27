@@ -29,6 +29,23 @@ from veridex.config import (
     require_txline,
 )
 
+# Config env vars that must be cleared so tests are deterministic regardless of the
+# developer's / CI's OS environment (e.g. an exported DATABASE_URL for the Postgres path).
+_CONFIG_ENV_VARS = ("JWT", "TXLINE_X_API_TOKEN", "DATABASE_URL", "SOLANA_KEYPAIR_PATH", "ANTHROPIC_API_KEY")
+
+
+@pytest.fixture(autouse=True)
+def _clear_config_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Clear all config env vars before each test (env-independent).
+
+    `Settings(_env_file=None)` disables the .env FILE but still reads `os.environ`, so a
+    stray exported var would leak into the "defaults" assertions. Tests that exercise env
+    overrides re-set the vars they need after this fixture runs.
+    """
+    for var in _CONFIG_ENV_VARS:
+        monkeypatch.delenv(var, raising=False)
+
+
 # ---------------------------------------------------------------------------
 # Defaults (no env file, no env vars)
 # ---------------------------------------------------------------------------
