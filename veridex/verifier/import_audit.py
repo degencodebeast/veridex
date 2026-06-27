@@ -25,9 +25,15 @@ def _is_forbidden(module: str | None) -> bool:
 
 
 def assert_no_llm_imports(package_dir: str | Path) -> None:
-    """Raise AssertionError if any module under `package_dir` imports a forbidden LLM SDK."""
+    """Raise AssertionError if a forbidden LLM SDK is imported under `package_dir`.
+
+    Accepts either a package directory (walked recursively) or a single ``*.py`` file, so a
+    single-module trust-path file (e.g. ``veridex/scoring.py``) can be audited directly without
+    sweeping its sibling modules.
+    """
     package_dir = Path(package_dir)
-    for py in sorted(package_dir.rglob("*.py")):
+    pyfiles = [package_dir] if package_dir.is_file() else sorted(package_dir.rglob("*.py"))
+    for py in pyfiles:
         tree = ast.parse(py.read_text(), filename=str(py))
         for node in ast.walk(tree):
             if isinstance(node, ast.Import):
