@@ -50,18 +50,91 @@ def memo_payload_for_manifest(manifest: dict[str, Any]) -> str:
     return run_manifest_hash(manifest)
 
 
-def anchor_memo(manifest_hash: str) -> str:
-    """Send ONE devnet Memo tx whose payload is `manifest_hash`. Returns the tx signature.
+async def anchor_memo(
+    manifest_hash: str,
+    *,
+    rpc_url: str | None = None,
+    keypair_path: str | None = None,
+    client: object | None = None,
+) -> str:
+    """Send ONE SPL Memo tx on Solana devnet with ``data == manifest_hash``. Returns tx sig.
 
-    DEFERRED — Phase 0 offline spike only. This function requires:
-      - A funded devnet wallet (keypair file or env var).
-      - A live Solana devnet RPC endpoint.
-      - The `solders` / `solana-py` SDK (intentionally NOT imported in this file,
-        which lives on the trust path and must stay stdlib-only).
-    Wire this up in the Phase 1 integration step once devnet creds are available.
-    A fake/no-op tx would be worse than an explicit deferral — do not stub.
+    This is the Phase 1 package anchor (B9, REQ-112 / AC-112 / CON-004): ONE Memo per run,
+    payload == the run-manifest SHA-256 hash (gate 4). ``solders`` / ``solana`` are imported
+    **lazily inside this function** so ``import veridex.chain.anchor`` works without them
+    installed (offline test suite / trust-core / light-core principle).
+
+    Args:
+        manifest_hash: Exactly 64 valid hex characters — the SHA-256 run-manifest hash.
+            This is verbatim the Memo ``data`` payload (gate 4: payload == manifest hash).
+        rpc_url: Solana RPC endpoint override. Defaults to ``config.solana_rpc_url``
+            (``https://api.devnet.solana.com``).
+        keypair_path: Path to the Solana keypair JSON byte-array file. Defaults to
+            ``config.require_keypair_path()``, which raises ``ValueError`` when unset.
+        client: Injected async RPC client duck-typed as
+            ``solana.rpc.async_api.AsyncClient``. When supplied the caller owns the
+            client lifecycle (``close`` is **not** called by this function). When
+            ``None`` (default) a real ``AsyncClient`` is created, used, and closed.
+
+    Returns:
+        The transaction signature as a string.
+
+    Raises:
+        ValueError: If ``manifest_hash`` is not exactly 64 valid hex characters, or if
+            ``SOLANA_KEYPAIR_PATH`` is unset and ``keypair_path`` is not provided.
     """
-    raise NotImplementedError(
-        "anchor_memo requires a live devnet RPC + funded wallet. "
-        "Deferred to Phase 1 — see docstring for wiring instructions."
+    # Validate before any I/O — ValueError is raised immediately, no network involved.
+    if len(manifest_hash) != 64:
+        raise ValueError(
+            f"manifest_hash must be exactly 64 hex characters, got {len(manifest_hash)}: {manifest_hash!r}"
+        )
+    try:
+        bytes.fromhex(manifest_hash)
+    except ValueError:
+        raise ValueError(f"manifest_hash is not valid hex: {manifest_hash!r}") from None
+
+    # Lazy imports — solders/solana are kept outside the module-load path so that
+    # ``import veridex.chain.anchor`` remains lightweight and SDK-free.
+    import json as _json
+    from pathlib import Path as _Path
+    from typing import Any as _Any
+
+    from solana.rpc.async_api import AsyncClient
+    from solana.rpc.commitment import Confirmed
+    from solders.instruction import AccountMeta, Instruction
+    from solders.keypair import Keypair
+    from solders.message import Message
+    from solders.pubkey import Pubkey
+    from solders.transaction import Transaction, VersionedTransaction
+
+    from veridex.config import get_settings
+    from veridex.config import require_keypair_path as _require_kp
+
+    cfg = get_settings()
+    url = rpc_url or cfg.solana_rpc_url
+    kp_path = keypair_path or _require_kp(cfg)
+
+    kp: _Any = Keypair.from_bytes(bytes(_json.loads(_Path(kp_path).read_text())))
+
+    _MEMO_PROGRAM: _Any = Pubkey.from_string("MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr")
+    ix: _Any = Instruction(
+        program_id=_MEMO_PROGRAM,
+        data=manifest_hash.encode("utf-8"),
+        accounts=[AccountMeta(pubkey=kp.pubkey(), is_signer=True, is_writable=False)],
     )
+
+    _owns_client = client is None
+    rpc: _Any = AsyncClient(url) if _owns_client else client
+
+    try:
+        blockhash: _Any = (await rpc.get_latest_blockhash()).value.blockhash
+        msg: _Any = Message.new_with_blockhash([ix], kp.pubkey(), blockhash)
+        tx: _Any = Transaction([kp], msg, blockhash)
+        vtx: _Any = VersionedTransaction.from_legacy(tx)
+        sig: _Any = (await rpc.send_transaction(vtx)).value
+        await rpc.confirm_transaction(sig, commitment=Confirmed)
+    finally:
+        if _owns_client:
+            await rpc.close()
+
+    return str(sig)
