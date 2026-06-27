@@ -1,0 +1,50 @@
+[
+  {
+    "_comment": "OVER/UNDER 2-outcome. Fixture 17588404. Pct sums to 100.001 (de-vigged).",
+    "FixtureId": 17588404,
+    "Ts": 1782518383695,
+    "SuperOddsType": "OVERUNDER_PARTICIPANT_GOALS",
+    "MarketPeriod": "half=1",
+    "MarketParameters": "line=1",
+    "InRunning": false,
+    "PriceNames": ["over", "under"],
+    "Prices": [2135, 1881],
+    "Pct": ["46.838", "53.163"]
+  },
+  {
+    "_comment": "1X2 3-outcome. Null period and params. Fixture 17588404. Pct sums exactly 100.000.",
+    "FixtureId": 17588404,
+    "Ts": 1782518380000,
+    "SuperOddsType": "1X2_PARTICIPANT_RESULT",
+    "MarketPeriod": null,
+    "MarketParameters": null,
+    "InRunning": false,
+    "PriceNames": ["home", "draw", "away"],
+    "Prices": [2222, 4000, 3333],
+    "Pct": ["45.000", "25.000", "30.000"]
+  },
+  {
+    "_comment": "ASIAN_HANDICAP with Pct=NA on all outcomes. Fixture 17588404. Should become suspended.",
+    "FixtureId": 17588404,
+    "Ts": 1782518381000,
+    "SuperOddsType": "ASIAN_HANDICAP",
+    "MarketPeriod": "half=full",
+    "MarketParameters": "line=0",
+    "InRunning": false,
+    "PriceNames": ["home", "away"],
+    "Prices": [1900, 1900],
+    "Pct": ["NA", "NA"]
+  },
+  {
+    "_comment": "OVERUNDER InRunning=true. SECOND fixture 17588405. Triggers phase=1.",
+    "FixtureId": 17588405,
+    "Ts": 1782518390000,
+    "SuperOddsType": "OVERUNDER_PARTICIPANT_GOALS",
+    "MarketPeriod": null,
+    "MarketParameters": null,
+    "InRunning": true,
+    "PriceNames": ["over", "under"],
+    "Prices": [2000, 1952],
+    "Pct": ["50.000", "50.000"]
+  }
+]
