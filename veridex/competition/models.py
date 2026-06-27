@@ -148,3 +148,34 @@ class Competition(BaseModel):
         if new not in allowed:
             raise ValueError(f"illegal competition status transition: {self.status.value} -> {new.value}")
         self.status = new
+
+
+# Maps all known wire/API proof-mode labels to the two canonical Phase-2A values.
+# Phase-1 emits "reproducible" and "LLM/evidence-verified"; both are mapped here.
+_PROOF_MODE_MAP: dict[str, Literal["reproducible", "verified"]] = {
+    "reproducible": "reproducible",
+    "verified": "verified",
+    "LLM/evidence-verified": "verified",
+}
+
+
+def normalize_proof_mode(value: str) -> Literal["reproducible", "verified"]:
+    """Normalise a wire proof-mode string to one of the two canonical values.
+
+    Accepts Phase-1 labels (``"reproducible"``, ``"LLM/evidence-verified"``) and
+    the canonical Phase-2A label (``"verified"``), mapping all to exactly
+    ``"reproducible"`` or ``"verified"`` per REQ-219 / AC-216.
+
+    Args:
+        value: Raw proof-mode string from the wire or API boundary.
+
+    Returns:
+        The canonical proof mode: ``"reproducible"`` or ``"verified"``.
+
+    Raises:
+        ValueError: If ``value`` is not a recognised proof-mode label.
+    """
+    try:
+        return _PROOF_MODE_MAP[value]
+    except KeyError:
+        raise ValueError(f"unknown proof_mode: {value!r}") from None
