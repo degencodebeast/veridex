@@ -49,6 +49,7 @@ from veridex.api.schemas import (
     LeaderboardResponse,
     LeaderboardRow,
 )
+from veridex.api.ws import ArenaConnectionManager, register_arena_routes
 from veridex.competition.events import CompetitionEvent, EventType
 from veridex.competition.models import AgentEntry, CompetitionConfig, CompetitionStatus
 from veridex.competition.service import (
@@ -632,5 +633,15 @@ def create_app(store: Store | None = None) -> FastAPI:
 
         events = await dep_store.list_competition_events(competition_id, since_seq=since_seq)
         return [e.model_dump(mode="json") for e in events]
+
+    # --- WS /competitions/{competition_id}/arena --------------------------
+    # Read-only spectator projection (P2A-7). The per-app manager owns per-client bounded
+    # broadcast queues; the route closes over ``resolved_store`` for replay (mirroring
+    # ``_get_store``). In 2A the synchronous ``/start`` runs to FINALIZED before any spectator
+    # connects, so the dominant path is store-backed REPLAY; the live-broadcast machinery is the
+    # 2B seam and is deliberately NOT wired into the synchronous run (broadcast must never block
+    # the run loop). ``arena_manager.broadcast`` is exposed for a future async live producer.
+    arena_manager = ArenaConnectionManager()
+    register_arena_routes(app, store=resolved_store, manager=arena_manager)
 
     return app
