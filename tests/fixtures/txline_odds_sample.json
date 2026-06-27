@@ -1,0 +1,24 @@
+{
+  "fixture_id": 17952170,
+  "competition": "WC2026 sample",
+  "ticks": [
+    {
+      "ts": 1718000000,
+      "phase": 2,
+      "markets": {
+        "OU_2_5": {"stable_prob_bps": 5800, "stable_price": 1.72, "suspended": false},
+        "1X2_HOME": {"stable_prob_bps": 4500, "stable_price": 2.22, "suspended": false}
+      },
+      "scores": {"1": 0, "2": 0, "7": 2, "8": 1}
+    },
+    {
+      "ts": 1718000060,
+      "phase": 2,
+      "markets": {
+        "OU_2_5": {"stable_prob_bps": 5200, "stable_price": 1.92, "suspended": false},
+        "1X2_HOME": {"stable_prob_bps": 4800, "stable_price": 2.08, "suspended": false}
+      },
+      "scores": {"1": 0, "2": 0, "7": 3, "8": 1}
+    }
+  ]
+}

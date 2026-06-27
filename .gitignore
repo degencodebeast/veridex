@@ -1,0 +1,26 @@
+# Veridex repo lives inside a multi-repo workspace (tx-odds-hack/).
+# Allowlist strategy: ignore EVERYTHING, then re-include only the Veridex deliverable.
+/*
+
+# --- re-include the Veridex deliverable ---
+!/.gitignore
+!/README.md
+!/pyproject.toml
+!/veridex/
+!/tests/
+!/scripts/
+!/spec/
+
+# --- within the allowed trees, still exclude secrets + build artifacts ---
+veridex/.env
+veridex/.env.local
+**/.omc/
+**/__pycache__/
+**/*.pyc
+**/.pytest_cache/
+.venv/
+
+# live-integration spike: never commit node_modules or captured market data
+scripts/txline_live/node_modules/
+scripts/txline_live/captured_*.json
+scripts/txline_live/*.tsbuildinfo
