@@ -214,6 +214,112 @@ def _is_number(value: Any) -> bool:
     return isinstance(value, int | float) and not isinstance(value, bool)
 
 
+# ---------------------------------------------------------------------------
+# Shared event constructors (single source of truth for live ≡ projection parity)
+# ---------------------------------------------------------------------------
+#
+# CON-203 corollary: the live spectator stream MUST be a byte-faithful projection of the sealed
+# record. To guarantee that without a second source of truth, the seq=0 ``COMPETITION_STARTED``
+# event and each per-``RunEvent`` evidence event are built HERE by pure constructors that BOTH
+# ``build_event_log`` (the offline projection) and ``veridex.competition.service`` (the live
+# sink) call. Any drift would change both at once — so they cannot diverge.
+
+
+def build_competition_started_event(
+    *,
+    competition_id: str,
+    run_id: str,
+    source_mode: str,
+    agent_ids: list[str],
+    base_ts: int,
+) -> CompetitionEvent:
+    """Build the canonical seq=0 ``COMPETITION_STARTED`` event (derived, deterministic).
+
+    Args:
+        competition_id: Owning competition identifier.
+        run_id: Sealed Phase-1 run identifier.
+        source_mode: ``"replay"`` or ``"live"`` (carried into the display payload).
+        agent_ids: Participating agent identifiers, in run order.
+        base_ts: Deterministic base timestamp for synthetic/derived events.
+
+    Returns:
+        The seq=0 :class:`CompetitionEvent` (``evidence=False``, ``derived_from=["competition_meta"]``).
+    """
+    started_payload: dict[str, Any] = {
+        "competition_id": competition_id,
+        "run_id": run_id,
+        "source_mode": source_mode,
+        "agent_ids": list(agent_ids),
+    }
+    return CompetitionEvent(
+        competition_id=competition_id,
+        run_id=run_id,
+        seq=0,
+        event_type=EventType.COMPETITION_STARTED,
+        event_ts=base_ts,
+        evidence=False,
+        source_sequence_no=None,
+        derived_from=["competition_meta"],
+        payload=started_payload,
+        payload_hash=event_payload_hash(started_payload),
+    )
+
+
+def build_evidence_event(
+    *,
+    competition_id: str,
+    run_id: str,
+    run_event: dict[str, Any],
+    current_tick_ts: int,
+) -> tuple[CompetitionEvent, int]:
+    """Build ONE evidence event from a sealed ``RunEvent``, carrying the tick ts forward.
+
+    The mapping mirrors :func:`build_event_log`: ``tick→MARKET_TICK``, ``decision→AGENT_ACTION``,
+    ``error→AGENT_ACTION`` (error variant). ``payload_hash`` binds the FULL sealed ``RunEvent``
+    (not the UI ``payload`` projection). ``event_ts`` is the current tick ts; a ``tick`` event
+    updates it and the new value is returned so callers can thread it across decisions.
+
+    Args:
+        competition_id: Owning competition identifier.
+        run_id: Sealed Phase-1 run identifier.
+        run_event: A single sealed, ``RunEvent``-validated event dict.
+        current_tick_ts: The ts carried forward from the most recent ``tick`` event.
+
+    Returns:
+        ``(event, updated_current_tick_ts)``.
+
+    Raises:
+        ValueError: If ``run_event`` carries an unknown sealed event type.
+    """
+    event_type = run_event["event_type"]
+    if event_type == EVENT_TICK:
+        parsed_ts = _tick_ts(run_event.get("state_snapshot_json"))
+        if parsed_ts is not None:
+            current_tick_ts = parsed_ts
+        comp_event_type = EventType.MARKET_TICK
+        payload = _tick_payload(run_event.get("state_snapshot_json"))
+    elif event_type in (EVENT_DECISION, EVENT_ERROR):
+        comp_event_type = EventType.AGENT_ACTION
+        payload = _action_payload(run_event)
+    else:  # defensive: orchestrator emits only the three known types
+        raise ValueError(f"unknown sealed run_event type: {event_type!r}")
+
+    event = CompetitionEvent(
+        competition_id=competition_id,
+        run_id=run_id,
+        seq=run_event["sequence_no"] + 1,
+        event_type=comp_event_type,
+        event_ts=current_tick_ts,
+        evidence=True,
+        source_sequence_no=run_event["sequence_no"],
+        derived_from=[],
+        payload=payload,
+        # KEYSTONE: hash binds the FULL sealed run_event, not the UI payload.
+        payload_hash=event_payload_hash(run_event),
+    )
+    return event, current_tick_ts
+
+
 def build_event_log(run_result: RunResult, competition_meta: dict[str, Any]) -> list[CompetitionEvent]:
     """Project a sealed ``RunResult`` into the full canonical competition event log.
 
@@ -244,59 +350,28 @@ def build_event_log(run_result: RunResult, competition_meta: dict[str, Any]) -> 
     events: list[CompetitionEvent] = []
 
     # --- seq 0: COMPETITION_STARTED (derived) ----------------------------------------------
-    started_payload: dict[str, Any] = {
-        "competition_id": competition_id,
-        "run_id": run_id,
-        "source_mode": run_result.source_mode,
-        "agent_ids": list(run_result.agent_ids),
-    }
     events.append(
-        CompetitionEvent(
+        build_competition_started_event(
             competition_id=competition_id,
             run_id=run_id,
-            seq=0,
-            event_type=EventType.COMPETITION_STARTED,
-            event_ts=base_ts,
-            evidence=False,
-            source_sequence_no=None,
-            derived_from=["competition_meta"],
-            payload=started_payload,
-            payload_hash=event_payload_hash(started_payload),
+            source_mode=run_result.source_mode,
+            agent_ids=list(run_result.agent_ids),
+            base_ts=base_ts,
         )
     )
 
     # --- seq 1..N: one evidence event per sealed RunEvent ----------------------------------
+    # Shared with the live sink (veridex.competition.service) so live ≡ projection by construction.
     sorted_run_events = sorted(run_result.run_events, key=lambda r: r["sequence_no"])
     current_tick_ts = base_ts
     for run_event in sorted_run_events:
-        event_type = run_event["event_type"]
-        if event_type == EVENT_TICK:
-            parsed_ts = _tick_ts(run_event.get("state_snapshot_json"))
-            if parsed_ts is not None:
-                current_tick_ts = parsed_ts
-            comp_event_type = EventType.MARKET_TICK
-            payload = _tick_payload(run_event.get("state_snapshot_json"))
-        elif event_type in (EVENT_DECISION, EVENT_ERROR):
-            comp_event_type = EventType.AGENT_ACTION
-            payload = _action_payload(run_event)
-        else:  # pragma: no cover - defensive: orchestrator emits only the three known types
-            raise ValueError(f"unknown sealed run_event type: {event_type!r}")
-
-        events.append(
-            CompetitionEvent(
-                competition_id=competition_id,
-                run_id=run_id,
-                seq=run_event["sequence_no"] + 1,
-                event_type=comp_event_type,
-                event_ts=current_tick_ts,
-                evidence=True,
-                source_sequence_no=run_event["sequence_no"],
-                derived_from=[],
-                payload=payload,
-                # KEYSTONE: hash binds the FULL sealed run_event, not the UI payload.
-                payload_hash=event_payload_hash(run_event),
-            )
+        event, current_tick_ts = build_evidence_event(
+            competition_id=competition_id,
+            run_id=run_id,
+            run_event=run_event,
+            current_tick_ts=current_tick_ts,
         )
+        events.append(event)
 
     # --- seq > N: derived tail -------------------------------------------------------------
     derived_seq = len(run_result.run_events) + 1

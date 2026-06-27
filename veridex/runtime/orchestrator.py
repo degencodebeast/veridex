@@ -256,6 +256,7 @@ async def run_competition(
     store: Store | None = None,
     decision_timeout_s: float | None = None,
     run_id: str | None = None,
+    event_sink: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
 ) -> RunResult:
     """Drive ingest → concurrent agent decisions → law recompute → evidence → score rows.
 
@@ -274,6 +275,11 @@ async def run_competition(
         store: Optional async store; when given, the run is persisted before returning.
         decision_timeout_s: Per-decide timeout (defaults to ``get_settings().decision_timeout_s``).
         run_id: Optional explicit run id (defaults to a fresh UUID hex).
+        event_sink: Optional async observer. When given, EACH event appended to the run is also
+            validated through ``RunEvent`` and awaited on the sink (in ``sequence_no`` order) for
+            live observation/persistence. This is an ADDITIVE SHELL: the sink NEVER feeds back
+            into the deterministic seal (``validate_run_events`` / ``compute_evidence_hash`` / the
+            sync scoring pass remain byte-identical whether or not a sink is supplied).
 
     Returns:
         The scored, evidence-backed :class:`RunResult`.
@@ -293,9 +299,21 @@ async def run_competition(
     decisions: list[tuple[Agent, AgentAction, MarketState]] = []
     sequence_no = 0
 
+    async def _emit(ev: dict[str, Any]) -> None:
+        """Append ``ev`` to the run AND (when present) mirror it to the live ``event_sink``.
+
+        The sink only ever receives ``RunEvent``-validated dicts — identical in shape to what
+        ``validate_run_events`` later produces for the seal — so the live stream stays a faithful
+        projection of the sealed record. ``raw_events`` keeps the original (unvalidated) dict so
+        the post-loop seal is byte-identical to the no-sink path.
+        """
+        raw_events.append(ev)
+        if event_sink is not None:
+            await event_sink(RunEvent.model_validate(ev).model_dump())
+
     # --- async decision loop: gather all agents per tick, fail-closed -----------------
     for snapshot in marketstates:
-        raw_events.append(
+        await _emit(
             {
                 "sequence_no": sequence_no,
                 "event_type": EVENT_TICK,
@@ -308,7 +326,7 @@ async def run_competition(
 
         for agent, action, error in results:
             if error is not None or action is None:
-                raw_events.append(
+                await _emit(
                     {
                         "sequence_no": sequence_no,
                         "event_type": EVENT_ERROR,
@@ -322,7 +340,7 @@ async def run_competition(
                     }
                 )
             else:
-                raw_events.append(
+                await _emit(
                     {
                         "sequence_no": sequence_no,
                         "event_type": EVENT_DECISION,
