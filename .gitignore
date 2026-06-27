@@ -9,7 +9,9 @@
 !/veridex/
 !/tests/
 !/scripts/
-!/spec/
+
+# planning/spec docs stay LOCAL — never pushed (per project decision)
+spec/
 
 # --- within the allowed trees, still exclude secrets + build artifacts ---
 veridex/.env
