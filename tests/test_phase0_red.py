@@ -8,8 +8,10 @@ NOTE on test 1: `test_verifier_imports_without_agno` is partly a standing GUARD 
 path must never import an LLM SDK), but it is RED here because the AST-audit machinery
 (`assert_no_llm_imports`) is not yet implemented (T3).
 """
+
 from __future__ import annotations
 
+import contextlib
 import json
 from pathlib import Path
 
@@ -20,9 +22,9 @@ FIXTURE = Path(__file__).parent / "fixtures" / "txline_odds_sample.json"
 
 # 1 — REQ-003 · gate 2/7 · KILL-2
 def test_verifier_imports_without_agno():
-    from veridex.verifier.import_audit import assert_no_llm_imports
     import veridex.checks as checks_pkg
     import veridex.verifier as verifier_pkg
+    from veridex.verifier.import_audit import assert_no_llm_imports
 
     # Trust-path packages must import cleanly AND contain no LLM SDK imports.
     assert_no_llm_imports(Path(checks_pkg.__file__).parent)
@@ -182,10 +184,8 @@ def test_marketstate_is_immutable_snapshot():
     from veridex.ingest.marketstate import MarketState
 
     ms = MarketState(fixture_id=1, tick_seq=0, ts=1, phase=2, markets={}, scores={})
-    try:
+    with contextlib.suppress(Exception):
         ms.fixture_id = 999  # top-level mutation must NOT take effect
-    except Exception:
-        pass
     assert ms.fixture_id == 1
 
 
@@ -215,9 +215,7 @@ def test_import_audit_fires_on_planted_llm_import(tmp_path, src):
 def test_import_audit_allows_sibling_and_relative_imports(tmp_path):
     from veridex.verifier.import_audit import assert_no_llm_imports
 
-    (tmp_path / "mod.py").write_text(
-        "from google.cloud import storage\nfrom . import sibling\nimport json\n"
-    )
+    (tmp_path / "mod.py").write_text("from google.cloud import storage\nfrom . import sibling\nimport json\n")
     assert_no_llm_imports(tmp_path)  # must not raise
 
 
@@ -228,16 +226,14 @@ def test_deterministic_baseline_responds_to_marketstate_not_constant():
     from veridex.runtime.baseline import deterministic_baseline_action
     from veridex.runtime.schemas import SportsActionType
 
-    base = dict(fixture_id=1, tick_seq=0, ts=1, phase=2, scores={})
+    base = {"fixture_id": 1, "tick_seq": 0, "ts": 1, "phase": 2, "scores": {}}
     suspended = MarketState(
         markets={"OU_2_5": {"stable_prob_bps": 5800, "stable_price": 1.72, "suspended": True}}, **base
     )
     flaggable = MarketState(
         markets={"OU_2_5": {"stable_prob_bps": 5800, "stable_price": 1.72, "suspended": False}}, **base
     )
-    quiet = MarketState(
-        markets={"OU_2_5": {"stable_prob_bps": 4200, "stable_price": 2.38, "suspended": False}}, **base
-    )
+    quiet = MarketState(markets={"OU_2_5": {"stable_prob_bps": 4200, "stable_price": 2.38, "suspended": False}}, **base)
     assert deterministic_baseline_action(suspended).type == SportsActionType.WIDEN_OR_SUSPEND
     assert deterministic_baseline_action(flaggable).type == SportsActionType.FLAG_VALUE
     assert deterministic_baseline_action(quiet).type == SportsActionType.WAIT

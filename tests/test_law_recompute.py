@@ -17,6 +17,7 @@ missing) before the production module was written.
   - kelly_fraction in [0,1], advisory only — never flips valid
   - import-audit clean over veridex/law/ (CON-007)
 """
+
 from __future__ import annotations
 
 from pathlib import Path
@@ -33,6 +34,7 @@ KEY = "OVERUNDER_PARTICIPANT_GOALS|half=1|line=1"
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
 
 def _market(prob_bps: dict, *, price: dict | None = None, suspended: bool = False) -> dict:
     return {
@@ -67,6 +69,7 @@ def _action(side="over", *, action_type=SportsActionType.FLAG_VALUE, market_key=
 # B3-1: positive CLV (closing prob > entry prob) -> positive clv, valid
 # ---------------------------------------------------------------------------
 
+
 def test_positive_clv_is_valid_and_positive():
     entry = _ms({KEY: _market({"over": 4684, "under": 5316})})
     closing = _ms({KEY: _market({"over": 5316, "under": 4684})}, tick_seq=9)
@@ -79,6 +82,7 @@ def test_positive_clv_is_valid_and_positive():
 # ---------------------------------------------------------------------------
 # B3-2: negative CLV recomputed even when params claim a fat positive edge
 # ---------------------------------------------------------------------------
+
 
 def test_negative_clv_recomputed_claimed_edge_ignored():
     entry = _ms({KEY: _market({"over": 6000, "under": 4000})})
@@ -96,6 +100,7 @@ def test_negative_clv_recomputed_claimed_edge_ignored():
 # ---------------------------------------------------------------------------
 # B3-3: missing closing market — replay invalid; live pending
 # ---------------------------------------------------------------------------
+
 
 def test_replay_closing_none_is_invalid():
     entry = _ms({KEY: _market({"over": 4684, "under": 5316})})
@@ -143,6 +148,7 @@ def test_unknown_source_mode_raises():
 # B3-4: missing market_key / side in params -> invalid
 # ---------------------------------------------------------------------------
 
+
 def test_missing_side_in_params_is_invalid():
     entry = _ms({KEY: _market({"over": 4684, "under": 5316})})
     closing = _ms({KEY: _market({"over": 5316, "under": 4684})}, tick_seq=9)
@@ -164,6 +170,7 @@ def test_missing_market_key_in_params_is_invalid():
 # ---------------------------------------------------------------------------
 # B3-5: suspended OR Pct="NA" at entry or closing -> invalid/unscored
 # ---------------------------------------------------------------------------
+
 
 def test_entry_suspended_is_invalid():
     entry = _ms({KEY: _market({"over": 4684, "under": 5316}, suspended=True)})
@@ -210,6 +217,7 @@ def test_closing_side_missing_is_invalid():
 # B3-6: WAIT action -> valid, unscored
 # ---------------------------------------------------------------------------
 
+
 def test_wait_action_is_valid_and_unscored():
     entry = _ms({KEY: _market({"over": 4684, "under": 5316})})
     closing = _ms({KEY: _market({"over": 5316, "under": 4684})}, tick_seq=9)
@@ -225,9 +233,9 @@ def test_wait_action_is_valid_and_unscored():
 # B3-7: kelly_fraction in [0,1] and never flips valid
 # ---------------------------------------------------------------------------
 
+
 def test_kelly_fraction_in_unit_interval_for_scored_action():
-    entry = _ms({KEY: _market({"over": 4684, "under": 5316},
-                              price={"over": 2.135, "under": 1.881})})
+    entry = _ms({KEY: _market({"over": 4684, "under": 5316}, price={"over": 2.135, "under": 1.881})})
     closing = _ms({KEY: _market({"over": 5316, "under": 4684})}, tick_seq=9)
     res = recompute(entry, _action("over"), closing=closing, source_mode="replay")
     # Pin the exact value: b=2.135-1=1.135, p=0.4684, q=0.5316.
@@ -240,8 +248,7 @@ def test_kelly_fraction_in_unit_interval_for_scored_action():
 
 def test_kelly_non_numeric_price_returns_zero_without_raising():
     # A non-numeric stable_price must never raise; kelly degrades to 0.0.
-    entry = _ms({KEY: _market({"over": 4684, "under": 5316},
-                              price={"over": "NA", "under": 1.881})})
+    entry = _ms({KEY: _market({"over": 4684, "under": 5316}, price={"over": "NA", "under": 1.881})})
     closing = _ms({KEY: _market({"over": 5316, "under": 4684})}, tick_seq=9)
     res = recompute(entry, _action("over"), closing=closing, source_mode="replay")
     assert res["kelly_fraction"] == 0.0
@@ -250,8 +257,7 @@ def test_kelly_non_numeric_price_returns_zero_without_raising():
 
 def test_kelly_clamps_negative_to_zero_without_flipping_valid():
     # p=0.30, decimal price 2.0 (b=1.0): (1.0*0.3 - 0.7)/1.0 = -0.4 -> clamp 0.0.
-    entry = _ms({KEY: _market({"over": 3000, "under": 7000},
-                              price={"over": 2.0, "under": 1.43})})
+    entry = _ms({KEY: _market({"over": 3000, "under": 7000}, price={"over": 2.0, "under": 1.43})})
     closing = _ms({KEY: _market({"over": 3500, "under": 6500})}, tick_seq=9)
     res = recompute(entry, _action("over"), closing=closing, source_mode="replay")
     assert res["kelly_fraction"] == 0.0
@@ -260,8 +266,7 @@ def test_kelly_clamps_negative_to_zero_without_flipping_valid():
 
 def test_kelly_clamps_high_to_one():
     # Malformed p>1 forces raw kelly > 1 -> clamp to 1.0 (defensive upper bound).
-    entry = _ms({KEY: _market({"over": 15000, "under": 0},
-                              price={"over": 2.0})})
+    entry = _ms({KEY: _market({"over": 15000, "under": 0}, price={"over": 2.0})})
     closing = _ms({KEY: _market({"over": 15000, "under": 0})}, tick_seq=9)
     res = recompute(entry, _action("over"), closing=closing, source_mode="replay")
     assert res["kelly_fraction"] == 1.0
@@ -279,6 +284,7 @@ def test_kelly_present_and_advisory_on_invalid_action():
 # ---------------------------------------------------------------------------
 # B3-8: import-audit clean over veridex/law/ (CON-007)
 # ---------------------------------------------------------------------------
+
 
 def test_law_import_audit_clean():
     import veridex.law as law_pkg

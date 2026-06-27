@@ -3,6 +3,7 @@
 Folds N TxLINE-native odds SSE messages for ONE fixture into a `MarketState`.
 Trust-path module: NO LLM SDK imports (CON-007).
 """
+
 from __future__ import annotations
 
 from typing import Any
@@ -17,10 +18,7 @@ def market_key(message: dict[str, Any]) -> str:
     Null / missing segments collapse to an empty string so the key is always
     two-pipe separated and comparable across ticks.
     """
-    return "|".join(
-        str(message.get(k) or "")
-        for k in ("SuperOddsType", "MarketPeriod", "MarketParameters")
-    )
+    return "|".join(str(message.get(k) or "") for k in ("SuperOddsType", "MarketPeriod", "MarketParameters"))
 
 
 def group_by_fixture(
@@ -63,15 +61,12 @@ def marketstate_from_txline_odds(
         contract — see REQ-101).
     """
     if not messages:
-        raise ValueError(
-            "marketstate_from_txline_odds requires at least one message"
-        )
+        raise ValueError("marketstate_from_txline_odds requires at least one message")
 
     fixture_ids = {int(m["FixtureId"]) for m in messages}
     if len(fixture_ids) > 1:
         raise ValueError(
-            f"single fixture expected but received messages for "
-            f"{len(fixture_ids)} fixtures: {sorted(fixture_ids)}"
+            f"single fixture expected but received messages for {len(fixture_ids)} fixtures: {sorted(fixture_ids)}"
         )
 
     fixture_id = next(iter(fixture_ids))
@@ -91,7 +86,7 @@ def marketstate_from_txline_odds(
 
         # de-vigged probability in basis-points (Pct is already de-margined)
         stable_prob_bps: dict[str, int] = {}
-        for name, pct in zip(names, pcts):
+        for name, pct in zip(names, pcts, strict=False):
             val = _try_float(pct)
             if val is not None:
                 stable_prob_bps[name] = round(val * 100)
@@ -99,7 +94,7 @@ def marketstate_from_txline_odds(
         # decimal odds (Prices are decimal × 1000); prices are retained on
         # suspended markets as last-known odds even when stable_prob_bps is empty.
         stable_price: dict[str, float] = {}
-        for name, price in zip(names, prices):
+        for name, price in zip(names, prices, strict=False):
             val = _try_float(price)
             if val is not None:
                 stable_price[name] = val / 1000

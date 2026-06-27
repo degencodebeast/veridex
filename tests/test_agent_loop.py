@@ -10,6 +10,7 @@ B4 is STATELESS, snapshot-only: the only context is the `MarketState(<=t)` snaps
 run-state, history, memory, or learning (those are B5/Phase 2). B4 returns the action only —
 it writes NO DB rows, proof cards, score rows, anchors, or evidence hashes.
 """
+
 from __future__ import annotations
 
 import json
@@ -72,9 +73,7 @@ def test_emit_returns_agent_action_when_content_is_typed():
     from veridex.runtime.agent import emit_agent_action
 
     expected = AgentAction(type=SportsActionType.FLAG_VALUE, params={"market": "OU_2_5"})
-    action = emit_agent_action(
-        _market_state(), model=_SENTINEL_MODEL, agent_factory=_spy_factory(expected)
-    )
+    action = emit_agent_action(_market_state(), model=_SENTINEL_MODEL, agent_factory=_spy_factory(expected))
     assert isinstance(action, AgentAction)
     assert action is expected
     assert action.type == SportsActionType.FLAG_VALUE
@@ -85,9 +84,7 @@ def test_emit_falls_back_to_json_parse_when_content_is_text():
     from veridex.runtime.agent import emit_agent_action
 
     raw = json.dumps({"type": "WAIT", "params": {"reason": "quiet", "confidence": 0.4}})
-    action = emit_agent_action(
-        _market_state(), model=_SENTINEL_MODEL, agent_factory=_spy_factory(raw)
-    )
+    action = emit_agent_action(_market_state(), model=_SENTINEL_MODEL, agent_factory=_spy_factory(raw))
     assert isinstance(action, AgentAction)
     assert action.type == SportsActionType.WAIT
     # rationale/confidence survive as UNTRUSTED params metadata (gate 1 may ignore them).
@@ -99,9 +96,7 @@ def test_emit_validates_dict_content():
     from veridex.runtime.agent import emit_agent_action
 
     raw = {"type": "WAIT", "params": {"confidence": 0.4}}
-    action = emit_agent_action(
-        _market_state(), model=_SENTINEL_MODEL, agent_factory=_spy_factory(raw)
-    )
+    action = emit_agent_action(_market_state(), model=_SENTINEL_MODEL, agent_factory=_spy_factory(raw))
     assert isinstance(action, AgentAction)
     assert action.type == SportsActionType.WAIT
     assert action.params["confidence"] == 0.4
@@ -113,9 +108,7 @@ def test_emit_raises_clean_value_error_on_none_content():
     from veridex.runtime.agent import emit_agent_action
 
     with pytest.raises(ValueError, match="no parseable content"):
-        emit_agent_action(
-            _market_state(), model=_SENTINEL_MODEL, agent_factory=_spy_factory(None)
-        )
+        emit_agent_action(_market_state(), model=_SENTINEL_MODEL, agent_factory=_spy_factory(None))
 
 
 # 3 — HARD invariant: the Agent is constructed with tools=[] (decision-only, no execution).
@@ -158,9 +151,7 @@ def test_emit_raises_on_overpowered_action_text():
     # "EXECUTE_TRADE" is not in the constrained SportsActionType enum -> must reject.
     rogue = json.dumps({"type": "EXECUTE_TRADE", "params": {"size": 9999}})
     with pytest.raises(pydantic.ValidationError):
-        emit_agent_action(
-            _market_state(), model=_SENTINEL_MODEL, agent_factory=_spy_factory(rogue)
-        )
+        emit_agent_action(_market_state(), model=_SENTINEL_MODEL, agent_factory=_spy_factory(rogue))
 
 
 # 5 — agent_config_hash is deterministic + stable (B5 records it as evidence later).
@@ -211,11 +202,11 @@ def test_agent_module_imports_without_agno_and_no_network():
 
 # 8 — trust-path import audit stays clean: agent.py (agno) must not leak into the trust path.
 def test_trust_path_imports_no_llm_sdk():
-    from veridex.verifier.import_audit import assert_no_llm_imports
     import veridex.checks as checks_pkg
-    import veridex.verifier as verifier_pkg
-    import veridex.law as law_pkg
     import veridex.ingest as ingest_pkg
+    import veridex.law as law_pkg
+    import veridex.verifier as verifier_pkg
+    from veridex.verifier.import_audit import assert_no_llm_imports
 
     for pkg in (checks_pkg, verifier_pkg, law_pkg, ingest_pkg):
         assert_no_llm_imports(Path(pkg.__file__).parent)

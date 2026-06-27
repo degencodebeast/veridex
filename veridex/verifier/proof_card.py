@@ -4,6 +4,7 @@ The judge-visible artifact. `agent-rank`'s `VerifierRunResponse` names its block
 proof card must surface it as `checks` / Proof Checks via a thin response adapter (KILL-6 if that
 needs broad schema rewrites). Must never expose "cat" in the public JSON.
 """
+
 from __future__ import annotations
 
 from typing import Any

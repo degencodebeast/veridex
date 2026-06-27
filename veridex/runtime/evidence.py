@@ -3,6 +3,7 @@
 Behavior is test-driven (T6) — stubs raise NotImplementedError so T1 fails meaningfully.
 Adapted from `agent-rank/backend/src/services/serialization.py` + `.../integrity/run_auditor.py`.
 """
+
 from __future__ import annotations
 
 import hashlib
@@ -58,9 +59,7 @@ def build_raw_prescore_record(
         "raw_action": raw_action,
         "tick_seq": tick_seq,
     }
-    raw_prescore_hash = hashlib.sha256(
-        serialize_payload(bound).encode("utf-8")
-    ).hexdigest()
+    raw_prescore_hash = hashlib.sha256(serialize_payload(bound).encode("utf-8")).hexdigest()
     return {
         "record_kind": "raw_prescore",
         "raw_prescore_hash": raw_prescore_hash,

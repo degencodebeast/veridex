@@ -3,6 +3,7 @@
 TRUST PATH: this module MUST NOT import agno/openai/anthropic/litellm (gate 2). It recomputes
 edge/CLV from evidence; the LLM-claimed edge is IGNORED (gate 1).
 """
+
 from __future__ import annotations
 
 from typing import Literal

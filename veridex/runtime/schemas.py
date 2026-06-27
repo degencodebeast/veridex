@@ -3,6 +3,7 @@
 DATA ONLY — no behavior here (behavior lives in test-driven modules). These are the
 constrained `AgentAction` the decision layer emits and the `RunEvent` evidence record.
 """
+
 from __future__ import annotations
 
 from enum import Enum

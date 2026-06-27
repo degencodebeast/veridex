@@ -2,6 +2,7 @@
 
 NOT per-tick anchoring. Payload = SHA-256 of the run manifest.
 """
+
 from __future__ import annotations
 
 import hashlib

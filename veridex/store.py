@@ -1,4 +1,5 @@
 """Minimal SQLite store for spike runs/events/artifacts. Test-driven (T6)."""
+
 from __future__ import annotations
 
 from typing import Any

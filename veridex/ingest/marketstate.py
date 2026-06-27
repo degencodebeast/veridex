@@ -3,6 +3,7 @@
 T2a: tiny local JSON fixture → MarketState (replay driver — NOT a full historical client).
 T2b: live SSE smoke → the SAME MarketState shape (a smoke gate — KILL-5 if it can't share quickly).
 """
+
 from __future__ import annotations
 
 import json
@@ -66,7 +67,7 @@ def parse_sse_line(line: str) -> dict[str, Any] | None:
         return None
     if not stripped.startswith("data:"):
         return None
-    payload = stripped[len("data:"):].strip()
+    payload = stripped[len("data:") :].strip()
     try:
         record = json.loads(payload)
     except (ValueError, TypeError):

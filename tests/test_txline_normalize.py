@@ -12,6 +12,7 @@ Behaviors under test:
 - Mixed-fixture input → ValueError mentioning "single fixture".
 - Import-audit clean over veridex/ingest/ (CON-007).
 """
+
 from __future__ import annotations
 
 import json
@@ -44,6 +45,7 @@ def _msgs_for_fixture(fid: int) -> list[dict]:
 # B1-1: market_key composition — normal case
 # ---------------------------------------------------------------------------
 
+
 def test_market_key_normal_case():
     """market_key joins SuperOddsType|MarketPeriod|MarketParameters."""
     msg = {
@@ -74,6 +76,7 @@ def test_market_key_missing_period_acts_like_null():
 # B1-2: group_by_fixture — two fixtures with correct counts
 # ---------------------------------------------------------------------------
 
+
 def test_group_by_fixture_produces_correct_keys_and_counts():
     """group_by_fixture must bucket by FixtureId and preserve all messages."""
     messages = _load_fixture()
@@ -89,13 +92,14 @@ def test_group_by_fixture_preserves_order():
     messages = _msgs_for_fixture(17588404)
     grouped = group_by_fixture(messages)
     result = grouped[17588404]
-    for orig, bucketed in zip(messages, result):
+    for orig, bucketed in zip(messages, result, strict=False):
         assert orig["SuperOddsType"] == bucketed["SuperOddsType"]
 
 
 # ---------------------------------------------------------------------------
 # B1-3: fold → MarketState: correct fixture_id and ts (ms → s)
 # ---------------------------------------------------------------------------
+
 
 def test_fold_correct_fixture_id():
     """marketstate_from_txline_odds must use the FixtureId from the messages."""
@@ -131,6 +135,7 @@ def test_fold_scores_empty():
 # B1-4: de-vig — OVER/UNDER bps sum to 10000
 # ---------------------------------------------------------------------------
 
+
 def test_devig_over_under_bps_sum_to_10000():
     """OVER/UNDER stable_prob_bps must sum to exactly 10000 for the fixture data.
 
@@ -164,6 +169,7 @@ def test_devig_1x2_bps_sum_to_10000():
 # B1-5: price scaling — Prices×1000 → decimal (2135 → 2.135)
 # ---------------------------------------------------------------------------
 
+
 def test_price_scaling_over_under():
     """Prices must be divided by 1000: 2135 → 2.135, 1881 → 1.881."""
     msgs = _msgs_for_fixture(17588404)
@@ -177,6 +183,7 @@ def test_price_scaling_over_under():
 # ---------------------------------------------------------------------------
 # B1-6: Pct="NA" → empty stable_prob_bps + suspended=True
 # ---------------------------------------------------------------------------
+
 
 def test_na_pct_market_has_empty_stable_prob_bps():
     """A market where all Pct entries are 'NA' must have an empty stable_prob_bps dict."""
@@ -223,6 +230,7 @@ def test_priced_market_is_not_suspended():
 # B1-7: InRunning=true → phase==1; all False → phase==0
 # ---------------------------------------------------------------------------
 
+
 def test_in_running_true_sets_phase_1():
     """A batch where any message has InRunning=true must produce phase=1."""
     msgs = _msgs_for_fixture(17588405)  # the InRunning=true message
@@ -241,6 +249,7 @@ def test_all_in_running_false_sets_phase_0():
 # B1-8: Mixed-fixture input → ValueError mentioning "single fixture"
 # ---------------------------------------------------------------------------
 
+
 def test_mixed_fixture_raises_value_error():
     """marketstate_from_txline_odds must raise ValueError for multi-fixture input."""
     all_msgs = _load_fixture()  # spans fixture 17588404 and 17588405
@@ -257,6 +266,7 @@ def test_empty_messages_raises_value_error():
 # ---------------------------------------------------------------------------
 # B1-9: Import-audit clean over veridex/ingest/ (CON-007)
 # ---------------------------------------------------------------------------
+
 
 def test_ingest_import_audit_clean():
     """No LLM SDK imports (agno, anthropic, openai, etc.) in the ingest package."""

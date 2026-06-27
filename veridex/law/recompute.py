@@ -31,6 +31,7 @@ Resolved §4 judgment calls (surfaced for the codex gate):
     side-missing (Pct="NA" collapses to empty stable_prob_bps, i.e. side-missing). Entry is
     validated before closing so the most upstream failure wins the reason code.
 """
+
 from __future__ import annotations
 
 from typing import Any, Literal
@@ -39,8 +40,8 @@ from veridex.checks.clv import compute_clv_check
 from veridex.ingest.marketstate import MarketState
 from veridex.runtime.schemas import AgentAction, SportsActionType
 
-REPLAY = "replay"
-LIVE = "live"
+REPLAY: Literal["replay"] = "replay"
+LIVE: Literal["live"] = "live"
 PENDING = "pending"  # non-numeric clv_bps sentinel (live-awaiting-close and WAIT abstentions)
 
 
@@ -134,7 +135,13 @@ def recompute(
     # No closing tick: replay => invalid; live => pending (awaiting a later horizon tick).
     if closing is None:
         if source_mode == LIVE:
-            return {"edge_bps": 0, "clv_bps": PENDING, "kelly_fraction": kelly, "valid": True, "reason": "pending_closing"}
+            return {
+                "edge_bps": 0,
+                "clv_bps": PENDING,
+                "kelly_fraction": kelly,
+                "valid": True,
+                "reason": "pending_closing",
+            }
         return _invalid("closing_missing", kelly=kelly)
 
     closing_reason = _validate_market(closing, market_key, side, where="closing")

@@ -1,4 +1,5 @@
 """Deterministic baseline agent (reproducible-proof contestant; no LLM). Test-driven (T4)."""
+
 from __future__ import annotations
 
 from typing import Any
@@ -25,15 +26,11 @@ def deterministic_baseline_action(market_state: Any) -> AgentAction:
             return AgentAction(type=SportsActionType.WIDEN_OR_SUSPEND, params={"market": key})
 
     # Deterministic pick: highest stable_prob_bps, ties broken by market key.
-    ranked = sorted(
-        markets.items(), key=lambda kv: (-int(kv[1].get("stable_prob_bps", 0)), kv[0])
-    )
+    ranked = sorted(markets.items(), key=lambda kv: (-int(kv[1].get("stable_prob_bps", 0)), kv[0]))
     if ranked:
         key, m = ranked[0]
         prob = int(m.get("stable_prob_bps", 0))
         if prob >= FLAG_THRESHOLD_BPS:
-            return AgentAction(
-                type=SportsActionType.FLAG_VALUE, params={"market": key, "stable_prob_bps": prob}
-            )
+            return AgentAction(type=SportsActionType.FLAG_VALUE, params={"market": key, "stable_prob_bps": prob})
 
     return AgentAction(type=SportsActionType.WAIT, params={})

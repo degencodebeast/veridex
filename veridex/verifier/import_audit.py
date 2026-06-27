@@ -3,6 +3,7 @@
 AST-walks a package dir and raises if any forbidden LLM SDK import is present. Adapted from
 `agent-rank/backend/tests/test_rebalance_cat_no_llm_imports.py` (the "Hamel-pattern" static audit).
 """
+
 from __future__ import annotations
 
 import ast

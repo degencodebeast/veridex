@@ -10,11 +10,13 @@ call, behind an injectable factory/model seam). Therefore `import veridex.runtim
 works WITHOUT agno installed and fires no network call; the import-audited trust path
 (`checks/ verifier/ law/ ingest/`) never imports an LLM SDK.
 """
+
 from __future__ import annotations
 
 import hashlib
 import json
-from typing import Any, Callable, Optional
+from collections.abc import Callable
+from typing import Any
 
 from veridex.runtime.schemas import AgentAction, SportsActionType
 
@@ -90,7 +92,7 @@ def _default_model(model_id: str) -> Any:
     return Claude(id=model_id, temperature=0)
 
 
-def _default_agent_factory(*, model: Any, tools: list, output_schema: Optional[type]) -> Any:
+def _default_agent_factory(*, model: Any, tools: list, output_schema: type | None) -> Any:
     """Lazily construct an Agno Agent. Imports agno ONLY when called.
 
     `tools=[]` is a HARD invariant (decision-only, no execution authority) and `markdown=False`
@@ -107,7 +109,7 @@ def emit_agent_action(
     prefer_output_schema: bool = True,
     model: Any = None,
     model_id: str = DEFAULT_MODEL_ID,
-    agent_factory: Optional[Callable[..., Any]] = None,
+    agent_factory: Callable[..., Any] | None = None,
 ) -> AgentAction:
     """Run the LLM decision pass over a MarketState snapshot → a validated `AgentAction`.
 
@@ -138,7 +140,7 @@ def emit_agent_action(
     return parse_agent_action_json(content)
 
 
-def parse_agent_action_json(text: str) -> AgentAction:
+def parse_agent_action_json(text: object) -> AgentAction:
     """JSON-parse fallback → validated AgentAction (when provider output_schema is unavailable).
 
     This is the trust-relevant path: whatever an LLM emits as text is parsed and *re-validated*

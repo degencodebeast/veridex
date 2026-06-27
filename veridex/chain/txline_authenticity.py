@@ -4,6 +4,7 @@ Honest split (Codex R1/R2): `validateStat` authenticates SCORE/STAT inputs only 
 IF the proof path is confirmed). ODDS/StablePrice inputs are `recorded_evidence` unless an
 odds-specific validation path is confirmed — we do NOT claim TxLINE-native authentication for odds.
 """
+
 from __future__ import annotations
 
 
