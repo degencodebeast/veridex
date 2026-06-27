@@ -1,5 +1,11 @@
-"""Veridex — TxLINE Agent Proof Arena. Phase 0 prove-or-kill spike package.
+"""Veridex — TxLINE Agent Proof Arena.
 
-Phase 0 goal: collect evidence on whether the local `agent-rank` spine can be reused for
-TxLINE sports without violating the domain or trust boundary. NOT a product build.
+LLM agents compete on live or replayed TxLINE sports-betting markets. A deterministic
+"law" recomputes the math (edge / CLV / Kelly), scores agents by closing-line value, and
+anchors tamper-evident proof records on Solana. The LLM proposes; the deterministic law
+disposes — the LLM never self-certifies.
+
+The trust path (``checks/``, ``verifier/``, ``law/``, ``ingest/`` + ``scoring.py`` +
+``leaderboard.py``) imports no LLM SDK; the LLM decision shell lives in ``runtime/agent.py``
+(via OpenRouter), outside that boundary. The separation is enforced by a static import audit.
 """
