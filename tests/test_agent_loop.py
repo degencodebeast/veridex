@@ -241,10 +241,23 @@ def test_trust_path_imports_no_llm_sdk():
         assert_no_llm_imports(Path(pkg.__file__).parent)
 
 
-# 9 — (creds-gated, default-skipped) live smoke against a real model key.
+# 9 — structural: _default_model must lazily import agno.models.openrouter (not anthropic).
+def test_default_model_source_uses_openrouter() -> None:
+    """_default_model source must reference agno.models.openrouter and OpenRouter, not anthropic."""
+    import inspect
+
+    from veridex.runtime import agent as agent_mod
+
+    src = inspect.getsource(agent_mod._default_model)
+    assert "agno.models.openrouter" in src, "_default_model must import from agno.models.openrouter"
+    assert "OpenRouter" in src, "_default_model must instantiate OpenRouter"
+    assert "agno.models.anthropic" not in src, "_default_model must not import the old Anthropic path"
+
+
+# 10 — (creds-gated, default-skipped) live smoke against OpenRouter key.
 @pytest.mark.skipif(
-    not (os.getenv("VERIDEX_LIVE_AGNO") and os.getenv("ANTHROPIC_API_KEY")),
-    reason="live Agno smoke: set VERIDEX_LIVE_AGNO=1 and ANTHROPIC_API_KEY",
+    not (os.getenv("VERIDEX_LIVE_AGNO") and os.getenv("OPENROUTER_API_KEY")),
+    reason="live Agno smoke: set VERIDEX_LIVE_AGNO=1 and OPENROUTER_API_KEY",
 )
 def test_live_emit_agent_action_smoke():
     from veridex.runtime.agent import emit_agent_action

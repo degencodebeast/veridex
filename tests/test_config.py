@@ -26,12 +26,20 @@ from veridex.config import (
     require_anthropic_key,
     require_database_url,
     require_keypair_path,
+    require_openrouter_key,
     require_txline,
 )
 
 # Config env vars that must be cleared so tests are deterministic regardless of the
 # developer's / CI's OS environment (e.g. an exported DATABASE_URL for the Postgres path).
-_CONFIG_ENV_VARS = ("JWT", "TXLINE_X_API_TOKEN", "DATABASE_URL", "SOLANA_KEYPAIR_PATH", "ANTHROPIC_API_KEY")
+_CONFIG_ENV_VARS = (
+    "JWT",
+    "TXLINE_X_API_TOKEN",
+    "DATABASE_URL",
+    "SOLANA_KEYPAIR_PATH",
+    "ANTHROPIC_API_KEY",
+    "OPENROUTER_API_KEY",
+)
 
 
 @pytest.fixture(autouse=True)
@@ -70,9 +78,9 @@ class TestDefaults:
         assert s.solana_cluster == "devnet"
 
     def test_model_id_default(self) -> None:
-        """model_id must default to the configured Claude model slug."""
+        """model_id must default to the OpenRouter provider/model slug."""
         s = Settings(_env_file=None)
-        assert s.model_id == "claude-sonnet-4-6"
+        assert s.model_id == "anthropic/claude-sonnet-4"
 
     def test_decision_timeout_default(self) -> None:
         """decision_timeout_s must default to 30.0 seconds."""
@@ -87,6 +95,7 @@ class TestDefaults:
         assert s.solana_keypair_path is None
         assert s.database_url is None
         assert s.anthropic_api_key is None
+        assert s.openrouter_api_key is None
 
 
 # ---------------------------------------------------------------------------
@@ -126,6 +135,12 @@ class TestEnvOverrides:
         monkeypatch.setenv("SOLANA_KEYPAIR_PATH", "/home/user/.config/solana/id.json")
         s = Settings(_env_file=None)
         assert s.solana_keypair_path == "/home/user/.config/solana/id.json"
+
+    def test_openrouter_api_key_env_var(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """OPENROUTER_API_KEY env var must map to openrouter_api_key field."""
+        monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-test")
+        s = Settings(_env_file=None)
+        assert s.openrouter_api_key == "sk-or-test"
 
     def test_multiple_env_vars_resolved_simultaneously(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Multiple env vars set at once must all be resolved correctly."""
@@ -215,6 +230,27 @@ class TestRequireAnthropicKey:
         monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-real")
         s = Settings(_env_file=None)
         assert require_anthropic_key(s) == "sk-ant-real"
+
+
+# ---------------------------------------------------------------------------
+# require_openrouter_key
+# ---------------------------------------------------------------------------
+
+
+class TestRequireOpenrouterKey:
+    """require_openrouter_key must raise when OPENROUTER_API_KEY is absent."""
+
+    def test_raises_when_missing(self) -> None:
+        """ValueError raised when openrouter_api_key is None."""
+        s = Settings(_env_file=None)
+        with pytest.raises(ValueError, match="OPENROUTER_API_KEY"):
+            require_openrouter_key(s)
+
+    def test_returns_key_when_set(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Returns the API key string when OPENROUTER_API_KEY is configured."""
+        monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-live")
+        s = Settings(_env_file=None)
+        assert require_openrouter_key(s) == "sk-or-live"
 
 
 # ---------------------------------------------------------------------------

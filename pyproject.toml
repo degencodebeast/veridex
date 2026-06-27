@@ -8,8 +8,9 @@ dependencies = ["pydantic>=2", "pydantic-settings>=2"]
 [project.optional-dependencies]
 # Postgres persistence (PostgresStore) — lazy-imported; not needed for the offline suite.
 postgres = ["psycopg[binary]>=3"]
-# LLM agent layer (Agno) — lazy-imported behind a seam; not needed for the offline suite.
-agent = ["agno"]
+# LLM agent layer (Agno via OpenRouter, OpenAI-compatible) — lazy-imported behind a seam;
+# not needed for the offline suite. openai is the client Agno's OpenRouter model uses.
+agent = ["agno", "openai"]
 # Live TxLINE SSE client (B2) — async HTTP.
 live = ["httpx>=0.27"]
 # FastAPI serving layer (B11 demo surface) — async read + trigger endpoints over the Store.

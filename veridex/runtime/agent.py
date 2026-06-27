@@ -18,13 +18,13 @@ import json
 from collections.abc import Callable
 from typing import Any
 
-from veridex.config import get_settings
+from veridex.config import get_settings, require_openrouter_key
 from veridex.runtime.schemas import AgentAction, SportsActionType
 
-# Default Claude model id for this project (overridable via `model_id=`). Verified against
-# the current Agno Anthropic model surface (agno.models.anthropic.Claude). Also the
-# config-level default — `config.py` defaults Settings.model_id to this value.
-DEFAULT_MODEL_ID = "claude-sonnet-4-6"
+# Default OpenRouter (multi-model gateway) slug for this project (overridable via `model_id=`).
+# Format is ``provider/model`` as defined by OpenRouter (https://openrouter.ai/models).
+# Also the config-level default — `config.py` defaults Settings.model_id to this value.
+DEFAULT_MODEL_ID = "anthropic/claude-sonnet-4"
 
 # Schema version stamped into the config hash so B5 can record prompt/model/schema identity
 # as evidence. Matches the `action_schema` version used elsewhere in the evidence records.
@@ -119,17 +119,21 @@ def agent_config_hash(
 
 
 def _default_model(model_id: str) -> Any:
-    """Lazily build the Agno Claude model (temperature=0). Imports agno ONLY when called.
+    """Lazily build an Agno OpenRouter model (temperature=0). Imports agno ONLY when called.
+
+    Routes all LLM calls through OpenRouter (``https://openrouter.ai/api/v1``), a unified
+    multi-model gateway supporting Claude, GPT, Gemini, DeepSeek, and more. The API key is
+    read from ``OPENROUTER_API_KEY`` via :func:`~veridex.config.require_openrouter_key`.
 
     Args:
-        model_id: The Anthropic model identifier to instantiate.
+        model_id: An OpenRouter ``provider/model`` slug (e.g. ``"anthropic/claude-sonnet-4"``).
 
     Returns:
-        An Agno ``Claude`` model instance.
+        An Agno ``OpenRouter`` model instance configured for deterministic output.
     """
-    from agno.models.anthropic import Claude  # lazy: keeps the module agno-free at import
+    from agno.models.openrouter import OpenRouter  # lazy: keeps the module agno-free at import
 
-    return Claude(id=model_id, temperature=0)
+    return OpenRouter(id=model_id, api_key=require_openrouter_key(get_settings()), temperature=0)
 
 
 def _default_agent_factory(*, model: Any, tools: list, output_schema: type | None) -> Any:
@@ -161,23 +165,23 @@ def emit_agent_action(
 ) -> AgentAction:
     """Run the LLM decision pass over a MarketState snapshot → a validated ``AgentAction``.
 
-    Builds an Agno ``Agent(model=<Claude>, tools=[], output_schema=AgentAction)`` and prompts
-    it with the serialized snapshot. If ``response.content`` is already an ``AgentAction``
-    (Agno honored ``output_schema``), it is returned; otherwise the raw provider output is
-    re-validated through the constrained schema (``parse_agent_action_json`` for text,
-    ``model_validate`` for a dict). Either way nothing reaches a caller until it passes
-    ``AgentAction`` validation.
+    Builds an Agno ``Agent(model=<OpenRouter>, tools=[], output_schema=AgentAction)`` and
+    prompts it with the serialized snapshot. If ``response.content`` is already an
+    ``AgentAction`` (Agno honored ``output_schema``), it is returned; otherwise the raw
+    provider output is re-validated through the constrained schema (``parse_agent_action_json``
+    for text, ``model_validate`` for a dict). Either way nothing reaches a caller until it
+    passes ``AgentAction`` validation.
 
     The ``model=`` / ``agent_factory=`` seams are injectable so offline tests never import
     agno or hit the network. ``tools=[]`` is a HARD invariant. This function writes NO
     evidence/DB rows. When ``model_id`` is ``None`` (the default), it resolves to
-    ``get_settings().model_id`` (config default: ``"claude-sonnet-4-6"``).
+    ``get_settings().model_id`` (config default: ``"anthropic/claude-sonnet-4"``).
 
     Args:
         market_state: Immutable market snapshot (MarketState or dict).
         prefer_output_schema: When ``True``, passes ``output_schema=AgentAction`` to the agent.
         model: Pre-built Agno model instance; if ``None``, built from ``model_id`` via config.
-        model_id: Anthropic model identifier; if ``None``, resolved from ``get_settings()``.
+        model_id: OpenRouter ``provider/model`` slug; if ``None``, resolved from ``get_settings()``.
         agent_factory: Optional factory callable overriding ``_default_agent_factory``.
 
     Returns:
@@ -225,7 +229,7 @@ async def emit_agent_action_async(
         market_state: Immutable market snapshot (MarketState or dict).
         prefer_output_schema: When ``True``, passes ``output_schema=AgentAction`` to the agent.
         model: Pre-built Agno model instance; if ``None``, built from ``model_id`` via config.
-        model_id: Anthropic model identifier; if ``None``, resolved from ``get_settings()``.
+        model_id: OpenRouter ``provider/model`` slug; if ``None``, resolved from ``get_settings()``.
         agent_factory: Optional factory callable overriding ``_default_agent_factory``.
 
     Returns:

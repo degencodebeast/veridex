@@ -63,7 +63,11 @@ class Settings(BaseSettings):
     # ------------------------------------------------------------------
     # Agent (§8 deps)
     # ------------------------------------------------------------------
-    model_id: str = "claude-sonnet-4-6"
+    # OpenRouter ``provider/model`` slug (override via MODEL_ID env var).
+    model_id: str = "anthropic/claude-sonnet-4"
+    # OpenRouter gateway key (primary LLM path).
+    openrouter_api_key: str | None = Field(default=None, validation_alias="OPENROUTER_API_KEY")
+    # Anthropic direct key — back-compat; no longer the default agent path.
     anthropic_api_key: str | None = Field(default=None, validation_alias="ANTHROPIC_API_KEY")
 
     # ------------------------------------------------------------------
@@ -117,6 +121,9 @@ def require_database_url(settings: Settings) -> str:
 def require_anthropic_key(settings: Settings) -> str:
     """Return the Anthropic API key or raise if not configured.
 
+    Back-compat helper; the default agent path now uses OpenRouter via
+    :func:`require_openrouter_key`.
+
     Args:
         settings: Application settings instance.
 
@@ -129,6 +136,27 @@ def require_anthropic_key(settings: Settings) -> str:
     if settings.anthropic_api_key is None:
         raise ValueError("set ANTHROPIC_API_KEY for the LLM agent")
     return settings.anthropic_api_key
+
+
+def require_openrouter_key(settings: Settings) -> str:
+    """Return the OpenRouter API key or raise if not configured.
+
+    This is the primary credential for the B4 LLM agent, which routes all
+    model calls through OpenRouter (``https://openrouter.ai/api/v1``) to
+    support multi-model competition across Claude/GPT/Gemini/DeepSeek/etc.
+
+    Args:
+        settings: Application settings instance.
+
+    Returns:
+        The ``OPENROUTER_API_KEY`` string.
+
+    Raises:
+        ValueError: If ``openrouter_api_key`` is ``None``.
+    """
+    if settings.openrouter_api_key is None:
+        raise ValueError("set OPENROUTER_API_KEY for the LLM agent")
+    return settings.openrouter_api_key
 
 
 def require_keypair_path(settings: Settings) -> str:
