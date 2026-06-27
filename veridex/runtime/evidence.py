@@ -16,9 +16,22 @@ def serialize_payload(payload: Any) -> str:
 
 
 def compute_evidence_hash(events: list[dict[str, Any]]) -> str:
-    """SHA-256 over sequence-ordered, canonically-serialized events (cross-process stable)."""
+    """SHA-256 over sequence-ordered, canonically-serialized events (cross-process stable).
+
+    REQ-113 / AC-113 (gate CON-003):
+    - Raises ValueError if any two events share a sequence_no (determinism hole: duplicate
+      seqs make sort order ambiguous, yielding different hashes for differently-ordered inputs).
+    - Hashes the canonical JSON of the whole sorted array (not a concatenation of per-event
+      strings), making the wire format unambiguous.
+    """
     sorted_events = sorted(events, key=lambda e: e["sequence_no"])
-    canonical = "".join(serialize_payload(e) for e in sorted_events)
+    seen: set[int] = set()
+    for e in sorted_events:
+        seq = e["sequence_no"]
+        if seq in seen:
+            raise ValueError(f"duplicate sequence_no: {seq}")
+        seen.add(seq)
+    canonical = serialize_payload(sorted_events)
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
