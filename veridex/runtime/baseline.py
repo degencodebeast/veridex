@@ -13,24 +13,60 @@ FLAG_THRESHOLD_BPS = 5000
 def deterministic_baseline_action(market_state: Any) -> AgentAction:
     """Pure-rules strategy: identical input → identical AgentAction (reproducible).
 
-    Reads `MarketState` (no LLM, no time, no randomness). Iteration is key-sorted so the
-    output is a deterministic function of the snapshot alone:
-      1. any suspended market  → WIDEN_OR_SUSPEND
-      2. highest-conviction market at/over the flag threshold → FLAG_VALUE
-      3. otherwise              → WAIT
+    Reads ``MarketState`` (no LLM, no time, no randomness). Iterates over all
+    non-suspended ``(market_key, side)`` pairs whose ``stable_prob_bps[side]`` is
+    numeric, picks the highest-conviction one (ties broken deterministically by
+    ``(market_key, side)``), and emits:
+
+    - ``FLAG_VALUE`` with ``params={"market_key": key, "side": side,
+      "stable_prob_bps": bps}`` when the top prob is ≥ ``FLAG_THRESHOLD_BPS``
+      (5 000 bps / even-money).
+    - ``WAIT`` with empty params when no candidate clears the threshold, or when
+      all markets are suspended.
+
+    The emitted ``market_key`` + ``side`` satisfy the §4 law contract so that
+    ``veridex.law.recompute`` can score the action (``valid=True``, numeric
+    ``clv_bps``).
+
+    Args:
+        market_state: A ``MarketState`` snapshot (or any object whose ``.markets``
+            attribute maps market-key → dict with ``stable_prob_bps: dict[str, int]``
+            and ``suspended: bool``).
+
+    Returns:
+        A deterministic, reproducible ``AgentAction``.
     """
-    markets = getattr(market_state, "markets", {}) or {}
+    markets: dict[str, dict[str, Any]] = getattr(market_state, "markets", {}) or {}
 
-    for key in sorted(markets):
-        if markets[key].get("suspended"):
-            return AgentAction(type=SportsActionType.WIDEN_OR_SUSPEND, params={"market": key})
+    # Collect (bps, market_key, side) for every non-suspended (key, side) pair.
+    candidates: list[tuple[int, str, str]] = []
+    for key, market in markets.items():
+        if market.get("suspended"):
+            continue
+        prob_bps_map = market.get("stable_prob_bps", {})
+        if not isinstance(prob_bps_map, dict):
+            continue
+        for side, bps in prob_bps_map.items():
+            try:
+                candidates.append((int(bps), key, side))
+            except (TypeError, ValueError):
+                continue
 
-    # Deterministic pick: highest stable_prob_bps, ties broken by market key.
-    ranked = sorted(markets.items(), key=lambda kv: (-int(kv[1].get("stable_prob_bps", 0)), kv[0]))
-    if ranked:
-        key, m = ranked[0]
-        prob = int(m.get("stable_prob_bps", 0))
-        if prob >= FLAG_THRESHOLD_BPS:
-            return AgentAction(type=SportsActionType.FLAG_VALUE, params={"market": key, "stable_prob_bps": prob})
+    if not candidates:
+        return AgentAction(type=SportsActionType.WAIT, params={})
+
+    # Sort by highest prob first; equal probs broken by (market_key, side) ascending
+    # so the winner is fully determined by the snapshot alone (no insertion-order risk).
+    best_bps, best_key, best_side = sorted(candidates, key=lambda t: (-t[0], t[1], t[2]))[0]
+
+    if best_bps >= FLAG_THRESHOLD_BPS:
+        return AgentAction(
+            type=SportsActionType.FLAG_VALUE,
+            params={
+                "market_key": best_key,
+                "side": best_side,
+                "stable_prob_bps": best_bps,
+            },
+        )
 
     return AgentAction(type=SportsActionType.WAIT, params={})

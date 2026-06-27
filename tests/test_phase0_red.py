@@ -158,12 +158,26 @@ def test_live_stream_parser_tolerates_plain_lines_and_sse_heartbeat_if_present()
 
 # 11 — REQ-004
 def test_deterministic_baseline_emits_same_schema_reproducibly():
-    from veridex.ingest.marketstate import marketstate_from_fixture
+    from veridex.ingest.marketstate import MarketState
     from veridex.runtime.baseline import deterministic_baseline_action
     from veridex.runtime.schemas import AgentAction
 
-    tick = json.loads(FIXTURE.read_text())["ticks"][0]
-    ms = marketstate_from_fixture(tick, tick_seq=0, fixture_id=17952170)
+    # Construct dict-form MarketState directly (do NOT load the shared scalar fixture —
+    # the real B1 normalizer produces dict-form stable_prob_bps, not scalar).
+    ms = MarketState(
+        fixture_id=17952170,
+        tick_seq=0,
+        ts=1718000000,
+        phase=2,
+        markets={
+            "OU_2_5": {
+                "stable_prob_bps": {"over": 5800, "under": 4200},
+                "stable_price": {"over": 1.72, "under": 2.30},
+                "suspended": False,
+            }
+        },
+        scores={"1": 0, "2": 0},
+    )
     a1 = deterministic_baseline_action(ms)
     a2 = deterministic_baseline_action(ms)
     assert isinstance(a1, AgentAction) and a1 == a2  # reproducible
@@ -227,13 +241,38 @@ def test_deterministic_baseline_responds_to_marketstate_not_constant():
     from veridex.runtime.schemas import SportsActionType
 
     base = {"fixture_id": 1, "tick_seq": 0, "ts": 1, "phase": 2, "scores": {}}
+    # Dict-form stable_prob_bps (B1 normalized contract). Suspended → WAIT (no scorable pick).
     suspended = MarketState(
-        markets={"OU_2_5": {"stable_prob_bps": 5800, "stable_price": 1.72, "suspended": True}}, **base
+        markets={
+            "OU_2_5": {
+                "stable_prob_bps": {"over": 5800, "under": 4200},
+                "stable_price": {"over": 1.72},
+                "suspended": True,
+            }
+        },
+        **base,
     )
     flaggable = MarketState(
-        markets={"OU_2_5": {"stable_prob_bps": 5800, "stable_price": 1.72, "suspended": False}}, **base
+        markets={
+            "OU_2_5": {
+                "stable_prob_bps": {"over": 5800, "under": 4200},
+                "stable_price": {"over": 1.72},
+                "suspended": False,
+            }
+        },
+        **base,
     )
-    quiet = MarketState(markets={"OU_2_5": {"stable_prob_bps": 4200, "stable_price": 2.38, "suspended": False}}, **base)
-    assert deterministic_baseline_action(suspended).type == SportsActionType.WIDEN_OR_SUSPEND
+    # All side probs below FLAG_THRESHOLD_BPS → WAIT.
+    quiet = MarketState(
+        markets={
+            "OU_2_5": {
+                "stable_prob_bps": {"over": 4200},
+                "stable_price": {"over": 2.38},
+                "suspended": False,
+            }
+        },
+        **base,
+    )
+    assert deterministic_baseline_action(suspended).type == SportsActionType.WAIT
     assert deterministic_baseline_action(flaggable).type == SportsActionType.FLAG_VALUE
     assert deterministic_baseline_action(quiet).type == SportsActionType.WAIT
