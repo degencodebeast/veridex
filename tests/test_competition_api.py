@@ -157,6 +157,27 @@ def test_start_competition_returns_finalized_status_and_run_id() -> None:
     assert isinstance(body["run_id"], str) and len(body["run_id"]) > 0
 
 
+def test_start_persists_sealed_run_loadable_via_runs_endpoint() -> None:
+    """REQ-208/AC-203: after /start, GET /runs/{run_id} loads the sealed run (200, not 404).
+
+    Without ``store=store`` on the internal ``run_competition`` call, the sealed RunResult is
+    never persisted and this would 404 — breaking external evidence verification.
+    """
+    client = _client()
+    comp_id = client.post("/competitions", json=_COMPETITION_CONFIG).json()["competition_id"]
+    client.post(f"/competitions/{comp_id}/agents", json=_AGENT_ENTRY_A)
+    client.post(f"/competitions/{comp_id}/agents", json=_AGENT_ENTRY_B)
+
+    start = client.post(f"/competitions/{comp_id}/start")
+    assert start.status_code == 200, start.text
+    run_id = start.json()["run_id"]
+
+    resp = client.get(f"/runs/{run_id}")
+    assert resp.status_code == 200, resp.text
+    # the loaded proof card binds to the same run.
+    assert resp.json()["run"]["run_id"] == run_id
+
+
 def test_start_competition_unknown_competition_404() -> None:
     """POST /competitions/unknown/start returns 404."""
     client = _client()

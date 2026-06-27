@@ -155,7 +155,8 @@ async def start_competition(
       3. Pre-generate ``run_id`` (so the live seq0 + evidence events share the run id
          ``build_event_log`` will project) and advance status to ``RUNNING``.
       4. Persist the seq=0 ``COMPETITION_STARTED`` event.
-      5. Run with a stateful live sink that persists one evidence event per sealed ``RunEvent``.
+      5. Run with ``store=store`` (persists the sealed ``RunResult`` for external verification)
+         and a stateful live sink that persists one evidence event per sealed ``RunEvent``.
       6. Project the sealed run, VERIFY the live evidence prefix == projection prefix, then
          append ONLY the derived tail (no evidence re-append → no ``UNIQUE(seq)`` collision).
       7. Advance status to ``FINALIZED`` and return the competition with ``run_id`` set.
@@ -228,11 +229,17 @@ async def start_competition(
         )
         await store.append_competition_events(competition_id, [event])
 
+    # ``store=store`` persists the SEALED RunResult (runs/run_events/score_rows) under the same
+    # pre-generated run_id the competition references — so a verifier can later load_run(run_id)
+    # and recompute the evidence hash to confirm each evidence CompetitionEvent binds to it
+    # (REQ-208/AC-203). The live sink writes the separate competition_events table; there is no
+    # double-persist or UNIQUE collision between the two paths.
     run_result = await run_competition(
         marketstates,
         agents,
         source_mode=source_mode,
         run_id=run_id,
+        store=store,
         event_sink=sink,
     )
 

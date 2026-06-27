@@ -277,6 +277,29 @@ async def test_run_id_persisted_in_store_after_start() -> None:
     assert stored.run_id == comp.run_id
 
 
+async def test_sealed_run_persisted_and_evidence_binds_to_it() -> None:
+    """REQ-208/AC-203: the sealed RunResult is persisted under comp.run_id and every persisted
+    evidence event hash-binds to a sealed RunEvent loadable from it (external verifiability)."""
+    store = InMemoryStore()
+    cid = await _seeded_competition(store)
+    comp = await start_competition(store, cid, _ticks(), _agents())
+    assert comp.run_id is not None
+
+    # run_id → sealed RunResult is retrievable (would 404/KeyError without store=store).
+    loaded = await store.load_run(comp.run_id)
+    sealed_by_seq = {ev["sequence_no"]: ev for ev in loaded.run_events}
+
+    persisted = await store.list_competition_events(cid, since_seq=-1)
+    evidence = [e for e in persisted if e.evidence]
+    assert evidence  # at least one evidence event exists
+    # one evidence event per sealed RunEvent, each binding to its sealed source by payload_hash.
+    assert len(evidence) == len(loaded.run_events)
+    for e in evidence:
+        assert e.source_sequence_no is not None
+        sealed_run_event = sealed_by_seq[e.source_sequence_no]
+        assert e.payload_hash == event_payload_hash(sealed_run_event)
+
+
 async def test_start_running_rejected() -> None:
     """A2: start_competition raises competition_already_running when status is RUNNING."""
     from veridex.competition.service import _ALREADY_RUNNING
