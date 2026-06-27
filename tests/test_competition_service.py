@@ -21,7 +21,7 @@ from typing import Any
 import pytest
 
 from tests._arena_fixtures import _beta_agent, _ticks
-from veridex.competition.events import EventType, build_event_log
+from veridex.competition.events import CompetitionEvent, EventType, build_event_log, event_payload_hash
 from veridex.competition.models import (
     AgentEntry,
     CompetitionConfig,
@@ -29,7 +29,15 @@ from veridex.competition.models import (
     CompetitionType,
     ExecutionMode,
 )
-from veridex.competition.service import create_competition, register_agent, start_competition
+from veridex.competition.service import (
+    _PREFIX_MISMATCH,
+    CompetitionConflictError,
+    CompetitionIntegrityError,
+    _assert_prefix_parity,
+    create_competition,
+    register_agent,
+    start_competition,
+)
 from veridex.ingest.marketstate import MarketState
 from veridex.runtime.orchestrator import Agent, deterministic_agent, run_competition
 from veridex.store import InMemoryStore
@@ -252,3 +260,126 @@ async def test_start_missing_marketstates_typing() -> None:
     log = await store.list_competition_events(cid, since_seq=-1)
     assert comp.status == CompetitionStatus.FINALIZED
     assert [e.seq for e in log] == list(range(len(log)))  # 0..end contiguous
+
+
+# ---------------------------------------------------------------------------
+# Part A follow-ups
+# ---------------------------------------------------------------------------
+
+
+async def test_run_id_persisted_in_store_after_start() -> None:
+    """A1: After start_competition, store.get_competition().run_id equals comp.run_id."""
+    store = InMemoryStore()
+    cid = await _seeded_competition(store)
+    comp = await start_competition(store, cid, _ticks(), _agents())
+    assert comp.run_id is not None
+    stored = await store.get_competition(cid)
+    assert stored.run_id == comp.run_id
+
+
+async def test_start_running_rejected() -> None:
+    """A2: start_competition raises competition_already_running when status is RUNNING."""
+    from veridex.competition.service import _ALREADY_RUNNING
+
+    store = InMemoryStore()
+    cid = await _seeded_competition(store)
+    # Simulate an interrupted start: manually advance status to RUNNING.
+    await store.update_competition_status(cid, CompetitionStatus.RUNNING)
+    with pytest.raises(ValueError, match=_ALREADY_RUNNING):
+        await start_competition(store, cid, _ticks(), _agents())
+    # No events should have been created during the rejected call.
+    events_after = await store.list_competition_events(cid, since_seq=-1)
+    assert events_after == []
+
+
+async def test_empty_marketstates_finalizes_cleanly() -> None:
+    """A4: start_competition with marketstates=[] produces seq=0 + derived tail, no evidence."""
+    from veridex.competition.events import EventType
+
+    store = InMemoryStore()
+    cid = await _seeded_competition(store)
+    comp = await start_competition(store, cid, [], _agents())
+    assert comp.status == CompetitionStatus.FINALIZED
+
+    log = await store.list_competition_events(cid, since_seq=-1)
+    # seq=0 is always COMPETITION_STARTED (prefix_end=0 → zero evidence events).
+    assert log[0].seq == 0
+    assert log[0].event_type == EventType.COMPETITION_STARTED
+    # With no marketstates there are no evidence events at all.
+    evidence = [e for e in log if e.evidence]
+    assert evidence == []
+    # The log still ends with the full derived tail.
+    assert log[-1].event_type == EventType.COMPETITION_FINALIZED
+    assert any(e.event_type == EventType.PROOF_ANCHOR for e in log)
+
+
+# ---------------------------------------------------------------------------
+# A3 — _assert_prefix_parity diagnostic (unit-tested directly; only path to
+# exercise the safety check since live≡projection is guaranteed by construction)
+# ---------------------------------------------------------------------------
+
+
+def _make_test_event(seq: int, competition_id: str = "c_test", run_id: str = "run_test") -> CompetitionEvent:
+    """Build a minimal deterministic CompetitionEvent for parity tests."""
+    payload = {"seq": seq, "value": "v"}
+    return CompetitionEvent(
+        competition_id=competition_id,
+        run_id=run_id,
+        seq=seq,
+        event_type=EventType.MARKET_TICK,
+        event_ts=1_000_000 + seq,
+        evidence=False,
+        source_sequence_no=None,
+        derived_from=["test"],
+        payload=payload,
+        payload_hash=event_payload_hash(payload),
+    )
+
+
+def test_assert_prefix_parity_length_mismatch_raises_integrity_error_with_seq() -> None:
+    """A3: length mismatch raises CompetitionIntegrityError with stable prefix + seq= in message."""
+    persisted = [_make_test_event(0), _make_test_event(1)]
+    projection = [_make_test_event(0), _make_test_event(1), _make_test_event(2)]
+    with pytest.raises(CompetitionIntegrityError, match=_PREFIX_MISMATCH) as exc_info:
+        _assert_prefix_parity(persisted, projection)
+    msg = str(exc_info.value)
+    assert "seq=2" in msg  # first missing seq = min(2, 3) = 2
+    assert "length mismatch" in msg
+
+
+def test_assert_prefix_parity_field_mismatch_raises_integrity_error_with_seq() -> None:
+    """A3: field mismatch raises CompetitionIntegrityError with stable prefix + divergent seq= in message."""
+    good = _make_test_event(0)
+    divergent = _make_test_event(1)
+    # Build a projection event at seq=1 with a different payload so canonical_dict differs.
+    bad_payload = {"seq": 1, "value": "TAMPERED"}
+    divergent_projected = CompetitionEvent(
+        competition_id=divergent.competition_id,
+        run_id=divergent.run_id,
+        seq=1,
+        event_type=EventType.MARKET_TICK,
+        event_ts=divergent.event_ts,
+        evidence=False,
+        source_sequence_no=None,
+        derived_from=["test"],
+        payload=bad_payload,
+        payload_hash=event_payload_hash(bad_payload),
+    )
+    with pytest.raises(CompetitionIntegrityError, match=_PREFIX_MISMATCH) as exc_info:
+        _assert_prefix_parity([good, divergent], [good, divergent_projected])
+    msg = str(exc_info.value)
+    assert "seq=1" in msg
+    assert "field mismatch" in msg
+
+
+def test_assert_prefix_parity_identical_lists_passes() -> None:
+    """_assert_prefix_parity does NOT raise when both lists are byte-identical."""
+    events = [_make_test_event(i) for i in range(3)]
+    _assert_prefix_parity(events, events)  # must not raise
+
+
+def test_conflict_gates_raise_competition_conflict_error() -> None:
+    """CompetitionConflictError is a ValueError (existing match tests remain valid)."""
+    err = CompetitionConflictError("competition_already_finalized")
+    assert isinstance(err, ValueError)
+    assert str(err) == "competition_already_finalized"

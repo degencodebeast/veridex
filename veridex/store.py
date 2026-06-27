@@ -120,6 +120,18 @@ class Store(Protocol):
         """
         ...
 
+    async def update_competition_run_id(self, competition_id: str, run_id: str) -> None:
+        """Persist the run_id on a competition (called once, when the run is pre-generated).
+
+        Args:
+            competition_id: The competition to update.
+            run_id: The sealed Phase-1 run identifier to store.
+
+        Raises:
+            KeyError: If no competition with ``competition_id`` exists.
+        """
+        ...
+
     async def append_competition_events(self, competition_id: str, events: list[CompetitionEvent]) -> None:
         """Append competition events to a competition's event log (append-only).
 
@@ -331,6 +343,20 @@ class InMemoryStore:
         if competition_id not in self._competitions:
             raise KeyError(f"no competition with competition_id={competition_id!r}")
         self._competitions[competition_id].status = status
+
+    async def update_competition_run_id(self, competition_id: str, run_id: str) -> None:
+        """Store the run_id on the competition (deep-copy semantics preserved via direct field set).
+
+        Args:
+            competition_id: The competition to update.
+            run_id: The sealed Phase-1 run identifier to store.
+
+        Raises:
+            KeyError: If no competition with ``competition_id`` exists.
+        """
+        if competition_id not in self._competitions:
+            raise KeyError(f"no competition with competition_id={competition_id!r}")
+        self._competitions[competition_id].run_id = run_id
 
     async def append_competition_events(self, competition_id: str, events: list[CompetitionEvent]) -> None:
         """Append deep copies of ``events`` to the competition's event list.
@@ -724,6 +750,28 @@ class PostgresStore:
                 await cur.execute(
                     "UPDATE competitions SET status = %s WHERE competition_id = %s",
                     (status.value, competition_id),
+                )
+                if cur.rowcount == 0:
+                    raise KeyError(f"no competition persisted with competition_id={competition_id!r}")
+        finally:
+            await conn.close()
+
+    async def update_competition_run_id(self, competition_id: str, run_id: str) -> None:
+        """Set the run_id column for a competition.
+
+        Args:
+            competition_id: The competition to update.
+            run_id: The sealed Phase-1 run identifier to store.
+
+        Raises:
+            KeyError: If no competition with ``competition_id`` exists (detected via ``rowcount``).
+        """
+        conn = await self._connect()
+        try:
+            async with conn.transaction(), conn.cursor() as cur:
+                await cur.execute(
+                    "UPDATE competitions SET run_id = %s WHERE competition_id = %s",
+                    (run_id, competition_id),
                 )
                 if cur.rowcount == 0:
                     raise KeyError(f"no competition persisted with competition_id={competition_id!r}")

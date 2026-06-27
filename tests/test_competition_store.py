@@ -234,6 +234,22 @@ async def test_create_duplicate_rejected() -> None:
         await s.create_competition(_make_competition("c1"))
 
 
+async def test_update_competition_run_id_persists_and_is_readable() -> None:
+    """A1: update_competition_run_id persists the run_id; get_competition returns it."""
+    s = InMemoryStore()
+    await s.create_competition(_make_competition("c1"))
+    assert (await s.get_competition("c1")).run_id is None
+    await s.update_competition_run_id("c1", "run_abc123")
+    assert (await s.get_competition("c1")).run_id == "run_abc123"
+
+
+async def test_update_competition_run_id_unknown_raises_key_error() -> None:
+    """A1: update_competition_run_id on an unknown id raises KeyError."""
+    s = InMemoryStore()
+    with pytest.raises(KeyError):
+        await s.update_competition_run_id("missing", "run_xyz")
+
+
 async def test_event_list_seq0_excluded_by_default() -> None:
     """seq=0 is excluded by the default since_seq=0; since_seq=-1 includes it."""
     s = InMemoryStore()

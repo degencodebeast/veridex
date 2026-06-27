@@ -54,8 +54,36 @@ if TYPE_CHECKING:  # the heavy/offline-safe types are only needed for annotation
 
 # Stable reason strings (tests match on these EXACTLY — do not edit casually).
 _ALREADY_FINALIZED = "competition_already_finalized"
+_ALREADY_RUNNING = "competition_already_running"
 _EXECUTION_MODE_UNAVAILABLE = "execution_mode_not_available_in_phase_2a"
 _PREFIX_MISMATCH = "live_evidence_prefix_diverged_from_projection"
+
+
+# ---------------------------------------------------------------------------
+# Typed exception hierarchy (all subclass ValueError so existing match tests pass)
+# ---------------------------------------------------------------------------
+
+
+class CompetitionConflictError(ValueError):
+    """Raised when an operation is rejected due to the competition's current lifecycle state.
+
+    Covers idempotency gates (already finalized / already running).  Maps to HTTP 409.
+    """
+
+
+class CompetitionStateError(ValueError):
+    """Raised when an operation is unavailable in the current Phase (e.g. non-paper modes).
+
+    Maps to HTTP 400 — the request is understood but not executable under Phase-2A rules.
+    """
+
+
+class CompetitionIntegrityError(ValueError):
+    """Raised when the live evidence prefix diverges from the deterministic projection.
+
+    Indicates an internal consistency violation (CON-203 trust invariant breach).
+    Maps to HTTP 500.
+    """
 
 
 async def create_competition(store: Store, config: CompetitionConfig) -> Competition:
@@ -143,20 +171,28 @@ async def start_competition(
         ``run_id`` set).
 
     Raises:
-        ValueError: If the competition is already finalized (``competition_already_finalized``),
-            the execution mode is not paper (``execution_mode_not_available_in_phase_2a``), or
-            the live evidence prefix diverged from the projection
-            (``live_evidence_prefix_diverged_from_projection``).
+        CompetitionConflictError: If the competition is already finalized
+            (``competition_already_finalized``) or already running
+            (``competition_already_running``).
+        CompetitionStateError: If the execution mode is not paper
+            (``execution_mode_not_available_in_phase_2a``).
+        CompetitionIntegrityError: If the live evidence prefix diverged from the projection
+            (``live_evidence_prefix_diverged_from_projection…``).  All three subclass
+            ``ValueError`` so existing ``match`` tests remain valid.
     """
     competition = await store.get_competition(competition_id)
 
     # 1. idempotency gate — refuse to re-run a finalized competition.
     if competition.status == CompetitionStatus.FINALIZED:
-        raise ValueError(_ALREADY_FINALIZED)
+        raise CompetitionConflictError(_ALREADY_FINALIZED)
+
+    # A2. Reject RUNNING before any mutation to prevent seq0 re-append / UNIQUE(seq) collision.
+    if competition.status == CompetitionStatus.RUNNING:
+        raise CompetitionConflictError(_ALREADY_RUNNING)
 
     # 2. REQ-204A — only paper trading is available in Phase 2A; create NO run/events otherwise.
     if competition.config.execution_mode != ExecutionMode.PAPER:
-        raise ValueError(_EXECUTION_MODE_UNAVAILABLE)
+        raise CompetitionStateError(_EXECUTION_MODE_UNAVAILABLE)
 
     source_mode = competition.config.source_mode
     agent_ids = [agent.agent_id for agent in agents]
@@ -166,6 +202,8 @@ async def start_competition(
     # 3. pre-generate the run id (so live events and the projection agree) and go RUNNING.
     run_id = uuid4().hex
     await store.update_competition_status(competition_id, CompetitionStatus.RUNNING)
+    # A1. Persist run_id immediately after RUNNING so store.get_competition().run_id is set.
+    await store.update_competition_run_id(competition_id, run_id)
 
     # 4. persist seq=0 COMPETITION_STARTED BEFORE the run (byte-identical to build_event_log[0]).
     started = build_competition_started_event(
@@ -210,10 +248,9 @@ async def start_competition(
     derived_tail = [event for event in full_log if event.seq > prefix_end]
     await store.append_competition_events(competition_id, derived_tail)
 
-    # 7. finalize the lifecycle; surface run_id on the returned aggregate.
+    # 7. finalize the lifecycle; run_id is already in the store (A1), so a plain load suffices.
     await store.update_competition_status(competition_id, CompetitionStatus.FINALIZED)
-    finalized = await store.get_competition(competition_id)
-    return finalized.model_copy(update={"run_id": run_id})
+    return await store.get_competition(competition_id)
 
 
 def _assert_prefix_parity(persisted: list[CompetitionEvent], projection: list[CompetitionEvent]) -> None:
@@ -222,15 +259,26 @@ def _assert_prefix_parity(persisted: list[CompetitionEvent], projection: list[Co
     Operational timestamps (``persisted_at`` / ``broadcasted_at``) are excluded via
     :meth:`~veridex.competition.events.CompetitionEvent.canonical_dict`.
 
+    The error message embeds the first divergent ``seq`` value (A3 diagnostic) while keeping
+    the stable ``live_evidence_prefix_diverged_from_projection`` prefix so existing ``match``
+    patterns still work.
+
     Args:
         persisted: The live-persisted evidence prefix (seq 0..N), ascending.
         projection: ``build_event_log``'s prefix (seq 0..N), ascending.
 
     Raises:
-        ValueError: If lengths differ or any canonical field diverges.
+        CompetitionIntegrityError: If lengths differ or any canonical field diverges.  The
+            message has the form ``"{_PREFIX_MISMATCH}: seq={s} ({detail})"`` where ``s``
+            is the first divergent sequence number.  Subclasses ``ValueError`` so existing
+            ``pytest.raises(ValueError, match=...)`` assertions remain valid.
     """
     if len(persisted) != len(projection):
-        raise ValueError(_PREFIX_MISMATCH)
+        # The first "missing" seq is whichever side is shorter.
+        s = min(len(persisted), len(projection))
+        raise CompetitionIntegrityError(
+            f"{_PREFIX_MISMATCH}: seq={s} (length mismatch: persisted={len(persisted)} projection={len(projection)})"
+        )
     for live_event, projected_event in zip(persisted, projection, strict=True):
         if live_event.canonical_dict() != projected_event.canonical_dict():
-            raise ValueError(_PREFIX_MISMATCH)
+            raise CompetitionIntegrityError(f"{_PREFIX_MISMATCH}: seq={live_event.seq} (field mismatch)")
