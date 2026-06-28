@@ -8,13 +8,19 @@ Two implementations behind one async :class:`Store` protocol:
     ``psycopg`` is imported LAZILY so ``import veridex.store`` works without it installed.
     Writes are batched via ``executemany`` inside ONE transaction; all SQL is parameterized.
 
-CON-010: this is the async SHELL — the deterministic core never imports it. Schema: five tables
-(``runs``, ``run_events``, ``score_rows``, ``competitions``, ``competition_events``). Each event
-table has an index on its parent-id column and a unique ``(parent_id, seq)`` constraint.
+CON-010: this is the async SHELL — the deterministic core never imports it. Schema: six tables
+(``runs``, ``run_events``, ``score_rows``, ``competitions``, ``competition_events``,
+``execution_records``). Each event table has an index on its parent-id column and a unique
+``(parent_id, seq)`` constraint.
 
 Phase-2A adds seven competition/event methods to the protocol; the CHECK-constraint literal
 tuples (``_COMPETITION_STATUS_VALUES``, ``_EVENT_TYPE_VALUES``) are module-level so drift-guard
 tests can import and compare them against the canonical enums.
+
+Phase-2B Task 5 adds three execution-record methods (``append_execution_record``,
+``get_execution_record``, ``list_executions``) with a matching ``_EXECUTION_STATUS_VALUES``
+literal tuple and ``execution_records`` table. Execution records are NON-SCORING — they never
+touch evidence or score columns; that boundary is enforced by the executor lane (Task 6).
 """
 
 from __future__ import annotations
@@ -26,6 +32,7 @@ from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 from veridex.competition.events import CompetitionEvent
 from veridex.competition.models import AgentEntry, Competition, CompetitionConfig, CompetitionStatus
 from veridex.config import get_settings, require_database_url
+from veridex.execution.models import ExecutionRecord
 from veridex.runtime.evidence import serialize_payload
 
 if TYPE_CHECKING:  # avoid an import cycle (orchestrator type-hints Store)
@@ -51,6 +58,25 @@ _EVENT_TYPE_VALUES: tuple[str, ...] = (
     "proof_anchor",
     "payout_status",
     "competition_finalized",
+)
+
+# CHECK-constraint literal tuple for execution_records.status. Values MUST stay in
+# ExecutionStatus enum-definition order; the drift-guard test asserts exact tuple equality.
+_EXECUTION_STATUS_VALUES: tuple[str, ...] = (
+    "proposed",
+    "law_approved",
+    "awaiting_human",
+    "policy_approved",
+    "submitted",
+    "accepted",
+    "rejected",
+    "filled",
+    "partial",
+    "cancelled",
+    "expired",
+    "settled",
+    "voided",
+    "unresolved",
 )
 
 
@@ -170,6 +196,44 @@ class Store(Protocol):
         """
         ...
 
+    async def append_execution_record(self, record: ExecutionRecord) -> None:
+        """Upsert an execution record (idempotent on ``execution_id``).
+
+        Re-appending the same ``execution_id`` with an updated record (e.g. as the status
+        advances ``proposed → … → filled``) overwrites the stored entry. Execution records
+        are NON-SCORING — this method never touches evidence or score columns.
+
+        Args:
+            record: The :class:`~veridex.execution.models.ExecutionRecord` to persist or update.
+        """
+        ...
+
+    async def get_execution_record(self, execution_id: str) -> ExecutionRecord:
+        """Load an execution record by id.
+
+        Args:
+            execution_id: The id used at :meth:`append_execution_record`.
+
+        Returns:
+            The stored :class:`~veridex.execution.models.ExecutionRecord`.
+
+        Raises:
+            KeyError: If no record with ``execution_id`` exists.
+        """
+        ...
+
+    async def list_executions(self, competition_id: str) -> list[ExecutionRecord]:
+        """Return all execution records for a competition in deterministic order.
+
+        Args:
+            competition_id: The owning competition.
+
+        Returns:
+            :class:`~veridex.execution.models.ExecutionRecord` objects sorted by
+            ``execution_id`` ascending.
+        """
+        ...
+
 
 # ---------------------------------------------------------------------------
 # Private reconstruction helpers
@@ -237,10 +301,11 @@ class InMemoryStore:
     """Dict-backed async store for the offline suite. Deep-copies on write and read."""
 
     def __init__(self) -> None:
-        """Initialise an empty, in-process registry for runs and competitions."""
+        """Initialise an empty, in-process registry for runs, competitions, and executions."""
         self._runs: dict[str, dict[str, Any]] = {}
         self._competitions: dict[str, Competition] = {}
         self._competition_events: dict[str, list[CompetitionEvent]] = {}
+        self._execution_records: dict[str, ExecutionRecord] = {}
 
     # --- run methods (Phase-1, unchanged) ---
 
@@ -361,13 +426,28 @@ class InMemoryStore:
     async def append_competition_events(self, competition_id: str, events: list[CompetitionEvent]) -> None:
         """Append deep copies of ``events`` to the competition's event list.
 
+        Mirrors the Postgres ``UNIQUE (competition_id, seq)`` constraint: raises
+        :class:`ValueError` if any incoming event has a ``seq`` already present for
+        this ``competition_id``, or if the batch itself contains a duplicate ``seq``.
+
         Args:
             competition_id: The owning competition.
-            events: Events to append.
+            events: Events to append; each ``seq`` must be unique within the competition.
+
+        Raises:
+            ValueError: If any event's ``seq`` collides with an already-stored seq or with
+                another event in the same batch (REQ-2B-31).
         """
         bucket = self._competition_events.setdefault(competition_id, [])
+        existing_seqs: set[int] = {e.seq for e in bucket}
+        # Pre-validate the entire batch before mutating (mirrors Postgres transaction atomicity).
+        seen: set[int] = set()
         for event in events:
-            bucket.append(event.model_copy(deep=True))
+            if event.seq in existing_seqs or event.seq in seen:
+                raise ValueError(f"duplicate (competition_id, seq): ({competition_id!r}, {event.seq!r})")
+            seen.add(event.seq)
+        # All seqs are unique — safe to extend atomically.
+        bucket.extend(event.model_copy(deep=True) for event in events)
 
     async def list_competition_events(self, competition_id: str, since_seq: int = 0) -> list[CompetitionEvent]:
         """Return deep copies of events with ``seq > since_seq``, sorted by ``seq``.
@@ -398,6 +478,53 @@ class InMemoryStore:
         if status is not None:
             return [c.model_copy(deep=True) for c in comps if c.status is status]
         return [c.model_copy(deep=True) for c in comps]
+
+    # --- execution-record methods (Phase-2B Task 5) ---
+
+    async def append_execution_record(self, record: ExecutionRecord) -> None:
+        """Upsert a deep copy of ``record`` keyed by ``execution_id`` (idempotent).
+
+        Re-appending the same ``execution_id`` overwrites the stored entry so callers
+        can advance the status (``proposed → … → filled``) without inserting duplicates.
+
+        Args:
+            record: The execution record to persist or update.
+        """
+        self._execution_records[record.execution_id] = record.model_copy(deep=True)
+
+    async def get_execution_record(self, execution_id: str) -> ExecutionRecord:
+        """Return a deep copy of the stored execution record.
+
+        Args:
+            execution_id: The id used at :meth:`append_execution_record`.
+
+        Returns:
+            A fresh deep copy of the stored :class:`~veridex.execution.models.ExecutionRecord`.
+
+        Raises:
+            KeyError: If no record with ``execution_id`` exists.
+        """
+        if execution_id not in self._execution_records:
+            raise KeyError(f"no execution record with execution_id={execution_id!r}")
+        return self._execution_records[execution_id].model_copy(deep=True)
+
+    async def list_executions(self, competition_id: str) -> list[ExecutionRecord]:
+        """Return deep copies of all execution records for a competition, sorted by ``execution_id``.
+
+        Args:
+            competition_id: The owning competition.
+
+        Returns:
+            Deep copies of matching :class:`~veridex.execution.models.ExecutionRecord` objects,
+            sorted ascending by ``execution_id``.
+        """
+        return [
+            rec.model_copy(deep=True)
+            for rec in sorted(
+                (r for r in self._execution_records.values() if r.competition_id == competition_id),
+                key=lambda r: r.execution_id,
+            )
+        ]
 
 
 # ---------------------------------------------------------------------------
@@ -542,6 +669,24 @@ class PostgresStore:
             )
             await cur.execute(
                 "CREATE INDEX IF NOT EXISTS idx_competition_events_comp_id ON competition_events(competition_id)"
+            )
+
+            # --- Phase-2B Task 5 table ---
+            exec_status_in = ", ".join(f"'{v}'" for v in _EXECUTION_STATUS_VALUES)
+            await cur.execute(
+                f"""
+                CREATE TABLE IF NOT EXISTS execution_records (
+                    execution_id TEXT PRIMARY KEY,
+                    competition_id TEXT NOT NULL REFERENCES competitions(competition_id),
+                    run_id TEXT,
+                    agent_id TEXT,
+                    status TEXT NOT NULL CHECK (status IN ({exec_status_in})),
+                    record_json TEXT NOT NULL
+                )
+                """
+            )
+            await cur.execute(
+                "CREATE INDEX IF NOT EXISTS idx_execution_records_comp_id ON execution_records(competition_id)"
             )
         await conn.commit()
 
@@ -858,3 +1003,92 @@ class PostgresStore:
             await conn.close()
 
         return [_build_competition(*row) for row in rows]
+
+    # --- execution-record methods (Phase-2B Task 5) ---
+
+    async def append_execution_record(self, record: ExecutionRecord) -> None:
+        """Upsert an execution record in ``execution_records`` (idempotent on ``execution_id``).
+
+        Uses ``INSERT … ON CONFLICT (execution_id) DO UPDATE`` so re-appending an already-stored
+        execution_id overwrites all mutable columns (status, record_json, etc.) without error.
+        All SQL is parameterized; psycopg stays lazy.
+
+        Args:
+            record: The execution record to persist or update.
+        """
+        conn = await self._connect()
+        try:
+            async with conn.transaction(), conn.cursor() as cur:
+                await cur.execute(
+                    """
+                    INSERT INTO execution_records
+                        (execution_id, competition_id, run_id, agent_id, status, record_json)
+                    VALUES (%s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (execution_id) DO UPDATE SET
+                        competition_id = EXCLUDED.competition_id,
+                        run_id         = EXCLUDED.run_id,
+                        agent_id       = EXCLUDED.agent_id,
+                        status         = EXCLUDED.status,
+                        record_json    = EXCLUDED.record_json
+                    """,
+                    (
+                        record.execution_id,
+                        record.competition_id,
+                        record.run_id,
+                        record.agent_id,
+                        record.status.value,
+                        serialize_payload(record.model_dump(mode="json")),
+                    ),
+                )
+        finally:
+            await conn.close()
+
+    async def get_execution_record(self, execution_id: str) -> ExecutionRecord:
+        """Fetch and reconstruct an execution record by id.
+
+        Args:
+            execution_id: The id used at :meth:`append_execution_record`.
+
+        Returns:
+            The reconstructed :class:`~veridex.execution.models.ExecutionRecord`.
+
+        Raises:
+            KeyError: If no record with ``execution_id`` exists.
+        """
+        conn = await self._connect()
+        try:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "SELECT record_json FROM execution_records WHERE execution_id = %s",
+                    (execution_id,),
+                )
+                row = await cur.fetchone()
+        finally:
+            await conn.close()
+
+        if row is None:
+            raise KeyError(f"no execution record with execution_id={execution_id!r}")
+        return ExecutionRecord.model_validate(json.loads(row[0]))
+
+    async def list_executions(self, competition_id: str) -> list[ExecutionRecord]:
+        """Return all execution records for a competition, ordered by ``execution_id``.
+
+        Args:
+            competition_id: The owning competition.
+
+        Returns:
+            Reconstructed :class:`~veridex.execution.models.ExecutionRecord` objects,
+            sorted ascending by ``execution_id``.
+        """
+        conn = await self._connect()
+        try:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "SELECT record_json FROM execution_records WHERE competition_id = %s ORDER BY execution_id",
+                    (competition_id,),
+                )
+                rows = await cur.fetchall()
+        finally:
+            await conn.close()
+
+        return [ExecutionRecord.model_validate(json.loads(row[0])) for row in rows]
