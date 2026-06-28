@@ -1,8 +1,14 @@
-"""Phase-2A Task 4 — Store competition/event methods (TDD).
+"""Phase-2A Task 4 + Phase-2B Task 5 — Store competition/event + execution-record methods (TDD).
 
-Tests for the 7 new competition/event persistence methods added to the Store protocol,
-InMemoryStore, and PostgresStore. The InMemory path is always run; the Postgres path is
-gated on DATABASE_URL + psycopg being present.
+Tests for the 7 competition/event persistence methods (Phase-2A) and the 3 execution-record
+persistence methods (Phase-2B Task 5) added to the Store protocol, InMemoryStore, and
+PostgresStore. The InMemory path is always run; the Postgres path is gated on DATABASE_URL +
+psycopg being present.
+
+Phase-2B Task 5 also covers:
+  - REQ-2B-31: InMemoryStore.append_competition_events raises ValueError on duplicate seq.
+  - operator_id on CompetitionConfig (default None).
+  - _EXECUTION_STATUS_VALUES drift-guard.
 """
 
 from __future__ import annotations
@@ -19,9 +25,11 @@ from veridex.competition.models import (
     CompetitionStatus,
     CompetitionType,
 )
+from veridex.execution.models import ExecutionRecord, ExecutionStatus
 from veridex.store import (
     _COMPETITION_STATUS_VALUES,
     _EVENT_TYPE_VALUES,
+    _EXECUTION_STATUS_VALUES,
     InMemoryStore,
 )
 
@@ -330,3 +338,233 @@ async def test_postgres_competition_store_round_trip() -> None:
     assert any(c.competition_id == "pg_c1_task4" for c in comps)
     draft_comps = await store.list_competitions(status=CompetitionStatus.DRAFT)
     assert not any(c.competition_id == "pg_c1_task4" for c in draft_comps)
+
+
+# ---------------------------------------------------------------------------
+# Phase-2B Task 5 helpers
+# ---------------------------------------------------------------------------
+
+
+def _make_execution_record(
+    execution_id: str = "exec_1",
+    competition_id: str = "c1",
+    status: ExecutionStatus = ExecutionStatus.PROPOSED,
+) -> ExecutionRecord:
+    """Return a minimal valid ExecutionRecord for testing."""
+    return ExecutionRecord(
+        execution_id=execution_id,
+        competition_id=competition_id,
+        run_id="run_test",
+        agent_id="agent_1",
+        source_sequence_no=1,
+        status=status,
+        policy_hash="hash_abc",
+    )
+
+
+# ---------------------------------------------------------------------------
+# Drift-guard — _EXECUTION_STATUS_VALUES must stay in sync with ExecutionStatus
+# ---------------------------------------------------------------------------
+
+
+def test_execution_status_values_drift_guard() -> None:
+    assert tuple(s.value for s in ExecutionStatus) == _EXECUTION_STATUS_VALUES
+
+
+# ---------------------------------------------------------------------------
+# operator_id on CompetitionConfig (REQ-2B-32)
+# ---------------------------------------------------------------------------
+
+
+def test_operator_id_defaults_to_none() -> None:
+    """operator_id must default to None when omitted."""
+    config = CompetitionConfig(
+        competition_type=CompetitionType.REPLAY_ARENA,
+        source_mode="replay",
+        market_scope="WC:FRA-BRA",
+        roster_size=2,
+    )
+    assert config.operator_id is None
+
+
+def test_operator_id_can_be_set() -> None:
+    """operator_id must be accepted when provided."""
+    config = CompetitionConfig(
+        competition_type=CompetitionType.REPLAY_ARENA,
+        source_mode="replay",
+        market_scope="WC:FRA-BRA",
+        roster_size=2,
+        operator_id="op_abc",
+    )
+    assert config.operator_id == "op_abc"
+
+
+# ---------------------------------------------------------------------------
+# REQ-2B-31: InMemoryStore.append_competition_events raises on duplicate seq
+# ---------------------------------------------------------------------------
+
+
+async def test_append_competition_events_duplicate_seq_raises_value_error() -> None:
+    """REQ-2B-31: duplicate (competition_id, seq) in InMemoryStore raises ValueError."""
+    s = InMemoryStore()
+    await s.create_competition(_make_competition("c1"))
+    events = _make_events(3)  # seqs 1, 2, 3
+    await s.append_competition_events("c1", events)
+    # Re-append events with overlapping seq values
+    duplicate_events = _make_events(2)  # seqs 1, 2 — already present
+    with pytest.raises(ValueError, match="seq"):
+        await s.append_competition_events("c1", duplicate_events)
+
+
+async def test_append_competition_events_same_seq_within_batch_raises() -> None:
+    """REQ-2B-31: duplicate seq within a single batch raises ValueError atomically.
+
+    The store must reject the ENTIRE batch — no partial append — mirroring Postgres
+    transactional all-or-nothing semantics: [seq=1, seq=2, seq=1] must leave the
+    bucket completely unchanged even though seq=1 and seq=2 are individually new.
+    """
+    s = InMemoryStore()
+    cid = "c1"
+    await s.create_competition(_make_competition(cid))
+    events = _make_events(2)  # seqs 1, 2
+    # Batch: [seq=1, seq=2, seq=1] — first two are new; third repeats seq=1.
+    dup_batch = [events[0], events[1], events[0]]
+    with pytest.raises(ValueError, match="seq"):
+        await s.append_competition_events(cid, dup_batch)
+    # Atomicity: bucket must be entirely unchanged — no partial write.
+    assert await s.list_competition_events(cid, since_seq=-1) == []
+
+
+# ---------------------------------------------------------------------------
+# InMemoryStore — execution record round-trip
+# ---------------------------------------------------------------------------
+
+
+async def test_execution_record_round_trip_inmemory() -> None:
+    """append_execution_record → get_execution_record returns equal record; list_executions returns it."""
+    s = InMemoryStore()
+    await s.create_competition(_make_competition("c1"))
+    rec = _make_execution_record("exec_1", "c1")
+    await s.append_execution_record(rec)
+    got = await s.get_execution_record("exec_1")
+    assert got == rec
+    listed = await s.list_executions("c1")
+    assert len(listed) == 1
+    assert listed[0].execution_id == "exec_1"
+
+
+async def test_get_unknown_execution_raises_key_error() -> None:
+    """get_execution_record on an unknown id raises KeyError."""
+    s = InMemoryStore()
+    with pytest.raises(KeyError):
+        await s.get_execution_record("missing")
+
+
+async def test_execution_record_idempotent_upsert() -> None:
+    """Upserting the same execution_id with an advanced status → latest stored; no duplication."""
+    s = InMemoryStore()
+    await s.create_competition(_make_competition("c1"))
+    rec1 = _make_execution_record("exec_1", "c1", ExecutionStatus.PROPOSED)
+    await s.append_execution_record(rec1)
+    rec2 = _make_execution_record("exec_1", "c1", ExecutionStatus.LAW_APPROVED)
+    await s.append_execution_record(rec2)
+    got = await s.get_execution_record("exec_1")
+    assert got.status is ExecutionStatus.LAW_APPROVED
+    listed = await s.list_executions("c1")
+    assert len(listed) == 1  # no duplication
+
+
+async def test_execution_record_deep_copy_isolation() -> None:
+    """Mutating a returned ExecutionRecord must not corrupt the stored state."""
+    s = InMemoryStore()
+    await s.create_competition(_make_competition("c1"))
+    rec = _make_execution_record("exec_1", "c1", ExecutionStatus.PROPOSED)
+    await s.append_execution_record(rec)
+    got = await s.get_execution_record("exec_1")
+    # Mutate the returned copy
+    got.status = ExecutionStatus.LAW_APPROVED
+    # Stored state must remain PROPOSED
+    stored = await s.get_execution_record("exec_1")
+    assert stored.status is ExecutionStatus.PROPOSED
+
+
+async def test_list_executions_deterministic_order() -> None:
+    """list_executions returns records sorted by execution_id."""
+    s = InMemoryStore()
+    await s.create_competition(_make_competition("c1"))
+    await s.append_execution_record(_make_execution_record("exec_z", "c1"))
+    await s.append_execution_record(_make_execution_record("exec_a", "c1"))
+    await s.append_execution_record(_make_execution_record("exec_m", "c1"))
+    listed = await s.list_executions("c1")
+    ids = [r.execution_id for r in listed]
+    assert ids == sorted(ids)
+
+
+async def test_list_executions_filters_by_competition_id() -> None:
+    """list_executions only returns records for the requested competition."""
+    s = InMemoryStore()
+    await s.create_competition(_make_competition("c1"))
+    await s.create_competition(_make_competition("c2"))
+    await s.append_execution_record(_make_execution_record("exec_c1", "c1"))
+    await s.append_execution_record(_make_execution_record("exec_c2", "c2"))
+    listed_c1 = await s.list_executions("c1")
+    assert all(r.competition_id == "c1" for r in listed_c1)
+    assert len(listed_c1) == 1
+    listed_c2 = await s.list_executions("c2")
+    assert all(r.competition_id == "c2" for r in listed_c2)
+    assert len(listed_c2) == 1
+
+
+async def test_write_original_not_aliased_in_execution_record() -> None:
+    """Mutating the original ExecutionRecord after append must not corrupt stored state."""
+    s = InMemoryStore()
+    await s.create_competition(_make_competition("c1"))
+    rec = _make_execution_record("exec_1", "c1", ExecutionStatus.PROPOSED)
+    await s.append_execution_record(rec)
+    # Mutate the original after persisting
+    rec.status = ExecutionStatus.LAW_APPROVED
+    stored = await s.get_execution_record("exec_1")
+    assert stored.status is ExecutionStatus.PROPOSED
+
+
+# ---------------------------------------------------------------------------
+# Postgres gated — execution record round-trip
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.skipif(
+    not (os.getenv("DATABASE_URL") and _psycopg_available()),
+    reason="Postgres round-trip: set DATABASE_URL and install psycopg",
+)
+async def test_postgres_execution_store_round_trip() -> None:
+    import psycopg
+
+    from veridex.store import PostgresStore
+
+    dsn = os.environ["DATABASE_URL"]
+    store = PostgresStore(dsn=dsn)
+
+    async with await psycopg.AsyncConnection.connect(dsn) as conn:
+        await store.init_db(conn)
+
+    comp = _make_competition("pg_c1_task5")
+    await store.create_competition(comp)
+
+    # Basic round-trip
+    rec = _make_execution_record("pg_exec_1", "pg_c1_task5", ExecutionStatus.PROPOSED)
+    await store.append_execution_record(rec)
+    got = await store.get_execution_record("pg_exec_1")
+    assert got == rec
+
+    # Idempotent upsert — advanced status stored; list has ONE entry
+    rec2 = _make_execution_record("pg_exec_1", "pg_c1_task5", ExecutionStatus.LAW_APPROVED)
+    await store.append_execution_record(rec2)
+    got2 = await store.get_execution_record("pg_exec_1")
+    assert got2.status is ExecutionStatus.LAW_APPROVED
+    listed = await store.list_executions("pg_c1_task5")
+    assert len(listed) == 1
+    assert listed[0].execution_id == "pg_exec_1"
+
+    # Unknown id raises KeyError
+    with pytest.raises(KeyError):
+        await store.get_execution_record("pg_exec_missing")

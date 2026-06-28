@@ -174,6 +174,36 @@ class CompetitionStateResponse(BaseModel):
     latest_seq: int
     anchor_status: str
     run_id: str | None
+    proof_card: dict[str, Any] | None = None
+    execution: dict[str, Any] | None = None
+
+
+class KillSwitchResponse(BaseModel):
+    """Response envelope for ``POST /competitions/{id}/kill-switch``.
+
+    Attributes:
+        competition_id: The competition whose envelope was toggled.
+        kill_switch: The new (post-flip) kill-switch state.
+        status: Human-readable status (``"kill_switch_on"`` / ``"kill_switch_off"``).
+    """
+
+    competition_id: str
+    kill_switch: bool
+    status: str
+
+
+class ApprovalResponse(BaseModel):
+    """Response envelope for ``POST /executions/{id}/approve``.
+
+    Attributes:
+        execution_id: The resolved execution record.
+        decision: ``"approved"`` (re-check clean → submitted) or ``"rejected"`` (fail-closed).
+        status: The execution record's lifecycle status after resolution.
+    """
+
+    execution_id: str
+    decision: str
+    status: str
 
 
 class CompetitionSummaryResponse(BaseModel):

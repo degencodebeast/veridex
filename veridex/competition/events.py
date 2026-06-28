@@ -42,22 +42,28 @@ from veridex.runtime.orchestrator import (
 class EventType(str, Enum):
     """Closed set of competition event types.
 
-    The four reserved types (``POLICY_RESULT``, ``EXECUTION_SUBMITTED``,
-    ``EXECUTION_RECEIPT``, ``PAYOUT_STATUS``) belong to Phase 2B/2D — they are DEFINED here
-    for forward wire-compatibility but MUST NEVER be emitted by :func:`build_event_log` in
-    Phase 2A.
+    Phase 2A emits: ``COMPETITION_STARTED``, ``MARKET_TICK``, ``AGENT_ACTION``,
+    ``LAW_RESULT``, ``SCORE_UPDATE``, ``PROOF_ANCHOR``, ``COMPETITION_FINALIZED``.
+
+    Phase 2B (executor lane) emits: ``POLICY_RESULT``, ``EXECUTION_SUBMITTED``,
+    ``EXECUTION_RECEIPT`` — these are DEFINED here for forward wire-compatibility but MUST
+    NEVER be emitted by :func:`build_event_log`.
+
+    Phase 2D (reserved): ``PAYOUT_STATUS`` — defined here for wire-compatibility only; not
+    emitted by any current lane.
     """
 
     COMPETITION_STARTED = "competition_started"
     MARKET_TICK = "market_tick"
     AGENT_ACTION = "agent_action"
     LAW_RESULT = "law_result"
-    POLICY_RESULT = "policy_result"  # reserved (Phase 2B) — never emitted in 2A
-    EXECUTION_SUBMITTED = "execution_submitted"  # reserved (Phase 2D) — never emitted in 2A
-    EXECUTION_RECEIPT = "execution_receipt"  # reserved (Phase 2D) — never emitted in 2A
+    POLICY_RESULT = "policy_result"  # Phase 2B (executor lane) — never emitted by build_event_log
+    EXECUTION_SUBMITTED = "execution_submitted"  # Phase 2B (executor lane) — never emitted by build_event_log
+    EXECUTION_RECEIPT = "execution_receipt"  # Phase 2B (executor lane) — never emitted by build_event_log
+    APPROVAL_AUDIT = "approval_audit"  # Phase 2B (human-approval resolution) — never emitted by build_event_log
     SCORE_UPDATE = "score_update"
     PROOF_ANCHOR = "proof_anchor"
-    PAYOUT_STATUS = "payout_status"  # reserved (Phase 2D) — never emitted in 2A
+    PAYOUT_STATUS = "payout_status"  # reserved (Phase 2D) — not emitted by any current lane
     COMPETITION_FINALIZED = "competition_finalized"
 
 
@@ -262,6 +268,176 @@ def build_competition_started_event(
         derived_from=["competition_meta"],
         payload=started_payload,
         payload_hash=event_payload_hash(started_payload),
+    )
+
+
+def build_policy_result_event(
+    *,
+    competition_id: str,
+    run_id: str,
+    seq: int,
+    event_ts: int,
+    agent_id: str,
+    source_sequence_no_ref: int,
+    policy_result_payload: dict[str, Any],
+) -> CompetitionEvent:
+    """Build a Phase-2B ``POLICY_RESULT`` derived event (executor lane only).
+
+    Called exclusively by the Phase-2B executor lane (Task 6). MUST NOT be called by
+    :func:`build_event_log` — the 2A canonical log MUST stay byte-identical to Phase 2A.
+
+    Args:
+        competition_id: Owning competition identifier.
+        run_id: Sealed Phase-1 run identifier.
+        seq: Monotonic competition sequence number for this event.
+        event_ts: Deterministic event timestamp.
+        agent_id: The agent whose score row triggered this policy check.
+        source_sequence_no_ref: The sealed ``RunEvent.sequence_no`` that the score row
+            references (used to build the ``derived_from`` reference, NOT stored as
+            ``source_sequence_no``).
+        policy_result_payload: The :class:`~veridex.competition.policy.PolicyResult` as a
+            plain dict (``decision``, ``reason_codes``, ``policy_hash``). Must be
+            secret-free.
+
+    Returns:
+        A :class:`CompetitionEvent` with ``evidence=False``, ``source_sequence_no=None``,
+        and ``derived_from=["score_row:{agent_id}:seq-{source_sequence_no_ref}"]``.
+    """
+    return CompetitionEvent(
+        competition_id=competition_id,
+        run_id=run_id,
+        seq=seq,
+        event_type=EventType.POLICY_RESULT,
+        event_ts=event_ts,
+        evidence=False,
+        source_sequence_no=None,
+        derived_from=[f"score_row:{agent_id}:seq-{source_sequence_no_ref}"],
+        payload=policy_result_payload,
+        payload_hash=event_payload_hash(policy_result_payload),
+    )
+
+
+def build_execution_submitted_event(
+    *,
+    competition_id: str,
+    run_id: str,
+    seq: int,
+    event_ts: int,
+    execution_id: str,
+    payload: dict[str, Any],
+) -> CompetitionEvent:
+    """Build a Phase-2B ``EXECUTION_SUBMITTED`` derived event (executor lane only).
+
+    Called exclusively by the Phase-2B executor lane (Task 6). MUST NOT be called by
+    :func:`build_event_log` — the 2A canonical log MUST stay byte-identical to Phase 2A.
+
+    Args:
+        competition_id: Owning competition identifier.
+        run_id: Sealed Phase-1 run identifier.
+        seq: Monotonic competition sequence number for this event.
+        event_ts: Deterministic event timestamp.
+        execution_id: Unique execution record identifier.
+        payload: The secret-free submission payload (``venue``, ``market_ref``, ``side``,
+            ``size``, etc.).
+
+    Returns:
+        A :class:`CompetitionEvent` with ``evidence=False``, ``source_sequence_no=None``,
+        and ``derived_from=["execution_record:{execution_id}"]``.
+    """
+    return CompetitionEvent(
+        competition_id=competition_id,
+        run_id=run_id,
+        seq=seq,
+        event_type=EventType.EXECUTION_SUBMITTED,
+        event_ts=event_ts,
+        evidence=False,
+        source_sequence_no=None,
+        derived_from=[f"execution_record:{execution_id}"],
+        payload=payload,
+        payload_hash=event_payload_hash(payload),
+    )
+
+
+def build_execution_receipt_event(
+    *,
+    competition_id: str,
+    run_id: str,
+    seq: int,
+    event_ts: int,
+    execution_id: str,
+    receipt_payload: dict[str, Any],
+) -> CompetitionEvent:
+    """Build a Phase-2B ``EXECUTION_RECEIPT`` derived event (executor lane only).
+
+    Called exclusively by the Phase-2B executor lane (Task 6). MUST NOT be called by
+    :func:`build_event_log` — the 2A canonical log MUST stay byte-identical to Phase 2A.
+
+    Args:
+        competition_id: Owning competition identifier.
+        run_id: Sealed Phase-1 run identifier.
+        seq: Monotonic competition sequence number for this event.
+        event_ts: Deterministic event timestamp.
+        execution_id: Unique execution record identifier (must match the submitted record).
+        receipt_payload: The normalized, secret-free receipt dict (``execution_id``,
+            ``venue``, ``status``, ``filled_size``, ``mode``, etc.).
+
+    Returns:
+        A :class:`CompetitionEvent` with ``evidence=False``, ``source_sequence_no=None``,
+        and ``derived_from=["execution_record:{execution_id}"]``.
+    """
+    return CompetitionEvent(
+        competition_id=competition_id,
+        run_id=run_id,
+        seq=seq,
+        event_type=EventType.EXECUTION_RECEIPT,
+        event_ts=event_ts,
+        evidence=False,
+        source_sequence_no=None,
+        derived_from=[f"execution_record:{execution_id}"],
+        payload=receipt_payload,
+        payload_hash=event_payload_hash(receipt_payload),
+    )
+
+
+def build_approval_audit_event(
+    *,
+    competition_id: str,
+    run_id: str,
+    seq: int,
+    event_ts: int,
+    execution_id: str,
+    audit_payload: dict[str, Any],
+) -> CompetitionEvent:
+    """Build a Phase-2B ``APPROVAL_AUDIT`` derived event (human-approval resolution only).
+
+    Emitted by the Task-7 control-plane approve endpoint to record an operator's NON-SCORING
+    decision on an ``awaiting_human`` execution. MUST NOT be called by :func:`build_event_log` —
+    the 2A canonical log stays byte-identical to Phase 2A.
+
+    Args:
+        competition_id: Owning competition identifier.
+        run_id: Sealed Phase-1 run identifier.
+        seq: Monotonic competition sequence number for this event.
+        event_ts: Deterministic event timestamp.
+        execution_id: The execution record this decision resolves.
+        audit_payload: Secret-free audit dict (``approver_id``, ``execution_id``, ``policy_hash``,
+            ``decision``, ``note``, ``ts``).
+
+    Returns:
+        A :class:`CompetitionEvent` with ``evidence=False``, ``source_sequence_no=None``, and
+        ``derived_from=["execution_record:{execution_id}"]``.
+    """
+    return CompetitionEvent(
+        competition_id=competition_id,
+        run_id=run_id,
+        seq=seq,
+        event_type=EventType.APPROVAL_AUDIT,
+        event_ts=event_ts,
+        evidence=False,
+        source_sequence_no=None,
+        derived_from=[f"execution_record:{execution_id}"],
+        payload=audit_payload,
+        payload_hash=event_payload_hash(audit_payload),
     )
 
 

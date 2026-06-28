@@ -8,10 +8,14 @@ strict **projection** and is **read-only**:
   truth, mutates state, or creates proof evidence (CON-203 / REQ-213).
 * Inbound client frames are consumed purely to observe the disconnect; they are never acted on.
 
-Decoupled fanout (REQ-214):
+Decoupled fanout (REQ-214 / REQ-2B-30):
     Each connection owns a **bounded** :class:`asyncio.Queue`. :meth:`ArenaConnectionManager.broadcast`
-    enqueues with non-blocking ``put_nowait``; a slow/full client has its event dropped
-    (backpressure) and is NEVER allowed to ``await`` and stall the producer or other clients.
+    enqueues with non-blocking ``put_nowait`` and is NEVER allowed to ``await`` and stall the
+    producer or other clients. A slow client whose bounded queue is FULL is **disconnected**
+    (dropped from the registry) rather than silently skipping one event — a silent skip would
+    leave a hidden mid-stream sequence gap, whereas dropping the client ends its live stream so the
+    gap is observable and it must reconnect. A client that raises on enqueue is likewise dropped
+    (error isolation), so a dead client can never abort the run loop or skip persistence.
 
 Single-instance scope:
     This is the **in-memory, single-process** broadcaster for Phase 2A — NO Redis, NO sticky
@@ -118,11 +122,19 @@ class ArenaConnectionManager:
     async def broadcast(self, competition_id: str, event: CompetitionEvent) -> None:
         """Fan ``event`` out to every registered client queue without blocking.
 
-        Uses non-blocking ``put_nowait`` per client. If a client's bounded queue is full
-        (:class:`asyncio.QueueFull`) the event is DROPPED for that slow client only — we never
-        ``await`` a full queue, so the producer and every healthy peer are unaffected (REQ-214
-        backpressure). ``async`` is part of the contract so a future live producer can ``await``
-        the broadcast uniformly.
+        Uses non-blocking ``put_nowait`` per client. Two failure modes are handled so neither the
+        run loop nor any healthy peer is ever affected (REQ-2B-30, persist-before-broadcast):
+
+        * **Full queue** (:class:`asyncio.QueueFull`): the slow client is DISCONNECTED (dropped
+          from the registry) rather than silently skipping the event. Silently dropping a single
+          event would leave a hidden mid-stream gap (the client keeps receiving later seqs and
+          never knows it missed one); dropping the whole client instead ends its live stream, so
+          the gap is observable and it must reconnect (replaying from ``since_seq``).
+        * **Any other error** (e.g. a dead/raising client): swallowed per-client and that client
+          is dropped — a raising broadcast NEVER aborts the run loop or skips persistence.
+
+        ``async`` is part of the contract so the live producer can ``await`` the broadcast
+        uniformly.
 
         Args:
             competition_id: The competition whose spectators should receive ``event``.
@@ -133,8 +145,11 @@ class ArenaConnectionManager:
             try:
                 queue.put_nowait(event)
             except asyncio.QueueFull:
-                # Backpressure: drop this event for the slow client; do not block others.
-                continue
+                # Slow client: disconnect (gap-signal) instead of a silent single-event drop.
+                self.disconnect(competition_id, queue)
+            except Exception:
+                # Error isolation: a raising client must not abort the run/persistence — drop it.
+                self.disconnect(competition_id, queue)
 
 
 async def _forward_live(

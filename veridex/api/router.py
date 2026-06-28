@@ -36,31 +36,47 @@ from __future__ import annotations
 
 from typing import Any
 
-from fastapi import Depends, FastAPI, HTTPException, Query
+from fastapi import Depends, FastAPI, Header, HTTPException, Query
 
+from veridex.api.demo_fixtures import (
+    build_agents_from_roster,
+    build_demo_ticks,
+    contrarian_agent,
+)
 from veridex.api.schemas import (
     AgentRegisterResponse,
+    ApprovalResponse,
     CompetitionCreateResponse,
     CompetitionLeaderboardRow,
     CompetitionStartResponse,
     CompetitionStateResponse,
     CompetitionSummaryResponse,
     DemoRunResponse,
+    KillSwitchResponse,
     LeaderboardResponse,
     LeaderboardRow,
 )
 from veridex.api.ws import ArenaConnectionManager, register_arena_routes
 from veridex.competition.events import CompetitionEvent, EventType
-from veridex.competition.models import AgentEntry, CompetitionConfig, CompetitionStatus
+from veridex.competition.models import (
+    AgentEntry,
+    Competition,
+    CompetitionConfig,
+    CompetitionStatus,
+    ExecutionMode,
+)
 from veridex.competition.service import (
     CompetitionConflictError,
     CompetitionIntegrityError,
     CompetitionStateError,
+    _default_policy_envelope,
     create_competition,
     register_agent,
     start_competition,
 )
-from veridex.ingest.marketstate import MarketState
+from veridex.config import Settings, get_settings
+from veridex.execution.models import ExecutionRecord, ExecutionStatus
+from veridex.execution.runner import resolve_approval
 from veridex.leaderboard import leaderboard as _build_leaderboard
 from veridex.runtime.competition import (
     DEFAULT_CLUSTER,
@@ -68,110 +84,15 @@ from veridex.runtime.competition import (
     _default_checks,
     run_demo_competition,
 )
-from veridex.runtime.orchestrator import (
-    PROOF_MODE_REPRODUCIBLE,
-    Agent,
-    deterministic_agent,
-)
-from veridex.runtime.schemas import AgentAction, SportsActionType
+from veridex.runtime.orchestrator import deterministic_agent
 from veridex.scoring import score_run
 from veridex.store import InMemoryStore, Store
+from veridex.venues.sx_bet import FakeVenueAdapter, SXBetAdapter
 from veridex.verifier.proof_card import proof_card_from_run_result
-
-# The OVERUNDER market the demo agents disagree on (see ``_build_demo_ticks``).
-_DEMO_MARKET_KEY = "OVERUNDER_PARTICIPANT_GOALS|half=1|line=1"
-
-
-def _contrarian_agent(agent_id: str = "agent-beta") -> Agent:
-    """Build a SECOND, differentiated deterministic agent (no LLM, no network).
-
-    Where :func:`~veridex.runtime.orchestrator.deterministic_agent` picks the
-    highest-probability side (the demo's "under"), this agent always FLAG_VALUEs the
-    OTHER side ("over") of the same OVERUNDER market.  On the demo ticks "over" drifts
-    DOWN while "under" drifts UP, so the contrarian earns a NEGATIVE CLV — giving the
-    leaderboard a genuine rank-1 vs rank-2 split instead of a tie.  Fully deterministic
-    and §4-scorable (market_key + side present on a non-suspended market).
-
-    Args:
-        agent_id: Identifier for this agent (defaults to ``"agent-beta"``).
-
-    Returns:
-        An :class:`~veridex.runtime.orchestrator.Agent` whose ``proof_mode`` is
-        ``"reproducible"``.
-    """
-
-    async def decide(market_state: MarketState) -> AgentAction:
-        return AgentAction(
-            type=SportsActionType.FLAG_VALUE,
-            params={"market_key": _DEMO_MARKET_KEY, "side": "over"},
-        )
-
-    return Agent(agent_id=agent_id, proof_mode=PROOF_MODE_REPRODUCIBLE, decide=decide)
-
 
 # Module-level default store — shared across requests when the app runs under Uvicorn.
 # Tests always inject their own store via ``create_app(store=InMemoryStore())``.
 _default_store: InMemoryStore = InMemoryStore()
-
-
-def _build_demo_ticks() -> list[MarketState]:
-    """Build two deterministic MarketState ticks for the offline demo fixture.
-
-    Tick 0 reflects the TxLINE fixture (17588404) opening snapshot.  Tick 1 models a
-    later update where the "under" probability on the OVERUNDER market drifts up,
-    ensuring a positive closing-line CLV (+184 bps) for the deterministic agents'
-    tick-0 decisions and a 0-bps CLV for tick-1 decisions.
-
-    Market keys follow the ``market_key()`` format:
-    ``{SuperOddsType}|{MarketPeriod or ''}|{MarketParameters or ''}``.
-
-    Returns:
-        A two-element list of ``MarketState`` snapshots (tick 0 then tick 1).
-    """
-    tick0 = MarketState(
-        fixture_id=17588404,
-        tick_seq=0,
-        ts=1782518383,
-        phase=0,
-        markets={
-            # OVERUNDER_PARTICIPANT_GOALS, half=1, line=1 — from txline_native_messages[0]
-            "OVERUNDER_PARTICIPANT_GOALS|half=1|line=1": {
-                "stable_prob_bps": {"over": 4684, "under": 5316},
-                "stable_price": {"over": 2.135, "under": 1.881},
-                "suspended": False,
-            },
-            # 1X2_PARTICIPANT_RESULT — from txline_native_messages[1] (null period/params → "")
-            "1X2_PARTICIPANT_RESULT||": {
-                "stable_prob_bps": {"home": 4500, "draw": 2500, "away": 3000},
-                "stable_price": {"home": 2.222, "draw": 4.000, "away": 3.333},
-                "suspended": False,
-            },
-        },
-        scores={},
-    )
-
-    # Tick 1: "under" drifts to 5500 (+184 bps vs tick 0) — positive CLV for tick-0 decisions.
-    tick1 = MarketState(
-        fixture_id=17588404,
-        tick_seq=1,
-        ts=1782518393,
-        phase=0,
-        markets={
-            "OVERUNDER_PARTICIPANT_GOALS|half=1|line=1": {
-                "stable_prob_bps": {"over": 4500, "under": 5500},
-                "stable_price": {"over": 2.222, "under": 1.818},
-                "suspended": False,
-            },
-            "1X2_PARTICIPANT_RESULT||": {
-                "stable_prob_bps": {"home": 4600, "draw": 2400, "away": 3000},
-                "stable_price": {"home": 2.174, "draw": 4.167, "away": 3.333},
-                "suspended": False,
-            },
-        },
-        scores={},
-    )
-
-    return [tick0, tick1]
 
 
 def get_store() -> Store:
@@ -181,33 +102,6 @@ def get_store() -> Store:
         The module-level :class:`~veridex.store.InMemoryStore` instance.
     """
     return _default_store
-
-
-def _build_agents_from_roster(entries: list[AgentEntry]) -> list[Agent]:
-    """Build offline Agent objects from registered roster entries.
-
-    2A offline simplification: each entry is mapped to a deterministic or contrarian agent
-    (alternating by roster position) so the run is fully reproducible and produces a real
-    ≥2-row leaderboard with distinct CLV.  Even-indexed entries → ``deterministic_agent``;
-    odd-indexed entries → ``_contrarian_agent``.
-
-    Note: This is a deliberate Phase-2A wiring simplification.  Real BYOA / live agent
-    execution (2B) will route each entry to its actual execution environment.
-
-    Args:
-        entries: Registered :class:`~veridex.competition.models.AgentEntry` objects in
-            roster order.
-
-    Returns:
-        A list of :class:`~veridex.runtime.orchestrator.Agent` objects, one per entry.
-    """
-    agents: list[Agent] = []
-    for i, entry in enumerate(entries):
-        if i % 2 == 0:
-            agents.append(deterministic_agent(entry.agent_id))
-        else:
-            agents.append(_contrarian_agent(entry.agent_id))
-    return agents
 
 
 def _derive_leaderboard(events: list[CompetitionEvent]) -> list[CompetitionLeaderboardRow]:
@@ -247,24 +141,56 @@ def _derive_leaderboard(events: list[CompetitionEvent]) -> list[CompetitionLeade
     return rows
 
 
-def create_app(store: Store | None = None) -> FastAPI:
+def _build_execution_attachment(records: list[ExecutionRecord]) -> dict[str, Any] | None:
+    """Build the NON-SCORING execution attachment from execution records (REQ-2B-20 / AC-2B-12).
+
+    The attachment is explicitly labelled ``non_scoring`` + ``derived`` and is an OFF-CHAIN venue
+    artifact (``venue_artifact=True``) — distinct from the Phase-1 Memo anchor and excluded from
+    every evidence/scoring hash. Receipts are surfaced ONLY here, never in the skill-block proof
+    card.
+
+    Args:
+        records: The competition's execution records (any order).
+
+    Returns:
+        ``None`` when there are no records; otherwise a dict with the records, their receipts, and
+        the pinned ``policy_hash`` set (REQ-2B-03).
+    """
+    if not records:
+        return None
+    receipts = [r.receipt.model_dump(mode="json") for r in records if r.receipt is not None]
+    policy_hashes = sorted({r.policy_hash for r in records})
+    return {
+        "non_scoring": True,
+        "derived": True,
+        "venue_artifact": True,
+        "off_chain": True,
+        "records": [r.model_dump(mode="json") for r in records],
+        "receipts": receipts,
+        "policy_hashes": policy_hashes,
+    }
+
+
+def create_app(store: Store | None = None, settings: Settings | None = None) -> FastAPI:
     """Create the Veridex demo FastAPI application.
 
-    Factory pattern: inject ``store`` in tests; omit for the default in-process store.
+    Factory pattern: inject ``store`` / ``settings`` in tests; omit for the default in-process
+    store and env-backed settings.
 
     Args:
         store: Optional :class:`~veridex.store.Store` override.  Defaults to the
             module-level ``_default_store`` (an :class:`~veridex.store.InMemoryStore`).
+        settings: Optional :class:`~veridex.config.Settings` override carrying the operator
+            control-plane credentials.  Defaults to :func:`~veridex.config.get_settings`.
 
     Returns:
-        A configured :class:`fastapi.FastAPI` application with nine endpoints: the Phase-1
-        demo trio (``POST /demo/run``, ``GET /leaderboard``, ``GET /runs/{run_id}``) plus the
-        six Phase-2A competition endpoints (``POST /competitions``,
-        ``POST /competitions/{id}/agents``, ``POST /competitions/{id}/start``,
-        ``GET /competitions/{id}``, ``GET /competitions``,
-        ``GET /competitions/{id}/events``).
+        A configured :class:`fastapi.FastAPI` application: the Phase-1 demo trio, the six
+        Phase-2A competition endpoints, plus the Phase-2B control-plane endpoints
+        (``GET /competitions/{id}/executions``, ``GET /executions/{id}``,
+        ``POST /competitions/{id}/kill-switch``, ``POST /executions/{id}/approve``).
     """
     resolved_store: Store = store if store is not None else _default_store
+    resolved_settings: Settings = settings if settings is not None else get_settings()
 
     app = FastAPI(
         title="Veridex Demo API",
@@ -276,6 +202,10 @@ def create_app(store: Store | None = None) -> FastAPI:
     # Populated by POST /demo/run; consumed by GET /leaderboard.
     _run_meta: dict[str, dict[str, str]] = {}
 
+    # Per-app live-fanout manager (owns per-client bounded broadcast queues). The live producer
+    # (start_competition's broadcast callback) persists each event BEFORE broadcasting it.
+    arena_manager = ArenaConnectionManager()
+
     # --- Dependency -------------------------------------------------------
 
     def _get_store() -> Store:
@@ -285,6 +215,54 @@ def create_app(store: Store | None = None) -> FastAPI:
             The resolved :class:`~veridex.store.Store` for this application.
         """
         return resolved_store
+
+    # --- Control-plane auth (REQ-2B-18/19; fail-closed) -------------------
+
+    def _authenticate(authorization: str | None) -> str | None:
+        """Validate a ``Bearer`` operator token; return the principal ``operator_id``.
+
+        Fail-closed: a missing/malformed header, or a token that does not match the configured
+        ``operator_token`` (or no token configured at all), raises 401.
+
+        Args:
+            authorization: The raw ``Authorization`` header value, if present.
+
+        Returns:
+            The authenticated principal's ``operator_id`` (``settings.operator_id``).
+
+        Raises:
+            HTTPException: 401 if authentication fails.
+        """
+        token = resolved_settings.operator_token
+        if not authorization or not authorization.startswith("Bearer "):
+            raise HTTPException(status_code=401, detail="missing or malformed operator bearer token")
+        presented = authorization.removeprefix("Bearer ")
+        if token is None or presented != token:
+            raise HTTPException(status_code=401, detail="invalid operator token")
+        return resolved_settings.operator_id
+
+    def _require_operator(authorization: str | None = Header(default=None)) -> str | None:  # noqa: B008
+        """FastAPI dependency: require a valid operator bearer token; return the principal id."""
+        return _authenticate(authorization)
+
+    def _check_owner(competition: Competition, principal_operator_id: str | None) -> None:
+        """Enforce per-competition ownership: 403 if the competition is owned by another operator.
+
+        A competition with ``operator_id is None`` is owner-less, so ANY authenticated operator
+        may act on it (the single-operator-token model — authentication is already enforced by
+        ``_require_operator`` / ``_authenticate`` upstream).
+
+        Args:
+            competition: The loaded competition.
+            principal_operator_id: The authenticated principal's ``operator_id``.
+
+        Raises:
+            HTTPException: 403 if ``competition.config.operator_id`` is set and differs from the
+                principal.
+        """
+        owner = competition.config.operator_id
+        if owner is not None and owner != principal_operator_id:
+            raise HTTPException(status_code=403, detail="operator does not own this competition")
 
     # --- POST /demo/run ---------------------------------------------------
 
@@ -303,10 +281,10 @@ def create_app(store: Store | None = None) -> FastAPI:
             A :class:`~veridex.api.schemas.DemoRunResponse` with ``run_id``,
             ``anchor_status``, ``leaderboard``, and ``proof_card``.
         """
-        ticks = _build_demo_ticks()
+        ticks = build_demo_ticks()
         agents = [
             deterministic_agent("agent-alpha"),
-            _contrarian_agent("agent-beta"),
+            contrarian_agent("agent-beta"),
         ]
         result = await run_demo_competition(
             ticks,
@@ -470,19 +448,24 @@ def create_app(store: Store | None = None) -> FastAPI:
     @app.post("/competitions/{competition_id}/start", response_model=CompetitionStartResponse)
     async def start_competition_endpoint(
         competition_id: str,
+        authorization: str | None = Header(default=None),  # noqa: B008
         dep_store: Store = Depends(_get_store),  # noqa: B008
     ) -> CompetitionStartResponse:
         """Run a competition offline/deterministically and return the finalized state.
 
-        2A offline simplification: market data is sourced from the demo ticks
-        (``_build_demo_ticks()``), and roster entries are mapped to deterministic Agent
-        objects by alternating between ``deterministic_agent`` (even index) and
-        ``_contrarian_agent`` (odd index).  This produces a real ≥2-row leaderboard with
-        distinct CLV without any LLM or network calls.  Real BYOA / live execution is a
-        Phase 2B concern.
+        Offline simplification: market data is sourced from the demo ticks
+        (:func:`~veridex.api.demo_fixtures.build_demo_ticks`), and roster entries are mapped to
+        deterministic Agent objects (alternating deterministic/contrarian).  This produces a real
+        ≥2-row leaderboard with distinct CLV without any LLM or network calls.
+
+        Control-plane auth (fail-closed): a ``paper`` start is OPEN/public; a ``dry_run`` /
+        ``live_guarded`` start REQUIRES a valid operator bearer token (401) AND competition
+        ownership (403).  The live executor lane runs DOWNSTREAM of the seal as a separate derived
+        block and is broadcast live (persist-before-broadcast).
 
         Args:
             competition_id: The competition to start.
+            authorization: Operator bearer header (required only for non-paper modes).
             dep_store: Injected store dependency.
 
         Returns:
@@ -490,19 +473,28 @@ def create_app(store: Store | None = None) -> FastAPI:
             ``status="finalized"`` and ``run_id`` set.
 
         Raises:
-            HTTPException: 404 when the competition is not found; 409 when already
-                finalized or already running.
+            HTTPException: 404 (unknown competition), 409 (already finalized/running),
+                401/403 (control-plane auth for non-paper), 501 (live venue not enabled),
+                500 (evidence-prefix integrity breach).
         """
         try:
             competition = await dep_store.get_competition(competition_id)
         except KeyError:
             raise HTTPException(status_code=404, detail=f"competition {competition_id!r} not found") from None
 
-        ticks = _build_demo_ticks()
-        agents = _build_agents_from_roster(competition.entries)
+        # Fail-closed auth gate for non-paper modes (paper stays public).
+        if competition.config.execution_mode != ExecutionMode.PAPER:
+            principal = _authenticate(authorization)
+            _check_owner(competition, principal)
+
+        ticks = build_demo_ticks()
+        agents = build_agents_from_roster(competition.entries)
+
+        async def _broadcast(event: CompetitionEvent) -> None:
+            await arena_manager.broadcast(competition_id, event)
 
         try:
-            finalized = await start_competition(dep_store, competition_id, ticks, agents)
+            finalized = await start_competition(dep_store, competition_id, ticks, agents, broadcast=_broadcast)
         except KeyError:
             raise HTTPException(status_code=404, detail=f"competition {competition_id!r} not found") from None
         except CompetitionConflictError as exc:
@@ -511,6 +503,8 @@ def create_app(store: Store | None = None) -> FastAPI:
             raise HTTPException(status_code=500, detail=str(exc)) from None
         except CompetitionStateError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from None
+        except NotImplementedError as exc:
+            raise HTTPException(status_code=501, detail=str(exc)) from None
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from None
 
@@ -560,6 +554,33 @@ def create_app(store: Store | None = None) -> FastAPI:
         anchor_event = next((e for e in events if e.event_type == EventType.PROOF_ANCHOR), None)
         anchor_status = anchor_event.payload.get("anchor_status", "not_anchored") if anchor_event else "not_anchored"
 
+        # Proof-card SKILL/scoring block (REQ-2B-20): byte-identical with or without fills, because
+        # it is built purely from the SEALED run. Execution receipts live ONLY under the separate
+        # ``execution`` attachment below (non-scoring, derived, off-chain) — never in this block.
+        proof_card: dict[str, Any] | None = None
+        if competition.run_id is not None:
+            try:
+                run_result = await dep_store.load_run(competition.run_id)
+            except KeyError:
+                run_result = None
+            if run_result is not None:
+                scores = score_run(run_result)
+                checks = _default_checks(scores, run_result)
+                anchor_block: dict[str, Any] = {
+                    "status": str(anchor_status),
+                    "signature": None,
+                    "cluster": DEFAULT_CLUSTER,
+                }
+                proof_card = proof_card_from_run_result(
+                    run_result,
+                    checks=checks,
+                    anchor=anchor_block,
+                    schema_versions=dict(SCHEMA_VERSIONS),
+                )
+
+        execution_records = await dep_store.list_executions(competition_id)
+        execution = _build_execution_attachment(execution_records)
+
         return CompetitionStateResponse(
             competition_id=competition.competition_id,
             status=competition.status.value,
@@ -569,6 +590,8 @@ def create_app(store: Store | None = None) -> FastAPI:
             latest_seq=latest_seq,
             anchor_status=str(anchor_status),
             run_id=competition.run_id,
+            proof_card=proof_card,
+            execution=execution,
         )
 
     # --- GET /competitions ------------------------------------------------
@@ -634,14 +657,172 @@ def create_app(store: Store | None = None) -> FastAPI:
         events = await dep_store.list_competition_events(competition_id, since_seq=since_seq)
         return [e.model_dump(mode="json") for e in events]
 
+    # --- GET /competitions/{competition_id}/executions --------------------
+
+    @app.get("/competitions/{competition_id}/executions", response_model=list[ExecutionRecord])
+    async def list_executions_endpoint(
+        competition_id: str,
+        dep_store: Store = Depends(_get_store),  # noqa: B008
+    ) -> list[ExecutionRecord]:
+        """Return all execution records for a competition (read-only, public).
+
+        Args:
+            competition_id: The owning competition.
+            dep_store: Injected store dependency.
+
+        Returns:
+            The competition's :class:`~veridex.execution.models.ExecutionRecord` list, sorted by
+            ``execution_id``.
+        """
+        return await dep_store.list_executions(competition_id)
+
+    # --- GET /executions/{execution_id} -----------------------------------
+
+    @app.get("/executions/{execution_id}", response_model=ExecutionRecord)
+    async def get_execution_endpoint(
+        execution_id: str,
+        dep_store: Store = Depends(_get_store),  # noqa: B008
+    ) -> ExecutionRecord:
+        """Return a single execution record (with its receipt, if any) — read-only, public.
+
+        Args:
+            execution_id: The execution record id.
+            dep_store: Injected store dependency.
+
+        Returns:
+            The :class:`~veridex.execution.models.ExecutionRecord`.
+
+        Raises:
+            HTTPException: 404 when no record with ``execution_id`` exists.
+        """
+        try:
+            return await dep_store.get_execution_record(execution_id)
+        except KeyError:
+            raise HTTPException(status_code=404, detail=f"execution {execution_id!r} not found") from None
+
+    # --- POST /competitions/{competition_id}/kill-switch (auth) -----------
+
+    @app.post("/competitions/{competition_id}/kill-switch", response_model=KillSwitchResponse)
+    async def kill_switch_endpoint(
+        competition_id: str,
+        principal: str | None = Depends(_require_operator),  # noqa: B008
+        dep_store: Store = Depends(_get_store),  # noqa: B008
+    ) -> KillSwitchResponse:
+        """Flip the competition's policy-envelope kill-switch (control-plane write; fail-closed).
+
+        Args:
+            competition_id: The competition to update.
+            principal: The authenticated operator principal (injected by ``_require_operator``).
+            dep_store: Injected store dependency.
+
+        Returns:
+            A :class:`~veridex.api.schemas.KillSwitchResponse` with the new kill-switch state.
+
+        Raises:
+            HTTPException: 401 (unauthenticated), 403 (wrong owner), 404 (unknown competition).
+        """
+        try:
+            competition = await dep_store.get_competition(competition_id)
+        except KeyError:
+            raise HTTPException(status_code=404, detail=f"competition {competition_id!r} not found") from None
+        _check_owner(competition, principal)
+
+        envelope = competition.config.policy_envelope or _default_policy_envelope()
+        flipped = envelope.model_copy(update={"kill_switch": not envelope.kill_switch})
+        new_config = competition.config.model_copy(update={"policy_envelope": flipped})
+        await dep_store.update_competition_config(competition_id, new_config)
+
+        return KillSwitchResponse(
+            competition_id=competition_id,
+            kill_switch=flipped.kill_switch,
+            status="kill_switch_on" if flipped.kill_switch else "kill_switch_off",
+        )
+
+    # --- POST /executions/{execution_id}/approve (auth) -------------------
+
+    @app.post("/executions/{execution_id}/approve", response_model=ApprovalResponse)
+    async def approve_execution_endpoint(
+        execution_id: str,
+        body: dict[str, Any] | None = None,
+        principal: str | None = Depends(_require_operator),  # noqa: B008
+        dep_store: Store = Depends(_get_store),  # noqa: B008
+    ) -> ApprovalResponse:
+        """Resolve an ``awaiting_human`` execution: re-check law+policy+eligibility, then submit-or-reject.
+
+        Control-plane write (fail-closed): requires a valid operator token (401) and competition
+        ownership (403). The resolution emits a NON-SCORING approval audit event, independently
+        re-derives the proposal from the SEALED run, re-evaluates the CURRENT envelope (kill-switch
+        included) + eligibility, and either advances to submission or rejects (no submit).
+
+        Args:
+            execution_id: The ``awaiting_human`` execution record to resolve.
+            body: Optional JSON body with an operator ``note``.
+            principal: The authenticated operator principal.
+            dep_store: Injected store dependency.
+
+        Returns:
+            An :class:`~veridex.api.schemas.ApprovalResponse` with the decision + resulting status.
+
+        Raises:
+            HTTPException: 401/403 (auth/owner), 404 (unknown execution/run), 409 (not awaiting).
+        """
+        try:
+            record = await dep_store.get_execution_record(execution_id)
+        except KeyError:
+            raise HTTPException(status_code=404, detail=f"execution {execution_id!r} not found") from None
+
+        try:
+            competition = await dep_store.get_competition(record.competition_id)
+        except KeyError:
+            raise HTTPException(status_code=404, detail=f"competition {record.competition_id!r} not found") from None
+        _check_owner(competition, principal)
+
+        if record.status != ExecutionStatus.AWAITING_HUMAN:
+            raise HTTPException(
+                status_code=409,
+                detail=f"execution {execution_id!r} is not awaiting_human (status={record.status.value})",
+            )
+
+        try:
+            run_result = await dep_store.load_run(record.run_id)
+        except KeyError:
+            raise HTTPException(status_code=404, detail=f"run {record.run_id!r} not found") from None
+
+        envelope = competition.config.policy_envelope or _default_policy_envelope()
+        execution_mode = competition.config.execution_mode
+        adapter = FakeVenueAdapter() if execution_mode == ExecutionMode.DRY_RUN else SXBetAdapter()
+        entry = next((e for e in competition.entries if e.agent_id == record.agent_id), None)
+        note = (body or {}).get("note")
+
+        # Append the resolution block AFTER the current log tail (contiguous seqs).
+        existing = await dep_store.list_competition_events(record.competition_id, since_seq=-1)
+        next_seq = max((e.seq for e in existing), default=-1) + 1
+
+        updated, events, decision = await resolve_approval(
+            dep_store,
+            record=record,
+            run_result=run_result,
+            envelope=envelope,
+            adapter=adapter,
+            entry=entry,
+            execution_mode=execution_mode.value,
+            base_seq=next_seq,
+            event_ts=0,
+            approver_id=principal,
+            note=note,
+        )
+        await dep_store.append_competition_events(record.competition_id, events)
+        for event in events:
+            await arena_manager.broadcast(record.competition_id, event)
+
+        return ApprovalResponse(execution_id=execution_id, decision=decision, status=updated.status.value)
+
     # --- WS /competitions/{competition_id}/arena --------------------------
-    # Read-only spectator projection (P2A-7). The per-app manager owns per-client bounded
-    # broadcast queues; the route closes over ``resolved_store`` for replay (mirroring
-    # ``_get_store``). In 2A the synchronous ``/start`` runs to FINALIZED before any spectator
-    # connects, so the dominant path is store-backed REPLAY; the live-broadcast machinery is the
-    # 2B seam and is deliberately NOT wired into the synchronous run (broadcast must never block
-    # the run loop). ``arena_manager.broadcast`` is exposed for a future async live producer.
-    arena_manager = ArenaConnectionManager()
+    # Read-only spectator projection (P2A-7). The per-app ``arena_manager`` (created above) owns
+    # per-client bounded broadcast queues; the route closes over ``resolved_store`` for replay.
+    # The Phase-2B live producer (start_competition / approve) PERSISTS each event BEFORE calling
+    # ``arena_manager.broadcast`` for it (persist-before-broadcast), so spectators see a gapless
+    # projection of the sealed log. ``broadcast`` never blocks the run loop (REQ-2B-30).
     register_arena_routes(app, store=resolved_store, manager=arena_manager)
 
     return app
