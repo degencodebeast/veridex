@@ -60,6 +60,7 @@ class EventType(str, Enum):
     POLICY_RESULT = "policy_result"  # Phase 2B (executor lane) — never emitted by build_event_log
     EXECUTION_SUBMITTED = "execution_submitted"  # Phase 2B (executor lane) — never emitted by build_event_log
     EXECUTION_RECEIPT = "execution_receipt"  # Phase 2B (executor lane) — never emitted by build_event_log
+    APPROVAL_AUDIT = "approval_audit"  # Phase 2B (human-approval resolution) — never emitted by build_event_log
     SCORE_UPDATE = "score_update"
     PROOF_ANCHOR = "proof_anchor"
     PAYOUT_STATUS = "payout_status"  # reserved (Phase 2D) — not emitted by any current lane
@@ -395,6 +396,48 @@ def build_execution_receipt_event(
         derived_from=[f"execution_record:{execution_id}"],
         payload=receipt_payload,
         payload_hash=event_payload_hash(receipt_payload),
+    )
+
+
+def build_approval_audit_event(
+    *,
+    competition_id: str,
+    run_id: str,
+    seq: int,
+    event_ts: int,
+    execution_id: str,
+    audit_payload: dict[str, Any],
+) -> CompetitionEvent:
+    """Build a Phase-2B ``APPROVAL_AUDIT`` derived event (human-approval resolution only).
+
+    Emitted by the Task-7 control-plane approve endpoint to record an operator's NON-SCORING
+    decision on an ``awaiting_human`` execution. MUST NOT be called by :func:`build_event_log` —
+    the 2A canonical log stays byte-identical to Phase 2A.
+
+    Args:
+        competition_id: Owning competition identifier.
+        run_id: Sealed Phase-1 run identifier.
+        seq: Monotonic competition sequence number for this event.
+        event_ts: Deterministic event timestamp.
+        execution_id: The execution record this decision resolves.
+        audit_payload: Secret-free audit dict (``approver_id``, ``execution_id``, ``policy_hash``,
+            ``decision``, ``note``, ``ts``).
+
+    Returns:
+        A :class:`CompetitionEvent` with ``evidence=False``, ``source_sequence_no=None``, and
+        ``derived_from=["execution_record:{execution_id}"]``.
+    """
+    return CompetitionEvent(
+        competition_id=competition_id,
+        run_id=run_id,
+        seq=seq,
+        event_type=EventType.APPROVAL_AUDIT,
+        event_ts=event_ts,
+        evidence=False,
+        source_sequence_no=None,
+        derived_from=[f"execution_record:{execution_id}"],
+        payload=audit_payload,
+        payload_hash=event_payload_hash(audit_payload),
     )
 
 

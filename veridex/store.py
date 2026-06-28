@@ -54,6 +54,7 @@ _EVENT_TYPE_VALUES: tuple[str, ...] = (
     "policy_result",
     "execution_submitted",
     "execution_receipt",
+    "approval_audit",
     "score_update",
     "proof_anchor",
     "payout_status",
@@ -152,6 +153,21 @@ class Store(Protocol):
         Args:
             competition_id: The competition to update.
             run_id: The sealed Phase-1 run identifier to store.
+
+        Raises:
+            KeyError: If no competition with ``competition_id`` exists.
+        """
+        ...
+
+    async def update_competition_config(self, competition_id: str, config: CompetitionConfig) -> None:
+        """Overwrite the immutable-config snapshot of a competition.
+
+        Used by the Task-7 control-plane kill-switch to persist a mutated
+        ``config.policy_envelope`` (the rest of the config is unchanged).
+
+        Args:
+            competition_id: The competition to update.
+            config: The new :class:`~veridex.competition.models.CompetitionConfig` snapshot.
 
         Raises:
             KeyError: If no competition with ``competition_id`` exists.
@@ -422,6 +438,20 @@ class InMemoryStore:
         if competition_id not in self._competitions:
             raise KeyError(f"no competition with competition_id={competition_id!r}")
         self._competitions[competition_id].run_id = run_id
+
+    async def update_competition_config(self, competition_id: str, config: CompetitionConfig) -> None:
+        """Overwrite the stored competition's config snapshot (deep-copied).
+
+        Args:
+            competition_id: The competition to update.
+            config: The new config snapshot.
+
+        Raises:
+            KeyError: If no competition with ``competition_id`` exists.
+        """
+        if competition_id not in self._competitions:
+            raise KeyError(f"no competition with competition_id={competition_id!r}")
+        self._competitions[competition_id].config = config.model_copy(deep=True)
 
     async def append_competition_events(self, competition_id: str, events: list[CompetitionEvent]) -> None:
         """Append deep copies of ``events`` to the competition's event list.
@@ -917,6 +947,28 @@ class PostgresStore:
                 await cur.execute(
                     "UPDATE competitions SET run_id = %s WHERE competition_id = %s",
                     (run_id, competition_id),
+                )
+                if cur.rowcount == 0:
+                    raise KeyError(f"no competition persisted with competition_id={competition_id!r}")
+        finally:
+            await conn.close()
+
+    async def update_competition_config(self, competition_id: str, config: CompetitionConfig) -> None:
+        """Overwrite the config_json column for a competition.
+
+        Args:
+            competition_id: The competition to update.
+            config: The new config snapshot (canonically serialized).
+
+        Raises:
+            KeyError: If no competition with ``competition_id`` exists (detected via ``rowcount``).
+        """
+        conn = await self._connect()
+        try:
+            async with conn.transaction(), conn.cursor() as cur:
+                await cur.execute(
+                    "UPDATE competitions SET config_json = %s WHERE competition_id = %s",
+                    (serialize_payload(config.model_dump(mode="json")), competition_id),
                 )
                 if cur.rowcount == 0:
                     raise KeyError(f"no competition persisted with competition_id={competition_id!r}")

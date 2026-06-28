@@ -12,6 +12,8 @@ from typing import Literal
 
 from pydantic import BaseModel, Field
 
+from veridex.policy.envelope import PolicyEnvelope
+
 
 class CompetitionType(str, Enum):
     """Categorises the competition format."""
@@ -78,6 +80,9 @@ class CompetitionConfig(BaseModel):
         prize_vault_ref: Phase 2D vault reference; ``None`` means no on-chain prize.
         operator_id: Optional identifier for the operator / control-plane account that
             owns this competition; used by the Task-7 control-plane auth layer.
+        policy_envelope: Optional operator-set execution guardrail envelope (Phase-2B). When
+            ``None``, the service builds a conservative deny-by-default envelope for non-paper
+            runs. The control-plane kill-switch endpoint mutates ``kill_switch`` here.
     """
 
     competition_type: CompetitionType
@@ -90,6 +95,7 @@ class CompetitionConfig(BaseModel):
     reward_policy: RewardPolicy | None = None
     prize_vault_ref: PrizeVaultRef | None = None
     operator_id: str | None = None
+    policy_envelope: PolicyEnvelope | None = None
 
 
 class AgentEntry(BaseModel):

@@ -71,6 +71,16 @@ class Settings(BaseSettings):
     anthropic_api_key: str | None = Field(default=None, validation_alias="ANTHROPIC_API_KEY")
 
     # ------------------------------------------------------------------
+    # Control-plane operator auth (Phase-2B Task 7; async shell, CON-010)
+    # ------------------------------------------------------------------
+    # Bearer token required for control-plane WRITES (start non-paper / approve /
+    # kill-switch). ``None`` means no operator is configured and every write fails closed.
+    operator_token: str | None = Field(default=None, validation_alias="OPERATOR_TOKEN")
+    # Identifier of the authenticated operator principal; compared against a competition's
+    # ``operator_id`` for per-competition ownership (403 on mismatch).
+    operator_id: str | None = Field(default=None, validation_alias="OPERATOR_ID")
+
+    # ------------------------------------------------------------------
     # Tuning
     # ------------------------------------------------------------------
     decision_timeout_s: float = 30.0

@@ -124,8 +124,13 @@ def test_register_agent_unknown_competition_404() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_start_non_paper_execution_mode_returns_400() -> None:
-    """AC-217: POST /start with execution_mode='dry_run' returns 400; no events created."""
+def test_start_non_paper_without_operator_auth_fails_closed() -> None:
+    """P2B-7: POST /start with execution_mode='dry_run' and NO operator token fails closed.
+
+    Supersedes the Phase-2A AC-217 blanket rejection: non-paper modes are now permitted, but only
+    behind operator auth. With no ``OPERATOR_TOKEN`` configured the control plane denies the write
+    (401) and creates no events.
+    """
     store = InMemoryStore()
     client = TestClient(create_app(store=store))
     dry_run_config = {**_COMPETITION_CONFIG, "execution_mode": "dry_run"}
@@ -135,9 +140,8 @@ def test_start_non_paper_execution_mode_returns_400() -> None:
 
     resp = client.post(f"/competitions/{comp_id}/start")
 
-    assert resp.status_code == 400, resp.text
-    assert "execution_mode_not_available_in_phase_2a" in resp.json()["detail"]
-    # Gate must fire before any mutation — no events should be present.
+    assert resp.status_code in (401, 403), resp.text
+    # Auth must fire before any mutation — no events should be present.
     events = client.get(f"/competitions/{comp_id}/events?since_seq=-1").json()
     assert events == []
 

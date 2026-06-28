@@ -176,13 +176,27 @@ async def test_config_hash_excludes_config_hash_and_eligibility() -> None:  # CO
     assert entry.config_hash == expected
 
 
-async def test_non_paper_start_rejected() -> None:  # AC-217
+async def test_live_guarded_start_is_testnet_gated() -> None:  # P2B-7: live venue gated
+    """Phase-2B: ``live_guarded`` is now ACCEPTED but the live SX Bet adapter is testnet-gated.
+
+    The executor lane fetches a venue quote per proposal BEFORE the policy gate, so an
+    un-enabled ``SXBetAdapter`` raises ``NotImplementedError`` — the expected gated behavior.
+    The seal + 2A tail persist, but NO execution-block events are appended (the lane raised
+    before the service could persist them). Crucially, the non-scoring lane failure must NOT
+    strand the lifecycle in RUNNING.
+    """
     store = InMemoryStore()
     cid = await _seeded_competition(store, execution_mode=ExecutionMode.LIVE_GUARDED)
-    with pytest.raises(ValueError, match="execution_mode_not_available_in_phase_2a"):
+    with pytest.raises(NotImplementedError):
         await start_competition(store, cid, _ticks(), _agents())
-    # no run / no events created on the rejected start.
-    assert await store.list_competition_events(cid, since_seq=-1) == []
+    events = await store.list_competition_events(cid, since_seq=-1)
+    reserved = {EventType.POLICY_RESULT, EventType.EXECUTION_SUBMITTED, EventType.EXECUTION_RECEIPT}
+    assert all(e.event_type not in reserved for e in events)
+    # The non-scoring lane failure must NOT strand the lifecycle: the seal + 2A tail are durable,
+    # so the competition is FINALIZED (a retry correctly hits the _ALREADY_FINALIZED 409 gate, not
+    # the _ALREADY_RUNNING gate forever).
+    competition = await store.get_competition(cid)
+    assert competition.status == CompetitionStatus.FINALIZED
 
 
 async def test_live_evidence_prefix_equals_final_projection() -> None:  # AC-213 KEYSTONE

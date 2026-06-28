@@ -28,6 +28,7 @@ from typing import TYPE_CHECKING
 
 from veridex.competition.events import (
     CompetitionEvent,
+    build_approval_audit_event,
     build_execution_receipt_event,
     build_execution_submitted_event,
     build_policy_result_event,
@@ -309,3 +310,218 @@ async def run_execution_lane(
         await store.append_execution_record(record)
 
     return events
+
+
+# Decision labels for the human-approval audit (stable wire values).
+_APPROVED = "approved"
+_REJECTED = "rejected"
+
+
+async def resolve_approval(
+    store: Store,
+    *,
+    record: ExecutionRecord,
+    run_result: RunResult,
+    envelope: PolicyEnvelope,
+    adapter: VenueAdapter,
+    entry: AgentEntry | None,
+    execution_mode: str,
+    base_seq: int,
+    event_ts: int,
+    approver_id: str | None,
+    note: str | None = None,
+    bankroll: float = _DEFAULT_BANKROLL,
+) -> tuple[ExecutionRecord, list[CompetitionEvent], str]:
+    """Resolve an ``awaiting_human`` record: audit, RE-CHECK law+policy+eligibility, submit-or-reject.
+
+    The pending-approval resolution (REQ-2B-19): emit a NON-SCORING approval audit event, then
+    independently re-derive the proposal from the SEALED run and re-evaluate the CURRENT policy
+    envelope (which may have a flipped kill-switch) plus the agent's current eligibility:
+
+    * If the re-check is clean (no hard reason codes) the record advances
+      ``awaiting_human → policy_approved → submitted → …`` and an ``EXECUTION_SUBMITTED`` +
+      ``EXECUTION_RECEIPT`` pair is emitted (``dry_run`` simulates; ``live_guarded`` really submits).
+    * Otherwise the record advances ``awaiting_human → rejected`` and a denied ``POLICY_RESULT`` is
+      emitted — NO submit (fail-closed).
+
+    This NEVER mutates ``run_result`` — the seal, scores, leaderboard, and evidence stay untouched.
+
+    Args:
+        store: Async store; receives one ``append_execution_record`` for the resolved record.
+        record: The ``awaiting_human`` execution record to resolve (mutated in place).
+        run_result: The frozen, sealed Phase-1 run (read-only).
+        envelope: The CURRENT operator policy envelope (re-check basis; may have kill_switch on).
+        adapter: The venue adapter (quote/submit/status/normalize).
+        entry: The agent's roster entry (supplies ``execution_eligibility``); ``None`` → ineligible.
+        execution_mode: ``"dry_run"`` | ``"live_guarded"`` (never ``"paper"`` — there is no
+            awaiting_human in paper mode).
+        base_seq: First competition ``seq`` for the emitted block.
+        event_ts: Deterministic event timestamp for emitted events / quote-age math.
+        approver_id: The authenticated operator principal recorded in the audit event.
+        note: Optional free-form operator note recorded in the audit event.
+        bankroll: Fixed deterministic bankroll the sealed half-Kelly fraction is sized against.
+
+    Returns:
+        ``(updated_record, events, decision)`` where ``decision`` is ``"approved"`` or
+        ``"rejected"``. The caller owns appending/broadcasting ``events`` to the canonical log.
+    """
+    venue = _venue_name(adapter)
+    seq = base_seq
+    events: list[CompetitionEvent] = []
+
+    # 1. RE-CHECK law: re-derive the proposal for THIS record from the sealed run.
+    proposal = next(
+        (
+            p
+            for p in value_proposals(run_result, min_edge_bps=envelope.min_edge_bps)
+            if p.source_sequence_no == record.source_sequence_no and p.agent_id == record.agent_id
+        ),
+        None,
+    )
+
+    decision = _REJECTED
+    reason_codes: list[str] = []
+    result_policy_hash = envelope.policy_hash()
+    quote = None
+    stake = 0.0
+
+    if proposal is not None:
+        # 2. RE-CHECK policy + eligibility against the CURRENT envelope.
+        quote = await adapter.quote_market(proposal.market_key)
+        stake = _size_stake(proposal.kelly_fraction, bankroll=bankroll, max_stake=envelope.max_stake)
+        agent_eligible = bool(entry.execution_eligibility) if entry is not None else False
+        ctx = PolicyContext(
+            recomputed_edge_bps=proposal.recomputed_edge_bps,
+            stake=stake,
+            venue=venue,
+            market_key=proposal.market_key,
+            price=quote.price,
+            slippage_bps=0,
+            quote_age_s=max(0, event_ts - quote.ts),
+            orders_this_run=0,
+            seconds_since_last_order=None,
+            agent_eligible=agent_eligible,
+        )
+        result = evaluate(ctx, envelope)
+        reason_codes = list(result.reason_codes)
+        result_policy_hash = result.policy_hash
+        # The human is approving an already-clean (or escalated) action: a clean re-check
+        # (no hard reason codes) means APPROVED-and-submit; any hard reason fails closed.
+        if not reason_codes:
+            decision = _APPROVED
+    else:
+        reason_codes = ["proposal_no_longer_qualifies"]
+
+    # 3. Emit the NON-SCORING approval audit event (always, regardless of outcome).
+    await _emit_audit(events, record, run_result, seq, event_ts, approver_id, note, decision, result_policy_hash)
+    seq += 1
+
+    # 4. Branch: submit (approved) or reject (fail-closed).
+    if decision == _APPROVED and proposal is not None and quote is not None:
+        record.advance(ExecutionStatus.POLICY_APPROVED)
+        order = Order(
+            market_ref=proposal.market_key,
+            side=proposal.side,
+            size=stake,
+            price=quote.price,
+            venue=venue,
+        )
+        if execution_mode == _DRY_RUN:
+            status = OrderStatus(
+                venue_order_id=f"dryrun-{record.execution_id}",
+                status="filled",
+                filled_size=order.size,
+                price=quote.price,
+            )
+            receipt = adapter.normalize_receipt(record.execution_id, order, status, mode=_DRY_RUN)
+        else:  # live_guarded
+            ack = await adapter.submit_order(order)
+            status = await adapter.get_order_status(ack.venue_order_id)
+            receipt = adapter.normalize_receipt(record.execution_id, order, status, mode=_LIVE_GUARDED)
+
+        _advance_through(record, _POST_POLICY_PATH.get(receipt.status, (ExecutionStatus.SUBMITTED,)))
+        record.receipt = receipt
+
+        events.append(
+            build_execution_submitted_event(
+                competition_id=record.competition_id,
+                run_id=run_result.run_id,
+                seq=seq,
+                event_ts=event_ts,
+                execution_id=record.execution_id,
+                payload={
+                    "execution_id": record.execution_id,
+                    "agent_id": record.agent_id,
+                    "venue": venue,
+                    "market_ref": proposal.market_key,
+                    "side": proposal.side,
+                    "size": stake,
+                    "price": quote.price,
+                    "mode": execution_mode,
+                },
+            )
+        )
+        seq += 1
+        events.append(
+            build_execution_receipt_event(
+                competition_id=record.competition_id,
+                run_id=run_result.run_id,
+                seq=seq,
+                event_ts=event_ts,
+                execution_id=record.execution_id,
+                receipt_payload=receipt.model_dump(mode="json"),
+            )
+        )
+        seq += 1
+    else:
+        record.advance(ExecutionStatus.REJECTED)
+        events.append(
+            build_policy_result_event(
+                competition_id=record.competition_id,
+                run_id=run_result.run_id,
+                seq=seq,
+                event_ts=event_ts,
+                agent_id=record.agent_id,
+                source_sequence_no_ref=record.source_sequence_no,
+                policy_result_payload={
+                    "decision": PolicyDecision.DENIED.value,
+                    "reason_codes": reason_codes,
+                    "policy_hash": result_policy_hash,
+                },
+            )
+        )
+        seq += 1
+
+    await store.append_execution_record(record)
+    return record, events, decision
+
+
+async def _emit_audit(
+    events: list[CompetitionEvent],
+    record: ExecutionRecord,
+    run_result: RunResult,
+    seq: int,
+    event_ts: int,
+    approver_id: str | None,
+    note: str | None,
+    decision: str,
+    policy_hash: str,
+) -> None:
+    """Append the REQ-2B-19 non-scoring approval audit event to ``events``."""
+    events.append(
+        build_approval_audit_event(
+            competition_id=record.competition_id,
+            run_id=run_result.run_id,
+            seq=seq,
+            event_ts=event_ts,
+            execution_id=record.execution_id,
+            audit_payload={
+                "approver_id": approver_id,
+                "execution_id": record.execution_id,
+                "policy_hash": policy_hash,
+                "decision": decision,
+                "note": note,
+                "ts": event_ts,
+            },
+        )
+    )
