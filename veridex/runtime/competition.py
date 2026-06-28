@@ -24,18 +24,23 @@ from __future__ import annotations
 import hashlib
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from veridex.chain.anchor import anchor_memo, run_manifest, run_manifest_hash
 from veridex.leaderboard import leaderboard
-from veridex.runtime.evidence import serialize_payload
+from veridex.runtime.evidence import compute_evidence_hash, serialize_payload
 from veridex.runtime.orchestrator import RunResult, run_competition
 from veridex.scoring import score_run
+from veridex.verifier.import_audit import assert_no_llm_imports
 from veridex.verifier.proof_card import DEFAULT_SCHEMA_VERSIONS, proof_card_from_run_result
 
 if TYPE_CHECKING:
     from veridex.ingest.marketstate import MarketState
     from veridex.store import Store
+
+#: Root of the ``veridex`` package — used to resolve trust-path targets for the import audit.
+_VERIDEX_PKG: Path = Path(__file__).parent.parent
 
 #: Solana cluster recorded in the proof-card anchor block (devnet for Phase 1).
 DEFAULT_CLUSTER: str = "devnet"
@@ -117,37 +122,78 @@ def _default_checks(scores: list[dict[str, Any]], run: RunResult) -> dict[str, A
       * ``clv``: ``"pass"`` iff the rank-1 agent has a positive average CLV (the run produced a
         genuinely edge-positive winner), else ``"fail"``; ``scored_actions`` is the total number
         of scored actions across all agents in the run.
-      * ``evidence_integrity``: a self-describing dict — ``"pass"`` when the run sealed a non-empty
-        ``evidence_hash``, with the ``method`` and a ``note`` so a judge can see WHAT was proven.
-      * ``llm_boundary``: a self-describing dict — always ``"pass"``, carrying the ``method``
-        (``"static_import_audit"``) and the audited ``scope`` so a judge sees exactly which modules
-        are proven LLM-SDK-free. The static import audit (``veridex.verifier.import_audit``) is what
-        actually guarantees the boundary; this block surfaces that guarantee (and its scope) on the
-        card rather than asking the judge to infer it.
+      * ``evidence_integrity``: recomputes ``sha256`` over ``run.run_events`` via
+        :func:`~veridex.runtime.evidence.compute_evidence_hash` and compares against the sealed
+        ``run.evidence_hash``. Returns ``"fail"`` on any mismatch (fail-closed). A tampered run
+        whose events were mutated after sealing will not match and will correctly show ✗.
+      * ``llm_boundary``: runs :func:`~veridex.verifier.import_audit.assert_no_llm_imports` over
+        every trust-path target. Returns ``"fail"`` if any target raises (caught; does not abort
+        card-building). The ``scope`` list reflects the exact set of modules audited.
 
     All check values are structured dicts (no bare-string/dict mix) so the block is uniform.
 
     Args:
         scores: The ranked per-agent metric stack (rank-1 first).
-        run: The completed run result (for the evidence hash).
+        run: The completed run result (evidence hash + run_events for integrity check).
 
     Returns:
         A Proof-Checks summary dict (exposed publicly as ``checks`` — never ``cats``).
     """
+    # --- clv: rank-1 agent must have positive average CLV ----------------------------
     top_avg = scores[0].get("avg_clv_bps") if scores else None
     clv_result = "pass" if isinstance(top_avg, (int, float)) and top_avg > 0 else "fail"
     scored_actions = sum(int(row.get("action_count", 0)) for row in scores)
+
+    # --- evidence_integrity: recompute hash and compare (fail-closed on any error) ----
+    # Wraps in try/except: compute_evidence_hash raises ValueError on duplicate
+    # sequence_no and KeyError on missing sequence_no — either means the evidence
+    # cannot be verified, which is itself an integrity failure (never a card crash).
+    try:
+        recomputed = compute_evidence_hash(run.run_events)
+        recomputed_match = recomputed == run.evidence_hash
+        integrity_result = "pass" if recomputed_match else "fail"
+        integrity_error: str | None = None
+    except Exception as e:  # malformed/unrecomputable evidence = integrity FAIL, never a crash
+        recomputed_match = False
+        integrity_result = "fail"
+        integrity_error = f"{type(e).__name__}: {e}"
+
+    # --- llm_boundary: run real static import audit over every trust-path target -----
+    # Catches Exception (not just AssertionError): assert_no_llm_imports also does
+    # ast.parse + read_text, which can raise SyntaxError or decode errors. An audit
+    # that cannot complete is a failed boundary — the card must not crash.
+    _trust_targets = [
+        _VERIDEX_PKG / "law",
+        _VERIDEX_PKG / "scoring.py",
+        _VERIDEX_PKG / "leaderboard.py",
+        _VERIDEX_PKG / "verifier",
+        _VERIDEX_PKG / "checks",
+        _VERIDEX_PKG / "ingest",
+        _VERIDEX_PKG / "policy",
+    ]
+    try:
+        for target in _trust_targets:
+            assert_no_llm_imports(target)
+        boundary_result = "pass"
+    except Exception:  # AssertionError (violation) or SyntaxError/OSError (unreadable) → fail
+        boundary_result = "fail"
+
     return {
         "clv": {"result": clv_result, "scored_actions": scored_actions},
         "evidence_integrity": {
-            "result": "pass" if run.evidence_hash else "fail",
+            "result": integrity_result,
             "method": "sha256_evidence_hash",
-            "note": "run events sealed in evidence_hash; scores bound via the prescore chain",
+            "recomputed_match": recomputed_match,
+            "error": integrity_error,
+            "note": (
+                "recomputes sha256 over run_events and compares against stored evidence_hash; "
+                "fails-closed on any mismatch or recompute error"
+            ),
         },
         "llm_boundary": {
-            "result": "pass",
+            "result": boundary_result,
             "method": "static_import_audit",
-            "scope": ["checks/", "verifier/", "law/", "ingest/", "scoring.py", "leaderboard.py"],
+            "scope": ["law/", "scoring.py", "leaderboard.py", "verifier/", "checks/", "ingest/", "policy/"],
             "note": (
                 "LLM SDK imports are forbidden in the deterministic trust path; "
                 "the LLM decision shell is outside this scope."

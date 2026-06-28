@@ -246,12 +246,13 @@ async def test_default_checks_summary_shape() -> None:
     assert checks["llm_boundary"]["result"] == "pass"  # import audit guarantees the boundary
     assert checks["llm_boundary"]["method"] == "static_import_audit"
     assert checks["llm_boundary"]["scope"] == [
-        "checks/",
-        "verifier/",
         "law/",
-        "ingest/",
         "scoring.py",
         "leaderboard.py",
+        "verifier/",
+        "checks/",
+        "ingest/",
+        "policy/",
     ]
     assert isinstance(checks["llm_boundary"]["note"], str)
 
