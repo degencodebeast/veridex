@@ -1,5 +1,11 @@
 // Frozen Veridex API contract (Plan A, Task 0). Generated/pinned by the backend; do not hand-edit
 // field names without updating veridex/api/schemas.py + contracts/fixtures + tests/test_api_contract.py.
+//
+// SEC-001 MIGRATION NOTE: `checks` is pinned here to its FINAL target shape — the 7 CheckId only,
+// with CLV/performance in `metrics` (NOT in `checks`). Consumers (C1/C2/D) bind to this final shape.
+// The live backend completes this migration in Plan A, Task 5 (WD-5b): until then it still emits the
+// legacy `clv`-in-`checks` block. A strict-xfail test in tests/test_api_contract.py asserts the SEC-001
+// target against the live response and flips to a hard failure the moment Task 5 lands.
 
 export type CheckStatus = "pass" | "fail" | "pending" | "not_applicable";
 export type CheckSeverity = "blocking" | "warning" | "info";
@@ -18,7 +24,7 @@ export interface ProofArtifact {
   run: Record<string, unknown>;
   lineage: Record<string, unknown>;
   evidence: { evidence_hash: string; run_event_count: number };
-  checks: Record<CheckId, CheckResult>;   // SEC-001: CLV is NOT here
+  checks: Record<CheckId, CheckResult>;   // SEC-001 target: the 7 CheckId only; CLV lives in `metrics` (see migration note)
   anchor: { status: string; signature: string | null; cluster: string | null };
   metrics?: PerformanceMetrics | null;     // Performance Metrics block (CLV lives here)
 }

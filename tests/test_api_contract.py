@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
 from fastapi.testclient import TestClient
 
 from veridex.api.router import create_app
@@ -69,3 +70,40 @@ def test_proof_artifact_route_is_get_runs() -> None:
     assert pc.status_code == 200
     ProofArtifactResponse.model_validate(pc.json())
     assert client.get(f"/api/proof/{run_id}").status_code == 404  # the alternate route is NOT added
+
+
+# The 7 frozen Proof-Check ids (spec §4.3 / SEC-001). CLV is NOT one of them — it lives in metrics.
+_SEVEN_CHECK_IDS = {
+    "evidence_integrity",
+    "llm_boundary",
+    "metrics_recomputed",
+    "manifest_bound",
+    "policy_obeyed",
+    "receipt_separation",
+    "anchor",
+}
+
+
+@pytest.mark.xfail(
+    reason="checks migrate to 7-CheckId in Task 5 (WD-5b); live backend still emits clv-in-checks until then",
+    strict=True,
+)
+def test_live_checks_block_is_sec001_compliant() -> None:
+    """SEC-001 target: the live ``checks`` block holds ONLY the 7 CheckId; CLV lives in ``metrics``.
+
+    This is the FINAL shape the frozen contract (``contracts/veridex_api.contract.ts`` + the
+    ``verify_response``/``proof_artifact`` fixtures) already pins. The live backend completes the
+    migration in Task 5 (WD-5b); until then it still emits the legacy ``clv``-in-``checks`` block,
+    so this assertion fails and is reported ``xfailed``. ``strict=True`` makes it FLIP to a hard
+    failure (forcing un-xfail) the moment Task 5 makes the live response SEC-001 compliant.
+    """
+    client = TestClient(create_app(store=InMemoryStore()))
+    run_id = client.post("/demo/run").json()["run_id"]
+
+    verify_checks = client.post(f"/runs/{run_id}/verify").json()["checks"]
+    assert "clv" not in verify_checks  # SEC-001: CLV must never appear in the checks block
+    assert set(verify_checks) >= _SEVEN_CHECK_IDS
+
+    proof_checks = client.get(f"/runs/{run_id}").json()["checks"]
+    assert "clv" not in proof_checks
+    assert set(proof_checks) >= _SEVEN_CHECK_IDS

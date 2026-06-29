@@ -5,33 +5,100 @@
   "recomputed_evidence_hash": "3f082b3504e0e5164c692ffd2e12265dabe3e1ce5b103a26499e371939c7d8d6",
   "manifest_hash": "2e8316f041d8e4e3f03f972e554ca64e5a489963c6012e96e2ab72ddd05b9748",
   "checks": {
-    "clv": {
-      "result": "pass",
-      "scored_actions": 4
-    },
     "evidence_integrity": {
+      "id": "evidence_integrity",
+      "label": "Evidence Integrity",
       "result": "pass",
+      "severity": "blocking",
       "method": "sha256_evidence_hash",
-      "recomputed_match": true,
-      "error": null,
-      "note": "recomputes sha256 over run_events and compares against stored evidence_hash; fails-closed on any mismatch or recompute error"
+      "scope": "run_events",
+      "evidence_refs": ["evidence_hash"],
+      "rules": [],
+      "details": { "recomputed_match": true },
+      "error": null
     },
     "llm_boundary": {
+      "id": "llm_boundary",
+      "label": "LLM Boundary",
       "result": "pass",
+      "severity": "blocking",
       "method": "static_import_audit",
-      "scope": [
-        "law/",
-        "scoring.py",
-        "leaderboard.py",
-        "verifier/",
-        "checks/",
-        "ingest/",
-        "policy/"
-      ],
-      "note": "LLM SDK imports are forbidden in the deterministic trust path; the LLM decision shell is outside this scope."
+      "scope": "law/, scoring.py, leaderboard.py, verifier/, checks/, ingest/, policy/",
+      "evidence_refs": [],
+      "rules": [],
+      "details": { "note": "LLM SDK imports forbidden in the deterministic trust path" },
+      "error": null
+    },
+    "metrics_recomputed": {
+      "id": "metrics_recomputed",
+      "label": "Score Recomputed",
+      "result": "pass",
+      "severity": "blocking",
+      "method": "deterministic_recompute",
+      "scope": "score_rows",
+      "evidence_refs": [],
+      "rules": [],
+      "details": { "scored_actions": 4 },
+      "error": null
+    },
+    "manifest_bound": {
+      "id": "manifest_bound",
+      "label": "Manifest Bound",
+      "result": "pass",
+      "severity": "blocking",
+      "method": "manifest_hash_binding",
+      "scope": "run_manifest",
+      "evidence_refs": ["manifest_hash"],
+      "rules": [],
+      "details": {},
+      "error": null
+    },
+    "policy_obeyed": {
+      "id": "policy_obeyed",
+      "label": "Policy Obeyed",
+      "result": "pass",
+      "severity": "blocking",
+      "method": "policy_replay",
+      "scope": "policy_envelope",
+      "evidence_refs": [],
+      "rules": [],
+      "details": {},
+      "error": null
+    },
+    "receipt_separation": {
+      "id": "receipt_separation",
+      "label": "Receipt Separation",
+      "result": "pass",
+      "severity": "blocking",
+      "method": "receipt_evidence_flag",
+      "scope": "execution_records",
+      "evidence_refs": [],
+      "rules": [],
+      "details": { "receipts_in_evidence": false },
+      "error": null
+    },
+    "anchor": {
+      "id": "anchor",
+      "label": "On-Chain Anchor",
+      "result": "not_applicable",
+      "severity": "info",
+      "method": "solana_memo_anchor",
+      "scope": "run_manifest_hash",
+      "evidence_refs": [],
+      "rules": [],
+      "details": { "anchor_status": "not_anchored" },
+      "error": null
     }
   },
-  "metrics": null,
+  "metrics": {
+    "clv": null,
+    "sim_pnl": null,
+    "brier": null,
+    "max_drawdown": null,
+    "hit_rate": null,
+    "scored_actions": 4,
+    "per_agent": []
+  },
   "anchor": {
     "status": "not_anchored",
     "signature": null,
@@ -58,36 +125,104 @@
       "run_event_count": 6
     },
     "checks": {
-      "clv": {
-        "result": "pass",
-        "scored_actions": 4
-      },
       "evidence_integrity": {
+        "id": "evidence_integrity",
+        "label": "Evidence Integrity",
         "result": "pass",
+        "severity": "blocking",
         "method": "sha256_evidence_hash",
-        "recomputed_match": true,
-        "error": null,
-        "note": "recomputes sha256 over run_events and compares against stored evidence_hash; fails-closed on any mismatch or recompute error"
+        "scope": "run_events",
+        "evidence_refs": ["evidence_hash"],
+        "rules": [],
+        "details": { "recomputed_match": true },
+        "error": null
       },
       "llm_boundary": {
+        "id": "llm_boundary",
+        "label": "LLM Boundary",
         "result": "pass",
+        "severity": "blocking",
         "method": "static_import_audit",
-        "scope": [
-          "law/",
-          "scoring.py",
-          "leaderboard.py",
-          "verifier/",
-          "checks/",
-          "ingest/",
-          "policy/"
-        ],
-        "note": "LLM SDK imports are forbidden in the deterministic trust path; the LLM decision shell is outside this scope."
+        "scope": "law/, scoring.py, leaderboard.py, verifier/, checks/, ingest/, policy/",
+        "evidence_refs": [],
+        "rules": [],
+        "details": { "note": "LLM SDK imports forbidden in the deterministic trust path" },
+        "error": null
+      },
+      "metrics_recomputed": {
+        "id": "metrics_recomputed",
+        "label": "Score Recomputed",
+        "result": "pass",
+        "severity": "blocking",
+        "method": "deterministic_recompute",
+        "scope": "score_rows",
+        "evidence_refs": [],
+        "rules": [],
+        "details": { "scored_actions": 4 },
+        "error": null
+      },
+      "manifest_bound": {
+        "id": "manifest_bound",
+        "label": "Manifest Bound",
+        "result": "pass",
+        "severity": "blocking",
+        "method": "manifest_hash_binding",
+        "scope": "run_manifest",
+        "evidence_refs": ["manifest_hash"],
+        "rules": [],
+        "details": {},
+        "error": null
+      },
+      "policy_obeyed": {
+        "id": "policy_obeyed",
+        "label": "Policy Obeyed",
+        "result": "pass",
+        "severity": "blocking",
+        "method": "policy_replay",
+        "scope": "policy_envelope",
+        "evidence_refs": [],
+        "rules": [],
+        "details": {},
+        "error": null
+      },
+      "receipt_separation": {
+        "id": "receipt_separation",
+        "label": "Receipt Separation",
+        "result": "pass",
+        "severity": "blocking",
+        "method": "receipt_evidence_flag",
+        "scope": "execution_records",
+        "evidence_refs": [],
+        "rules": [],
+        "details": { "receipts_in_evidence": false },
+        "error": null
+      },
+      "anchor": {
+        "id": "anchor",
+        "label": "On-Chain Anchor",
+        "result": "not_applicable",
+        "severity": "info",
+        "method": "solana_memo_anchor",
+        "scope": "run_manifest_hash",
+        "evidence_refs": [],
+        "rules": [],
+        "details": { "anchor_status": "not_anchored" },
+        "error": null
       }
     },
     "anchor": {
       "status": "not_anchored",
       "signature": null,
       "cluster": "devnet"
+    },
+    "metrics": {
+      "clv": null,
+      "sim_pnl": null,
+      "brier": null,
+      "max_drawdown": null,
+      "hit_rate": null,
+      "scored_actions": 4,
+      "per_agent": []
     }
   }
 }
