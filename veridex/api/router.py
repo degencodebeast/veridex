@@ -444,6 +444,25 @@ def create_app(store: Store | None = None, settings: Settings | None = None) -> 
             proof_mode_map=run_result.proof_mode_map,
             code_prompt_schema_versions=dict(SCHEMA_VERSIONS),
         )
+
+        # Bind the per-domain root forest identically to seal time (competition.py) so the
+        # route-rebuilt manifest_hash stays byte-identical — inputs are reproducible from the
+        # persisted RunResult (run_events / source_mode / agent_ids).
+        from veridex.chain.merkle import build_root_forest
+
+        manifest["root_forest"] = build_root_forest(
+            event_log=run_result.run_events,
+            score_rows=scores,
+            receipts=[],  # demo path runs no executor lane
+            policy_results=[],
+            competition=[
+                {
+                    "run_id": run_result.run_id,
+                    "source_mode": run_result.source_mode,
+                    "agent_ids": run_result.agent_ids,
+                }
+            ],
+        )
         manifest_hash = run_manifest_hash(manifest)
 
         meta = _run_meta.get(run_id, {})

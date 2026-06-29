@@ -319,4 +319,7 @@ def test_run_manifest_uses_run_fields() -> None:
         proof_mode_map=manifest["proof_mode_map"],
         code_prompt_schema_versions=manifest["code_prompt_schema_versions"],
     )
+    # The per-domain root forest (Pre-2C) is bound into the canonical manifest before hashing,
+    # so a faithful rebuild must carry it too (it is part of what manifest_hash commits to).
+    rebuilt["root_forest"] = manifest["root_forest"]
     assert run_manifest_hash(rebuilt) == result.manifest_hash

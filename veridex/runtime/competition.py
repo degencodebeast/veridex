@@ -187,6 +187,16 @@ async def run_demo_competition(
         proof_mode_map=run.proof_mode_map,
         code_prompt_schema_versions=dict(SCHEMA_VERSIONS),
     )
+
+    from veridex.chain.merkle import build_root_forest  # local import keeps trust-core load light
+
+    manifest["root_forest"] = build_root_forest(
+        event_log=run.run_events,
+        score_rows=scores,
+        receipts=[],  # demo path runs no executor lane
+        policy_results=[],
+        competition=[{"run_id": run.run_id, "source_mode": source_mode, "agent_ids": run.agent_ids}],
+    )
     manifest_hash = run_manifest_hash(manifest)
 
     # --- anchor (injectable; default real, mocked offline, skippable via None) ----------

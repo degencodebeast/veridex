@@ -48,3 +48,35 @@ def merkle_root(leaves: list[str]) -> str:
 def domain_root(records: list[Any]) -> str:
     """Merkle root over a domain's records (each canonically hashed, in the given order)."""
     return merkle_root([leaf_hash(r) for r in records])
+
+
+def build_root_forest(
+    *,
+    event_log: list[Any],
+    score_rows: list[Any],
+    receipts: list[Any],
+    policy_results: list[Any],
+    competition: list[Any],
+    payout_reserved: list[Any] | None = None,
+) -> dict[str, str]:
+    """Compute per-domain Merkle roots so validation + anchoring bind to sealed records.
+
+    Args:
+        event_log: The sealed RunEvent dicts (event-log domain).
+        score_rows: The derived score rows (score domain).
+        receipts: Execution receipt payloads (receipt domain; non-scoring — SEC-004).
+        policy_results: Policy-result payloads (policy domain).
+        competition: Competition meta/config records (competition domain).
+        payout_reserved: Reserved for Phase 2D; ``None`` ⇒ empty (Plan A never populates it).
+
+    Returns:
+        ``{event_log, score, receipt, policy, competition, payout_reserved}`` → hex roots.
+    """
+    return {
+        "event_log": domain_root(event_log),
+        "score": domain_root(score_rows),
+        "receipt": domain_root(receipts),
+        "policy": domain_root(policy_results),
+        "competition": domain_root(competition),
+        "payout_reserved": domain_root(payout_reserved or []),
+    }
