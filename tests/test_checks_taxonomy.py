@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import hashlib
+
 from tests._arena_fixtures import finished_run_result
+from veridex.chain.anchor import run_manifest, run_manifest_hash
 from veridex.checks.build import (
     build_check_results,
     build_performance_metrics,
@@ -14,6 +17,7 @@ from veridex.checks.result import (
     CheckId,
     CheckResult,
 )
+from veridex.runtime.evidence import serialize_payload
 from veridex.scoring import score_run
 
 
@@ -125,3 +129,74 @@ def test_performance_metrics_carry_clv_not_checks() -> None:
     run = finished_run_result()
     metrics = build_performance_metrics(score_run(run))
     assert "clv" in metrics and "max_drawdown" in metrics and "hit_rate" in metrics
+
+
+def _manifest_for(run, scores):
+    return run_manifest(
+        run_id=run.run_id,
+        fixture_or_window_id="fx",
+        agent_ids=run.agent_ids,
+        action_evidence_root=run.evidence_hash,
+        score_root=hashlib.sha256(serialize_payload(scores).encode()).hexdigest(),
+        proof_mode_map=run.proof_mode_map,
+        code_prompt_schema_versions={"verifier": "v0"},
+    )
+
+
+def test_manifest_bound_not_applicable_without_manifest() -> None:
+    run = finished_run_result()
+    mb = {r.id: r for r in build_check_results(scores=score_run(run), run=run)}[CheckId.MANIFEST_BOUND]
+    assert mb.result == "not_applicable"
+
+
+def test_manifest_bound_pass_on_consistent_manifest() -> None:
+    run = finished_run_result()
+    scores = score_run(run)
+    manifest = _manifest_for(run, scores)
+    mb = {
+        r.id: r
+        for r in build_check_results(
+            scores=scores, run=run, manifest=manifest, manifest_hash=run_manifest_hash(manifest)
+        )
+    }[CheckId.MANIFEST_BOUND]
+    assert mb.result == "pass"
+
+
+def test_manifest_bound_fail_on_wrong_evidence_root() -> None:
+    run = finished_run_result()
+    scores = score_run(run)
+    manifest = _manifest_for(run, scores)
+    manifest["action_evidence_root"] = "deadbeef"
+    mb = {r.id: r for r in build_check_results(scores=scores, run=run, manifest=manifest)}[CheckId.MANIFEST_BOUND]
+    assert mb.result == "fail" and any("action_evidence_root" in str(rule) for rule in mb.rules)
+
+
+def test_manifest_bound_fails_closed_on_unserializable_manifest() -> None:
+    # CON-2B-02: a manifest that cannot be canonically serialized must yield a `fail`
+    # CheckResult with a populated error, never propagate an exception out of the pass.
+    run = finished_run_result()
+    scores = score_run(run)
+    manifest = {"run_id": run.run_id, "nonserializable": {1, 2, 3}}  # set is not JSON-serializable
+    mb = {r.id: r for r in build_check_results(scores=scores, run=run, manifest=manifest, manifest_hash="deadbeef")}[
+        CheckId.MANIFEST_BOUND
+    ]
+    assert mb.result == "fail" and mb.error is not None
+
+
+def test_anchor_not_applicable_offline_replay() -> None:
+    run = finished_run_result()
+    a = {r.id: r for r in build_check_results(scores=score_run(run), run=run, source_mode="replay")}[CheckId.ANCHOR]
+    assert a.result == "not_applicable"
+
+
+def test_anchor_pending_when_live_unanchored() -> None:
+    run = finished_run_result()
+    a = {r.id: r for r in build_check_results(scores=score_run(run), run=run, source_mode="live")}[CheckId.ANCHOR]
+    assert a.result == "pending"
+
+
+def test_anchor_pass_when_anchored() -> None:
+    run = finished_run_result()
+    anchor = {"status": "anchored", "signature": "sig123", "cluster": "devnet"}
+    a = {r.id: r for r in build_check_results(scores=score_run(run), run=run, anchor=anchor)}[CheckId.ANCHOR]
+    assert a.result == "pass"

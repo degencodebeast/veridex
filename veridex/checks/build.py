@@ -11,16 +11,18 @@ as ``not_applicable`` so the list is always length-7 and stably ordered.
 
 from __future__ import annotations
 
+import hashlib
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from veridex.chain.anchor import run_manifest_hash
 from veridex.checks.result import (
     CHECK_LABELS,
     CHECK_SEVERITY,
     CheckId,
     CheckResult,
 )
-from veridex.runtime.evidence import compute_evidence_hash
+from veridex.runtime.evidence import compute_evidence_hash, serialize_payload
 from veridex.scoring import score_run
 from veridex.verifier.import_audit import assert_no_llm_imports
 
@@ -126,6 +128,74 @@ def _metrics_recomputed(scores: list[dict[str, Any]], run: RunResult) -> CheckRe
         )
 
 
+def _manifest_bound(
+    scores: list[dict[str, Any]],
+    run: RunResult,
+    manifest: dict[str, Any] | None,
+    manifest_hash: str | None,
+) -> CheckResult:
+    """Verify the manifest binds the same run/evidence/score-root/lineage as the card.
+
+    Fail-closed (CON-2B-02): an unserializable/malformed manifest (e.g. one that breaks the
+    canonical hash) yields a ``fail`` verdict with a populated ``error`` — never a raised
+    exception that would crash the whole check pass.
+    """
+    if manifest is None:
+        return _not_applicable(CheckId.MANIFEST_BOUND, method="manifest_field_binding", scope="run_manifest")
+    try:
+        expected_score_root = hashlib.sha256(serialize_payload(scores).encode("utf-8")).hexdigest()
+        mismatches: list[dict[str, Any]] = []
+        checks: dict[str, bool] = {
+            "run_id": manifest.get("run_id") == run.run_id,
+            "action_evidence_root": manifest.get("action_evidence_root") == run.evidence_hash,
+            "score_root": manifest.get("score_root") == expected_score_root,
+            "proof_mode_map": manifest.get("proof_mode_map") == run.proof_mode_map,
+            "code_prompt_schema_versions": bool(manifest.get("code_prompt_schema_versions")),
+        }
+        if manifest_hash is not None:
+            checks["manifest_hash"] = run_manifest_hash(manifest) == manifest_hash
+        for field, ok in checks.items():
+            if not ok:
+                mismatches.append({"field": field, "bound": False})
+        return _result(
+            CheckId.MANIFEST_BOUND,
+            "pass" if not mismatches else "fail",
+            method="manifest_field_binding",
+            scope="run_manifest",
+            evidence_refs=["evidence_hash", "score_root"],
+            rules=mismatches if mismatches else [{"all_bound": True}],
+            details={"bound_fields": sorted(checks)},
+        )
+    except Exception as e:  # unserializable/malformed manifest = binding FAIL, never a crash
+        return _result(
+            CheckId.MANIFEST_BOUND,
+            "fail",
+            method="manifest_field_binding",
+            scope="run_manifest",
+            evidence_refs=["evidence_hash", "score_root"],
+            error=f"{type(e).__name__}: {e}",
+        )
+
+
+def _anchor(anchor: dict[str, Any] | None, source_mode: str | None) -> CheckResult:
+    """Honest anchor verdict: anchored→pass, pending→pending, unanchored→na(replay)/pending(live)."""
+    data = anchor or {}
+    status = data.get("status", "not_anchored")
+    if status == "anchored" and data.get("signature"):
+        return _result(
+            CheckId.ANCHOR,
+            "pass",
+            method="memo_anchor",
+            scope="solana_memo",
+            details={"signature": data["signature"], "cluster": data.get("cluster")},
+        )
+    if status == "pending":
+        return _result(CheckId.ANCHOR, "pending", method="memo_anchor", scope="solana_memo")
+    # not_anchored: pure offline replay is honestly not_applicable; live is awaiting its batch.
+    result = "not_applicable" if source_mode == "replay" else "pending"
+    return _result(CheckId.ANCHOR, result, method="memo_anchor", scope="solana_memo")
+
+
 def _not_applicable(check_id: CheckId, *, method: str, scope: str) -> CheckResult:
     """A placeholder verdict for a check whose inputs are absent (honest not_applicable)."""
     return _result(check_id, "not_applicable", method=method, scope=scope)
@@ -159,10 +229,10 @@ def build_check_results(
         _evidence_integrity(run),
         _llm_boundary(),
         _metrics_recomputed(scores, run),
-        _not_applicable(CheckId.MANIFEST_BOUND, method="manifest_field_binding", scope="run_manifest"),
+        _manifest_bound(scores, run, manifest, manifest_hash),
         _not_applicable(CheckId.POLICY_OBEYED, method="policy_event_audit", scope="competition_events"),
         _not_applicable(CheckId.RECEIPT_SEPARATION, method="evidence_flag_audit", scope="competition_events"),
-        _not_applicable(CheckId.ANCHOR, method="memo_anchor", scope="solana_memo"),
+        _anchor(anchor, source_mode),
     ]
 
 
