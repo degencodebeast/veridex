@@ -186,6 +186,53 @@ def test_policy_result_event_secret_free() -> None:
     assert secret_keys.isdisjoint(ev.payload.keys())
 
 
+def test_policy_result_event_threads_execution_id() -> None:
+    """Plan-A Task 4: execution_id is threaded into the policy_result payload so POLICY_OBEYED
+    can correlate a DENIED decision with a submit for the same execution."""
+    payload = {"decision": "denied", "reason_codes": ["slippage_over_max"], "policy_hash": "ph"}
+    ev = build_policy_result_event(
+        competition_id="c",
+        run_id="r",
+        seq=20,
+        event_ts=0,
+        agent_id="a",
+        source_sequence_no_ref=3,
+        policy_result_payload=payload,
+        execution_id="r:3",
+    )
+    assert ev.payload["execution_id"] == "r:3"
+    assert ev.payload_hash == event_payload_hash({**payload, "execution_id": "r:3"})
+    assert "execution_id" not in payload  # caller's dict is not mutated
+
+
+def test_policy_result_execution_id_is_additive_and_evidence_safe() -> None:
+    """AC-213: threading execution_id changes ONLY this derived event's own payload_hash and
+    never the sealed prefix — the event stays evidence=False / non-evidence."""
+    payload = {"decision": "denied", "reason_codes": [], "policy_hash": "ph"}
+    bare = build_policy_result_event(
+        competition_id="c",
+        run_id="r",
+        seq=20,
+        event_ts=0,
+        agent_id="a",
+        source_sequence_no_ref=3,
+        policy_result_payload=payload,
+    )
+    enriched = build_policy_result_event(
+        competition_id="c",
+        run_id="r",
+        seq=20,
+        event_ts=0,
+        agent_id="a",
+        source_sequence_no_ref=3,
+        policy_result_payload=payload,
+        execution_id="r:3",
+    )
+    assert bare.evidence is False and enriched.evidence is False
+    assert "execution_id" not in bare.payload  # default omits the key entirely
+    assert enriched.payload_hash != bare.payload_hash  # additive change is confined to this event
+
+
 def test_execution_submitted_event_is_derived() -> None:
     """build_execution_submitted_event produces evidence=False with correct derived_from."""
     payload = {"venue": "sx_bet", "market_ref": "OU|2.5|full", "side": "over", "size": 100.0}

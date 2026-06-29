@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+from typing import Any
 
 from tests._arena_fixtures import finished_run_result
 from veridex.chain.anchor import run_manifest, run_manifest_hash
@@ -17,7 +18,13 @@ from veridex.checks.result import (
     CheckId,
     CheckResult,
 )
-from veridex.runtime.evidence import serialize_payload
+from veridex.competition.events import (
+    build_execution_receipt_event,
+    build_execution_submitted_event,
+    build_policy_result_event,
+)
+from veridex.policy.engine import PolicyDecision
+from veridex.runtime.evidence import compute_evidence_hash, serialize_payload
 from veridex.scoring import score_run
 
 
@@ -200,3 +207,135 @@ def test_anchor_pass_when_anchored() -> None:
     anchor = {"status": "anchored", "signature": "sig123", "cluster": "devnet"}
     a = {r.id: r for r in build_check_results(scores=score_run(run), run=run, anchor=anchor)}[CheckId.ANCHOR]
     assert a.result == "pass"
+
+
+# ---------------------------------------------------------------------------
+# Task 4 — POLICY_OBEYED + RECEIPT_SEPARATION (from REAL derived-event producers).
+#
+# These build the derived events via the SAME constructors the executor lane uses
+# (`build_policy_result_event` / `build_execution_submitted_event` /
+# `build_execution_receipt_event`) — NEVER hand-injecting fields — so the checks are
+# proven non-inert against the production event shape, not a synthetic fixture.
+# ---------------------------------------------------------------------------
+
+
+def _real_exec_events(*, bypass: bool = False) -> list[dict[str, Any]]:
+    """Two executions via the real producers: one DENIED (``run:3``), one APPROVED+filled (``run:5``).
+
+    When ``bypass`` is True the DENIED execution ``run:3`` ALSO gets an ``execution_submitted``
+    — the exact denied-then-submitted bypass POLICY_OBEYED must catch.
+    """
+    denied = build_policy_result_event(
+        competition_id="c",
+        run_id="run",
+        seq=1,
+        event_ts=0,
+        agent_id="a",
+        source_sequence_no_ref=3,
+        policy_result_payload={
+            "decision": PolicyDecision.DENIED.value,
+            "reason_codes": ["slippage_over_max"],
+            "policy_hash": "ph",
+        },
+        execution_id="run:3",
+    )
+    approved = build_policy_result_event(
+        competition_id="c",
+        run_id="run",
+        seq=2,
+        event_ts=0,
+        agent_id="b",
+        source_sequence_no_ref=5,
+        policy_result_payload={
+            "decision": PolicyDecision.APPROVED.value,
+            "reason_codes": [],
+            "policy_hash": "ph",
+        },
+        execution_id="run:5",
+    )
+    submitted = build_execution_submitted_event(
+        competition_id="c",
+        run_id="run",
+        seq=3,
+        event_ts=0,
+        execution_id="run:5",
+        payload={"execution_id": "run:5", "agent_id": "b"},
+    )
+    receipt = build_execution_receipt_event(
+        competition_id="c",
+        run_id="run",
+        seq=4,
+        event_ts=0,
+        execution_id="run:5",
+        receipt_payload={"execution_id": "run:5", "status": "filled"},
+    )
+    events = [denied, approved, submitted, receipt]
+    if bypass:
+        events.append(
+            build_execution_submitted_event(
+                competition_id="c",
+                run_id="run",
+                seq=5,
+                event_ts=0,
+                execution_id="run:3",
+                payload={"execution_id": "run:3", "agent_id": "a"},
+            )
+        )
+    return [e.model_dump(mode="json") for e in events]
+
+
+def test_policy_obeyed_pass_no_bypass() -> None:
+    run = finished_run_result()
+    po = {r.id: r for r in build_check_results(scores=score_run(run), run=run, events=_real_exec_events())}[
+        CheckId.POLICY_OBEYED
+    ]
+    assert po.result == "pass"
+    assert po.details["denied_count"] == 1
+
+
+def test_policy_obeyed_fail_on_denied_then_submitted() -> None:
+    # The whole point: a DENIED policy result whose execution was nonetheless submitted.
+    run = finished_run_result()
+    po = {r.id: r for r in build_check_results(scores=score_run(run), run=run, events=_real_exec_events(bypass=True))}[
+        CheckId.POLICY_OBEYED
+    ]
+    assert po.result == "fail"
+    assert any("run:3" in str(rule) for rule in po.rules)
+
+
+def test_receipt_separation_pass_when_all_derived() -> None:
+    run = finished_run_result()
+    rs = {r.id: r for r in build_check_results(scores=score_run(run), run=run, events=_real_exec_events())}[
+        CheckId.RECEIPT_SEPARATION
+    ]
+    assert rs.result == "pass"
+
+
+def test_receipt_separation_fail_when_receipt_is_evidence() -> None:
+    run = finished_run_result()
+    events = _real_exec_events()
+    for e in events:
+        if e["event_type"] == "execution_receipt":
+            e["evidence"] = True  # a receipt leaked into the evidence prefix (SEC-004 violation)
+    rs = {r.id: r for r in build_check_results(scores=score_run(run), run=run, events=events)}[
+        CheckId.RECEIPT_SEPARATION
+    ]
+    assert rs.result == "fail"
+    assert any("execution_receipt" in str(rule) for rule in rs.rules)
+
+
+def test_policy_and_receipt_not_applicable_without_events() -> None:
+    run = finished_run_result()
+    results = {r.id: r for r in build_check_results(scores=score_run(run), run=run)}
+    assert results[CheckId.POLICY_OBEYED].result == "not_applicable"
+    assert results[CheckId.RECEIPT_SEPARATION].result == "not_applicable"
+
+
+def test_evidence_hash_independent_of_policy_result_enrichment() -> None:
+    # AC-213 sealed-prefix parity: the policy_result enrichment lives in the derived,
+    # evidence=False tail — recomputing the sealed evidence hash is byte-identical.
+    run = finished_run_result()
+    sealed = compute_evidence_hash(run.run_events)
+    assert sealed == run.evidence_hash
+    _ = _real_exec_events(bypass=True)  # building enriched derived events touches nothing sealed
+    assert compute_evidence_hash(run.run_events) == sealed

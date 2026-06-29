@@ -201,6 +201,90 @@ def _not_applicable(check_id: CheckId, *, method: str, scope: str) -> CheckResul
     return _result(check_id, "not_applicable", method=method, scope=scope)
 
 
+#: The derived (``evidence=False``) executor-lane event types RECEIPT_SEPARATION audits.
+_EXEC_EVENT_TYPES = {"policy_result", "execution_submitted", "execution_receipt", "approval_audit"}
+
+
+def _execution_id_from_derived(derived_from: list[str]) -> str | None:
+    """Pull the execution-record id from a derived_from ref like ``execution_record:{id}``."""
+    for ref in derived_from:
+        if ref.startswith("execution_record:"):
+            return ref.split(":", 1)[1]
+    return None
+
+
+def _policy_obeyed(events: list[dict[str, Any]] | None) -> CheckResult:
+    """Assert no DENIED policy result was followed by a submit for the same execution.
+
+    POLICY_OBEYED correlates a ``denied`` ``policy_result`` (by its ``payload.execution_id``,
+    threaded by the executor lane) with any ``execution_submitted`` for that execution record.
+    Honest ``not_applicable`` (no policy events) stays OUTSIDE the try; a present-but-malformed
+    event stream fails closed (CON-2B-02) rather than crashing the whole check pass.
+    """
+    if not events or not any(e.get("event_type") == "policy_result" for e in events):
+        return _not_applicable(CheckId.POLICY_OBEYED, method="policy_event_audit", scope="competition_events")
+    try:
+        denied_exec_ids = {
+            e.get("payload", {}).get("execution_id")
+            for e in events
+            if e.get("event_type") == "policy_result" and e.get("payload", {}).get("decision") == "denied"
+        }
+        denied_exec_ids.discard(None)
+        submitted_exec_ids = {
+            _execution_id_from_derived(e.get("derived_from", []))
+            for e in events
+            if e.get("event_type") == "execution_submitted"
+        }
+        submitted_exec_ids.discard(None)
+        bypassed = sorted(denied_exec_ids & submitted_exec_ids)
+        return _result(
+            CheckId.POLICY_OBEYED,
+            "pass" if not bypassed else "fail",
+            method="policy_event_audit",
+            scope="competition_events",
+            rules=[{"bypassed_execution_id": eid} for eid in bypassed] or [{"no_bypass": True}],
+            details={"denied_count": len(denied_exec_ids)},
+        )
+    except Exception as e:  # a malformed/unscannable event stream fails closed, never crashes
+        return _result(
+            CheckId.POLICY_OBEYED,
+            "fail",
+            method="policy_event_audit",
+            scope="competition_events",
+            error=f"{type(e).__name__}: {e}",
+        )
+
+
+def _receipt_separation(events: list[dict[str, Any]] | None) -> CheckResult:
+    """Assert every policy/execution event stayed ``evidence=False`` (the SEC-004 invariant).
+
+    Execution receipts/fills are production-readiness evidence only: any one that leaked into
+    the sealed evidence prefix (``evidence is True``) is a ``fail``. Honest ``not_applicable``
+    (no executor-lane events) stays OUTSIDE the try; a malformed stream fails closed.
+    """
+    if not events or not any(e.get("event_type") in _EXEC_EVENT_TYPES for e in events):
+        return _not_applicable(CheckId.RECEIPT_SEPARATION, method="evidence_flag_audit", scope="competition_events")
+    try:
+        exec_events = [e for e in events if e.get("event_type") in _EXEC_EVENT_TYPES]
+        leaked = [e for e in exec_events if e.get("evidence") is True]
+        return _result(
+            CheckId.RECEIPT_SEPARATION,
+            "pass" if not leaked else "fail",
+            method="evidence_flag_audit",
+            scope="competition_events",
+            rules=[{"leaked_event_type": e.get("event_type")} for e in leaked] or [{"all_derived": True}],
+            details={"execution_event_count": len(exec_events)},
+        )
+    except Exception as e:  # a malformed/unscannable event stream fails closed, never crashes
+        return _result(
+            CheckId.RECEIPT_SEPARATION,
+            "fail",
+            method="evidence_flag_audit",
+            scope="competition_events",
+            error=f"{type(e).__name__}: {e}",
+        )
+
+
 def build_check_results(
     *,
     scores: list[dict[str, Any]],
@@ -230,8 +314,8 @@ def build_check_results(
         _llm_boundary(),
         _metrics_recomputed(scores, run),
         _manifest_bound(scores, run, manifest, manifest_hash),
-        _not_applicable(CheckId.POLICY_OBEYED, method="policy_event_audit", scope="competition_events"),
-        _not_applicable(CheckId.RECEIPT_SEPARATION, method="evidence_flag_audit", scope="competition_events"),
+        _policy_obeyed(events),
+        _receipt_separation(events),
         _anchor(anchor, source_mode),
     ]
 

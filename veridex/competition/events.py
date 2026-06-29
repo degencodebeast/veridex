@@ -280,6 +280,7 @@ def build_policy_result_event(
     agent_id: str,
     source_sequence_no_ref: int,
     policy_result_payload: dict[str, Any],
+    execution_id: str | None = None,
 ) -> CompetitionEvent:
     """Build a Phase-2B ``POLICY_RESULT`` derived event (executor lane only).
 
@@ -298,11 +299,18 @@ def build_policy_result_event(
         policy_result_payload: The :class:`~veridex.competition.policy.PolicyResult` as a
             plain dict (``decision``, ``reason_codes``, ``policy_hash``). Must be
             secret-free.
+        execution_id: The execution-record id this decision governs. Threaded into the
+            payload (additively) so POLICY_OBEYED can correlate a ``denied`` decision with a
+            submit for the same execution (Plan-A Task 4). ``None`` (e.g. a pre-quote deny
+            with no record yet) leaves the payload untouched — a missing id simply cannot be
+            a bypass, so no false positive. This stays a DERIVED, ``evidence=False`` event:
+            the field changes only this event's own ``payload_hash``, never the sealed prefix.
 
     Returns:
         A :class:`CompetitionEvent` with ``evidence=False``, ``source_sequence_no=None``,
         and ``derived_from=["score_row:{agent_id}:seq-{source_sequence_no_ref}"]``.
     """
+    payload = policy_result_payload if execution_id is None else {**policy_result_payload, "execution_id": execution_id}
     return CompetitionEvent(
         competition_id=competition_id,
         run_id=run_id,
@@ -312,8 +320,8 @@ def build_policy_result_event(
         evidence=False,
         source_sequence_no=None,
         derived_from=[f"score_row:{agent_id}:seq-{source_sequence_no_ref}"],
-        payload=policy_result_payload,
-        payload_hash=event_payload_hash(policy_result_payload),
+        payload=payload,
+        payload_hash=event_payload_hash(payload),
     )
 
 

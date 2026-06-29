@@ -237,6 +237,7 @@ async def run_execution_lane(
                     "reason_codes": list(result.reason_codes),
                     "policy_hash": result.policy_hash,
                 },
+                execution_id=execution_id,
             )
         )
         seq += 1
@@ -488,6 +489,7 @@ async def resolve_approval(
                     "reason_codes": reason_codes,
                     "policy_hash": result_policy_hash,
                 },
+                execution_id=record.execution_id,
             )
         )
         seq += 1
