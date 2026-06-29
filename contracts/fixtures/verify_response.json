@@ -1,0 +1,93 @@
+{
+  "run_id": "0ccc120de9024314a5a890e9fa34c370",
+  "verified": true,
+  "evidence_hash": "3f082b3504e0e5164c692ffd2e12265dabe3e1ce5b103a26499e371939c7d8d6",
+  "recomputed_evidence_hash": "3f082b3504e0e5164c692ffd2e12265dabe3e1ce5b103a26499e371939c7d8d6",
+  "manifest_hash": "2e8316f041d8e4e3f03f972e554ca64e5a489963c6012e96e2ab72ddd05b9748",
+  "checks": {
+    "clv": {
+      "result": "pass",
+      "scored_actions": 4
+    },
+    "evidence_integrity": {
+      "result": "pass",
+      "method": "sha256_evidence_hash",
+      "recomputed_match": true,
+      "error": null,
+      "note": "recomputes sha256 over run_events and compares against stored evidence_hash; fails-closed on any mismatch or recompute error"
+    },
+    "llm_boundary": {
+      "result": "pass",
+      "method": "static_import_audit",
+      "scope": [
+        "law/",
+        "scoring.py",
+        "leaderboard.py",
+        "verifier/",
+        "checks/",
+        "ingest/",
+        "policy/"
+      ],
+      "note": "LLM SDK imports are forbidden in the deterministic trust path; the LLM decision shell is outside this scope."
+    }
+  },
+  "metrics": null,
+  "anchor": {
+    "status": "not_anchored",
+    "signature": null,
+    "cluster": "devnet"
+  },
+  "proof_card": {
+    "verifier_version": "v0",
+    "run": {
+      "run_id": "0ccc120de9024314a5a890e9fa34c370",
+      "source_mode": "replay"
+    },
+    "lineage": {
+      "proof_mode_map": {
+        "agent-alpha": "reproducible",
+        "agent-beta": "reproducible"
+      },
+      "schema_versions": {
+        "action_schema": "sports_v0",
+        "verifier": "v0"
+      }
+    },
+    "evidence": {
+      "evidence_hash": "3f082b3504e0e5164c692ffd2e12265dabe3e1ce5b103a26499e371939c7d8d6",
+      "run_event_count": 6
+    },
+    "checks": {
+      "clv": {
+        "result": "pass",
+        "scored_actions": 4
+      },
+      "evidence_integrity": {
+        "result": "pass",
+        "method": "sha256_evidence_hash",
+        "recomputed_match": true,
+        "error": null,
+        "note": "recomputes sha256 over run_events and compares against stored evidence_hash; fails-closed on any mismatch or recompute error"
+      },
+      "llm_boundary": {
+        "result": "pass",
+        "method": "static_import_audit",
+        "scope": [
+          "law/",
+          "scoring.py",
+          "leaderboard.py",
+          "verifier/",
+          "checks/",
+          "ingest/",
+          "policy/"
+        ],
+        "note": "LLM SDK imports are forbidden in the deterministic trust path; the LLM decision shell is outside this scope."
+      }
+    },
+    "anchor": {
+      "status": "not_anchored",
+      "signature": null,
+      "cluster": "devnet"
+    }
+  }
+}

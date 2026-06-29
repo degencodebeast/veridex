@@ -55,6 +55,7 @@ from veridex.api.schemas import (
     KillSwitchResponse,
     LeaderboardResponse,
     LeaderboardRow,
+    VerifyResponse,
 )
 from veridex.api.ws import ArenaConnectionManager, register_arena_routes
 from veridex.competition.events import CompetitionEvent, EventType
@@ -383,6 +384,75 @@ def create_app(store: Store | None = None, settings: Settings | None = None) -> 
             checks=checks,
             anchor=anchor_block,
             schema_versions=dict(SCHEMA_VERSIONS),
+        )
+
+    # --- POST /runs/{run_id}/verify (WD-1 authoritative recompute, REQ-050 / AC-020) ------
+
+    @app.post("/runs/{run_id}/verify", response_model=VerifyResponse)
+    async def verify_run(run_id: str, dep_store: Store = Depends(_get_store)) -> VerifyResponse:  # noqa: B008
+        """Authoritatively recompute a sealed run: confirm the evidence hash + rebuild the proof.
+
+        The frontend NEVER reimplements the law (CON-003): it calls this, renders the returned
+        recompute + hash-confirmation, and opens the Solana tx. ``verified`` is ``True`` iff the
+        recomputed evidence hash matches the sealed one (fail-closed on any recompute error).
+        """
+        import hashlib
+        import json as _json
+
+        from veridex.runtime.evidence import compute_evidence_hash, serialize_payload
+
+        try:
+            run_result = await dep_store.load_run(run_id)
+        except KeyError:
+            raise HTTPException(status_code=404, detail=f"run {run_id!r} not found") from None
+
+        try:
+            recomputed = compute_evidence_hash(run_result.run_events)
+            verified = recomputed == run_result.evidence_hash
+        except Exception as exc:  # malformed/unrecomputable evidence = NOT verified, never a crash
+            recomputed = f"recompute_error:{type(exc).__name__}"
+            verified = False
+
+        scores = score_run(run_result)
+        checks = _default_checks(scores, run_result)
+        score_root = hashlib.sha256(serialize_payload(scores).encode("utf-8")).hexdigest()
+        first_tick = next((e for e in run_result.run_events if e.get("event_type") == "tick"), {})
+        fixture_id = "unknown"
+        if first_tick.get("state_snapshot_json"):
+            fixture_id = str(_json.loads(first_tick["state_snapshot_json"]).get("fixture_id", "unknown"))
+
+        from veridex.chain.anchor import run_manifest, run_manifest_hash
+
+        manifest = run_manifest(
+            run_id=run_result.run_id,
+            fixture_or_window_id=fixture_id,
+            agent_ids=run_result.agent_ids,
+            action_evidence_root=run_result.evidence_hash,
+            score_root=score_root,
+            proof_mode_map=run_result.proof_mode_map,
+            code_prompt_schema_versions=dict(SCHEMA_VERSIONS),
+        )
+        manifest_hash = run_manifest_hash(manifest)
+
+        meta = _run_meta.get(run_id, {})
+        anchor_block: dict[str, Any] = {
+            "status": meta.get("anchor_status", "not_anchored"),
+            "signature": None,
+            "cluster": DEFAULT_CLUSTER,
+        }
+        proof_card = proof_card_from_run_result(
+            run_result, checks=checks, anchor=anchor_block, schema_versions=dict(SCHEMA_VERSIONS)
+        )
+        return VerifyResponse(
+            run_id=run_id,
+            verified=verified,
+            evidence_hash=run_result.evidence_hash,
+            recomputed_evidence_hash=recomputed,
+            manifest_hash=manifest_hash,
+            checks=checks,
+            metrics=proof_card.get("metrics"),
+            anchor=anchor_block,
+            proof_card=proof_card,
         )
 
     # --- POST /competitions -----------------------------------------------

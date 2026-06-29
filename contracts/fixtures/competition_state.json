@@ -1,0 +1,112 @@
+{
+  "competition_id": "c_876af810c83b46f2b4d52c59f44d7afb",
+  "status": "finalized",
+  "config": {
+    "competition_type": "replay_arena",
+    "source_mode": "replay",
+    "execution_mode": "paper",
+    "market_scope": "WC:TEST",
+    "scoring_window": null,
+    "roster_size": 2,
+    "division": null,
+    "reward_policy": null,
+    "prize_vault_ref": null,
+    "operator_id": null,
+    "policy_envelope": null
+  },
+  "roster": [
+    {
+      "agent_id": "a",
+      "owner": "u",
+      "strategy": "value",
+      "model": null,
+      "proof_mode": "reproducible",
+      "config_hash": "4247905e2bd25ce884dd1a40fdb1541006bcc52608740a1026c6ea4ca4413be2",
+      "execution_eligibility": false
+    },
+    {
+      "agent_id": "b",
+      "owner": "u",
+      "strategy": "value",
+      "model": null,
+      "proof_mode": "reproducible",
+      "config_hash": "747ba28e4a8843bad013b12813c4e859468406f6f21472f8d633c2afc363a21d",
+      "execution_eligibility": false
+    }
+  ],
+  "leaderboard": [
+    {
+      "rank": 1,
+      "agent_id": "a",
+      "total_clv_bps": 184,
+      "mean_clv_bps": 92.0,
+      "valid_count": 2,
+      "proof_mode": "reproducible"
+    },
+    {
+      "rank": 2,
+      "agent_id": "b",
+      "total_clv_bps": -184,
+      "mean_clv_bps": -92.0,
+      "valid_count": 2,
+      "proof_mode": "reproducible"
+    }
+  ],
+  "latest_seq": 14,
+  "anchor_status": "not_anchored",
+  "run_id": "57545f0ae1d347cca4ace367e1b56d31",
+  "proof_card": {
+    "verifier_version": "v0",
+    "run": {
+      "run_id": "57545f0ae1d347cca4ace367e1b56d31",
+      "source_mode": "replay"
+    },
+    "lineage": {
+      "proof_mode_map": {
+        "a": "reproducible",
+        "b": "reproducible"
+      },
+      "schema_versions": {
+        "action_schema": "sports_v0",
+        "verifier": "v0"
+      }
+    },
+    "evidence": {
+      "evidence_hash": "3fb164ed8950b6df0299f1c232d8ba0d1a049229fb49352f889ff5e4764f56fd",
+      "run_event_count": 6
+    },
+    "checks": {
+      "clv": {
+        "result": "pass",
+        "scored_actions": 4
+      },
+      "evidence_integrity": {
+        "result": "pass",
+        "method": "sha256_evidence_hash",
+        "recomputed_match": true,
+        "error": null,
+        "note": "recomputes sha256 over run_events and compares against stored evidence_hash; fails-closed on any mismatch or recompute error"
+      },
+      "llm_boundary": {
+        "result": "pass",
+        "method": "static_import_audit",
+        "scope": [
+          "law/",
+          "scoring.py",
+          "leaderboard.py",
+          "verifier/",
+          "checks/",
+          "ingest/",
+          "policy/"
+        ],
+        "note": "LLM SDK imports are forbidden in the deterministic trust path; the LLM decision shell is outside this scope."
+      }
+    },
+    "anchor": {
+      "status": "not_anchored",
+      "signature": null,
+      "cluster": "devnet"
+    }
+  },
+  "execution": null
+}

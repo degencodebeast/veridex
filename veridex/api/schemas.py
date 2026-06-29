@@ -220,3 +220,69 @@ class CompetitionSummaryResponse(BaseModel):
     status: str
     config: dict[str, Any]
     run_id: str | None
+
+
+# ---------------------------------------------------------------------------
+# Phase-2C pinned view-model envelopes (Task 0 — API Surface Contract Freeze)
+#
+# These are the frozen read/control contracts the frontend (Plans C1/C2/D) binds to.
+# The backend returns assembled per-screen view-models, never a raw ``RunResult`` (CON-003).
+# SEC-001: the ``checks`` block holds ONLY the 7 CheckId; CLV/performance lives in ``metrics``.
+# ---------------------------------------------------------------------------
+
+
+class ProofArtifactResponse(BaseModel):
+    """The proof-card view-model the frontend renders (GET /runs/{run_id}). CLV lives in metrics."""
+
+    verifier_version: str
+    run: dict[str, Any]
+    lineage: dict[str, Any]
+    evidence: dict[str, Any]
+    checks: dict[str, Any]
+    anchor: dict[str, Any]
+    metrics: dict[str, Any] | None = None
+
+
+class VerifyResponse(BaseModel):
+    """WD-1 authoritative recompute (POST /runs/{run_id}/verify). C1's VerifyResult binds to this."""
+
+    run_id: str
+    verified: bool
+    evidence_hash: str
+    recomputed_evidence_hash: str
+    manifest_hash: str
+    checks: dict[str, Any]
+    metrics: dict[str, Any] | None = None
+    anchor: dict[str, Any]
+    proof_card: dict[str, Any]
+
+
+class InspectorRecord(BaseModel):
+    """Per-action forensic view-model (frontend adapter over GET /runs + events)."""
+
+    run_id: str
+    agent_id: str
+    tick_seq: int
+    market_state: dict[str, Any]
+    agent_action: dict[str, Any]
+    recompute: dict[str, Any]
+    clv_bps: int | str
+    untrusted_llm_metadata: dict[str, Any]
+
+
+class FeedHealthResponse(BaseModel):
+    """Feed-health view-model (Markets / cockpit feed-health strip)."""
+
+    source_mode: str
+    events_per_min: float | None
+    ws_live: bool
+    last_tick_ts: int | None
+    anchor_status: str
+
+
+class RuntimeEventsResponse(BaseModel):
+    """Agent Ops drawer feed (§4.4 OPS channel). Single-field object wrapper (mirrors
+    ``LeaderboardResponse{rows}``) so C2 binds field-name-exact to ``.events``; the ``agent_id``
+    is already in the request path, never echoed in the body. ``events`` are RuntimeEvent dicts."""
+
+    events: list[dict[str, Any]]

@@ -9,6 +9,7 @@
 !/veridex/
 !/tests/
 !/scripts/
+!/contracts/
 
 # planning/spec docs stay LOCAL — never pushed (per project decision)
 spec/
