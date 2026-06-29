@@ -13,10 +13,14 @@ watched fail (wrong verdict), then the minimal implementation turns them GREEN.
 
 from __future__ import annotations
 
+import copy
+
 import pytest
 
 from tests._arena_fixtures import finished_run_result
+from veridex.checks.build import build_performance_metrics
 from veridex.runtime.competition import _default_checks
+from veridex.runtime.evidence import compute_evidence_hash
 from veridex.scoring import score_run
 
 # ---------------------------------------------------------------------------
@@ -62,16 +66,16 @@ def test_evidence_integrity_exposes_recomputed_match_flag() -> None:
     run = finished_run_result()
     scores = score_run(run)
 
-    # Clean run: recomputed_match must be True.
+    # Clean run: recomputed_match must be True (now nested under details — typed CheckResult).
     checks = _default_checks(scores, run)
-    assert checks["evidence_integrity"]["recomputed_match"] is True
+    assert checks["evidence_integrity"]["details"]["recomputed_match"] is True
 
     # Tampered run: recomputed_match must be False.
     run2 = finished_run_result()
     scores2 = score_run(run2)
     run2.run_events[0]["_tampered"] = "injected_by_test"
     checks2 = _default_checks(scores2, run2)
-    assert checks2["evidence_integrity"]["recomputed_match"] is False
+    assert checks2["evidence_integrity"]["details"]["recomputed_match"] is False
 
 
 # ---------------------------------------------------------------------------
@@ -82,18 +86,19 @@ def test_evidence_integrity_exposes_recomputed_match_flag() -> None:
 def test_llm_boundary_fails_when_audit_raises(monkeypatch: pytest.MonkeyPatch) -> None:
     """_default_checks must return ``"fail"`` when ``assert_no_llm_imports`` raises.
 
-    Monkeypatches the function in the competition module's namespace so the try/except
-    inside ``_default_checks`` catches the injected ``AssertionError``.
+    Monkeypatches the function in the ``checks.build`` namespace (where ``_default_checks`` now
+    delegates the audit) so the try/except inside ``_llm_boundary`` catches the injected
+    ``AssertionError``.
 
     RED: before WD-5a the check was hardcoded ``"pass"``, ignoring any exception entirely.
-    After WD-5a it runs the real audit and catches violations.
+    After WD-5a/WD-5b it runs the real audit (in ``checks/build.py``) and catches violations.
     """
-    import veridex.runtime.competition as comp_mod
+    import veridex.checks.build as build_mod
 
     def _always_raise(path: object) -> None:
         raise AssertionError("Forbidden LLM import 'openai' in fake.py (injected by test)")
 
-    monkeypatch.setattr(comp_mod, "assert_no_llm_imports", _always_raise)
+    monkeypatch.setattr(build_mod, "assert_no_llm_imports", _always_raise)
 
     run = finished_run_result()
     scores = score_run(run)
@@ -136,7 +141,7 @@ def test_evidence_integrity_fails_closed_on_duplicate_sequence_no() -> None:
 
     checks = _default_checks(scores, run)
     assert checks["evidence_integrity"]["result"] == "fail"
-    assert checks["evidence_integrity"]["recomputed_match"] is False
+    assert checks["evidence_integrity"]["details"]["recomputed_match"] is False
     assert checks["evidence_integrity"]["error"] is not None
 
 
@@ -155,7 +160,7 @@ def test_evidence_integrity_fails_closed_on_missing_sequence_no() -> None:
 
     checks = _default_checks(scores, run)
     assert checks["evidence_integrity"]["result"] == "fail"
-    assert checks["evidence_integrity"]["recomputed_match"] is False
+    assert checks["evidence_integrity"]["details"]["recomputed_match"] is False
 
 
 def test_llm_boundary_fails_closed_on_non_assertion_error(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -166,15 +171,65 @@ def test_llm_boundary_fails_closed_on_non_assertion_error(monkeypatch: pytest.Mo
 
     RED: before this fix a SyntaxError escapes the except clause and crashes card-build.
     """
-    import veridex.runtime.competition as comp_mod
+    import veridex.checks.build as build_mod
 
     def _raise_syntax_error(path: object) -> None:
         raise SyntaxError("Fake syntax error in trust-path file (injected by test)")
 
-    monkeypatch.setattr(comp_mod, "assert_no_llm_imports", _raise_syntax_error)
+    monkeypatch.setattr(build_mod, "assert_no_llm_imports", _raise_syntax_error)
 
     run = finished_run_result()
     scores = score_run(run)
 
     checks = _default_checks(scores, run)
     assert checks["llm_boundary"]["result"] == "fail"
+
+
+# ---------------------------------------------------------------------------
+# WD-5b — SEC-001 shape (7 CheckIds, CLV NOT a check) + evidence boundary
+# ---------------------------------------------------------------------------
+
+
+def test_default_checks_emits_seven_check_ids_and_no_clv() -> None:
+    """SEC-001: ``_default_checks`` emits exactly the 7 frozen CheckIds; CLV is NOT one of them.
+
+    The 2-arg convenience path has no manifest/anchor/events, so the manifest/policy/receipt
+    checks are ``not_applicable`` and ANCHOR follows the run's source_mode (replay→na).
+    """
+    run = finished_run_result()
+    scores = score_run(run)
+
+    checks = _default_checks(scores, run)
+    assert set(checks) == {
+        "evidence_integrity",
+        "llm_boundary",
+        "metrics_recomputed",
+        "manifest_bound",
+        "policy_obeyed",
+        "receipt_separation",
+        "anchor",
+    }
+    assert "clv" not in checks  # SEC-001: CLV is a performance metric, never a check
+    # CLV lives in the separate Performance-Metrics block instead.
+    assert "clv" in build_performance_metrics(scores)
+
+
+def test_default_checks_does_not_mutate_sealed_evidence() -> None:
+    """The migration changes the proof-card representation, NOT the sealed evidence.
+
+    Building checks + metrics must leave ``run.run_events`` and ``run.evidence_hash``
+    byte-identical, and the sealed prefix must still recompute to the same hash.
+    """
+    run = finished_run_result()
+    scores = score_run(run)
+
+    evidence_hash_before = run.evidence_hash
+    events_before = copy.deepcopy(run.run_events)
+
+    _default_checks(scores, run)
+    build_performance_metrics(scores)
+
+    assert run.evidence_hash == evidence_hash_before
+    assert run.run_events == events_before
+    # The sealed RunEvent prefix still recomputes to the identical evidence_hash.
+    assert compute_evidence_hash(run.run_events) == evidence_hash_before

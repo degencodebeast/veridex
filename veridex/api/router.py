@@ -58,6 +58,7 @@ from veridex.api.schemas import (
     VerifyResponse,
 )
 from veridex.api.ws import ArenaConnectionManager, register_arena_routes
+from veridex.checks.build import build_performance_metrics
 from veridex.competition.events import CompetitionEvent, EventType
 from veridex.competition.models import (
     AgentEntry,
@@ -78,11 +79,14 @@ from veridex.competition.service import (
 from veridex.config import Settings, get_settings
 from veridex.execution.models import ExecutionRecord, ExecutionStatus
 from veridex.execution.runner import resolve_approval
+from veridex.ingest.marketstate import MarketState
 from veridex.leaderboard import leaderboard as _build_leaderboard
 from veridex.runtime.competition import (
     DEFAULT_CLUSTER,
     SCHEMA_VERSIONS,
     _default_checks,
+    _fixture_or_window_id,
+    _score_root,
     run_demo_competition,
 )
 from veridex.runtime.orchestrator import deterministic_agent
@@ -370,6 +374,7 @@ def create_app(store: Store | None = None, settings: Settings | None = None) -> 
 
         scores = score_run(run_result)
         checks = _default_checks(scores, run_result)
+        metrics = build_performance_metrics(scores)  # SEC-001: CLV lives here, not in checks
         # Recover anchor_status from the registry; fall back to not_anchored for
         # runs loaded from an externally supplied store.
         meta = _run_meta.get(run_id, {})
@@ -384,6 +389,7 @@ def create_app(store: Store | None = None, settings: Settings | None = None) -> 
             checks=checks,
             anchor=anchor_block,
             schema_versions=dict(SCHEMA_VERSIONS),
+            metrics=metrics,
         )
 
     # --- POST /runs/{run_id}/verify (WD-1 authoritative recompute, REQ-050 / AC-020) ------
@@ -396,10 +402,9 @@ def create_app(store: Store | None = None, settings: Settings | None = None) -> 
         recompute + hash-confirmation, and opens the Solana tx. ``verified`` is ``True`` iff the
         recomputed evidence hash matches the sealed one (fail-closed on any recompute error).
         """
-        import hashlib
         import json as _json
 
-        from veridex.runtime.evidence import compute_evidence_hash, serialize_payload
+        from veridex.runtime.evidence import compute_evidence_hash
 
         try:
             run_result = await dep_store.load_run(run_id)
@@ -415,11 +420,18 @@ def create_app(store: Store | None = None, settings: Settings | None = None) -> 
 
         scores = score_run(run_result)
         checks = _default_checks(scores, run_result)
-        score_root = hashlib.sha256(serialize_payload(scores).encode("utf-8")).hexdigest()
-        first_tick = next((e for e in run_result.run_events if e.get("event_type") == "tick"), {})
-        fixture_id = "unknown"
-        if first_tick.get("state_snapshot_json"):
-            fixture_id = str(_json.loads(first_tick["state_snapshot_json"]).get("fixture_id", "unknown"))
+        metrics = build_performance_metrics(scores)  # SEC-001: CLV lives here, not in checks
+
+        # Manifest derivation reuses the authoritative seal-time helpers (competition.py) so the
+        # route-computed ``manifest_hash`` is byte-identical to the one sealed at run time (DRY).
+        # The marketstates are reconstructed from the sealed tick snapshots in the evidence prefix.
+        score_root = _score_root(scores)
+        marketstates = [
+            MarketState(**_json.loads(e["state_snapshot_json"]))
+            for e in run_result.run_events
+            if e.get("event_type") == "tick" and e.get("state_snapshot_json")
+        ]
+        fixture_id = _fixture_or_window_id(marketstates)
 
         from veridex.chain.anchor import run_manifest, run_manifest_hash
 
@@ -441,7 +453,11 @@ def create_app(store: Store | None = None, settings: Settings | None = None) -> 
             "cluster": DEFAULT_CLUSTER,
         }
         proof_card = proof_card_from_run_result(
-            run_result, checks=checks, anchor=anchor_block, schema_versions=dict(SCHEMA_VERSIONS)
+            run_result,
+            checks=checks,
+            anchor=anchor_block,
+            schema_versions=dict(SCHEMA_VERSIONS),
+            metrics=metrics,
         )
         return VerifyResponse(
             run_id=run_id,
@@ -450,7 +466,7 @@ def create_app(store: Store | None = None, settings: Settings | None = None) -> 
             recomputed_evidence_hash=recomputed,
             manifest_hash=manifest_hash,
             checks=checks,
-            metrics=proof_card.get("metrics"),
+            metrics=metrics,
             anchor=anchor_block,
             proof_card=proof_card,
         )
@@ -636,6 +652,7 @@ def create_app(store: Store | None = None, settings: Settings | None = None) -> 
             if run_result is not None:
                 scores = score_run(run_result)
                 checks = _default_checks(scores, run_result)
+                metrics = build_performance_metrics(scores)  # SEC-001: CLV lives here, not in checks
                 anchor_block: dict[str, Any] = {
                     "status": str(anchor_status),
                     "signature": None,
@@ -646,6 +663,7 @@ def create_app(store: Store | None = None, settings: Settings | None = None) -> 
                     checks=checks,
                     anchor=anchor_block,
                     schema_versions=dict(SCHEMA_VERSIONS),
+                    metrics=metrics,
                 )
 
         execution_records = await dep_store.list_executions(competition_id)

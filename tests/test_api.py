@@ -101,9 +101,9 @@ def test_demo_run_proof_card_has_checks() -> None:
     assert "checks" in pc
     assert "cats" not in pc
     checks = pc["checks"]
-    assert "clv" in checks
-    assert "evidence_integrity" in checks
-    assert "llm_boundary" in checks
+    assert set(checks) >= {"evidence_integrity", "llm_boundary", "metrics_recomputed", "anchor"}
+    assert "clv" not in checks  # SEC-001
+    assert "metrics" in pc and "clv" in pc["metrics"]  # CLV lives in Performance Metrics
 
 
 # ---------------------------------------------------------------------------

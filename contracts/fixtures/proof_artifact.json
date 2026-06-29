@@ -1,7 +1,7 @@
 {
   "verifier_version": "v0",
   "run": {
-    "run_id": "0ccc120de9024314a5a890e9fa34c370",
+    "run_id": "32ca14c7bba04fafb4c00f50ec2d2e6e",
     "source_mode": "replay"
   },
   "lineage": {
@@ -26,9 +26,13 @@
       "severity": "blocking",
       "method": "sha256_evidence_hash",
       "scope": "run_events",
-      "evidence_refs": ["evidence_hash"],
+      "evidence_refs": [
+        "evidence_hash"
+      ],
       "rules": [],
-      "details": { "recomputed_match": true },
+      "details": {
+        "recomputed_match": true
+      },
       "error": null
     },
     "llm_boundary": {
@@ -40,7 +44,7 @@
       "scope": "law/, scoring.py, leaderboard.py, verifier/, checks/, ingest/, policy/",
       "evidence_refs": [],
       "rules": [],
-      "details": { "note": "LLM SDK imports forbidden in the deterministic trust path" },
+      "details": {},
       "error": null
     },
     "metrics_recomputed": {
@@ -48,21 +52,26 @@
       "label": "Score Recomputed",
       "result": "pass",
       "severity": "blocking",
-      "method": "deterministic_recompute",
+      "method": "recompute_score_run",
       "scope": "score_rows",
-      "evidence_refs": [],
+      "evidence_refs": [
+        "evidence_hash"
+      ],
       "rules": [],
-      "details": { "scored_actions": 4 },
+      "details": {
+        "recomputed_match": true,
+        "row_count": 2
+      },
       "error": null
     },
     "manifest_bound": {
       "id": "manifest_bound",
       "label": "Manifest Bound",
-      "result": "pass",
+      "result": "not_applicable",
       "severity": "blocking",
-      "method": "manifest_hash_binding",
+      "method": "manifest_field_binding",
       "scope": "run_manifest",
-      "evidence_refs": ["manifest_hash"],
+      "evidence_refs": [],
       "rules": [],
       "details": {},
       "error": null
@@ -70,10 +79,10 @@
     "policy_obeyed": {
       "id": "policy_obeyed",
       "label": "Policy Obeyed",
-      "result": "pass",
+      "result": "not_applicable",
       "severity": "blocking",
-      "method": "policy_replay",
-      "scope": "policy_envelope",
+      "method": "policy_event_audit",
+      "scope": "competition_events",
       "evidence_refs": [],
       "rules": [],
       "details": {},
@@ -82,13 +91,13 @@
     "receipt_separation": {
       "id": "receipt_separation",
       "label": "Receipt Separation",
-      "result": "pass",
+      "result": "not_applicable",
       "severity": "blocking",
-      "method": "receipt_evidence_flag",
-      "scope": "execution_records",
+      "method": "evidence_flag_audit",
+      "scope": "competition_events",
       "evidence_refs": [],
       "rules": [],
-      "details": { "receipts_in_evidence": false },
+      "details": {},
       "error": null
     },
     "anchor": {
@@ -96,11 +105,11 @@
       "label": "On-Chain Anchor",
       "result": "not_applicable",
       "severity": "info",
-      "method": "solana_memo_anchor",
-      "scope": "run_manifest_hash",
+      "method": "memo_anchor",
+      "scope": "solana_memo",
       "evidence_refs": [],
       "rules": [],
-      "details": { "anchor_status": "not_anchored" },
+      "details": {},
       "error": null
     }
   },
@@ -110,12 +119,33 @@
     "cluster": "devnet"
   },
   "metrics": {
-    "clv": null,
-    "sim_pnl": null,
+    "clv": 92.0,
+    "sim_pnl": 184,
     "brier": null,
-    "max_drawdown": null,
-    "hit_rate": null,
+    "max_drawdown": 0.0,
+    "hit_rate": 0.5,
     "scored_actions": 4,
-    "per_agent": []
+    "per_agent": [
+      {
+        "agent_id": "agent-alpha",
+        "rank": 1,
+        "avg_clv_bps": 92.0,
+        "total_clv_bps": 184,
+        "sim_pnl": 184,
+        "brier": null,
+        "max_drawdown": 0.0,
+        "action_count": 2
+      },
+      {
+        "agent_id": "agent-beta",
+        "rank": 2,
+        "avg_clv_bps": -92.0,
+        "total_clv_bps": -184,
+        "sim_pnl": -184,
+        "brier": null,
+        "max_drawdown": -184.0,
+        "action_count": 2
+      }
+    ]
   }
 }
