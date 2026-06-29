@@ -133,15 +133,39 @@ def _closings_from_marketstates(marketstates: list[MarketState]) -> dict[str, Ma
     return closing_by_market
 
 
+def _actions_from_events(run_events: list[dict[str, Any]]) -> dict[tuple[Any, Any], dict[str, Any]]:
+    """Map ``(tick_seq, agent_id) -> raw action dict``, sourced from the SEALED decision events.
+
+    The agent action is read from the hash-protected ``action_payload_json`` on each ``decision``
+    RunEvent (NOT from the non-hashed ``score_rows``), so a coordinated tamper of ``score_rows``
+    (clv_bps + raw_action edited together) cannot evade the recompute. Decision events carry no
+    ``tick_seq``, so it is derived from the preceding ``tick`` event: events are processed in
+    ``sequence_no`` order, and a tick is followed by that tick's decisions until the next tick.
+    The ``agent_id`` is read from the decision's ``result_payload_json``.
+    """
+    actions: dict[tuple[Any, Any], dict[str, Any]] = {}
+    current_tick_seq: Any = None
+    for e in sorted(run_events, key=lambda ev: ev.get("sequence_no", 0)):
+        event_type = e.get("event_type")
+        if event_type == "tick" and e.get("state_snapshot_json"):
+            current_tick_seq = json.loads(e["state_snapshot_json"]).get("tick_seq")
+        elif event_type == "decision" and e.get("action_payload_json"):
+            agent_id = json.loads(e.get("result_payload_json") or "{}").get("agent_id")
+            actions[(current_tick_seq, agent_id)] = json.loads(e["action_payload_json"])
+    return actions
+
+
 def _metrics_recomputed(scores: list[dict[str, Any]], run: RunResult) -> CheckResult:
     """Re-derive every persisted action metric from the SEALED evidence and confirm it matches.
 
-    SEC-002 falsifiability: this check binds TWO INDEPENDENT sources so it can genuinely FAIL.
+    SEC-002 falsifiability: this check binds TWO INDEPENDENT sources so it can genuinely FAIL. Both
+    recompute INPUTS are sourced from the hash-protected ``run_events`` (never from ``score_rows``):
 
       1. **Fresh recompute (from raw sealed evidence):** for each persisted ``score_rows`` entry,
          re-derive ``clv_bps`` by re-running the deterministic law :func:`~veridex.law.recompute.recompute`
-         over the entry/closing ``MarketState``s reconstructed from the hash-protected ``run_events``
-         tick snapshots + the row's own ``raw_prescore.raw_action`` — NEVER from the already-stored clv.
+         over the entry/closing ``MarketState``s reconstructed from the sealed ``tick`` snapshots AND
+         the agent action read from the sealed ``decision`` event (``action_payload_json``) — NEVER
+         from the already-stored clv NOR the row's own (non-hashed) ``raw_prescore.raw_action``.
       2. **Persisted/displayed metric:** the ``clv_bps`` stored on each ``score_rows`` entry (the value
          that aggregates into the leaderboard ``avg_clv_bps`` the judge reads).
 
@@ -149,24 +173,32 @@ def _metrics_recomputed(scores: list[dict[str, Any]], run: RunResult) -> CheckRe
     recomputed faithfully from sealed evidence. Because ``score_rows`` is NOT part of the hashed
     evidence prefix, tampering a displayed ``clv_bps`` is invisible to EVIDENCE_INTEGRITY and caught
     ONLY here: the fresh recompute diverges from the doctored row ⇒ ``fail`` (with the discrepancy in
-    ``rules``). A secondary rule re-aggregates the rows and confirms the displayed ``scores`` table is
-    a faithful aggregation of the persisted rows. Fail-closed on any recompute error (CON-2B-02).
+    ``rules``). Sourcing the action from the sealed decision event also closes the coordinated-tamper
+    evasion (editing ``clv_bps`` + ``raw_action`` together in a row). A run with no score rows is an
+    honest ``not_applicable`` (nothing to recompute). Fail-closed on any recompute error (CON-2B-02).
     """
+    # Honest not_applicable (mirrors POLICY_OBEYED / RECEIPT_SEPARATION): nothing to recompute.
+    if not run.score_rows:
+        return _not_applicable(CheckId.METRICS_RECOMPUTED, method="recompute_from_sealed_evidence", scope="score_rows")
+
     # Defend against an unexpected source_mode (fail-closed): anything other than "live" replays.
     source_mode: Literal["replay", "live"] = "live" if run.source_mode == "live" else "replay"
     try:
         marketstates = _marketstates_from_events(run.run_events)
         entry_by_tick: dict[Any, MarketState] = {ms.tick_seq: ms for ms in marketstates}
         closing_by_market = _closings_from_marketstates(marketstates)
+        action_by_key = _actions_from_events(run.run_events)  # (tick_seq, agent_id) -> sealed raw action
 
         mismatches: list[dict[str, Any]] = []
         for row in run.score_rows:
             tick_seq = row.get("tick_seq")
+            agent_id = row.get("agent_id")
             entry = entry_by_tick.get(tick_seq)
-            if entry is None:
-                mismatches.append({"tick_seq": tick_seq, "reason": "entry_snapshot_missing"})
+            raw_action = action_by_key.get((tick_seq, agent_id))
+            if entry is None or raw_action is None:
+                reason = "entry_snapshot_missing" if entry is None else "sealed_action_missing"
+                mismatches.append({"tick_seq": tick_seq, "agent_id": agent_id, "reason": reason})
                 continue
-            raw_action = row.get("raw_prescore", {}).get("raw_action", {})
             action = AgentAction(**raw_action)
             market_key = (action.params or {}).get("market_key")
             closing = closing_by_market.get(market_key) if market_key else None
@@ -174,14 +206,15 @@ def _metrics_recomputed(scores: list[dict[str, Any]], run: RunResult) -> CheckRe
             if redo["clv_bps"] != row.get("clv_bps"):
                 mismatches.append(
                     {
-                        "agent_id": row.get("agent_id"),
+                        "agent_id": agent_id,
                         "tick_seq": tick_seq,
                         "persisted_clv_bps": row.get("clv_bps"),
                         "recomputed_clv_bps": redo["clv_bps"],
                     }
                 )
 
-        # Secondary: the displayed aggregate table must be a faithful aggregation of the persisted rows.
+        # Secondary guard (displayed-table vs persisted-rows, NOT an evidence guard): confirms the
+        # aggregate metric table shown to the judge is a faithful aggregation of run.score_rows.
         aggregate_match = score_run(run) == scores
         if not aggregate_match:
             mismatches.append({"reason": "displayed_aggregate_diverges_from_score_rows"})

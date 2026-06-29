@@ -260,9 +260,9 @@ def test_metrics_recomputed_fails_on_tampered_persisted_clv() -> None:
     """SEC-002 falsifiability: tampering a persisted ``clv_bps`` in ``run.score_rows`` (the value
     that feeds the displayed leaderboard avg) must flip METRICS_RECOMPUTED to ``fail``.
 
-    The fresh recompute re-derives clv from the SEALED RunEvents (market snapshots) + the row's
-    ``raw_prescore.raw_action`` via the deterministic law — NOT from the stored clv — so a doctored
-    score row no longer matches. ``score_rows`` is NOT part of the hashed evidence prefix, so
+    The fresh recompute re-derives clv from the SEALED RunEvents (market snapshots + the sealed
+    decision action) via the deterministic law — NOT from the stored clv — so a doctored score row
+    no longer matches. ``score_rows`` is NOT part of the hashed evidence prefix, so
     ``evidence_integrity`` still passes; only METRICS_RECOMPUTED catches this tamper class.
     """
     run = finished_run_result()
@@ -279,3 +279,40 @@ def test_metrics_recomputed_fails_on_tampered_persisted_clv() -> None:
     assert any("recomputed_clv_bps" in rule for rule in checks["metrics_recomputed"]["rules"])
     # the tamper did NOT touch the hashed evidence prefix, so evidence_integrity stays pass.
     assert checks["evidence_integrity"]["result"] == "pass"
+
+
+def test_metrics_recomputed_fails_on_coordinated_score_row_tamper() -> None:
+    """SEC-002 (coordinated-tamper evasion closed): editing BOTH ``clv_bps`` AND ``raw_action`` in a
+    score row so the row is INTERNALLY CONSISTENT must STILL flip METRICS_RECOMPUTED to ``fail``.
+
+    The tamper swaps a scored row to look like a WAIT (``raw_action`` = WAIT, ``clv_bps`` = the
+    ``"pending"`` sentinel a WAIT recompute yields) — self-consistent, so a check that sourced the
+    action from ``score_rows`` would be fooled into ``pass``. Because the action is instead read from
+    the SEALED ``decision`` event (``action_payload_json``, the original FLAG_VALUE), the recompute
+    still yields the real numeric clv ≠ ``"pending"`` ⇒ ``fail``. The sealed RunEvents are untouched,
+    so ``evidence_integrity`` stays ``pass``.
+    """
+    run = finished_run_result()
+    idx = _first_scored_index(run)
+    row = run.score_rows[idx]
+    # Coordinated, internally-consistent doctor of the NON-hashed score row:
+    row["clv_bps"] = "pending"  # what a WAIT recompute would produce
+    row["raw_prescore"]["raw_action"] = {"type": "WAIT", "params": {}}
+
+    checks = _default_checks(score_run(run), run)
+
+    assert checks["metrics_recomputed"]["result"] == "fail"
+    assert checks["metrics_recomputed"]["error"] is not None
+    # the recompute used the SEALED action (numeric clv), not the row's WAIT/"pending".
+    assert any(rule.get("persisted_clv_bps") == "pending" for rule in checks["metrics_recomputed"]["rules"])
+    assert checks["evidence_integrity"]["result"] == "pass"
+
+
+def test_metrics_recomputed_not_applicable_when_no_score_rows() -> None:
+    """A run with no score rows is an honest ``not_applicable`` (nothing to recompute), never a
+    vacuous ``pass`` — matching the POLICY_OBEYED / RECEIPT_SEPARATION honesty pattern."""
+    run = finished_run_result()
+    run.score_rows.clear()  # mutate the list in place (frozen dataclass guards reassignment only)
+
+    checks = _default_checks(score_run(run), run)
+    assert checks["metrics_recomputed"]["result"] == "not_applicable"
