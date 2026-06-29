@@ -12,8 +12,9 @@ as ``not_applicable`` so the list is always length-7 and stably ordered.
 from __future__ import annotations
 
 import hashlib
+import json
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 from veridex.chain.anchor import run_manifest_hash
 from veridex.checks.result import (
@@ -22,7 +23,10 @@ from veridex.checks.result import (
     CheckId,
     CheckResult,
 )
+from veridex.ingest.marketstate import MarketState
+from veridex.law.recompute import recompute
 from veridex.runtime.evidence import compute_evidence_hash, serialize_payload
+from veridex.runtime.schemas import AgentAction
 from veridex.scoring import score_run
 from veridex.verifier.import_audit import assert_no_llm_imports
 
@@ -100,28 +104,104 @@ def _llm_boundary() -> CheckResult:
         )
 
 
-def _metrics_recomputed(scores: list[dict[str, Any]], run: RunResult) -> CheckResult:
-    """Recompute the metric table from sealed evidence and confirm it matches the visible table.
+def _marketstates_from_events(run_events: list[dict[str, Any]]) -> list[MarketState]:
+    """Reconstruct the ordered tick ``MarketState``s from the sealed RunEvent tick snapshots.
 
-    CLV itself is a performance metric, NOT a check (SEC-001); this check proves the table the
-    judge reads was recomputed faithfully from the sealed ``RunResult`` (Checks Doctrine).
+    Each ``tick`` RunEvent carries ``state_snapshot_json`` (the canonical dump of the snapshot the
+    agents decided on). These are part of the hash-protected evidence prefix, so they are the
+    tamper-resistant raw inputs the metric recompute re-derives CLV from. Ordered by ``tick_seq``.
     """
+    states = [
+        MarketState(**json.loads(e["state_snapshot_json"]))
+        for e in run_events
+        if e.get("event_type") == "tick" and e.get("state_snapshot_json")
+    ]
+    states.sort(key=lambda ms: ms.tick_seq)
+    return states
+
+
+def _closings_from_marketstates(marketstates: list[MarketState]) -> dict[str, MarketState]:
+    """Map each ``market_key`` to its closing snapshot (the last tick carrying it).
+
+    Mirrors the seal-time ``orchestrator._closing_snapshots`` (re-derived here rather than imported,
+    so ``checks/`` keeps NO runtime dependency on the LLM agent shell).
+    """
+    closing_by_market: dict[str, MarketState] = {}
+    for state in marketstates:  # ordered by tick_seq; later ticks overwrite earlier ones
+        for market_key in state.markets:
+            closing_by_market[market_key] = state
+    return closing_by_market
+
+
+def _metrics_recomputed(scores: list[dict[str, Any]], run: RunResult) -> CheckResult:
+    """Re-derive every persisted action metric from the SEALED evidence and confirm it matches.
+
+    SEC-002 falsifiability: this check binds TWO INDEPENDENT sources so it can genuinely FAIL.
+
+      1. **Fresh recompute (from raw sealed evidence):** for each persisted ``score_rows`` entry,
+         re-derive ``clv_bps`` by re-running the deterministic law :func:`~veridex.law.recompute.recompute`
+         over the entry/closing ``MarketState``s reconstructed from the hash-protected ``run_events``
+         tick snapshots + the row's own ``raw_prescore.raw_action`` — NEVER from the already-stored clv.
+      2. **Persisted/displayed metric:** the ``clv_bps`` stored on each ``score_rows`` entry (the value
+         that aggregates into the leaderboard ``avg_clv_bps`` the judge reads).
+
+    CLV is a performance metric, NOT a check (SEC-001); this check proves the displayed table was
+    recomputed faithfully from sealed evidence. Because ``score_rows`` is NOT part of the hashed
+    evidence prefix, tampering a displayed ``clv_bps`` is invisible to EVIDENCE_INTEGRITY and caught
+    ONLY here: the fresh recompute diverges from the doctored row ⇒ ``fail`` (with the discrepancy in
+    ``rules``). A secondary rule re-aggregates the rows and confirms the displayed ``scores`` table is
+    a faithful aggregation of the persisted rows. Fail-closed on any recompute error (CON-2B-02).
+    """
+    # Defend against an unexpected source_mode (fail-closed): anything other than "live" replays.
+    source_mode: Literal["replay", "live"] = "live" if run.source_mode == "live" else "replay"
     try:
-        recomputed = score_run(run)
-        match = recomputed == scores
+        marketstates = _marketstates_from_events(run.run_events)
+        entry_by_tick: dict[Any, MarketState] = {ms.tick_seq: ms for ms in marketstates}
+        closing_by_market = _closings_from_marketstates(marketstates)
+
+        mismatches: list[dict[str, Any]] = []
+        for row in run.score_rows:
+            tick_seq = row.get("tick_seq")
+            entry = entry_by_tick.get(tick_seq)
+            if entry is None:
+                mismatches.append({"tick_seq": tick_seq, "reason": "entry_snapshot_missing"})
+                continue
+            raw_action = row.get("raw_prescore", {}).get("raw_action", {})
+            action = AgentAction(**raw_action)
+            market_key = (action.params or {}).get("market_key")
+            closing = closing_by_market.get(market_key) if market_key else None
+            redo = recompute(entry, action, closing=closing, source_mode=source_mode)
+            if redo["clv_bps"] != row.get("clv_bps"):
+                mismatches.append(
+                    {
+                        "agent_id": row.get("agent_id"),
+                        "tick_seq": tick_seq,
+                        "persisted_clv_bps": row.get("clv_bps"),
+                        "recomputed_clv_bps": redo["clv_bps"],
+                    }
+                )
+
+        # Secondary: the displayed aggregate table must be a faithful aggregation of the persisted rows.
+        aggregate_match = score_run(run) == scores
+        if not aggregate_match:
+            mismatches.append({"reason": "displayed_aggregate_diverges_from_score_rows"})
+
+        match = not mismatches
         return _result(
             CheckId.METRICS_RECOMPUTED,
             "pass" if match else "fail",
-            method="recompute_score_run",
+            method="recompute_from_sealed_evidence",
             scope="score_rows",
-            evidence_refs=["evidence_hash"],
-            details={"recomputed_match": match, "row_count": len(recomputed)},
+            evidence_refs=["evidence_hash", "score_rows"],
+            rules=mismatches if mismatches else [{"all_metrics_match": True}],
+            details={"recomputed_match": match, "row_count": len(run.score_rows)},
+            error=(None if match else f"{len(mismatches)} metric(s) diverged from the sealed-evidence recompute"),
         )
     except Exception as e:
         return _result(
             CheckId.METRICS_RECOMPUTED,
             "fail",
-            method="recompute_score_run",
+            method="recompute_from_sealed_evidence",
             scope="score_rows",
             details={"recomputed_match": False},
             error=f"{type(e).__name__}: {e}",

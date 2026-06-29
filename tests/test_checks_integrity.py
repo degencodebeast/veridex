@@ -233,3 +233,49 @@ def test_default_checks_does_not_mutate_sealed_evidence() -> None:
     assert run.run_events == events_before
     # The sealed RunEvent prefix still recomputes to the identical evidence_hash.
     assert compute_evidence_hash(run.run_events) == evidence_hash_before
+
+
+# ---------------------------------------------------------------------------
+# METRICS_RECOMPUTED — falsifiable (SEC-002): a tampered persisted clv_bps fails
+# ---------------------------------------------------------------------------
+
+
+def _first_scored_index(run: object) -> int:
+    """Index of the first genuinely-scored row (valid + numeric clv_bps, not a bool/sentinel)."""
+    for i, r in enumerate(run.score_rows):  # type: ignore[attr-defined]
+        clv = r.get("clv_bps")
+        if r.get("valid") is True and isinstance(clv, int) and not isinstance(clv, bool):
+            return i
+    raise AssertionError("fixture has no scored row to tamper")
+
+
+def test_metrics_recomputed_passes_on_untampered_run() -> None:
+    """The honest case: the displayed score table re-derives faithfully from sealed evidence."""
+    run = finished_run_result()
+    scores = score_run(run)
+    assert _default_checks(scores, run)["metrics_recomputed"]["result"] == "pass"
+
+
+def test_metrics_recomputed_fails_on_tampered_persisted_clv() -> None:
+    """SEC-002 falsifiability: tampering a persisted ``clv_bps`` in ``run.score_rows`` (the value
+    that feeds the displayed leaderboard avg) must flip METRICS_RECOMPUTED to ``fail``.
+
+    The fresh recompute re-derives clv from the SEALED RunEvents (market snapshots) + the row's
+    ``raw_prescore.raw_action`` via the deterministic law — NOT from the stored clv — so a doctored
+    score row no longer matches. ``score_rows`` is NOT part of the hashed evidence prefix, so
+    ``evidence_integrity`` still passes; only METRICS_RECOMPUTED catches this tamper class.
+    """
+    run = finished_run_result()
+    idx = _first_scored_index(run)
+    run.score_rows[idx]["clv_bps"] = run.score_rows[idx]["clv_bps"] + 9999  # doctor the displayed metric
+
+    # The displayed aggregate now reflects the tamper (score_run reads score_rows).
+    tampered_scores = score_run(run)
+    checks = _default_checks(tampered_scores, run)
+
+    assert checks["metrics_recomputed"]["result"] == "fail"
+    assert checks["metrics_recomputed"]["error"] is not None
+    # the per-row discrepancy is surfaced in rules (persisted vs recomputed).
+    assert any("recomputed_clv_bps" in rule for rule in checks["metrics_recomputed"]["rules"])
+    # the tamper did NOT touch the hashed evidence prefix, so evidence_integrity stays pass.
+    assert checks["evidence_integrity"]["result"] == "pass"

@@ -1,7 +1,7 @@
 {
   "verifier_version": "v0",
   "run": {
-    "run_id": "32ca14c7bba04fafb4c00f50ec2d2e6e",
+    "run_id": "14607d0ffef5446589fd8829e899c3af",
     "source_mode": "replay"
   },
   "lineage": {
@@ -52,15 +52,20 @@
       "label": "Score Recomputed",
       "result": "pass",
       "severity": "blocking",
-      "method": "recompute_score_run",
+      "method": "recompute_from_sealed_evidence",
       "scope": "score_rows",
       "evidence_refs": [
-        "evidence_hash"
+        "evidence_hash",
+        "score_rows"
       ],
-      "rules": [],
+      "rules": [
+        {
+          "all_metrics_match": true
+        }
+      ],
       "details": {
         "recomputed_match": true,
-        "row_count": 2
+        "row_count": 4
       },
       "error": null
     },
