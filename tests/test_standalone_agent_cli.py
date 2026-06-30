@@ -24,3 +24,11 @@ def test_main_run_exits_zero(capsys) -> None:  # type: ignore[no-untyped-def]
     assert code == 0
     out = capsys.readouterr().out
     assert "VERIFIED" in out
+
+
+def test_main_run_missing_config_is_clean_error(capsys) -> None:  # type: ignore[no-untyped-def]
+    # A bad/missing config must produce a clean operator-facing error + nonzero exit, NOT a traceback.
+    code = main(["run", "--config", "does-not-exist.toml"])
+    assert code == 1
+    err = capsys.readouterr().err
+    assert "veridex-agent: error:" in err

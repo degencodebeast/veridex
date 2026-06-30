@@ -41,3 +41,16 @@ def test_no_baked_secrets_in_dockerfile_or_doc() -> None:
 
     # Runtime injection must be the documented path (not baked-in creds).
     assert "--env-file" in doc
+
+
+def test_dockerignore_excludes_env_secrets() -> None:
+    # COM-001 ENFORCED (not eyeballed): Docker honors .dockerignore, NOT .gitignore — so without a
+    # root .dockerignore that excludes env files, `docker build .` (the documented command) would
+    # bake veridex/.env (live creds) into an image layer via `COPY veridex ./veridex`. This test
+    # FAILS if the .dockerignore is missing or stops excluding env files — i.e. it catches the leak.
+    dockerignore_path = ROOT / ".dockerignore"
+    assert dockerignore_path.exists(), "root .dockerignore is REQUIRED (Docker ignores .gitignore — COM-001)"
+    patterns = [line.strip() for line in dockerignore_path.read_text().splitlines() if line.strip()]
+    # An env-exclusion pattern must be present (any of the standard forms).
+    env_excludes = {"**/.env", "*.env", "veridex/.env", ".env"}
+    assert env_excludes & set(patterns), f".dockerignore must exclude env secrets; has {patterns}"

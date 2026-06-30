@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import sys
 
 from veridex.chain.anchor import anchor_memo
 from veridex.ingest.marketstate import replay_marketstates
@@ -72,7 +73,12 @@ def main(argv: list[str] | None = None) -> int:
     """
     args = build_arg_parser().parse_args(argv)
     if args.command == "run":
-        result = asyncio.run(run_from_config(args.config, fixture_override=args.fixture))
+        try:
+            result = asyncio.run(run_from_config(args.config, fixture_override=args.fixture))
+        except (ValueError, FileNotFoundError) as exc:
+            # Clean operator-facing error (bad/missing fixture, live mode without creds) — no traceback.
+            print(f"veridex-agent: error: {exc}", file=sys.stderr)
+            return 1
         avg_clv = result.scores[0]["avg_clv_bps"] if result.scores else None
         verdict = "VERIFIED" if result.verified else "VERIFY-FAILED"
         print(

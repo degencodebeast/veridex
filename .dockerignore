@@ -1,0 +1,27 @@
+# WD-3 / COM-001 — NEVER bake secrets or junk into the agent image.
+# Docker honors .dockerignore (NOT .gitignore), so `COPY veridex ./veridex` must exclude .env here.
+
+# Secrets — must never enter an image layer.
+**/.env
+**/.env.*
+*.env
+veridex/.env
+veridex/.env.local
+
+# VCS + caches + build artifacts (slim image).
+.git
+.gitignore
+**/__pycache__/
+**/*.pyc
+**/.pytest_cache/
+.venv/
+.mypy_cache/
+.ruff_cache/
+
+# Not needed in the agent image.
+apps/
+node_modules/
+**/node_modules/
+.omc/
+spec/
+docs/strategy/

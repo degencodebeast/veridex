@@ -104,13 +104,26 @@ async def standalone_run(
         signature = await anchor_fn(manifest_hash)
         anchor_status = "anchored"
 
-    # Plan A's split (SEC-001): the 7-CheckId proof block (clv excluded) + a separate metrics
-    # block (clv lives here) — the SAME builders the arena proof card / verify endpoint use, so a
-    # standalone-deployed agent's proof reads identically to an in-competition one. (build_check_results
+    # Plan A's split (SEC-001): the 7-CheckId proof block (clv excluded) + a separate metrics block
+    # (clv lives here). FULL arena parity — this passes the freshly-built manifest/manifest_hash +
+    # anchor + source_mode to build_check_results EXACTLY as run_demo_competition does, so
+    # MANIFEST_BOUND and ANCHOR get real verdicts (not not_applicable) and a standalone-deployed
+    # agent's card reads identically to an in-competition one. MANIFEST_BOUND is the scoring-time
+    # binding check: it independently recomputes the score-root + manifest hash from this run+scores
+    # and fails on a mis-built manifest (falsifiable — see test_standalone_run). (build_check_results
     # is keyword-only; build_performance_metrics takes scores only — matching the landed signatures.)
-    checks = check_results_to_proof_block(build_check_results(scores=scores, run=run))
-    metrics = build_performance_metrics(scores)
     anchor_block = {"status": anchor_status, "signature": signature, "cluster": DEFAULT_CLUSTER}
+    checks = check_results_to_proof_block(
+        build_check_results(
+            scores=scores,
+            run=run,
+            manifest=manifest,
+            manifest_hash=manifest_hash,
+            anchor=anchor_block,
+            source_mode=source_mode,
+        )
+    )
+    metrics = build_performance_metrics(scores)
     proof_card = proof_card_from_run_result(
         run, checks=checks, metrics=metrics, anchor=anchor_block, schema_versions=dict(SCHEMA_VERSIONS)
     )

@@ -4,6 +4,7 @@
 
 # --- re-include the Veridex deliverable ---
 !/.gitignore
+!/.dockerignore
 !/README.md
 !/pyproject.toml
 !/veridex/
