@@ -1,4 +1,3 @@
-'use client';
 import Link from 'next/link';
 import { Badge } from '@/components/ui/Badge';
 import styles from './LandingScreen.module.css';
@@ -58,8 +57,14 @@ export function LandingScreen() {
             {COMPARE.map((row) => (
               <tr key={row.attr}>
                 <td>{row.attr}</td>
-                <td className={styles.center}>{row.veridex ? '✓' : '—'}</td>
-                <td className={styles.center}>{row.others ? '✓' : '—'}</td>
+                <td className={styles.center}>
+                  <span aria-hidden>{row.veridex ? '✓' : '—'}</span>
+                  <span className={styles.srOnly}>{row.veridex ? 'Yes' : 'No'}</span>
+                </td>
+                <td className={styles.center}>
+                  <span aria-hidden>{row.others ? '✓' : '—'}</span>
+                  <span className={styles.srOnly}>{row.others ? 'Yes' : 'No'}</span>
+                </td>
               </tr>
             ))}
           </tbody>
