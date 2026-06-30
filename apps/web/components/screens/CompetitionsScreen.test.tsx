@@ -11,7 +11,9 @@ describe('CompetitionsScreen (REQ-014)', () => {
 
   it('routes an upcoming competition to Join and a settled one to Proof', () => {
     render(<CompetitionsScreen />);
-    expect(within(screen.getByTestId('comp-wc-arg-ger')).getByRole('link', { name: /join/i })).toBeInTheDocument();
+    // Join points at the competition's arena/detail page — NOT the create flow (joining ≠ creating).
+    expect(within(screen.getByTestId('comp-wc-arg-ger')).getByRole('link', { name: /join/i }))
+      .toHaveAttribute('href', '/arena/wc-arg-ger');
     expect(within(screen.getByTestId('comp-wc-esp-ned')).getByRole('link', { name: /proof/i }))
       .toHaveAttribute('href', '/proof/run_esp_ned_01');
   });

@@ -62,6 +62,13 @@ describe('LeaderboardScreen (REQ-013 / AC-005 / WD-7)', () => {
     expect(screen.getAllByText(/low sample/i).length).toBeGreaterThanOrEqual(1);
   });
 
+  it('renders a mixed-source row honestly as "mixed" — not collapsed to replay', () => {
+    render(<LeaderboardScreen rows={[mk({ agent_id: 'm', agent_name: 'Mixed Co', source_mode: 'mixed' })]} />);
+    const src = within(screen.getByTestId('lb-row')).getByTestId('lb-source');
+    expect(src).toHaveTextContent(/mixed/i);
+    expect(src).not.toHaveTextContent(/replay/i);
+  });
+
   it('filters by source without changing the CLV-only sort rule', async () => {
     const user = userEvent.setup();
     render(<LeaderboardScreen />);

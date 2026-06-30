@@ -17,6 +17,10 @@ export interface CreateCompetitionCommit {
   competition_type: CompetitionType;
   source_mode: SourceMode;
   execution_mode: ExecutionMode;
+  // SEC-009: commit exactly what is pinned. proof_mode is deterministic from type+source
+  // and is shown in the pinned block, so it travels with the commit. The policy envelope is
+  // the default (DEFAULT_POLICY_ENVELOPE), applied backend-side at run creation.
+  proof_mode: ProofMode;
 }
 
 export function CreateCompetitionScreen({ onCommit = () => {} }: { onCommit?: (cfg: CreateCompetitionCommit) => void }) {
@@ -67,7 +71,7 @@ export function CreateCompetitionScreen({ onCommit = () => {} }: { onCommit?: (c
         <p className={styles.note}>These are frozen at entry. Changing config after a run starts creates a new version (SEC-009).</p>
       </div>
 
-      <button type="button" className={styles.commit} onClick={() => onCommit({ competition_type: type, source_mode: source, execution_mode: exec })}>
+      <button type="button" className={styles.commit} onClick={() => onCommit({ competition_type: type, source_mode: source, execution_mode: exec, proof_mode: proof })}>
         Commit &amp; Enter →
       </button>
     </section>

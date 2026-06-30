@@ -12,7 +12,8 @@ const TYPE_LABEL: Record<CompetitionType, string> = {
 
 function CtaFor({ c }: { c: CompetitionSummary }) {
   if (c.lifecycle === 'live') return <Link href={`/arena/${c.competition_id}`} className={styles.cta}>Enter Arena →</Link>;
-  if (c.lifecycle === 'upcoming') return <Link href="/competitions/create" className={styles.ctaSecondary}>Join</Link>;
+  // Join routes to the competition's own arena/detail page (not the create flow — joining ≠ creating).
+  if (c.lifecycle === 'upcoming') return <Link href={`/arena/${c.competition_id}`} className={styles.ctaSecondary}>Join</Link>;
   return <Link href={`/proof/${c.settled_run_id}`} className={styles.ctaSecondary}>Proof →</Link>;
 }
 

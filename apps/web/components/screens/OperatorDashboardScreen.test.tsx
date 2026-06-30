@@ -50,6 +50,19 @@ describe('OperatorDashboardScreen (REQ-012 / SEC-008)', () => {
     expect(within(rewards).queryByText(/^paid$/i)).toBeNull();
   });
 
+  it('shows a FAILED payout as a distinct negative state, never a misleading pending badge (honesty)', () => {
+    render(
+      <OperatorDashboardScreen
+        connected
+        rewards={[{ competition_id: 'x', title: 'X Cup', amount_label: '— (failed)', payout_state: 'failed' }]}
+      />,
+    );
+    const rewards = screen.getByTestId('your-rewards');
+    const failed = within(rewards).getByText('failed');
+    expect(failed).toHaveAttribute('data-payout', 'failed'); // distinct negative span, not a Badge
+    expect(within(rewards).queryByText(/pending/i)).toBeNull(); // a failure is NOT shown as pending
+  });
+
   it('shows the alerts rail with kill/deny/hold items', () => {
     render(<OperatorDashboardScreen connected />);
     const rail = screen.getByTestId('alerts-rail');

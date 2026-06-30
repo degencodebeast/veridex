@@ -3,18 +3,21 @@ import Link from 'next/link';
 import { Badge } from '@/components/ui/Badge';
 import { Num } from '@/components/ui/Num';
 import { MY_AGENTS, MY_RUNS, MY_REWARDS, ALERTS, COMPETITIONS } from '@/lib/fixtures/catalog';
-import type { PayoutState } from '@/lib/catalog';
+import type { PayoutState, RewardSummary } from '@/lib/catalog';
 import styles from './OperatorDashboardScreen.module.css';
 
-const PAYOUT_BADGE: Record<PayoutState, 'pending' | 'partial' | 'valid'> = {
+// `failed` is intentionally excluded: a failed payout is an off-nominal state and is
+// rendered as a distinct NEGATIVE span (below), never collapsed into a nominal badge.
+const PAYOUT_BADGE: Record<Exclude<PayoutState, 'failed'>, 'pending' | 'partial' | 'valid'> = {
   pending: 'pending', 'design-target': 'pending', 'sponsor-funded': 'partial',
-  'manual approval': 'pending', paid: 'valid', failed: 'pending', '2D implementation': 'pending',
+  'manual approval': 'pending', paid: 'valid', '2D implementation': 'pending',
 };
 
 export function OperatorDashboardScreen({
   connected = false,
   onOpenRuntime = () => {},
-}: { connected?: boolean; onOpenRuntime?: (agentId: string) => void }) {
+  rewards = MY_REWARDS,
+}: { connected?: boolean; onOpenRuntime?: (agentId: string) => void; rewards?: RewardSummary[] }) {
   // SEC-008 fail-closed gate: operator-private data (agents/runs/rewards/alerts) is only
   // ever rendered when the operator session is authorized. When disconnected we render an
   // honest prompt and NOTHING private — not hidden-but-present, genuinely absent from the DOM.
@@ -102,12 +105,14 @@ export function OperatorDashboardScreen({
           <section className={styles.panel} data-testid="your-rewards">
             <h2 className={styles.h2}>Your Rewards</h2>
             <ul className={styles.list}>
-              {MY_REWARDS.map((r) => (
+              {rewards.map((r) => (
                 <li key={r.competition_id} className={styles.runRow}>
                   <span className={styles.rowMain}>{r.title}</span>
                   <span className={styles.rowMeta}>
                     <span className={`${styles.amount} mono`}>{r.amount_label}</span>
-                    <Badge variant={PAYOUT_BADGE[r.payout_state]}>{r.payout_state}</Badge>
+                    {r.payout_state === 'failed'
+                      ? <span className={`${styles.failed} mono`} data-payout="failed">failed</span>
+                      : <Badge variant={PAYOUT_BADGE[r.payout_state]}>{r.payout_state}</Badge>}
                   </span>
                 </li>
               ))}

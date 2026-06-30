@@ -19,6 +19,7 @@
 .runtimeBtn { padding: 4px 8px; border: 1px solid var(--border-strong); border-radius: var(--radius-badge); background: var(--panel-2); color: var(--accent-hi); font-family: var(--font-mono), monospace; font-size: 10px; cursor: pointer; }
 .runtimeBtn:hover { border-color: var(--accent); }
 .amount { font-size: 11px; color: var(--text-2); }
+.failed { font-size: 10px; text-transform: uppercase; letter-spacing: 0.04em; color: var(--negative); border: 1px solid var(--negative); border-radius: var(--radius-badge); padding: 1px 6px; }
 .alert { padding: 6px 4px; border-bottom: 1px solid var(--border-soft); font-size: 11px; color: var(--text-2); }
 .kill { color: var(--negative); }
 .deny { color: var(--warning-hi); }

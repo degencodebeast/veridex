@@ -71,7 +71,11 @@ export function LeaderboardScreen({ rows = LEADERBOARD_ROWS }: { rows?: Leaderbo
                 <td><Badge variant={r.proof_mode} /></td>
                 <td><Badge variant={isEligible(r.proof_mode) ? 'eligible' : 'not-eligible'} /></td>
                 <td><Badge variant={r.anchor_status === 'anchored' ? 'anchored' : r.anchor_status === 'not-anchored' ? 'not-anchored' : 'pending'} /></td>
-                <td data-testid="lb-source"><Badge variant={r.source_mode === 'live' ? 'live' : 'replay'} /></td>
+                <td data-testid="lb-source">
+                  {r.source_mode === 'live' ? <Badge variant="live" />
+                    : r.source_mode === 'replay' ? <Badge variant="replay" />
+                      : <span className={`${styles.mixedSrc} mono`}>mixed</span>}
+                </td>
               </tr>
             ))}
           </tbody>

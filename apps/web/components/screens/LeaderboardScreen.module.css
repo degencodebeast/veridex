@@ -12,3 +12,4 @@
 .agentLink { color: var(--text-1); text-decoration: none; }
 .agentLink:hover { color: var(--accent-hi); }
 .kind { color: var(--text-3); font-size: 10px; }
+.mixedSrc { font-size: 10px; text-transform: uppercase; letter-spacing: 0.04em; color: var(--text-2); border: 1px solid var(--border-soft); border-radius: var(--radius-badge); padding: 1px 6px; }

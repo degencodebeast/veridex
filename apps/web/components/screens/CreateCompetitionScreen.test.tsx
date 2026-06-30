@@ -28,7 +28,9 @@ describe('CreateCompetitionScreen (REQ-015 / SEC-009)', () => {
     render(<CreateCompetitionScreen onCommit={onCommit} />);
     await user.click(screen.getByRole('button', { name: /commit & enter/i }));
     expect(onCommit).toHaveBeenCalledWith(
-      expect.objectContaining({ competition_type: expect.any(String), execution_mode: expect.any(String) }),
+      expect.objectContaining({
+        competition_type: expect.any(String), execution_mode: expect.any(String), proof_mode: expect.any(String),
+      }),
     );
   });
 
@@ -39,6 +41,7 @@ describe('CreateCompetitionScreen (REQ-015 / SEC-009)', () => {
     const sourceGroup = screen.getByRole('radiogroup', { name: /source mode/i });
     await user.click(within(sourceGroup).getByRole('radio', { name: 'Replay' }));
     await user.click(screen.getByRole('button', { name: /commit & enter/i }));
-    expect(onCommit).toHaveBeenCalledWith(expect.objectContaining({ source_mode: 'replay' }));
+    // The derived proof_mode (shown as pinned) must travel with the commit (SEC-009 "commit what's pinned").
+    expect(onCommit).toHaveBeenCalledWith(expect.objectContaining({ source_mode: 'replay', proof_mode: 'reproducible' }));
   });
 });
