@@ -148,6 +148,16 @@ describe('MarketsScreen V5 (default-select · right rail · EDGE/AGENTS honesty)
     expect(agents.some((c) => /\d/.test(c.textContent ?? ''))).toBe(false);
   });
 
+  it('the disabled 1X2-HT tab states WHY it is unavailable (reuse the disabledReason idiom — not "broken")', () => {
+    render(<MarketsScreen />);
+    const ht = screen.getByTestId('tab-1x2-ht');
+    expect(ht).toBeDisabled();
+    // a user-facing reason (title + accessible name), not just a code comment, so it reads
+    // "not available" rather than "broken". A regression that disables it silently fails here.
+    expect(ht).toHaveAttribute('title', expect.stringMatching(/not in.*feed/i));
+    expect(ht).toHaveAccessibleName(/not in.*feed/i);
+  });
+
   it('market-type tabs filter the families; the 1X2-HT tab is honestly disabled (not in feed)', async () => {
     const user = userEvent.setup();
     render(<MarketsScreen />);

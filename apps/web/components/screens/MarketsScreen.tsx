@@ -16,10 +16,10 @@ import styles from './MarketsScreen.module.css';
 // Market-type tabs (V5). The HT half-time variant is NOT in the free feed → its tab is present
 // for layout parity but DISABLED (honest), never a fabricated empty/zero market.
 type TabId = 'all' | MarketFamilyKey | 'ht';
-const TABS: { id: TabId; label: string; disabled?: boolean; testid: string }[] = [
+const TABS: { id: TabId; label: string; disabled?: boolean; disabledReason?: string; testid: string }[] = [
   { id: 'all', label: 'ALL', testid: 'tab-all' },
   { id: '1X2_PARTICIPANT_RESULT', label: '1X2 FT', testid: 'tab-1x2' },
-  { id: 'ht', label: '1X2 HT', disabled: true, testid: 'tab-1x2-ht' },
+  { id: 'ht', label: '1X2 HT', disabled: true, disabledReason: 'not in current feed', testid: 'tab-1x2-ht' },
   { id: 'OVERUNDER_PARTICIPANT_GOALS', label: 'O/U', testid: 'tab-ou' },
   { id: 'ASIANHANDICAP_PARTICIPANT_GOALS', label: 'AH', testid: 'tab-ah' },
 ];
@@ -109,6 +109,10 @@ export function MarketsScreen({
                     aria-selected={tab === t.id}
                     data-testid={t.testid}
                     disabled={t.disabled}
+                    // Disabled tabs state WHY (reuse the disabledReason idiom) — reads "not
+                    // available", not "broken". title = hover, aria-label = the accessible name.
+                    title={t.disabledReason}
+                    aria-label={t.disabledReason ? `${t.label} — ${t.disabledReason}` : undefined}
                     className={`${styles.tab} ${tab === t.id ? styles.activeTab : ''}`}
                     onClick={() => !t.disabled && setTab(t.id)}
                   >
