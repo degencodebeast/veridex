@@ -1,6 +1,17 @@
 .panel { background: var(--panel); border: 1px solid var(--accent); border-radius: var(--radius-panel); padding: var(--pad-panel); }
 .head { display: flex; justify-content: space-between; align-items: center; }
 .title { color: var(--accent-hi); font-family: var(--font-mono), monospace; font-size: 10px; font-weight: 600; letter-spacing: 0.08em; }
+.naBadge {
+  display: inline-flex;
+  align-items: center;
+  padding: 3px 7px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-badge);
+  color: var(--text-3);
+  font-size: 9px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
 .grid { display: grid; grid-template-columns: auto 1fr; gap: 4px var(--space-2); margin: var(--space-2) 0; }
 .label { color: var(--text-3); font-size: 10px; text-transform: uppercase; letter-spacing: 0.04em; }
 .value { color: var(--text-1); font-size: 11px; text-align: right; }

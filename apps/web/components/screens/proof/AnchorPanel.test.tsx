@@ -36,4 +36,13 @@ describe('AnchorPanel (REQ-020 / SEC-008)', () => {
     expect(screen.queryByText(/verify to reveal/i)).toBeNull();
     expect(screen.getByText(/0xMANI/)).toBeInTheDocument(); // shortHash of the manifest
   });
+
+  it('labels a not_applicable anchor as neutral n/a, NOT "Not Anchored" (offline replay)', () => {
+    const { container } = render(<AnchorPanel anchor={{
+      status: 'not_applicable', tx_signature: null, cluster: 'solana-devnet', slot: null,
+      committed_at: null, batching_note: 'offline replay — no anchor', explorer_url: null,
+    }} />);
+    expect(screen.getByText('n/a')).toBeInTheDocument();
+    expect(container.textContent?.toLowerCase()).not.toContain('not anchored');
+  });
 });

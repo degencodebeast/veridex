@@ -10,7 +10,12 @@ export function AnchorPanel({ anchor }: { anchor: AnchorInfo }) {
     <section className={styles.panel} aria-label="Anchor">
       <div className={styles.head}>
         <span className={styles.title}>ANCHOR</span>
-        <Badge variant={STATUS_VARIANT[anchor.status]} />
+        {/* A genuinely not-applicable anchor (offline replay) is neutral n/a — NOT
+            "Not Anchored" (which implies a failed/missing anchor). Neutral-span
+            pattern, reused from the b2 ClvLeaderboard fix (no 14th Badge variant). */}
+        {anchor.status === 'not_applicable'
+          ? <span className={styles.naBadge}>n/a</span>
+          : <Badge variant={STATUS_VARIANT[anchor.status]} />}
       </div>
       <dl className={styles.grid}>
         <dt className={styles.label}>tx signature</dt>
