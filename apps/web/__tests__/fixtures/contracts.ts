@@ -54,12 +54,15 @@ export const offlineReplayProofArtifact: ProofArtifact = {
 
 export const sampleVerifyResult: VerifyResult = {
   ok: true,
+  verified: true,
   evidence_hash_confirmed: true,
   manifest_hash_confirmed: true,
   recomputed: { recomputed_edge_bps: 22.0, clv_bps: 18.0, valid: true },
   anchor_tx: '5xQ…anchorTx',
   explorer_url: 'https://explorer.solana.com/tx/5xQanchorTx?cluster=devnet',
   verifier_version: 'v1.4.2',
+  checks: sampleChecks,
+  metrics: { clv_bps: 18.0, sim_pnl: 124.5, brier: 0.182, hit_rate: 0.61, max_drawdown: -42.0 },
 };
 
 export const sampleInspectorRecord: InspectorRecord = {

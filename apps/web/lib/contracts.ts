@@ -252,12 +252,17 @@ export interface ProofArtifact {
 // Returned by the AUTHORITATIVE backend verify/recompute endpoint (WD-1).
 export interface VerifyResult {
   ok: boolean;
+  verified: boolean; // wire `verified` preserved verbatim (trust-critical)
   evidence_hash_confirmed: boolean;
   manifest_hash_confirmed: boolean;
   recomputed: { recomputed_edge_bps: number; clv_bps: number; valid: boolean };
   anchor_tx: string | null;
   explorer_url: string | null;
   verifier_version: string;
+  // The 7 trust checks + metrics from the authoritative recompute, preserved so
+  // the VerifyButton can show per-check confirmation (SEC-001: no CLV in checks).
+  checks: CheckResult[];
+  metrics: PerformanceMetrics;
 }
 
 // ---- Decision Inspector (REQ-019) ----
