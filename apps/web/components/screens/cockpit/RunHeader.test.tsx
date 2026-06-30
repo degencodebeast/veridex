@@ -25,4 +25,11 @@ describe('RunHeader (REQ-011 run header)', () => {
     render(<RunHeader header={sampleCockpitState.header} wsStatus="reconnecting" />);
     expect(screen.getByText(/reconnecting/i)).toBeInTheDocument();
   });
+
+  it('renders valid_pct as a percent (0-100), matching the wire convention', () => {
+    // sample header valid_pct is 93 (percent); must render "93% valid", not 9300%.
+    render(<RunHeader header={{ ...sampleCockpitState.header, valid_pct: 93 }} wsStatus="connected" />);
+    expect(screen.getByText(/93% valid/)).toBeInTheDocument();
+    expect(screen.queryByText(/9300/)).toBeNull();
+  });
 });

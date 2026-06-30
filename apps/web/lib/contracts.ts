@@ -83,7 +83,7 @@ export interface LeaderboardRow {
   brier: number;
   max_drawdown: number;
   action_count: number;
-  valid_pct: number;
+  valid_pct: number; // PERCENT 0-100 (1:1 from the wire LeaderboardRow)
   proof_mode: ProofMode;
   eligibility_badge: 'eligible' | 'not-eligible';
   anchor_status: AnchorStatus;
@@ -154,7 +154,7 @@ export interface RunHeaderState {
   execution_mode: ExecutionMode;
   proof_mode: ProofMode;
   events: number;
-  valid_pct: number;
+  valid_pct: number; // PERCENT 0-100 (matches the wire convention)
 }
 
 export type WsStatus = 'connecting' | 'connected' | 'reconnecting' | 'disconnected';

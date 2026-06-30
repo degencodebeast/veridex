@@ -23,6 +23,17 @@
   text-transform: uppercase;
   letter-spacing: 0.04em;
 }
+.naBadge {
+  display: inline-flex;
+  align-items: center;
+  padding: 3px 7px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-badge);
+  color: var(--text-3);
+  font-size: 9px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
 .pos { color: var(--positive); }
 .neg { color: var(--negative); }
 .zero { color: var(--text-2); }

@@ -24,7 +24,8 @@ export function RunHeader({ header, wsStatus }: { header: RunHeaderState; wsStat
       </div>
       <div className={styles.stats}>
         <span className={`${styles.stat} mono`}>{header.events} events</span>
-        <span className={`${styles.stat} mono`}>{Math.round(header.valid_pct * 100)}% valid</span>
+        {/* valid_pct is a PERCENT (0-100), matching the wire convention. */}
+        <span className={`${styles.stat} mono`}>{Math.round(header.valid_pct)}% valid</span>
       </div>
     </header>
   );

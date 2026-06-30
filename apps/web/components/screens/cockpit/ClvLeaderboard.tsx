@@ -47,9 +47,15 @@ export function ClvLeaderboard({ rows }: { rows: LeaderboardRow[] }) {
               <td className={`${styles.num} mono`}>{r.brier.toFixed(3)}</td>
               <td className={`${styles.num} mono ${NUM[signClass(r.max_drawdown)]}`}>{r.max_drawdown.toFixed(1)}</td>
               <td className={`${styles.num} mono`}>{r.action_count}</td>
+              {/* valid_pct is a PERCENT (0-100), matching the wire LeaderboardRow. */}
               <td className={`${styles.num} mono`}>{r.valid_pct}%</td>
               <td><Badge variant={r.proof_mode} /></td>
-              <td><Badge variant={r.anchor_status === 'anchored' ? 'anchored' : r.anchor_status === 'pending' ? 'pending' : 'not-anchored'} /></td>
+              <td>
+                {r.anchor_status === 'anchored' ? <Badge variant="anchored" />
+                  : r.anchor_status === 'pending' ? <Badge variant="pending" />
+                  : r.anchor_status === 'not_applicable' ? <span className={styles.naBadge}>n/a</span>
+                  : <Badge variant="not-anchored" />}
+              </td>
             </tr>
           ))}
         </tbody>

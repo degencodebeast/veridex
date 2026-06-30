@@ -182,7 +182,7 @@ export function adaptLeaderboard(w: W.LeaderboardResponse): LeaderboardRow[] {
     brier: r.brier ?? 0,
     max_drawdown: r.max_drawdown,
     action_count: r.action_count,
-    valid_pct: r.valid_pct,
+    valid_pct: r.valid_pct, // PERCENT 0-100, passed through 1:1 from the wire
     proof_mode: toProofMode(r.proof_mode),
     eligibility_badge: r.eligibility_badge === 'eligible' ? 'eligible' : 'not-eligible',
     anchor_status: toAnchorStatus(r.anchor_status),
@@ -210,7 +210,7 @@ export function adaptCompetitionState(w: W.CompetitionStateResponse): CockpitSta
       execution_mode: (cfg.execution_mode as ExecutionMode) ?? 'paper',
       proof_mode: 'reproducible', // GAP: not in wire competition config
       events: w.latest_seq,
-      valid_pct: 0, // GAP
+      valid_pct: 0, // GAP (PERCENT 0-100 convention; no header source in wire competition state)
     },
     // GAPs: the cockpit's trace/match/events/receipts/policy/kill_armed and the rich
     // leaderboard are NOT in GET /competitions/{id}; the cockpit screen assembles them

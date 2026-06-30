@@ -51,6 +51,27 @@ describe('ClvLeaderboard (REQ-011 / SEC-005)', () => {
     expect(within(bodyRows[1]).getByText('LowCLV')).toBeInTheDocument();
   });
 
+  it('REORDERS ascending input into Avg-CLV-desc (rank IS Avg CLV — would fail a no-op comparator)', () => {
+    // Input is in ASCENDING avg_clv order; a no-op/identity sort would render
+    // [12, 25] and fail. The metric-sort must actively reorder to [25, 12].
+    const rows: LeaderboardRow[] = [
+      { ...base, rank: 99, agent_id: 'lo', agent_name: 'LowCLV', avg_clv_bps: 12, eligibility_badge: 'eligible' },
+      { ...base, rank: 1, agent_id: 'hi', agent_name: 'HighCLV', avg_clv_bps: 25, eligibility_badge: 'eligible' },
+    ];
+    render(<ClvLeaderboard rows={rows} />);
+    const bodyRows = screen.getAllByRole('row').slice(1);
+    expect(within(bodyRows[0]).getByText('HighCLV')).toBeInTheDocument(); // avg 25 first
+    expect(within(bodyRows[1]).getByText('LowCLV')).toBeInTheDocument();  // avg 12 second
+  });
+
+  it('labels a not_applicable anchor as n/a, not "Not Anchored"', () => {
+    const { container } = render(
+      <ClvLeaderboard rows={[{ ...base, rank: 1, agent_id: 'a', agent_name: 'A', avg_clv_bps: 20, eligibility_badge: 'eligible', anchor_status: 'not_applicable' }]} />,
+    );
+    expect(screen.getByText('n/a')).toBeInTheDocument();
+    expect(container.textContent?.toLowerCase()).not.toContain('not anchored');
+  });
+
   it('shows the rank-rule + proxy disclaimers', () => {
     render(<ClvLeaderboard rows={[{ ...base, rank: 1, agent_id: 'a', agent_name: 'A', avg_clv_bps: 20, eligibility_badge: 'eligible' }]} />);
     expect(screen.getByText(/Rank is Avg CLV only/i)).toBeInTheDocument();
