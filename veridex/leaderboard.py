@@ -32,6 +32,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from veridex.clv_confidence import clv_confidence
+
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
@@ -137,6 +139,8 @@ def _aggregate(agent_id: str, rows: list[dict[str, Any]]) -> dict[str, Any]:
     total_clv_bps: int = sum(r["total_clv_bps"] for r in rows)
     sim_pnl: int = sum(r["sim_pnl"] for r in rows)
     action_count: int = sum(r["action_count"] for r in rows)
+    # WD-7: pooled CLV sample size across runs (display context — never a rank input, SEC-005).
+    valid_count: int = sum(int(r.get("valid_count", 0)) for r in rows)
 
     # POOLED avg — true mean over all scored actions, NOT mean-of-run-means.
     avg_clv_bps: float | None = (total_clv_bps / action_count) if action_count > 0 else None
@@ -171,6 +175,8 @@ def _aggregate(agent_id: str, rows: list[dict[str, Any]]) -> dict[str, Any]:
         "eligibility_badge": _eligibility_badge(anchor_statuses),
         "anchor_status": _summarize_anchor_status(anchor_statuses),
         "source_mode": _summarize_source_mode(source_modes),
+        "valid_count": valid_count,
+        **clv_confidence(valid_count),  # adds clv_confidence + low_sample + sample_size (display-only)
     }
 
 
@@ -250,7 +256,9 @@ def leaderboard(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
         Row keys: ``agent_id``, ``runs``, ``avg_clv_bps``, ``total_clv_bps``,
         ``sim_pnl``, ``brier``, ``max_drawdown``, ``action_count``, ``valid_pct``,
         ``proof_mode``, ``eligibility_badge``, ``anchor_status``, ``source_mode``,
-        ``rank``.
+        ``valid_count`` (WD-7 pooled CLV sample size), ``clv_confidence``
+        (``"low"``/``"medium"``/``"high"``), ``low_sample``, ``sample_size``, ``rank``.
+        The WD-7 confidence fields are DISPLAY-only and never enter ``_rank_key`` (SEC-005).
     """
     # Group records by agent_id, preserving first-seen order for determinism
     # (dict insertion order is guaranteed stable in Python ≥ 3.7).
