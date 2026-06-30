@@ -1,4 +1,5 @@
-import { ScreenStub } from '@/components/layout/ScreenStub';
+import { LeaderboardScreen } from '@/components/screens/LeaderboardScreen';
+
 export default function LeaderboardPage() {
-  return <ScreenStub label="Leaderboard" plan="2C Plan C" />;
+  return <LeaderboardScreen />;
 }
