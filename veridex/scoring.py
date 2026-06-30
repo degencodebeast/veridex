@@ -163,6 +163,7 @@ def _agent_metrics(agent_id: str, proof_mode: str, agent_rows: list[dict[str, An
         "max_drawdown": _max_drawdown(scored_clv),
         "action_count": action_count,
         "valid_pct": valid_pct,
+        "valid_count": valid_count,  # WD-7: CLV sample-size source (law-valid decisions)
         "proof_mode": proof_mode,
     }
 
@@ -206,7 +207,8 @@ def score_run(run: RunResult) -> list[dict[str, Any]]:
     Returns:
         Metric-stack rows sorted best-first, each with ``rank`` (1..N) assigned. Each row is
         ``{agent_id, avg_clv_bps, total_clv_bps, sim_pnl, brier, max_drawdown, action_count,
-        valid_pct, rank, proof_mode}``.
+        valid_pct, valid_count, rank, proof_mode}`` (``valid_count`` is the WD-7 CLV sample size;
+        it is display-only and never enters the rank key — SEC-005).
     """
     rows_by_agent: dict[str, list[dict[str, Any]]] = {agent_id: [] for agent_id in run.agent_ids}
     for row in run.score_rows:
