@@ -1,4 +1,8 @@
-import { ScreenStub } from '@/components/layout/ScreenStub';
+'use client';
+import { useRouter } from 'next/navigation';
+import { AgentStudioScreen } from '@/components/screens/AgentStudioScreen';
+
 export default function AgentStudioPage() {
-  return <ScreenStub label="Agent Studio" plan="2C Plan C" />;
+  const router = useRouter();
+  return <AgentStudioScreen onPin={() => router.push('/dashboard')} />;
 }
