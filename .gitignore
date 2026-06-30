@@ -10,6 +10,7 @@
 !/tests/
 !/scripts/
 !/contracts/
+!/apps/
 
 # planning/spec docs stay LOCAL — never pushed (per project decision)
 spec/
