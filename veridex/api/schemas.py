@@ -277,13 +277,39 @@ class InspectorRecord(BaseModel):
 
 
 class FeedHealthResponse(BaseModel):
-    """Feed-health view-model (Markets / cockpit feed-health strip)."""
+    """Feed-health view-model (Markets / cockpit feed-health strip).
+
+    Read-only OPERATIONAL TELEMETRY — never scored, never in ``evidence_hash``, never a proof
+    check or leaderboard input. Carries TWO complementary views of the same feed: A's throughput
+    view (``events_per_min`` / ``ws_live`` / ``anchor_status``) and the WD-4 staleness view
+    (``txline_configured`` / ``connected`` / ``ticks_seen`` / ``fixture_id`` / ``staleness_s`` /
+    ``stale``). ``ws_live`` mirrors ``connected`` so both views agree.
+
+    Attributes:
+        source_mode: ``"live"`` or ``"replay"``.
+        events_per_min: Tick throughput (``None`` when no live counter is wired).
+        ws_live: Whether the live WS stream is up (mirrors ``connected``).
+        last_tick_ts: Unix seconds of the most recent tick, or ``None`` when none seen.
+        anchor_status: Honest anchor state for the surface (``"not_anchored"`` offline).
+        txline_configured: Whether TxLINE credentials are present (never the secret values).
+        connected: Whether the stream is currently connected (best-effort).
+        ticks_seen: Count of ingested ticks.
+        fixture_id: The fixture being followed, or ``None``.
+        staleness_s: Seconds since the last tick, or ``None`` when none seen.
+        stale: Whether the feed has exceeded its staleness budget.
+    """
 
     source_mode: str
     events_per_min: float | None
     ws_live: bool
     last_tick_ts: int | None
     anchor_status: str
+    txline_configured: bool
+    connected: bool
+    ticks_seen: int
+    fixture_id: int | None
+    staleness_s: int | None
+    stale: bool
 
 
 class RuntimeEventsResponse(BaseModel):

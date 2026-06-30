@@ -62,9 +62,12 @@ export interface InspectorRecord {
   untrusted_llm_metadata: Record<string, unknown>;   // "NOT AN INPUT TO SCORE" (SEC-007)
 }
 
-export interface FeedHealth {
+export interface FeedHealth {           // GET /feed/health — read-only telemetry (NOT scored)
   source_mode: string; events_per_min: number | null; ws_live: boolean;
   last_tick_ts: number | null; anchor_status: string;
+  // WD-4 staleness view (additive — ws_live mirrors connected):
+  txline_configured: boolean; connected: boolean; ticks_seen: number;
+  fixture_id: number | null; staleness_s: number | null; stale: boolean;
 }
 
 export type RuntimeEventType =

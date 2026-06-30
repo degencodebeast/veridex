@@ -3,5 +3,11 @@
   "events_per_min": null,
   "ws_live": false,
   "last_tick_ts": 1782518393,
-  "anchor_status": "not_anchored"
+  "anchor_status": "not_anchored",
+  "txline_configured": false,
+  "connected": false,
+  "ticks_seen": 128,
+  "fixture_id": 18172280,
+  "staleness_s": 5,
+  "stale": false
 }
