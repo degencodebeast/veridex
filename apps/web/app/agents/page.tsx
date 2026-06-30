@@ -1,4 +1,5 @@
-import { ScreenStub } from '@/components/layout/ScreenStub';
+import { AgentsScreen } from '@/components/screens/AgentsScreen';
+
 export default function AgentsPage() {
-  return <ScreenStub label="Agents Directory" plan="2C Plan C" />;
+  return <AgentsScreen />;
 }
