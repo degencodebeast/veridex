@@ -12,9 +12,9 @@ export interface QuantityDef {
 
 export const QUANTITIES: readonly QuantityDef[] = [
   { id: 'fair_value', label: 'Fair Value', definition: 'TxLINE de-margined consensus probability — the market-implied fair probability, not guaranteed truth.' },
-  { id: 'executable_edge', label: 'Executable Edge', definition: 'Expected value at the actual venue decimal price.' },
-  { id: 'clv', label: 'CLV', definition: 'Closing-Line Value — the proven skill metric the law recomputes from sealed evidence.' },
-  { id: 'stake', label: 'Stake · Kelly', definition: 'Policy sizing (Kelly fraction under the PolicyEnvelope) — not a measure of skill.' },
+  { id: 'executable_edge', label: 'Executable Edge', definition: 'Forward EV at the actual venue decimal price — gates execution, never scored.' },
+  { id: 'clv', label: 'CLV', definition: 'Closing-Line Value — the backward, at-close skill metric the law recomputes from sealed evidence. The ONLY scored quantity.' },
+  { id: 'stake', label: 'Stake · Kelly', definition: 'Policy sizing (Kelly fraction under the PolicyEnvelope) — never a score or skill metric.' },
 ] as const;
 
 export const STABLE_PRICE_CAPTION =
