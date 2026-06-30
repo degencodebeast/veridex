@@ -23,7 +23,11 @@ beforeEach(() => {
 describe('killer flow (REQ-004 / AC-021)', () => {
   it('cockpit AGENT_ACTION row links to the Inspector for that action', () => {
     render(<CockpitScreen competitionId="wc-fra-bra" initial={sampleCockpitState} />);
-    const expected = inspectorHref(sampleCockpitState.run_id, 87);
+    // Derive the seq from the fixture's AGENT_ACTION event, not a hardcoded literal,
+    // so the link contract is asserted against the real data the cockpit renders.
+    const agentAction = sampleCockpitState.events.find((e) => e.type === 'AGENT_ACTION');
+    expect(agentAction).toBeDefined();
+    const expected = inspectorHref(sampleCockpitState.run_id, agentAction!.seq);
     expect(screen.getByRole('link', { name: /AGENT_ACTION/i })).toHaveAttribute('href', expected);
   });
 
