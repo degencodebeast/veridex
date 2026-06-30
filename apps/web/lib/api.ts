@@ -34,6 +34,8 @@ export const PATHS = {
     competitionId ? `/leaderboard?competition_id=${competitionId}` : `/leaderboard`,
   inspector: (runId: string, seq: number | string) => `/runs/${runId}/actions/${seq}`,
   feedHealth: () => `/feed/health`,
+  // C2 catalog: agent runtime-events (OPS telemetry; ImplD-served orphaned route).
+  runtimeEvents: (agentId: string) => `/agents/${agentId}/runtime-events`,
 } as const;
 
 export class ApiError extends Error {
