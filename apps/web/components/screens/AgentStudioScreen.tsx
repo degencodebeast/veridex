@@ -5,6 +5,7 @@ import { JsonView } from '@/components/ui/JsonView';
 import { Badge } from '@/components/ui/Badge';
 import { availableModes, resolveMode, type StudioMode } from '@/lib/studio/coupling';
 import { ARCHETYPES, SPORTS_ACTION_TYPES, type Archetype, type ExecutionMode } from '@/lib/catalog';
+import { STRATEGY_TEMPLATES, COMPLEXITY_LABEL, type StrategyTemplate } from '@/lib/studio/templates';
 import { DEFAULT_POLICY_ENVELOPE } from '@/lib/fixtures/catalog';
 import styles from './AgentStudioScreen.module.css';
 
@@ -47,6 +48,12 @@ export function AgentStudioScreen({
   function onMode(next: StudioMode) {
     setMode(resolveMode(archetype, next));
   }
+  // Selecting a BUILT template applies its archetype + default mode through the existing coupling
+  // (snap-back preserved). Heavy-extension (Phase-3) templates are not selectable.
+  function applyTemplate(t: StrategyTemplate) {
+    setArchetype(t.archetype);
+    setMode(resolveMode(t.archetype, t.defaultMode));
+  }
 
   const config_hash = hashConfig(archetype, mode);
   const policy_hash = hashPolicy(DEFAULT_POLICY_ENVELOPE.min_edge_bps, exec);
@@ -88,6 +95,25 @@ export function AgentStudioScreen({
       <div className={styles.layout}>
         <div className={styles.sections}>
           <Section n="01" title="Identity & archetype">
+            <div className={styles.cards} data-testid="strategy-cards">
+              {STRATEGY_TEMPLATES.map((t) => {
+                const phase3 = t.complexity === 'heavy-extension';
+                return (
+                  <button
+                    key={t.id}
+                    type="button"
+                    className={`${styles.card} ${phase3 ? styles.cardPhase3 : ''}`}
+                    disabled={phase3 || running}
+                    aria-disabled={phase3 || undefined}
+                    onClick={() => { if (!phase3) applyTemplate(t); }}
+                  >
+                    <span className={styles.cardLabel}>{t.label}</span>
+                    <span className={styles.cardComplexity}>{COMPLEXITY_LABEL[t.complexity]}</span>
+                    <span className={styles.cardBlurb}>{t.blurb}</span>
+                  </button>
+                );
+              })}
+            </div>
             <label className={styles.field}>
               <span className={styles.label}>Archetype</span>
               <select aria-label="Archetype" className={styles.select} value={archetype} disabled={running} onChange={(e) => onArchetype(e.target.value as Archetype)}>
