@@ -1,3 +1,24 @@
+@import '../styles/tokens.css';
+
 *, *::before, *::after { box-sizing: border-box; }
 html, body { margin: 0; padding: 0; }
-body { background: #070A0E; color: #E7EBF2; }
+
+body {
+  background: var(--bg);
+  color: var(--text-1);
+  font-family: var(--font-sans), system-ui, sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* Mono / tabular numerals for all data, hashes, numerics (PAT-001). */
+.mono {
+  font-family: var(--font-mono), ui-monospace, monospace;
+  font-feature-settings: 'tnum' 1;
+}
+
+/* Right-aligned tabular numerics (GUD-001). */
+.num {
+  font-family: var(--font-mono), ui-monospace, monospace;
+  font-feature-settings: 'tnum' 1;
+  text-align: right;
+}

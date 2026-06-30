@@ -1,0 +1,57 @@
+/* Veridex Direction A (dark terminal) — THE single source of design values.
+   This is the ONLY file permitted to contain raw hex (PAT-001). */
+:root {
+  /* Surfaces */
+  --bg: #070A0E;
+  --bg-bar: #0A0E14;
+  --panel: #0C1016;
+  --panel-2: #10141B;
+  --border: #1A212C;
+  --border-soft: #141A23;
+  --border-strong: #2A3340;
+
+  /* Text */
+  --text-1: #E7EBF2;
+  --text-2: #93A0B4;
+  --text-2-alt: #9AA6B8;
+  --text-3: #5D6675;
+  --text-4: #4A525F;
+
+  /* Accent (the ONE accent: blue = live/proof) */
+  --accent: #3B82F6;
+  --accent-hi: #9CC1FF;
+  --accent-2: #7FB0FF;
+  --accent-bg: rgba(59, 130, 246, 0.14);
+  --accent-bg-soft: rgba(59, 130, 246, 0.10);
+
+  /* Warning (the ONE warning: amber = pending/invalid) */
+  --warning: #C9A44A;
+  --warning-hi: #D6B25E;
+  --warning-bg: rgba(200, 154, 58, 0.12);
+
+  /* Numeric direction ONLY (never decoration) */
+  --positive: #5CBF8A;
+  --positive-bg: rgba(63, 164, 107, 0.12);
+  --negative: #E08A78;
+  --negative-bg: rgba(210, 96, 75, 0.14);
+
+  /* Radius (8px max) */
+  --radius-badge: 4px;
+  --radius-control: 6px;
+  --radius-panel: 8px;
+
+  /* Spacing (base-8, 4px half-step) */
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 18px;
+  --pad-panel: 12px;
+  --pad-screen: 16px;
+
+  /* Motion */
+  --pulse-duration: 1.4s;
+
+  /* Layout */
+  --nav-h: 51px;
+}
