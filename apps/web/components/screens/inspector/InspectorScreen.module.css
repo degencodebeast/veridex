@@ -25,6 +25,9 @@
 .clvPlain { color: var(--text-2); font-size: 12px; line-height: 1.6; }
 .scoreChip { display: inline-block; padding: 4px 8px; border-radius: var(--radius-control); background: var(--positive-bg); color: var(--positive); font-weight: 600; }
 
+.actionPanel { display: flex; flex-direction: column; gap: var(--space-1); }
+.actionNote { margin: 0; color: var(--warning-hi); font-size: 9px; font-style: italic; letter-spacing: 0.02em; }
+
 .untrusted { padding: var(--pad-panel); border: 1px dashed var(--warning); border-radius: var(--radius-panel); background: var(--warning-bg); }
 .untrustedHead { color: var(--warning-hi); font-family: var(--font-mono), monospace; font-size: 10px; font-weight: 600; letter-spacing: 0.04em; margin-bottom: var(--space-2); }
 .rationale { color: var(--text-2); font-size: 12px; font-style: italic; line-height: 1.6; margin: var(--space-2) 0 0; }

@@ -34,6 +34,12 @@ describe('InspectorScreen (REQ-019 / SEC-006/007 / AC-006/021)', () => {
     expect(screen.getByText(/France controlling tempo/i)).toBeInTheDocument(); // rationale shown but fenced
   });
 
+  it('marks the AgentAction panel params as untrusted (claimed_edge_bps must not read as authoritative)', () => {
+    render(<InspectorScreen record={sampleInspectorRecord} />);
+    expect(screen.getByText(/params include untrusted LLM claims/i)).toBeInTheDocument();
+    expect(screen.getByText(/recorded, not scored/i)).toBeInTheDocument();
+  });
+
   it('is read-only during a run with no editable affordances + shows READ-ONLY DURING RUN (AC-006)', () => {
     const { container } = render(<InspectorScreen record={sampleInspectorRecord} />);
     expect(screen.getByText(/READ-ONLY DURING RUN/i)).toBeInTheDocument();

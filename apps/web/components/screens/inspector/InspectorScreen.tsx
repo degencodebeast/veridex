@@ -34,7 +34,15 @@ export function InspectorScreen({ record }: { record: InspectorRecord }) {
 
       <div className={styles.panels}>
         <JsonPanel title="MarketState" data={record.market_state} />
-        <JsonPanel title="AgentAction" data={record.agent_action} />
+        <div className={styles.actionPanel}>
+          <JsonPanel title="AgentAction" data={record.agent_action} />
+          {/* The action params include untrusted LLM claims (reason/confidence/
+              claimed_edge_bps) — recorded, never scored (SEC-007). Marked so the
+              claim never reads as authoritative on this trust screen. */}
+          <p className={styles.actionNote}>
+            ⚠ params include untrusted LLM claims (reason · confidence · claimed_edge_bps) — recorded, not scored
+          </p>
+        </div>
         <JsonPanel title="Deterministic Recompute" data={record.recompute} accent />
         <section className={styles.clv}>
           <div className={styles.clvTitle}>CLV Explanation</div>
