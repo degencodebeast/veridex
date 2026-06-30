@@ -105,6 +105,21 @@ def test_live_checks_block_is_sec001_compliant() -> None:
     assert set(proof_checks) >= _SEVEN_CHECK_IDS
 
 
+def test_verify_manifest_bound_passes_on_honest_run() -> None:
+    """BLOCKER: verify must CONFIRM the manifest hash on an honest run.
+
+    The endpoint reconstructs the manifest + manifest_hash; passing them to ``build_check_results``
+    makes MANIFEST_BOUND ``pass``. The prior 2-arg ``_default_checks`` omitted them → ``not_applicable``
+    → the Proof Card false-red "manifest hash mismatch" on a perfectly honest run. Regression guard.
+    """
+    client = TestClient(create_app(store=InMemoryStore()))
+    run_id = client.post("/demo/run").json()["run_id"]
+
+    body = client.post(f"/runs/{run_id}/verify").json()
+    assert body["verified"] is True  # honest run still verifies
+    assert body["checks"]["manifest_bound"]["result"] == "pass"  # not "not_applicable"
+
+
 async def test_verify_route_manifest_hash_matches_seal_time() -> None:
     """Carry #3 (DRY): the verify route rebuilds the manifest with the seal-time helpers.
 

@@ -58,13 +58,29 @@
     "manifest_bound": {
       "id": "manifest_bound",
       "label": "Manifest Bound",
-      "result": "not_applicable",
+      "result": "pass",
       "severity": "blocking",
       "method": "manifest_field_binding",
       "scope": "run_manifest",
-      "evidence_refs": [],
-      "rules": [],
-      "details": {},
+      "evidence_refs": [
+        "evidence_hash",
+        "score_root"
+      ],
+      "rules": [
+        {
+          "all_bound": true
+        }
+      ],
+      "details": {
+        "bound_fields": [
+          "action_evidence_root",
+          "code_prompt_schema_versions",
+          "manifest_hash",
+          "proof_mode_map",
+          "run_id",
+          "score_root"
+        ]
+      },
       "error": null
     },
     "policy_obeyed": {
@@ -213,13 +229,29 @@
       "manifest_bound": {
         "id": "manifest_bound",
         "label": "Manifest Bound",
-        "result": "not_applicable",
+        "result": "pass",
         "severity": "blocking",
         "method": "manifest_field_binding",
         "scope": "run_manifest",
-        "evidence_refs": [],
-        "rules": [],
-        "details": {},
+        "evidence_refs": [
+          "evidence_hash",
+          "score_root"
+        ],
+        "rules": [
+          {
+            "all_bound": true
+          }
+        ],
+        "details": {
+          "bound_fields": [
+            "action_evidence_root",
+            "code_prompt_schema_versions",
+            "manifest_hash",
+            "proof_mode_map",
+            "run_id",
+            "score_root"
+          ]
+        },
         "error": null
       },
       "policy_obeyed": {

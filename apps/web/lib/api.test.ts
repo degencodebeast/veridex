@@ -38,7 +38,11 @@ describe('api client (CON-003: binds the frozen wire contract, maps to the view-
     expect(a.checks.some((c) => /clv/i.test(c.id) || /clv/i.test(c.label))).toBe(false);
     expect(typeof a.metrics.clv_bps).toBe('number');
     expect(a.metrics.clv_bps).toBe(92); // CLV lives in metrics, mapped faithfully
-    expect(String(calls()[0][0])).toContain('/runs/run_7f3a');
+    // EXACT path: GET /runs/{id} (backend serves the ProofArtifact here). A regression
+    // re-adding the old /proof suffix would 404 against the real API — so pin it precisely.
+    const proofUrl = String(calls()[0][0]);
+    expect(proofUrl).toMatch(/\/runs\/run_7f3a$/);
+    expect(proofUrl).not.toContain('/proof');
   });
 
   it('POSTs the authoritative verify endpoint and preserves verified + the 7 checks (WD-1)', async () => {
@@ -47,6 +51,8 @@ describe('api client (CON-003: binds the frozen wire contract, maps to the view-
     expect(r.verified).toBe(true);
     expect(r.ok).toBe(true);
     expect(r.evidence_hash_confirmed).toBe(true); // evidence_hash === recomputed_evidence_hash in fixture
+    // manifest_bound=pass in the fixture (backend now binds the manifest) → confirmed, not false-red.
+    expect(r.manifest_hash_confirmed).toBe(true);
     expect(r.checks).toHaveLength(7);
     expect(r.checks.some((c) => /clv/i.test(c.id))).toBe(false);
     const [url, init] = calls()[0];

@@ -64,7 +64,11 @@ from veridex.api.schemas import (
 )
 from veridex.api.ws import ArenaConnectionManager, register_arena_routes
 from veridex.chain.anchor import explorer_tx_url
-from veridex.checks.build import build_performance_metrics
+from veridex.checks.build import (
+    build_check_results,
+    build_performance_metrics,
+    check_results_to_proof_block,
+)
 from veridex.competition.events import CompetitionEvent, EventType
 from veridex.competition.models import (
     AgentEntry,
@@ -560,7 +564,6 @@ def create_app(
             raise HTTPException(status_code=404, detail=f"run {run_id!r} not found") from None
 
         report = _verify_run_core(run_result)
-        checks = _default_checks(report.score_rows, run_result)
         metrics = build_performance_metrics(report.score_rows)  # SEC-001: CLV lives here, not in checks
 
         meta = _run_meta.get(run_id, {})
@@ -571,6 +574,18 @@ def create_app(
             "cluster": DEFAULT_CLUSTER,
             "explorer_url": explorer_tx_url(signature, cluster=DEFAULT_CLUSTER),
         }
+        # Bind the FULL verdict: pass the reconstructed manifest/manifest_hash + anchor so
+        # MANIFEST_BOUND confirms the seal — the 2-arg _default_checks omits them, leaving
+        # manifest_bound=not_applicable, which false-reds the manifest hash on an honest run.
+        check_results = build_check_results(
+            scores=report.score_rows,
+            run=run_result,
+            manifest=report.manifest,
+            manifest_hash=report.manifest_hash,
+            anchor=anchor_block,
+            source_mode=report.source_mode,
+        )
+        checks = check_results_to_proof_block(check_results)
         proof_card = proof_card_from_run_result(
             run_result,
             checks=checks,

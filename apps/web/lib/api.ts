@@ -26,7 +26,9 @@ export const API_BASE = process.env.NEXT_PUBLIC_API_BASE ?? '';
 
 // Centralized path map — the C1 binding points. A route change is a one-line edit.
 export const PATHS = {
-  runProof: (runId: string) => `/runs/${runId}/proof`,
+  // The backend serves the ProofArtifact at GET /runs/{id} (no /proof suffix — pinned by
+  // tests/test_api_contract.py; /api/proof is 404). A regression re-adding /proof false-404s the card.
+  runProof: (runId: string) => `/runs/${runId}`,
   verify: (runId: string) => `/runs/${runId}/verify`,
   competitionState: (id: string) => `/competitions/${id}`,
   competitionEvents: (id: string, sinceSeq = 0) => `/competitions/${id}/events?since_seq=${sinceSeq}`,
