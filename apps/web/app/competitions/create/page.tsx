@@ -1,4 +1,8 @@
-import { ScreenStub } from '@/components/layout/ScreenStub';
+'use client';
+import { useRouter } from 'next/navigation';
+import { CreateCompetitionScreen } from '@/components/screens/CreateCompetitionScreen';
+
 export default function CreateCompetitionPage() {
-  return <ScreenStub label="Create Competition" plan="2C Plan C" />;
+  const router = useRouter();
+  return <CreateCompetitionScreen onCommit={() => router.push('/arena/new')} />;
 }
