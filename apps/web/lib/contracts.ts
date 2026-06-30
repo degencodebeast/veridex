@@ -158,6 +158,23 @@ export interface RunHeaderState {
   verifier_version: string; // from the run's proof artifact (single source the status bar reads)
 }
 
+// GET /feed/health (WD-4) telemetry view-model — read-only, NEVER scored. `source_mode` is the
+// honesty-gated data axis; `ws_live`/`connected`/`stale`/`staleness_s` are the real connection
+// signals (the rail renders them verbatim — never a coerced "healthy/live" when the feed isn't).
+export interface FeedHealthState {
+  source_mode: SourceMode;
+  ws_live: boolean;
+  connected: boolean;
+  txline_configured: boolean;
+  events_per_min: number | null;
+  ticks_seen: number;
+  staleness_s: number | null;
+  stale: boolean;
+  fixture_id: number | null;
+  anchor_status: AnchorStatus;
+  last_tick_ts: number | null;
+}
+
 export type WsStatus = 'connecting' | 'connected' | 'reconnecting' | 'disconnected';
 
 export type ProofTraceStage =

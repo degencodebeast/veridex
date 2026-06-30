@@ -1,7 +1,7 @@
 import type {
   LeaderboardRow, CompetitionSummary, AgentSummary, AgentProfileRecord, RunSummary,
   RewardSummary, OpsAlert, OddsUpdate, FixtureSummary, RuntimeOverview, CanonicalLogLine,
-  PolicyEnvelope,
+  PolicyEnvelope, FeedHealthState,
 } from '@/lib/catalog';
 
 export const DEFAULT_POLICY_ENVELOPE: PolicyEnvelope = {
@@ -118,6 +118,23 @@ export const FIXTURES: FixtureSummary[] = [
   { fixture_id: 18172280, competition: 'World Cup', participant1: 'FRA', participant2: 'BRA', start_time: '2026-06-29T18:00:00Z', in_running: true },
   { fixture_id: 18172281, competition: 'World Cup', participant1: 'ARG', participant2: 'GER', start_time: '2026-06-30T18:00:00Z', in_running: false },
 ];
+
+// WD-4 feed-health DEMO default for the Markets right rail — honest replay/not-live telemetry
+// (mirrors contracts/fixtures/feed_health.json). ws_live=false ⇒ the rail renders OFFLINE, never
+// a fake "healthy/live"; staleness is real. This is DEMO data (the MockBanner labels it).
+export const FEED_HEALTH: FeedHealthState = {
+  source_mode: 'replay',
+  ws_live: false,
+  connected: false,
+  txline_configured: false,
+  events_per_min: null,
+  ticks_seen: 128,
+  staleness_s: 5,
+  stale: false,
+  fixture_id: 18172280,
+  anchor_status: 'not-anchored',
+  last_tick_ts: 1782518393,
+};
 
 export const RUNTIME_OVERVIEW: Record<string, RuntimeOverview> = {
   momentum_fr: {

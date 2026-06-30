@@ -14,11 +14,12 @@ vi.mock('@/lib/mock', async () => {
       leaderboard: { ...f.leaderboard, rows: f.leaderboard.rows.map((r) => ({ ...r, source_mode: 'live' })) },
       competition: { ...f.competition, config: { ...(f.competition.config as Record<string, unknown>), source_mode: 'live' } },
       proofArtifact: { ...f.proofArtifact, run: { ...(f.proofArtifact.run as Record<string, unknown>), source_mode: 'live' } },
+      feedHealth: { ...f.feedHealth, source_mode: 'live' },
     },
   };
 });
 
-import { getLeaderboard, getCockpitState, getProofArtifact, mockStatusSeed } from '@/lib/api';
+import { getLeaderboard, getCockpitState, getProofArtifact, getFeedHealth, mockStatusSeed } from '@/lib/api';
 
 describe('MOCK MODE live→replay demotion (synthetic-live teeth)', () => {
   it('demotes a synthetic LIVE source_mode to replay at every mock reader', async () => {
@@ -33,6 +34,9 @@ describe('MOCK MODE live→replay demotion (synthetic-live teeth)', () => {
 
     // proof artifact demote (via the demote() helper)
     expect((await getProofArtifact('x')).source_mode).toBe('replay');
+
+    // feed-health demote (via the demote() helper) — a synthetic LIVE feed never renders LIVE
+    expect((await getFeedHealth()).source_mode).toBe('replay');
   });
 
   it('demotes the status-bar mock seed too — synthetic LIVE → REPLAY (the bar never shows fake LIVE)', () => {

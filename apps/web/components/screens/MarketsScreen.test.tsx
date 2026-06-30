@@ -57,8 +57,9 @@ describe('MarketsScreen (REQ-016 / AC-010/011 / REQ-042 / CON-040)', () => {
     expect(within(fam).getByText(/Asian Handicap/i)).toBeInTheDocument();
     expect(within(fam).getByText('1.472')).toBeInTheDocument(); // decimal odds (decoded, 3dp)
     expect(within(fam).getByText(/67\.935/)).toBeInTheDocument(); // full-precision implied %
-    // in-running with no pre-match → closing pending/— (CON-040)
-    expect(within(fam).getAllByText(/pending|—/).length).toBeGreaterThanOrEqual(1);
+    // in-running with no pre-match → CLOSING is pending (CON-040). Scope to /pending/ so this
+    // tests the closing state, not the EDGE/AGENTS "—" cells (which are honestly — by design).
+    expect(within(fam).getAllByText(/pending/i).length).toBeGreaterThanOrEqual(1);
   });
 
   it('does NOT render any unsupported TxLINE field — only the 4-field decimal outcome (#5 / REQ-042)', async () => {
@@ -85,6 +86,82 @@ describe('MarketsScreen (REQ-016 / AC-010/011 / REQ-042 / CON-040)', () => {
     await user.click(screen.getByTestId('fixture-18172280'));
     const fam = screen.getByTestId('families');
     expect(within(fam).getAllByText('1.500').length).toBeGreaterThanOrEqual(1); // decimal AND closing both 1.500
-    expect(within(fam).queryAllByText(/pending|—/)).toHaveLength(0); // closing is a value, not pending
+    // closing is a value, not pending. Scope to /pending/ (not /—/) — the EDGE/AGENTS cells are
+    // honestly "—" by design, which is unrelated to the closing-reconstruction branch under test.
+    expect(within(fam).queryAllByText(/pending/i)).toHaveLength(0);
+  });
+});
+
+// ── V5 fidelity: default-select + right rail + odds-table density ──────────────
+describe('MarketsScreen V5 (default-select · right rail · EDGE/AGENTS honesty)', () => {
+  it('default-selects the first fixture on load — the odds table populates WITHOUT a click', () => {
+    render(<MarketsScreen />);
+    // No interaction: the families table is already rendered (not the empty "select a fixture" prompt).
+    const fam = screen.getByTestId('families');
+    // consensus AND closing both reconstruct to 1.472 in the default data → at least one cell present.
+    expect(within(fam).getAllByText('1.472').length).toBeGreaterThanOrEqual(1); // default fixture populated
+    expect(screen.queryByText(/select a fixture/i)).toBeNull();
+  });
+
+  it('MATCH STATE rail shows the match-phase (IN-PLAY) — SEPARATE from source_mode, no source vocab', () => {
+    render(<MarketsScreen />); // default fixture FRA v BRA is in_running → IN-PLAY
+    const rail = screen.getByTestId('rail-match-state');
+    expect(rail).toHaveTextContent(/FRA/);
+    expect(rail).toHaveTextContent(/World Cup/);
+    expect(rail).toHaveTextContent(/in-play/i);   // match phase (the fixture axis)
+    // match-phase is NOT a data-source claim — the source axis lives in the strip/status bar.
+    expect(rail).not.toHaveTextContent(/replay/i);
+    expect(screen.getByTestId('source-strip')).toHaveTextContent(/replay/i);
+  });
+
+  it('FEED HEALTH rail renders honestly — not-live feed shows OFFLINE + REAL staleness, never "healthy/live"', () => {
+    render(<MarketsScreen />); // catalog FEED_HEALTH default: ws_live=false, staleness_s=5
+    const rail = screen.getByTestId('rail-feed-health');
+    expect(rail).toHaveTextContent(/offline/i);   // ws_live=false → OFFLINE, never a fake "LIVE"
+    expect(rail).not.toHaveTextContent(/\blive\b/i);
+    expect(rail).not.toHaveTextContent(/healthy/i);
+    expect(rail).toHaveTextContent(/5\s*s/);       // real staleness from the fixture
+  });
+
+  it('ELIGIBLE AGENTS rail shows the eligible POOL (not fixture-scoped) — not-eligible agents excluded', () => {
+    render(<MarketsScreen />);
+    const rail = screen.getByTestId('rail-eligible-agents');
+    expect(rail).toHaveTextContent(/Value CLV/);   // eligible
+    expect(rail).not.toHaveTextContent(/Momentum FR/); // not-eligible → excluded (SEC: eligibility honest)
+    expect(rail).toHaveTextContent(/pool/i);       // honestly labeled a pool, NOT "scoped to this fixture"
+    expect(rail).not.toHaveTextContent(/scoped to this fixture/i);
+  });
+
+  it('EDGE + AGENTS columns are honest "—" (no fabricated executable-edge / per-market agent counts)', () => {
+    render(<MarketsScreen />);
+    const fam = screen.getByTestId('families');
+    expect(within(fam).getAllByText(/EDGE/i).length).toBeGreaterThanOrEqual(1);   // header kept for layout
+    expect(within(fam).getAllByText(/AGENTS/i).length).toBeGreaterThanOrEqual(1);
+    // every EDGE/AGENTS cell is the em-dash, NEVER a number (executable edge needs a venue price;
+    // per-market agent counts aren't tracked — we refuse to fabricate either).
+    const edge = within(fam).getAllByTestId('edge-cell');
+    const agents = within(fam).getAllByTestId('agents-cell');
+    expect(edge.length).toBeGreaterThan(0);
+    expect(edge.every((c) => c.textContent === '—')).toBe(true);
+    expect(edge.some((c) => /\d/.test(c.textContent ?? ''))).toBe(false);
+    expect(agents.every((c) => c.textContent === '—')).toBe(true);
+    expect(agents.some((c) => /\d/.test(c.textContent ?? ''))).toBe(false);
+  });
+
+  it('market-type tabs filter the families; the 1X2-HT tab is honestly disabled (not in feed)', async () => {
+    const user = userEvent.setup();
+    render(<MarketsScreen />);
+    // HT half-time market is NOT in the feed → its tab exists for layout but is disabled, not faked.
+    expect(screen.getByTestId('tab-1x2-ht')).toBeDisabled();
+    // clicking O/U narrows to just the Over/Under family.
+    await user.click(screen.getByTestId('tab-ou'));
+    const fam = screen.getByTestId('families');
+    expect(within(fam).getByText(/Over \/ Under/i)).toBeInTheDocument();
+    expect(within(fam).queryByText(/Match Result/i)).toBeNull();
+  });
+
+  it('LAUNCH COMPETITION pre-scopes the create flow to the selected fixture', () => {
+    render(<MarketsScreen />);
+    expect(screen.getByTestId('launch-competition')).toHaveAttribute('href', '/competitions/create?fixture=18172280');
   });
 });

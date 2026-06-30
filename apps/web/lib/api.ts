@@ -19,9 +19,9 @@ import { isMockEnabled, MOCK_FIXTURES } from '@/lib/mock';
 import { VERIFIER_VERSION, type StatusBarState } from '@/lib/status';
 import type * as W from '@/lib/wire';
 import type {
-  AnchorInfo, AnchorStatus, CheckResult, CockpitState, ExecutionMode, InspectorRecord,
-  LeaderboardRow, MatchState, PerformanceMetrics, ProofArtifact, ProofMode, SourceMode,
-  VerifyResult,
+  AnchorInfo, AnchorStatus, CheckResult, CockpitState, ExecutionMode, FeedHealthState,
+  InspectorRecord, LeaderboardRow, MatchState, PerformanceMetrics, ProofArtifact, ProofMode,
+  SourceMode, VerifyResult,
 } from '@/lib/contracts';
 
 export const API_BASE = process.env.NEXT_PUBLIC_API_BASE ?? '';
@@ -262,6 +262,25 @@ export function adaptInspector(w: W.InspectorRecord): InspectorRecord {
   };
 }
 
+// GET /feed/health (WD-4) → view-model. Telemetry only (never scored). Carries the honesty
+// signals verbatim — `ws_live`/`connected`/`stale`/`staleness_s` are the real feed state, never
+// coerced to look healthy/live. `source_mode` rides the same honesty axis as every other reader.
+export function adaptFeedHealth(w: W.FeedHealth): FeedHealthState {
+  return {
+    source_mode: toSourceMode(w.source_mode),
+    ws_live: w.ws_live,
+    connected: w.connected,
+    txline_configured: w.txline_configured,
+    events_per_min: w.events_per_min,
+    ticks_seen: w.ticks_seen,
+    staleness_s: w.staleness_s,
+    stale: w.stale,
+    fixture_id: w.fixture_id,
+    anchor_status: toAnchorStatus(w.anchor_status),
+    last_tick_ts: w.last_tick_ts,
+  };
+}
+
 // MOCK MODE: demote any `live` source_mode → `replay` so fixtures never render under a LIVE
 // badge (DEMO data is replay/recorded, never live — doctrine).
 const demote = (s: SourceMode): SourceMode => (s === 'live' ? 'replay' : s);
@@ -301,6 +320,14 @@ export async function getCockpitState(competitionId: string): Promise<CockpitSta
 export async function getInspectorRecord(runId: string, seq: number | string): Promise<InspectorRecord> {
   if (isMockEnabled()) return adaptInspector(MOCK_FIXTURES.inspector);
   return adaptInspector(await getJson<W.InspectorRecord>(PATHS.inspector(runId, seq)));
+}
+
+export async function getFeedHealth(): Promise<FeedHealthState> {
+  if (isMockEnabled()) {
+    const h = adaptFeedHealth(MOCK_FIXTURES.feedHealth);
+    return { ...h, source_mode: demote(h.source_mode) }; // a synthetic LIVE feed never renders LIVE
+  }
+  return adaptFeedHealth(await getJson<W.FeedHealth>(PATHS.feedHealth()));
 }
 
 // MOCK status-bar seed (sync): when mock is on, the status bar populates app-wide from the mock

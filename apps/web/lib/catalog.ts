@@ -4,14 +4,14 @@
 // declared below. Logic is limited to the wire→view RuntimeEvent bridge (SEC-003 seam).
 import type {
   SourceMode, ProofMode, ExecutionMode, AnchorStatus, ExecutionReceipt, LeaderboardRow,
-  SportsActionType,
+  SportsActionType, FeedHealthState,
 } from '@/lib/contracts';
 import type { RuntimeEvent as WireRuntimeEvent, RuntimeEventType } from '@/lib/wire';
 
 // Re-export the C1 shared types (no duplication; one import surface for C2 screens).
 export type {
   SourceMode, ProofMode, ExecutionMode, AnchorStatus, ExecutionReceipt, LeaderboardRow,
-  SportsActionType,
+  SportsActionType, FeedHealthState,
 };
 
 // SportsActionType const (C1 has the type only) — typed against C1's union so it can't drift.
