@@ -18,7 +18,7 @@ vi.mock('@/lib/mock', async () => {
   };
 });
 
-import { getLeaderboard, getCockpitState, getProofArtifact } from '@/lib/api';
+import { getLeaderboard, getCockpitState, getProofArtifact, mockStatusSeed } from '@/lib/api';
 
 describe('MOCK MODE live→replay demotion (synthetic-live teeth)', () => {
   it('demotes a synthetic LIVE source_mode to replay at every mock reader', async () => {
@@ -33,5 +33,11 @@ describe('MOCK MODE live→replay demotion (synthetic-live teeth)', () => {
 
     // proof artifact demote (via the demote() helper)
     expect((await getProofArtifact('x')).source_mode).toBe('replay');
+  });
+
+  it('demotes the status-bar mock seed too — synthetic LIVE → REPLAY (the bar never shows fake LIVE)', () => {
+    // mockStatusSeed feeds the shared status bar app-wide under mock; the real fixture is already
+    // replay, so without a synthetic-live input this guard would be untested. This makes it bite.
+    expect(mockStatusSeed()?.sourceMode).toBe('replay');
   });
 });
