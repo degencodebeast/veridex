@@ -1,4 +1,5 @@
-import { ScreenStub } from '@/components/layout/ScreenStub';
+import { DuelScreen } from '@/components/screens/DuelScreen';
+
 export default function DuelPage() {
-  return <ScreenStub label="Head-to-Head Duel" plan="2C Plan C" />;
+  return <DuelScreen />;
 }
