@@ -24,11 +24,24 @@ export function DesignSystemScreen() {
   return (
     <div className={styles.page}>
       <h1 className={styles.title}>Design System</h1>
-      <p className={styles.body}>Direction A — dark terminal. The living reference and source of truth for the shared component library.</p>
+      <p className={styles.body}>Direction A — dark terminal (default) and Direction B — light SaaS (CON-001). The living reference and source of truth for the shared component library.</p>
 
       <section className={styles.section}>
-        <h2 className={styles.heading}>Colors</h2>
+        <h2 className={styles.heading}>Colors — Direction A (dark terminal)</h2>
         <div className={styles.swatches}>
+          {SWATCHES.map(([name, token]) => (
+            <div key={token} className={styles.swatch}>
+              <span className={styles.chipColor} style={{ background: `var(${token})` }} />
+              <span className={`${styles.swatchLabel} mono`}>{name}</span>
+            </div>
+          ))}
+        </div>
+      </section>
+
+      <section className={styles.section}>
+        <h2 className={styles.heading}>Colors — Direction B (light SaaS)</h2>
+        {/* data-direction="b" scopes the [data-direction='b'] token overrides to this subtree only. */}
+        <div className={styles.swatches} data-direction="b" data-testid="swatches-b">
           {SWATCHES.map(([name, token]) => (
             <div key={token} className={styles.swatch}>
               <span className={styles.chipColor} style={{ background: `var(${token})` }} />

@@ -5,6 +5,7 @@ import { Badge } from '@/components/ui/Badge';
 import { Num } from '@/components/ui/Num';
 import { ConfBar } from '@/components/ui/ConfBar';
 import { SegmentedControl } from '@/components/ui/SegmentedControl';
+import { DirectionToggle } from '@/components/ui/DirectionToggle';
 import { rankByAvgClv, isEligible } from '@/lib/derive';
 import { LEADERBOARD_ROWS } from '@/lib/fixtures/catalog';
 import type { LeaderboardRow } from '@/lib/catalog';
@@ -26,12 +27,15 @@ export function LeaderboardScreen({ rows = LEADERBOARD_ROWS }: { rows?: Leaderbo
     <section className={styles.screen} aria-label="Leaderboard">
       <header className={styles.head}>
         <h1 className={styles.title}>Leaderboard</h1>
-        <SegmentedControl<Filter>
-          ariaLabel="Source filter"
-          value={filter}
-          onChange={setFilter}
-          options={[{ value: 'ALL', label: 'ALL' }, { value: 'REPLAY', label: 'REPLAY' }, { value: 'LIVE', label: 'LIVE' }]}
-        />
+        <div className={styles.headControls}>
+          <DirectionToggle />
+          <SegmentedControl<Filter>
+            ariaLabel="Source filter"
+            value={filter}
+            onChange={setFilter}
+            options={[{ value: 'ALL', label: 'ALL' }, { value: 'REPLAY', label: 'REPLAY' }, { value: 'LIVE', label: 'LIVE' }]}
+          />
+        </div>
       </header>
 
       <p className={styles.banner}>

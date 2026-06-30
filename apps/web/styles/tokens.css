@@ -68,3 +68,34 @@
   --json-bool: var(--positive);
   --json-punct: var(--text-3);
 }
+
+/* Direction B (light SaaS) — CON-001. Overrides the SAME token names so components need
+   no Direction-specific code. Element-level selector (not :root-only) so a nested subtree
+   carrying data-direction="b" (e.g. the Design System B swatches) also resolves the light
+   theme. All raw hex stays in this single lint-exempt file (PAT-001). */
+[data-direction='b'] {
+  --bg: #F6F7F9;
+  --bg-bar: #FFFFFF;
+  --panel: #FFFFFF;
+  --panel-2: #F1F2F5;
+  --border: #E6E8EC;
+  --border-soft: #EEF0F3;
+  --border-strong: #D7DBE2;
+  --text-1: #1A1F29;
+  --text-2: #5B6573;
+  --text-3: #8A93A1;
+  --text-4: #A0A8B4;
+  --accent: #2A6FDB;
+  --accent-hi: #2A6FDB;
+  --accent-2: #2A6FDB;
+  --accent-bg: #EEF3FD;
+  --accent-bg-soft: #EEF3FD;
+  --warning: #B07D1A;
+  --warning-hi: #B07D1A;
+  --warning-bg: #FBF3E2;
+  --positive: #1F8A5B;
+  --positive-bg: rgba(31, 138, 91, 0.12);
+  --negative: #C4503A;
+  --negative-bg: rgba(196, 80, 58, 0.12);
+  --scrim: rgba(0, 0, 0, 0.35);
+}

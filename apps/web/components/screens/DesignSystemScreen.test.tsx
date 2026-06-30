@@ -15,7 +15,8 @@ describe('DesignSystemScreen (REQ-026)', () => {
   it('renders the reference sections', () => {
     render(<DesignSystemScreen />);
     expect(screen.getByRole('heading', { name: /design system/i })).toBeInTheDocument();
-    expect(screen.getByRole('heading', { name: /colors/i })).toBeInTheDocument();
+    // two color sections now: Direction A + Direction B
+    expect(screen.getAllByRole('heading', { name: /colors/i }).length).toBeGreaterThanOrEqual(2);
     expect(screen.getByRole('heading', { name: /typography/i })).toBeInTheDocument();
     expect(screen.getByRole('heading', { name: /status badges/i })).toBeInTheDocument();
     expect(screen.getByRole('heading', { name: /proof.check/i })).toBeInTheDocument();
@@ -27,6 +28,14 @@ describe('DesignSystemScreen (REQ-026)', () => {
     for (const v of BADGE_VARIANTS) {
       expect(within(gallery).getByTestId(`badge-${v}`)).toBeInTheDocument();
     }
+  });
+
+  it('shows the Direction-B (light SaaS) swatches scoped via data-direction (CON-001 carry)', () => {
+    render(<DesignSystemScreen />);
+    const b = screen.getByTestId('swatches-b');
+    // the B swatch subtree carries data-direction="b" so its var(--token) resolve to the light theme
+    expect(b).toHaveAttribute('data-direction', 'b');
+    expect(within(b).getByText('accent')).toBeInTheDocument();
   });
 
   it('renders all four proof-check chip statuses', () => {
