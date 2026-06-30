@@ -33,7 +33,9 @@ export function PerformanceMetricsBlock({ metrics }: { metrics: PerformanceMetri
           <dd className={`${styles.value} mono ${NUM[signClass(metrics.max_drawdown)]}`}>{metrics.max_drawdown.toFixed(1)}</dd>
         </div>
       </dl>
-      <p className={styles.footer}>ⓟ Sim PnL &amp; Brier are simulated proxies. Checks certify the run is valid; metrics show performance. Rank is Avg CLV only.</p>
+      <p className={styles.footer}>
+        ⓟ Sim PnL &amp; Brier are simulated proxies. CLV is the proven skill metric — Rank is Avg CLV only. Executable Edge (EV at the venue price) and Fair Value (de-margined consensus) are decision inputs shown in the Decision Inspector, not ranked.
+      </p>
     </section>
   );
 }

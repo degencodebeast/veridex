@@ -82,7 +82,12 @@ export const sampleInspectorRecord: InspectorRecord = {
     params: { market_key: '1X2_PARTICIPANT_RESULT', side: 'FRA', reason: 'home pressure rising', confidence: 0.72, claimed_edge_bps: 30 },
   },
   recompute: { recomputed_edge_bps: 22.0, clv_bps: 18.0, valid: true },
-  clv_explanation: { entry_implied_pct: 67.9, delta_bps: 18.0, closing_implied_pct: 69.7, score_bps: 18.0, plain: 'Entry 67.9% → closing 69.7% (+18.0 bps).' },
+  clv_explanation: {
+    entry_implied_pct: 67.9, delta_bps: 18.0, closing_implied_pct: 69.7, score_bps: 18.0,
+    fair_value_pct: 67.9, closing_fair_value_pct: 69.7, venue_decimal_price: 1.472,
+    executable_edge_bps: 22.0, clv_bps: 18.0, stake_fraction: 0.06,
+    plain: 'Fair value 67.9% → closing 69.7%; executable edge +22.0 bps at venue 1.472; CLV +18.0 bps.',
+  },
   untrusted_llm: { model: 'claude-sonnet-4-6', confidence: 0.72, claimed_edge_bps: 30, rationale: 'France controlling tempo; expect goal.' },
 };
 

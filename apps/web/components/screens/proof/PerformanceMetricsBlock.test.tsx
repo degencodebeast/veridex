@@ -9,7 +9,8 @@ describe('PerformanceMetricsBlock (SEC-001 / REQ-020)', () => {
     const block = screen.getByLabelText('Performance Metrics');
     // anchor to the metric label (the footer also says "Rank is Avg CLV only").
     expect(within(block).getByText(/^CLV/)).toBeInTheDocument();
-    expect(within(block).getByText(/ranked/i)).toBeInTheDocument();
+    // exact-match the CLV "ranked" label (the doctrine footer also says "not ranked").
+    expect(within(block).getByText('ranked')).toBeInTheDocument();
     // anchor to the metric labels (the footer also names "Sim PnL & Brier").
     expect(within(block).getByText(/^Sim PnL/)).toHaveTextContent('ⓟ');
     expect(within(block).getByText(/^Brier/)).toHaveTextContent('ⓟ');

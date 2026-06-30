@@ -3,8 +3,11 @@ import { Badge } from '@/components/ui/Badge';
 import { JsonPanel } from '@/components/ui/JsonPanel';
 import { proofHref } from '@/lib/deeplinks';
 import { fmtBps, fmtPct } from '@/lib/format';
+import { QUANTITIES, STABLE_PRICE_CAPTION } from '@/lib/doctrine';
 import type { InspectorRecord } from '@/lib/contracts';
 import styles from './InspectorScreen.module.css';
+
+const QLABEL = Object.fromEntries(QUANTITIES.map((q) => [q.id, q.label])) as Record<string, string>;
 
 export function InspectorScreen({ record }: { record: InspectorRecord }) {
   const { clv_explanation: clv } = record;
@@ -44,12 +47,17 @@ export function InspectorScreen({ record }: { record: InspectorRecord }) {
           </p>
         </div>
         <JsonPanel title="Deterministic Recompute" data={record.recompute} accent />
-        <section className={styles.clv}>
+        <section className={styles.clv} aria-label="CLV explanation">
           <div className={styles.clvTitle}>CLV Explanation</div>
-          <p className={styles.clvPlain}>
-            Entry {fmtPct(String(clv.entry_implied_pct))} → closing {fmtPct(String(clv.closing_implied_pct))}.
-          </p>
-          <span className={`${styles.scoreChip} mono`}>SCORE = {fmtBps(clv.score_bps)}</span>
+          <dl className={styles.quantities}>
+            <div className={styles.qrow}><dt className={styles.qlabel}>{QLABEL.fair_value}</dt><dd className={`${styles.qval} mono`}>{fmtPct(String(clv.fair_value_pct))} → {fmtPct(String(clv.closing_fair_value_pct))}</dd></div>
+            <div className={styles.qrow}><dt className={styles.qlabel}>{QLABEL.executable_edge}</dt><dd className={`${styles.qval} mono`}>{fmtBps(clv.executable_edge_bps)} @ {clv.venue_decimal_price.toFixed(3)}</dd></div>
+            <div className={styles.qrow}><dt className={styles.qlabel}>{QLABEL.clv}</dt><dd className={`${styles.qval} mono`}>{fmtBps(clv.clv_bps)}</dd></div>
+            <div className={styles.qrow}><dt className={styles.qlabel}>{QLABEL.stake}</dt><dd className={`${styles.qval} mono`}>{(clv.stake_fraction * 100).toFixed(1)}%</dd></div>
+          </dl>
+          <p className={styles.clvPlain}>{clv.plain}</p>
+          <span className={`${styles.scoreChip} mono`}>SCORE = {fmtBps(clv.clv_bps)}</span>
+          <p className={styles.stableNote}>{STABLE_PRICE_CAPTION}</p>
         </section>
       </div>
 

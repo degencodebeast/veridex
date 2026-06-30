@@ -8,6 +8,7 @@ import { ClvLeaderboard } from './ClvLeaderboard';
 import { CanonicalEventStream } from './CanonicalEventStream';
 import { ExecutionLane } from './ExecutionLane';
 import { PolicyDecisions } from './PolicyDecisions';
+import { QuantityLegend } from '@/components/ui/QuantityLegend';
 import styles from './CockpitScreen.module.css';
 
 export function CockpitScreen({ competitionId, initial }: { competitionId: string; initial: CockpitState }) {
@@ -19,6 +20,7 @@ export function CockpitScreen({ competitionId, initial }: { competitionId: strin
       <div className={styles.grid}>
         <div className={styles.left}>
           <ClvLeaderboard rows={state.leaderboard} />
+          <QuantityLegend />
           <CanonicalEventStream runId={state.run_id} events={state.events} />
         </div>
         <div className={styles.right}>

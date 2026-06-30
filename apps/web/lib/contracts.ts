@@ -273,6 +273,13 @@ export interface ClvExplanation {
   delta_bps: number;
   closing_implied_pct: number;
   score_bps: number;
+  // Strategy-doctrine fields (Task 22) — four distinct quantities:
+  fair_value_pct: number;          // de-margined consensus fair probability at entry
+  closing_fair_value_pct: number;  // de-margined consensus fair probability at close
+  venue_decimal_price: number;     // the actual venue decimal price
+  executable_edge_bps: number;     // EV at the venue price (NOT CLV)
+  clv_bps: number;                 // the proven skill metric
+  stake_fraction: number;          // Kelly/policy sizing
   plain: string;
 }
 export interface UntrustedLlmMetadata {

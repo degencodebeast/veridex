@@ -239,8 +239,15 @@ export function adaptInspector(w: W.InspectorRecord): InspectorRecord {
     market_state: w.market_state as unknown as InspectorRecord['market_state'],
     agent_action: w.agent_action as unknown as InspectorRecord['agent_action'],
     recompute: { recomputed_edge_bps: rec.recomputed_edge_bps ?? 0, clv_bps: rec.clv_bps ?? 0, valid: rec.valid ?? false },
-    // GAP: wire has no clv_explanation; carry the score through `plain` empty for now.
-    clv_explanation: { entry_implied_pct: 0, delta_bps: clv, closing_implied_pct: 0, score_bps: clv, plain: '' },
+    // GAP: wire has no clv_explanation; the four strategy quantities (fair value,
+    // executable edge, venue price, stake) are not in the wire InspectorRecord →
+    // default honestly. CLV (the score) is carried through.
+    clv_explanation: {
+      entry_implied_pct: 0, delta_bps: clv, closing_implied_pct: 0, score_bps: clv,
+      fair_value_pct: 0, closing_fair_value_pct: 0, venue_decimal_price: 0,
+      executable_edge_bps: 0, clv_bps: clv, stake_fraction: 0,
+      plain: '',
+    },
     untrusted_llm: llm
       ? { model: llm.model ?? '', confidence: llm.confidence ?? 0, claimed_edge_bps: llm.claimed_edge_bps ?? 0, rationale: llm.reason ?? '' }
       : null,
