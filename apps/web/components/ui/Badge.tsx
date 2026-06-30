@@ -7,7 +7,7 @@ export function Badge({ variant, children }: { variant: BadgeVariant; children?:
   const meta = BADGE_META[variant];
   const variantClass = styles[variantClassName(variant)] ?? '';
   return (
-    <span className={`${styles.badge} ${variantClass} ${variant}`} data-variant={variant}>
+    <span className={`${styles.badge} ${variantClass}`} data-variant={variant}>
       {variant === 'live' ? <LiveDot size={5} /> : meta.glyph ? <span aria-hidden>{meta.glyph}</span> : null}
       <span>{children ?? meta.label}</span>
     </span>

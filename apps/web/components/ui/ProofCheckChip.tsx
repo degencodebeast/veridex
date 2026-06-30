@@ -18,7 +18,7 @@ const CLASS: Record<CheckStatus, string> = {
 
 export function ProofCheckChip({ status }: { status: CheckStatus }) {
   return (
-    <span className={`${status === 'not_applicable' ? 'notApplicable' : status} ${styles.chip} ${CLASS[status]}`} aria-label={status}>
+    <span className={`${styles.chip} ${CLASS[status] ?? ''}`} data-status={status} aria-label={status}>
       {GLYPH[status]}
     </span>
   );

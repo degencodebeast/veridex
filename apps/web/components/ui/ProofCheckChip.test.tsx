@@ -26,4 +26,15 @@ describe('ProofCheckChip (PAT-002: 24px proof-check status mark)', () => {
     expect(container.textContent).toContain('○');
     expect(container.firstChild).toHaveClass('notApplicable');
   });
+
+  // Trust property: a non-pass status must NEVER render the pass glyph (no
+  // hardcoded-PASS path on a proof-UI primitive). The type guards bad calls;
+  // this locks the runtime guarantee.
+  it.each(['fail', 'pending', 'not_applicable'] as const)(
+    'never renders the pass glyph for %s',
+    (status) => {
+      const { container } = render(<ProofCheckChip status={status} />);
+      expect(container.textContent).not.toContain('✓');
+    },
+  );
 });
