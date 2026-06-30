@@ -34,6 +34,7 @@ No auth / Redis / rate-limiting — Phase-2 only (CON-009).
 
 from __future__ import annotations
 
+import json
 import time
 from typing import Any
 
@@ -54,6 +55,7 @@ from veridex.api.schemas import (
     CompetitionSummaryResponse,
     DemoRunResponse,
     FeedHealthResponse,
+    InspectorRecord,
     KillSwitchResponse,
     LeaderboardResponse,
     LeaderboardRow,
@@ -450,6 +452,87 @@ def create_app(
             anchor=anchor_block,
             schema_versions=dict(SCHEMA_VERSIONS),
             metrics=metrics,
+        )
+
+    # --- GET /runs/{run_id}/actions/{seq} (C1 Inspector — per-action forensic view) -------
+
+    @app.get("/runs/{run_id}/actions/{seq}", response_model=InspectorRecord)
+    async def get_inspector_record(
+        run_id: str,
+        seq: int,
+        dep_store: Store = Depends(_get_store),  # noqa: B008
+    ) -> InspectorRecord:
+        """Per-action forensic record for one sealed decision (C1 Inspector — killer-flow step).
+
+        Read-only over the sealed run. ``seq`` is the decision event's ``sequence_no`` in the run's
+        event log (the canonical-stream seq the cockpit links from). Serializes from SEALED data:
+        the :class:`AgentAction` + its entry ``market_state`` from ``run_events``, and the
+        law-recomputed ``clv_bps`` from the matching ``score_rows`` entry. The action's
+        ``reason``/``confidence``/``claimed_edge_bps`` are surfaced as ``untrusted_llm_metadata`` —
+        recorded-but-NEVER-scored (SEC-003/007); the frontend fences them. Never mutates the seal,
+        never recomputes the evidence hash, never calls an LLM (it reads recorded params).
+
+        Args:
+            run_id: The sealed run identifier.
+            seq: The decision event's ``sequence_no`` in the run's event log.
+            dep_store: Injected store dependency.
+
+        Returns:
+            A :class:`~veridex.api.schemas.InspectorRecord`.
+
+        Raises:
+            HTTPException: 404 when the run is unknown, or ``seq`` is not a decision/action event.
+        """
+        try:
+            run_result = await dep_store.load_run(run_id)
+        except KeyError:
+            raise HTTPException(status_code=404, detail=f"run {run_id!r} not found") from None
+
+        # Walk the sealed log in sequence order; track the most recent tick snapshot (the action's
+        # entry market state) and stop at the requested decision event.
+        entry_snapshot: dict[str, Any] | None = None
+        decision: dict[str, Any] | None = None
+        for event in sorted(run_result.run_events, key=lambda e: e["sequence_no"]):
+            if event.get("event_type") == "tick" and event.get("state_snapshot_json"):
+                entry_snapshot = json.loads(event["state_snapshot_json"])
+            if event.get("sequence_no") == seq:
+                decision = event
+                break
+
+        if decision is None or decision.get("event_type") != "decision" or not decision.get("action_payload_json"):
+            raise HTTPException(status_code=404, detail=f"no action at seq {seq} in run {run_id!r}")
+
+        agent_action = json.loads(decision["action_payload_json"])
+        result_payload = json.loads(decision["result_payload_json"]) if decision.get("result_payload_json") else {}
+        agent_id = str(result_payload.get("agent_id", ""))
+        tick_seq = int(entry_snapshot["tick_seq"]) if entry_snapshot and "tick_seq" in entry_snapshot else -1
+
+        # SCORED metric: the deterministic law-recomputed clv from the matching sealed score row —
+        # NEVER the agent's claim. "pending" (non-numeric) for a valid WAIT/abstention.
+        score_row = next(
+            (r for r in run_result.score_rows if r.get("tick_seq") == tick_seq and r.get("agent_id") == agent_id),
+            {},
+        )
+        clv_bps = score_row.get("clv_bps", "pending")
+        recompute = {
+            "recomputed_edge_bps": score_row.get("recomputed_edge_bps"),
+            "clv_bps": clv_bps,
+            "valid": score_row.get("valid"),
+        }
+
+        # UNTRUSTED (SEC-003/007): reason/confidence/claimed_edge_bps are recorded-but-NEVER-scored.
+        params = agent_action.get("params", {}) or {}
+        untrusted = {key: params[key] for key in ("reason", "confidence", "claimed_edge_bps") if key in params}
+
+        return InspectorRecord(
+            run_id=run_id,
+            agent_id=agent_id,
+            tick_seq=tick_seq,
+            market_state=entry_snapshot or {},
+            agent_action=agent_action,
+            recompute=recompute,
+            clv_bps=clv_bps,
+            untrusted_llm_metadata=untrusted,
         )
 
     # --- POST /runs/{run_id}/verify (WD-1 authoritative recompute, REQ-050 / AC-020) ------
