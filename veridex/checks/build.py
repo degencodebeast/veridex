@@ -89,12 +89,20 @@ def _evidence_integrity(run: RunResult) -> CheckResult:
 
 
 def _llm_boundary() -> CheckResult:
-    """Run the real static import audit over every trust-path target; fail-closed (WD-5a)."""
+    """Run the real static import audit over every trust-path target; fail-closed (WD-5a).
+
+    Each target's existence is asserted BEFORE auditing it: ``Path.rglob`` over a deleted/renamed
+    directory yields nothing, so a missing trust dir would make the audit vacuously pass (fail-OPEN,
+    inverted from SEC-002). A missing target therefore raises ⇒ LLM_BOUNDARY ``fail`` (CON-2B-02),
+    never a silent pass.
+    """
     try:
         for target in _TRUST_TARGETS:
+            if not target.exists():
+                raise FileNotFoundError(f"trust target missing (cannot audit): {target}")
             assert_no_llm_imports(target)
         return _result(CheckId.LLM_BOUNDARY, "pass", method="static_import_audit", scope=_TRUST_SCOPE)
-    except Exception as e:  # AssertionError (violation) or SyntaxError/OSError (unreadable) → fail
+    except Exception as e:  # AssertionError (violation), FileNotFoundError (missing), SyntaxError/OSError → fail
         return _result(
             CheckId.LLM_BOUNDARY,
             "fail",

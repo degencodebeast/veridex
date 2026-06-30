@@ -5,6 +5,8 @@ from __future__ import annotations
 import hashlib
 from typing import Any
 
+import pytest
+
 from tests._arena_fixtures import finished_run_result
 from veridex.chain.anchor import run_manifest, run_manifest_hash
 from veridex.checks.build import (
@@ -108,6 +110,21 @@ def test_llm_boundary_pass_on_clean_trust_path() -> None:
     run = finished_run_result()
     lb = {r.id: r for r in build_check_results(scores=score_run(run), run=run)}[CheckId.LLM_BOUNDARY]
     assert lb.result == "pass" and lb.method == "static_import_audit"
+
+
+def test_llm_boundary_fails_closed_on_missing_trust_target(monkeypatch: pytest.MonkeyPatch) -> None:
+    # CON-2B-02 fail-closed parity: a deleted/renamed trust dir must FAIL, not vacuously PASS.
+    # `Path.rglob` over a nonexistent directory yields nothing, so without an existence guard
+    # the audit silently passes (fail-OPEN, inverted from SEC-002). Point the audit at a missing
+    # target and assert LLM_BOUNDARY reports `fail` with a populated error.
+    import veridex.checks.build as build_mod
+
+    missing = build_mod._VERIDEX_PKG / "nonexistent_trust_dir"
+    assert not missing.exists()
+    monkeypatch.setattr(build_mod, "_TRUST_TARGETS", (*build_mod._TRUST_TARGETS, missing))
+    run = finished_run_result()
+    lb = {r.id: r for r in build_check_results(scores=score_run(run), run=run)}[CheckId.LLM_BOUNDARY]
+    assert lb.result == "fail" and lb.error is not None
 
 
 def test_metrics_recomputed_pass_when_table_matches() -> None:
