@@ -1,3 +1,4 @@
+import { LandingScreen } from '@/components/screens/LandingScreen';
 export default function LandingPage() {
-  return <main>Veridex</main>;
+  return <LandingScreen />;
 }

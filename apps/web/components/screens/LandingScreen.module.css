@@ -1,0 +1,31 @@
+.landing { display: flex; flex-direction: column; gap: var(--space-5); max-width: 980px; }
+
+.hero { display: flex; flex-direction: column; gap: var(--space-3); align-items: flex-start; padding: 32px var(--pad-panel); border: 1px solid var(--border); border-radius: var(--radius-panel); background: var(--panel); }
+.h1 { margin: 0; font-size: 28px; font-weight: 600; letter-spacing: -0.015em; color: var(--text-1); }
+.promise { margin: 0; max-width: 720px; color: var(--text-2); font-size: 14px; line-height: 1.6; }
+
+.ctas { display: flex; gap: var(--space-2); flex-wrap: wrap; margin-top: var(--space-2); }
+.ctaPrimary { padding: 9px 14px; border-radius: var(--radius-control); background: var(--accent); color: var(--text-1); font-size: 12px; font-weight: 600; text-decoration: none; }
+.ctaSecondary { padding: 9px 14px; border-radius: var(--radius-control); border: 1px solid var(--border-strong); color: var(--text-1); font-size: 12px; font-weight: 600; text-decoration: none; }
+.ctaGhost { padding: 9px 14px; border-radius: var(--radius-control); border: 1px solid var(--border-strong); background: transparent; color: var(--text-2); font-size: 12px; font-weight: 600; cursor: pointer; }
+.ctaGhost:hover { color: var(--text-1); border-color: var(--accent); }
+
+.section { display: flex; flex-direction: column; gap: var(--space-3); padding: var(--pad-panel); border: 1px solid var(--border); border-radius: var(--radius-panel); background: var(--panel); }
+.h2 { margin: 0; font-size: 12px; font-weight: 600; letter-spacing: 0.04em; text-transform: uppercase; color: var(--text-2); }
+
+.diffs { list-style: none; margin: 0; padding: 0; display: grid; grid-template-columns: repeat(2, 1fr); gap: var(--space-3); }
+.diff { padding: var(--pad-panel); border: 1px solid var(--border-soft); border-radius: var(--radius-control); background: var(--panel-2); }
+.diffTitle { margin: 0 0 var(--space-1); font-size: 13px; font-weight: 600; color: var(--text-1); }
+.diffBody { margin: 0; color: var(--text-2); font-size: 12px; line-height: 1.6; }
+
+.table { border-collapse: collapse; width: 100%; font-size: 12px; }
+.table th { text-align: left; padding: 9px; font-size: 9px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--text-3); background: var(--bg-bar); border-bottom: 1px solid var(--border); }
+.table td { padding: 9px; border-bottom: 1px solid var(--border-soft); color: var(--text-1); }
+.center { text-align: center; }
+
+.steps { list-style: none; margin: 0; padding: 0; display: flex; flex-wrap: wrap; gap: var(--space-2); }
+.step { display: inline-flex; align-items: center; gap: var(--space-2); padding: 7px 10px; border: 1px solid var(--border-strong); border-radius: var(--radius-control); color: var(--accent-hi); font-size: 11px; text-transform: uppercase; letter-spacing: 0.04em; }
+.stepNum { display: inline-flex; align-items: center; justify-content: center; width: 18px; height: 18px; border-radius: 50%; background: var(--accent-bg); color: var(--accent-hi); font-size: 10px; }
+
+.vault { border-color: var(--border-strong); }
+.vaultNote { color: var(--warning-hi); }
