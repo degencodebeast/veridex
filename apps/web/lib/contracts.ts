@@ -230,6 +230,7 @@ export interface AnchorInfo {
   committed_at: number | null;
   batching_note: string;
   explorer_url: string | null;
+  manifest_hash?: string | null; // threaded from the verify result; honest-absent before a verify
 }
 
 export interface ProofArtifact {
