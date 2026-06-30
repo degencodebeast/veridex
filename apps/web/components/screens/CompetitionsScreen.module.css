@@ -33,3 +33,4 @@
 .muted { color: var(--text-3); }
 .actionCell { text-align: right; }
 .legend { margin: 0; font-family: var(--font-mono), monospace; font-size: 9px; color: var(--text-3); line-height: 1.5; }
+.thCaption { display: block; margin-top: 2px; font-size: 8px; font-weight: 400; letter-spacing: 0.02em; text-transform: none; color: var(--text-3); }

@@ -92,6 +92,29 @@ describe('CompetitionsScreen V5 (density · counts/prize/leader honesty)', () =>
     expect(prizes.some((c) => /\$|paid|disbursed|funds (moved|settled)/i.test(c.textContent ?? ''))).toBe(false);
   });
 
+  it('the PRIZE column is FENCED — header disclaims funds held/paid, and an empty vault reads "No vault"', () => {
+    render(<CompetitionsScreen />);
+    const table = screen.getByTestId('all-competitions');
+    // the header disclaimer fences PRIZE so V5's literal "PRIZE" can never read as a funded/held pool.
+    expect(within(table).getByTestId('prize-caption')).toHaveTextContent(/no funds held or paid/i);
+    // a competition with no reward entry shows "No vault" (clearer than a bare em-dash).
+    expect(within(within(table).getByTestId('comp-wc-arg-ger')).getByTestId('prize-cell'))
+      .toHaveTextContent(/no vault/i);
+  });
+
+  it('AGENTS column shows the REAL roster count (roster_size), NOT "—" — the data exists on this screen', () => {
+    render(<CompetitionsScreen />);
+    const table = screen.getByTestId('all-competitions');
+    // fra-bra roster_size=4 (lib/fixtures/catalog.ts) — a real count, the inverse of LEADER CLV's honest —.
+    const fra = within(table).getByTestId('comp-wc-fra-bra');
+    expect(within(fra).getByTestId('agents-cell')).toHaveTextContent('4');
+    expect(within(fra).getByTestId('agents-cell')).not.toHaveTextContent('—');
+    // every AGENTS cell carries a real digit (this column is backed by roster_size, never an em-dash).
+    const cells = within(table).getAllByTestId('agents-cell');
+    expect(cells.every((c) => /\d/.test(c.textContent ?? ''))).toBe(true);
+    expect(cells.some((c) => c.textContent === '—')).toBe(false);
+  });
+
   it('LEADER CLV is "—" everywhere — no fabricated comp leader (no honest comp→leader link)', () => {
     render(<CompetitionsScreen />);
     const cells = within(screen.getByTestId('all-competitions')).getAllByTestId('leader-cell');

@@ -51,8 +51,9 @@ export function CompetitionsScreen({ comps = COMPETITIONS, rewards = MY_REWARDS 
   const upcoming = comps.filter((c) => c.lifecycle === 'upcoming');
   const settled = comps.filter((c) => c.lifecycle === 'settled');
   // PRIZE is the honest design-target label from the rewards join (Prize Vault doctrine: designed,
-  // Phase 2D, no funds move). No reward entry ⇒ "—". Never a fabricated figure / custody claim.
-  const prizeFor = (id: string) => rewards.find((r) => r.competition_id === id)?.amount_label ?? '—';
+  // Phase 2D, no funds move). No reward entry ⇒ "No vault" (clearer than a bare —). The column is
+  // fenced by a header disclaimer so V5's literal "PRIZE" can never read as a funded/held pool.
+  const prizeFor = (id: string) => rewards.find((r) => r.competition_id === id)?.amount_label ?? 'No vault';
 
   return (
     <section className={styles.screen} aria-label="Competitions">
@@ -104,10 +105,13 @@ export function CompetitionsScreen({ comps = COMPETITIONS, rewards = MY_REWARDS 
               <th scope="col">TYPE</th>
               <th scope="col">SOURCE</th>
               <th scope="col">EXEC</th>
+              <th scope="col" className={styles.r}>AGENTS</th>
+              <th scope="col" className={styles.r}>LEADER CLV</th>
+              <th scope="col" title="Design target only · no funds held or paid">
+                PRIZE<span className={styles.thCaption} data-testid="prize-caption">Design target only · no funds held or paid</span>
+              </th>
               <th scope="col">PROOF</th>
               <th scope="col">STATUS</th>
-              <th scope="col">PRIZE</th>
-              <th scope="col">LEADER CLV</th>
               <th scope="col" />
             </tr>
           </thead>
@@ -118,12 +122,14 @@ export function CompetitionsScreen({ comps = COMPETITIONS, rewards = MY_REWARDS 
                 <td className="mono">{TYPE_LABEL[c.competition_type]}</td>
                 <td data-testid="source-cell"><Badge variant={c.source_mode === 'live' ? 'live' : 'replay'} /></td>
                 <td className="mono">{c.execution_mode}</td>
-                <td><Badge variant={c.proof_mode} /></td>
-                <td className="mono" data-testid="status-cell">{c.lifecycle}</td>
-                {/* designed target, never moved funds */}
-                <td className={`${styles.muted} mono`} data-testid="prize-cell">{prizeFor(c.competition_id)}</td>
+                {/* AGENTS = roster_size — real, trusted data (the LIVE-NOW card shows it too) */}
+                <td className={`${styles.num} mono`} data-testid="agents-cell">{c.roster_size}</td>
                 {/* no honest comp→leader source → honest — (never a fabricated leader) */}
                 <td className={styles.num} data-testid="leader-cell"><span className={styles.muted}>—</span></td>
+                {/* designed target, never moved funds */}
+                <td className={`${styles.muted} mono`} data-testid="prize-cell">{prizeFor(c.competition_id)}</td>
+                <td><Badge variant={c.proof_mode} /></td>
+                <td className="mono" data-testid="status-cell">{c.lifecycle}</td>
                 <td className={styles.actionCell}><CtaFor c={c} /></td>
               </tr>
             ))}
