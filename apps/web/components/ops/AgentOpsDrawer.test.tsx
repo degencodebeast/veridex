@@ -63,11 +63,17 @@ describe('AgentOpsDrawer (REQ-030..032 / AC-003 / AC-030 / SEC-003)', () => {
     expect(within(overview).getAllByText('—').length).toBeGreaterThanOrEqual(2);
   });
 
-  it('exposes lifecycle controls (audited operator actions)', () => {
+  it('exposes lifecycle controls but keeps them DISABLED until control-plane wiring lands, with honest future-tense copy', () => {
     render(<AgentOpsDrawer state={openState('momentum_fr')} />);
     for (const name of [/pause/i, /resume/i, /kill/i, /rotate/i, /disable/i]) {
-      expect(screen.getByRole('button', { name })).toBeInTheDocument();
+      const btn = screen.getByRole('button', { name });
+      expect(btn).toBeInTheDocument();
+      // inert-but-honest: a regression that enables them without real wiring fails here
+      expect(btn).toBeDisabled();
     }
+    // honest pending label + future-tense intent (NOT a present-tense "are audited" claim)
+    expect(screen.getByText(/control-plane wiring lands in a later phase/i)).toBeInTheDocument();
+    expect(screen.getByText(/when wired/i)).toBeInTheDocument();
   });
 
   it('handles an unknown agent gracefully — honest empty, no crash (REQ-031)', () => {

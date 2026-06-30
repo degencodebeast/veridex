@@ -1,4 +1,4 @@
-.scrim { position: fixed; inset: 0; background: rgba(0, 0, 0, 0.5); display: flex; justify-content: flex-end; z-index: 100; }
+.scrim { position: fixed; inset: 0; background: var(--scrim); display: flex; justify-content: flex-end; z-index: 100; }
 .drawer { width: 420px; max-width: 92vw; height: 100%; display: flex; flex-direction: column; background: var(--panel); border-left: 1px solid var(--border); }
 .fence { display: flex; align-items: center; justify-content: space-between; padding: var(--space-2) var(--pad-panel); background: var(--bg-bar); border-bottom: 1px solid var(--border); }
 .fenceText { font-family: var(--font-mono), monospace; font-size: 9px; letter-spacing: 0.06em; color: var(--text-3); }
@@ -12,6 +12,8 @@
 .controls { display: flex; flex-wrap: wrap; gap: var(--space-1); margin-top: var(--space-2); }
 .ctl { padding: 5px 9px; border: 1px solid var(--border-strong); border-radius: var(--radius-badge); background: var(--panel-2); color: var(--text-1); font-size: 10px; cursor: pointer; }
 .ctl:hover { border-color: var(--accent); }
+.ctl:disabled { color: var(--text-3); cursor: not-allowed; opacity: 0.55; }
+.ctl:disabled:hover { border-color: var(--border-strong); }
 .audit { margin: var(--space-2) 0 0; color: var(--text-3); font-size: 10px; }
 .logs { display: flex; flex-direction: column; gap: var(--space-2); }
 .log { display: flex; flex-direction: column; gap: 2px; font-family: var(--font-mono), monospace; font-size: 10px; }

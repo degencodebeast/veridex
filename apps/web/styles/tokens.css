@@ -29,6 +29,9 @@
   --warning-hi: #D6B25E;
   --warning-bg: rgba(200, 154, 58, 0.12);
 
+  /* Overlay scrim (modal/drawer backdrop) */
+  --scrim: rgba(0, 0, 0, 0.5);
+
   /* Numeric direction ONLY (never decoration) */
   --positive: #5CBF8A;
   --positive-bg: rgba(63, 164, 107, 0.12);

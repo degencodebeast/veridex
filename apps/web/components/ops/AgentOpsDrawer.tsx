@@ -28,10 +28,10 @@ function OverviewTab({ o }: { o: RuntimeOverview }) {
       <div className={styles.kv}><span>Last action</span><span className="mono">{o.last_action ?? '—'}</span></div>
       <div className={styles.kv}><span>Schema valid</span><span className="mono">{o.schema_valid == null ? '—' : String(o.schema_valid)}</span></div>
       <div className={styles.kv}><span>Errors / retries / tools</span><span className="mono">{o.errors} / {o.retries} / {o.tool_calls}</span></div>
-      <div className={styles.controls}>
-        {LIFECYCLE.map((c) => <button key={c} type="button" className={styles.ctl}>{c}</button>)}
+      <div className={styles.controls} aria-disabled="true">
+        {LIFECYCLE.map((c) => <button key={c} type="button" className={styles.ctl} disabled>{c}</button>)}
       </div>
-      <p className={styles.audit}>Lifecycle actions are audited and never edit scored evidence.</p>
+      <p className={styles.audit}>Control-plane wiring lands in a later phase. When wired, lifecycle actions will be audited and will never edit scored evidence.</p>
     </div>
   );
 }
