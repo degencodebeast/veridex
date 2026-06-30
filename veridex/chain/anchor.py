@@ -50,6 +50,28 @@ def memo_payload_for_manifest(manifest: dict[str, Any]) -> str:
     return run_manifest_hash(manifest)
 
 
+def explorer_tx_url(signature: str | None, *, cluster: str) -> str | None:
+    """Build a Solana Explorer URL for an anchored Memo transaction (WD-1 render aid).
+
+    Returns ``None`` when ``signature`` is ``None`` (the run was not anchored — e.g. offline
+    replay), so the UI can honestly show ``pending``/``not_applicable`` instead of a dead link.
+    Mainnet (``"mainnet-beta"``) takes no ``?cluster`` query; devnet/testnet append it.
+
+    Args:
+        signature: The anchored transaction signature, or ``None`` when unanchored.
+        cluster: The Solana cluster the anchor lives on (e.g. ``"devnet"``).
+
+    Returns:
+        The explorer URL string, or ``None`` when there is no signature to link.
+    """
+    if signature is None:
+        return None
+    base = f"https://explorer.solana.com/tx/{signature}"
+    if cluster == "mainnet-beta":
+        return base
+    return f"{base}?cluster={cluster}"
+
+
 async def anchor_memo(
     manifest_hash: str,
     *,
