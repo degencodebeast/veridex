@@ -32,6 +32,21 @@ describe('MarketsScreen (REQ-016 / AC-010/011 / REQ-042 / CON-040)', () => {
     expect(panel.getAttribute('data-odds-path')).not.toContain('snapshot');
   });
 
+  it('reflects the ACTUAL source in the strip — replay/demo data is not mislabelled "live" (honest provenance)', async () => {
+    const user = userEvent.setup();
+    // default source is the honest replay/demo state (fixtures are not a live feed)
+    const { unmount } = render(<MarketsScreen />);
+    await user.click(screen.getByTestId('fixture-18172280'));
+    const strip = screen.getByTestId('source-strip');
+    expect(strip).toHaveTextContent(/replay/i);
+    expect(strip).not.toHaveTextContent(/\blive\b/i);
+    unmount();
+    // only when the source is genuinely live does the strip say "live"
+    render(<MarketsScreen sourceMode="live" />);
+    await user.click(screen.getByTestId('fixture-18172280'));
+    expect(screen.getByTestId('source-strip')).toHaveTextContent(/\blive\b/i);
+  });
+
   it('renders the three families with decimal odds + implied % and pending/— closings (REQ-042/CON-040)', async () => {
     const user = userEvent.setup();
     render(<MarketsScreen oddsByFixture={IN_RUNNING} />);

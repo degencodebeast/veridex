@@ -4,7 +4,7 @@ import Link from 'next/link';
 import { Badge } from '@/components/ui/Badge';
 import { SPORT_CATALOG, buildFamilies, oddsUpdatesPath } from '@/lib/txline/client';
 import { ODDS_UPDATES, FIXTURES } from '@/lib/fixtures/catalog';
-import type { FixtureSummary, OddsUpdate } from '@/lib/catalog';
+import type { FixtureSummary, OddsUpdate, SourceMode } from '@/lib/catalog';
 import styles from './MarketsScreen.module.css';
 
 // buildFamilies already DECODES prices to decimal odds and carries a 3dp implied-% string,
@@ -12,8 +12,8 @@ import styles from './MarketsScreen.module.css';
 // fmtDecimalOdds expects raw milli and fmtPct rounds to 1dp — wrong domain/precision here.)
 
 export function MarketsScreen({
-  oddsByFixture = ODDS_UPDATES, fixtures = FIXTURES,
-}: { oddsByFixture?: Record<number, OddsUpdate[]>; fixtures?: FixtureSummary[] }) {
+  oddsByFixture = ODDS_UPDATES, fixtures = FIXTURES, sourceMode = 'replay',
+}: { oddsByFixture?: Record<number, OddsUpdate[]>; fixtures?: FixtureSummary[]; sourceMode?: SourceMode }) {
   const [sportId, setSportId] = useState('soccer');
   const [fixtureId, setFixtureId] = useState<number | null>(null);
 
@@ -59,9 +59,9 @@ export function MarketsScreen({
             <p className={styles.empty}>Select a fixture to view consensus odds (decimal Prices + implied %).</p>
           ) : (
             <>
-              <div className={styles.feedStrip}>
-                <Badge variant="live" />
-                <span className={`${styles.feed} mono`}>SOURCE live · TxLINE Stable Price consensus · de-margined</span>
+              <div className={styles.feedStrip} data-testid="source-strip">
+                <Badge variant={sourceMode === 'live' ? 'live' : 'replay'} />
+                <span className={`${styles.feed} mono`}>SOURCE {sourceMode} · TxLINE Stable Price consensus · de-margined</span>
                 <Link href="/competitions/create" className={styles.launch}>Launch a competition from here →</Link>
               </div>
               <div className={styles.families} data-testid="families" data-odds-path={oddsUpdatesPath(fixtureId)}>
