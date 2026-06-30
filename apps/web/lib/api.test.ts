@@ -68,9 +68,11 @@ describe('api client (CON-003: binds the frozen wire contract, maps to the view-
 
   it('GETs competition state from /competitions/{id}', async () => {
     stubFetch(async () => new Response(JSON.stringify(competitionWire), { status: 200 }));
-    const s = await getCockpitState('c_876af810c83b46f2b4d52c59f44d7afb');
-    expect(s.competition_id).toBe('c_876af810c83b46f2b4d52c59f44d7afb');
-    expect(String(calls()[0][0])).toContain('/competitions/c_876af810c83b46f2b4d52c59f44d7afb');
+    // Derive the id from the fixture so this never drifts when it is regenerated.
+    const id = competitionWire.competition_id;
+    const s = await getCockpitState(id);
+    expect(s.competition_id).toBe(id);
+    expect(String(calls()[0][0])).toContain(`/competitions/${id}`);
   });
 
   it('GETs the inspector record and maps wire InspectorRecord → view-model', async () => {
