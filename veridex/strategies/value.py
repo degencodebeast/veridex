@@ -42,6 +42,13 @@ class Proposal(BaseModel):
         kelly_fraction: The deterministic-law advisory Kelly fraction (the SEALED value used to
             size the order). Read straight from the score row — the lane NEVER re-derives Kelly
             from a venue price (the law owns that math). ``0.0`` when the law advised no sizing.
+        reference_price: The sealed entry decimal price (``stable_price[side]``) for
+            ``(market_key, side)`` pulled from the entry tick that matches ``tick_seq``; ``0.0``
+            when absent. Deterministic, trust-safe — the post-quote gate computes real slippage
+            against it (never against a live/LLM-claimed price).
+        entry_prob_bps: The sealed entry de-vigged consensus probability (``stable_prob_bps[side]``,
+            basis points) for ``(market_key, side)`` from that same sealed entry tick; ``0`` when
+            absent. Feeds the forward executable-edge gate.
     """
 
     agent_id: str
@@ -51,6 +58,8 @@ class Proposal(BaseModel):
     side: str
     recomputed_edge_bps: int
     kelly_fraction: float
+    reference_price: float = 0.0  # sealed entry decimal price for (market_key, side); 0.0 if absent
+    entry_prob_bps: int = 0  # sealed entry de-vigged prob (bps) for (market_key, side); 0 if absent
 
 
 def _decision_seq_index(run_events: list[dict[str, Any]]) -> dict[tuple[str, int], int]:
@@ -85,6 +94,19 @@ def _decision_seq_index(run_events: list[dict[str, Any]]) -> dict[tuple[str, int
     return index
 
 
+def _entry_market_index(run_events: list[dict[str, Any]]) -> dict[int, dict[str, Any]]:
+    """Map each ``tick_seq`` to its sealed entry tick's ``markets`` dict (from sealed evidence)."""
+    index: dict[int, dict[str, Any]] = {}
+    for event in run_events:
+        if event.get("event_type") != EVENT_TICK:
+            continue
+        snapshot = json.loads(event["state_snapshot_json"]) if event.get("state_snapshot_json") else {}
+        tick_seq = snapshot.get("tick_seq")
+        if tick_seq is not None:
+            index[int(tick_seq)] = snapshot.get("markets", {}) or {}
+    return index
+
+
 def value_proposals(run_result: RunResult, *, min_edge_bps: int) -> list[Proposal]:
     """Select law-approved, threshold-clearing taker proposals from a SEALED run.
 
@@ -107,6 +129,7 @@ def value_proposals(run_result: RunResult, *, min_edge_bps: int) -> list[Proposa
         The selected :class:`Proposal` objects, ascending by ``source_sequence_no``.
     """
     seq_index = _decision_seq_index(run_result.run_events)
+    entry_index = _entry_market_index(run_result.run_events)
     proposals: list[Proposal] = []
     for row in run_result.score_rows:
         if row.get("valid") is not True:
@@ -128,6 +151,15 @@ def value_proposals(run_result: RunResult, *, min_edge_bps: int) -> list[Proposa
         kelly_fraction = (
             float(kelly_raw) if isinstance(kelly_raw, (int, float)) and not isinstance(kelly_raw, bool) else 0.0
         )
+        market = entry_index.get(row["tick_seq"], {}).get(market_key, {})
+        ref_price_raw = (market.get("stable_price") or {}).get(side)
+        reference_price = (
+            float(ref_price_raw)
+            if isinstance(ref_price_raw, (int, float)) and not isinstance(ref_price_raw, bool)
+            else 0.0
+        )
+        prob_raw = (market.get("stable_prob_bps") or {}).get(side)
+        entry_prob_bps = int(prob_raw) if isinstance(prob_raw, int) and not isinstance(prob_raw, bool) else 0
         proposals.append(
             Proposal(
                 agent_id=row["agent_id"],
@@ -137,6 +169,8 @@ def value_proposals(run_result: RunResult, *, min_edge_bps: int) -> list[Proposa
                 side=side,
                 recomputed_edge_bps=edge,
                 kelly_fraction=kelly_fraction,
+                reference_price=reference_price,
+                entry_prob_bps=entry_prob_bps,
             )
         )
     proposals.sort(key=lambda proposal: proposal.source_sequence_no)

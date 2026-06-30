@@ -83,3 +83,45 @@ def test_value_proposals_pure_no_mutation() -> None:
     before = rr.evidence_hash
     value_proposals(rr, min_edge_bps=0)
     assert rr.evidence_hash == before
+
+
+def test_proposal_carries_sealed_reference_price_and_prob() -> None:
+    # Build a run whose sealed entry tick has a priced market the agent takes.
+    from tests._arena_fixtures import finished_run_result
+    from veridex.strategies.value import value_proposals
+
+    run = finished_run_result()
+    proposals = value_proposals(run, min_edge_bps=-100000)  # accept everything to get a taker
+    takers = [p for p in proposals if p.market_key and p.side]
+    if takers:  # at least one priced taker in the fixture
+        p = takers[0]
+        assert isinstance(p.reference_price, float)
+        assert isinstance(p.entry_prob_bps, int)
+        assert p.entry_prob_bps >= 0
+
+
+def test_proposal_reference_price_matches_sealed_entry_tick() -> None:
+    """``reference_price`` / ``entry_prob_bps`` are sourced from the SEALED entry tick.
+
+    Independently reconstructs the entry-tick ``markets`` per ``tick_seq`` straight from the
+    sealed event log and asserts each proposal's fields equal those sealed values exactly —
+    proving the strategy reads sealed evidence (never a live/LLM-claimed price).
+    """
+    import json
+
+    from veridex.runtime.orchestrator import EVENT_TICK
+
+    rr = finished_run_result()
+    entry_markets: dict[int, dict[str, dict[str, object]]] = {}
+    for ev in rr.run_events:
+        if ev["event_type"] != EVENT_TICK:
+            continue
+        snap = json.loads(ev["state_snapshot_json"])
+        entry_markets[int(snap["tick_seq"])] = snap.get("markets", {})
+
+    takers = [p for p in value_proposals(rr, min_edge_bps=-100000) if p.market_key and p.side]
+    assert takers  # the fixture yields priced takers
+    for p in takers:
+        market = entry_markets[p.tick_seq][p.market_key]
+        assert p.reference_price == float(market["stable_price"][p.side])  # type: ignore[index]
+        assert p.entry_prob_bps == int(market["stable_prob_bps"][p.side])  # type: ignore[index]
