@@ -15,6 +15,7 @@
 //     not in wire CompetitionStateResponse; they come from the WS stream + /leaderboard.
 //   - InspectorRecord: proof_mode/is_live/clv_explanation are not in wire InspectorRecord.
 import { CHECK_ORDER } from '@/lib/checks';
+import { isMockEnabled, MOCK_FIXTURES } from '@/lib/mock';
 import type * as W from '@/lib/wire';
 import type {
   AnchorInfo, AnchorStatus, CheckResult, CockpitState, ExecutionMode, InspectorRecord,
@@ -257,23 +258,43 @@ export function adaptInspector(w: W.InspectorRecord): InspectorRecord {
   };
 }
 
+// MOCK MODE: demote any `live` source_mode → `replay` so fixtures never render under a LIVE
+// badge (DEMO data is replay/recorded, never live — doctrine).
+const demote = (s: SourceMode): SourceMode => (s === 'live' ? 'replay' : s);
+
 // ---- readers / control ----
+// Each reader short-circuits to the canonical wire fixture (via the SAME adapter) when mock is
+// on — so the screen populates to its full state from contracts/fixtures, never the backend.
 export async function getProofArtifact(runId: string): Promise<ProofArtifact> {
+  if (isMockEnabled()) {
+    const p = adaptProofArtifact(MOCK_FIXTURES.proofArtifact);
+    return { ...p, source_mode: demote(p.source_mode) };
+  }
   return adaptProofArtifact(await getJson<W.ProofArtifact>(PATHS.runProof(runId)));
 }
 
 export async function verifyProof(runId: string): Promise<VerifyResult> {
+  if (isMockEnabled()) return adaptVerify(MOCK_FIXTURES.verify);
   return adaptVerify(await postJson<W.VerifyResult>(PATHS.verify(runId)));
 }
 
 export async function getLeaderboard(competitionId?: string): Promise<LeaderboardRow[]> {
+  if (isMockEnabled()) {
+    // leaderboard source_mode is SourceMode|'mixed' — demote only `live`, keep replay/mixed.
+    return adaptLeaderboard(MOCK_FIXTURES.leaderboard).map((r) => ({ ...r, source_mode: r.source_mode === 'live' ? 'replay' : r.source_mode }));
+  }
   return adaptLeaderboard(await getJson<W.LeaderboardResponse>(PATHS.leaderboard(competitionId)));
 }
 
 export async function getCockpitState(competitionId: string): Promise<CockpitState> {
+  if (isMockEnabled()) {
+    const c = adaptCompetitionState(MOCK_FIXTURES.competition);
+    return { ...c, header: { ...c.header, source_mode: demote(c.header.source_mode) } };
+  }
   return adaptCompetitionState(await getJson<W.CompetitionStateResponse>(PATHS.competitionState(competitionId)));
 }
 
 export async function getInspectorRecord(runId: string, seq: number | string): Promise<InspectorRecord> {
+  if (isMockEnabled()) return adaptInspector(MOCK_FIXTURES.inspector);
   return adaptInspector(await getJson<W.InspectorRecord>(PATHS.inspector(runId, seq)));
 }
