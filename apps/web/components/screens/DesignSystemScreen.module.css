@@ -1,0 +1,28 @@
+.page { display: flex; flex-direction: column; gap: var(--space-4); }
+.title { margin: 0; font-size: 19px; font-weight: 600; letter-spacing: -0.01em; color: var(--text-1); }
+.section { display: flex; flex-direction: column; gap: var(--space-3); padding: var(--pad-panel); border: 1px solid var(--border); border-radius: var(--radius-panel); background: var(--panel); }
+.heading { margin: 0; font-size: 12px; font-weight: 600; letter-spacing: 0.04em; text-transform: uppercase; color: var(--text-2); }
+.body { margin: 0; color: var(--text-2); font-size: 12px; line-height: 1.6; }
+
+.swatches { display: grid; grid-template-columns: repeat(auto-fill, minmax(120px, 1fr)); gap: var(--space-3); }
+.swatch { display: flex; align-items: center; gap: var(--space-2); }
+.chipColor { width: 28px; height: 28px; border-radius: var(--radius-control); border: 1px solid var(--border-strong); }
+.swatchLabel { font-size: 10px; color: var(--text-3); }
+
+.specimens { display: flex; flex-direction: column; gap: var(--space-3); }
+.specimenRow { display: flex; flex-direction: column; gap: var(--space-1); }
+.specLabel { font-size: 9px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--text-3); }
+
+.radii { display: flex; gap: var(--space-3); }
+.radiusBox { display: flex; align-items: flex-end; padding: var(--space-2); width: 96px; height: 64px; border: 1px solid var(--border-strong); background: var(--panel-2); }
+
+.badges { display: flex; flex-wrap: wrap; gap: var(--space-2); }
+.chips { display: flex; gap: var(--space-4); }
+.chipCell { display: flex; flex-direction: column; align-items: center; gap: var(--space-1); }
+
+.table { border-collapse: collapse; width: 100%; font-family: var(--font-mono), monospace; font-size: 11px; }
+.table th { text-align: left; padding: 9px; font-size: 9px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--text-3); background: var(--bg-bar); border-bottom: 1px solid var(--border); }
+.numH { text-align: right; }
+.table td { padding: 9px; border-bottom: 1px solid var(--border-soft); color: var(--text-1); }
+.pos { color: var(--positive); }
+.neg { color: var(--negative); }
