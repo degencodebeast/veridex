@@ -1,9 +1,10 @@
-import { numericClass } from '@/lib/derive';
-import { fmtBps } from '@/lib/format';
+import { signClass, fmtBps } from '@/lib/format';
 import styles from './Num.module.css';
 
 export function Num({ value, kind = 'plain' }: { value: number; kind?: 'bps' | 'plain' }) {
-  const cls = numericClass(value);
+  const cls = signClass(value);
   const text = kind === 'bps' ? fmtBps(value) : `${value}`;
-  return <span className={`${cls} ${styles.num} ${styles[cls]} mono num`}>{text}</span>;
+  // Scoped CSS-module classes only (no raw global passthrough); data-sign is the stable
+  // selector for sign→color (REQ-006/GUD-001). `mono` is a global typography utility.
+  return <span data-sign={cls} className={`${styles.num} ${styles[cls]} mono`}>{text}</span>;
 }

@@ -8,6 +8,8 @@ describe('Num (GUD-001 / REQ-006)', () => {
   it('renders a positive bps value with the positive class and a + sign', () => {
     const { container } = render(<Num value={18.4} kind="bps" />);
     expect(container.firstChild).toHaveClass('pos');
+    // Stable, non-global selector for sign→color (raw passthrough classes were dropped).
+    expect(container.firstChild).toHaveAttribute('data-sign', 'pos');
     expect(container.textContent).toBe('+18.4 bps');
   });
   it('renders a negative value with the negative class', () => {

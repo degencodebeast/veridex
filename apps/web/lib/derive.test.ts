@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { rankByAvgClv, isEligible, numericClass, clvConfidence, isLowSample } from '@/lib/derive';
+import { rankByAvgClv, isEligible, clvConfidence, isLowSample } from '@/lib/derive';
 import type { LeaderboardRow } from '@/lib/contracts';
 
 function row(p: Partial<LeaderboardRow>): LeaderboardRow {
@@ -47,11 +47,8 @@ describe('derive (SEC-005 / REQ-006 / WD-7)', () => {
     expect(isEligible('partial')).toBe(false);
   });
 
-  it('maps numeric sign to a color class', () => {
-    expect(numericClass(3.2)).toBe('pos');
-    expect(numericClass(-0.1)).toBe('neg');
-    expect(numericClass(0)).toBe('zero');
-  });
+  // Numeric sign→color class is `signClass` in lib/format.ts (tested in format.test.ts) —
+  // not duplicated here.
 
   it('grades CLV confidence by sample size and flags low samples (WD-7)', () => {
     expect(clvConfidence(40)).toBe('high');

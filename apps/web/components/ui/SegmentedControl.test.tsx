@@ -36,4 +36,54 @@ describe('SegmentedControl', () => {
     await user.click(llm);
     expect(onChange).not.toHaveBeenCalled();
   });
+
+  it('is a single tab stop — only the checked radio is tabbable (roving tabindex)', () => {
+    render(
+      <SegmentedControl
+        ariaLabel="Source"
+        value="b"
+        onChange={vi.fn()}
+        options={[{ value: 'a', label: 'A' }, { value: 'b', label: 'B' }]}
+      />,
+    );
+    expect(screen.getByRole('radio', { name: 'B' })).toHaveAttribute('tabindex', '0');
+    expect(screen.getByRole('radio', { name: 'A' })).toHaveAttribute('tabindex', '-1');
+  });
+
+  it('moves selection with arrow keys (radiogroup keyboard model)', async () => {
+    const user = userEvent.setup();
+    const onChange = vi.fn();
+    render(
+      <SegmentedControl
+        ariaLabel="Source"
+        value="a"
+        onChange={onChange}
+        options={[{ value: 'a', label: 'A' }, { value: 'b', label: 'B' }]}
+      />,
+    );
+    screen.getByRole('radio', { name: 'A' }).focus();
+    await user.keyboard('{ArrowRight}');
+    expect(onChange).toHaveBeenCalledWith('b');
+  });
+
+  it('skips locked options during arrow navigation (never selects a locked mode)', async () => {
+    const user = userEvent.setup();
+    const onChange = vi.fn();
+    render(
+      <SegmentedControl
+        ariaLabel="Mode"
+        value="b"
+        onChange={onChange}
+        options={[
+          { value: 'a', label: 'A' },
+          { value: 'b', label: 'B' },
+          { value: 'c', label: 'C', locked: true },
+        ]}
+      />,
+    );
+    screen.getByRole('radio', { name: 'B' }).focus();
+    await user.keyboard('{ArrowRight}'); // C is locked → wrap past it to A
+    expect(onChange).toHaveBeenCalledWith('a');
+    expect(onChange).not.toHaveBeenCalledWith('c');
+  });
 });

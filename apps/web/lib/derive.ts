@@ -13,12 +13,8 @@ export function isEligible(proof_mode: ProofMode): boolean {
   return proof_mode === 'reproducible' || proof_mode === 'verified';
 }
 
-// REQ-006: numeric color is the sign of the value (never decoration).
-export function numericClass(value: number): 'pos' | 'neg' | 'zero' {
-  if (value > 0) return 'pos';
-  if (value < 0) return 'neg';
-  return 'zero';
-}
+// Numeric sign→color class lives in lib/format.ts as `signClass` (REQ-006) — reused here
+// and by every numeric cell; no duplicate is kept in this module.
 
 // WD-7 (REQ-054): CLV confidence from valid sample size; low-sample is flagged, never hidden.
 export type ClvConfidence = 'high' | 'medium' | 'low';
