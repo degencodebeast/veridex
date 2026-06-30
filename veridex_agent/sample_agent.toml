@@ -1,0 +1,20 @@
+# Sample standalone-agent run config (WD-3). NON-SECRET ONLY.
+# Credentials (TxLINE JWT/X-Api-Token, Solana keypair, venue keys) come from veridex/.env
+# via veridex.config.Settings — NEVER from this file (COM-001).
+
+agent_id = "momentum-desk-1"
+strategy = "momentum"          # baseline | momentum | llm
+source_mode = "replay"         # replay | live
+fixture_path = "tests/fixtures/wd2_momentum_replay.json"
+
+# momentum tuning
+lookback = 8
+min_momentum_bps = 50
+
+# policy envelope (operator guardrails)
+max_stake = 100.0
+min_edge_bps = 8
+market_allowlist = ["M"]
+venue_allowlist = ["sx_bet"]
+execution_mode = "paper"       # paper | dry_run | live_guarded
+anchor = false                 # true → real Solana Memo anchor (requires SOLANA_KEYPAIR_PATH)
