@@ -45,6 +45,8 @@ export interface LeaderboardRow {
   rank: number; agent_id: string; runs: number; avg_clv_bps: number | null; total_clv_bps: number;
   sim_pnl: number; brier: number | null; max_drawdown: number; action_count: number;
   valid_pct: number; proof_mode: string; eligibility_badge: string; anchor_status: string; source_mode: string;
+  // WD-7 CLV confidence (display-only — NEVER a rank input, SEC-005):
+  valid_count: number; clv_confidence: string; low_sample: boolean;
 }
 export interface LeaderboardResponse { rows: LeaderboardRow[]; }
 
