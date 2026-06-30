@@ -83,6 +83,7 @@
   --border-strong: #D7DBE2;
   --text-1: #1A1F29;
   --text-2: #5B6573;
+  --text-2-alt: #5B6573; /* Badge .replay — AA on light (was dark-only → ~2.3:1 fail) */
   --text-3: #8A93A1;
   --text-4: #A0A8B4;
   --accent: #2A6FDB;
@@ -97,5 +98,8 @@
   --positive-bg: rgba(31, 138, 91, 0.12);
   --negative: #C4503A;
   --negative-bg: rgba(196, 80, 58, 0.12);
+  /* JsonView/Inspector syntax colors — AA on light (dark defaults were ~1.6:1, illegible) */
+  --json-key: #245AAE;
+  --json-string: #1B7A4E;
   --scrim: rgba(0, 0, 0, 0.35);
 }

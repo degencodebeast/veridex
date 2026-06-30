@@ -24,4 +24,13 @@ describe('MobileArenaScreen (REQ-027)', () => {
       expect(within(bar).getByRole('link', { name: t })).toBeInTheDocument();
     }
   });
+
+  it('does NOT dress the static demo header as a live feed (honesty)', () => {
+    render(<MobileArenaScreen />);
+    // no pulsing SCORING pill over hardcoded constants
+    expect(screen.queryByText(/SCORING/)).toBeNull();
+    const match = screen.getByTestId('mobile-match');
+    expect(within(match).queryByText(/^Live$/)).toBeNull(); // no live badge over the static score
+    expect(within(match).getByText(/mock/i)).toBeInTheDocument(); // honestly labelled demo/mock data
+  });
 });

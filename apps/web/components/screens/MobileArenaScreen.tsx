@@ -1,7 +1,6 @@
 'use client';
 import Link from 'next/link';
 import { Badge } from '@/components/ui/Badge';
-import { LiveDot } from '@/components/ui/LiveDot';
 import { Num } from '@/components/ui/Num';
 import { rankByAvgClv } from '@/lib/derive';
 import { LEADERBOARD_ROWS } from '@/lib/fixtures/catalog';
@@ -19,10 +18,13 @@ export function MobileArenaScreen({ rows = LEADERBOARD_ROWS }: { rows?: Leaderbo
     <div className={styles.frame} data-testid="phone-frame" data-width="392">
       <header className={styles.appbar}>
         <span className={styles.logo}>V</span>
-        <span className={styles.scoring}><LiveDot size={5} /> SCORING</span>
+        {/* Static demo shell — not a live feed. Honestly labelled (no live/SCORING affordance). */}
+        <span className={styles.scoring}>DEMO · REPLAY</span>
       </header>
 
-      <div className={styles.toggle}><Badge variant="live" /> <span className={styles.toggleText}>FRA v BRA · H2 62&apos;</span></div>
+      <div className={styles.toggle} data-testid="mobile-match">
+        <Badge variant="replay" /> <span className={styles.toggleText}>FRA v BRA · H2 62&apos; · mock data</span>
+      </div>
 
       <div className={styles.fixtureCard}>
         <div className={styles.tile}><span className={styles.tileLabel}>SCORE</span><span className="mono">1 - 1</span></div>
