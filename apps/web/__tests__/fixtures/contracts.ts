@@ -93,7 +93,7 @@ export const sampleInspectorRecord: InspectorRecord = {
 export const sampleCockpitState: CockpitState = {
   competition_id: 'wc-fra-bra',
   run_id: 'run_7f3a',
-  header: { fixture: 'FRA v BRA', competition: 'World Cup', source_mode: 'live', execution_mode: 'paper', proof_mode: 'verified', events: 142, valid_pct: 93 },
+  header: { fixture: 'FRA v BRA', competition: 'World Cup', source_mode: 'live', execution_mode: 'paper', proof_mode: 'verified', events: 142, valid_pct: 93, verifier_version: 'v0' },
   trace: [
     { stage: 'evidence', label: 'Evidence', state: 'done' },
     { stage: 'law', label: 'Law', state: 'done' },

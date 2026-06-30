@@ -16,7 +16,7 @@
 //   - InspectorRecord: proof_mode/is_live/clv_explanation are not in wire InspectorRecord.
 import { CHECK_ORDER } from '@/lib/checks';
 import { isMockEnabled, MOCK_FIXTURES } from '@/lib/mock';
-import type { StatusBarState } from '@/lib/status';
+import { VERIFIER_VERSION, type StatusBarState } from '@/lib/status';
 import type * as W from '@/lib/wire';
 import type {
   AnchorInfo, AnchorStatus, CheckResult, CockpitState, ExecutionMode, InspectorRecord,
@@ -218,6 +218,9 @@ export function adaptCompetitionState(w: W.CompetitionStateResponse): CockpitSta
       proof_mode: 'reproducible', // GAP: not in wire competition config
       events: w.latest_seq,
       valid_pct: 0, // GAP (PERCENT 0-100 convention; no header source in wire competition state)
+      // Single source: the verifier the Proof Card shows is carried in the run's proof_card.
+      // Fall back to the canonical const only when the competition has no sealed run yet.
+      verifier_version: w.proof_card?.verifier_version ?? VERIFIER_VERSION,
     },
     // GAPs: the cockpit's trace/match/events/receipts/policy/kill_armed and the rich
     // leaderboard are NOT in GET /competitions/{id}; the cockpit screen assembles them
@@ -314,5 +317,6 @@ export function mockStatusSeed(): StatusBarState | null {
     ws: 'disconnected', // DEMO: no real stream in mock — honest, never CONNECTED
     seq: c.header.events ?? null,
     scoring: false,
+    verifierVersion: c.header.verifier_version, // === the Proof Card's verifier (same artifact)
   };
 }

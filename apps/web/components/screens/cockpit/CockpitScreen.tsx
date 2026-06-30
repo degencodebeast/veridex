@@ -28,7 +28,8 @@ export function CockpitScreen({ competitionId, initial }: { competitionId: strin
     ws: wsStatus,
     seq,
     scoring: true,
-  }), [state.header.fixture, state.header.competition, state.header.source_mode, state.header.execution_mode, wsStatus, seq]);
+    verifierVersion: state.header.verifier_version, // from the run artifact ⇒ matches the Proof Card
+  }), [state.header.fixture, state.header.competition, state.header.source_mode, state.header.execution_mode, state.header.verifier_version, wsStatus, seq]);
   usePublishStatus(status);
 
   return (

@@ -155,6 +155,7 @@ export interface RunHeaderState {
   proof_mode: ProofMode;
   events: number;
   valid_pct: number; // PERCENT 0-100 (matches the wire convention)
+  verifier_version: string; // from the run's proof artifact (single source the status bar reads)
 }
 
 export type WsStatus = 'connecting' | 'connected' | 'reconnecting' | 'disconnected';

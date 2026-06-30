@@ -1,6 +1,7 @@
 'use client';
 import Link from 'next/link';
 import { useReducedMotion } from '@/hooks/useReducedMotion';
+import { VERIFIER_VERSION } from '@/lib/status';
 import styles from './LandingScreen.module.css';
 
 type TraceTone = 'pos' | 'accent';
@@ -181,7 +182,7 @@ export function LandingScreen() {
         <div className={styles.footerRow}>
           <span className={styles.footerBrand}>
             <Wordmark />
-            <span className={styles.footerMeta}>built on TxLINE · anchored on Solana · verifier v0.9.2</span>
+            <span className={styles.footerMeta}>built on TxLINE · anchored on Solana · verifier {VERIFIER_VERSION}</span>
           </span>
           <div className={styles.footerLinks}>
             <span className={styles.footerLink}>Docs</span>

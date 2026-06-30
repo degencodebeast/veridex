@@ -43,7 +43,9 @@ export function StatusBar() {
       <span className={styles.sep} aria-hidden>·</span>
       <span className={`${styles.mono} mono`} data-testid="status-ws">{status ? wsLabel(status.ws, status.seq) : 'WS idle'}</span>
       <span className={styles.spacer} />
-      <span className={`${styles.verifier} mono`}>verifier {VERIFIER_VERSION}</span>
+      {/* Derived from the active run's artifact (=== Proof Card); idle falls back to the const. */}
+      {/* Derived from the active run's artifact (=== Proof Card); idle falls back to the const. */}
+      <span className={`${styles.verifier} mono`}>verifier {status?.verifierVersion ?? VERIFIER_VERSION}</span>
       <span className={styles.sep} aria-hidden>·</span>
       <DirectionToggle />
     </div>
