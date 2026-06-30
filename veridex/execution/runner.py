@@ -34,7 +34,14 @@ from veridex.competition.events import (
     build_policy_result_event,
 )
 from veridex.execution.models import ExecutionRecord, ExecutionStatus
-from veridex.policy.engine import PolicyContext, PolicyDecision, evaluate
+from veridex.law.edge import executable_edge_bps
+from veridex.policy.engine import PolicyDecision
+from veridex.policy.gate import (
+    PostQuoteContext,
+    PreQuoteContext,
+    evaluate_post_quote,
+    evaluate_pre_quote,
+)
 from veridex.strategies.value import value_proposals
 from veridex.venues.base import Order, OrderStatus
 
@@ -124,6 +131,26 @@ def _size_stake(kelly_fraction: float, *, bankroll: float, max_stake: float) -> 
     return min(_FRACTIONAL_KELLY_MULTIPLIER * kelly_fraction * bankroll, max_stake)
 
 
+def _slippage_bps(reference_price: float, quote_price: float) -> int:
+    """Absolute deviation (bps) of the quote from the sealed reference price; 0 if no reference.
+
+    The sealed ``reference_price`` is the entry decimal price the deterministic law committed
+    (``Proposal.reference_price``); the post-quote gate measures how far the ACTUAL venue quote has
+    drifted from it. A non-positive reference (absent in the sealed evidence) yields ``0`` — a
+    missing reference cannot manufacture slippage, and the edge/staleness rules still gate.
+
+    Args:
+        reference_price: The sealed entry decimal price for ``(market_key, side)``.
+        quote_price: The decimal price actually quoted by the venue.
+
+    Returns:
+        ``round(|quote - reference| / reference * 10000)``; ``0`` when ``reference_price <= 0``.
+    """
+    if reference_price <= 0.0:
+        return 0
+    return round(abs(quote_price - reference_price) / reference_price * 10000)
+
+
 async def run_execution_lane(
     store: Store,
     *,
@@ -142,9 +169,14 @@ async def run_execution_lane(
 
     For each :class:`~veridex.strategies.value.Proposal` (deterministically ordered), the lane:
 
-    1. Fetches a venue quote and builds a :class:`~veridex.policy.engine.PolicyContext` from the
-       SEALED proposal edge plus the quote and operator-set stake/eligibility facts.
-    2. Evaluates the deny-by-default policy and emits a derived ``POLICY_RESULT`` event.
+    1. Runs the cheap :func:`~veridex.policy.gate.evaluate_pre_quote` pass (kill-switch / sealed-edge /
+       stake / venue-market allowlists / order-cap / cooldown / eligibility) BEFORE any venue I/O. A
+       pre-quote ``DENIED`` emits a ``phase="pre_quote"`` ``POLICY_RESULT``, rejects the record, and
+       SKIPS the venue quote entirely (no network on deny).
+    2. Otherwise fetches the venue quote, computes the REAL ``slippage_bps`` (from the proposal's
+       sealed ``reference_price``) and the forward ``executable_edge_bps`` at the actual price, runs
+       :func:`~veridex.policy.gate.evaluate_post_quote`, and emits a ``phase="post_quote"``
+       ``POLICY_RESULT`` carrying those price-dependent numbers (the inert-``slippage_bps=0`` fix).
     3. Creates an :class:`~veridex.execution.models.ExecutionRecord` (``proposed`` →
        ``law_approved``) and branches on the decision:
 
@@ -192,24 +224,23 @@ async def run_execution_lane(
             await broadcast(event)
 
     for proposal in proposals:
-        quote = await adapter.quote_market(proposal.market_key)
         stake = _size_stake(proposal.kelly_fraction, bankroll=bankroll, max_stake=envelope.max_stake)
         entry = entries_by_agent.get(proposal.agent_id)
         agent_eligible = bool(entry.execution_eligibility) if entry is not None else False
 
-        ctx = PolicyContext(
-            recomputed_edge_bps=proposal.recomputed_edge_bps,
-            stake=stake,
-            venue=venue,
-            market_key=proposal.market_key,
-            price=quote.price,
-            slippage_bps=0,
-            quote_age_s=max(0, event_ts - quote.ts),
-            orders_this_run=orders_this_run,
-            seconds_since_last_order=None,
-            agent_eligible=agent_eligible,
+        # --- PRE-QUOTE gate (cheap, deterministic, NO venue I/O) -----------------------
+        pre = evaluate_pre_quote(
+            PreQuoteContext(
+                recomputed_edge_bps=proposal.recomputed_edge_bps,
+                stake=stake,
+                venue=venue,
+                market_key=proposal.market_key,
+                orders_this_run=orders_this_run,
+                seconds_since_last_order=None,
+                agent_eligible=agent_eligible,
+            ),
+            envelope,
         )
-        result = evaluate(ctx, envelope)
 
         execution_id = f"{run_result.run_id}:{proposal.source_sequence_no}"
         record = ExecutionRecord(
@@ -219,11 +250,55 @@ async def run_execution_lane(
             agent_id=proposal.agent_id,
             source_sequence_no=proposal.source_sequence_no,
             status=ExecutionStatus.PROPOSED,
-            policy_hash=result.policy_hash,
+            policy_hash=pre.policy_hash,
         )
         record.advance(ExecutionStatus.LAW_APPROVED)
 
-        # POLICY_RESULT — one per proposal, always emitted, derived/non-evidence.
+        if pre.decision == PolicyDecision.DENIED:
+            # Deny BEFORE any venue I/O — the whole point of the pre-quote pass. ``execution_id``
+            # stays threaded into the payload so POLICY_OBEYED can still correlate a deny with any
+            # (illegal) submit for the same execution (Task-4 bypass detection).
+            await _emit(
+                build_policy_result_event(
+                    competition_id=competition_id,
+                    run_id=run_result.run_id,
+                    seq=seq,
+                    event_ts=event_ts,
+                    agent_id=proposal.agent_id,
+                    source_sequence_no_ref=proposal.source_sequence_no,
+                    policy_result_payload={
+                        "decision": pre.decision.value,
+                        "reason_codes": list(pre.reason_codes),
+                        "policy_hash": pre.policy_hash,
+                        "phase": "pre_quote",
+                    },
+                    execution_id=execution_id,
+                )
+            )
+            seq += 1
+            record.advance(ExecutionStatus.REJECTED)
+            await store.append_execution_record(record)
+            continue  # NO venue quote — saved the I/O.
+
+        # --- venue quote (only reached when the pre-quote gate passes) -----------------
+        quote = await adapter.quote_market(proposal.market_key)
+        slippage = _slippage_bps(proposal.reference_price, quote.price)
+        exec_edge = executable_edge_bps(proposal.entry_prob_bps, quote.price)
+
+        # --- POST-QUOTE gate (REAL slippage + forward executable edge) -----------------
+        post = evaluate_post_quote(
+            PostQuoteContext(
+                executable_edge_bps=exec_edge,
+                price=quote.price,
+                slippage_bps=slippage,
+                quote_age_s=max(0, event_ts - quote.ts),
+                stake=stake,
+            ),
+            envelope,
+        )
+        record.policy_hash = post.policy_hash
+
+        # POST-QUOTE POLICY_RESULT — carries the real, price-dependent numbers (the inert-gate fix).
         await _emit(
             build_policy_result_event(
                 competition_id=competition_id,
@@ -233,20 +308,23 @@ async def run_execution_lane(
                 agent_id=proposal.agent_id,
                 source_sequence_no_ref=proposal.source_sequence_no,
                 policy_result_payload={
-                    "decision": result.decision.value,
-                    "reason_codes": list(result.reason_codes),
-                    "policy_hash": result.policy_hash,
+                    "decision": post.decision.value,
+                    "reason_codes": list(post.reason_codes),
+                    "policy_hash": post.policy_hash,
+                    "phase": "post_quote",
+                    "slippage_bps": slippage,
+                    "executable_edge_bps": exec_edge,
                 },
                 execution_id=execution_id,
             )
         )
         seq += 1
 
-        will_submit = result.decision == PolicyDecision.APPROVED and execution_mode != _PAPER and agent_eligible
+        will_submit = post.decision == PolicyDecision.APPROVED and execution_mode != _PAPER and agent_eligible
 
-        if result.decision == PolicyDecision.DENIED:
+        if post.decision == PolicyDecision.DENIED:
             record.advance(ExecutionStatus.REJECTED)
-        elif result.decision == PolicyDecision.REQUIRES_HUMAN:
+        elif post.decision == PolicyDecision.REQUIRES_HUMAN:
             record.advance(ExecutionStatus.AWAITING_HUMAN)
         elif will_submit:
             record.advance(ExecutionStatus.POLICY_APPROVED)
@@ -387,29 +465,46 @@ async def resolve_approval(
     stake = 0.0
 
     if proposal is not None:
-        # 2. RE-CHECK policy + eligibility against the CURRENT envelope.
-        quote = await adapter.quote_market(proposal.market_key)
-        stake = _size_stake(proposal.kelly_fraction, bankroll=bankroll, max_stake=envelope.max_stake)
+        # 2. RE-CHECK policy + eligibility against the CURRENT envelope (two-phase).
         agent_eligible = bool(entry.execution_eligibility) if entry is not None else False
-        ctx = PolicyContext(
-            recomputed_edge_bps=proposal.recomputed_edge_bps,
-            stake=stake,
-            venue=venue,
-            market_key=proposal.market_key,
-            price=quote.price,
-            slippage_bps=0,
-            quote_age_s=max(0, event_ts - quote.ts),
-            orders_this_run=0,
-            seconds_since_last_order=None,
-            agent_eligible=agent_eligible,
+        stake = _size_stake(proposal.kelly_fraction, bankroll=bankroll, max_stake=envelope.max_stake)
+        pre = evaluate_pre_quote(
+            PreQuoteContext(
+                recomputed_edge_bps=proposal.recomputed_edge_bps,
+                stake=stake,
+                venue=venue,
+                market_key=proposal.market_key,
+                orders_this_run=0,
+                seconds_since_last_order=None,
+                agent_eligible=agent_eligible,
+            ),
+            envelope,
         )
-        result = evaluate(ctx, envelope)
-        reason_codes = list(result.reason_codes)
-        result_policy_hash = result.policy_hash
-        # The human is approving an already-clean (or escalated) action: a clean re-check
-        # (no hard reason codes) means APPROVED-and-submit; any hard reason fails closed.
-        if not reason_codes:
-            decision = _APPROVED
+        result_policy_hash = pre.policy_hash
+        if pre.decision == PolicyDecision.DENIED:
+            # Cheap deny (e.g. a flipped kill-switch) fails closed BEFORE any venue I/O.
+            reason_codes = list(pre.reason_codes)
+        else:
+            quote = await adapter.quote_market(proposal.market_key)
+            slippage = _slippage_bps(proposal.reference_price, quote.price)
+            exec_edge = executable_edge_bps(proposal.entry_prob_bps, quote.price)
+            post = evaluate_post_quote(
+                PostQuoteContext(
+                    executable_edge_bps=exec_edge,
+                    price=quote.price,
+                    slippage_bps=slippage,
+                    quote_age_s=max(0, event_ts - quote.ts),
+                    stake=stake,
+                ),
+                envelope,
+            )
+            reason_codes = list(post.reason_codes)
+            result_policy_hash = post.policy_hash
+            # The human is approving an already-clean (or escalated) action: a clean re-check
+            # (no hard reason codes — REQUIRES_HUMAN is clean) means APPROVED-and-submit; any hard
+            # reason fails closed.
+            if not reason_codes:
+                decision = _APPROVED
     else:
         reason_codes = ["proposal_no_longer_qualifies"]
 

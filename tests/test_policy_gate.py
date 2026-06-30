@@ -1,5 +1,8 @@
 """Aegis two-phase policy gate — pre-quote (no I/O) then post-quote (price-dependent)."""
+
 from __future__ import annotations
+
+from pathlib import Path
 
 from veridex.policy.engine import PolicyDecision
 from veridex.policy.envelope import PolicyEnvelope
@@ -9,30 +12,53 @@ from veridex.policy.gate import (
     evaluate_post_quote,
     evaluate_pre_quote,
 )
+from veridex.verifier.import_audit import assert_no_llm_imports
 
 
-def _env(**kw):
-    base = dict(
-        max_stake=100.0, max_orders_per_run=5, max_orders_per_session=20, max_orders_per_day=50,
-        venue_allowlist=["sx_bet"], market_allowlist=["OU|2.5|full"], min_edge_bps=50,
-        max_slippage_bps=100, max_price=3.0, max_quote_age_s=10, cooldown_s=0,
-        human_approval_threshold=1000.0, kill_switch=False,
-    )
+def _env(**kw: object) -> PolicyEnvelope:
+    base: dict[str, object] = {
+        "max_stake": 100.0,
+        "max_orders_per_run": 5,
+        "max_orders_per_session": 20,
+        "max_orders_per_day": 50,
+        "venue_allowlist": ["sx_bet"],
+        "market_allowlist": ["OU|2.5|full"],
+        "min_edge_bps": 50,
+        "max_slippage_bps": 100,
+        "max_price": 3.0,
+        "max_quote_age_s": 10,
+        "cooldown_s": 0,
+        "human_approval_threshold": 1000.0,
+        "kill_switch": False,
+    }
     base.update(kw)
-    return PolicyEnvelope(**base)
+    return PolicyEnvelope(**base)  # type: ignore[arg-type]
 
 
-def _pre(**kw):
-    base = dict(recomputed_edge_bps=120, stake=50.0, venue="sx_bet", market_key="OU|2.5|full",
-                orders_this_run=0, seconds_since_last_order=None, agent_eligible=True)
+def _pre(**kw: object) -> PreQuoteContext:
+    base: dict[str, object] = {
+        "recomputed_edge_bps": 120,
+        "stake": 50.0,
+        "venue": "sx_bet",
+        "market_key": "OU|2.5|full",
+        "orders_this_run": 0,
+        "seconds_since_last_order": None,
+        "agent_eligible": True,
+    }
     base.update(kw)
-    return PreQuoteContext(**base)
+    return PreQuoteContext(**base)  # type: ignore[arg-type]
 
 
-def _post(**kw):
-    base = dict(executable_edge_bps=120, price=2.0, slippage_bps=10, quote_age_s=1, stake=50.0)
+def _post(**kw: object) -> PostQuoteContext:
+    base: dict[str, object] = {
+        "executable_edge_bps": 120,
+        "price": 2.0,
+        "slippage_bps": 10,
+        "quote_age_s": 1,
+        "stake": 50.0,
+    }
     base.update(kw)
-    return PostQuoteContext(**base)
+    return PostQuoteContext(**base)  # type: ignore[arg-type]
 
 
 def test_pre_quote_clean_approves() -> None:
@@ -71,6 +97,4 @@ def test_post_quote_over_threshold_requires_human() -> None:
 
 
 def test_gate_import_audit_clean() -> None:
-    from pathlib import Path
-    from veridex.verifier.import_audit import assert_no_llm_imports
     assert_no_llm_imports(Path("veridex/policy"))

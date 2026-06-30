@@ -176,23 +176,27 @@ async def test_config_hash_excludes_config_hash_and_eligibility() -> None:  # CO
     assert entry.config_hash == expected
 
 
-async def test_live_guarded_start_is_testnet_gated() -> None:  # P2B-7: live venue gated
-    """Phase-2B: ``live_guarded`` is now ACCEPTED but the live SX Bet adapter is testnet-gated.
+async def test_live_guarded_pre_quote_denies_before_venue_io() -> None:  # P2B-7 / Pre-2C Task 11
+    """``live_guarded`` with the fail-closed default envelope denies at PRE-QUOTE, before any I/O.
 
-    The executor lane fetches a venue quote per proposal BEFORE the policy gate, so an
-    un-enabled ``SXBetAdapter`` raises ``NotImplementedError`` — the expected gated behavior.
-    The seal + 2A tail persist, but NO execution-block events are appended (the lane raised
-    before the service could persist them). Crucially, the non-scoring lane failure must NOT
-    strand the lifecycle in RUNNING.
+    Pre-2C Task 11 splits the gate: the cheap :func:`~veridex.policy.gate.evaluate_pre_quote` pass
+    runs BEFORE any venue quote. The conservative default envelope (empty venue/market allowlists,
+    agents not execution-eligible) denies every proposal at pre-quote, so the un-enabled live
+    ``SXBetAdapter`` is NEVER hit (no ``NotImplementedError``, no network) — exactly the safety win.
+    The lane emits denied ``phase="pre_quote"`` ``POLICY_RESULT`` events but NO submit/receipt, and
+    the seal + 2A tail persist so the competition still FINALIZES (never stranded in RUNNING).
     """
     store = InMemoryStore()
     cid = await _seeded_competition(store, execution_mode=ExecutionMode.LIVE_GUARDED)
-    with pytest.raises(NotImplementedError):
-        await start_competition(store, cid, _ticks(), _agents())
+    # No raise: the pre-quote gate short-circuits before the un-enabled live adapter is ever called.
+    await start_competition(store, cid, _ticks(), _agents())
     events = await store.list_competition_events(cid, since_seq=-1)
-    reserved = {EventType.POLICY_RESULT, EventType.EXECUTION_SUBMITTED, EventType.EXECUTION_RECEIPT}
-    assert all(e.event_type not in reserved for e in events)
-    # The non-scoring lane failure must NOT strand the lifecycle: the seal + 2A tail are durable,
+    policy = [e for e in events if e.event_type == EventType.POLICY_RESULT]
+    assert policy  # the lane reached the pre-quote gate for each proposal
+    assert all(e.payload["decision"] == "denied" and e.payload["phase"] == "pre_quote" for e in policy)
+    # Pre-quote denial means NO venue I/O: no submit, no receipt (the live adapter was never hit).
+    assert not any(e.event_type in {EventType.EXECUTION_SUBMITTED, EventType.EXECUTION_RECEIPT} for e in events)
+    # The non-scoring lane outcome must NOT strand the lifecycle: the seal + 2A tail are durable,
     # so the competition is FINALIZED (a retry correctly hits the _ALREADY_FINALIZED 409 gate, not
     # the _ALREADY_RUNNING gate forever).
     competition = await store.get_competition(cid)

@@ -13,9 +13,12 @@ production-readiness evidence, NEVER skill evidence:
 
 from __future__ import annotations
 
+import time
+
 import pytest
 
 from tests._arena_fixtures import _DEMO_MARKET_KEY, finished_run_result
+from veridex.competition.events import EventType
 from veridex.competition.models import (
     AgentEntry,
     Competition,
@@ -30,6 +33,7 @@ from veridex.runtime.orchestrator import RunResult
 from veridex.scoring import score_run
 from veridex.store import InMemoryStore
 from veridex.strategies.value import value_proposals
+from veridex.venues.base import Quote
 from veridex.venues.sx_bet import FakeVenueAdapter
 
 # FakeVenueAdapter resolves to the venue slug "fake" (class-name derived); the envelope must
@@ -236,6 +240,14 @@ async def test_live_guarded_fill_submits_real_order(rr: RunResult) -> None:
 
 
 async def test_paper_mode_law_approved_no_submit(rr: RunResult) -> None:
+    """Paper mode NEVER submits: clean post-quote approvals park at ``law_approved`` (no fill).
+
+    With the two-phase gate (Pre-2C Task 11) the post-quote pass is now LIVE, so a proposal whose
+    forward executable edge has decayed at the quoted price is correctly ``rejected`` even in paper
+    mode (the inert-gate fix). The invariant under test is the paper-mode one: no order is ever
+    submitted, every event is a ``policy_result``, and at least one clean proposal parks at
+    ``law_approved`` (never ``submitted``/``filled``).
+    """
     adapter = FakeVenueAdapter()
     store = InMemoryStore()
     await store.create_competition(_comp("c"))
@@ -253,7 +265,10 @@ async def test_paper_mode_law_approved_no_submit(rr: RunResult) -> None:
     assert all(e.event_type.value == "policy_result" for e in events)
     assert adapter.submit_calls == 0
     recs = await store.list_executions("c")
-    assert recs and all(r.status.value == "law_approved" for r in recs)
+    # Paper mode never reaches a fill terminal; clean approvals stay law_approved, decayed-edge
+    # takes are rejected by the (now-live) post-quote gate — but nothing is ever submitted/filled.
+    assert recs and all(r.status.value in ("law_approved", "rejected") for r in recs)
+    assert any(r.status.value == "law_approved" for r in recs)
 
 
 async def test_kill_switch_denies_collects_reasons_no_submit(rr: RunResult) -> None:
@@ -420,3 +435,100 @@ async def test_positive_kelly_sizes_order_end_to_end(rr: RunResult) -> None:
     assert submitted.payload["size"] == expected
     record = await store.get_execution_record(execution_id)
     assert record.receipt is not None and record.receipt.requested_size == expected
+
+
+# ---------------------------------------------------------------------------
+# Two-phase gate (Pre-2C Task 11) — pre-quote denies BEFORE I/O; post-quote uses
+# the REAL slippage + forward executable-edge from the actual venue quote.
+# ---------------------------------------------------------------------------
+
+
+class _RecordingAdapter(FakeVenueAdapter):
+    """FakeVenueAdapter that counts quote calls and returns a chosen price (for gate tests)."""
+
+    # Explicit venue slug so the policy allowlist (which lists "fake") matches — otherwise the
+    # class-name-derived slug ("_recording") would trip ``venue_not_allowed`` at pre-quote and the
+    # post-quote path could never be reached.
+    venue = "fake"
+
+    def __init__(self, *, price: float, fill: bool = True) -> None:
+        super().__init__(fill=fill)
+        self._price = price
+        self.quote_calls = 0
+
+    async def quote_market(self, market_ref: str) -> Quote:
+        self.quote_calls += 1
+        return Quote(market_ref=market_ref, price=self._price, size=500.0, ts=int(time.time()))
+
+
+async def test_pre_quote_kill_switch_skips_venue_quote(rr: RunResult) -> None:
+    """Pre-quote kill-switch deny: NO venue quote, NO submit, POLICY_RESULT.phase == 'pre_quote'."""
+    adapter = _RecordingAdapter(price=2.05)
+    store = InMemoryStore()
+    await store.create_competition(_comp("c"))
+    events = await run_execution_lane(
+        store,
+        competition_id="c",
+        run_result=rr,
+        envelope=_env(kill_switch=True),
+        adapter=adapter,
+        entries_by_agent=_eligible(rr),
+        execution_mode="dry_run",
+        base_seq=1000,
+        event_ts=0,
+    )
+    assert adapter.quote_calls == 0  # pre-quote gate denied BEFORE any venue I/O
+    assert adapter.submit_calls == 0
+    policy = [e for e in events if e.event_type == EventType.POLICY_RESULT]
+    assert policy and all(e.payload["phase"] == "pre_quote" for e in policy)
+    assert all("kill_switch_on" in e.payload["reason_codes"] for e in policy)
+    assert not any(e.event_type == EventType.EXECUTION_SUBMITTED for e in events)
+
+
+async def test_post_quote_slippage_denies_submit(rr: RunResult) -> None:
+    """Quote far from the sealed reference price trips slippage_over_max → quoted once, no submit."""
+    adapter = _RecordingAdapter(price=9.0)  # far from the sealed entry price (~1.88–2.14)
+    store = InMemoryStore()
+    await store.create_competition(_comp("c"))
+    events = await run_execution_lane(
+        store,
+        competition_id="c",
+        run_result=rr,
+        # min_edge negative so BOTH proposals clear the pre-quote edge screen and reach the quote;
+        # tiny slippage cap so the post-quote gate trips on the 9.0 quote.
+        envelope=_env(min_edge_bps=-100000, max_slippage_bps=50, max_price=1.0e9),
+        adapter=adapter,
+        entries_by_agent=_eligible(rr),
+        execution_mode="dry_run",
+        base_seq=1000,
+        event_ts=0,
+    )
+    assert adapter.quote_calls >= 1  # pre-quote passed → venue WAS quoted
+    assert adapter.submit_calls == 0  # post-quote slippage tripped → NO submit
+    post = [e for e in events if e.event_type == EventType.POLICY_RESULT and e.payload.get("phase") == "post_quote"]
+    assert post
+    assert any("slippage_over_max" in e.payload["reason_codes"] for e in post)
+    # the post-quote payload surfaces the real, price-dependent numbers (the inert-gate fix):
+    assert all("slippage_bps" in e.payload and "executable_edge_bps" in e.payload for e in post)
+    assert not any(e.event_type == EventType.EXECUTION_SUBMITTED for e in events)
+
+
+async def test_receipt_independence_unchanged(rr: RunResult) -> None:
+    """The existing SEC-004 invariant still holds after the gate rewire: receipts never touch the seal."""
+    board_before = leaderboard([dict(r) for r in score_run(rr)])
+    ev_before = rr.evidence_hash
+    store = InMemoryStore()
+    await store.create_competition(_comp("c"))
+    await run_execution_lane(
+        store,
+        competition_id="c",
+        run_result=rr,
+        envelope=_env(min_edge_bps=0),
+        adapter=FakeVenueAdapter(fill=True),
+        entries_by_agent=_eligible(rr),
+        execution_mode="dry_run",
+        base_seq=1000,
+        event_ts=0,
+    )
+    assert rr.evidence_hash == ev_before
+    assert leaderboard([dict(r) for r in score_run(rr)]) == board_before
