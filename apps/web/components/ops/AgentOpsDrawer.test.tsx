@@ -80,4 +80,20 @@ describe('AgentOpsDrawer (REQ-030..032 / AC-003 / AC-030 / SEC-003)', () => {
     render(<AgentOpsDrawer state={openState('does_not_exist')} />);
     expect(screen.getByText(/no runtime data/i)).toBeInTheDocument();
   });
+
+  it('is a proper modal dialog — role on the content panel, aria-modal, Escape closes, tabs link a tabpanel (a11y)', async () => {
+    const user = userEvent.setup();
+    const state = openState('momentum_fr');
+    render(<AgentOpsDrawer state={state} />);
+    const dialog = screen.getByRole('dialog');
+    expect(dialog).toHaveAttribute('aria-modal', 'true');
+    // the dialog role is on the CONTENT panel (it contains the fence header), not the backdrop
+    expect(within(dialog).getByText(/RUNTIME OBSERVABILITY/i)).toBeInTheDocument();
+    // tab/tabpanel wiring
+    expect(screen.getAllByRole('tab')).toHaveLength(2);
+    expect(screen.getByRole('tabpanel')).toBeInTheDocument();
+    // Escape closes (WalletChip keydown pattern)
+    await user.keyboard('{Escape}');
+    expect(state.close).toHaveBeenCalled();
+  });
 });

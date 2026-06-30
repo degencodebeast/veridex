@@ -2,8 +2,15 @@ import { describe, it, expect } from 'vitest';
 import { render, screen, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { DuelScreen } from '@/components/screens/DuelScreen';
+import { AGENTS } from '@/lib/fixtures/catalog';
 
 describe('DuelScreen (REQ-023)', () => {
+  it('guards against fewer than two agents — honest empty, no crash', () => {
+    render(<DuelScreen agents={[AGENTS[0]]} />);
+    expect(screen.getByTestId('duel-empty')).toBeInTheDocument();
+    expect(screen.queryAllByTestId('duel-card')).toHaveLength(0);
+  });
+
   it('shows two agents on the SAME sealed evidence (one shared evidence hash)', () => {
     render(<DuelScreen />);
     const evidence = screen.getAllByTestId('evidence-hash');

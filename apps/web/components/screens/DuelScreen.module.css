@@ -13,3 +13,4 @@
 .name { margin: 0; font-size: 14px; font-weight: 600; color: var(--text-1); }
 .kv { display: flex; align-items: center; justify-content: space-between; padding: 6px 0; border-bottom: 1px solid var(--border-soft); font-size: 11px; color: var(--text-2); }
 .divergence { margin: 0; color: var(--text-2); font-size: 12px; }
+.empty { margin: 0; color: var(--text-2); font-size: 12px; padding: var(--pad-panel); border: 1px solid var(--border); border-radius: var(--radius-panel); background: var(--panel); }

@@ -1,5 +1,5 @@
 'use client';
-import { useState } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { Badge } from '@/components/ui/Badge';
 import { SegmentedControl } from '@/components/ui/SegmentedControl';
 import { RUNTIME_OVERVIEW, RUNTIME_LOG } from '@/lib/fixtures/catalog';
@@ -50,7 +50,7 @@ function LogsTab({ log }: { log: CanonicalLogLine[] }) {
       />
       <div className={styles.log} data-testid="log">
         {visible.map((l, i) => (
-          <div key={i} className={`${styles.line} ${l.channel === 'OPS' ? styles.ops : ''}`}>
+          <div key={`${l.ts}-${l.channel}-${i}`} className={`${styles.line} ${l.channel === 'OPS' ? styles.ops : ''}`}>
             <span className={styles.ts}>{l.ts}</span>
             <span className={`${styles.tag} ${styles[`tag_${l.channel}`]}`}>{l.channel}</span>
             <span className={styles.evt}>{l.event}</span>
@@ -69,21 +69,49 @@ export function AgentOpsDrawer({
   state, overviewByAgent = RUNTIME_OVERVIEW, log = RUNTIME_LOG,
 }: { state: AgentOpsState; overviewByAgent?: Record<string, RuntimeOverview>; log?: CanonicalLogLine[] }) {
   const [tab, setTab] = useState<Tab>('overview');
+  const panelRef = useRef<HTMLElement>(null);
+  const { isOpen, close } = state;
+
+  // Modal semantics (WalletChip keydown pattern): focus into the dialog on open, Escape closes,
+  // and focus is restored to the trigger on close. Listener is cleaned up to avoid leaks.
+  useEffect(() => {
+    if (!isOpen) return undefined;
+    const trigger = document.activeElement as HTMLElement | null;
+    panelRef.current?.focus();
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') close(); };
+    document.addEventListener('keydown', onKey);
+    return () => {
+      document.removeEventListener('keydown', onKey);
+      trigger?.focus?.();
+    };
+  }, [isOpen, close]);
+
   if (!state.isOpen || !state.agentId) return null;
   const overview = overviewByAgent[state.agentId];
+  const panelId = 'ops-panel';
+  const activeTabId = tab === 'overview' ? 'ops-tab-overview' : 'ops-tab-logs';
 
   return (
-    <div className={styles.scrim} role="dialog" aria-label="Agent Ops" onClick={state.close}>
-      <aside className={styles.drawer} onClick={(e) => e.stopPropagation()}>
+    <div className={styles.scrim} onClick={state.close}>
+      <aside
+        ref={panelRef}
+        className={styles.drawer}
+        role="dialog"
+        aria-modal="true"
+        aria-label="Agent Ops"
+        aria-labelledby="ops-fence-title"
+        tabIndex={-1}
+        onClick={(e) => e.stopPropagation()}
+      >
         <header className={styles.fence}>
-          <span className={styles.fenceText}>RUNTIME OBSERVABILITY · READ-ONLY · NOT SCORED</span>
+          <span id="ops-fence-title" className={styles.fenceText}>RUNTIME OBSERVABILITY · READ-ONLY · NOT SCORED</span>
           <button type="button" className={styles.close} onClick={state.close} aria-label="Close">×</button>
         </header>
-        <div className={styles.tabs} role="tablist">
-          <button type="button" role="tab" aria-selected={tab === 'overview'} className={`${styles.tab} ${tab === 'overview' ? styles.activeTab : ''}`} onClick={() => setTab('overview')}>Overview</button>
-          <button type="button" role="tab" aria-selected={tab === 'logs'} className={`${styles.tab} ${tab === 'logs' ? styles.activeTab : ''}`} onClick={() => setTab('logs')}>Logs</button>
+        <div className={styles.tabs} role="tablist" aria-label="Runtime sections">
+          <button type="button" id="ops-tab-overview" role="tab" aria-selected={tab === 'overview'} aria-controls={panelId} className={`${styles.tab} ${tab === 'overview' ? styles.activeTab : ''}`} onClick={() => setTab('overview')}>Overview</button>
+          <button type="button" id="ops-tab-logs" role="tab" aria-selected={tab === 'logs'} aria-controls={panelId} className={`${styles.tab} ${tab === 'logs' ? styles.activeTab : ''}`} onClick={() => setTab('logs')}>Logs</button>
         </div>
-        <div className={styles.body}>
+        <div className={styles.body} id={panelId} role="tabpanel" aria-labelledby={activeTabId}>
           {tab === 'overview'
             ? (overview ? <OverviewTab o={overview} /> : <p className={styles.empty}>No runtime data for this agent.</p>)
             : <LogsTab log={log} />}

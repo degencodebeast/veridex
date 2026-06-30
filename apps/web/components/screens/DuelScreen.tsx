@@ -21,10 +21,22 @@ function DuelCard({ agent, side }: { agent: AgentSummary; side: string }) {
 }
 
 export function DuelScreen({ agents = AGENTS }: { agents?: AgentSummary[] }) {
-  const [aId, setAId] = useState(agents[0].agent_id);
-  const [bId, setBId] = useState(agents[1].agent_id);
-  const a = agents.find((x) => x.agent_id === aId)!;
-  const b = agents.find((x) => x.agent_id === bId)!;
+  // Hooks run unconditionally; default ids safely even when <2 agents are supplied.
+  const [aId, setAId] = useState(agents[0]?.agent_id ?? '');
+  const [bId, setBId] = useState(agents[1]?.agent_id ?? '');
+
+  // A duel needs two agents — render an honest empty state rather than crashing on agents[1].
+  if (agents.length < 2) {
+    return (
+      <section className={styles.screen} aria-label="Head-to-Head Duel">
+        <h1 className={styles.title}>Head-to-Head Duel</h1>
+        <p className={styles.empty} data-testid="duel-empty">Select at least two agents to run a head-to-head.</p>
+      </section>
+    );
+  }
+
+  const a = agents.find((x) => x.agent_id === aId) ?? agents[0];
+  const b = agents.find((x) => x.agent_id === bId) ?? agents[1];
   const divergence = (a.avg_clv_bps - b.avg_clv_bps).toFixed(1);
 
   return (
