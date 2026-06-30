@@ -105,8 +105,8 @@ export function CompetitionsScreen({ comps = COMPETITIONS, rewards = MY_REWARDS 
               <th scope="col">TYPE</th>
               <th scope="col">SOURCE</th>
               <th scope="col">EXEC</th>
-              <th scope="col" className={styles.r}>AGENTS</th>
-              <th scope="col" className={styles.r}>LEADER CLV</th>
+              <th scope="col" className={styles.num}>AGENTS</th>
+              <th scope="col" className={styles.num}>LEADER CLV</th>
               <th scope="col" title="Design target only · no funds held or paid">
                 PRIZE<span className={styles.thCaption} data-testid="prize-caption">Design target only · no funds held or paid</span>
               </th>
