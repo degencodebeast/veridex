@@ -1,0 +1,9 @@
+.wrap { display: inline-flex; align-items: center; gap: var(--space-2); }
+.label { font-size: 9px; color: var(--text-3); letter-spacing: 0.06em; }
+.bars { display: inline-flex; gap: 2px; }
+.bar { width: 8px; height: 8px; border-radius: 2px; background: var(--border-strong); }
+.high { background: var(--positive); }
+.medium { background: var(--accent); }
+.low { background: var(--warning); }
+.n { font-size: 9px; color: var(--text-3); }
+.lowFlag { font-size: 9px; color: var(--warning-hi); background: var(--warning-bg); padding: 1px 5px; border-radius: var(--radius-badge); text-transform: uppercase; letter-spacing: 0.04em; }
