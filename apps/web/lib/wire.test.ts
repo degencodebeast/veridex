@@ -72,16 +72,19 @@ describe('wire contract binding — fixtures parse into lib/wire types', () => {
     expect(Array.isArray(r.events)).toBe(true);
   });
 
-  // competition_state.json top-level matches the contract, but its proof_card is
-  // still the pre-SEC-001 legacy shape (clv-in-checks) the contract migration note
-  // warns about. This assertion is a DRIFT TRIPWIRE: it flips to failure once the
-  // fixture is regenerated post-WD-5b — then switch to a strict ProofArtifact parse.
-  it('competition_state.json → top-level CompetitionStateResponse; proof_card legacy (drift tripwire)', () => {
+  // competition_state.json was regenerated to the SEC-001 shape (WD-5b): proof_card
+  // now carries the 7 lowercase CheckId with NO clv-in-checks. Strict parse.
+  it('competition_state.json → CompetitionStateResponse; proof_card is SEC-001 (7 checks, no CLV)', () => {
     const c = load<CompetitionStateResponse>('competition_state.json');
     expect(typeof c.competition_id).toBe('string');
     expect(typeof c.latest_seq).toBe('number');
     expect(Array.isArray(c.roster)).toBe(true);
-    const checks = (c.proof_card?.checks ?? {}) as Record<string, unknown>;
-    expect(Object.keys(checks)).toContain('clv'); // KNOWN legacy drift
+    expect(c.proof_card).not.toBeNull();
+    const checks = c.proof_card!.checks;
+    expect(Object.keys(checks).sort()).toEqual([...CHECK_IDS].sort());
+    expect(Object.keys(checks)).not.toContain('clv'); // SEC-001: CLV is never a check
+    for (const id of CHECK_IDS) {
+      expect(STATUSES).toContain(checks[id].result);
+    }
   });
 });
