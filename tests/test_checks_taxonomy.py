@@ -356,3 +356,39 @@ def test_evidence_hash_independent_of_policy_result_enrichment() -> None:
     assert sealed == run.evidence_hash
     _ = _real_exec_events(bypass=True)  # building enriched derived events touches nothing sealed
     assert compute_evidence_hash(run.run_events) == sealed
+
+
+# ---------------------------------------------------------------------------
+# Task 14 — WS1-5 cross-cutting regression gate (checks / merkle / gate / edge / live).
+#
+# A fresh reviewer gates the first five workstreams against the trust invariants:
+# CLV is never a check (SEC-001), no status is hardcoded PASS (SEC-002), and building
+# checks/metrics never mutates the sealed run (evidence stays byte-identical).
+# ---------------------------------------------------------------------------
+
+
+def test_clv_never_a_check_anywhere() -> None:
+    """SEC-001: no CheckId is 'clv', and the proof block never contains a 'clv' key."""
+    run = finished_run_result()
+    block = check_results_to_proof_block(build_check_results(scores=score_run(run), run=run))
+    assert "clv" not in block
+    assert all(cid.value != "clv" for cid in CheckId)
+
+
+def test_no_check_status_is_hardcoded_pass() -> None:
+    """SEC-002: every status is a real CheckStatus; offline replay has not_applicable rows."""
+    run = finished_run_result()
+    results = build_check_results(scores=score_run(run), run=run, source_mode="replay")
+    statuses = {r.id: r.result for r in results}
+    assert statuses[CheckId.ANCHOR] == "not_applicable"
+    assert statuses[CheckId.MANIFEST_BOUND] == "not_applicable"
+    assert all(r.result in ("pass", "fail", "pending", "not_applicable") for r in results)
+
+
+def test_evidence_hash_unchanged_by_checks_build() -> None:
+    """Building checks/metrics never mutates the sealed run (evidence stays byte-identical)."""
+    run = finished_run_result()
+    before = run.evidence_hash
+    _ = build_check_results(scores=score_run(run), run=run)
+    _ = build_performance_metrics(score_run(run))
+    assert run.evidence_hash == before
