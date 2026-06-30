@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from veridex.chain.merkle import (
     EMPTY_ROOT,
+    _pair_hash,
     build_root_forest,
     domain_root,
     leaf_hash,
@@ -31,6 +32,9 @@ def test_odd_leaf_count_duplicates_last() -> None:
     a, b, c = leaf_hash({"i": 0}), leaf_hash({"i": 1}), leaf_hash({"i": 2})
     # 3 leaves must still produce a stable, non-error root.
     assert len(merkle_root([a, b, c])) == 64
+    # Pin the NAMED behavior: the odd leaf `c` is duplicated (not dropped, not EMPTY_ROOT-padded),
+    # so the root is pair(pair(a, b), pair(c, c)). This catches a wrong odd-level strategy.
+    assert merkle_root([a, b, c]) == _pair_hash(_pair_hash(a, b), _pair_hash(c, c))
 
 
 def test_tamper_changes_root() -> None:
