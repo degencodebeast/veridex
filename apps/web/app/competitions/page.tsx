@@ -1,4 +1,5 @@
-import { ScreenStub } from '@/components/layout/ScreenStub';
+import { CompetitionsScreen } from '@/components/screens/CompetitionsScreen';
+
 export default function CompetitionsPage() {
-  return <ScreenStub label="Competitions" plan="2C Plan C" />;
+  return <CompetitionsScreen />;
 }
