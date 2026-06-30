@@ -1,4 +1,5 @@
 """§4.4 AgentRuntime seam + AgnoRuntime required-tier synthesis (SEC-010, offline)."""
+
 from __future__ import annotations
 
 import pytest

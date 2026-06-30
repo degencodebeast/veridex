@@ -1,4 +1,5 @@
 """§4.4 RuntimeEvent — runtime-neutral OPS-channel telemetry, never sealed (SEC-003)."""
+
 from __future__ import annotations
 
 import pytest
@@ -16,8 +17,12 @@ from veridex.runtime.schemas import RunEvent
 
 def test_required_tier_is_exactly_the_six() -> None:
     assert {e.value for e in REQUIRED_RUNTIME_EVENTS} == {
-        "run_started", "status_changed", "action_emitted",
-        "schema_validation", "run_completed", "run_failed",
+        "run_started",
+        "status_changed",
+        "action_emitted",
+        "schema_validation",
+        "run_completed",
+        "run_failed",
     }
 
 

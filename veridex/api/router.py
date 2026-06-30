@@ -55,6 +55,7 @@ from veridex.api.schemas import (
     KillSwitchResponse,
     LeaderboardResponse,
     LeaderboardRow,
+    RuntimeEventsResponse,
     VerifyResponse,
 )
 from veridex.api.ws import ArenaConnectionManager, register_arena_routes
@@ -90,6 +91,7 @@ from veridex.runtime.competition import (
     run_demo_competition,
 )
 from veridex.runtime.orchestrator import deterministic_agent
+from veridex.runtime.runtime_store import RuntimeEventStore
 from veridex.scoring import score_run
 from veridex.store import InMemoryStore, Store
 from veridex.venues.sx_bet import FakeVenueAdapter, SXBetAdapter
@@ -176,7 +178,11 @@ def _build_execution_attachment(records: list[ExecutionRecord]) -> dict[str, Any
     }
 
 
-def create_app(store: Store | None = None, settings: Settings | None = None) -> FastAPI:
+def create_app(
+    store: Store | None = None,
+    settings: Settings | None = None,
+    runtime_event_store: RuntimeEventStore | None = None,
+) -> FastAPI:
     """Create the Veridex demo FastAPI application.
 
     Factory pattern: inject ``store`` / ``settings`` in tests; omit for the default in-process
@@ -187,6 +193,9 @@ def create_app(store: Store | None = None, settings: Settings | None = None) -> 
             module-level ``_default_store`` (an :class:`~veridex.store.InMemoryStore`).
         settings: Optional :class:`~veridex.config.Settings` override carrying the operator
             control-plane credentials.  Defaults to :func:`~veridex.config.get_settings`.
+        runtime_event_store: Optional :class:`~veridex.runtime.runtime_store.RuntimeEventStore`
+            override — the OPS-channel buffer the Agent Ops drawer reads (SEC-003). Defaults to a
+            fresh per-app store. Distinct from the evidence/competition log.
 
     Returns:
         A configured :class:`fastapi.FastAPI` application: the Phase-1 demo trio, the six
@@ -196,6 +205,9 @@ def create_app(store: Store | None = None, settings: Settings | None = None) -> 
     """
     resolved_store: Store = store if store is not None else _default_store
     resolved_settings: Settings = settings if settings is not None else get_settings()
+    resolved_runtime_store: RuntimeEventStore = (
+        runtime_event_store if runtime_event_store is not None else RuntimeEventStore()
+    )
 
     app = FastAPI(
         title="Veridex Demo API",
@@ -806,6 +818,30 @@ def create_app(store: Store | None = None, settings: Settings | None = None) -> 
             return await dep_store.get_execution_record(execution_id)
         except KeyError:
             raise HTTPException(status_code=404, detail=f"execution {execution_id!r} not found") from None
+
+    # --- GET /agents/{agent_id}/runtime-events (OPS channel; read-only) ----
+
+    @app.get("/agents/{agent_id}/runtime-events", response_model=RuntimeEventsResponse)
+    async def get_runtime_events(  # noqa: B008
+        agent_id: str,
+        since: int = Query(default=0),  # noqa: B008
+        limit: int | None = Query(default=None),  # noqa: B008
+    ) -> RuntimeEventsResponse:
+        """Serve an agent's OPS-channel RuntimeEvents (Agent Ops drawer feed — SEC-003 / REQ-030).
+
+        Read-only, runtime-neutral (SEC-010). Unknown agents return an empty list, never 404, so a
+        minimal/just-started runtime renders a clean empty drawer (REQ-031).
+
+        Args:
+            agent_id: The agent whose OPS-channel telemetry to read.
+            since: ``ts`` lower bound (ms); ``0`` returns everything retained.
+            limit: When set, return only the most-recent ``limit`` matching events.
+
+        Returns:
+            A :class:`~veridex.api.schemas.RuntimeEventsResponse` wrapping the ``events`` list.
+        """
+        events = resolved_runtime_store.list_for_agent(agent_id, since=since, limit=limit)
+        return RuntimeEventsResponse(events=[e.model_dump(mode="json") for e in events])
 
     # --- POST /competitions/{competition_id}/kill-switch (auth) -----------
 
