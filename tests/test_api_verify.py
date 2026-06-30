@@ -63,5 +63,32 @@ def test_verify_is_byte_identical_over_the_seal(client: TestClient) -> None:
     assert first["manifest_hash"] == second["manifest_hash"]
 
 
+def test_verify_route_surfaces_tampered_score_rows_metric() -> None:
+    # SEC-002 end-to-end: doctoring a PERSISTED score_rows clv_bps (NOT a sealed event) is invisible
+    # to the evidence-hash recompute but MUST surface as a metrics_recomputed FAIL in the route's
+    # VerifyResponse — the fresh recompute from the sealed run_events diverges from the doctored row.
+    # This exercises the SEC-002 falsifiability through the flagship route, not just the builder.
+    store = InMemoryStore()
+    client = TestClient(create_app(store=store))
+    run_id = client.post("/demo/run").json()["run_id"]
+
+    # Doctor a persisted (non-sealed) displayed metric directly in the store's per-tick score rows.
+    doctored = 0
+    for row in store._runs[run_id]["score_rows"]:
+        if isinstance(row.get("clv_bps"), int):
+            row["clv_bps"] = row["clv_bps"] + 99999
+            doctored += 1
+    assert doctored > 0, "demo run must have at least one scored clv_bps row to doctor"
+
+    body = client.post(f"/runs/{run_id}/verify").json()
+    # The verdict field on a serialized CheckResult is ``result`` (pass/fail/pending/not_applicable).
+    assert body["checks"]["metrics_recomputed"]["result"] == "fail"
+    # BY DESIGN: top-level `verified` stays True — it reflects the SEALED evidence-hash prefix only,
+    # which score_rows is NOT part of. The recompute discrepancy is surfaced via the CHECK, not
+    # `verified`. Locking this split: evidence integrity (prefix) and metric faithfulness (check)
+    # are independent verdicts.
+    assert body["verified"] is True
+
+
 def test_verify_unknown_run_is_404(client: TestClient) -> None:
     assert client.post("/runs/does-not-exist/verify").status_code == 404

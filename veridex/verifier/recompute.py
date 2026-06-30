@@ -172,11 +172,15 @@ def verify_run(run_result: RunResult, *, fixture_or_window_id: str | None = None
     """Independently recompute the law/scoring/manifest from a sealed run (WD-1, CON-003).
 
     Recomputes the evidence hash over the sealed ``run_events`` prefix and compares it to the
-    sealed hash (fail-closed on any recompute error — a tampered or malformed run is an integrity
-    failure, never a crash): tampering ANY sealed event/snapshot/action payload diverges the hash
-    and flips ``verified`` to ``False``. It then re-derives the ranked score stack, the score root,
-    the root forest, and the run manifest, and hashes the manifest to the exact anchored Memo
-    payload. Reads ONLY the sealed run — never receipts (SEC-004) and never mutates the seal.
+    sealed hash: tampering ANY sealed event/snapshot/action payload diverges the hash and flips
+    ``verified`` to ``False``. It then re-derives the ranked score stack, the score root, the root
+    forest, and the run manifest, and hashes the manifest to the exact anchored Memo payload. Reads
+    ONLY the sealed run — never receipts (SEC-004) and never mutates the seal.
+
+    Fail-closed (CON-2B-02): the ENTIRE recompute — evidence hash AND the score/manifest rebuild —
+    is guarded, so a malformed or tampered sealed run that raises anywhere yields a structured
+    ``verified=False`` report (with the error captured in ``evidence_error`` and empty
+    score/manifest) rather than a 500 on this flagship endpoint.
 
     Args:
         run_result: The sealed run to verify.
@@ -187,27 +191,32 @@ def verify_run(run_result: RunResult, *, fixture_or_window_id: str | None = None
         The :class:`VerifyReport` the Proof Card "Verify" renders.
     """
     sealed = run_result.evidence_hash
+    recomputed: str | None = None
+    evidence_match = False
+    evidence_error: str | None = None
+    scores: list[dict[str, Any]] = []
+    score_root = ""
+    manifest: dict[str, Any] = {}
+    manifest_hash = ""
     try:
-        recomputed: str | None = compute_evidence_hash(run_result.run_events)
+        recomputed = compute_evidence_hash(run_result.run_events)
         evidence_match = recomputed == sealed
-        evidence_error: str | None = None
-    except Exception as exc:  # dup/missing sequence_no or malformed evidence → integrity FAIL
-        recomputed = None
+
+        scores = score_run(run_result)
+        score_root = recompute_score_root(scores)
+        resolved_fixture_id = (
+            fixture_or_window_id
+            if fixture_or_window_id is not None
+            else fixture_or_window_id_from_events(run_result.run_events)
+        )
+        manifest = manifest_from_run(run_result, fixture_or_window_id=resolved_fixture_id, score_root=score_root)
+        # Bind the per-domain root forest identically to seal time so the reconstructed manifest_hash
+        # stays byte-identical to the anchored one (Task D2 routes the harness through the same helper).
+        manifest["root_forest"] = root_forest_for_run(run_result, scores)
+        manifest_hash = run_manifest_hash(manifest)
+    except Exception as exc:  # malformed/tampered sealed run → structured integrity FAIL, never a 500
         evidence_match = False
         evidence_error = f"{type(exc).__name__}: {exc}"
-
-    scores = score_run(run_result)
-    score_root = recompute_score_root(scores)
-    resolved_fixture_id = (
-        fixture_or_window_id
-        if fixture_or_window_id is not None
-        else fixture_or_window_id_from_events(run_result.run_events)
-    )
-    manifest = manifest_from_run(run_result, fixture_or_window_id=resolved_fixture_id, score_root=score_root)
-    # Bind the per-domain root forest identically to seal time so the reconstructed manifest_hash
-    # stays byte-identical to the anchored one (Task D2 routes the harness through the same helper).
-    manifest["root_forest"] = root_forest_for_run(run_result, scores)
-    manifest_hash = run_manifest_hash(manifest)
 
     return VerifyReport(
         run_id=run_result.run_id,

@@ -49,6 +49,21 @@ async def test_verify_run_detects_tampered_evidence() -> None:
     assert report.verified is False
 
 
+async def test_verify_run_fail_closed_on_recompute_error() -> None:
+    # CON-2B-02: an error raised DURING the score/manifest rebuild (after the evidence-hash recompute
+    # already succeeded) must yield a structured verified=False — never propagate / 500. A score row
+    # missing ``agent_id`` makes score_run raise mid-recompute, exercising the extended guard.
+    result = await _sealed_run()
+    run = result.run
+    run.score_rows.append({"tick_seq": 0})  # malformed row → score_run raises after the hash recompute
+    report = verify_run(run)
+    assert report.verified is False
+    assert report.evidence_match is False
+    assert report.evidence_error is not None
+    assert report.manifest == {}
+    assert report.manifest_hash == ""
+
+
 async def test_fixture_or_window_id_from_events_reads_first_tick() -> None:
     result = await _sealed_run()
     fid = fixture_or_window_id_from_events(result.run.run_events)
