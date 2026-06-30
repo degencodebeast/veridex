@@ -28,6 +28,16 @@ describe('VerifyButton (WD-1 / AC-020 / CON-003)', () => {
     expect(screen.getByRole('link', { name: /Open Solana tx/i })).toHaveAttribute('href', expect.stringContaining('explorer.solana.com'));
   });
 
+  it('announces the verdict in an aria-live region (a11y)', async () => {
+    verifyProof.mockResolvedValue(sampleVerifyResult);
+    const user = userEvent.setup();
+    render(<VerifyButton runId="run_7f3a" />);
+    await user.click(screen.getByRole('button', { name: /Verify/i }));
+    const live = await screen.findByRole('status');
+    expect(live).toHaveAttribute('aria-live', 'polite');
+    expect(live).toHaveTextContent('✓ Verified'); // verdict is inside the live region
+  });
+
   it('shows ✓ Verified when verified AND no blocking check failed', async () => {
     verifyProof.mockResolvedValue(sampleVerifyResult); // verified, all blocking checks pass
     const user = userEvent.setup();

@@ -35,10 +35,14 @@ export function VerifyButton({ runId, onVerified }: { runId: string; onVerified?
 
   return (
     <div className={styles.wrap}>
-      <button type="button" className={styles.btn} onClick={run} disabled={state.kind === 'loading'}>
+      <button type="button" className={styles.btn} onClick={run} disabled={state.kind === 'loading'} aria-busy={state.kind === 'loading'}>
         {state.kind === 'loading' ? 'Verifying…' : 'Verify'}
       </button>
 
+      {/* Live region: the verify verdict renders silently after the click, so announce
+          it to screen-reader users (a11y). The region is always present so the change
+          is spoken when content is injected. */}
+      <div role="status" aria-live="polite">
       {result ? (
         <div className={styles.result}>
           <p className={fullyVerified ? styles.headlineOk : styles.headlineBad}>
@@ -69,6 +73,7 @@ export function VerifyButton({ runId, onVerified }: { runId: string; onVerified?
       ) : null}
 
       {state.kind === 'error' ? <p className={styles.bad}>Verification failed — try again.</p> : null}
+      </div>
     </div>
   );
 }
