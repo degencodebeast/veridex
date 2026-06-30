@@ -8,7 +8,7 @@ describe('AppShell', () => {
   it('renders the top nav, the wallet chip, and the page content region', () => {
     render(<AppShell><p>screen body</p></AppShell>);
     expect(screen.getByRole('navigation', { name: 'Primary' })).toBeInTheDocument();
-    expect(screen.getByRole('button', { name: /OP 0x/i })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /OP 9xQe/i })).toBeInTheDocument();
     expect(screen.getByRole('main')).toBeInTheDocument();
     expect(screen.getByText('screen body')).toBeInTheDocument();
   });

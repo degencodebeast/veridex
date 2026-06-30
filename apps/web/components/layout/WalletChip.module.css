@@ -44,10 +44,16 @@
 
 .item {
   display: block;
+  width: 100%;
   padding: 7px 10px;
+  border: 0;
   border-radius: var(--radius-control);
+  background: none;
   color: var(--text-2);
+  font-family: inherit;
   font-size: 12px;
+  text-align: left;
   text-decoration: none;
+  cursor: pointer;
 }
 .item:hover { color: var(--text-1); background: var(--panel-2); }
