@@ -1,0 +1,53 @@
+.wrap { position: relative; }
+
+.chip {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: 6px 10px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-control);
+  background: var(--panel-2);
+  color: var(--text-1);
+  font-size: 12px;
+  cursor: pointer;
+}
+.chip:hover { border-color: var(--accent); }
+
+.op { color: var(--accent-hi); font-size: 11px; }
+.sep { color: var(--text-3); }
+.dash { color: var(--text-2); font-weight: 600; }
+
+.menu {
+  position: absolute;
+  right: 0;
+  top: calc(100% + 6px);
+  min-width: 240px;
+  padding: var(--space-1);
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-panel);
+  z-index: 50;
+}
+
+.group { display: flex; flex-direction: column; border-top: 1px solid var(--border-soft); margin-top: var(--space-1); padding-top: var(--space-1); }
+
+.groupLabel {
+  margin-top: var(--space-2);
+  padding: var(--space-1) var(--space-2);
+  color: var(--text-3);
+  font-family: var(--font-mono), monospace;
+  font-size: 9px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+
+.item {
+  display: block;
+  padding: 7px 10px;
+  border-radius: var(--radius-control);
+  color: var(--text-2);
+  font-size: 12px;
+  text-decoration: none;
+}
+.item:hover { color: var(--text-1); background: var(--panel-2); }
