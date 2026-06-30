@@ -1,5 +1,5 @@
 {
-  "competition_id": "c_876af810c83b46f2b4d52c59f44d7afb",
+  "competition_id": "c_670bf47735914e4b82ae9be1efd62a59",
   "status": "finalized",
   "config": {
     "competition_type": "replay_arena",
@@ -16,28 +16,28 @@
   },
   "roster": [
     {
-      "agent_id": "a",
-      "owner": "u",
-      "strategy": "value",
+      "agent_id": "agent-alpha",
+      "owner": "team-a",
+      "strategy": "value_clv",
       "model": null,
       "proof_mode": "reproducible",
-      "config_hash": "4247905e2bd25ce884dd1a40fdb1541006bcc52608740a1026c6ea4ca4413be2",
+      "config_hash": "0a8b70f20289b9cad27e596de345faecc8c1928de1da3b1a36c79ed7ed2c09e5",
       "execution_eligibility": false
     },
     {
-      "agent_id": "b",
-      "owner": "u",
-      "strategy": "value",
+      "agent_id": "agent-beta",
+      "owner": "team-b",
+      "strategy": "contrarian_clv",
       "model": null,
       "proof_mode": "reproducible",
-      "config_hash": "747ba28e4a8843bad013b12813c4e859468406f6f21472f8d633c2afc363a21d",
+      "config_hash": "4d740a93095bc501a0682c597fb3b6a71553cedeed4dae88f62c34e4bee10e36",
       "execution_eligibility": false
     }
   ],
   "leaderboard": [
     {
       "rank": 1,
-      "agent_id": "a",
+      "agent_id": "agent-alpha",
       "total_clv_bps": 184,
       "mean_clv_bps": 92.0,
       "valid_count": 2,
@@ -45,7 +45,7 @@
     },
     {
       "rank": 2,
-      "agent_id": "b",
+      "agent_id": "agent-beta",
       "total_clv_bps": -184,
       "mean_clv_bps": -92.0,
       "valid_count": 2,
@@ -54,17 +54,17 @@
   ],
   "latest_seq": 14,
   "anchor_status": "not_anchored",
-  "run_id": "57545f0ae1d347cca4ace367e1b56d31",
+  "run_id": "7b14966046574f31ba82fe3210c4e9a7",
   "proof_card": {
     "verifier_version": "v0",
     "run": {
-      "run_id": "57545f0ae1d347cca4ace367e1b56d31",
+      "run_id": "7b14966046574f31ba82fe3210c4e9a7",
       "source_mode": "replay"
     },
     "lineage": {
       "proof_mode_map": {
-        "a": "reproducible",
-        "b": "reproducible"
+        "agent-alpha": "reproducible",
+        "agent-beta": "reproducible"
       },
       "schema_versions": {
         "action_schema": "sports_v0",
@@ -72,40 +72,143 @@
       }
     },
     "evidence": {
-      "evidence_hash": "3fb164ed8950b6df0299f1c232d8ba0d1a049229fb49352f889ff5e4764f56fd",
+      "evidence_hash": "3f082b3504e0e5164c692ffd2e12265dabe3e1ce5b103a26499e371939c7d8d6",
       "run_event_count": 6
     },
     "checks": {
-      "clv": {
-        "result": "pass",
-        "scored_actions": 4
-      },
       "evidence_integrity": {
+        "id": "evidence_integrity",
+        "label": "Evidence Integrity",
         "result": "pass",
+        "severity": "blocking",
         "method": "sha256_evidence_hash",
-        "recomputed_match": true,
-        "error": null,
-        "note": "recomputes sha256 over run_events and compares against stored evidence_hash; fails-closed on any mismatch or recompute error"
+        "scope": "run_events",
+        "evidence_refs": [
+          "evidence_hash"
+        ],
+        "rules": [],
+        "details": {
+          "recomputed_match": true
+        },
+        "error": null
       },
       "llm_boundary": {
+        "id": "llm_boundary",
+        "label": "LLM Boundary",
         "result": "pass",
+        "severity": "blocking",
         "method": "static_import_audit",
-        "scope": [
-          "law/",
-          "scoring.py",
-          "leaderboard.py",
-          "verifier/",
-          "checks/",
-          "ingest/",
-          "policy/"
+        "scope": "law/, scoring.py, leaderboard.py, verifier/, checks/, ingest/, policy/",
+        "evidence_refs": [],
+        "rules": [],
+        "details": {},
+        "error": null
+      },
+      "metrics_recomputed": {
+        "id": "metrics_recomputed",
+        "label": "Score Recomputed",
+        "result": "pass",
+        "severity": "blocking",
+        "method": "recompute_from_sealed_evidence",
+        "scope": "score_rows",
+        "evidence_refs": [
+          "evidence_hash",
+          "score_rows"
         ],
-        "note": "LLM SDK imports are forbidden in the deterministic trust path; the LLM decision shell is outside this scope."
+        "rules": [
+          {
+            "all_metrics_match": true
+          }
+        ],
+        "details": {
+          "recomputed_match": true,
+          "row_count": 4
+        },
+        "error": null
+      },
+      "manifest_bound": {
+        "id": "manifest_bound",
+        "label": "Manifest Bound",
+        "result": "not_applicable",
+        "severity": "blocking",
+        "method": "manifest_field_binding",
+        "scope": "run_manifest",
+        "evidence_refs": [],
+        "rules": [],
+        "details": {},
+        "error": null
+      },
+      "policy_obeyed": {
+        "id": "policy_obeyed",
+        "label": "Policy Obeyed",
+        "result": "not_applicable",
+        "severity": "blocking",
+        "method": "policy_event_audit",
+        "scope": "competition_events",
+        "evidence_refs": [],
+        "rules": [],
+        "details": {},
+        "error": null
+      },
+      "receipt_separation": {
+        "id": "receipt_separation",
+        "label": "Receipt Separation",
+        "result": "not_applicable",
+        "severity": "blocking",
+        "method": "evidence_flag_audit",
+        "scope": "competition_events",
+        "evidence_refs": [],
+        "rules": [],
+        "details": {},
+        "error": null
+      },
+      "anchor": {
+        "id": "anchor",
+        "label": "On-Chain Anchor",
+        "result": "not_applicable",
+        "severity": "info",
+        "method": "memo_anchor",
+        "scope": "solana_memo",
+        "evidence_refs": [],
+        "rules": [],
+        "details": {},
+        "error": null
       }
     },
     "anchor": {
       "status": "not_anchored",
       "signature": null,
       "cluster": "devnet"
+    },
+    "metrics": {
+      "clv": 92.0,
+      "sim_pnl": 184,
+      "brier": null,
+      "max_drawdown": 0.0,
+      "hit_rate": 0.5,
+      "scored_actions": 4,
+      "per_agent": [
+        {
+          "agent_id": "agent-alpha",
+          "rank": 1,
+          "avg_clv_bps": 92.0,
+          "total_clv_bps": 184,
+          "sim_pnl": 184,
+          "brier": null,
+          "max_drawdown": 0.0,
+          "action_count": 2
+        },
+        {
+          "agent_id": "agent-beta",
+          "rank": 2,
+          "avg_clv_bps": -92.0,
+          "total_clv_bps": -184,
+          "sim_pnl": -184,
+          "brier": null,
+          "max_drawdown": -184.0,
+          "action_count": 2
+        }
+      ]
     }
   },
   "execution": null
