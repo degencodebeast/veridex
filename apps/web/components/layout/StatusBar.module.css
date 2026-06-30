@@ -1,0 +1,10 @@
+.bar { display: flex; align-items: center; gap: var(--space-2); flex-wrap: wrap; padding: 6px var(--pad-screen); background: var(--bg-bar); border-bottom: 1px solid var(--border); font-family: var(--font-mono), monospace; font-size: 10px; color: var(--text-2); }
+.field { display: inline-flex; align-items: center; gap: 6px; }
+.tag { font-size: 9px; font-weight: 600; letter-spacing: 0.1em; color: var(--text-3); }
+.value { color: var(--text-1); font-weight: 600; }
+.sep { color: var(--text-4); }
+.idle { font-size: 9px; font-weight: 600; letter-spacing: 0.06em; color: var(--text-3); border: 1px solid var(--border-soft); border-radius: var(--radius-badge); padding: 2px 6px; }
+.scoring { display: inline-flex; align-items: center; font-size: 9px; font-weight: 600; letter-spacing: 0.08em; color: var(--accent-hi); }
+.mono { color: var(--text-2); }
+.spacer { flex: 1; min-width: 8px; }
+.verifier { color: var(--text-3); }

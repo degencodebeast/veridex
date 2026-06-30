@@ -57,6 +57,11 @@ describe('LandingScreen (V4 fidelity)', () => {
     expect(container.querySelector('main')).not.toBeNull();
   });
 
+  it('does NOT render the app status bar (standalone marketing chrome, outside the (app) shell)', () => {
+    render(<LandingScreen />);
+    expect(screen.queryByTestId('status-bar')).toBeNull();
+  });
+
   it('renders the wordmark nav (VERIDEX + PROOF ARENA tag) and an Enter App entry', () => {
     render(<LandingScreen />);
     expect(screen.getAllByText('VERIDEX').length).toBeGreaterThanOrEqual(1);

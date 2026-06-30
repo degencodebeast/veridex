@@ -11,6 +11,8 @@ describe('AppShell', () => {
     expect(screen.getByRole('button', { name: /OP 9xQe/i })).toBeInTheDocument();
     expect(screen.getByRole('main')).toBeInTheDocument();
     expect(screen.getByText('screen body')).toBeInTheDocument();
+    // the shared run status bar is part of the app chrome (every app route)
+    expect(screen.getByTestId('status-bar')).toBeInTheDocument();
   });
 
   it('restores the persisted visual Direction app-wide on mount (CON-001 — every route, not just the toggle screens)', () => {

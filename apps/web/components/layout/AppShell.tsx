@@ -3,6 +3,7 @@ import { TopNav } from './TopNav';
 import { WalletChip } from './WalletChip';
 import { DirectionRestore } from './DirectionRestore';
 import { MockBanner } from './MockBanner';
+import { StatusBar } from './StatusBar';
 import styles from './AppShell.module.css';
 
 export function AppShell({ children }: { children: ReactNode }) {
@@ -16,6 +17,7 @@ export function AppShell({ children }: { children: ReactNode }) {
           <WalletChip />
         </div>
       </header>
+      <StatusBar />
       <main className={styles.main}>{children}</main>
     </div>
   );

@@ -2,7 +2,6 @@
 import Link from 'next/link';
 import { Badge } from '@/components/ui/Badge';
 import { Num } from '@/components/ui/Num';
-import { DirectionToggle } from '@/components/ui/DirectionToggle';
 import { MY_AGENTS, MY_RUNS, MY_REWARDS, ALERTS, COMPETITIONS } from '@/lib/fixtures/catalog';
 import type { PayoutState, RewardSummary } from '@/lib/catalog';
 import styles from './OperatorDashboardScreen.module.css';
@@ -40,7 +39,6 @@ export function OperatorDashboardScreen({
       <header className={styles.head}>
         <h1 className={styles.title}>Operator Dashboard</h1>
         <div className={styles.actions}>
-          <DirectionToggle />
           <Link href="/studio" className={styles.primary}>+ New Agent</Link>
           <Link href="/competitions" className={styles.secondary}>Join Competition</Link>
         </div>

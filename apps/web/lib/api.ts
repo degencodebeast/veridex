@@ -16,6 +16,7 @@
 //   - InspectorRecord: proof_mode/is_live/clv_explanation are not in wire InspectorRecord.
 import { CHECK_ORDER } from '@/lib/checks';
 import { isMockEnabled, MOCK_FIXTURES } from '@/lib/mock';
+import type { StatusBarState } from '@/lib/status';
 import type * as W from '@/lib/wire';
 import type {
   AnchorInfo, AnchorStatus, CheckResult, CockpitState, ExecutionMode, InspectorRecord,
@@ -297,4 +298,21 @@ export async function getCockpitState(competitionId: string): Promise<CockpitSta
 export async function getInspectorRecord(runId: string, seq: number | string): Promise<InspectorRecord> {
   if (isMockEnabled()) return adaptInspector(MOCK_FIXTURES.inspector);
   return adaptInspector(await getJson<W.InspectorRecord>(PATHS.inspector(runId, seq)));
+}
+
+// MOCK status-bar seed (sync): when mock is on, the status bar populates app-wide from the mock
+// competition fixture (demoted source) so the full bar is inspectable — but WS is `disconnected`
+// (DEMO), NEVER a fabricated CONNECTED. Returns null when mock is off (⇒ honest idle bar).
+export function mockStatusSeed(): StatusBarState | null {
+  if (!isMockEnabled()) return null;
+  const c = adaptCompetitionState(MOCK_FIXTURES.competition);
+  return {
+    fixture: c.header.fixture,
+    competition: c.header.competition,
+    sourceMode: demote(c.header.source_mode),
+    executionMode: c.header.execution_mode,
+    ws: 'disconnected', // DEMO: no real stream in mock — honest, never CONNECTED
+    seq: c.header.events ?? null,
+    scoring: false,
+  };
 }
