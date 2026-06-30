@@ -37,6 +37,9 @@ class LeaderboardRow(BaseModel):
         eligibility_badge: ``"fully-proven"``, ``"partially-proven"``, or ``"unproven"``.
         anchor_status: ``"all-anchored"``, ``"some-pending"``, or ``"none-anchored"``.
         source_mode: ``"all-replay"``, ``"all-live"``, ``"mixed"``, or ``"unknown"``.
+        valid_count: Pooled number of law-valid decisions across runs (WD-7 sample size).
+        clv_confidence: Sample-size confidence tier — ``"low"``, ``"medium"``, or ``"high"``.
+        low_sample: ``True`` when the CLV is backed by a small sample (flag, not a rank input).
     """
 
     rank: int
@@ -53,6 +56,9 @@ class LeaderboardRow(BaseModel):
     eligibility_badge: str
     anchor_status: str
     source_mode: str
+    valid_count: int
+    clv_confidence: str
+    low_sample: bool
 
 
 class LeaderboardResponse(BaseModel):

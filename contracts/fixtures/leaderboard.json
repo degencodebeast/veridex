@@ -14,7 +14,10 @@
       "proof_mode": "reproducible",
       "eligibility_badge": "unproven",
       "anchor_status": "none-anchored",
-      "source_mode": "all-replay"
+      "source_mode": "all-replay",
+      "valid_count": 2,
+      "clv_confidence": "low",
+      "low_sample": true
     },
     {
       "rank": 2,
@@ -30,7 +33,10 @@
       "proof_mode": "reproducible",
       "eligibility_badge": "unproven",
       "anchor_status": "none-anchored",
-      "source_mode": "all-replay"
+      "source_mode": "all-replay",
+      "valid_count": 2,
+      "clv_confidence": "low",
+      "low_sample": true
     }
   ]
 }
