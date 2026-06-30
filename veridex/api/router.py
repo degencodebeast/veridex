@@ -59,6 +59,7 @@ from veridex.api.schemas import (
     VerifyResponse,
 )
 from veridex.api.ws import ArenaConnectionManager, register_arena_routes
+from veridex.chain.anchor import explorer_tx_url
 from veridex.checks.build import build_performance_metrics
 from veridex.competition.events import CompetitionEvent, EventType
 from veridex.competition.models import (
@@ -80,14 +81,11 @@ from veridex.competition.service import (
 from veridex.config import Settings, get_settings
 from veridex.execution.models import ExecutionRecord, ExecutionStatus
 from veridex.execution.runner import resolve_approval
-from veridex.ingest.marketstate import MarketState
 from veridex.leaderboard import leaderboard as _build_leaderboard
 from veridex.runtime.competition import (
     DEFAULT_CLUSTER,
     SCHEMA_VERSIONS,
     _default_checks,
-    _fixture_or_window_id,
-    _score_root,
     run_demo_competition,
 )
 from veridex.runtime.orchestrator import deterministic_agent
@@ -96,6 +94,7 @@ from veridex.scoring import score_run
 from veridex.store import InMemoryStore, Store
 from veridex.venues.sx_bet import FakeVenueAdapter, SXBetAdapter
 from veridex.verifier.proof_card import proof_card_from_run_result
+from veridex.verifier.recompute import verify_run as _verify_run_core
 
 # Module-level default store — shared across requests when the app runs under Uvicorn.
 # Tests always inject their own store via ``create_app(store=InMemoryStore())``.
@@ -407,81 +406,38 @@ def create_app(
     # --- POST /runs/{run_id}/verify (WD-1 authoritative recompute, REQ-050 / AC-020) ------
 
     @app.post("/runs/{run_id}/verify", response_model=VerifyResponse)
-    async def verify_run(run_id: str, dep_store: Store = Depends(_get_store)) -> VerifyResponse:  # noqa: B008
+    async def verify_run_endpoint(run_id: str, dep_store: Store = Depends(_get_store)) -> VerifyResponse:  # noqa: B008
         """Authoritatively recompute a sealed run: confirm the evidence hash + rebuild the proof.
 
         The frontend NEVER reimplements the law (CON-003): it calls this, renders the returned
         recompute + hash-confirmation, and opens the Solana tx. ``verified`` is ``True`` iff the
         recomputed evidence hash matches the sealed one (fail-closed on any recompute error).
+
+        Delegates the deterministic recompute to the WD-1 trust-path core
+        (:func:`veridex.verifier.recompute.verify_run`): it recomputes the evidence hash over the
+        sealed ``run_events`` prefix, re-derives the score root, and rebuilds the run manifest
+        (base + ``root_forest``) so ``manifest_hash`` is byte-identical to the anchored Memo
+        payload — receipt-independent (SEC-004) and read-only over the seal. The Proof-Checks block
+        (7 ``CheckId``, no clv — SEC-001) + the separate Performance-Metrics block (clv lives here)
+        are composed via the SAME builders the Proof-Card GET uses, so both endpoints return one
+        consistent shape to the Proof Card (Plan C1).
         """
-        import json as _json
-
-        from veridex.runtime.evidence import compute_evidence_hash
-
         try:
             run_result = await dep_store.load_run(run_id)
         except KeyError:
             raise HTTPException(status_code=404, detail=f"run {run_id!r} not found") from None
 
-        try:
-            recomputed = compute_evidence_hash(run_result.run_events)
-            verified = recomputed == run_result.evidence_hash
-        except Exception as exc:  # malformed/unrecomputable evidence = NOT verified, never a crash
-            recomputed = f"recompute_error:{type(exc).__name__}"
-            verified = False
-
-        scores = score_run(run_result)
-        checks = _default_checks(scores, run_result)
-        metrics = build_performance_metrics(scores)  # SEC-001: CLV lives here, not in checks
-
-        # Manifest derivation reuses the authoritative seal-time helpers (competition.py) so the
-        # route-computed ``manifest_hash`` is byte-identical to the one sealed at run time (DRY).
-        # The marketstates are reconstructed from the sealed tick snapshots in the evidence prefix.
-        score_root = _score_root(scores)
-        marketstates = [
-            MarketState(**_json.loads(e["state_snapshot_json"]))
-            for e in run_result.run_events
-            if e.get("event_type") == "tick" and e.get("state_snapshot_json")
-        ]
-        fixture_id = _fixture_or_window_id(marketstates)
-
-        from veridex.chain.anchor import run_manifest, run_manifest_hash
-
-        manifest = run_manifest(
-            run_id=run_result.run_id,
-            fixture_or_window_id=fixture_id,
-            agent_ids=run_result.agent_ids,
-            action_evidence_root=run_result.evidence_hash,
-            score_root=score_root,
-            proof_mode_map=run_result.proof_mode_map,
-            code_prompt_schema_versions=dict(SCHEMA_VERSIONS),
-        )
-
-        # Bind the per-domain root forest identically to seal time (competition.py) so the
-        # route-rebuilt manifest_hash stays byte-identical — inputs are reproducible from the
-        # persisted RunResult (run_events / source_mode / agent_ids).
-        from veridex.chain.merkle import build_root_forest
-
-        manifest["root_forest"] = build_root_forest(
-            event_log=run_result.run_events,
-            score_rows=scores,
-            receipts=[],  # demo path runs no executor lane
-            policy_results=[],
-            competition=[
-                {
-                    "run_id": run_result.run_id,
-                    "source_mode": run_result.source_mode,
-                    "agent_ids": run_result.agent_ids,
-                }
-            ],
-        )
-        manifest_hash = run_manifest_hash(manifest)
+        report = _verify_run_core(run_result)
+        checks = _default_checks(report.score_rows, run_result)
+        metrics = build_performance_metrics(report.score_rows)  # SEC-001: CLV lives here, not in checks
 
         meta = _run_meta.get(run_id, {})
+        signature = meta.get("signature")  # present only after a real on-chain anchor
         anchor_block: dict[str, Any] = {
             "status": meta.get("anchor_status", "not_anchored"),
-            "signature": None,
+            "signature": signature,
             "cluster": DEFAULT_CLUSTER,
+            "explorer_url": explorer_tx_url(signature, cluster=DEFAULT_CLUSTER),
         }
         proof_card = proof_card_from_run_result(
             run_result,
@@ -491,11 +447,15 @@ def create_app(
             metrics=metrics,
         )
         return VerifyResponse(
-            run_id=run_id,
-            verified=verified,
-            evidence_hash=run_result.evidence_hash,
-            recomputed_evidence_hash=recomputed,
-            manifest_hash=manifest_hash,
+            run_id=report.run_id,
+            verified=report.verified,
+            evidence_hash=report.evidence_hash_sealed,
+            recomputed_evidence_hash=(
+                report.evidence_hash_recomputed
+                if report.evidence_hash_recomputed is not None
+                else f"recompute_error:{report.evidence_error}"
+            ),
+            manifest_hash=report.manifest_hash,
             checks=checks,
             metrics=metrics,
             anchor=anchor_block,
