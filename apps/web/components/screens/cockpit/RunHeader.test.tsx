@@ -1,0 +1,28 @@
+import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { render, screen } from '@testing-library/react';
+import { RunHeader } from '@/components/screens/cockpit/RunHeader';
+import { sampleCockpitState } from '@/__tests__/fixtures/contracts';
+
+beforeEach(() => {
+  window.matchMedia = vi.fn().mockImplementation((q: string) => ({
+    matches: false, media: q, onchange: null,
+    addEventListener: vi.fn(), removeEventListener: vi.fn(),
+    addListener: vi.fn(), removeListener: vi.fn(), dispatchEvent: vi.fn(),
+  }));
+});
+
+describe('RunHeader (REQ-011 run header)', () => {
+  it('renders fixture, source/exec/proof modes and WS status', () => {
+    render(<RunHeader header={sampleCockpitState.header} wsStatus="connected" />);
+    expect(screen.getByText(/FRA v BRA/)).toBeInTheDocument();
+    expect(screen.getByText(/live/i)).toBeInTheDocument();      // source-mode badge
+    expect(screen.getByText(/paper/i)).toBeInTheDocument();      // exec-mode pill
+    expect(screen.getByText(/verified/i)).toBeInTheDocument();   // proof-mode badge
+    expect(screen.getByText(/connected/i)).toBeInTheDocument();  // WS status
+  });
+
+  it('flags a degraded WebSocket connection honestly', () => {
+    render(<RunHeader header={sampleCockpitState.header} wsStatus="reconnecting" />);
+    expect(screen.getByText(/reconnecting/i)).toBeInTheDocument();
+  });
+});
