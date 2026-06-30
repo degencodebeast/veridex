@@ -44,6 +44,9 @@ export class ArenaSocket {
 
   private ingest(raw: string): void {
     let event: CanonicalEvent;
+    // A malformed/unparseable frame is dropped here — but this is NOT a silent
+    // canonical drop: lastSeq is unchanged, so the next valid event whose seq isn't
+    // contiguous trips detectSeqGap and fails closed (disconnect + resync). CON-002.
     try { event = JSON.parse(raw) as CanonicalEvent; } catch { return; }
 
     if (detectSeqGap(this.lastSeq, event.seq)) {
