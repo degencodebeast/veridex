@@ -7,10 +7,13 @@
 !/README.md
 !/pyproject.toml
 !/veridex/
+!/veridex_agent/
 !/tests/
 !/scripts/
 !/contracts/
 !/apps/
+!/docs/
+!/Dockerfile.agent
 
 # planning/spec docs stay LOCAL — never pushed (per project decision)
 spec/
