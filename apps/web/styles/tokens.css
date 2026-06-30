@@ -55,3 +55,13 @@
   /* Layout */
   --nav-h: 51px;
 }
+
+/* JSON syntax colors (Decision Inspector, GUD-002). Appended by 2C Plan C1.
+   Bools/numbers/punct reuse existing tokens; keys/strings are new design values. */
+:root {
+  --json-key: #7E93B8;
+  --json-string: #9CCF9C;
+  --json-number: var(--warning-hi);
+  --json-bool: var(--positive);
+  --json-punct: var(--text-3);
+}
