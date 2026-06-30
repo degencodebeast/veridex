@@ -21,22 +21,21 @@ a live-mode state owned by B9).
 
 from __future__ import annotations
 
-import hashlib
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
-from veridex.chain.anchor import anchor_memo, run_manifest, run_manifest_hash
+from veridex.chain.anchor import anchor_memo, run_manifest_hash
 from veridex.checks.build import (
     build_check_results,
     build_performance_metrics,
     check_results_to_proof_block,
 )
 from veridex.leaderboard import leaderboard
-from veridex.runtime.evidence import serialize_payload
 from veridex.runtime.orchestrator import RunResult, run_competition
 from veridex.scoring import score_run
 from veridex.verifier.proof_card import DEFAULT_SCHEMA_VERSIONS, proof_card_from_run_result
+from veridex.verifier.recompute import manifest_from_run, recompute_score_root, root_forest_for_run
 
 if TYPE_CHECKING:
     from veridex.ingest.marketstate import MarketState
@@ -102,7 +101,11 @@ def _fixture_or_window_id(marketstates: list[MarketState]) -> str:
 
 
 def _score_root(scores: list[dict[str, Any]]) -> str:
-    """SHA-256 over the canonically-serialized ranked score rows (the manifest score root).
+    """Back-compat alias for :func:`veridex.verifier.recompute.recompute_score_root`.
+
+    The score-root formula now lives in the verifier trust path (single source of truth, Task D2);
+    this thin re-export keeps existing importers (the API router) working without forking the
+    formula.
 
     Args:
         scores: The :func:`~veridex.scoring.score_run` output.
@@ -110,7 +113,7 @@ def _score_root(scores: list[dict[str, Any]]) -> str:
     Returns:
         A 64-character hex digest binding the scored result into the manifest.
     """
-    return hashlib.sha256(serialize_payload(scores).encode("utf-8")).hexdigest()
+    return recompute_score_root(scores)
 
 
 def _default_checks(scores: list[dict[str, Any]], run: RunResult) -> dict[str, Any]:
@@ -178,25 +181,16 @@ async def run_demo_competition(
     run = await run_competition(marketstates, agents, source_mode=source_mode, store=store, run_id=run_id)
     scores = score_run(run)
 
-    manifest = run_manifest(
-        run_id=run.run_id,
+    # Build the anchored manifest through the verifier's shared helpers (Task D2 — single source of
+    # truth) so that ``verify_run(run).manifest`` reconstructs THIS manifest byte-for-byte.
+    score_root = recompute_score_root(scores)
+    manifest = manifest_from_run(
+        run,
         fixture_or_window_id=_fixture_or_window_id(marketstates),
-        agent_ids=run.agent_ids,
-        action_evidence_root=run.evidence_hash,
-        score_root=_score_root(scores),
-        proof_mode_map=run.proof_mode_map,
-        code_prompt_schema_versions=dict(SCHEMA_VERSIONS),
+        score_root=score_root,
+        schema_versions=dict(SCHEMA_VERSIONS),
     )
-
-    from veridex.chain.merkle import build_root_forest  # local import keeps trust-core load light
-
-    manifest["root_forest"] = build_root_forest(
-        event_log=run.run_events,
-        score_rows=scores,
-        receipts=[],  # demo path runs no executor lane
-        policy_results=[],
-        competition=[{"run_id": run.run_id, "source_mode": source_mode, "agent_ids": run.agent_ids}],
-    )
+    manifest["root_forest"] = root_forest_for_run(run, scores)
     manifest_hash = run_manifest_hash(manifest)
 
     # --- anchor (injectable; default real, mocked offline, skippable via None) ----------
