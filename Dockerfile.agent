@@ -1,0 +1,18 @@
+# WD-3 — standalone Veridex agent container.
+# Builds the decoupled-standalone-run agent (veridex_agent) under law/policy/proof.
+# Secrets are NEVER baked in — mount the env file or pass env vars at run time (COM-001).
+FROM python:3.11-slim AS base
+
+WORKDIR /app
+
+# Install the package with the agent + live + api extras (LLM gateway, SSE, anchor RPC).
+COPY pyproject.toml ./
+COPY veridex ./veridex
+COPY veridex_agent ./veridex_agent
+RUN pip install --no-cache-dir ".[agent,live,api]" solders solana
+
+# Default to the bundled sample config; override with -v / --config at run time.
+COPY veridex_agent/sample_agent.toml ./agent.toml
+
+ENTRYPOINT ["veridex-agent"]
+CMD ["run", "--config", "agent.toml"]
