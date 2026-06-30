@@ -47,6 +47,10 @@ class Settings(BaseSettings):
     txline_base_url: str = "https://txline-dev.txodds.com/api"
     txline_jwt: str | None = Field(default=None, validation_alias="JWT")
     txline_api_token: str | None = Field(default=None, validation_alias="TXLINE_X_API_TOKEN")
+    # Auth host for guest-JWT / token-activate (CON-041); the ``/api`` base stays separate.
+    txline_auth_base_url: str = "https://txline-dev.txodds.com"
+    # Program id for the on-chain ``subscribe()`` tx; secret-by-policy, defaults ``None``.
+    txline_subscribe_program_id: str | None = Field(default=None, validation_alias="TXLINE_SUBSCRIBE_PROGRAM_ID")
 
     # ------------------------------------------------------------------
     # Solana
@@ -122,6 +126,29 @@ def require_txline(settings: Settings) -> tuple[str, str]:
     if settings.txline_jwt is None or settings.txline_api_token is None:
         raise ValueError("TxLINE creds missing: set JWT and TXLINE_X_API_TOKEN in veridex/.env")
     return settings.txline_jwt, settings.txline_api_token
+
+
+def require_txline_subscribe(settings: Settings) -> tuple[str, str]:
+    """Return ``(keypair_path, program_id)`` for the on-chain subscribe tx, or raise.
+
+    The on-chain ``subscribe()`` (CON-041) needs both a Solana keypair to sign the
+    free World-Cup subscribe tx and the target program id. Both come from typed
+    config only; the guard fires only when a live subscribe is attempted, so the
+    offline suite never triggers it.
+
+    Args:
+        settings: Application settings instance.
+
+    Returns:
+        A ``(keypair_path, program_id)`` tuple.
+
+    Raises:
+        ValueError: If either ``solana_keypair_path`` or
+            ``txline_subscribe_program_id`` is ``None``.
+    """
+    if settings.solana_keypair_path is None or settings.txline_subscribe_program_id is None:
+        raise ValueError("subscribe creds missing: set SOLANA_KEYPAIR_PATH and TXLINE_SUBSCRIBE_PROGRAM_ID")
+    return settings.solana_keypair_path, settings.txline_subscribe_program_id
 
 
 def require_database_url(settings: Settings) -> str:
