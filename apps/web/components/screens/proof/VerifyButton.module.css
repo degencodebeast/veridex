@@ -1,0 +1,27 @@
+.wrap { display: flex; flex-direction: column; gap: var(--space-2); }
+.btn {
+  align-self: flex-start;
+  padding: 7px 14px;
+  border: 1px solid var(--accent);
+  border-radius: var(--radius-control);
+  background: var(--accent-bg);
+  color: var(--accent-hi);
+  font-family: var(--font-mono), monospace;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  cursor: pointer;
+}
+.btn:disabled { opacity: 0.6; cursor: default; }
+.result { display: flex; flex-direction: column; gap: 4px; padding: var(--space-2); background: var(--panel-2); border-radius: var(--radius-control); }
+.headlineOk { margin: 0 0 var(--space-1); color: var(--positive); font-size: 13px; font-weight: 700; }
+.headlineBad { margin: 0 0 var(--space-1); color: var(--negative); font-size: 13px; font-weight: 700; }
+.ok { margin: 0; color: var(--positive); font-size: 11px; }
+.bad { margin: 0; color: var(--negative); font-size: 11px; }
+.recompute { color: var(--text-2); font-size: 11px; margin: 0; }
+.checks { list-style: none; margin: var(--space-1) 0 0; padding: 0; display: flex; flex-direction: column; gap: 4px; }
+.checkRow { display: flex; align-items: center; gap: var(--space-2); }
+.checkLabel { color: var(--text-2); font-size: 11px; }
+.tx { color: var(--accent-hi); font-size: 12px; font-weight: 600; text-decoration: none; }
+.tx:hover { text-decoration: underline; }

@@ -58,6 +58,7 @@ export const sampleVerifyResult: VerifyResult = {
   evidence_hash_confirmed: true,
   manifest_hash_confirmed: true,
   recomputed: { recomputed_edge_bps: 22.0, clv_bps: 18.0, valid: true },
+  manifest_hash: '0x4d2c8a01ffee9931',
   anchor_tx: '5xQ…anchorTx',
   explorer_url: 'https://explorer.solana.com/tx/5xQanchorTx?cluster=devnet',
   verifier_version: 'v1.4.2',

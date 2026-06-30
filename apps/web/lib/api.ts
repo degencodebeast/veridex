@@ -161,6 +161,7 @@ export function adaptVerify(w: W.VerifyResult): VerifyResult {
       clv_bps: w.metrics?.clv ?? 0,
       valid: w.verified,
     },
+    manifest_hash: w.manifest_hash, // PRESERVE the raw manifest hash (threaded to AnchorPanel/chain)
     anchor_tx: (w.anchor as { signature?: string | null }).signature ?? null,
     explorer_url: null,
     verifier_version: w.proof_card.verifier_version,

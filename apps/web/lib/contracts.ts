@@ -257,6 +257,7 @@ export interface VerifyResult {
   evidence_hash_confirmed: boolean;
   manifest_hash_confirmed: boolean;
   recomputed: { recomputed_edge_bps: number; clv_bps: number; valid: boolean };
+  manifest_hash: string; // raw manifest hash from the verify response (threaded to AnchorPanel/chain)
   anchor_tx: string | null;
   explorer_url: string | null;
   verifier_version: string;
