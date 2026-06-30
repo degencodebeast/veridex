@@ -1,4 +1,5 @@
-import { ScreenStub } from '@/components/layout/ScreenStub';
+import { MarketsScreen } from '@/components/screens/MarketsScreen';
+
 export default function MarketsPage() {
-  return <ScreenStub label="Markets" plan="2C Plan C" />;
+  return <MarketsScreen />;
 }
