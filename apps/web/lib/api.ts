@@ -239,13 +239,12 @@ export function adaptInspector(w: W.InspectorRecord): InspectorRecord {
     market_state: w.market_state as unknown as InspectorRecord['market_state'],
     agent_action: w.agent_action as unknown as InspectorRecord['agent_action'],
     recompute: { recomputed_edge_bps: rec.recomputed_edge_bps ?? 0, clv_bps: rec.clv_bps ?? 0, valid: rec.valid ?? false },
-    // GAP: wire has no clv_explanation; the four strategy quantities (fair value,
-    // executable edge, venue price, stake) are not in the wire InspectorRecord →
-    // default honestly. CLV (the score) is carried through.
+    // GAP: the wire InspectorRecord carries no doctrine quantities (fair value,
+    // executable edge, venue price, stake) → null = honest "not in proof artifact"
+    // (rendered as "—"), NOT a plausible 0. CLV (the real score) is carried through.
     clv_explanation: {
-      entry_implied_pct: 0, delta_bps: clv, closing_implied_pct: 0, score_bps: clv,
-      fair_value_pct: 0, closing_fair_value_pct: 0, venue_decimal_price: 0,
-      executable_edge_bps: 0, clv_bps: clv, stake_fraction: 0,
+      fair_value_pct: null, closing_fair_value_pct: null, venue_decimal_price: null,
+      executable_edge_bps: null, clv_bps: clv, stake_fraction: null,
       plain: '',
     },
     untrusted_llm: llm

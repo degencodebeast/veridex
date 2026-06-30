@@ -40,6 +40,23 @@ describe('InspectorScreen (REQ-019 / SEC-006/007 / AC-006/021)', () => {
     expect(screen.getByText(/recorded, not scored/i)).toBeInTheDocument();
   });
 
+  it('renders honest "—" (not 0.0%/0.000) for doctrine quantities absent from the proof artifact', () => {
+    // A wire-sourced record (adaptInspector) has null doctrine quantities — these must
+    // read as "not in proof artifact", never a plausible computed zero (no-overclaim).
+    const gapRecord = {
+      ...sampleInspectorRecord,
+      clv_explanation: {
+        fair_value_pct: null, closing_fair_value_pct: null, venue_decimal_price: null,
+        executable_edge_bps: null, clv_bps: 18.0, stake_fraction: null, plain: '',
+      },
+    };
+    const clvSection = render(<InspectorScreen record={gapRecord} />).container.querySelector('[aria-label="CLV explanation"]') as HTMLElement;
+    expect(clvSection.textContent).not.toContain('0.0%');   // no fabricated fair-value/closing pct
+    expect(clvSection.textContent).not.toContain('0.000');  // no fabricated venue price
+    expect(clvSection.querySelectorAll('dd')[0].textContent).toBe('—'); // fair value absent
+    expect(clvSection).toHaveTextContent('+18.0 bps'); // CLV (the real score) still renders
+  });
+
   it('is read-only during a run with no editable affordances + shows READ-ONLY DURING RUN (AC-006)', () => {
     const { container } = render(<InspectorScreen record={sampleInspectorRecord} />);
     expect(screen.getByText(/READ-ONLY DURING RUN/i)).toBeInTheDocument();

@@ -17,6 +17,8 @@ export function deriveProofChain(
   const c = artifact.checks;
   return [
     { id: 'evidence', label: 'Evidence', sub: 'sealed RunEvents', hash: artifact.evidence_hash || '—', status: statusOf(c, 'evidence_integrity') },
+    // pre-score has no dedicated check in the frozen 7 — the raw prescore is part of
+    // the sealed evidence, so its trust status is evidence_integrity's (same hash chain).
     { id: 'pre-score', label: 'Pre-Score', sub: 'raw prescore', hash: '—', status: statusOf(c, 'evidence_integrity') },
     { id: 'score', label: 'Score', sub: 'law recompute', hash: '—', status: statusOf(c, 'metrics_recomputed') },
     { id: 'manifest', label: 'Manifest', sub: 'config+policy', hash: manifestHash || '—', status: statusOf(c, 'manifest_bound') },

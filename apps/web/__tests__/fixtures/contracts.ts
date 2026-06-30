@@ -83,7 +83,6 @@ export const sampleInspectorRecord: InspectorRecord = {
   },
   recompute: { recomputed_edge_bps: 22.0, clv_bps: 18.0, valid: true },
   clv_explanation: {
-    entry_implied_pct: 67.9, delta_bps: 18.0, closing_implied_pct: 69.7, score_bps: 18.0,
     fair_value_pct: 67.9, closing_fair_value_pct: 69.7, venue_decimal_price: 1.472,
     executable_edge_bps: 22.0, clv_bps: 18.0, stake_fraction: 0.06,
     plain: 'Fair value 67.9% → closing 69.7%; executable edge +22.0 bps at venue 1.472; CLV +18.0 bps.',

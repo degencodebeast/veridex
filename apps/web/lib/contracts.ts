@@ -269,17 +269,15 @@ export interface VerifyResult {
 
 // ---- Decision Inspector (REQ-019) ----
 export interface ClvExplanation {
-  entry_implied_pct: number;
-  delta_bps: number;
-  closing_implied_pct: number;
-  score_bps: number;
-  // Strategy-doctrine fields (Task 22) — four distinct quantities:
-  fair_value_pct: number;          // de-margined consensus fair probability at entry
-  closing_fair_value_pct: number;  // de-margined consensus fair probability at close
-  venue_decimal_price: number;     // the actual venue decimal price
-  executable_edge_bps: number;     // EV at the venue price (NOT CLV)
-  clv_bps: number;                 // the proven skill metric
-  stake_fraction: number;          // Kelly/policy sizing
+  // Strategy-doctrine quantities (Task 22). The four decision inputs are nullable:
+  // the wire InspectorRecord does NOT carry them yet, so `null` = "not in the proof
+  // artifact" (rendered as "—"), distinct from a genuine computed 0 (honest-absence).
+  fair_value_pct: number | null;          // de-margined consensus fair probability at entry
+  closing_fair_value_pct: number | null;  // de-margined consensus fair probability at close
+  venue_decimal_price: number | null;     // the actual venue decimal price
+  executable_edge_bps: number | null;     // EV at the venue price (NOT CLV)
+  clv_bps: number;                         // the proven skill metric (the real scored value)
+  stake_fraction: number | null;          // Kelly/policy sizing
   plain: string;
 }
 export interface UntrustedLlmMetadata {

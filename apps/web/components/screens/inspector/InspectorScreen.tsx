@@ -11,6 +11,15 @@ const QLABEL = Object.fromEntries(QUANTITIES.map((q) => [q.id, q.label])) as Rec
 
 export function InspectorScreen({ record }: { record: InspectorRecord }) {
   const { clv_explanation: clv } = record;
+  // Honest-absence: the doctrine quantities are null when not in the proof artifact —
+  // render "—", never a plausible 0.0%/0.000 (no-overclaim). CLV is the real score.
+  const fairValueText = clv.fair_value_pct == null || clv.closing_fair_value_pct == null
+    ? '—'
+    : `${fmtPct(String(clv.fair_value_pct))} → ${fmtPct(String(clv.closing_fair_value_pct))}`;
+  const execEdgeText = clv.executable_edge_bps == null || clv.venue_decimal_price == null
+    ? '—'
+    : `${fmtBps(clv.executable_edge_bps)} @ ${clv.venue_decimal_price.toFixed(3)}`;
+  const stakeText = clv.stake_fraction == null ? '—' : `${(clv.stake_fraction * 100).toFixed(1)}%`;
   return (
     <article className={styles.inspector}>
       <header className={styles.header}>
@@ -50,10 +59,10 @@ export function InspectorScreen({ record }: { record: InspectorRecord }) {
         <section className={styles.clv} aria-label="CLV explanation">
           <div className={styles.clvTitle}>CLV Explanation</div>
           <dl className={styles.quantities}>
-            <div className={styles.qrow}><dt className={styles.qlabel}>{QLABEL.fair_value}</dt><dd className={`${styles.qval} mono`}>{fmtPct(String(clv.fair_value_pct))} → {fmtPct(String(clv.closing_fair_value_pct))}</dd></div>
-            <div className={styles.qrow}><dt className={styles.qlabel}>{QLABEL.executable_edge}</dt><dd className={`${styles.qval} mono`}>{fmtBps(clv.executable_edge_bps)} @ {clv.venue_decimal_price.toFixed(3)}</dd></div>
+            <div className={styles.qrow}><dt className={styles.qlabel}>{QLABEL.fair_value}</dt><dd className={`${styles.qval} mono`}>{fairValueText}</dd></div>
+            <div className={styles.qrow}><dt className={styles.qlabel}>{QLABEL.executable_edge}</dt><dd className={`${styles.qval} mono`}>{execEdgeText}</dd></div>
             <div className={styles.qrow}><dt className={styles.qlabel}>{QLABEL.clv}</dt><dd className={`${styles.qval} mono`}>{fmtBps(clv.clv_bps)}</dd></div>
-            <div className={styles.qrow}><dt className={styles.qlabel}>{QLABEL.stake}</dt><dd className={`${styles.qval} mono`}>{(clv.stake_fraction * 100).toFixed(1)}%</dd></div>
+            <div className={styles.qrow}><dt className={styles.qlabel}>{QLABEL.stake}</dt><dd className={`${styles.qval} mono`}>{stakeText}</dd></div>
           </dl>
           <p className={styles.clvPlain}>{clv.plain}</p>
           <span className={`${styles.scoreChip} mono`}>SCORE = {fmtBps(clv.clv_bps)}</span>
