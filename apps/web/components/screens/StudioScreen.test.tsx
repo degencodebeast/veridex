@@ -94,17 +94,24 @@ describe('StudioScreen (REQ-018 / AC-007 / SEC-006/007/009)', () => {
     expect(screen.getByText(/read-only during a scored run/i)).toBeInTheDocument();
   });
 
-  it('PIN CONFIG calls onPin with config_hash and policy_hash, then advances the baseline (SEC-009)', async () => {
+  it('PIN CONFIG calls onPin and shows an honest "Config pinned ✓" affordance, then advances the baseline (SEC-009)', async () => {
     const user = userEvent.setup();
     const onPin = vi.fn();
     render(<StudioScreen onPin={onPin} />);
     await user.click(screen.getByRole('button', { name: /pin config & queue run/i }));
-    expect(onPin).toHaveBeenCalledWith(expect.objectContaining({
-      config_hash: expect.any(String),
-      policy_hash: expect.any(String),
-    }));
+    expect(onPin).toHaveBeenCalledTimes(1);
+    // The pin is represented as an honest affordance ("Config pinned ✓"), NOT a fabricated hash.
+    expect(screen.getByTestId('config-pinned')).toHaveTextContent(/config pinned ✓/i);
     // After pin, baseline advances → no pending changes
     expect(within(screen.getByTestId('config-diff')).getByText(/no pending changes/i)).toBeInTheDocument();
+  });
+
+  it('DOCTRINE: renders NO fabricated proof-flavored hash (no 0x… / config_hash / fiction hex) anywhere on Studio', async () => {
+    const user = userEvent.setup();
+    const { container } = render(<StudioScreen />);
+    // Even after pinning, the pin is "Config pinned ✓" — never a fabricated 0x-prefixed digest.
+    await user.click(screen.getByRole('button', { name: /pin config & queue run/i }));
+    expect(container.textContent).not.toMatch(/0x[0-9a-z_]/i); // no 0xcfg_/0xpol_/0x… fiction hex
   });
 
   // ── PREFLIGHT PREVIEW — codex option 3 (TEETH) ─────────────────────────────

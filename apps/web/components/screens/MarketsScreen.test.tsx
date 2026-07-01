@@ -164,21 +164,43 @@ describe('MarketsScreen V5 (default-select · right rail · EDGE/AGENTS honesty)
     expect(edge.some((c) => /\d/.test(c.textContent ?? ''))).toBe(false);
   });
 
-  it('the disabled 1X2-HT tab states WHY it is unavailable (reuse the disabledReason idiom — not "broken")', () => {
+  it('the disabled 1X2-HT tab states WHY it is unavailable via aria-disabled (announceable to SRs, not a native-disabled dead element)', async () => {
+    const user = userEvent.setup();
     render(<MarketsScreen />);
     const ht = screen.getByTestId('tab-1x2-ht');
-    expect(ht).toBeDisabled();
-    // a user-facing reason (title + accessible name), not just a code comment, so it reads
-    // "not available" rather than "broken". A regression that disables it silently fails here.
+    // aria-disabled (NOT the native `disabled` attribute) keeps the button in the a11y tree so the
+    // title + accessible-name reason actually reaches screen readers; the handler guards the click.
+    expect(ht).toHaveAttribute('aria-disabled', 'true');
+    expect(ht).not.toHaveAttribute('disabled');
     expect(ht).toHaveAttribute('title', expect.stringMatching(/not in.*feed/i));
     expect(ht).toHaveAccessibleName(/not in.*feed/i);
+    // handler-guard: clicking the aria-disabled tab must NOT change the active selection.
+    await user.click(ht);
+    expect(ht).toHaveAttribute('aria-selected', 'false');
+    expect(screen.getByTestId('tab-all')).toHaveAttribute('aria-selected', 'true');
+  });
+
+  it('completes the ARIA tabs contract: every tab aria-controls the panel; the panel is role=tabpanel labelled by the active tab', () => {
+    render(<MarketsScreen />);
+    const panel = screen.getByTestId('families');
+    const panelId = panel.getAttribute('id');
+    expect(panel).toHaveAttribute('role', 'tabpanel');
+    expect(panelId).toBeTruthy();
+    // Panel is labelled by the currently-selected tab (default: ALL).
+    const activeTab = screen.getByTestId('tab-all');
+    expect(panel).toHaveAttribute('aria-labelledby', activeTab.id);
+    expect(activeTab.id).toBeTruthy();
+    // Every tab points at the single panel via aria-controls.
+    for (const testid of ['tab-all', 'tab-1x2', 'tab-1x2-ht', 'tab-ou', 'tab-ah']) {
+      expect(screen.getByTestId(testid)).toHaveAttribute('aria-controls', panelId as string);
+    }
   });
 
   it('market-type tabs filter the families; the 1X2-HT tab is honestly disabled (not in feed)', async () => {
     const user = userEvent.setup();
     render(<MarketsScreen />);
-    // HT half-time market is NOT in the feed → its tab exists for layout but is disabled, not faked.
-    expect(screen.getByTestId('tab-1x2-ht')).toBeDisabled();
+    // HT half-time market is NOT in the feed → its tab exists for layout but is aria-disabled, not faked.
+    expect(screen.getByTestId('tab-1x2-ht')).toHaveAttribute('aria-disabled', 'true');
     // clicking O/U narrows to just the Over/Under family.
     await user.click(screen.getByTestId('tab-ou'));
     const fam = screen.getByTestId('families');

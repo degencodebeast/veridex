@@ -7,4 +7,4 @@
 .scoring { display: inline-flex; align-items: center; font-size: 9px; font-weight: 600; letter-spacing: 0.08em; color: var(--accent-hi); }
 .mono { color: var(--text-2); }
 .spacer { flex: 1; min-width: 8px; }
-.verifier { color: var(--text-3); }
+.verifier { color: var(--text-3); font-feature-settings: 'tnum' 1; }

@@ -17,6 +17,8 @@ import styles from './MarketsScreen.module.css';
 // Market-type tabs (V5). The HT half-time variant is NOT in the free feed → its tab is present
 // for layout parity but DISABLED (honest), never a fabricated empty/zero market.
 type TabId = 'all' | MarketFamilyKey | 'ht';
+// Single shared tabpanel id — every market-type tab aria-controls it (ARIA tabs contract).
+const FAMILIES_PANEL_ID = 'markets-families-panel';
 const TABS: { id: TabId; label: string; disabled?: boolean; disabledReason?: string; testid: string }[] = [
   { id: 'all', label: 'ALL', testid: 'tab-all' },
   { id: '1X2_PARTICIPANT_RESULT', label: '1X2 FT', testid: 'tab-1x2' },
@@ -40,6 +42,8 @@ export function MarketsScreen({
   const updates = fixtureId != null ? oddsByFixture[fixtureId] ?? [] : [];
   const allFamilies = useMemo(() => buildFamilies(updates), [updates]);
   const families = tab === 'all' ? allFamilies : allFamilies.filter((f) => f.key === tab);
+  // The active tab's element id — labels the shared tabpanel (ARIA tabs contract).
+  const activeTabId = TABS.find((t) => t.id === tab)?.testid;
   const selected = fixtures.find((f) => f.fixture_id === fixtureId) ?? null;
   // ELIGIBLE AGENTS rail = the eligible POOL (badge==='eligible'), NOT scoped to this fixture
   // (no fixture→agent mapping exists). Honest: not-eligible agents are excluded.
@@ -113,9 +117,14 @@ export function MarketsScreen({
                     key={t.id}
                     type="button"
                     role="tab"
+                    id={t.testid}
                     aria-selected={tab === t.id}
+                    // Panel is a single shared tabpanel — every tab controls it (ARIA tabs contract).
+                    aria-controls={FAMILIES_PANEL_ID}
                     data-testid={t.testid}
-                    disabled={t.disabled}
+                    // aria-disabled (NOT native `disabled`) keeps the tab in the a11y tree so the
+                    // reason reaches screen readers; the onClick handler guards the interaction.
+                    aria-disabled={t.disabled || undefined}
                     // Disabled tabs state WHY (reuse the disabledReason idiom) — reads "not
                     // available", not "broken". title = hover, aria-label = the accessible name.
                     title={t.disabledReason}
@@ -128,7 +137,14 @@ export function MarketsScreen({
                 ))}
               </div>
 
-              <div className={styles.families} data-testid="families" data-odds-path={oddsUpdatesPath(fixtureId)}>
+              <div
+                className={styles.families}
+                data-testid="families"
+                data-odds-path={oddsUpdatesPath(fixtureId)}
+                role="tabpanel"
+                id={FAMILIES_PANEL_ID}
+                aria-labelledby={activeTabId}
+              >
                 {families.map((fam) => (
                   <div key={fam.key} className={styles.family}>
                     <h3 className={styles.familyTitle}>{fam.label}</h3>

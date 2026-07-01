@@ -10,13 +10,9 @@ import { DEFAULT_POLICY_ENVELOPE } from '@/lib/fixtures/catalog';
 import { GLOSSARY } from '@/lib/glossary';
 import styles from './StudioScreen.module.css';
 
-// Deterministic, fiction config hashes derived from the chosen config (pre-run pin).
-function hashConfig(a: Archetype, mode: StudioMode): string {
-  return `0xcfg_${a}_${mode}`.slice(0, 22);
-}
-function hashPolicy(minEdge: number, exec: ExecutionMode): string {
-  return `0xpol_${minEdge}_${exec}`.slice(0, 22);
-}
+// Honesty (law_hash / Create-wizard ruling): the config pin is an affordance, NOT a fabricated
+// proof-flavored digest. The config is frozen at entry; real evidence/score/manifest hashes only
+// appear on the Proof Card AFTER a sealed run. So there is no client-side "config hash" here.
 
 function Section({ n, title, inactive, children }: { n: string; title: string; inactive?: boolean; children: ReactNode }) {
   return (
@@ -34,7 +30,7 @@ function Section({ n, title, inactive, children }: { n: string; title: string; i
 export function StudioScreen({
   onPin = () => {},
   running = false,
-}: { onPin?: (pinned: { config_hash: string; policy_hash: string }) => void; running?: boolean }) {
+}: { onPin?: () => void; running?: boolean }) {
   const [archetype, setArchetype] = useState<Archetype>('value_clv');
   const [mode, setMode] = useState<StudioMode>('numeric');
   const [exec, setExec] = useState<ExecutionMode>('paper');
@@ -42,6 +38,8 @@ export function StudioScreen({
   const [baseline, setBaseline] = useState<{ archetype: Archetype; mode: StudioMode; exec: ExecutionMode }>(
     { archetype: 'value_clv', mode: 'numeric', exec: 'paper' },
   );
+  // Whether the current draft has been pinned (drives the honest "Config pinned ✓" affordance).
+  const [pinned, setPinned] = useState(false);
 
   const modes = availableModes(archetype);
 
@@ -60,9 +58,6 @@ export function StudioScreen({
     setMode(resolveMode(t.archetype, t.defaultMode));
   }
 
-  const config_hash = hashConfig(archetype, mode);
-  const policy_hash = hashPolicy(DEFAULT_POLICY_ENVELOPE.min_edge_bps, exec);
-
   // #4 reviewable diff: current draft vs last-pinned baseline (a structured before→after patch).
   const diffEntries = [
     { field: 'archetype', before: baseline.archetype as string, after: archetype as string },
@@ -71,8 +66,9 @@ export function StudioScreen({
   ].filter((e) => e.before !== e.after);
 
   function pin() {
-    onPin({ config_hash, policy_hash });
+    onPin();
     setBaseline({ archetype, mode, exec }); // applied as the new pinned version
+    setPinned(true);
   }
 
   // PREFLIGHT PREVIEW — fully (A) real config (codex option 3): threshold + rule-config + disclaimer.
@@ -248,6 +244,14 @@ export function StudioScreen({
                 PIN CONFIG &amp; QUEUE RUN →
               </button>
             )}
+            {/* Honest pin affordance — NOT a fabricated hash (law_hash / Create-wizard ruling).
+                Real evidence/score/manifest hashes appear on the Proof Card after the sealed run. */}
+            {!running && pinned && diffEntries.length === 0 ? (
+              <p className={styles.pinnedOk} data-testid="config-pinned">
+                <span className="mono">Config pinned ✓</span>{' '}
+                <InfoTip label={GLOSSARY.config_pinned.label}>{GLOSSARY.config_pinned.definition}</InfoTip>
+              </p>
+            ) : null}
             <p className={styles.note}>Config is frozen at run start. Mid-run edits create a new version/run (SEC-009).</p>
           </aside>
         </div>

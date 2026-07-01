@@ -18,7 +18,7 @@ export interface ProofExplanation {
 // short-circuited to the FIXED template and NEVER reaches the LLM/endpoint. The LLM never answers
 // "is this run valid?" freeform.
 const VALIDITY_RE =
-  /\b(valid|invalid|verif(y|ied|ies)?|pass(ed|es)?|legit(imate)?|certif(y|ied|ication)?|prove[dn]?|proof is (ok|good|right)|correct|trust(ed|worthy)?|genuine|authentic|is (this|it) (run )?(ok|right|good|real))\b/i;
+  /\b(valid|invalid|verif(y|ied|ies)?|pass(ed|es)?|legit(imate)?|certif(y|ied|ication)?|prove[dn]?|proof is (ok|good|right)|is (this|it) correct|trust(ed|worthy)?|genuine|authentic|succeed(s|ed)?|reliable|accurate|hold up|real|fake|cheat(ed|s|ing)?|is (this|it) (run )?(ok|right|good|real))\b/i;
 
 export function isValidityQuestion(q: string): boolean {
   return VALIDITY_RE.test(q);
