@@ -89,6 +89,7 @@ from veridex.competition.service import (
 from veridex.config import Settings, get_settings
 from veridex.execution.models import ExecutionRecord, ExecutionStatus
 from veridex.execution.runner import resolve_approval
+from veridex.explainer import GLOSSARY_DEFINITIONS, explain_proof
 from veridex.ingest.feed_health import feed_health
 from veridex.leaderboard import leaderboard as _build_leaderboard
 from veridex.runtime.competition import (
@@ -607,6 +608,97 @@ def create_app(
             metrics=metrics,
             anchor=anchor_block,
             proof_card=proof_card,
+        )
+
+    # --- POST /runs/{run_id}/explain (Proof Explainer — educational LLM narration) --------
+
+    @app.post("/runs/{run_id}/explain")
+    async def explain_run_endpoint(
+        run_id: str,
+        body: dict[str, Any] | None = None,
+        dep_store: Store = Depends(_get_store),  # noqa: B008
+    ) -> dict[str, str]:
+        """Narrate an already-produced proof in plain language — the Proof Explainer (NOT a verifier).
+
+        READ-ONLY and NON-scoring: this endpoint recomputes the served proof artifact + verify
+        view-models exactly as ``GET /runs/{id}`` and ``POST /runs/{id}/verify`` do, assembles a
+        SANITIZED read-model (ONLY the served ``ProofArtifactResponse`` + ``VerifyResponse`` fields
+        + the pinned glossary — never the raw ``RunResult``, unsealed/live state, or the store
+        handle), and hands that dict to the LLM explainer. It performs NO writes, NO mutation, and
+        NO control. The deterministic Verify result remains the source of truth; the explanation is
+        educational only and carries that disclaimer.
+
+        Args:
+            run_id: The sealed run identifier.
+            body: Optional ``{"question": str, "target_field": str}`` to focus the narration.
+            dep_store: Injected store dependency.
+
+        Returns:
+            ``{"explanation": ..., "disclaimer": ..., "footer": ...}``.
+
+        Raises:
+            HTTPException: 404 when no run with ``run_id`` is found.
+        """
+        try:
+            run_result = await dep_store.load_run(run_id)
+        except KeyError:
+            raise HTTPException(status_code=404, detail=f"run {run_id!r} not found") from None
+
+        # Rebuild the SERVED verify view-model via the SAME trust-path core the verify route uses.
+        report = _verify_run_core(run_result)
+        metrics = build_performance_metrics(report.score_rows)  # SEC-001: CLV lives here, not checks
+        meta = _run_meta.get(run_id, {})
+        signature = meta.get("signature")
+        anchor_block: dict[str, Any] = {
+            "status": meta.get("anchor_status", "not_anchored"),
+            "signature": signature,
+            "cluster": DEFAULT_CLUSTER,
+            "explorer_url": explorer_tx_url(signature, cluster=DEFAULT_CLUSTER),
+        }
+        check_results = build_check_results(
+            scores=report.score_rows,
+            run=run_result,
+            manifest=report.manifest,
+            manifest_hash=report.manifest_hash,
+            anchor=anchor_block,
+            source_mode=report.source_mode,
+        )
+        checks = check_results_to_proof_block(check_results)
+        proof_artifact = proof_card_from_run_result(
+            run_result,
+            checks=checks,
+            anchor=anchor_block,
+            schema_versions=dict(SCHEMA_VERSIONS),
+            metrics=metrics,
+        )
+
+        # SANITIZED read-model: ONLY served ProofArtifactResponse + VerifyResponse fields + glossary.
+        # No raw RunResult, no run_events, no unsealed/live state, no store handle crosses this line.
+        read_model: dict[str, Any] = {
+            "proof_artifact": proof_artifact,
+            "verify": {
+                "run_id": report.run_id,
+                "verified": report.verified,
+                "evidence_hash": report.evidence_hash_sealed,
+                "recomputed_evidence_hash": (
+                    report.evidence_hash_recomputed
+                    if report.evidence_hash_recomputed is not None
+                    else f"recompute_error:{report.evidence_error}"
+                ),
+                "manifest_hash": report.manifest_hash,
+                "checks": checks,
+                "metrics": metrics,
+                "anchor": anchor_block,
+            },
+            "glossary": GLOSSARY_DEFINITIONS,
+        }
+
+        payload = body or {}
+        return await explain_proof(
+            read_model,
+            question=payload.get("question"),
+            target_field=payload.get("target_field"),
+            settings=resolved_settings,
         )
 
     # --- POST /competitions -----------------------------------------------
