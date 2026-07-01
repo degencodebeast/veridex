@@ -116,7 +116,8 @@ describe('CreateCompetitionScreen V5 (wizard density · honest pins)', () => {
 
   it('InfoTip copy is single-sourced from lib/glossary.ts — no per-screen microcopy drift', () => {
     render(<CreateCompetitionScreen />);
-    // the on-screen tooltip text for these doctrine terms MUST equal the glossary verbatim.
+    // the on-screen tooltip text for ALL 4 wired doctrine terms MUST equal the glossary verbatim.
+    expect(screen.getByText(GLOSSARY.source_mode.definition)).toBeInTheDocument();
     expect(screen.getByText(GLOSSARY.execution_mode.definition)).toBeInTheDocument();
     expect(screen.getByText(GLOSSARY.proof_mode.definition)).toBeInTheDocument();
     expect(screen.getByText(GLOSSARY.config_pinned.definition)).toBeInTheDocument();
