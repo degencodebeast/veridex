@@ -1,36 +1,55 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { render, screen, within } from '@testing-library/react';
 import { MobileArenaScreen } from '@/components/screens/MobileArenaScreen';
-import { LEADERBOARD_ROWS } from '@/lib/fixtures/catalog';
+import { sampleCockpitState } from '@/__tests__/fixtures/contracts';
+import { GLOSSARY } from '@/lib/glossary';
+import type { MatchState } from '@/lib/contracts';
 
-describe('MobileArenaScreen (REQ-027)', () => {
-  it('constrains to a 392px phone frame', () => {
-    render(<MobileArenaScreen />);
+vi.mock('next/navigation', () => ({ usePathname: () => '/m/arena' }));
+
+beforeEach(() => {
+  window.matchMedia = vi.fn().mockImplementation((q: string) => ({
+    matches: false, media: q, onchange: null,
+    addEventListener: vi.fn(), removeEventListener: vi.fn(),
+    addListener: vi.fn(), removeListener: vi.fn(), dispatchEvent: vi.fn(),
+  }));
+});
+
+// the live emptyMatch (scores not wired): no coverage
+const EMPTY: MatchState = {
+  fixture: '', phase: 'NS', minute: null, goals: [0, 0], yellow: [0, 0], red: [0, 0], corners: [0, 0], status: 'scheduled',
+};
+
+describe('MobileArenaScreen (Cockpit collapsed to one scroll column)', () => {
+  it('constrains to a 392px phone frame with a fixed bottom tab bar (4 destinations)', () => {
+    render(<MobileArenaScreen initial={sampleCockpitState} />);
     expect(screen.getByTestId('phone-frame')).toHaveAttribute('data-width', '392');
-  });
-
-  it('renders the leaderboard as stacked cards ranked by Avg CLV (CLV-only)', () => {
-    render(<MobileArenaScreen />);
-    const cards = screen.getAllByTestId('mobile-lb-card');
-    expect(cards.length).toBe(LEADERBOARD_ROWS.length);
-    expect(within(cards[0]).getByTestId('mobile-rank')).toHaveTextContent('1');
-    expect(within(cards[0]).getByText(/Momentum FR/)).toBeInTheDocument(); // highest avg_clv
-  });
-
-  it('renders a fixed bottom tab bar with 4 destinations', () => {
-    render(<MobileArenaScreen />);
     const bar = screen.getByTestId('bottom-tabs');
     for (const t of ['Arena', 'Agents', 'Proof', 'Rank']) {
       expect(within(bar).getByRole('link', { name: t })).toBeInTheDocument();
     }
   });
 
-  it('does NOT dress the static demo header as a live feed (honesty)', () => {
-    render(<MobileArenaScreen />);
-    // no pulsing SCORING pill over hardcoded constants
-    expect(screen.queryByText(/SCORING/)).toBeNull();
-    const match = screen.getByTestId('mobile-match');
-    expect(within(match).queryByText(/^Live$/)).toBeNull(); // no live badge over the static score
-    expect(within(match).getByText(/mock/i)).toBeInTheDocument(); // honestly labelled demo/mock data
+  it('REUSES the closed Cockpit panels in ONE scroll column (RunHeader / MatchState / CLV / event stream)', () => {
+    render(<MobileArenaScreen initial={sampleCockpitState} />);
+    const col = screen.getByTestId('mobile-column');
+    expect(within(col).getByText(/FRA v BRA/)).toBeInTheDocument();          // RunHeader
+    expect(within(col).getByLabelText('Match state')).toBeInTheDocument();   // MatchStatePanel
+    expect(within(col).getByLabelText('CLV leaderboard')).toBeInTheDocument(); // ClvLeaderboard
+    expect(within(col).getByLabelText('Canonical event stream')).toBeInTheDocument();
+  });
+
+  it('inherits the MatchState B/C honesty: live-empty shows pending scores-feed, NO fabricated stats, NO clock', () => {
+    render(<MobileArenaScreen initial={{ ...sampleCockpitState, match: EMPTY }} />);
+    expect(screen.getByTestId('match-empty')).toHaveTextContent(/pending/i);
+    expect(screen.queryByTestId('match-stats')).toBeNull();     // no fabricated 0–0 stats
+    expect(screen.queryByText(/\d+'/)).toBeNull();              // no live minute/clock
+  });
+
+  it('InfoTip copy is single-sourced from lib/glossary.ts (inherited from the reused panels)', () => {
+    render(<MobileArenaScreen initial={sampleCockpitState} />);
+    expect(screen.getByText(GLOSSARY.clv.definition)).toBeInTheDocument();
+    expect(screen.getByText(GLOSSARY.source_mode.definition)).toBeInTheDocument();
+    expect(screen.getByText(GLOSSARY.proof_mode.definition)).toBeInTheDocument();
   });
 });

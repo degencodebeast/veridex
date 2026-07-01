@@ -1,10 +1,13 @@
 'use client';
+import { useEffect, useState } from 'react';
 import Link from 'next/link';
-import { Badge } from '@/components/ui/Badge';
-import { Num } from '@/components/ui/Num';
-import { rankByAvgClv } from '@/lib/derive';
-import { LEADERBOARD_ROWS } from '@/lib/fixtures/catalog';
-import type { LeaderboardRow } from '@/lib/catalog';
+import { getCockpitState } from '@/lib/api';
+import { RunHeader } from './cockpit/RunHeader';
+import { ProofTraceStrip } from './cockpit/ProofTraceStrip';
+import { MatchStatePanel } from './cockpit/MatchStatePanel';
+import { ClvLeaderboard } from './cockpit/ClvLeaderboard';
+import { CanonicalEventStream } from './cockpit/CanonicalEventStream';
+import type { CockpitState } from '@/lib/contracts';
 import styles from './MobileArenaScreen.module.css';
 
 const TABS = [
@@ -12,42 +15,47 @@ const TABS = [
   { label: 'Proof', href: '/leaderboard' }, { label: 'Rank', href: '/leaderboard' },
 ];
 
-export function MobileArenaScreen({ rows = LEADERBOARD_ROWS }: { rows?: LeaderboardRow[] }) {
-  const ranked = rankByAvgClv(rows);
+const COMPETITION_ID = 'wc-fra-bra';
+
+// Honest-empty initial (SSR + before the client projection loads). Live with no backend stays here
+// (fetch fails → caught → honest-empty panels); mock populates it via getCockpitState (COCKPIT_DEMO).
+const EMPTY_COCKPIT: CockpitState = {
+  competition_id: COMPETITION_ID, run_id: '',
+  header: {
+    fixture: '', competition: '', source_mode: 'replay', execution_mode: 'paper',
+    proof_mode: 'reproducible', events: 0, valid_pct: 0, verifier_version: 'v0',
+  },
+  trace: [],
+  match: { fixture: '', phase: 'NS', minute: null, goals: [0, 0], yellow: [0, 0], red: [0, 0], corners: [0, 0], status: 'scheduled' },
+  leaderboard: [], events: [], receipts: [], policy: [], kill_armed: false,
+};
+
+// Mobile = the Cockpit collapsed to ONE scroll column. It REUSES the closed Cockpit panels + the
+// getCockpitState projection (no forked data / honesty logic): MatchState B/C framing, ●evidence/
+// ○ui-only, REPLAY≠LIVE, CLV-only rank, and the glossary InfoTips all come along with the panels.
+export function MobileArenaScreen({ competitionId = COMPETITION_ID, initial }: {
+  competitionId?: string; initial?: CockpitState;
+}) {
+  const [state, setState] = useState<CockpitState>(initial ?? EMPTY_COCKPIT);
+
+  useEffect(() => {
+    if (initial) return; // a supplied projection (tests / SSR seed) skips the client fetch
+    let live = true;
+    // mock ⇒ populated demo; live with no backend ⇒ caught ⇒ honest-empty (never fabricated).
+    getCockpitState(competitionId).then((s) => { if (live) setState(s); }).catch(() => {});
+    return () => { live = false; };
+  }, [competitionId, initial]);
+
   return (
     <div className={styles.frame} data-testid="phone-frame" data-width="392">
-      <header className={styles.appbar}>
-        <span className={styles.logo}>V</span>
-        {/* Static demo shell — not a live feed. Honestly labelled (no live/SCORING affordance). */}
-        <span className={styles.scoring}>DEMO · REPLAY</span>
-      </header>
-
-      <div className={styles.toggle} data-testid="mobile-match">
-        <Badge variant="replay" /> <span className={styles.toggleText}>FRA v BRA · H2 62&apos; · mock data</span>
-      </div>
-
-      <div className={styles.fixtureCard}>
-        <div className={styles.tile}><span className={styles.tileLabel}>SCORE</span><span className="mono">1 - 1</span></div>
-        <div className={styles.tile}><span className={styles.tileLabel}>PHASE</span><span className="mono">H2</span></div>
-        <div className={styles.tile}><span className={styles.tileLabel}>EVENTS/MIN</span><span className="mono">11</span></div>
-      </div>
-
-      <div className={styles.cards}>
-        {ranked.map((r) => (
-          <div key={r.agent_id} className={styles.card} data-testid="mobile-lb-card">
-            <div className={styles.cardTop}>
-              <span className={styles.rank} data-testid="mobile-rank">{r.rank}</span>
-              <span className={styles.name}>{r.agent_name}</span>
-              <span className={styles.bigClv}><Num value={r.avg_clv_bps} kind="bps" /></span>
-            </div>
-            <div className={styles.cardBadges}>
-              <Badge variant={r.proof_mode} />
-              {r.source_mode === 'live' ? <Badge variant="live" />
-                : r.source_mode === 'replay' ? <Badge variant="replay" />
-                  : <span className={`${styles.mixedSrc} mono`}>mixed</span>}
-            </div>
-          </div>
-        ))}
+      {/* one scroll column — the reused Cockpit panels stacked; no live WS on mobile (honest). */}
+      <div className={styles.column} data-testid="mobile-column">
+        <RunHeader header={state.header} wsStatus="disconnected" />
+        <ProofTraceStrip trace={state.trace} />
+        <MatchStatePanel match={state.match} />
+        {/* the CLV table is wide — allow horizontal scroll rather than fork a mobile leaderboard. */}
+        <div className={styles.scrollX}><ClvLeaderboard rows={state.leaderboard} /></div>
+        <CanonicalEventStream runId={state.run_id} events={state.events} />
       </div>
 
       <nav className={styles.tabs} data-testid="bottom-tabs" aria-label="Mobile tabs">
