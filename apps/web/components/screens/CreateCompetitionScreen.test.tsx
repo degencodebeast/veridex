@@ -3,6 +3,7 @@ import { render, screen, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { CreateCompetitionScreen } from '@/components/screens/CreateCompetitionScreen';
 import { MARKET_FAMILY_KEYS } from '@/lib/catalog';
+import { GLOSSARY } from '@/lib/glossary';
 
 describe('CreateCompetitionScreen (REQ-015 / SEC-009)', () => {
   it('pins law/policy/proof/exec before entry and reflects the type choice', async () => {
@@ -101,5 +102,23 @@ describe('CreateCompetitionScreen V5 (wizard density · honest pins)', () => {
     render(<CreateCompetitionScreen />);
     expect(screen.queryByText(/law_hash/i)).toBeNull();
     expect(screen.queryByText(/0x[0-9a-f]{6,}/i)).toBeNull();
+  });
+
+  it('pins "Config pinned ✓" with the frozen-at-create caption — NOT a hash digest', () => {
+    render(<CreateCompetitionScreen />);
+    const summary = screen.getByTestId('pinned-config');
+    expect(within(summary).getByTestId('summary-config-pinned')).toHaveTextContent(/config pinned ✓/i);
+    expect(within(summary).getByTestId('config-pinned-caption'))
+      .toHaveTextContent(/frozen at create.*Proof Card/i);
+    // still no fake digest (the "Config pinned" value must not regress into a hash)
+    expect(within(summary).getByTestId('summary-config-pinned')).not.toHaveTextContent(/0x[0-9a-f]{6,}/i);
+  });
+
+  it('InfoTip copy is single-sourced from lib/glossary.ts — no per-screen microcopy drift', () => {
+    render(<CreateCompetitionScreen />);
+    // the on-screen tooltip text for these doctrine terms MUST equal the glossary verbatim.
+    expect(screen.getByText(GLOSSARY.execution_mode.definition)).toBeInTheDocument();
+    expect(screen.getByText(GLOSSARY.proof_mode.definition)).toBeInTheDocument();
+    expect(screen.getByText(GLOSSARY.config_pinned.definition)).toBeInTheDocument();
   });
 });

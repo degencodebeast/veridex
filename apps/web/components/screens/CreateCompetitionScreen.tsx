@@ -2,8 +2,10 @@
 import { useState } from 'react';
 import { SegmentedControl } from '@/components/ui/SegmentedControl';
 import { Badge } from '@/components/ui/Badge';
+import { InfoTip } from '@/components/ui/InfoTip';
 import { DEFAULT_POLICY_ENVELOPE, FIXTURES } from '@/lib/fixtures/catalog';
 import { MARKET_FAMILY_KEYS } from '@/lib/catalog';
+import { GLOSSARY } from '@/lib/glossary';
 import type { CompetitionType, ExecutionMode, ProofMode, MarketFamilyKey } from '@/lib/catalog';
 import styles from './CreateCompetitionScreen.module.css';
 
@@ -159,16 +161,17 @@ export function CreateCompetitionScreen({
           <h2 className={styles.h2}>Pinned before entry</h2>
           <dl className={styles.summary}>
             <div className={styles.sumRow}><dt>TYPE</dt><dd data-testid="summary-type">{TYPE_CARDS.find((c) => c.type === type)?.label}</dd></div>
-            <div className={styles.sumRow}><dt>SOURCE</dt><dd data-testid="summary-source"><Badge variant={source === 'live' ? 'live' : 'replay'} /></dd></div>
-            <div className={styles.sumRow}><dt>EXEC</dt><dd data-testid="summary-exec" className="mono">{exec}</dd></div>
+            <div className={styles.sumRow}><dt>SOURCE <InfoTip label={GLOSSARY.source_mode.label}>{GLOSSARY.source_mode.definition}</InfoTip></dt><dd data-testid="summary-source"><Badge variant={source === 'live' ? 'live' : 'replay'} /></dd></div>
+            <div className={styles.sumRow}><dt>EXEC <InfoTip label={GLOSSARY.execution_mode.label}>{GLOSSARY.execution_mode.definition}</InfoTip></dt><dd data-testid="summary-exec" className="mono">{exec}</dd></div>
             <div className={styles.sumRow}><dt>MARKET SCOPE</dt><dd data-testid="summary-market-scope" className="mono">{market_scope || '—'}</dd></div>
             <div className={styles.sumRow}><dt>SCORING WINDOW</dt><dd data-testid="summary-scoring-window" className="mono">{scoring_window ?? 'full match'}</dd></div>
-            <div className={styles.sumRow}><dt>PROOF</dt><dd><Badge variant={proof} /></dd></div>
+            <div className={styles.sumRow}><dt>PROOF <InfoTip label={GLOSSARY.proof_mode.label}>{GLOSSARY.proof_mode.definition}</InfoTip></dt><dd><Badge variant={proof} /></dd></div>
+            {/* law_hash is NOT a digest at create (POST surfaces none — config_hash is per-agent at
+                registration, policy_hash at run-start). Honest pin = the config itself. */}
+            <div className={styles.sumRow}><dt>CONFIG <InfoTip label={GLOSSARY.config_pinned.label}>{GLOSSARY.config_pinned.definition}</InfoTip></dt><dd data-testid="summary-config-pinned" className="mono">Config pinned ✓</dd></div>
             <div className={styles.sumRow}><dt>POLICY</dt><dd className="mono">min_edge {DEFAULT_POLICY_ENVELOPE.min_edge_bps} bps · kill {String(DEFAULT_POLICY_ENVELOPE.kill_switch)}</dd></div>
-            {/* law_hash row intentionally OMITTED: POST /competitions surfaces no hash at create
-                (config_hash is per-agent at registration; policy_hash at run-start). Drop the honest
-                treatment in here once decided — no placeholder/fake hash. */}
           </dl>
+          <p className={styles.pinnedCaption} data-testid="config-pinned-caption">This exact CompetitionConfig is frozen at create. Run evidence, score roots, and manifest hashes appear on the Proof Card after the run.</p>
           <div className={styles.pins}>
             <span className={styles.pin}>LAW deterministic recompute</span>
           </div>
