@@ -2,6 +2,14 @@
 // header (source demoted to replay). REPLAY is labeled REPLAY; the MATCH phase (in-play) is a
 // SEPARATE fixture-fact axis from source_mode. No fabricated LIVE. This demo projection is what the
 // Cockpit screen renders under mock; the real WS stream replaces it when wired (B→A).
+//
+// Cockpit B/C split (match panel): goals/yellow/red/corners/phase = (B) WIREABLE — TxLINE's soccer
+// feed provides them (stat-keys 1-8 + the 19-value phase enum); Veridex just stubs scores={} today
+// (txline_normalize.py:117), so LIVE is honest-empty "pending scores-feed" (MatchStatePanel). The
+// running minute/clock ("67'") = (C) genuinely absent — TxLINE tracks WHICH HALF, not elapsed time;
+// the screen never implies a live clock. ROADMAP: wire the TxLINE /scores/stream normalizer
+// (stat-keys 1-8 + 19-phase enum → MarketState.scores/phase) to turn goals/cards/corners/phase from
+// demo into real on-chain-verifiable data.
 import { LEADERBOARD_ROWS } from '@/lib/fixtures/catalog';
 import type { CockpitState } from '@/lib/contracts';
 

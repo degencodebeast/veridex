@@ -2,6 +2,7 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { render, screen } from '@testing-library/react';
 import { CockpitScreen } from '@/components/screens/cockpit/CockpitScreen';
 import { sampleCockpitState } from '@/__tests__/fixtures/contracts';
+import { GLOSSARY } from '@/lib/glossary';
 
 vi.mock('next/navigation', () => ({ usePathname: () => '/arena/wc-fra-bra' }));
 vi.mock('@/hooks/useArenaStream', () => ({
@@ -31,5 +32,16 @@ describe('CockpitScreen (REQ-011 assembly)', () => {
   it('surfaces a deep-linkable AGENT_ACTION row (start of the killer flow — AC-021)', () => {
     render(<CockpitScreen competitionId="wc-fra-bra" initial={sampleCockpitState} />);
     expect(screen.getByRole('link', { name: /AGENT_ACTION/i })).toHaveAttribute('href', '/inspector/run_7f3a/87');
+  });
+
+  it('InfoTip copy is single-sourced from lib/glossary.ts — no per-panel microcopy drift', () => {
+    render(<CockpitScreen competitionId="wc-fra-bra" initial={sampleCockpitState} />);
+    // the cockpit panels pull glossary text verbatim (RunHeader / ClvLeaderboard / event stream)
+    expect(screen.getByText(GLOSSARY.clv.definition)).toBeInTheDocument();
+    expect(screen.getByText(GLOSSARY.source_mode.definition)).toBeInTheDocument();
+    expect(screen.getByText(GLOSSARY.proof_mode.definition)).toBeInTheDocument();
+    expect(screen.getByText(GLOSSARY.seq.definition)).toBeInTheDocument();
+    expect(screen.getByText(GLOSSARY.anchor.definition)).toBeInTheDocument();
+    expect(screen.getByText(GLOSSARY.checks_vs_metrics.definition)).toBeInTheDocument();
   });
 });

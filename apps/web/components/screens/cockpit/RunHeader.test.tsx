@@ -15,9 +15,11 @@ describe('RunHeader (REQ-011 run header)', () => {
   it('renders fixture, source/exec/proof modes and WS status', () => {
     render(<RunHeader header={sampleCockpitState.header} wsStatus="connected" />);
     expect(screen.getByText(/FRA v BRA/)).toBeInTheDocument();
-    expect(screen.getByText(/live/i)).toBeInTheDocument();      // source-mode badge
-    expect(screen.getByText(/paper/i)).toBeInTheDocument();      // exec-mode pill
-    expect(screen.getByText(/verified/i)).toBeInTheDocument();   // proof-mode badge
+    // exact badge/pill strings — the InfoTip glossary popovers also contain "live"/"paper"/"verified"
+    // as substrings (they're in the DOM for aria-describedby), so scope to the exact chip text.
+    expect(screen.getByText('Live')).toBeInTheDocument();        // source-mode badge
+    expect(screen.getByText('PAPER')).toBeInTheDocument();       // exec-mode pill
+    expect(screen.getByText('Verified')).toBeInTheDocument();    // proof-mode badge
     expect(screen.getByText(/connected/i)).toBeInTheDocument();  // WS status
   });
 

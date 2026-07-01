@@ -1,4 +1,6 @@
 import { Badge } from '@/components/ui/Badge';
+import { InfoTip } from '@/components/ui/InfoTip';
+import { GLOSSARY } from '@/lib/glossary';
 import { fmtBps, signClass } from '@/lib/format';
 import type { LeaderboardRow } from '@/lib/contracts';
 import styles from './ClvLeaderboard.module.css';
@@ -15,15 +17,15 @@ export function ClvLeaderboard({ rows }: { rows: LeaderboardRow[] }) {
           <tr>
             <th className={styles.thNum}>#</th>
             <th className={styles.thAgent}>AGENT</th>
-            <th className={styles.thNum}>AVG CLV</th>
+            <th className={styles.thNum}>AVG CLV <InfoTip label={GLOSSARY.clv.label}>{GLOSSARY.clv.definition}</InfoTip></th>
             <th className={styles.thNum}>TOTAL CLV</th>
             <th className={styles.thNum}>SIM PNL ⓟ</th>
             <th className={styles.thNum}>BRIER ⓟ</th>
             <th className={styles.thNum}>MAX DD</th>
             <th className={styles.thNum}>ACT</th>
             <th className={styles.thNum}>VALID</th>
-            <th>PROOF</th>
-            <th>ANCHOR</th>
+            <th>PROOF <InfoTip label={GLOSSARY.checks_vs_metrics.label}>{GLOSSARY.checks_vs_metrics.definition}</InfoTip></th>
+            <th>ANCHOR <InfoTip label={GLOSSARY.anchor.label}>{GLOSSARY.anchor.definition}</InfoTip></th>
           </tr>
         </thead>
         <tbody>
