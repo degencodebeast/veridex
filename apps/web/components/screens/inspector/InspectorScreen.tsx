@@ -1,9 +1,12 @@
+'use client';
 import Link from 'next/link';
 import { Badge } from '@/components/ui/Badge';
+import { InfoTip } from '@/components/ui/InfoTip';
 import { JsonPanel } from '@/components/ui/JsonPanel';
 import { proofHref } from '@/lib/deeplinks';
 import { fmtBps, fmtPct } from '@/lib/format';
 import { QUANTITIES, STABLE_PRICE_CAPTION } from '@/lib/doctrine';
+import { GLOSSARY } from '@/lib/glossary';
 import type { InspectorRecord } from '@/lib/contracts';
 import styles from './InspectorScreen.module.css';
 
@@ -19,7 +22,8 @@ export function InspectorScreen({ record }: { record: InspectorRecord }) {
   const execEdgeText = clv.executable_edge_bps == null || clv.venue_decimal_price == null
     ? '—'
     : `${fmtBps(clv.executable_edge_bps)} @ ${clv.venue_decimal_price.toFixed(3)}`;
-  const stakeText = clv.stake_fraction == null ? '—' : `${(clv.stake_fraction * 100).toFixed(1)}%`;
+  // Kelly/stake sizing is UNSERVED in both mock and live (SEC-005) — never surfaced regardless of value.
+  const stakeText = '—';
   return (
     <article className={styles.inspector}>
       <header className={styles.header}>
@@ -59,10 +63,10 @@ export function InspectorScreen({ record }: { record: InspectorRecord }) {
         <section className={styles.clv} aria-label="CLV explanation">
           <div className={styles.clvTitle}>CLV Explanation</div>
           <dl className={styles.quantities}>
-            <div className={styles.qrow}><dt className={styles.qlabel}>{QLABEL.fair_value}</dt><dd className={`${styles.qval} mono`}>{fairValueText}</dd></div>
-            <div className={styles.qrow}><dt className={styles.qlabel}>{QLABEL.executable_edge}</dt><dd className={`${styles.qval} mono`}>{execEdgeText}</dd></div>
-            <div className={styles.qrow}><dt className={styles.qlabel}>{QLABEL.clv}</dt><dd className={`${styles.qval} mono`}>{fmtBps(clv.clv_bps)}</dd></div>
-            <div className={styles.qrow}><dt className={styles.qlabel}>{QLABEL.stake}</dt><dd className={`${styles.qval} mono`}>{stakeText}</dd></div>
+            <div className={styles.qrow}><dt className={styles.qlabel}>{QLABEL.fair_value} <InfoTip label={GLOSSARY.fair_value.label}>{GLOSSARY.fair_value.definition}</InfoTip></dt><dd className={`${styles.qval} mono`}>{fairValueText}</dd></div>
+            <div className={styles.qrow}><dt className={styles.qlabel}>{QLABEL.executable_edge} <InfoTip label={GLOSSARY.executable_edge.label}>{GLOSSARY.executable_edge.definition}</InfoTip></dt><dd className={`${styles.qval} mono`}>{execEdgeText}</dd></div>
+            <div className={styles.qrow}><dt className={styles.qlabel}>{QLABEL.clv} <InfoTip label={GLOSSARY.clv.label}>{GLOSSARY.clv.definition}</InfoTip></dt><dd className={`${styles.qval} mono`}>{fmtBps(clv.clv_bps)}</dd></div>
+            <div className={styles.qrow}><dt className={styles.qlabel}>{QLABEL.stake} <InfoTip label={GLOSSARY.kelly.label}>{GLOSSARY.kelly.definition}</InfoTip></dt><dd className={`${styles.qval} mono`}>{stakeText}</dd></div>
           </dl>
           <p className={styles.clvPlain}>{clv.plain}</p>
           <span className={`${styles.scoreChip} mono`}>SCORE = {fmtBps(clv.clv_bps)}</span>

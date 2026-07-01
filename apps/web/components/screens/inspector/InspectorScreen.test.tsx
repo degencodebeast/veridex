@@ -2,6 +2,7 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { render, screen } from '@testing-library/react';
 import { InspectorScreen } from '@/components/screens/inspector/InspectorScreen';
 import { sampleInspectorRecord } from '@/__tests__/fixtures/contracts';
+import { GLOSSARY } from '@/lib/glossary';
 
 beforeEach(() => {
   window.matchMedia = vi.fn().mockImplementation((q: string) => ({
@@ -60,11 +61,58 @@ describe('InspectorScreen (REQ-019 / SEC-006/007 / AC-006/021)', () => {
   it('is read-only during a run with no editable affordances + shows READ-ONLY DURING RUN (AC-006)', () => {
     const { container } = render(<InspectorScreen record={sampleInspectorRecord} />);
     expect(screen.getByText(/READ-ONLY DURING RUN/i)).toBeInTheDocument();
-    expect(container.querySelectorAll('input, textarea, select, button').length).toBe(0);
+    // No data-entry elements (inputs/selects/textareas) — screen is fully read-only.
+    expect(container.querySelectorAll('input, textarea, select').length).toBe(0);
+    // InfoTip ⓘ triggers are informational-only buttons; no action/submit buttons.
+    const nonInfoTipBtns = Array.from(container.querySelectorAll('button')).filter(
+      (b) => !/^What is /.test(b.getAttribute('aria-label') ?? '')
+    );
+    expect(nonInfoTipBtns.length).toBe(0);
   });
 
   it('links to the full Proof Card for the run (AC-021)', () => {
     render(<InspectorScreen record={sampleInspectorRecord} />);
     expect(screen.getByRole('link', { name: /View Full Proof Card/i })).toHaveAttribute('href', '/proof/run_7f3a');
+  });
+
+  // ---- Doctrine-quantities + InfoTip teeth (WD-5 Task 22) ----
+
+  it('InfoTip copy is single-sourced from lib/glossary.ts — no per-screen microcopy drift (fair_value / executable_edge / clv / kelly)', () => {
+    render(<InspectorScreen record={sampleInspectorRecord} />);
+    // The on-screen tooltip text MUST equal the glossary verbatim — no paraphrasing.
+    expect(screen.getByText(GLOSSARY.fair_value.definition)).toBeInTheDocument();
+    expect(screen.getByText(GLOSSARY.executable_edge.definition)).toBeInTheDocument();
+    expect(screen.getByText(GLOSSARY.clv.definition)).toBeInTheDocument();
+    expect(screen.getByText(GLOSSARY.kelly.definition)).toBeInTheDocument();
+  });
+
+  it('stake/Kelly is always "—" regardless of stake_fraction value (SEC-005 — never surfaced, not even in mock)', () => {
+    // sampleInspectorRecord has stake_fraction: 0.06 — must still render "—", never "6.0%".
+    const clvSection = render(<InspectorScreen record={sampleInspectorRecord} />)
+      .container.querySelector('[aria-label="CLV explanation"]') as HTMLElement;
+    const dds = clvSection.querySelectorAll('dd');
+    expect(dds[3].textContent).toBe('—'); // stake row is 4th dd
+    expect(clvSection.textContent).not.toContain('6.0%'); // no sizing value revealed
+  });
+
+  it('Executable Edge is a per-decision Inspector quantity — label renders here, not on Markets', () => {
+    render(<InspectorScreen record={sampleInspectorRecord} />);
+    // Scoped to the CLV section to avoid matching the clvPlain paragraph's lowercase "executable edge".
+    const clvSection = screen.getByRole('region', { name: /CLV explanation/i });
+    expect(clvSection).toHaveTextContent(/Executable Edge/i);
+    // Edge value (+22.0 bps) renders inside the CLV explanation section.
+    expect(clvSection).toHaveTextContent('+22.0 bps');
+  });
+
+  it('doctrine quantities populate under mock-populated fixture; all four InfoTip triggers present', () => {
+    render(<InspectorScreen record={sampleInspectorRecord} />);
+    // Four InfoTip ⓘ triggers exist — one per doctrine quantity label.
+    const triggers = screen.getAllByRole('button', { name: /^What is / });
+    expect(triggers.length).toBe(4);
+    // Fair Value and Executable Edge populate (non-"—") when clv_explanation carries values.
+    const clvSection = screen.getByRole('region', { name: /CLV explanation/i });
+    expect(clvSection.textContent).toContain('67.9%'); // fair_value_pct
+    expect(clvSection.textContent).toContain('69.7%'); // closing_fair_value_pct
+    expect(clvSection.textContent).toContain('1.472'); // venue_decimal_price
   });
 });
