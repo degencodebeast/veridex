@@ -42,6 +42,7 @@ export const sampleProofArtifact: ProofArtifact = {
     explorer_url: null,
   },
   proof_mode_map: { reproducible: 3, verified: 1, partial: 0 },
+  roots: [], // honest-empty (the served proof_card has no root_forest yet)
 };
 
 // Offline-replay variant: ANCHOR is not_applicable (AC-002).

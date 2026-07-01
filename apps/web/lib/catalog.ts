@@ -55,6 +55,18 @@ export interface PolicyEnvelope {
   kill_switch: boolean;
 }
 
+// Studio PREFLIGHT PREVIEW view-model — FULLY (A) real config (codex option 3). policy_envelope +
+// rule_config + min_edge_threshold_bps are all derived from the real config that WILL be pinned
+// (SEC-009). There is intentionally NO computed/estimated pre-run edge value: pre-run edge is a
+// per-run sealed proof quantity (same risk class as Markets EDGE), so Studio shows only the min-edge
+// THRESHOLD ("Minimum executable edge ≥ N bps") + a plain disclaimer — never a proof-styled number.
+export interface PreflightRule { field: string; value: string; }
+export interface PreflightPreview {
+  policy_envelope: PolicyEnvelope;
+  rule_config: PreflightRule[];
+  min_edge_threshold_bps: number; // the REAL policy threshold (config) — NOT a computed edge value
+}
+
 export interface CompetitionConfig {
   competition_type: CompetitionType;
   source_mode: SourceMode; // replay | live (never mixed for a single competition)

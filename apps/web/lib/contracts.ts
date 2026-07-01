@@ -221,13 +221,23 @@ export interface PerformanceMetrics {
   max_drawdown: number;
 }
 
-export type ProofChainStepId = 'evidence' | 'pre-score' | 'score' | 'manifest' | 'anchor';
+// The 6th step ('policy') carries the policy/exec gate — justified by the real `policy`/`receipt`
+// Merkle roots in the backend root-forest (veridex/chain/merkle.py build_root_forest).
+export type ProofChainStepId = 'evidence' | 'pre-score' | 'policy' | 'score' | 'manifest' | 'anchor';
 export interface ProofChainStep {
   id: ProofChainStepId;
   label: string;
   sub: string;
   hash: string;
   status: CheckStatus;
+}
+
+// One named Merkle root of the backend root-forest. `domain` is a REAL backend key (event_log /
+// score / receipt / policy / competition / payout_reserved) — never invented. `root` is the hex.
+export interface ProofRoot {
+  domain: string;
+  label: string;
+  root: string;
 }
 
 export type ValidationMethod =
@@ -266,6 +276,9 @@ export interface ProofArtifact {
   validations: ValidationEntry[];
   anchor: AnchorInfo;
   proof_mode_map: Record<ProofMode, number>;
+  // The named Merkle root-forest (6 real domains). Mapped from the served `lineage.root_forest`
+  // when the backend serializes it; honest-empty ([]) until then (mock overlays a demo forest).
+  roots: ProofRoot[];
 }
 
 // Returned by the AUTHORITATIVE backend verify/recompute endpoint (WD-1).

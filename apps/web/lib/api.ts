@@ -16,6 +16,9 @@
 //   - InspectorRecord: proof_mode/is_live/clv_explanation are not in wire InspectorRecord.
 import { CHECK_ORDER } from '@/lib/checks';
 import { isMockEnabled, MOCK_FIXTURES } from '@/lib/mock';
+import { COCKPIT_DEMO } from '@/lib/fixtures/cockpit';
+import { INSPECTOR_DEMO_QUANTITIES } from '@/lib/fixtures/inspector';
+import { PROOF_DEMO_ROOTS, mapRootForest } from '@/lib/fixtures/proof';
 import { VERIFIER_VERSION, type StatusBarState } from '@/lib/status';
 import type * as W from '@/lib/wire';
 import type {
@@ -152,6 +155,8 @@ export function adaptProofArtifact(w: W.ProofArtifact): ProofArtifact {
     validations: [], // GAP: on-chain validation entries not in wire ProofArtifact
     anchor: mapAnchor(w.anchor),
     proof_mode_map: modes,
+    // Maps the served root_forest (6 real named roots) when present; honest-empty [] until then.
+    roots: mapRootForest(w.lineage),
   };
 }
 
@@ -290,8 +295,10 @@ const demote = (s: SourceMode): SourceMode => (s === 'live' ? 'replay' : s);
 // on — so the screen populates to its full state from contracts/fixtures, never the backend.
 export async function getProofArtifact(runId: string): Promise<ProofArtifact> {
   if (isMockEnabled()) {
+    // Overlay the DEMO root-forest (real names + demo hex) — mock only. Live maps the served forest
+    // (currently absent ⇒ honest-empty). REPLAY source (demoted), never LIVE.
     const p = adaptProofArtifact(MOCK_FIXTURES.proofArtifact);
-    return { ...p, source_mode: demote(p.source_mode) };
+    return { ...p, source_mode: demote(p.source_mode), roots: PROOF_DEMO_ROOTS };
   }
   return adaptProofArtifact(await getJson<W.ProofArtifact>(PATHS.runProof(runId)));
 }
@@ -311,14 +318,21 @@ export async function getLeaderboard(competitionId?: string): Promise<Leaderboar
 
 export async function getCockpitState(competitionId: string): Promise<CockpitState> {
   if (isMockEnabled()) {
+    // Fixture-seeded REPLAY projection: honest header (source demoted) + the populated demo body.
+    // Live (mock off) stays honest-empty until the WS fills it — no fabricated projection.
     const c = adaptCompetitionState(MOCK_FIXTURES.competition);
-    return { ...c, header: { ...c.header, source_mode: demote(c.header.source_mode) } };
+    return { ...c, header: { ...c.header, source_mode: demote(c.header.source_mode) }, ...COCKPIT_DEMO };
   }
   return adaptCompetitionState(await getJson<W.CompetitionStateResponse>(PATHS.competitionState(competitionId)));
 }
 
 export async function getInspectorRecord(runId: string, seq: number | string): Promise<InspectorRecord> {
-  if (isMockEnabled()) return adaptInspector(MOCK_FIXTURES.inspector);
+  if (isMockEnabled()) {
+    // Overlay the DEMO doctrine quantities (Fair Value / Executable Edge / stake) — mock only. Live
+    // has none of these on the wire, so adaptInspector leaves them null ("—"). clv_bps travels through.
+    const rec = adaptInspector(MOCK_FIXTURES.inspector);
+    return { ...rec, clv_explanation: { ...rec.clv_explanation, ...INSPECTOR_DEMO_QUANTITIES } };
+  }
   return adaptInspector(await getJson<W.InspectorRecord>(PATHS.inspector(runId, seq)));
 }
 
