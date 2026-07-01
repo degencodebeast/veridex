@@ -1,4 +1,4 @@
-/* StudioScreen — identical base to AgentStudioScreen; new preflight-density classes appended. */
+/* StudioScreen — archetype/config base + the V5 preflight-density classes (threshold + rule-config). */
 .screen { display: flex; flex-direction: column; gap: var(--space-3); }
 .head { display: flex; align-items: center; justify-content: space-between; }
 .title { margin: 0; font-size: 19px; font-weight: 600; letter-spacing: -0.01em; }

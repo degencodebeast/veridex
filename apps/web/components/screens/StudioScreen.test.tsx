@@ -158,7 +158,8 @@ describe('StudioScreen (REQ-018 / AC-007 / SEC-006/007/009)', () => {
     });
 
     // ── RED-PROOF TOOTH C: No ALLOW/DENY badge from a sample edge ────────────
-    // The old preflight computed policyDecision from sampleEdge — that pattern is forbidden.
+    // The old preflight computed an ALLOW/DENY policyDecision from a hardcoded pre-run edge value —
+    // that computed-edge pattern is forbidden (codex option 3); this tooth guards against it.
     it('TOOTH-C: no ALLOW/DENY badge computed from a sample edge in the preflight panel', () => {
       render(<StudioScreen />);
       const preflight = screen.getByTestId('preflight');
