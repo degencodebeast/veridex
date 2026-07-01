@@ -2,6 +2,7 @@ import { describe, it, expect, vi } from 'vitest';
 import { render, screen, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { CreateCompetitionScreen } from '@/components/screens/CreateCompetitionScreen';
+import { MARKET_FAMILY_KEYS } from '@/lib/catalog';
 
 describe('CreateCompetitionScreen (REQ-015 / SEC-009)', () => {
   it('pins law/policy/proof/exec before entry and reflects the type choice', async () => {
@@ -43,5 +44,62 @@ describe('CreateCompetitionScreen (REQ-015 / SEC-009)', () => {
     await user.click(screen.getByRole('button', { name: /commit & enter/i }));
     // The derived proof_mode (shown as pinned) must travel with the commit (SEC-009 "commit what's pinned").
     expect(onCommit).toHaveBeenCalledWith(expect.objectContaining({ source_mode: 'replay', proof_mode: 'reproducible' }));
+  });
+});
+
+// ── V5 fidelity: type cards · fixture/scoring · market scope · SUMMARY sidebar ──
+describe('CreateCompetitionScreen V5 (wizard density · honest pins)', () => {
+  it('renders the 4 REAL competition_type cards; selecting one pins it into the commit (SEC-009)', async () => {
+    const user = userEvent.setup();
+    const onCommit = vi.fn();
+    render(<CreateCompetitionScreen onCommit={onCommit} />);
+    const cards = screen.getByTestId('type-cards');
+    (['live_arena', 'replay_arena', 'head_to_head', 'prize_vault_challenge'] as const).forEach((t) =>
+      expect(within(cards).getByTestId(`type-${t}`)).toBeInTheDocument());
+    await user.click(within(cards).getByTestId('type-head_to_head'));
+    await user.click(screen.getByRole('button', { name: /commit & enter/i }));
+    expect(onCommit).toHaveBeenCalledWith(expect.objectContaining({ competition_type: 'head_to_head' }));
+  });
+
+  it('market-scope options are EXACTLY the real MARKET_FAMILY_KEYS — never invented markets', () => {
+    render(<CreateCompetitionScreen />);
+    const scope = screen.getByTestId('market-scope');
+    MARKET_FAMILY_KEYS.forEach((k) => expect(within(scope).getByTestId(`market-${k}`)).toBeInTheDocument());
+    // no fabricated market families offered
+    expect(within(scope).queryByText(/BTTS|correct score|first goalscorer|half-time/i)).toBeNull();
+  });
+
+  it('composes market_scope from the selected fixture + real families; scoring window honest-empty when unset', async () => {
+    const user = userEvent.setup();
+    const onCommit = vi.fn();
+    render(<CreateCompetitionScreen onCommit={onCommit} />);
+    const summary = screen.getByTestId('pinned-config');
+    // default fixture (FRA v BRA) + families compose into the pinned market_scope
+    expect(within(summary).getByTestId('summary-market-scope')).toHaveTextContent(/FRA v BRA/i);
+    // scoring window is optional → honest label when unset, NOT a fabricated window
+    expect(within(summary).getByTestId('summary-scoring-window')).toHaveTextContent(/full match/i);
+    await user.click(screen.getByRole('button', { name: /commit & enter/i }));
+    expect(onCommit).toHaveBeenCalledWith(expect.objectContaining({
+      market_scope: expect.stringMatching(/FRA v BRA/i), scoring_window: null,
+    }));
+  });
+
+  it('SUMMARY pins the real CompetitionConfig fields POST freezes; REPLAY source shows REPLAY, never LIVE', async () => {
+    const user = userEvent.setup();
+    render(<CreateCompetitionScreen />);
+    const summary = screen.getByTestId('pinned-config');
+    ['summary-type', 'summary-source', 'summary-exec', 'summary-market-scope', 'summary-scoring-window']
+      .forEach((id) => expect(within(summary).getByTestId(id)).toBeInTheDocument());
+    // source_mode axis is separate from competition_type: choosing Replay pins REPLAY, never LIVE.
+    const sourceGroup = screen.getByRole('radiogroup', { name: /source mode/i });
+    await user.click(within(sourceGroup).getByRole('radio', { name: 'Replay' }));
+    expect(within(summary).getByTestId('summary-source')).toHaveTextContent(/replay/i);
+    expect(within(summary).getByTestId('summary-source')).not.toHaveTextContent(/\blive\b/i);
+  });
+
+  it('renders NO fabricated law_hash / pin-hash — the create API surfaces none (row deferred, honest-absent)', () => {
+    render(<CreateCompetitionScreen />);
+    expect(screen.queryByText(/law_hash/i)).toBeNull();
+    expect(screen.queryByText(/0x[0-9a-f]{6,}/i)).toBeNull();
   });
 });
