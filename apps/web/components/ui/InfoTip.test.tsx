@@ -24,4 +24,24 @@ describe('InfoTip (accessible glossary primitive)', () => {
     fireEvent.keyDown(btn, { key: 'Escape' });
     expect(tip).toHaveAttribute('data-open', 'false'); // Escape closes
   });
+
+  it('opens on tap/click and STAYS open — not a self-closing toggle (reliable for touch/Mobile)', () => {
+    render(<InfoTip label="CLV">definition text</InfoTip>);
+    const btn = screen.getByRole('button', { name: /what is clv/i });
+    const tip = screen.getByRole('tooltip');
+    fireEvent.click(btn);
+    expect(tip).toHaveAttribute('data-open', 'true'); // tap opens
+    fireEvent.click(btn);
+    expect(tip).toHaveAttribute('data-open', 'true'); // re-tap does NOT toggle it closed
+  });
+
+  it('closes on an outside tap/click (coherent dismissal for touch)', () => {
+    render(<div><InfoTip label="CLV">definition text</InfoTip></div>);
+    const btn = screen.getByRole('button', { name: /what is clv/i });
+    const tip = screen.getByRole('tooltip');
+    fireEvent.click(btn);
+    expect(tip).toHaveAttribute('data-open', 'true');
+    fireEvent.mouseDown(document.body); // tap outside the tip
+    expect(tip).toHaveAttribute('data-open', 'false');
+  });
 });

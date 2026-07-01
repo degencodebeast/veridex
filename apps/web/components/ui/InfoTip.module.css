@@ -1,5 +1,5 @@
 .wrap { position: relative; display: inline-flex; vertical-align: middle; }
-.trigger { display: inline-flex; align-items: center; justify-content: center; width: 14px; height: 14px; padding: 0; margin-left: 4px; border: none; background: transparent; color: var(--text-3); font-size: 11px; line-height: 1; cursor: help; border-radius: 50%; }
+.trigger { display: inline-flex; align-items: center; justify-content: center; width: 14px; height: 14px; padding: 0; margin-left: 4px; border: none; background: transparent; color: var(--text-3); font-size: 11px; line-height: 1; cursor: pointer; border-radius: 50%; }
 .trigger:hover, .trigger:focus-visible { color: var(--accent-hi); outline: none; }
 .trigger:focus-visible { box-shadow: 0 0 0 2px var(--accent); }
 .popover {
