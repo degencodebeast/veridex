@@ -17,6 +17,21 @@ from typing import Any
 from pydantic import BaseModel
 
 
+class ExplainRequest(BaseModel):
+    """Optional focus for the Proof Explainer (``POST /runs/{id}/explain``).
+
+    Both fields are optional: a bare ``{}`` requests a general narration. Neither is scored,
+    persisted, or fed to any trust-path code — they only steer the educational narration.
+
+    Attributes:
+        question: Free-form question about the already-produced proof.
+        target_field: A specific served field to explain.
+    """
+
+    question: str | None = None
+    target_field: str | None = None
+
+
 class LeaderboardRow(BaseModel):
     """One ranked agent row from the cross-run leaderboard.
 

@@ -131,8 +131,10 @@ async def explain_proof(
 
     resolved_settings = settings if settings is not None else get_settings()
 
-    # Graceful degrade BEFORE any network work: no key ⇒ honest unavailable, never a fabrication.
-    if getattr(resolved_settings, "openrouter_api_key", None) is None:
+    # Graceful degrade BEFORE any network work: no key (missing OR empty/whitespace) ⇒ honest
+    # unavailable, never a fabrication. An empty-string OPENROUTER_API_KEY="" is NOT a real key.
+    api_key = getattr(resolved_settings, "openrouter_api_key", None)
+    if not api_key or not str(api_key).strip():
         return _envelope(_UNAVAILABLE_NO_KEY)
 
     system_prompt = _build_system_prompt(read_model)

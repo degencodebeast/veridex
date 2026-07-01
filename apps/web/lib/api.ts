@@ -19,6 +19,7 @@ import { isMockEnabled, MOCK_FIXTURES } from '@/lib/mock';
 import { COCKPIT_DEMO } from '@/lib/fixtures/cockpit';
 import { INSPECTOR_DEMO_QUANTITIES } from '@/lib/fixtures/inspector';
 import { PROOF_DEMO_ROOTS, mapRootForest } from '@/lib/fixtures/proof';
+import { PROOF_EXPLAIN_DEMO, type ProofExplanation } from '@/lib/explainer';
 import { VERIFIER_VERSION, type StatusBarState } from '@/lib/status';
 import type * as W from '@/lib/wire';
 import type {
@@ -35,6 +36,7 @@ export const PATHS = {
   // tests/test_api_contract.py; /api/proof is 404). A regression re-adding /proof false-404s the card.
   runProof: (runId: string) => `/runs/${runId}`,
   verify: (runId: string) => `/runs/${runId}/verify`,
+  explain: (runId: string) => `/runs/${runId}/explain`,
   competitionState: (id: string) => `/competitions/${id}`,
   competitionEvents: (id: string, sinceSeq = 0) => `/competitions/${id}/events?since_seq=${sinceSeq}`,
   leaderboard: (competitionId?: string) =>
@@ -306,6 +308,17 @@ export async function getProofArtifact(runId: string): Promise<ProofArtifact> {
 export async function verifyProof(runId: string): Promise<VerifyResult> {
   if (isMockEnabled()) return adaptVerify(MOCK_FIXTURES.verify);
   return adaptVerify(await postJson<W.VerifyResult>(PATHS.verify(runId)));
+}
+
+// Proof Explainer (Phase B) — POST /runs/{id}/explain. READ-ONLY, non-scoring. Returns ONLY the
+// {explanation, disclaimer, footer} envelope. Mock ⇒ a DEMO narration (same disclaimer/footer),
+// never a live call. NOTE: validity/pass questions are short-circuited to the FIXED template in the
+// UI BEFORE this reader is ever called — the LLM never answers "is this valid?".
+export async function explainProof(
+  runId: string, opts?: { question?: string; target_field?: string },
+): Promise<ProofExplanation> {
+  if (isMockEnabled()) return PROOF_EXPLAIN_DEMO;
+  return postJson<ProofExplanation>(PATHS.explain(runId), opts ?? {});
 }
 
 export async function getLeaderboard(competitionId?: string): Promise<LeaderboardRow[]> {

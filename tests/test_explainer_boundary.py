@@ -143,6 +143,18 @@ async def test_missing_openrouter_key_returns_honest_unavailable() -> None:
     assert out["footer"] == FOOTER
 
 
+async def test_empty_string_openrouter_key_is_treated_as_missing() -> None:
+    """An empty/whitespace OPENROUTER_API_KEY="" is NOT a real key ⇒ honest unavailable, no call."""
+    from veridex.explainer import explain_proof
+
+    fake = _FakeClient()
+    empty = Settings(_env_file=None, openrouter_api_key="   ")  # empty/whitespace, not a real key
+    out = await explain_proof({"proof_artifact": {}}, settings=empty, client=fake)
+
+    assert "unavailable" in out["explanation"].lower()
+    assert fake.calls == []  # graceful-degrade BEFORE any network work
+
+
 async def test_llm_call_failure_degrades_honestly_not_fabricated() -> None:
     from veridex.explainer import explain_proof
 

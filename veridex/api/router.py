@@ -54,6 +54,7 @@ from veridex.api.schemas import (
     CompetitionStateResponse,
     CompetitionSummaryResponse,
     DemoRunResponse,
+    ExplainRequest,
     FeedHealthResponse,
     InspectorRecord,
     KillSwitchResponse,
@@ -615,7 +616,7 @@ def create_app(
     @app.post("/runs/{run_id}/explain")
     async def explain_run_endpoint(
         run_id: str,
-        body: dict[str, Any] | None = None,
+        body: ExplainRequest | None = None,
         dep_store: Store = Depends(_get_store),  # noqa: B008
     ) -> dict[str, str]:
         """Narrate an already-produced proof in plain language — the Proof Explainer (NOT a verifier).
@@ -693,11 +694,11 @@ def create_app(
             "glossary": GLOSSARY_DEFINITIONS,
         }
 
-        payload = body or {}
+        req = body or ExplainRequest()
         return await explain_proof(
             read_model,
-            question=payload.get("question"),
-            target_field=payload.get("target_field"),
+            question=req.question,
+            target_field=req.target_field,
             settings=resolved_settings,
         )
 

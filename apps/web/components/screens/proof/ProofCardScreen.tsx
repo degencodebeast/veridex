@@ -13,6 +13,7 @@ import { PerformanceMetricsBlock } from './PerformanceMetricsBlock';
 import { OnChainValidationBlock } from './OnChainValidationBlock';
 import { AnchorPanel } from './AnchorPanel';
 import { VerifyButton } from './VerifyButton';
+import { ProofExplainer } from './ProofExplainer';
 import styles from './ProofCardScreen.module.css';
 
 export function ProofCardScreen({ artifact }: { artifact: ProofArtifact }) {
@@ -89,7 +90,9 @@ export function ProofCardScreen({ artifact }: { artifact: ProofArtifact }) {
               </div>
             )}
           </section>
-          <p className={styles.chatNote}>Proof Chat · READ-ONLY · POST-RUN</p>
+          {/* Read-only educational narrator — fenced (never verifies). Cites the deterministic
+              Verify result; validity questions are short-circuited to a fixed non-LLM template. */}
+          <ProofExplainer runId={artifact.run_id} verified={verify?.verified ?? null} />
         </div>
       </div>
     </article>
