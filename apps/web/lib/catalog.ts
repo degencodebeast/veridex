@@ -82,6 +82,9 @@ export interface CompetitionSummary {
   events_per_min: number | null; // null while not live
   ws_live: boolean;
   settled_run_id: string | null; // for the Recent-Settled strip → Proof
+  // Roadmappable DEMO field: a per-competition leader CLV shown ONLY in mock mode (no honest
+  // comp→leader mapping yet). null ⇒ "—" even under mock (e.g. upcoming, no runs). Never LIVE.
+  demo_leader_clv_bps?: number | null;
 }
 
 // --- Agents -------------------------------------------------------------------

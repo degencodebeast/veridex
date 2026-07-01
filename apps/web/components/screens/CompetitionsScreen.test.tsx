@@ -1,7 +1,9 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi, afterEach } from 'vitest';
 import { render, screen, within } from '@testing-library/react';
 import { CompetitionsScreen } from '@/components/screens/CompetitionsScreen';
 import type { CompetitionSummary } from '@/lib/catalog';
+
+afterEach(() => { vi.unstubAllEnvs(); });
 
 // minimal builder for count/derivation teeth (real shape, no fabricated aggregate band)
 function comp(id: string, lifecycle: CompetitionSummary['lifecycle'], over: Partial<CompetitionSummary> = {}): CompetitionSummary {
@@ -116,10 +118,26 @@ describe('CompetitionsScreen V5 (density · counts/prize/leader honesty)', () =>
   });
 
   it('LEADER CLV is "—" everywhere — no fabricated comp leader (no honest comp→leader link)', () => {
-    render(<CompetitionsScreen />);
+    render(<CompetitionsScreen />); // mock OFF (default) → live view
     const cells = within(screen.getByTestId('all-competitions')).getAllByTestId('leader-cell');
     expect(cells.length).toBeGreaterThan(0);
     expect(cells.every((c) => c.textContent === '—')).toBe(true);
     expect(cells.some((c) => /\d/.test(c.textContent ?? ''))).toBe(false);
+  });
+
+  it('LEADER CLV is mock-gated: a demo value under MOCK, honest "—" in LIVE (roadmappable field)', () => {
+    // MOCK ON → populated demo leader CLV (only ever under the DEMO banner, never labeled LIVE)
+    vi.stubEnv('NEXT_PUBLIC_VERIDEX_MOCK', '1');
+    const { unmount } = render(<CompetitionsScreen />);
+    const fraMock = within(within(screen.getByTestId('all-competitions')).getByTestId('comp-wc-fra-bra')).getByTestId('leader-cell');
+    expect(fraMock).toHaveTextContent(/\+?\d+\.\d+\s*bps/i); // a real bps digit, not —
+    expect(fraMock).not.toHaveTextContent('—');
+    unmount();
+    // MOCK OFF (live) → "—", never the demo number (guards live from showing fabricated data)
+    vi.unstubAllEnvs();
+    render(<CompetitionsScreen />);
+    const fraLive = within(within(screen.getByTestId('all-competitions')).getByTestId('comp-wc-fra-bra')).getByTestId('leader-cell');
+    expect(fraLive).toHaveTextContent('—');
+    expect(fraLive.textContent).not.toMatch(/\d/);
   });
 });

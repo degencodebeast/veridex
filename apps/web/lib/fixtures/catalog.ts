@@ -50,6 +50,7 @@ export const COMPETITIONS: CompetitionSummary[] = [
     competition_id: 'wc-fra-bra', title: 'World Cup · FRA v BRA', competition_type: 'live_arena',
     lifecycle: 'live', source_mode: 'live', execution_mode: 'paper', proof_mode: 'verified',
     market_scope: '1X2 · O/U · AH', roster_size: 4, events_per_min: 11, ws_live: true, settled_run_id: null,
+    demo_leader_clv_bps: 24.6,
   },
   {
     competition_id: 'wc-arg-ger', title: 'World Cup · ARG v GER', competition_type: 'replay_arena',
@@ -60,6 +61,7 @@ export const COMPETITIONS: CompetitionSummary[] = [
     competition_id: 'wc-esp-ned', title: 'World Cup · ESP v NED', competition_type: 'head_to_head',
     lifecycle: 'settled', source_mode: 'replay', execution_mode: 'paper', proof_mode: 'reproducible',
     market_scope: '1X2', roster_size: 2, events_per_min: null, ws_live: false, settled_run_id: 'run_esp_ned_01',
+    demo_leader_clv_bps: 16.2,
   },
 ];
 

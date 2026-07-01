@@ -1,8 +1,10 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi, afterEach } from 'vitest';
 import { render, screen, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { MarketsScreen } from '@/components/screens/MarketsScreen';
 import type { OddsUpdate } from '@/lib/catalog';
+
+afterEach(() => { vi.unstubAllEnvs(); });
 
 // In-running-only odds (no pre-match capture) → closings cannot be reconstructed → pending/—
 // (the honest CON-040 branch). Covers all three soccer families.
@@ -132,13 +134,12 @@ describe('MarketsScreen V5 (default-select · right rail · EDGE/AGENTS honesty)
     expect(rail).not.toHaveTextContent(/scoped to this fixture/i);
   });
 
-  it('EDGE + AGENTS columns are honest "—" (no fabricated executable-edge / per-market agent counts)', () => {
-    render(<MarketsScreen />);
+  it('EDGE + AGENTS columns are honest "—" in LIVE (mock OFF) — no fabricated edge / per-market counts', () => {
+    render(<MarketsScreen />); // mock OFF (default) → live view
     const fam = screen.getByTestId('families');
     expect(within(fam).getAllByText(/EDGE/i).length).toBeGreaterThanOrEqual(1);   // header kept for layout
     expect(within(fam).getAllByText(/AGENTS/i).length).toBeGreaterThanOrEqual(1);
-    // every EDGE/AGENTS cell is the em-dash, NEVER a number (executable edge needs a venue price;
-    // per-market agent counts aren't tracked — we refuse to fabricate either).
+    // every EDGE/AGENTS cell is the em-dash in live, NEVER a number.
     const edge = within(fam).getAllByTestId('edge-cell');
     const agents = within(fam).getAllByTestId('agents-cell');
     expect(edge.length).toBeGreaterThan(0);
@@ -146,6 +147,21 @@ describe('MarketsScreen V5 (default-select · right rail · EDGE/AGENTS honesty)
     expect(edge.some((c) => /\d/.test(c.textContent ?? ''))).toBe(false);
     expect(agents.every((c) => c.textContent === '—')).toBe(true);
     expect(agents.some((c) => /\d/.test(c.textContent ?? ''))).toBe(false);
+  });
+
+  it('under MOCK: AGENTS shows a demo count, but EDGE STAYS "—" (executable edge belongs on the Inspector)', () => {
+    vi.stubEnv('NEXT_PUBLIC_VERIDEX_MOCK', '1');
+    render(<MarketsScreen />);
+    const fam = screen.getByTestId('families');
+    const agents = within(fam).getAllByTestId('agents-cell');
+    const edge = within(fam).getAllByTestId('edge-cell');
+    // AGENTS (roadmappable) populates with a demo count under the DEMO banner — never "—" here.
+    expect(agents.length).toBeGreaterThan(0);
+    expect(agents.every((c) => /\d/.test(c.textContent ?? ''))).toBe(true);
+    expect(agents.some((c) => c.textContent === '—')).toBe(false);
+    // EDGE stays "—" EVEN under mock — doctrine: executable edge is a per-decision Inspector quantity.
+    expect(edge.every((c) => c.textContent === '—')).toBe(true);
+    expect(edge.some((c) => /\d/.test(c.textContent ?? ''))).toBe(false);
   });
 
   it('the disabled 1X2-HT tab states WHY it is unavailable (reuse the disabledReason idiom — not "broken")', () => {

@@ -1,8 +1,10 @@
 'use client';
+import { useEffect, useState } from 'react';
 import Link from 'next/link';
 import { Badge } from '@/components/ui/Badge';
 import { LiveDot } from '@/components/ui/LiveDot';
 import { COMPETITIONS, MY_REWARDS } from '@/lib/fixtures/catalog';
+import { isMockEnabled } from '@/lib/mock';
 import type { CompetitionSummary, CompetitionType, RewardSummary } from '@/lib/catalog';
 import styles from './CompetitionsScreen.module.css';
 
@@ -47,9 +49,15 @@ function LiveCard({ c }: { c: CompetitionSummary }) {
 export function CompetitionsScreen({ comps = COMPETITIONS, rewards = MY_REWARDS }: {
   comps?: CompetitionSummary[]; rewards?: RewardSummary[];
 }) {
+  // Mock-gate (hydration-safe: default off on SSR/first render, then read after mount). Roadmappable
+  // demo fields (LEADER CLV) populate ONLY under mock; live shows honest "—" until backend-wired.
+  const [mock, setMock] = useState(false);
+  useEffect(() => { setMock(isMockEnabled()); }, []);
   const live = comps.filter((c) => c.lifecycle === 'live');
   const upcoming = comps.filter((c) => c.lifecycle === 'upcoming');
   const settled = comps.filter((c) => c.lifecycle === 'settled');
+  const leaderClv = (c: CompetitionSummary) =>
+    mock && c.demo_leader_clv_bps != null ? `${c.demo_leader_clv_bps >= 0 ? '+' : ''}${c.demo_leader_clv_bps.toFixed(1)} bps` : null;
   // PRIZE is the honest design-target label from the rewards join (Prize Vault doctrine: designed,
   // Phase 2D, no funds move). No reward entry ⇒ "No vault" (clearer than a bare —). The column is
   // fenced by a header disclaimer so V5's literal "PRIZE" can never read as a funded/held pool.
@@ -125,7 +133,7 @@ export function CompetitionsScreen({ comps = COMPETITIONS, rewards = MY_REWARDS 
                 {/* AGENTS = roster_size — real, trusted data (the LIVE-NOW card shows it too) */}
                 <td className={`${styles.num} mono`} data-testid="agents-cell">{c.roster_size}</td>
                 {/* no honest comp→leader source → honest — (never a fabricated leader) */}
-                <td className={styles.num} data-testid="leader-cell"><span className={styles.muted}>—</span></td>
+                <td className={styles.num} data-testid="leader-cell">{leaderClv(c) ?? <span className={styles.muted}>—</span>}</td>
                 {/* designed target, never moved funds */}
                 <td className={`${styles.muted} mono`} data-testid="prize-cell">{prizeFor(c.competition_id)}</td>
                 <td><Badge variant={c.proof_mode} /></td>

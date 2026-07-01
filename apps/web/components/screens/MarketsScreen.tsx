@@ -1,9 +1,10 @@
 'use client';
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import Link from 'next/link';
 import { Badge } from '@/components/ui/Badge';
 import { SPORT_CATALOG, buildFamilies, oddsUpdatesPath } from '@/lib/txline/client';
 import { ODDS_UPDATES, FIXTURES, FEED_HEALTH, LEADERBOARD_ROWS } from '@/lib/fixtures/catalog';
+import { isMockEnabled } from '@/lib/mock';
 import type {
   FixtureSummary, OddsUpdate, SourceMode, FeedHealthState, LeaderboardRow, MarketFamilyKey,
 } from '@/lib/catalog';
@@ -43,6 +44,12 @@ export function MarketsScreen({
   // ELIGIBLE AGENTS rail = the eligible POOL (badge==='eligible'), NOT scoped to this fixture
   // (no fixture→agent mapping exists). Honest: not-eligible agents are excluded.
   const eligible = useMemo(() => leaderboard.filter((r) => r.eligibility_badge === 'eligible'), [leaderboard]);
+  // Mock-gate (hydration-safe). The AGENTS column is a roadmappable demo count shown ONLY under mock
+  // (no market_key→agents mapping yet); live stays honest "—". EDGE is NOT gated — it stays "—" even
+  // under mock (executable edge is a per-decision Inspector quantity, not a catalog value).
+  const [mock, setMock] = useState(false);
+  useEffect(() => { setMock(isMockEnabled()); }, []);
+  const demoAgents = eligible.length;
 
   return (
     <section className={styles.screen} aria-label="Markets">
@@ -147,7 +154,7 @@ export function MarketsScreen({
                               {/* EDGE: executable edge needs a venue price (not in this feed) — honest — */}
                               <td className={styles.num} data-testid="edge-cell"><span className={styles.muted}>—</span></td>
                               {/* AGENTS: no per-market agent mapping in the backend — honest — (never a count) */}
-                              <td className={styles.num} data-testid="agents-cell"><span className={styles.muted}>—</span></td>
+                              <td className={styles.num} data-testid="agents-cell">{mock ? demoAgents : <span className={styles.muted}>—</span>}</td>
                             </tr>
                           ))}
                         </tbody>
