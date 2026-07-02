@@ -33,7 +33,7 @@ from typing import TYPE_CHECKING, Any
 
 from veridex.config import get_settings
 from veridex.ingest.marketstate import MarketState
-from veridex.law.recompute import LIVE, REPLAY, recompute
+from veridex.law.recompute import LIVE, PENDING, REPLAY, recompute
 from veridex.runtime.agent import (
     AGENT_ACTION_SCHEMA_VERSION,
     DEFAULT_MODEL_ID,
@@ -49,6 +49,7 @@ from veridex.runtime.evidence import (
     serialize_payload,
 )
 from veridex.runtime.schemas import AgentAction, RunEvent
+from veridex.runtime.window import CLV_FIELD_TRUE, RunWindow, clv_field_name, is_pending_horizon
 
 if TYPE_CHECKING:  # avoid a runtime import cycle (store lazily imports RunResult)
     from veridex.store import Store
@@ -215,6 +216,19 @@ def _closing_snapshots(marketstates: list[MarketState]) -> dict[str, MarketState
     return closing_by_market
 
 
+def _is_scored_row(row: dict[str, Any]) -> bool:
+    """A row IS scored IFF ``valid is True`` AND ``clv_bps`` is a real ``int`` (not ``bool``).
+
+    Mirrors ``veridex.scoring._is_scored`` exactly (kept local to avoid inverting the module
+    layering — ``scoring`` depends on this module's ``RunResult``, not the reverse). Used ONLY to
+    decide which rows the windowed DEC-2D-1/2 overrides may touch: WAIT/live-pending (``"pending"``
+    sentinel) and invalid (``valid is False``) rows are deliberately excluded so an override can
+    never mislabel an abstention or flip an invalid action's validity.
+    """
+    clv = row.get("clv_bps")
+    return row.get("valid") is True and isinstance(clv, int) and not isinstance(clv, bool)
+
+
 # ---------------------------------------------------------------------------
 # Per-agent decide — timeout-wrapped, fail-closed (CON-010)
 # ---------------------------------------------------------------------------
@@ -370,7 +384,37 @@ class CompetitionRun:
                 self._decisions.append((agent, action, snapshot))
             self._sequence_no += 1
 
-    async def finalize(self, *, store: Store | None = None) -> RunResult:
+    async def feed_closing(self, snapshot: MarketState) -> None:
+        """Ingest the CLOSING tick: emit it as a normal TICK evidence event, gather NO decisions.
+
+        The live runner (Task 8) supplies the reconstructed/observed closing snapshot for a
+        ``pre_match`` window (the CON-040 close). Unlike :meth:`feed`, agents NEVER act on the
+        closing tick — it is the line they are scored AGAINST, not a fresh decision point — so this
+        emits exactly ONE ``EVENT_TICK`` (same payload shape as ``feed``'s tick) and gathers no
+        agent decisions. The snapshot is appended to ``self._snapshots`` so ``finalize``'s
+        ``_closing_snapshots`` picks it as the closing line for its markets, and the tick event
+        enters ``_raw_events`` so it is inside the sealed, evidence-hash-covered ``run_events``.
+        ``sequence_no`` advances exactly as for a fed tick.
+
+        Raises:
+            RuntimeError: If called after ``finalize()`` (the SAME seal guard as ``feed`` — a sealed
+                run accepts no further ticks; a post-seal closing tick could never appear in the
+                sealed evidence).
+        """
+        if self._finalized:
+            raise RuntimeError("run already finalized")
+
+        self._snapshots.append(snapshot)
+        await self._emit(
+            {
+                "sequence_no": self._sequence_no,
+                "event_type": EVENT_TICK,
+                "state_snapshot_json": serialize_payload(snapshot.model_dump()),
+            }
+        )
+        self._sequence_no += 1
+
+    async def finalize(self, *, store: Store | None = None, window: RunWindow | None = None) -> RunResult:
         """Seal the run EXACTLY once: validate → hash → SYNC score → build (and persist) RunResult.
 
         The evidence boundary is sealed by validating every emitted event through ``RunEvent`` then
@@ -385,6 +429,18 @@ class CompetitionRun:
         be idempotent/keyed on ``run_id`` (fixed at construction) and the seal is deterministic, so a
         re-run re-produces a byte-identical ``RunResult``.
 
+        Args:
+            store: Optional async store; when given, the run is persisted before the seal is set.
+            window: Optional live :class:`~veridex.runtime.window.RunWindow` (DEC-2D-1/2). When
+                ``None`` (the batch/legacy path) the scoring pass is BYTE-IDENTICAL to before. When
+                supplied it (a) stamps ``window.started_ts`` from the first accepted tick, (b) marks
+                any decision entered within ``min_clv_horizon_s`` of the window close as
+                ``pending_horizon`` (``clv_bps == "pending"``, excluded from CLV means like WAIT),
+                and (c) names the CLV value field per :func:`~veridex.runtime.window.clv_field_name`
+                — ``clv_bps`` for ``pre_match`` (true CLV) or ``window_clv_bps`` for
+                ``fixed_duration``/``manual_stop`` (window CLV; the row never carries a numeric
+                ``clv_bps`` alongside it, so window CLV is never mistaken for true CLV).
+
         Raises:
             RuntimeError: If called more than once (a run seals exactly once).
         """
@@ -392,6 +448,21 @@ class CompetitionRun:
             raise RuntimeError("run already finalized")
 
         closing_by_market = _closing_snapshots(self._snapshots)
+
+        # --- windowed-CLV setup (DEC-2D-1/2): window=None leaves everything below untouched, so
+        # the legacy (batch) path stays BYTE-IDENTICAL (pinned by tests/test_orchestrator_golden.py).
+        window_end_ts: int | None = None
+        clv_field = CLV_FIELD_TRUE
+        if window is not None:
+            if self._snapshots:
+                if window.started_ts is None:
+                    # (a) stamp the coverage window's start from the FIRST accepted tick's ts —
+                    # an evidence-derived start (never overwritten if the caller preset one).
+                    window.started_ts = self._snapshots[0].ts
+                # (b) the close is the last accumulated snapshot: the feed_closing tick for a
+                # pre_match window, or the last feed() for fixed_duration/manual_stop.
+                window_end_ts = self._snapshots[-1].ts
+            clv_field = clv_field_name(window.end_rule)
 
         # --- seal the evidence boundary: validate THEN hash (carry-forward 1) --------------
         run_events = validate_run_events(self._raw_events)
@@ -422,19 +493,34 @@ class CompetitionRun:
                 raw_prescore_hash=prescore["raw_prescore_hash"],
                 recomputed_edge_bps=int(result["edge_bps"]),
             )
-            score_rows.append(
-                {
-                    **score,
-                    "agent_id": agent.agent_id,
-                    "tick_seq": snapshot.tick_seq,
-                    "proof_mode": agent.proof_mode,
-                    "clv_bps": result["clv_bps"],
-                    "valid": result["valid"],
-                    "reason": result["reason"],
-                    "kelly_fraction": result["kelly_fraction"],
-                    "raw_prescore": prescore,
-                }
-            )
+            row = {
+                **score,
+                "agent_id": agent.agent_id,
+                "tick_seq": snapshot.tick_seq,
+                "proof_mode": agent.proof_mode,
+                "clv_bps": result["clv_bps"],
+                "valid": result["valid"],
+                "reason": result["reason"],
+                "kelly_fraction": result["kelly_fraction"],
+                "raw_prescore": prescore,
+            }
+            # Windowed honesty overrides (DEC-2D-1/2) apply ONLY to rows that ARE scored — the
+            # exact scoring.py predicate (valid AND real int clv_bps). This deliberately leaves
+            # WAIT/live-pending (clv_bps == "pending") and invalid (valid is False) rows UNTOUCHED,
+            # so pending_horizon never mislabels an abstention and the rename never flips validity.
+            if window is not None and window_end_ts is not None and _is_scored_row(row):
+                if is_pending_horizon(snapshot.ts, window_end_ts, window.min_clv_horizon_s):
+                    # DEC-2D-2: too little runway to close → excluded from CLV means like WAIT, via
+                    # the EXISTING "pending" sentinel (scoring.py excludes it for free — no numeric 0,
+                    # no new sentinel, no parallel exclusion logic). valid stays True (abstention).
+                    row["reason"] = "pending_horizon"
+                    row["clv_bps"] = PENDING
+                elif clv_field != CLV_FIELD_TRUE:
+                    # DEC-2D-1: a fixed_duration/manual_stop window closes on the in-play line, so
+                    # its value is WINDOW CLV — the rename REPLACES clv_bps with window_clv_bps (the
+                    # row never carries both) so downstream can't mistake it for TRUE closing CLV.
+                    row[clv_field] = row.pop("clv_bps")
+            score_rows.append(row)
 
         run_result = RunResult(
             run_id=self._run_id,
