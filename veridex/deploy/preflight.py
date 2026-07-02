@@ -39,12 +39,12 @@ _NUMERIC_BOUNDS: tuple[_NumericBound, ...] = (
     ("alpha", 0.0, 1.0, False, True),  # EWMA smoothing in (0, 1]
     ("z_threshold", 0.0, 1_000_000.0, False, True),  # robust-z gate must be > 0
     ("ph_delta", 0.0, 1_000_000.0, True, True),  # Page-Hinkley tolerance >= 0
-    ("ph_lambda", 0.0, 1_000_000.0, True, True),  # Page-Hinkley alarm >= 0
+    ("ph_lambda", 0.0, 1_000_000.0, False, True),  # Page-Hinkley alarm > 0
     ("cooldown_ticks", 0.0, 1_000_000.0, True, True),
     ("warmup_ticks", 0.0, 1_000_000.0, True, True),
-    ("min_movements", 1.0, 1_000_000.0, True, True),  # need >= 1 sample for robust-z
+    ("min_movements", 2.0, 1_000_000.0, True, True),  # robust-z needs >= 2 samples
     ("lookback", 1.0, 1_000_000.0, True, True),  # window must retain >= 1 movement
-    ("scale_floor", 0.0, 1_000_000.0, False, True),  # robust-z denominator must be > 0
+    ("scale_floor", 0.0, 1_000_000.0, True, True),  # robust-z denominator scale >= 0
     ("persistence_logit", 0.0, 1_000_000.0, True, True),
     # market universe / sizing / risk caps
     ("min_edge_bps", 0.0, 100_000.0, True, True),

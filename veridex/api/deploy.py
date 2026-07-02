@@ -29,9 +29,9 @@ from veridex.chain.anchor import anchor_memo
 from veridex.deploy.preflight import DeployConfig, PreflightCheck, run_deploy_preflight
 from veridex.ingest.feed_health import FeedHealthReport
 from veridex.ingest.marketstate import MarketState
-from veridex.runtime.orchestrator import Agent, deterministic_agent, llm_agent
+from veridex.runtime.orchestrator import Agent
 from veridex.runtime.window import RunWindow
-from veridex.strategies.momentum import momentum_agent, sharp_momentum_agent
+from veridex_agent.config import AgentRunConfig, build_agent
 from veridex_agent.run import standalone_run
 
 if TYPE_CHECKING:
@@ -124,26 +124,40 @@ class DeployDeps:
 
 
 def _build_agent(config: DeployConfig) -> Agent:
-    """Construct the orchestrator agent for ``config.strategy`` (v2 knobs enter the sharp agent)."""
-    if config.strategy == "baseline":
-        return deterministic_agent(config.agent_id)
-    if config.strategy == "momentum":
-        return momentum_agent(config.agent_id, lookback=config.lookback)
-    if config.strategy == "momentum-sharp":
-        return sharp_momentum_agent(
-            config.agent_id,
-            alpha=config.alpha,
-            z_threshold=config.z_threshold,
-            ph_delta=config.ph_delta,
-            ph_lambda=config.ph_lambda,
-            cooldown_ticks=config.cooldown_ticks,
-            warmup_ticks=config.warmup_ticks,
-            min_movements=config.min_movements,
-            lookback=config.lookback,
-            scale_floor=config.scale_floor,
-            persistence_logit=config.persistence_logit,
-        )
-    return llm_agent(config.agent_id)
+    """Construct the deployed agent through the SINGLE ``build_agent`` dispatch (no parallel builder).
+
+    Maps the validated wire config onto an :class:`~veridex_agent.config.AgentRunConfig` (the typed,
+    bounded config the CLI also uses) and delegates to :func:`~veridex_agent.config.build_agent`, so
+    the flagship ``momentum-sharp`` v2 (and every strategy) is constructed in exactly one place. The
+    AgentRunConfig's own Field bounds re-validate here as defense-in-depth — preflight already passed,
+    so construction is safe.
+    """
+    run_config = AgentRunConfig(
+        agent_id=config.agent_id,
+        strategy=config.strategy,
+        source_mode=config.source_mode,
+        execution_mode=config.execution_mode,
+        market_allowlist=list(config.market_allowlist),
+        venue_allowlist=list(config.venue_allowlist),
+        min_edge_bps=config.min_edge_bps,
+        max_stake=config.max_stake,
+        window_id=config.window_id,
+        fixture_id=config.fixture_id,
+        end_rule=config.end_rule,
+        duration_s=config.duration_s,
+        min_clv_horizon_s=config.min_clv_horizon_s,
+        lookback=config.lookback,
+        alpha=config.alpha,
+        z_threshold=config.z_threshold,
+        ph_delta=config.ph_delta,
+        ph_lambda=config.ph_lambda,
+        cooldown_ticks=config.cooldown_ticks,
+        warmup_ticks=config.warmup_ticks,
+        min_movements=config.min_movements,
+        scale_floor=config.scale_floor,
+        persistence_logit=config.persistence_logit,
+    )
+    return build_agent(run_config)
 
 
 def _build_window(config: DeployConfig) -> RunWindow:

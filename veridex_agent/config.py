@@ -12,13 +12,13 @@ import hashlib
 import tomllib
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from veridex.policy.envelope import PolicyEnvelope
 from veridex.runtime.evidence import serialize_payload
 from veridex.runtime.orchestrator import Agent, deterministic_agent, llm_agent
 from veridex.runtime.window import RunWindow
-from veridex.strategies.momentum import momentum_agent
+from veridex.strategies.momentum import momentum_agent, sharp_momentum_agent
 
 
 class AgentRunConfig(BaseModel):
@@ -26,7 +26,7 @@ class AgentRunConfig(BaseModel):
 
     Attributes:
         agent_id: Stable agent identifier.
-        strategy: ``"baseline"`` | ``"momentum"`` | ``"llm"``.
+        strategy: ``"baseline"`` | ``"momentum"`` | ``"momentum-sharp"`` (flagship v2) | ``"llm"``.
         model_id: OpenRouter ``provider/model`` slug (LLM strategy only); ``None`` → config default.
         source_mode: ``"replay"`` or ``"live"``.
         fixture_path: Replay fixture path (required when ``source_mode == "replay"``).
@@ -36,8 +36,18 @@ class AgentRunConfig(BaseModel):
         duration_s: Window duration in seconds; required IFF ``end_rule == "fixed_duration"``.
         min_clv_horizon_s: DEC-2D-2 horizon — an entry within this many seconds of close is
             excluded from CLV means (pending_horizon).
-        lookback: Momentum window (momentum strategy).
+        lookback: Momentum window (v1 momentum window; the v2 robust-z movement window). ``>= 1``,
+            and for ``momentum-sharp`` must be ``>= min_movements`` (else robust-z can never fire).
         min_momentum_bps: Minimum momentum to flag a side (momentum strategy).
+        alpha: v2 EWMA smoothing factor in ``(0, 1]``.
+        z_threshold: v2 minimum robust z-score to flag (``> 0``).
+        ph_delta: v2 Page-Hinkley per-step tolerance (``>= 0``).
+        ph_lambda: v2 Page-Hinkley alarm threshold (``> 0``).
+        cooldown_ticks: v2 ticks a market is suppressed after firing (``>= 0``).
+        warmup_ticks: v2 ticks observed before any action (``>= 0``).
+        min_movements: v2 minimum per-side movement samples before robust-z can fire (``>= 2``).
+        scale_floor: v2 minimum robust-z denominator scale (``>= 0``).
+        persistence_logit: v2 minimum cumulative logit move over the persistence window (``>= 0``).
         market_allowlist: Allowed market keys (policy envelope + live window market prefixes).
         venue_allowlist: Allowed venues (policy envelope).
         max_stake: Max stake per order (policy envelope).
@@ -47,7 +57,7 @@ class AgentRunConfig(BaseModel):
     """
 
     agent_id: str
-    strategy: Literal["baseline", "momentum", "llm"]
+    strategy: Literal["baseline", "momentum", "momentum-sharp", "llm"]
     model_id: str | None = None
     source_mode: Literal["replay", "live"] = "replay"
     fixture_path: str | None = None
@@ -56,14 +66,39 @@ class AgentRunConfig(BaseModel):
     end_rule: Literal["pre_match", "fixed_duration", "manual_stop"] = "pre_match"
     duration_s: int | None = None
     min_clv_horizon_s: int = 60
-    lookback: int = 8
+    lookback: int = Field(default=8, ge=1)
     min_momentum_bps: int = 50
+    # Momentum v2 (sharp-move) detector knobs — TYPED + BOUNDED so an out-of-range value raises at
+    # config-load (never a weird-but-hashable instance). All enter config_hash (behavioural surface).
+    alpha: float = Field(default=0.4, gt=0.0, le=1.0)
+    z_threshold: float = Field(default=2.5, gt=0.0)
+    ph_delta: float = Field(default=0.01, ge=0.0)
+    ph_lambda: float = Field(default=0.15, gt=0.0)
+    cooldown_ticks: int = Field(default=3, ge=0)
+    warmup_ticks: int = Field(default=10, ge=0)
+    min_movements: int = Field(default=8, ge=2)
+    scale_floor: float = Field(default=0.02, ge=0.0)
+    persistence_logit: float = Field(default=0.06, ge=0.0)
     market_allowlist: list[str] = Field(default_factory=list)
     venue_allowlist: list[str] = Field(default_factory=list)
     max_stake: float = 0.0
     min_edge_bps: int = 0
     execution_mode: Literal["paper", "dry_run", "live_guarded"] = "paper"
     anchor: bool = False
+
+    @model_validator(mode="after")
+    def _check_sharp_window(self) -> AgentRunConfig:
+        """Cross-field guard: for ``momentum-sharp``, the robust-z window must retain enough samples.
+
+        ``lookback`` caps the retained per-side movements; if it is smaller than ``min_movements``
+        the robust-z gate can never accumulate enough samples to fire. Rejecting it at config-load
+        keeps a deployed v2 instance from being a valid-but-inert (never-fires) configuration.
+        """
+        if self.strategy == "momentum-sharp" and self.lookback < self.min_movements:
+            raise ValueError(
+                f"lookback ({self.lookback}) must be >= min_movements ({self.min_movements}) for momentum-sharp"
+            )
+        return self
 
     def config_hash(self) -> str:
         """SHA-256 over the canonical serialization of this (non-secret) config.
@@ -110,6 +145,20 @@ def build_agent(config: AgentRunConfig) -> Agent:
         return deterministic_agent(config.agent_id)
     if config.strategy == "momentum":
         return momentum_agent(config.agent_id, lookback=config.lookback, min_momentum_bps=config.min_momentum_bps)
+    if config.strategy == "momentum-sharp":
+        return sharp_momentum_agent(
+            config.agent_id,
+            alpha=config.alpha,
+            z_threshold=config.z_threshold,
+            ph_delta=config.ph_delta,
+            ph_lambda=config.ph_lambda,
+            cooldown_ticks=config.cooldown_ticks,
+            warmup_ticks=config.warmup_ticks,
+            min_movements=config.min_movements,
+            lookback=config.lookback,
+            scale_floor=config.scale_floor,
+            persistence_logit=config.persistence_logit,
+        )
     if config.strategy == "llm":
         return llm_agent(config.agent_id, model_id=config.model_id)
     raise ValueError(f"unknown strategy: {config.strategy!r}")

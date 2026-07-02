@@ -130,6 +130,16 @@ def test_negative_z_threshold_fails_named_config_check() -> None:
     assert _check(checks, "config").ok is False
 
 
+def test_min_movements_below_two_fails_named_config_check() -> None:
+    config = DeployConfig(**{**_VALID, "min_movements": 1})  # robust-z needs >= 2 samples
+    checks = run_deploy_preflight(
+        config, feed_report=_healthy_live_feed(), market_resolved=None, envelope=config.to_policy_envelope()
+    )
+    cfg = _check(checks, "config")
+    assert cfg.ok is False
+    assert "min_movements" in cfg.detail
+
+
 # ---------------------------------------------------------------------------
 # Pure preflight — feed / market / policy named checks
 # ---------------------------------------------------------------------------
