@@ -1,10 +1,20 @@
 import Link from 'next/link';
 import { inspectorHref } from '@/lib/deeplinks';
-import { shortHash } from '@/lib/format';
+import { shortHash, fmtBps } from '@/lib/format';
 import { InfoTip } from '@/components/ui/InfoTip';
 import { GLOSSARY } from '@/lib/glossary';
 import type { CanonicalEvent } from '@/lib/contracts';
 import styles from './CanonicalEventStream.module.css';
+
+// T10 AC-2D-103: window CLV is NEVER shown as the plain "CLV" label, and a pending row is NEVER
+// shown as a fabricated number — both read straight off the single-sourced glossary.
+function ClvCell({ clv }: { clv: NonNullable<CanonicalEvent['clv']> }) {
+  if (clv.kind === 'pending') {
+    return <span className={`${styles.clv} mono`} data-testid="clv-cell">{GLOSSARY.clv_pending.label}</span>;
+  }
+  const label = clv.kind === 'window_clv' ? GLOSSARY.window_clv.label : GLOSSARY.clv.label;
+  return <span className={`${styles.clv} mono`} data-testid="clv-cell">{label} {fmtBps(clv.bps)}</span>;
+}
 
 function Cells({ event }: { event: CanonicalEvent }) {
   return (
@@ -16,7 +26,7 @@ function Cells({ event }: { event: CanonicalEvent }) {
         {/* ● = sealed-evidence prefix; ○ = derived non-scoring tail (ui-only). Honest, never faked. */}
         {event.evidence ? '● evidence' : '○ ui-only'}
       </span>
-      {event.summary ? <span className={styles.summary}>{event.summary}</span> : <span />}
+      {event.clv ? <ClvCell clv={event.clv} /> : event.summary ? <span className={styles.summary}>{event.summary}</span> : <span />}
     </>
   );
 }

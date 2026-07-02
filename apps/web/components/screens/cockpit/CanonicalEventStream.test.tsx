@@ -2,6 +2,7 @@ import { describe, it, expect, vi } from 'vitest';
 import { render, screen } from '@testing-library/react';
 import { CanonicalEventStream } from '@/components/screens/cockpit/CanonicalEventStream';
 import { sampleCockpitState } from '@/__tests__/fixtures/contracts';
+import { GLOSSARY } from '@/lib/glossary';
 import type { CanonicalEvent } from '@/lib/contracts';
 
 vi.mock('next/navigation', () => ({ usePathname: () => '/arena/wc-fra-bra' }));
@@ -41,5 +42,34 @@ describe('CanonicalEventStream (REQ-011 / AC-021)', () => {
   it('applies no per-row entrance animation class (PAT-003/AC-031)', () => {
     const { container } = render(<CanonicalEventStream runId="run_7f3a" events={sampleCockpitState.events} />);
     expect(container.querySelector('[class*="enter"], [class*="animate"]')).toBeNull();
+  });
+
+  // T10 AC-2D-103: a live score row carrying window_clv_bps must render the "window CLV" glossary
+  // label — and must NEVER render the plain "CLV" label, so a spectator can't mistake an in-play
+  // window value for the true closing CLV.
+  it('renders the "window CLV" label (not "CLV") for a row carrying window_clv_bps', () => {
+    const rows: CanonicalEvent[] = [
+      { seq: 1, type: 'law_result', payload_hash: '0x1', evidence: false, ts: 1, clv: { kind: 'window_clv', bps: 7 } },
+    ];
+    render(<CanonicalEventStream runId="run_7f3a" events={rows} />);
+    expect(screen.getByText(new RegExp(GLOSSARY.window_clv.label, 'i'))).toBeInTheDocument();
+    expect(screen.queryByText(/^CLV /)).toBeNull();
+  });
+
+  it('renders the plain "CLV" label for a row carrying true clv_bps', () => {
+    const rows: CanonicalEvent[] = [
+      { seq: 1, type: 'law_result', payload_hash: '0x1', evidence: false, ts: 1, clv: { kind: 'clv', bps: 18 } },
+    ];
+    render(<CanonicalEventStream runId="run_7f3a" events={rows} />);
+    expect(screen.getByText(new RegExp(`^${GLOSSARY.clv.label}`))).toBeInTheDocument();
+  });
+
+  it('renders an honest pending state for a pending_horizon row — never a fabricated number', () => {
+    const rows: CanonicalEvent[] = [
+      { seq: 1, type: 'law_result', payload_hash: '0x1', evidence: false, ts: 1, clv: { kind: 'pending' } },
+    ];
+    render(<CanonicalEventStream runId="run_7f3a" events={rows} />);
+    expect(screen.getByText(GLOSSARY.clv_pending.label)).toBeInTheDocument();
+    expect(screen.queryByText(/bps/)).toBeNull();
   });
 });

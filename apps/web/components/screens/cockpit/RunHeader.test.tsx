@@ -34,4 +34,16 @@ describe('RunHeader (REQ-011 run header)', () => {
     expect(screen.getByText(/93% valid/)).toBeInTheDocument();
     expect(screen.queryByText(/9300/)).toBeNull();
   });
+
+  // T10 AC-2D-103: the LIVE/REPLAY badge derives from header.source_mode ONLY — it must flip with
+  // the data, never render as a hardcoded/optimistic constant.
+  it('flips the badge from source_mode data: live -> Live, replay -> Replay', () => {
+    const { rerender } = render(<RunHeader header={{ ...sampleCockpitState.header, source_mode: 'live' }} wsStatus="connected" />);
+    expect(screen.getByText('Live')).toBeInTheDocument();
+    expect(screen.queryByText('Replay')).toBeNull();
+
+    rerender(<RunHeader header={{ ...sampleCockpitState.header, source_mode: 'replay' }} wsStatus="connected" />);
+    expect(screen.getByText('Replay')).toBeInTheDocument();
+    expect(screen.queryByText('Live')).toBeNull();
+  });
 });

@@ -3,10 +3,17 @@ import { render, screen } from '@testing-library/react';
 import { CockpitScreen } from '@/components/screens/cockpit/CockpitScreen';
 import { sampleCockpitState } from '@/__tests__/fixtures/contracts';
 import { GLOSSARY } from '@/lib/glossary';
+import type { FeedHealthState } from '@/lib/contracts';
+
+const SAMPLE_FEED_HEALTH: FeedHealthState = {
+  source_mode: 'live', ws_live: true, connected: true, txline_configured: true,
+  events_per_min: 12, ticks_seen: 40, staleness_s: 2, stale: false, fixture_id: 18172280,
+  anchor_status: 'pending', last_tick_ts: 100,
+};
 
 vi.mock('next/navigation', () => ({ usePathname: () => '/arena/wc-fra-bra' }));
 vi.mock('@/hooks/useArenaStream', () => ({
-  useArenaStream: () => ({ state: sampleCockpitState, wsStatus: 'connected' }),
+  useArenaStream: () => ({ state: sampleCockpitState, wsStatus: 'connected', feedHealth: SAMPLE_FEED_HEALTH }),
 }));
 
 beforeEach(() => {
@@ -27,6 +34,7 @@ describe('CockpitScreen (REQ-011 assembly)', () => {
     expect(screen.getByLabelText('Canonical event stream')).toBeInTheDocument();
     expect(screen.getByLabelText('Execution lane')).toBeInTheDocument();
     expect(screen.getByLabelText('Policy decisions')).toBeInTheDocument();
+    expect(screen.getByLabelText('Feed health')).toBeInTheDocument(); // T10: FeedHealthPanel
   });
 
   it('surfaces a deep-linkable AGENT_ACTION row (start of the killer flow — AC-021)', () => {

@@ -58,6 +58,14 @@ export const GLOSSARY = {
     label: 'Verifier version',
     definition: 'version of the deterministic verifier/law used for recompute.',
   },
+  window_clv: {
+    label: 'window CLV',
+    definition: 'CLV measured against the run window\'s close (fixed_duration/manual_stop), not the true match closing line — never shown as CLV.',
+  },
+  clv_pending: {
+    label: 'pending',
+    definition: 'too little runway remains before the window closes to score CLV; excluded from CLV means, never shown as a fabricated number.',
+  },
 } as const satisfies Record<string, GlossaryEntry>;
 
 export type GlossaryTerm = keyof typeof GLOSSARY;

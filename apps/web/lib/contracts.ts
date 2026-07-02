@@ -123,6 +123,14 @@ export interface CanonicalEvent {
   ts: number;
   agent_id?: string;
   summary?: string;
+  // T10 live-projection extras — populated only for `law_result` wire events. A discriminated
+  // union so a windowed value can NEVER be mistaken for true closing CLV (honesty doctrine):
+  // 'clv' = true closing CLV, 'window_clv' = the run-window's close (NOT true CLV), 'pending' =
+  // too little runway to score yet (an honest abstention, never a fabricated number).
+  clv?: { kind: 'clv' | 'window_clv'; bps: number } | { kind: 'pending' };
+  // Populated only for `policy_result` wire events — lets useArenaStream also push this decision
+  // onto CockpitState.policy so the PolicyDecisions panel updates live.
+  policy?: PolicyDecision;
 }
 
 export interface PolicyDecision {

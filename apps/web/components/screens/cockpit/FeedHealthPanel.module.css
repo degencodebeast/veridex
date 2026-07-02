@@ -1,0 +1,7 @@
+.panel { background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius-panel); }
+.head { display: flex; justify-content: space-between; align-items: center; padding: var(--space-2) var(--pad-panel); border-bottom: 1px solid var(--border-soft); }
+.sectionLabel { color: var(--text-3); font-family: var(--font-mono), monospace; font-size: 9px; text-transform: uppercase; letter-spacing: 0.1em; }
+.mode { color: var(--text-3); font-size: 10px; letter-spacing: 0.06em; }
+.ok { color: var(--positive); font-size: 11px; padding: var(--space-2) var(--pad-panel) 0; }
+.stale { color: var(--warning-hi); font-size: 11px; padding: var(--space-2) var(--pad-panel) 0; }
+.meta { display: flex; gap: var(--space-3); padding: var(--space-2) var(--pad-panel); color: var(--text-3); font-size: 10px; }
