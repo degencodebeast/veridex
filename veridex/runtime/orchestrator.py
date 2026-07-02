@@ -1,7 +1,8 @@
 """B5 — the ASYNC run orchestrator (REQ-105 / AC-105, gate CON-003/CON-006).
 
-CON-010 (async shell / sync core): ``run_competition`` is the ASYNC SHELL. It gathers every
-agent's decision CONCURRENTLY per tick, each wrapped in ``asyncio.timeout`` and fail-closed.
+CON-010 (async shell / sync core): ``CompetitionRun`` is the ASYNC SHELL (``run_competition`` is a
+thin batch wrapper over it). Its ``feed()`` gathers every agent's decision CONCURRENTLY per tick,
+each wrapped in ``asyncio.timeout`` and fail-closed; its ``finalize()`` holds the SYNC seal.
 The deterministic law (``veridex.law.recompute``), evidence binding/hashing
 (``veridex.runtime.evidence``) and the baseline strategy stay SYNC and are CALLED from the
 async loop — concurrency NEVER reaches the deterministic core.
@@ -320,7 +321,16 @@ class CompetitionRun:
         and fail-closed (timeout/exception → an ``error`` event). Successful ``(agent, action,
         snapshot)`` triples accumulate for the finalize-time scoring pass; the snapshot itself is
         retained so ``finalize()`` can rebuild the closing-horizon map over the full run.
+
+        Raises:
+            RuntimeError: If called after ``finalize()`` (a sealed run accepts no further ticks —
+                feeding past the seal would run ``agent.decide`` and push events to ``event_sink``
+                that can NEVER appear in the sealed evidence, breaking the faithful-projection
+                invariant the live broadcast relies on).
         """
+        if self._finalized:
+            raise RuntimeError("run already finalized")
+
         self._snapshots.append(snapshot)
         await self._emit(
             {
@@ -369,6 +379,11 @@ class CompetitionRun:
         (built over ALL fed snapshots), a raw pre-score record binds the run evidence + action +
         order + proof mode, and the score row derives ONLY from that bound hash + recomputed values
         (gate-3 ordering: tick → decision → pre-score → score).
+
+        The ``_finalized`` guard is set only AFTER ``store.persist_run`` returns, so a transient
+        store failure can be retried; that retry is safe only because ``persist_run`` is expected to
+        be idempotent/keyed on ``run_id`` (fixed at construction) and the seal is deterministic, so a
+        re-run re-produces a byte-identical ``RunResult``.
 
         Raises:
             RuntimeError: If called more than once (a run seals exactly once).

@@ -97,6 +97,17 @@ async def test_decisions_happen_at_feed_time_not_finalize() -> None:
     assert decided_at == [0, 1]  # finalize added no further decide() calls
 
 
+async def test_feed_after_finalize_raises() -> None:
+    """A sealed run rejects further feed(): no phantom decisions/events past the seal (REQ-2D-101)."""
+    marketstates = _marketstates()
+    run = CompetitionRun([deterministic_agent()], source_mode="replay", run_id="feed-after-seal-1")
+    await run.feed(marketstates[0])
+    await run.finalize()
+
+    with pytest.raises(RuntimeError):
+        await run.feed(marketstates[1])
+
+
 async def test_finalize_twice_raises() -> None:
     """A run seals exactly once: the second finalize() raises."""
     run = CompetitionRun([deterministic_agent()], source_mode="replay", run_id="seal-once-1")
