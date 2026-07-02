@@ -19,8 +19,12 @@ import pytest
 
 from tests._arena_fixtures import finished_run_result
 from veridex.checks.build import build_performance_metrics
+from veridex.ingest.marketstate import MarketState
 from veridex.runtime.competition import read_path_check_block
 from veridex.runtime.evidence import compute_evidence_hash
+from veridex.runtime.orchestrator import Agent, CompetitionRun
+from veridex.runtime.schemas import AgentAction, SportsActionType
+from veridex.runtime.window import RunWindow
 from veridex.scoring import score_run
 
 # ---------------------------------------------------------------------------
@@ -316,3 +320,104 @@ def test_metrics_recomputed_not_applicable_when_no_score_rows() -> None:
 
     checks = read_path_check_block(score_run(run), run)
     assert checks["metrics_recomputed"]["result"] == "not_applicable"
+
+
+# ---------------------------------------------------------------------------
+# REQ-2D-801 — METRICS_RECOMPUTED honors T7's windowed row shapes:
+#   * window_clv_bps rows (fixed_duration / manual_stop): CLV stored under window_clv_bps,
+#     clv_bps ABSENT — must verify against window_clv_bps (anti-tamper preserved).
+#   * pending_horizon rows: honest abstention (clv_bps == "pending") — skip like WAIT.
+# These runs are built through the REAL orchestrator (finalize(window=...)) so the row shapes
+# are byte-identical to production, not hand-mocked.
+# ---------------------------------------------------------------------------
+
+_WKEY = "OU_2_5"
+
+
+def _wmarket(prob_bps: dict[str, int]) -> dict:
+    return {"stable_prob_bps": dict(prob_bps), "stable_price": {"over": 1.6, "under": 2.4}, "suspended": False}
+
+
+def _wms(prob_bps: dict[str, int], *, tick_seq: int, ts: int) -> MarketState:
+    return MarketState(fixture_id=1, tick_seq=tick_seq, ts=ts, phase=2, markets={_WKEY: _wmarket(prob_bps)}, scores={})
+
+
+def _wflag_agent(agent_id: str = "flagger") -> Agent:
+    """An agent that always FLAG_VALUEs 'over' — a scored, numeric-CLV action every tick."""
+
+    async def decide(market_state: MarketState) -> AgentAction:
+        return AgentAction(type=SportsActionType.FLAG_VALUE, params={"market_key": _WKEY, "side": "over"})
+
+    return Agent(agent_id=agent_id, proof_mode="reproducible", decide=decide)
+
+
+def _window(end_rule: str, **kw: object) -> RunWindow:
+    base: dict[str, object] = {"window_id": "win-1", "fixture_id": 1, "market_allowlist": ["OU"], "end_rule": end_rule}
+    base.update(kw)
+    return RunWindow(**base)  # type: ignore[arg-type]
+
+
+async def _fixed_duration_run() -> object:
+    """A fixed_duration windowed run: tick0 is a scored WINDOW-CLV row (window_clv_bps=300, no
+    clv_bps); tick1 (entry AT close) is a pending_horizon abstention (clv_bps=="pending")."""
+    run = CompetitionRun([_wflag_agent()], source_mode="replay", run_id="wc-check")
+    await run.feed(_wms({"over": 6000}, tick_seq=0, ts=1000))
+    await run.feed(_wms({"over": 6300}, tick_seq=1, ts=1100))  # window_end_ts = 1100
+    return await run.finalize(window=_window("fixed_duration", duration_s=100, min_clv_horizon_s=10))
+
+
+async def test_metrics_recomputed_passes_on_honest_window_clv() -> None:
+    """RED before the fix: an honest fixed_duration run stores CLV under ``window_clv_bps`` (clv_bps
+    absent). The old check compared ``redo["clv_bps"]`` (numeric) to ``row.get("clv_bps")`` (None) and
+    spuriously FAILED an honest run. The fix verifies against ``window_clv_bps`` ⇒ ``pass``."""
+    result = await _fixed_duration_run()
+
+    # Confirm the fixture really carries the window_clv_bps shape the check must understand.
+    scored = {r["tick_seq"]: r for r in result.score_rows}[0]  # type: ignore[attr-defined]
+    assert scored["window_clv_bps"] == 300
+    assert "clv_bps" not in scored
+
+    checks = read_path_check_block(score_run(result), result)
+    assert checks["metrics_recomputed"]["result"] == "pass"
+
+
+async def test_metrics_recomputed_passes_on_honest_pending_horizon() -> None:
+    """RED before the fix: a pending_horizon row displays the ``"pending"`` sentinel (an abstention,
+    like WAIT), but the sealed-evidence recompute yields a NUMERIC clv (the horizon decision lives in
+    finalize, not the law) — so the old check spuriously FAILED. The fix skips it ⇒ ``pass``."""
+    run = CompetitionRun([_wflag_agent()], source_mode="replay", run_id="ph-check")
+    await run.feed(_wms({"over": 6000}, tick_seq=0, ts=1000))  # far from close -> scored true CLV
+    await run.feed(_wms({"over": 6300}, tick_seq=1, ts=1970))  # 30s before close -> pending_horizon
+    await run.feed_closing(_wms({"over": 6600}, tick_seq=2, ts=2000))  # window_end_ts = 2000
+    result = await run.finalize(window=_window("pre_match", min_clv_horizon_s=60))
+
+    # Confirm the pending_horizon shape the check must treat as an honest abstention.
+    horizoned = {r["tick_seq"]: r for r in result.score_rows}[1]
+    assert horizoned["reason"] == "pending_horizon"
+    assert horizoned["clv_bps"] == "pending"
+
+    checks = read_path_check_block(score_run(result), result)
+    assert checks["metrics_recomputed"]["result"] == "pass"
+
+
+async def test_metrics_recomputed_fails_on_tampered_window_clv() -> None:
+    """Anti-tamper preserved for window rows: the SAME honest run passes, but doctoring the displayed
+    ``window_clv_bps`` away from the recomputed value must STILL flip METRICS_RECOMPUTED to ``fail``.
+
+    This proves the fix does NOT "pass" window rows by skipping them — it verifies the recompute
+    against ``window_clv_bps``, so a tampered window CLV is caught exactly like a tampered true CLV."""
+    result = await _fixed_duration_run()
+
+    # Baseline: the honest run passes (so a subsequent fail is attributable ONLY to the tamper).
+    assert read_path_check_block(score_run(result), result)["metrics_recomputed"]["result"] == "pass"
+
+    scored = {r["tick_seq"]: r for r in result.score_rows}[0]  # type: ignore[attr-defined]
+    scored["window_clv_bps"] = scored["window_clv_bps"] + 9999  # doctor the displayed WINDOW metric
+
+    checks = read_path_check_block(score_run(result), result)
+    assert checks["metrics_recomputed"]["result"] == "fail"
+    assert checks["metrics_recomputed"]["error"] is not None
+    # The per-row discrepancy surfaces the doctored displayed value vs the sealed-evidence recompute.
+    assert any(rule.get("persisted_clv_bps") == 300 + 9999 for rule in checks["metrics_recomputed"]["rules"])
+    # The tamper touched only the non-hashed score_rows, so the evidence prefix still verifies.
+    assert checks["evidence_integrity"]["result"] == "pass"

@@ -24,9 +24,10 @@ from veridex.checks.result import (
     CheckResult,
 )
 from veridex.ingest.marketstate import MarketState
-from veridex.law.recompute import recompute
+from veridex.law.recompute import PENDING, recompute
 from veridex.runtime.evidence import compute_evidence_hash, serialize_payload
 from veridex.runtime.schemas import AgentAction
+from veridex.runtime.window import CLV_FIELD_WINDOW
 from veridex.scoring import score_run
 from veridex.verifier.import_audit import assert_no_llm_imports
 
@@ -207,16 +208,30 @@ def _metrics_recomputed(scores: list[dict[str, Any]], run: RunResult) -> CheckRe
                 reason = "entry_snapshot_missing" if entry is None else "sealed_action_missing"
                 mismatches.append({"tick_seq": tick_seq, "agent_id": agent_id, "reason": reason})
                 continue
+            # DEC-2D-2 honest abstention: a pending_horizon row carries the SAME "pending" sentinel
+            # as WAIT/pending_closing — no numeric displayed metric to anti-tamper. Its exclusion is a
+            # window-horizon (timing) decision made in finalize, NOT in the law the recompute replays,
+            # so the recompute can't reproduce "pending" here; skip it exactly like the other pending
+            # abstentions rather than flag a spurious mismatch. Gated on BOTH the reason AND the
+            # sentinel so a doctored numeric clv can never hide behind a relabelled reason.
+            if row.get("reason") == "pending_horizon" and row.get("clv_bps") == PENDING:
+                continue
             action = AgentAction(**raw_action)
             market_key = (action.params or {}).get("market_key")
             closing = closing_by_market.get(market_key) if market_key else None
             redo = recompute(entry, action, closing=closing, source_mode=source_mode)
-            if redo["clv_bps"] != row.get("clv_bps"):
+            # Verify against the field the row ACTUALLY carries: a fixed_duration/manual_stop window
+            # stores WINDOW CLV under window_clv_bps (finalize did window_clv_bps = row.pop("clv_bps"),
+            # so it holds the recomputed value under a different name), while true-CLV / WAIT /
+            # pending_closing rows use clv_bps. Anti-tamper holds for BOTH names — a doctored
+            # window_clv_bps still diverges from the sealed-evidence recompute.
+            displayed = row[CLV_FIELD_WINDOW] if CLV_FIELD_WINDOW in row else row.get("clv_bps")
+            if redo["clv_bps"] != displayed:
                 mismatches.append(
                     {
                         "agent_id": agent_id,
                         "tick_seq": tick_seq,
-                        "persisted_clv_bps": row.get("clv_bps"),
+                        "persisted_clv_bps": displayed,
                         "recomputed_clv_bps": redo["clv_bps"],
                     }
                 )
