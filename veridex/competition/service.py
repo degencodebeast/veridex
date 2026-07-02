@@ -206,9 +206,9 @@ async def start_competition(
         competition_id: The competition to start.
         marketstates: Ordered tick snapshots driving the run.
         agents: Participating agents (identical inputs per tick).
-        broadcast: Optional persist-before-broadcast callback. Each execution event is appended
-            to the store FIRST, then broadcast; broadcast errors are swallowed and never abort
-            the run (REQ-2B-17/30).
+        broadcast: Optional persist-before-broadcast callback. Each evidence event (live sink)
+            and each execution event is appended to the store FIRST, then broadcast; broadcast
+            errors are swallowed and never abort the run (REQ-2B-17/30, REQ-2D-105).
 
     Returns:
         The finalized :class:`~veridex.competition.models.Competition` (status ``FINALIZED``,
@@ -267,7 +267,13 @@ async def start_competition(
             run_event=run_event,
             current_tick_ts=current_tick_ts,
         )
+        # Persist-before-broadcast (DEC-2D-4): the store append MUST complete before the
+        # broadcast is attempted, so a spectator can never see an event that isn't durably
+        # persisted. Broadcasting only when a callback was provided keeps the no-broadcast
+        # path (existing callers) byte-identical to today.
         await store.append_competition_events(competition_id, [event])
+        if broadcast is not None:
+            await _safe_broadcast(broadcast, event)
 
     # ``store=store`` persists the SEALED RunResult (runs/run_events/score_rows) under the same
     # pre-generated run_id the competition references — so a verifier can later load_run(run_id)

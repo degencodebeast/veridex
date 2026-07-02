@@ -27,13 +27,15 @@ Gapless replay→live handoff:
     (skipping ``seq <= last_sent_seq``) so the spectator sees a gapless, duplicate-free stream
     across the replay→live seam.
 
-    Producer-ordering contract (2B): the future live producer MUST persist an event to the store
-    BEFORE calling :meth:`ArenaConnectionManager.broadcast` for it. The register-before-replay
-    design closes the consumer-side race; persist-before-broadcast is the matching producer-side
-    requirement. If a producer broadcast before persisting, an event could land after a
-    spectator's replay snapshot but before its queue registration and be lost from BOTH paths —
-    a gap. (In Phase 2A this is moot: ``/start`` persists the whole log synchronously and never
-    broadcasts live.)
+    Producer-ordering contract (2B/2D, DEC-2D-4): every live producer MUST persist an event to
+    the store BEFORE calling :meth:`ArenaConnectionManager.broadcast` for it. The
+    register-before-replay design closes the consumer-side race; persist-before-broadcast is the
+    matching producer-side requirement. If a producer broadcast before persisting, an event could
+    land after a spectator's replay snapshot but before its queue registration and be lost from
+    BOTH paths — a gap. Both live producers honor this: the ``/start`` EXECUTION block and (as of
+    Phase 2D Task 9) the evidence sink each append to the store first, then broadcast via the
+    service's ``_safe_broadcast`` helper, so a spectator connected mid-run now sees evidence
+    events live rather than only on reconnect/replay.
 
 Heartbeat:
     Liveness/disconnect detection relies on the ASGI server's (uvicorn) built-in WebSocket
