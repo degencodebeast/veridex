@@ -18,7 +18,7 @@ from veridex.ingest.marketstate import MarketState
 from veridex.runtime.agent import emit_agent_action_async  # noqa: F401  (documented stub seam)
 from veridex.runtime.competition import (
     CompetitionResult,
-    _default_checks,
+    read_path_check_block,
     run_demo_competition,
 )
 from veridex.runtime.orchestrator import Agent, deterministic_agent, llm_agent
@@ -233,10 +233,10 @@ async def test_no_anchor_path_is_not_anchored() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_default_checks_summary_shape() -> None:
+def testread_path_check_block_summary_shape() -> None:
     run = finished_run_result()
     scores = score_run(run)
-    checks = _default_checks(scores, run)
+    checks = read_path_check_block(scores, run)
     # SEC-001: exactly the 7 CheckIds, and CLV is NOT one of them.
     assert set(checks) == {
         "evidence_integrity",

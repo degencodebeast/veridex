@@ -96,7 +96,7 @@ from veridex.leaderboard import leaderboard as _build_leaderboard
 from veridex.runtime.competition import (
     DEFAULT_CLUSTER,
     SCHEMA_VERSIONS,
-    _default_checks,
+    read_path_check_block,
     run_demo_competition,
 )
 from veridex.runtime.orchestrator import deterministic_agent
@@ -441,7 +441,7 @@ def create_app(
             raise HTTPException(status_code=404, detail=f"run {run_id!r} not found") from None
 
         scores = score_run(run_result)
-        checks = _default_checks(scores, run_result)
+        checks = read_path_check_block(scores, run_result)
         metrics = build_performance_metrics(scores)  # SEC-001: CLV lives here, not in checks
         # Recover anchor_status from the registry; fall back to not_anchored for
         # runs loaded from an externally supplied store.
@@ -577,7 +577,7 @@ def create_app(
             "explorer_url": explorer_tx_url(signature, cluster=DEFAULT_CLUSTER),
         }
         # Bind the FULL verdict: pass the reconstructed manifest/manifest_hash + anchor so
-        # MANIFEST_BOUND confirms the seal — the 2-arg _default_checks omits them, leaving
+        # MANIFEST_BOUND confirms the seal — the 2-arg read_path_check_block omits them, leaving
         # manifest_bound=not_applicable, which false-reds the manifest hash on an honest run.
         check_results = build_check_results(
             scores=report.score_rows,
@@ -882,7 +882,7 @@ def create_app(
                 run_result = None
             if run_result is not None:
                 scores = score_run(run_result)
-                checks = _default_checks(scores, run_result)
+                checks = read_path_check_block(scores, run_result)
                 metrics = build_performance_metrics(scores)  # SEC-001: CLV lives here, not in checks
                 anchor_block: dict[str, Any] = {
                     "status": str(anchor_status),

@@ -1,7 +1,7 @@
 """WD-5a — checks integrity: evidence_integrity recomputes hash; llm_boundary runs real audit.
 
 RED → GREEN tests written strictly before the implementation fix. Both checks in
-``_default_checks`` were no-ops prior to this fix:
+``read_path_check_block`` were no-ops prior to this fix:
 
   * ``evidence_integrity`` only asserted non-empty hash — never recomputed, so a tampered
     run with a stale hash still showed ✅.
@@ -19,7 +19,7 @@ import pytest
 
 from tests._arena_fixtures import finished_run_result
 from veridex.checks.build import build_performance_metrics
-from veridex.runtime.competition import _default_checks
+from veridex.runtime.competition import read_path_check_block
 from veridex.runtime.evidence import compute_evidence_hash
 from veridex.scoring import score_run
 
@@ -29,7 +29,7 @@ from veridex.scoring import score_run
 
 
 def test_evidence_integrity_fails_on_tampered_run() -> None:
-    """_default_checks must return ``"fail"`` when run_events no longer match evidence_hash.
+    """read_path_check_block must return ``"fail"`` when run_events no longer match evidence_hash.
 
     Tamper: inject a new key into ``run_events[0]`` so the recomputed SHA-256 diverges from
     the stored ``evidence_hash`` (which was sealed over the original events).
@@ -44,12 +44,12 @@ def test_evidence_integrity_fails_on_tampered_run() -> None:
     # The stored evidence_hash is now stale (sealed before the mutation).
     run.run_events[0]["_tampered"] = "injected_by_test"
 
-    checks = _default_checks(scores, run)
+    checks = read_path_check_block(scores, run)
     assert checks["evidence_integrity"]["result"] == "fail"
 
 
 def test_evidence_integrity_passes_on_clean_run() -> None:
-    """_default_checks must return ``"pass"`` on an unmodified (clean) run.
+    """read_path_check_block must return ``"pass"`` on an unmodified (clean) run.
 
     The recomputed hash must equal the stored evidence_hash for a run that was
     not tampered with after sealing.
@@ -57,7 +57,7 @@ def test_evidence_integrity_passes_on_clean_run() -> None:
     run = finished_run_result()
     scores = score_run(run)
 
-    checks = _default_checks(scores, run)
+    checks = read_path_check_block(scores, run)
     assert checks["evidence_integrity"]["result"] == "pass"
 
 
@@ -67,14 +67,14 @@ def test_evidence_integrity_exposes_recomputed_match_flag() -> None:
     scores = score_run(run)
 
     # Clean run: recomputed_match must be True (now nested under details — typed CheckResult).
-    checks = _default_checks(scores, run)
+    checks = read_path_check_block(scores, run)
     assert checks["evidence_integrity"]["details"]["recomputed_match"] is True
 
     # Tampered run: recomputed_match must be False.
     run2 = finished_run_result()
     scores2 = score_run(run2)
     run2.run_events[0]["_tampered"] = "injected_by_test"
-    checks2 = _default_checks(scores2, run2)
+    checks2 = read_path_check_block(scores2, run2)
     assert checks2["evidence_integrity"]["details"]["recomputed_match"] is False
 
 
@@ -84,9 +84,9 @@ def test_evidence_integrity_exposes_recomputed_match_flag() -> None:
 
 
 def test_llm_boundary_fails_when_audit_raises(monkeypatch: pytest.MonkeyPatch) -> None:
-    """_default_checks must return ``"fail"`` when ``assert_no_llm_imports`` raises.
+    """read_path_check_block must return ``"fail"`` when ``assert_no_llm_imports`` raises.
 
-    Monkeypatches the function in the ``checks.build`` namespace (where ``_default_checks`` now
+    Monkeypatches the function in the ``checks.build`` namespace (where ``read_path_check_block`` now
     delegates the audit) so the try/except inside ``_llm_boundary`` catches the injected
     ``AssertionError``.
 
@@ -103,12 +103,12 @@ def test_llm_boundary_fails_when_audit_raises(monkeypatch: pytest.MonkeyPatch) -
     run = finished_run_result()
     scores = score_run(run)
 
-    checks = _default_checks(scores, run)
+    checks = read_path_check_block(scores, run)
     assert checks["llm_boundary"]["result"] == "fail"
 
 
 def test_llm_boundary_passes_on_clean_trust_path() -> None:
-    """_default_checks must return ``"pass"`` when the real trust path is LLM-SDK-free.
+    """read_path_check_block must return ``"pass"`` when the real trust path is LLM-SDK-free.
 
     Exercises the real ``assert_no_llm_imports`` over the real trust-path targets — this
     is the live integration smoke-test that proves the boundary is actually enforced.
@@ -116,7 +116,7 @@ def test_llm_boundary_passes_on_clean_trust_path() -> None:
     run = finished_run_result()
     scores = score_run(run)
 
-    checks = _default_checks(scores, run)
+    checks = read_path_check_block(scores, run)
     assert checks["llm_boundary"]["result"] == "pass"
 
 
@@ -139,7 +139,7 @@ def test_evidence_integrity_fails_closed_on_duplicate_sequence_no() -> None:
     # Inject a second copy of the first event — same sequence_no, duplicate.
     run.run_events.append(dict(run.run_events[0]))
 
-    checks = _default_checks(scores, run)
+    checks = read_path_check_block(scores, run)
     assert checks["evidence_integrity"]["result"] == "fail"
     assert checks["evidence_integrity"]["details"]["recomputed_match"] is False
     assert checks["evidence_integrity"]["error"] is not None
@@ -158,7 +158,7 @@ def test_evidence_integrity_fails_closed_on_missing_sequence_no() -> None:
     # Remove the sequence_no key from the first event so the sort-key lambda KeyErrors.
     del run.run_events[0]["sequence_no"]
 
-    checks = _default_checks(scores, run)
+    checks = read_path_check_block(scores, run)
     assert checks["evidence_integrity"]["result"] == "fail"
     assert checks["evidence_integrity"]["details"]["recomputed_match"] is False
 
@@ -181,7 +181,7 @@ def test_llm_boundary_fails_closed_on_non_assertion_error(monkeypatch: pytest.Mo
     run = finished_run_result()
     scores = score_run(run)
 
-    checks = _default_checks(scores, run)
+    checks = read_path_check_block(scores, run)
     assert checks["llm_boundary"]["result"] == "fail"
 
 
@@ -190,8 +190,8 @@ def test_llm_boundary_fails_closed_on_non_assertion_error(monkeypatch: pytest.Mo
 # ---------------------------------------------------------------------------
 
 
-def test_default_checks_emits_seven_check_ids_and_no_clv() -> None:
-    """SEC-001: ``_default_checks`` emits exactly the 7 frozen CheckIds; CLV is NOT one of them.
+def testread_path_check_block_emits_seven_check_ids_and_no_clv() -> None:
+    """SEC-001: ``read_path_check_block`` emits exactly the 7 frozen CheckIds; CLV is NOT one of them.
 
     The 2-arg convenience path has no manifest/anchor/events, so the manifest/policy/receipt
     checks are ``not_applicable`` and ANCHOR follows the run's source_mode (replay→na).
@@ -199,7 +199,7 @@ def test_default_checks_emits_seven_check_ids_and_no_clv() -> None:
     run = finished_run_result()
     scores = score_run(run)
 
-    checks = _default_checks(scores, run)
+    checks = read_path_check_block(scores, run)
     assert set(checks) == {
         "evidence_integrity",
         "llm_boundary",
@@ -214,7 +214,7 @@ def test_default_checks_emits_seven_check_ids_and_no_clv() -> None:
     assert "clv" in build_performance_metrics(scores)
 
 
-def test_default_checks_does_not_mutate_sealed_evidence() -> None:
+def testread_path_check_block_does_not_mutate_sealed_evidence() -> None:
     """The migration changes the proof-card representation, NOT the sealed evidence.
 
     Building checks + metrics must leave ``run.run_events`` and ``run.evidence_hash``
@@ -226,7 +226,7 @@ def test_default_checks_does_not_mutate_sealed_evidence() -> None:
     evidence_hash_before = run.evidence_hash
     events_before = copy.deepcopy(run.run_events)
 
-    _default_checks(scores, run)
+    read_path_check_block(scores, run)
     build_performance_metrics(scores)
 
     assert run.evidence_hash == evidence_hash_before
@@ -253,7 +253,7 @@ def test_metrics_recomputed_passes_on_untampered_run() -> None:
     """The honest case: the displayed score table re-derives faithfully from sealed evidence."""
     run = finished_run_result()
     scores = score_run(run)
-    assert _default_checks(scores, run)["metrics_recomputed"]["result"] == "pass"
+    assert read_path_check_block(scores, run)["metrics_recomputed"]["result"] == "pass"
 
 
 def test_metrics_recomputed_fails_on_tampered_persisted_clv() -> None:
@@ -271,7 +271,7 @@ def test_metrics_recomputed_fails_on_tampered_persisted_clv() -> None:
 
     # The displayed aggregate now reflects the tamper (score_run reads score_rows).
     tampered_scores = score_run(run)
-    checks = _default_checks(tampered_scores, run)
+    checks = read_path_check_block(tampered_scores, run)
 
     assert checks["metrics_recomputed"]["result"] == "fail"
     assert checks["metrics_recomputed"]["error"] is not None
@@ -299,7 +299,7 @@ def test_metrics_recomputed_fails_on_coordinated_score_row_tamper() -> None:
     row["clv_bps"] = "pending"  # what a WAIT recompute would produce
     row["raw_prescore"]["raw_action"] = {"type": "WAIT", "params": {}}
 
-    checks = _default_checks(score_run(run), run)
+    checks = read_path_check_block(score_run(run), run)
 
     assert checks["metrics_recomputed"]["result"] == "fail"
     assert checks["metrics_recomputed"]["error"] is not None
@@ -314,5 +314,5 @@ def test_metrics_recomputed_not_applicable_when_no_score_rows() -> None:
     run = finished_run_result()
     run.score_rows.clear()  # mutate the list in place (frozen dataclass guards reassignment only)
 
-    checks = _default_checks(score_run(run), run)
+    checks = read_path_check_block(score_run(run), run)
     assert checks["metrics_recomputed"]["result"] == "not_applicable"

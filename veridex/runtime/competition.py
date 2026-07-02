@@ -116,17 +116,19 @@ def _score_root(scores: list[dict[str, Any]]) -> str:
     return recompute_score_root(scores)
 
 
-def _default_checks(scores: list[dict[str, Any]], run: RunResult) -> dict[str, Any]:
-    """Back-compat 2-arg builder: the serialized proof block keyed by CheckId value.
+def read_path_check_block(scores: list[dict[str, Any]], run: RunResult) -> dict[str, Any]:
+    """The read-path (manifest-unavailable) proof block: a 2-arg convenience over the ONE builder.
 
     Delegates to :func:`~veridex.checks.build.build_check_results` (WD-5b) — the typed 7-member
-    Proof-Check taxonomy. CLV is NOT a check here (SEC-001); it lives in the separate Performance-
-    Metrics block (:func:`~veridex.checks.build.build_performance_metrics`).
+    Proof-Check taxonomy. There is no separate/divergent dict-based implementation here; this is
+    purely a narrower call into the same builder for callers (the API read endpoints) that don't
+    have a manifest/anchor/events on hand. CLV is NOT a check here (SEC-001); it lives in the
+    separate Performance-Metrics block (:func:`~veridex.checks.build.build_performance_metrics`).
 
-    Manifest/anchor/events are unavailable in this convenience path (used by the API read
-    endpoints), so MANIFEST_BOUND/POLICY_OBEYED/RECEIPT_SEPARATION are ``not_applicable`` and ANCHOR
-    follows the run's ``source_mode`` (SEC-002/SEC-008). The richer path in
-    :func:`run_demo_competition` passes the manifest/anchor for the full verdict.
+    Manifest/anchor/events are unavailable in this convenience path, so MANIFEST_BOUND/
+    POLICY_OBEYED/RECEIPT_SEPARATION are ``not_applicable`` and ANCHOR follows the run's
+    ``source_mode`` (SEC-002/SEC-008) — the ONLY difference from the full path in
+    :func:`run_demo_competition`, which passes the manifest/anchor/events for the richer verdict.
 
     Args:
         scores: The ranked per-agent metric stack (rank-1 first) — the PERSISTED/VISIBLE table
