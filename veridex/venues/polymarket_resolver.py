@@ -18,9 +18,12 @@ SELECTS the exact market:
   fixture's home/away team, normalized — NOT positional). Team names may differ between TxLINE
   and Polymarket ("USA" vs "United States", "Bosnia & Herzegovina" vs "Bosnia and Herzegovina");
   see :func:`_normalize_team`. Ambiguous or absent match → :class:`MarketUnavailable`.
-* ``1X2|draw`` → the ``"… end in a draw?"`` market. Draw is canonicalized HERE to the draw
-  market's YES token — ``side="draw"`` is NEVER passed to :func:`side_to_token` (Codex M2).
-* ``OU|<line>`` → the ``"… : O/U <line>"`` market whose numeric line equals ``<line>``.
+* ``1X2|draw`` → the ``"… end in a draw?"`` market, flagged :attr:`ResolvedMarket.draw_market`
+  so a live ``side="draw"`` order maps to that market's YES token (DRAW = YES) via
+  :func:`side_to_token`; ``side="draw"`` on any other market fails closed.
+* ``OU|<line>`` → the full-match ``"… : O/U <line>"`` market whose numeric line equals
+  ``<line>``. O/U totals live on the sibling ``<slug>-more-markets`` event, so the OU lookup
+  fetches that event (not the base fixture event) and excludes 2nd-half / team-total markets.
 
 A market_ref without ``"|"`` is treated as a LEGACY direct reference: select the market whose
 ``slug`` equals ``fixture_hint`` (the pre-T13b behavior, kept backward-usable and fail-closed).
@@ -86,6 +89,11 @@ _WIN_RE = re.compile(r"^will\s+(.+?)\s+win\b", re.IGNORECASE)
 _DRAW_RE = re.compile(r"\bend in a draw\b", re.IGNORECASE)
 # "… : O/U 2.5" — capture the numeric goal line.
 _OU_RE = re.compile(r"\bo\s*/\s*u\s*([0-9]+(?:\.[0-9]+)?)", re.IGNORECASE)
+# Period markers that make an O/U market NON-full-match (1st/2nd half, half-time totals).
+_HALF_RE = re.compile(r"\b(?:1st|2nd|first|second)\s+half\b|\bhalf\b|\bh[12]\b", re.IGNORECASE)
+# Matchup marker ("vs"/"vs.") — a FULL-MATCH O/U question names both teams ("A vs. B: O/U X");
+# a single-team total ("A Team Total: O/U X") does not, so this excludes team totals.
+_MATCHUP_RE = re.compile(r"\bvs\.?\b", re.IGNORECASE)
 
 
 def _normalize_team(name: str) -> str:
@@ -113,12 +121,18 @@ class ResolvedMarket(BaseModel):
         token_id_yes: CLOB token ID for the "yes"-side outcome (Yes/Over/Home).
         token_id_no: CLOB token ID for the "no"-side outcome (No/Under/Away).
         tick_size: Minimum price increment (from Gamma ``orderPriceMinTickSize``).
+        draw_market: ``True`` when this is the "…end in a draw?" binary market (from a
+            ``1X2|draw`` ref), where the YES outcome IS "the match ended in a draw". Only
+            then does :func:`side_to_token` map ``side="draw"`` to :attr:`token_id_yes`;
+            on any other market ``side="draw"`` fails closed (a wrong outcome loses real
+            money). Defaults ``False`` (a non-draw market).
     """
 
     condition_id: str
     token_id_yes: str
     token_id_no: str
     tick_size: float
+    draw_market: bool = False
 
 
 class MarketUnavailable(Exception):
@@ -149,15 +163,28 @@ def side_to_token(resolved: ResolvedMarket, side: str) -> str:
         resolved: The resolved market to read token IDs from.
         side: One of ``"over"``/``"home"``/``"yes"`` (-> :attr:`ResolvedMarket.token_id_yes`)
             or ``"under"``/``"away"``/``"no"`` (-> :attr:`ResolvedMarket.token_id_no`),
-            case-insensitive.
+            case-insensitive. ``"draw"`` is accepted ONLY when
+            :attr:`ResolvedMarket.draw_market` is ``True`` (the "…end in a draw?" binary
+            market), where DRAW = YES -> :attr:`token_id_yes`.
 
     Returns:
         The token ID for *side*.
 
     Raises:
-        ValueError: If *side* is not a recognised alias. Never silently picks a side.
+        ValueError: If *side* is not a recognised alias, or ``side="draw"`` on a market
+            that is not the draw-binary market. Never silently picks a side, and never
+            mis-maps ``"draw"`` to a non-draw market's YES token (a wrong live outcome).
     """
     normalized = side.strip().lower()
+    if normalized == "draw":
+        # DRAW is a real venue side ONLY on the draw-binary market, where YES == "draw".
+        # On any other market a bare "draw" must fail closed rather than route to its YES.
+        if resolved.draw_market:
+            return resolved.token_id_yes
+        raise ValueError(
+            "side 'draw' is only valid on the draw-binary market "
+            "(resolved.draw_market is False) — failing closed"
+        )
     if normalized in _YES_LABELS:
         return resolved.token_id_yes
     if normalized in _NO_LABELS:
@@ -195,8 +222,9 @@ async def resolve_market(
 
     Returns:
         A :class:`ResolvedMarket` with condition_id, both token IDs, and tick_size. For
-        ``1X2|draw`` the draw market's YES token is :attr:`ResolvedMarket.token_id_yes`
-        (draw canonicalized here — ``side="draw"`` never reaches :func:`side_to_token`).
+        ``1X2|draw`` the draw market's YES token is :attr:`ResolvedMarket.token_id_yes` and
+        :attr:`ResolvedMarket.draw_market` is ``True`` so :func:`side_to_token` maps a live
+        ``side="draw"`` to that YES token (DRAW = YES on the draw-binary market).
 
     Raises:
         MarketUnavailable: If the client lookup fails; no market matches the ref; the match
@@ -207,11 +235,17 @@ async def resolve_market(
     if client is None:
         client = _DefaultGammaClient()
 
+    # Route to the RIGHT Gamma event per market TYPE (verified overlap): 1X2 lives on the
+    # base fixture event; O/U totals live on the sibling ``<slug>-more-markets`` event. We
+    # fetch exactly one event and NEVER fall back across events — resolving OU against the
+    # base event (or vice-versa) could route a live order to the wrong outcome.
+    lookup_slug = _lookup_slug(market_ref, fixture_hint)
+
     try:
-        raw = await client.get_markets(slug=fixture_hint)
+        raw = await client.get_markets(slug=lookup_slug)
     except Exception as exc:
         raise MarketUnavailable(
-            f"Gamma lookup failed for market_ref={market_ref!r} slug={fixture_hint!r}: {exc}"
+            f"Gamma lookup failed for market_ref={market_ref!r} slug={lookup_slug!r}: {exc}"
         ) from exc
 
     if not isinstance(raw, list):
@@ -230,11 +264,44 @@ async def resolve_market(
     selected = _select_market(
         markets,
         market_ref=market_ref,
-        fixture_hint=fixture_hint,
+        fixture_hint=lookup_slug,
         home_team=home_team,
         away_team=away_team,
     )
-    return _parse_gamma_market(selected, market_ref=market_ref, fixture_hint=fixture_hint)
+    # A 1X2|draw ref selects the draw-binary market; flag it so side_to_token can map the
+    # live side="draw" to the draw market's YES token (DRAW = YES on "…end in a draw?").
+    is_draw = _is_draw_ref(market_ref)
+    return _parse_gamma_market(
+        selected, market_ref=market_ref, fixture_hint=lookup_slug, draw_market=is_draw
+    )
+
+
+def _ref_kind(market_ref: str) -> str:
+    """Return the lowercased TYPE token of a structured ref (``""`` for a legacy ref)."""
+    if "|" not in market_ref:
+        return ""
+    return market_ref.split("|", 1)[0].strip().lower()
+
+
+def _is_draw_ref(market_ref: str) -> bool:
+    """True when *market_ref* is a ``1X2|draw`` reference (selects the draw-binary market)."""
+    parts = market_ref.split("|")
+    return (
+        len(parts) >= 2
+        and parts[0].strip().lower() == "1x2"
+        and parts[1].strip().lower() == "draw"
+    )
+
+
+def _lookup_slug(market_ref: str, fixture_hint: str) -> str:
+    """Return the Gamma EVENT slug to fetch for *market_ref*.
+
+    O/U totals are NOT on the base fixture event — they live on the ``<slug>-more-markets``
+    event (verified overlap). 1X2 and legacy refs use the base event slug unchanged.
+    """
+    if _ref_kind(market_ref) == "ou":
+        return f"{fixture_hint}-more-markets"
+    return fixture_hint
 
 
 def _select_market(
@@ -334,7 +401,14 @@ def _match_ou(
     line: str,
     market_ref: str,
 ) -> list[dict[str, Any]]:
-    """Return event markets whose ``O/U <line>`` numeric line equals *line* (0, 1, or many)."""
+    """Return FULL-MATCH event markets whose ``O/U <line>`` equals *line* (0, 1, or many).
+
+    Scope is fixed to full-match (the only supported/verified O/U scope): a candidate must
+    carry the numeric line AND be a full-match market — NOT a 1st/2nd-half total and NOT a
+    single-team total. Half markets (:data:`_HALF_RE`) are excluded, and the question must
+    name the matchup (:data:`_MATCHUP_RE`, "A vs. B"), which team totals ("A Team Total")
+    lack. Anything ambiguous surfaces to :func:`_select_market` as >1 hit and fails closed.
+    """
     try:
         target_line = float(line)
     except ValueError as exc:
@@ -345,19 +419,32 @@ def _match_ou(
     hits: list[dict[str, Any]] = []
     for market in markets:
         question = str(market.get("question", ""))
-        if any(
+        line_matches = any(
             abs(float(found.group(1)) - target_line) < 1e-9
             for found in _OU_RE.finditer(question)
-        ):
-            hits.append(market)
+        )
+        if not line_matches:
+            continue
+        # Full-match scope only: drop period/half totals and single-team totals (fail closed
+        # rather than route a full-match order to a half or team-total outcome).
+        if _HALF_RE.search(question) or not _MATCHUP_RE.search(question):
+            continue
+        hits.append(market)
     return hits
 
 
-def _parse_gamma_market(market: dict[str, Any], *, market_ref: str, fixture_hint: str) -> ResolvedMarket:
+def _parse_gamma_market(
+    market: dict[str, Any],
+    *,
+    market_ref: str,
+    fixture_hint: str,
+    draw_market: bool = False,
+) -> ResolvedMarket:
     """Parse a single Gamma market object into a :class:`ResolvedMarket`.
 
     Fails closed: any missing/malformed field raises :class:`MarketUnavailable` rather than
-    crashing or guessing (AC-2D-201).
+    crashing or guessing (AC-2D-201). *draw_market* flags the draw-binary market (a
+    ``1X2|draw`` selection) so :func:`side_to_token` can map ``side="draw"`` to its YES token.
     """
     try:
         condition_id = market["conditionId"]
@@ -401,6 +488,7 @@ def _parse_gamma_market(market: dict[str, Any], *, market_ref: str, fixture_hint
         token_id_yes=token_id_yes,
         token_id_no=token_id_no,
         tick_size=tick_size,
+        draw_market=draw_market,
     )
 
 

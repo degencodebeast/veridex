@@ -1,0 +1,67 @@
+[
+  {
+    "id": "700104",
+    "question": "Portugal vs. Croatia: O/U 1.5",
+    "slug": "fifwc-prt-hrv-2026-07-02-ou-1-5",
+    "conditionId": "0xOU15MORE00000000000000000000000000000000000000000000000000001",
+    "active": true,
+    "closed": false,
+    "outcomes": "[\"Over\", \"Under\"]",
+    "outcomePrices": "[\"0.72\", \"0.28\"]",
+    "clobTokenIds": "[\"45150000000000000000000000000000000000000000000000000000000001\", \"45150000000000000000000000000000000000000000000000000000000002\"]",
+    "orderPriceMinTickSize": 0.0025,
+    "orderMinSize": 5
+  },
+  {
+    "id": "700105",
+    "question": "Portugal vs. Croatia: O/U 2.5",
+    "slug": "fifwc-prt-hrv-2026-07-02-ou-2-5",
+    "conditionId": "0xOU25MORE00000000000000000000000000000000000000000000000000001",
+    "active": true,
+    "closed": false,
+    "outcomes": "[\"Over\", \"Under\"]",
+    "outcomePrices": "[\"0.48\", \"0.52\"]",
+    "clobTokenIds": "[\"45250000000000000000000000000000000000000000000000000000000001\", \"45250000000000000000000000000000000000000000000000000000000002\"]",
+    "orderPriceMinTickSize": 0.0025,
+    "orderMinSize": 5
+  },
+  {
+    "id": "700106",
+    "question": "Portugal vs. Croatia: O/U 3.5",
+    "slug": "fifwc-prt-hrv-2026-07-02-ou-3-5",
+    "conditionId": "0xOU35MORE00000000000000000000000000000000000000000000000000001",
+    "active": true,
+    "closed": false,
+    "outcomes": "[\"Over\", \"Under\"]",
+    "outcomePrices": "[\"0.22\", \"0.78\"]",
+    "clobTokenIds": "[\"45350000000000000000000000000000000000000000000000000000000001\", \"45350000000000000000000000000000000000000000000000000000000002\"]",
+    "orderPriceMinTickSize": 0.0025,
+    "orderMinSize": 5
+  },
+  {
+    "id": "700107",
+    "question": "Portugal vs. Croatia 2nd Half: O/U 2.5",
+    "slug": "fifwc-prt-hrv-2026-07-02-2h-ou-2-5",
+    "conditionId": "0xOU25HALF00000000000000000000000000000000000000000000000000001",
+    "active": true,
+    "closed": false,
+    "outcomes": "[\"Over\", \"Under\"]",
+    "outcomePrices": "[\"0.35\", \"0.65\"]",
+    "clobTokenIds": "[\"45259000000000000000000000000000000000000000000000000000000001\", \"45259000000000000000000000000000000000000000000000000000000002\"]",
+    "orderPriceMinTickSize": 0.0025,
+    "orderMinSize": 5
+  },
+  {
+    "id": "700108",
+    "question": "Portugal Team Total: O/U 2.5",
+    "slug": "fifwc-prt-hrv-2026-07-02-prt-team-total-2-5",
+    "conditionId": "0xOU25TEAM00000000000000000000000000000000000000000000000000001",
+    "active": true,
+    "closed": false,
+    "outcomes": "[\"Over\", \"Under\"]",
+    "outcomePrices": "[\"0.30\", \"0.70\"]",
+    "clobTokenIds": "[\"45258000000000000000000000000000000000000000000000000000000001\", \"45258000000000000000000000000000000000000000000000000000000002\"]",
+    "orderPriceMinTickSize": 0.0025,
+    "orderMinSize": 5
+  }
+]

@@ -1,0 +1,54 @@
+[
+  {
+    "id": "700001",
+    "question": "Will Portugal win on 2026-07-02?",
+    "slug": "fifwc-prt-hrv-2026-07-02-portugal-win",
+    "conditionId": "0xPRTWIN000000000000000000000000000000000000000000000000000000001",
+    "active": true,
+    "closed": false,
+    "outcomes": "[\"Yes\", \"No\"]",
+    "outcomePrices": "[\"0.574\", \"0.426\"]",
+    "clobTokenIds": "[\"11100000000000000000000000000000000000000000000000000000000001\", \"11100000000000000000000000000000000000000000000000000000000002\"]",
+    "orderPriceMinTickSize": 0.0025,
+    "orderMinSize": 5
+  },
+  {
+    "id": "700002",
+    "question": "Will Portugal vs. Croatia end in a draw?",
+    "slug": "fifwc-prt-hrv-2026-07-02-draw",
+    "conditionId": "0xDRAW00000000000000000000000000000000000000000000000000000000001",
+    "active": true,
+    "closed": false,
+    "outcomes": "[\"Yes\", \"No\"]",
+    "outcomePrices": "[\"0.261\", \"0.739\"]",
+    "clobTokenIds": "[\"22200000000000000000000000000000000000000000000000000000000001\", \"22200000000000000000000000000000000000000000000000000000000002\"]",
+    "orderPriceMinTickSize": 0.0025,
+    "orderMinSize": 5
+  },
+  {
+    "id": "700003",
+    "question": "Will Croatia win on 2026-07-02?",
+    "slug": "fifwc-prt-hrv-2026-07-02-croatia-win",
+    "conditionId": "0xHRVWIN000000000000000000000000000000000000000000000000000000001",
+    "active": true,
+    "closed": false,
+    "outcomes": "[\"Yes\", \"No\"]",
+    "outcomePrices": "[\"0.176\", \"0.824\"]",
+    "clobTokenIds": "[\"33300000000000000000000000000000000000000000000000000000000001\", \"33300000000000000000000000000000000000000000000000000000000002\"]",
+    "orderPriceMinTickSize": 0.0025,
+    "orderMinSize": 5
+  },
+  {
+    "id": "700006",
+    "question": "Spread: Portugal (-1.5)",
+    "slug": "fifwc-prt-hrv-2026-07-02-spread-portugal-1-5",
+    "conditionId": "0xSPREAD00000000000000000000000000000000000000000000000000000000001",
+    "active": true,
+    "closed": false,
+    "outcomes": "[\"Portugal\", \"Croatia\"]",
+    "outcomePrices": "[\"0.40\", \"0.60\"]",
+    "clobTokenIds": "[\"66600000000000000000000000000000000000000000000000000000000001\", \"66600000000000000000000000000000000000000000000000000000000002\"]",
+    "orderPriceMinTickSize": 0.0025,
+    "orderMinSize": 5
+  }
+]
