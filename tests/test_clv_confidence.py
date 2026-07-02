@@ -43,37 +43,76 @@ def test_leaderboard_aggregates_valid_count_and_confidence() -> None:
     assert by_id["big"]["low_sample"] is False
 
 
-def _identical_except_sample(agent_id: str, valid_count: int) -> dict:
-    # Identical on EVERY rank-key field (avg/total CLV, brier, drawdown, action_count); only the
-    # sample size differs — so the rank tiebreak is agent_id, never valid_count.
+def _row_scored(agent_id: str, *, action_count: int, valid_count: int) -> dict:
+    # A PHYSICALLY-VALID leaderboard row: valid_count >= action_count (every scored pick is a valid
+    # decision, PLUS any valid WAIT abstentions). avg CLV is fixed at 10.0 so the CLV rank axis is
+    # tied across agents; only the SCORED sample (action_count) and the WAIT count (valid_count) vary.
+    assert valid_count >= action_count, "a scored pick is always a valid decision: valid_count >= action_count"
     return {
         "agent_id": agent_id,
         "avg_clv_bps": 10.0,
-        "total_clv_bps": 100,
-        "sim_pnl": 100,
+        "total_clv_bps": 10 * action_count,  # keeps the pooled avg == 10.0 for any action_count
+        "sim_pnl": 10 * action_count,
         "brier": None,
         "max_drawdown": 0.0,
-        "action_count": 10,
+        "action_count": action_count,
         "valid_pct": 100.0,
         "valid_count": valid_count,
         "proof_mode": "reproducible",
     }
 
 
+def _waits_only_row(agent_id: str, valid_count: int) -> dict:
+    # ZERO scored picks (action_count == 0) but many law-valid WAIT abstentions. The honest CLV
+    # confidence for this row is LOW (no scored sample) — NEVER 'high' off the WAIT count.
+    return {
+        "agent_id": agent_id,
+        "avg_clv_bps": None,
+        "total_clv_bps": 0,
+        "sim_pnl": 0,
+        "brier": None,
+        "max_drawdown": 0.0,
+        "action_count": 0,
+        "valid_pct": 100.0,
+        "valid_count": valid_count,
+        "proof_mode": "reproducible",
+    }
+
+
+def test_leaderboard_confidence_keys_off_scored_picks_not_valid_waits() -> None:
+    # HONESTY (same overclaim the report fix closed): a leaderboard agent that abstained (valid WAIT)
+    # on 500 decisions and scored ZERO picks must read LOW confidence, not 'high'. Confidence keys off
+    # the scored-pick count (action_count), never valid_count.
+    board = leaderboard([_waits_only_row("waiter", 500)])
+    row = board[0]
+    assert row["valid_count"] == 500  # law-acceptance is still reported (a distinct, honest metric)
+    assert row["clv_confidence"] == "low"  # NOT 'high' — no scored sample backs a CLV claim
+    assert row["low_sample"] is True
+
+
 def test_rank_order_is_clv_only_not_sample_size() -> None:
-    # SEC-005: two agents identical on all rank-key fields but different valid_count rank by the
-    # deterministic agent_id tiebreak, NEVER by the larger sample. Confidence is not a rank input.
-    board = leaderboard([_identical_except_sample("zeta", 100), _identical_except_sample("alpha", 1)])
+    # SEC-005: two agents IDENTICAL on every rank-key field (incl. action_count) but with different
+    # valid_count (WAIT abstentions) rank by the deterministic agent_id tiebreak — NEVER by the
+    # larger law-valid/WAIT sample. Physically valid now (valid_count >= action_count).
+    board = leaderboard(
+        [
+            _row_scored("zeta", action_count=10, valid_count=100),
+            _row_scored("alpha", action_count=10, valid_count=10),
+        ]
+    )
     assert [r["agent_id"] for r in board] == ["alpha", "zeta"]  # agent_id asc, not valid_count desc
     by_id = {r["agent_id"]: r for r in board}
-    # Confidence rides along as DISPLAY context only.
-    assert by_id["alpha"]["low_sample"] is True
+    # Confidence no longer keys off valid_count: both have the SAME scored count (10) → SAME tier,
+    # even though zeta logged 100 law-valid decisions to alpha's 10. The WAIT count moves NEITHER
+    # rank NOR confidence.
+    assert by_id["alpha"]["clv_confidence"] == by_id["zeta"]["clv_confidence"]
+    assert by_id["alpha"]["low_sample"] is False
     assert by_id["zeta"]["low_sample"] is False
 
 
 def test_rank_key_ignores_confidence_and_kelly_is_absent() -> None:
     # The rank key reads CLV/Brier/drawdown/action_count/agent_id only — never the confidence fields.
-    base = _identical_except_sample("a", 1)
+    base = _row_scored("a", action_count=10, valid_count=10)
     key_before = _rank_key(base)
     mutated = {**base, "valid_count": 999, "clv_confidence": "high", "low_sample": False, "sample_size": 999}
     assert _rank_key(mutated) == key_before

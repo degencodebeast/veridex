@@ -139,7 +139,9 @@ def _aggregate(agent_id: str, rows: list[dict[str, Any]]) -> dict[str, Any]:
     total_clv_bps: int = sum(r["total_clv_bps"] for r in rows)
     sim_pnl: int = sum(r["sim_pnl"] for r in rows)
     action_count: int = sum(r["action_count"] for r in rows)
-    # WD-7: pooled CLV sample size across runs (display context — never a rank input, SEC-005).
+    # Pooled LAW-ACCEPTANCE count across runs (valid decisions, INCLUDING valid WAIT abstentions).
+    # This is NOT the CLV confidence source (that keys off action_count below) — it is the distinct
+    # law-acceptance sample; display context only, never a rank input (SEC-005).
     valid_count: int = sum(int(r.get("valid_count", 0)) for r in rows)
 
     # POOLED avg — true mean over all scored actions, NOT mean-of-run-means.
@@ -190,7 +192,11 @@ def _aggregate(agent_id: str, rows: list[dict[str, Any]]) -> dict[str, Any]:
         "avg_window_clv_bps": avg_window_clv_bps,
         "total_window_clv_bps": total_window_clv_bps,
         "window_action_count": window_action_count,
-        **clv_confidence(valid_count),  # adds clv_confidence + low_sample + sample_size (display-only)
+        # CLV confidence keys off the SCORED-pick count (action_count), NOT valid_count: an agent can
+        # be law-valid on many WAIT abstentions yet score ZERO picks, and a zero-scored agent must
+        # read "low" confidence, never "high" (honesty — the tier reflects CLV coverage, not
+        # acceptance). valid_count stays exposed above as the distinct law-acceptance sample.
+        **clv_confidence(action_count),  # adds clv_confidence + low_sample + sample_size (display-only)
     }
 
 
@@ -270,9 +276,10 @@ def leaderboard(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
         Row keys: ``agent_id``, ``runs``, ``avg_clv_bps``, ``total_clv_bps``,
         ``sim_pnl``, ``brier``, ``max_drawdown``, ``action_count``, ``valid_pct``,
         ``proof_mode``, ``eligibility_badge``, ``anchor_status``, ``source_mode``,
-        ``valid_count`` (WD-7 pooled CLV sample size), ``clv_confidence``
-        (``"low"``/``"medium"``/``"high"``), ``low_sample``, ``sample_size``, ``rank``.
-        The WD-7 confidence fields are DISPLAY-only and never enter ``_rank_key`` (SEC-005).
+        ``valid_count`` (pooled LAW-ACCEPTANCE count — includes valid WAIT abstentions),
+        ``clv_confidence`` (``"low"``/``"medium"``/``"high"`` — keyed off the SCORED-pick count
+        ``action_count``, NOT ``valid_count``), ``low_sample``, ``sample_size`` (== ``action_count``),
+        ``rank``. The confidence fields are DISPLAY-only and never enter ``_rank_key`` (SEC-005).
     """
     # Group records by agent_id, preserving first-seen order for determinism
     # (dict insertion order is guaranteed stable in Python ≥ 3.7).
