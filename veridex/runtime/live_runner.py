@@ -28,6 +28,7 @@ The proof card / anchor happen ONLY AFTER ``finalize`` (DEC-2D-3). The compositi
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
@@ -55,6 +56,67 @@ if TYPE_CHECKING:  # avoid a runtime import cycle (the store lazily imports RunR
 #: the run's last fed stream tick became the de-facto close. It labels the run's CLV as WINDOW CLV
 #: (``window_clv_bps``), NEVER true closing CLV — and it lives on the OPS bundle, never in evidence.
 CLOSING_SOURCE_FALLBACK = "stream_observed_fallback"
+
+#: Sentinel: the stream is exhausted (a normal, finite end of the window).
+_STREAM_DONE: Any = object()
+#: Sentinel: ``stop_event`` won the next-tick race (manual_stop ended on an IDLE stream).
+_STOPPED: Any = object()
+
+
+@contextlib.asynccontextmanager
+async def _aclosing_if_possible(
+    stream: AsyncIterator[MarketState],
+) -> AsyncIterator[AsyncIterator[MarketState]]:
+    """Yield ``stream``, ``aclose()``-ing it on exit IF it supports it (robustness fold).
+
+    The real :func:`~veridex.ingest.live_client.stream_marketstates` owns an ``httpx`` client that
+    must be closed so it does not linger to GC across a long-running (hours) window; on ANY exit
+    (break at kickoff/duration/stop, normal exhaustion, or a mid-stream error) this closes it. An
+    injected test iterator that does not implement ``aclose`` is left untouched (guarded).
+    """
+    try:
+        yield stream
+    finally:
+        aclose = getattr(stream, "aclose", None)
+        if aclose is not None:
+            with contextlib.suppress(Exception):
+                await aclose()
+
+
+async def _next_or_done(stream: AsyncIterator[MarketState]) -> Any:
+    """Return the next tick, or the ``_STREAM_DONE`` sentinel when the stream is exhausted.
+
+    ``StopAsyncIteration`` is converted to a sentinel so a raced ``anext`` future never has to carry
+    it as a result/exception; any OTHER exception propagates unchanged (the interrupt-degrade path).
+    """
+    try:
+        return await anext(stream)
+    except StopAsyncIteration:
+        return _STREAM_DONE
+
+
+async def _race_next_tick(stream: AsyncIterator[MarketState], stop_event: asyncio.Event) -> Any:
+    """Await the next tick, but return ``_STOPPED`` if ``stop_event`` fires first (idle-stop fold).
+
+    A plain ``anext`` blocks until the next tick — so on an IDLE stream (halftime, no line moves) a
+    SET ``stop_event`` would not be honored until some later tick arrived, and if none ever did the
+    run would hang forever. Racing the next-tick future against ``stop_event.wait()`` ends the window
+    promptly on an idle stream. ``stop_event`` is prioritized when both are ready (that just-arrived
+    tick is post-stop and is dropped), and the losing future is cancelled + settled so nothing leaks.
+    """
+    tick_task = asyncio.ensure_future(_next_or_done(stream))
+    stop_task = asyncio.ensure_future(stop_event.wait())
+    try:
+        await asyncio.wait({tick_task, stop_task}, return_when=asyncio.FIRST_COMPLETED)
+        if stop_task.done() and not stop_task.cancelled():
+            return _STOPPED  # stop wins even alongside a ready tick — the tick is not fed.
+        return tick_task.result()  # a real stream error re-raises here (interrupt-degrade path).
+    finally:
+        for task in (tick_task, stop_task):
+            if not task.done():
+                task.cancel()
+            with contextlib.suppress(BaseException):  # settle cancelled/errored tasks (cleanup only)
+                await task
 
 
 @dataclass(frozen=True)
@@ -187,11 +249,24 @@ async def run_live_window(
         store: Optional async store; when given the run is persisted at ``finalize`` time.
         anchor_fn: Injectable ``async (manifest_hash) -> signature``; ``None`` skips anchoring
             (``anchor_status="not_anchored"``). Anchoring happens ONLY after ``finalize`` (DEC-2D-3).
-        stop_event: For the ``manual_stop`` end rule — the loop ends when it is set (checked between
-            ticks).
+        stop_event: For the ``manual_stop`` end rule — the loop ends when it is set. Checked between
+            ticks AND raced against the next-tick await, so a stop is honored promptly even on an
+            IDLE stream (no line moves) rather than blocking until the next tick.
 
     Returns:
         A :class:`LiveRunResult` bundle (the sealed run + the after-seal proof composition + ops).
+
+    Note:
+        Resilience over data-loss: if ``stream`` raises mid-iteration (e.g. an httpx blip over a
+        multi-hour window) AFTER at least one tick was fed, the partial run is finalized as a DEGRADE
+        (``window_clv_bps``, never true CLV — the window was cut short) with a non-sealed
+        ``ops["stream_interrupted"]`` marker, and the bundle is RETURNED so the sealed evidence is
+        preserved and the interruption is explicit. The caller owns reconnect/restart (open a NEW
+        window) to continue past an interruption. If ZERO ticks were fed, the stream error re-raises
+        (there is nothing to seal).
+
+    Raises:
+        Exception: Re-raises a mid-stream error from ``stream`` when NO ticks were fed yet.
     """
     run = CompetitionRun(agents, source_mode="live", event_sink=event_sink)
 
@@ -204,49 +279,85 @@ async def run_live_window(
     last_tick_seq = -1
     fed_any = False
     seen_markets: set[str] = set()
+    stream_interrupted: BaseException | None = None
+    # A stop_event only governs the manual_stop end rule; ``None`` elsewhere disables the race path.
+    stop = stop_event if window.end_rule == "manual_stop" else None
 
-    async for tick in stream:
-        # manual_stop: end when the stop_event is set (checked BETWEEN ticks — the current tick that
-        # arrives after a stop request is NOT fed).
-        if window.end_rule == "manual_stop" and stop_event is not None and stop_event.is_set():
-            break
+    async with _aclosing_if_possible(stream) as guarded_stream:
+        try:
+            while True:
+                # (a) Obtain the next tick. For manual_stop, RACE the next-tick against stop_event so
+                # an IDLE stream (no line moves) still honors a SET stop promptly instead of hanging.
+                if stop is not None:
+                    outcome = await _race_next_tick(guarded_stream, stop)
+                    if outcome is _STOPPED:
+                        break
+                    tick = outcome
+                else:
+                    tick = await _next_or_done(guarded_stream)
+                if tick is _STREAM_DONE:
+                    break  # a finite stream reached its end — a normal window close.
 
-        # Fixture filter: a tick for another fixture is dropped whole (never fed).
-        if tick.fixture_id != window.fixture_id:
-            continue
+                # (b) Between-ticks stop check: a stop set by the time this tick arrived means the
+                # tick is post-stop and must NOT be fed. This keeps the "ends between ticks" rule
+                # deterministic even when a tick and the stop become ready in the same loop turn.
+                if stop is not None and stop.is_set():
+                    break
 
-        # pre_match end: the first IN-RUNNING (kickoff) tick TERMINATES the window and is NOT fed —
-        # it is post-kickoff, the line the agents are scored against comes from the reconstructed
-        # close, not this tick. All prior pre-kickoff ticks were already fed.
-        if window.end_rule == "pre_match" and _is_in_running(tick):
-            break
+                # Fixture filter: a tick for another fixture is dropped whole (never fed).
+                if tick.fixture_id != window.fixture_id:
+                    continue
 
-        # fixed_duration end: a tick past started_ts + duration_s terminates and is NOT fed. We track
-        # started_ts from the first FED tick ourselves (finalize stamps window.started_ts, but that
-        # is not visible during the loop).
-        if (
-            window.end_rule == "fixed_duration"
-            and started_ts is not None
-            and window.duration_s is not None
-            and tick.ts > started_ts + window.duration_s
-        ):
-            break
+                # pre_match end: the first IN-RUNNING (kickoff) tick TERMINATES the window and is NOT
+                # fed — it is post-kickoff; the line agents are scored against comes from the
+                # reconstructed close, not this tick. All prior pre-kickoff ticks were already fed.
+                if window.end_rule == "pre_match" and _is_in_running(tick):
+                    break
 
-        # Restrict to allowlisted markets, then feed in REAL TIME (concurrency lives in feed()).
-        filtered = _filter_markets(tick, window.market_allowlist)
-        await run.feed(filtered)
-        fed_any = True
-        if started_ts is None:
-            started_ts = filtered.ts
-        last_tick_seq = filtered.tick_seq
-        seen_markets.update(filtered.markets)
+                # fixed_duration end: a tick past started_ts + duration_s terminates and is NOT fed. We
+                # track started_ts from the first FED tick ourselves (finalize stamps window.started_ts,
+                # but that is not visible during the loop).
+                if (
+                    window.end_rule == "fixed_duration"
+                    and started_ts is not None
+                    and window.duration_s is not None
+                    and tick.ts > started_ts + window.duration_s
+                ):
+                    break
+
+                # Restrict to allowlisted markets, then feed in REAL TIME (concurrency lives in feed()).
+                filtered = _filter_markets(tick, window.market_allowlist)
+                await run.feed(filtered)
+                fed_any = True
+                if started_ts is None:
+                    started_ts = filtered.ts
+                last_tick_seq = filtered.tick_seq
+                seen_markets.update(filtered.markets)
+        except Exception as exc:  # noqa: BLE001 — a mid-stream error (e.g. an httpx blip over hours).
+            # Honesty over data-loss: if ANY ticks were fed, finalize the PARTIAL run as a DEGRADE
+            # below (window_clv, NEVER true CLV — the window was cut short) so hours of sealed work
+            # are not vaporized and the interruption is EXPLICIT. ZERO ticks -> nothing to seal.
+            if not fed_any:
+                raise
+            stream_interrupted = exc
 
     ops: dict[str, Any] = {}
     effective_window = window
 
+    if stream_interrupted is not None:
+        # A truncated window is NOT a complete authoritative close: degrade to WINDOW CLV and record
+        # the cause as a NON-sealed ops marker (never in evidence). The caller owns reconnect/restart
+        # (open a NEW window) — run_live_window degrades-and-returns rather than crashing, so the
+        # partial sealed evidence is preserved honestly. Only a pre_match window needs the rename;
+        # fixed_duration/manual_stop already yield window_clv_bps.
+        ops["stream_interrupted"] = f"{type(stream_interrupted).__name__}: {stream_interrupted}"
+        if window.end_rule == "pre_match":
+            effective_window = window.model_copy(update={"end_rule": "manual_stop"})
+
     # pre_match closing (REQ-2D-104, honesty-critical): fetch + reconstruct the CON-040 close and
-    # SEAL it via feed_closing BEFORE finalize, so the verifier recomputes TRUE CLV from it.
-    if window.end_rule == "pre_match" and fed_any:
+    # SEAL it via feed_closing BEFORE finalize, so the verifier recomputes TRUE CLV from it. Skipped
+    # entirely on an interrupted run (a cut-short window can never be a complete authoritative close).
+    elif window.end_rule == "pre_match" and fed_any:
         if fetch_updates is None:
             from veridex.ingest.txline_client import fetch_odds_updates  # noqa: PLC0415  (lazy httpx)
 

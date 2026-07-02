@@ -27,6 +27,8 @@ import json
 from collections.abc import AsyncIterator
 from typing import Any
 
+import pytest
+
 from veridex.ingest.marketstate import MarketState
 from veridex.runtime.live_runner import LiveRunResult, run_live_window
 from veridex.runtime.orchestrator import Agent
@@ -464,3 +466,125 @@ async def test_manual_stop_event_terminates_between_ticks() -> None:
     assert "window_clv_bps" in rows[0]
     assert "clv_bps" not in rows[0]
     assert bundle.ops.get("closing_source") is None
+
+
+# ===========================================================================
+# 9 — live-run robustness: idle-stop race, interrupt-degrade, stream aclose
+# ===========================================================================
+
+
+async def test_manual_stop_honored_on_idle_stream() -> None:
+    # The operator hits stop during a quiet period (halftime / no line moves). The stream then goes
+    # IDLE — no further ticks ever arrive. A plain `async for` would block on the next-tick await and
+    # never honor the stop; the next-tick-vs-stop race must end the window PROMPTLY (no hang).
+    stop = asyncio.Event()
+    never = asyncio.Event()  # never set -> the stream is idle after tick1
+
+    async def idle_stream() -> AsyncIterator[MarketState]:
+        yield _ms(6000, tick_seq=0, ts=1000, phase=0)
+        yield _ms(6300, tick_seq=1, ts=1100, phase=0)
+        stop.set()  # stop requested during the quiet period ...
+        await never.wait()  # ... and then NO more ticks ever arrive (idle stream)
+        yield _ms(6600, tick_seq=2, ts=1200, phase=0)  # unreachable
+
+    # wait_for is the anti-hang guard: if the race were broken this would time out and FAIL loudly.
+    bundle = await asyncio.wait_for(
+        run_live_window(
+            _window("manual_stop", min_clv_horizon_s=10),
+            [_flag_agent()],
+            stream=idle_stream(),
+            stop_event=stop,
+        ),
+        timeout=2.0,
+    )
+
+    tss = [t["ts"] for t in _tick_snaps(bundle.run.run_events)]
+    assert tss == [1000, 1100]  # ended promptly at the stop; the idle await never blocked us
+    assert bundle.run.evidence_hash  # the run finalized (it did not hang)
+
+
+async def test_mid_stream_exception_degrades_partial_run() -> None:
+    # A mid-stream error (a plausible httpx blip over a multi-hour window) after N ticks must NOT
+    # vaporize the run: it degrades to WINDOW CLV (never true CLV — the window was cut short) and
+    # returns the partial sealed evidence with an explicit ops marker.
+    async def failing_stream() -> AsyncIterator[MarketState]:
+        yield _ms(6000, tick_seq=0, ts=1000, phase=0)
+        yield _ms(6300, tick_seq=1, ts=1100, phase=0)
+        raise RuntimeError("stream connection dropped")
+
+    bundle = await run_live_window(
+        _window("pre_match", min_clv_horizon_s=10),
+        [_flag_agent()],
+        stream=failing_stream(),
+        anchor_fn=None,
+    )
+
+    # N=2 ticks were sealed despite the interruption ...
+    assert [t["ts"] for t in _tick_snaps(bundle.run.run_events)] == [1000, 1100]
+    # ... the run degraded to WINDOW CLV (a truncated window is not a complete authoritative close) ...
+    rows = {r["tick_seq"]: r for r in bundle.run.score_rows}
+    assert "window_clv_bps" in rows[0]
+    assert "clv_bps" not in rows[0]
+    # ... the interruption is EXPLICIT with the cause preserved ...
+    assert "RuntimeError" in bundle.ops.get("stream_interrupted", "")
+    assert "stream connection dropped" in bundle.ops["stream_interrupted"]
+    # ... and the ops marker is NOT inside the sealed evidence.
+    assert "stream_interrupted" not in json.dumps(bundle.run.run_events)
+    assert "stream_interrupted" not in json.dumps(bundle.run.score_rows)
+
+
+async def test_zero_ticks_then_stream_error_reraises() -> None:
+    # A stream that dies before yielding a single tick has nothing to seal -> re-raise (never seal an
+    # empty run as if it were a valid window).
+    async def immediately_failing() -> AsyncIterator[MarketState]:
+        raise RuntimeError("connect failed")
+        yield  # pragma: no cover  (marks this an async generator)
+
+    with pytest.raises(RuntimeError, match="connect failed"):
+        await run_live_window(
+            _window("pre_match"),
+            [_flag_agent()],
+            stream=immediately_failing(),
+            anchor_fn=None,
+        )
+
+
+class _SpyStream:
+    """An injected async iterator that records whether ``aclose()`` was called (aclose fold)."""
+
+    def __init__(self, items: list[MarketState]) -> None:
+        self._it = iter(items)
+        self.aclose_calls = 0
+
+    def __aiter__(self) -> _SpyStream:
+        return self
+
+    async def __anext__(self) -> MarketState:
+        try:
+            return next(self._it)
+        except StopIteration:
+            raise StopAsyncIteration from None
+
+    async def aclose(self) -> None:
+        self.aclose_calls += 1
+
+
+async def test_stream_aclose_called_on_break() -> None:
+    # On break (here: kickoff) the runner must aclose() the stream so the real httpx client does not
+    # linger to GC in a long-running process.
+    spy = _SpyStream(
+        [
+            _ms(6000, tick_seq=0, ts=1000, phase=0),
+            _ms(6200, tick_seq=1, ts=9999, phase=1),  # kickoff -> break
+        ]
+    )
+
+    async def fetch(fid: int) -> list[dict[str, Any]]:
+        return [_upd(66, 34, ts_ms=2_000_000)]
+
+    bundle = await run_live_window(
+        _window("pre_match"), [_flag_agent()], stream=spy, fetch_updates=fetch, anchor_fn=None
+    )
+
+    assert spy.aclose_calls == 1  # the stream was closed exactly once on break
+    assert bundle.run.evidence_hash  # and the run still finalized
