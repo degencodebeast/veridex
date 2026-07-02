@@ -29,7 +29,7 @@ from pydantic import BaseModel
 
 from veridex.api.demo_fixtures import build_demo_ticks
 from veridex.chain.anchor import anchor_memo
-from veridex.deploy.instance import AgentInstance, DeployStatus
+from veridex.deploy.instance import AgentInstance, DeployFailureReason, DeployStatus
 from veridex.deploy.preflight import DeployConfig, PreflightCheck, run_deploy_preflight
 from veridex.ingest.feed_health import FeedHealthReport
 from veridex.ingest.marketstate import MarketState
@@ -43,19 +43,10 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# Cap the durable ``last_failure_reason`` to a bounded, honest one-liner — the FULL diagnostic
-# (with traceback) is surfaced on the server log by the done-callback, never in the stored record.
-_MAX_FAILURE_REASON_LEN = 500
-
 
 def _now_iso() -> str:
     """Return the current UTC time as an ISO-8601 string (the deploy-record timestamp stamp)."""
     return datetime.now(tz=UTC).isoformat()
-
-
-def _failure_reason(exc: BaseException) -> str:
-    """Render a bounded, honest failure reason for the durable record (never a raw trace dump)."""
-    return f"{type(exc).__name__}: {exc}"[:_MAX_FAILURE_REASON_LEN]
 
 
 # ---------------------------------------------------------------------------
@@ -218,6 +209,10 @@ def register_deploy_routes(app: FastAPI, *, store: Store, deploy_deps: DeployDep
         left in ``running`` (honest — it was running when the process was cancelled).
         """
         await store.update_agent_instance_status(instance_id, DeployStatus.RUNNING, updated_at=_now_iso())
+        # Controlled failure taxonomy (never a raw trace): a failure while constructing the agent is
+        # a RUNTIME_ERROR; once we enter the runner seam it is a SEAL_FAILED. The FULL diagnostic is
+        # logged with exc_info by the done-callback below — only this short reason is persisted.
+        phase = DeployFailureReason.RUNTIME_ERROR
         try:
             agent = _build_agent(config)
             envelope = config.to_policy_envelope()
@@ -225,6 +220,7 @@ def register_deploy_routes(app: FastAPI, *, store: Store, deploy_deps: DeployDep
             lane_envelope = None if config.execution_mode == "paper" else envelope
             config_hash = config.config_hash()
 
+            phase = DeployFailureReason.SEAL_FAILED
             if config.source_mode == "live":
                 await standalone_run(
                     [],
@@ -256,13 +252,14 @@ def register_deploy_routes(app: FastAPI, *, store: Store, deploy_deps: DeployDep
         except asyncio.CancelledError:
             # Shutdown cancellation is neither a seal nor a failure — leave the record RUNNING.
             raise
-        except Exception as exc:
-            # Pre-seal failure: durably mark FAILED with a bounded reason, then re-raise so the
-            # done-callback still surfaces the FULL diagnostic on the server log (never lost to GC).
+        except Exception:
+            # Pre-seal failure: durably mark FAILED with the CONTROLLED reason (no raw trace), then
+            # re-raise so the done-callback surfaces the FULL diagnostic on the server log (never
+            # lost to GC, never persisted to the record).
             await store.update_agent_instance_status(
                 instance_id,
                 DeployStatus.FAILED,
-                last_failure_reason=_failure_reason(exc),
+                last_failure_reason=phase,
                 updated_at=_now_iso(),
             )
             raise
@@ -328,6 +325,9 @@ def register_deploy_routes(app: FastAPI, *, store: Store, deploy_deps: DeployDep
             market_allowlist=list(config.market_allowlist),
             venue_allowlist=list(config.venue_allowlist),
             run_id=run_id,
+            # Durable "why did this launch?" audit: the named preflight verdicts that GATED it
+            # (all passing/not-applicable — a failing preflight never reaches here).
+            preflight_checks=list(checks),
             status=DeployStatus.PENDING,
             last_failure_reason=None,
             created_at=now,

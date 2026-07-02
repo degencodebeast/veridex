@@ -32,7 +32,7 @@ from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 from veridex.competition.events import CompetitionEvent
 from veridex.competition.models import AgentEntry, Competition, CompetitionConfig, CompetitionStatus
 from veridex.config import get_settings, require_database_url
-from veridex.deploy.instance import AgentInstance, DeployStatus
+from veridex.deploy.instance import AgentInstance, DeployFailureReason, DeployStatus
 from veridex.execution.models import ExecutionRecord
 from veridex.runtime.evidence import serialize_payload
 
@@ -288,21 +288,21 @@ class Store(Protocol):
         instance_id: str,
         status: DeployStatus,
         *,
-        last_failure_reason: str | None = None,
+        last_failure_reason: DeployFailureReason | None = None,
         updated_at: str,
     ) -> None:
         """Durably update a deployed instance's lifecycle status (background success/failure).
 
         The background run task calls this to advance the STORED record to ``running`` then to a
         terminal ``sealed`` / ``failed`` — so the outcome survives beyond process memory. On
-        ``failed`` the caller supplies a bounded, honest ``last_failure_reason`` (never a raw
-        framework trace).
+        ``failed`` the caller supplies a controlled :class:`~veridex.deploy.instance.DeployFailureReason`
+        (never a raw framework trace).
 
         Args:
             instance_id: The instance to update.
             status: The new :class:`~veridex.deploy.instance.DeployStatus`.
-            last_failure_reason: Bounded reason to persist (only meaningful for ``failed``); when
-                ``None`` the stored reason is left unchanged.
+            last_failure_reason: Controlled taxonomy value to persist (only meaningful for
+                ``failed``); when ``None`` the stored reason is left unchanged.
             updated_at: ISO-8601 UTC timestamp of this write (caller owns the clock).
 
         Raises:
@@ -648,7 +648,7 @@ class InMemoryStore:
         instance_id: str,
         status: DeployStatus,
         *,
-        last_failure_reason: str | None = None,
+        last_failure_reason: DeployFailureReason | None = None,
         updated_at: str,
     ) -> None:
         """Update the stored instance's status (and optional failure reason) in place.
@@ -656,7 +656,7 @@ class InMemoryStore:
         Args:
             instance_id: The instance to update.
             status: The new lifecycle status.
-            last_failure_reason: Bounded reason to persist; ``None`` leaves it unchanged.
+            last_failure_reason: Controlled taxonomy value to persist; ``None`` leaves it unchanged.
             updated_at: ISO-8601 UTC timestamp of this write.
 
         Raises:
@@ -1346,7 +1346,7 @@ class PostgresStore:
         instance_id: str,
         status: DeployStatus,
         *,
-        last_failure_reason: str | None = None,
+        last_failure_reason: DeployFailureReason | None = None,
         updated_at: str,
     ) -> None:
         """Read-modify-write the instance's status column + ``record_json`` in one transaction.
@@ -1358,7 +1358,7 @@ class PostgresStore:
         Args:
             instance_id: The instance to update.
             status: The new lifecycle status.
-            last_failure_reason: Bounded reason to persist; ``None`` leaves it unchanged.
+            last_failure_reason: Controlled taxonomy value to persist; ``None`` leaves it unchanged.
             updated_at: ISO-8601 UTC timestamp of this write.
 
         Raises:

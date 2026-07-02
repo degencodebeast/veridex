@@ -22,7 +22,7 @@ from httpx import ASGITransport
 
 from veridex.api.deploy import DeployDeps
 from veridex.api.router import create_app
-from veridex.deploy.instance import DeployStatus, deploy_status_values
+from veridex.deploy.instance import DeployFailureReason, DeployStatus, deploy_status_values
 from veridex.deploy.preflight import DeployConfig
 from veridex.ingest.feed_health import FeedHealthReport
 from veridex.ingest.marketstate import MarketState
@@ -261,6 +261,32 @@ async def test_deployed_instance_is_durable_through_the_store_after_app_state_cl
         await _drain(app)
 
 
+async def test_launched_instance_carries_the_named_preflight_check_audit() -> None:
+    # Option-1 audit trail: a LAUNCHED instance durably carries the named preflight verdicts that
+    # GATED it (each check's name + pass/fail + reason), loadable from a fresh Store and linked to
+    # the run_id — durable "why did this agent launch?" traceability beyond just last_failure_reason.
+    app, store = _app_and_deps(_never_ending_stream)
+    try:
+        async with _transport(app) as client:
+            resp = await client.post("/agents/deploy", json=_VALID)
+        body = resp.json()
+
+        loaded = await store.get_agent_instance(body["instance_id"])
+        # The full named preflight set is attached (config + feed_health + market_mapped + policy).
+        by_name = {c.name: c for c in loaded.preflight_checks}
+        assert set(by_name) == {"config", "feed_health", "market_mapped", "policy_limits"}
+        # A launched instance's gating checks are all passing/not-applicable — never a hard fail.
+        assert all(c.ok is not False for c in loaded.preflight_checks)
+        # Each verdict carries its human-readable reason (the "why"), not just a bare boolean.
+        assert all(c.detail for c in loaded.preflight_checks)
+        # The audit is linked to the launched run.
+        assert loaded.run_id == body["run_id"]
+    finally:
+        for task in list(getattr(app.state, "deploy_background_tasks", set())):
+            task.cancel()
+        await _drain(app)
+
+
 async def test_preflight_failure_persists_no_instance_and_launches_no_run() -> None:
     # Persist-then-launch ordering: a FAILING preflight pins NO AgentInstance row AND starts NO run.
     # (Default app + a LIVE deploy with no live feed wired → the honest feed_health 422.)
@@ -313,8 +339,13 @@ async def test_background_failure_updates_stored_instance_status_and_reason(
 
     loaded = await store.get_agent_instance(instance_id)
     assert loaded.status == DeployStatus.FAILED
-    assert loaded.last_failure_reason  # a bounded reason is recorded durably
-    assert "stream boom pre-seal" in loaded.last_failure_reason
+    # The durable reason is a CONTROLLED taxonomy value (seal path failed) — NOT a raw trace.
+    assert loaded.last_failure_reason == DeployFailureReason.SEAL_FAILED
+    # The raw framework message never leaks into the persisted record...
+    assert "stream boom pre-seal" not in (loaded.last_failure_reason.value if loaded.last_failure_reason else "")
+    # ...it is surfaced on the SERVER LOG only (raw diagnostics — including the traceback — stay in
+    # the logs via exc_info, never in the DB field).
+    assert "stream boom pre-seal" in caplog.text
 
 
 async def test_deploy_response_is_narrow() -> None:
