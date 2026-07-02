@@ -7,7 +7,10 @@ exactly what is/ isn't ready:
 * ``market_mapped`` — the market resolved to concrete Polymarket identifiers.
 * ``liquidity`` — the book fills the capped order size at acceptable slippage (quote-size coupled).
 * ``wallet_funded_usdc`` / ``usdc_allowance`` — funded wallet + USDC allowance to the exchange.
-* ``ctf_approval_exchange`` / ``ctf_approval_neg_risk`` — CTF (ERC-1155) approvals on BOTH exchanges.
+* ``ctf_approval_exchange`` — CTF (ERC-1155) approval to the regular exchange (offline-checkable).
+* ``ctf_approval_neg_risk`` — the neg-risk exchange's SEPARATE approval; the vendored
+  balance-allowance surface can't distinguish it, so this is OPERATOR-VERIFIED (``ok=None``), never
+  a boolean pass we can't back.
 * ``sig_type`` — the signer's signature type matches the wallet kind.
 * ``egress_reachable`` — the Cloudflare-fronted CLOB egress is reachable.
 * ``kill_switch_ready`` — the policy kill switch is NOT engaged.
@@ -236,13 +239,10 @@ async def run_preflight(
         )
     )
 
-    # --- CTF (ERC-1155) approvals on BOTH the exchange and the neg-risk exchange ---
+    # --- CTF (ERC-1155) approval to the regular exchange (offline-checkable) ---
     if resolved is not None:
         conditional = await balances.get_balance_allowance(
             asset_type="CONDITIONAL", token_id=resolved.token_id_yes
-        )
-        neg_risk = await balances.get_balance_allowance(
-            asset_type="CONDITIONAL", token_id=resolved.token_id_yes, neg_risk=True
         )
         cheap.append(
             PreflightCheck(
@@ -251,20 +251,32 @@ async def run_preflight(
                 detail=f"CTF allowance (exchange) {_amount(conditional, 'allowance'):g}",
             )
         )
+    else:
         cheap.append(
             PreflightCheck(
-                name="ctf_approval_neg_risk",
-                ok=_amount(neg_risk, "allowance") > 0.0,
-                detail=f"CTF allowance (neg-risk exchange) {_amount(neg_risk, 'allowance'):g}",
+                name="ctf_approval_exchange",
+                ok=False,
+                detail="market unresolved — cannot check CTF token approval",
             )
         )
-    else:
-        for name in ("ctf_approval_exchange", "ctf_approval_neg_risk"):
-            cheap.append(
-                PreflightCheck(
-                    name=name, ok=False, detail="market unresolved — cannot check CTF token approval"
-                )
-            )
+
+    # --- CTF neg-risk exchange approval: NOT offline-verifiable (operator-verify, ok=None) ---
+    # The neg-risk exchange is a SEPARATE contract needing its OWN ERC-1155 approval. The vendored
+    # get_balance_allowance sends only {asset_type, signature_type, token_id} and has no neg-risk
+    # selector, so it CANNOT distinguish the neg-risk exchange's approval — a boolean here would
+    # merely MIRROR ctf_approval_exchange and FABRICATE a pass for an operator who approved the
+    # regular exchange but not the neg-risk one. Honest verdict: ok=None, confirmed by the operator
+    # via the live on-chain approval + the 1-share FAK smoke (ASM-3).
+    cheap.append(
+        PreflightCheck(
+            name="ctf_approval_neg_risk",
+            ok=None,
+            detail=(
+                "operator-verify: the vendored balance-allowance surface cannot distinguish the "
+                "neg-risk exchange approval — confirm on-chain approval + the 1-share FAK smoke (ASM-3)"
+            ),
+        )
+    )
 
     # --- signature type ---
     cheap.append(
@@ -294,7 +306,9 @@ async def run_preflight(
         )
     )
 
-    all_cheap_ok = all(check.ok for check in cheap)
+    # Only boolean-verdict cheap checks gate the quote; an operator-verify (ok=None) check does not
+    # block the offline liquidity read (nor fabricate a pass).
+    all_cheap_ok = all(check.ok for check in cheap if check.ok is not None)
 
     # --- liquidity: the ONLY quote-dependent check; skipped (zero quote I/O) on any cheap failure ---
     if all_cheap_ok:

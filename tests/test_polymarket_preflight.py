@@ -52,30 +52,23 @@ class _FakeQuoteAdapter:
 
 
 class _FakeBalances:
-    """Fake vendored-shaped balance/allowance client; returns configured dicts per asset type."""
+    """Fake matching the PRODUCTION ``get_balance_allowance`` surface exactly: it keys only on
+    ``asset_type`` (COLLATERAL / CONDITIONAL). It has NO neg-risk selector — the vendored client has
+    none either, so the fake must not invent a capability the real client lacks (that phantom is
+    what would mask the neg-risk false-green)."""
 
-    def __init__(
-        self,
-        *,
-        collateral: dict[str, Any],
-        conditional: dict[str, Any],
-        neg_risk: dict[str, Any] | None = None,
-    ) -> None:
+    def __init__(self, *, collateral: dict[str, Any], conditional: dict[str, Any]) -> None:
         self._collateral = collateral
         self._conditional = conditional
-        self._neg_risk = neg_risk if neg_risk is not None else conditional
 
     async def get_balance_allowance(
         self,
         asset_type: str,
         token_id: str | None = None,
         signature_type: int = -1,
-        neg_risk: bool = False,
         **kwargs: Any,
     ) -> dict[str, Any]:
-        if asset_type == "COLLATERAL":
-            return self._collateral
-        return self._neg_risk if neg_risk else self._conditional
+        return self._collateral if asset_type == "COLLATERAL" else self._conditional
 
 
 class _FakeEgress:
@@ -184,7 +177,8 @@ async def test_preflight_all_pass_ok_true_operator_smoke_pending() -> None:
     assert checks["wallet_funded_usdc"].ok is True
     assert checks["usdc_allowance"].ok is True
     assert checks["ctf_approval_exchange"].ok is True
-    assert checks["ctf_approval_neg_risk"].ok is True
+    # neg-risk exchange approval is NOT offline-verifiable — operator-verify, never a boolean pass.
+    assert checks["ctf_approval_neg_risk"].ok is None
     assert checks["sig_type"].ok is True
     assert checks["egress_reachable"].ok is True
     assert checks["kill_switch_ready"].ok is True
@@ -236,15 +230,19 @@ async def test_missing_ctf_approval_fails_named() -> None:
     assert _by_name(report)["ctf_approval_exchange"].ok is False
 
 
-async def test_missing_neg_risk_approval_fails_named() -> None:
-    balances = _FakeBalances(
-        collateral={"balance": 100.0, "allowance": 100.0},
-        conditional={"balance": 5.0, "allowance": 5.0},
-        neg_risk={"balance": 5.0, "allowance": 0.0},
-    )
-    report, _ = await _run(balances=balances)
-    assert report.ok is False
-    assert _by_name(report)["ctf_approval_neg_risk"].ok is False
+async def test_neg_risk_approval_is_operator_verify_not_a_boolean_pass() -> None:
+    """The neg-risk exchange approval CANNOT be verified offline (the vendored balance-allowance
+    surface has no neg-risk selector), so it must be reported ok=None — never a fabricated boolean
+    pass that would merely mirror the regular-exchange approval. Being ok=None, it neither fails the
+    report on its own nor claims a pass the code can't back."""
+    report, _ = await _run()  # everything else healthy
+
+    check = _by_name(report)["ctf_approval_neg_risk"]
+    assert check.ok is None  # operator-verify, not True and not False
+    assert "operator-verify" in check.detail.lower()
+    assert "neg-risk" in check.detail.lower()
+    # ok=None does not drag the overall verdict down when every boolean check passed.
+    assert report.ok is True
 
 
 async def test_thin_liquidity_fails_named() -> None:

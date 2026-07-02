@@ -524,6 +524,14 @@ class PolymarketAdapter:
         token_id = side_to_token(self._resolved, order.side)
         # DECIMAL ODDS -> native share price q -> tick-rounded to the market's tick. NATIVE on the wire.
         native_price = round_to_tick(decimal_to_native(order.price), self._resolved.tick_size)
+        # Defense-in-depth (real money): a valid share price is strictly inside (0, 1). Fail CLOSED
+        # BEFORE the wire so a pathological decimal price (e.g. odds <= 1) can never reach a mainnet
+        # order — the vendored client would also reject it, but we never rely on the wire to catch it.
+        if not 0.0 < native_price < 1.0:
+            raise PolymarketWriteDisabled(
+                f"refusing to submit: native price {native_price!r} outside (0, 1) for decimal odds "
+                f"{order.price!r} at tick {self._resolved.tick_size!r} — fail-closed on the money path"
+            )
         response = await client.limit_order(
             ticker=token_id,
             amount=order.size,  # positive => BUY the side's token

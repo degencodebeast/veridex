@@ -169,6 +169,26 @@ async def test_submit_prices_selected_side_token() -> None:
     assert client.limit_order_calls[0]["ticker"] == "222"  # no-side token
 
 
+async def test_submit_fails_closed_when_native_price_outside_unit_interval() -> None:
+    """Defense-in-depth: a decimal price that inverts to a native q outside (0, 1) is rejected
+    BEFORE the wire — the pathological order never reaches the mainnet client."""
+    client = _CapturingWriteClient()
+    adapter = PolymarketAdapter(
+        _RESOLVED,
+        _FakeBookClient(),
+        side="yes",
+        settings=_write_enabled_settings(),
+        write_client=client,
+        dry_run=False,
+    )
+
+    # decimal odds 0.5 -> native 1/0.5 = 2.0, outside (0, 1) -> must fail closed.
+    with pytest.raises(PolymarketWriteDisabled):
+        await adapter.submit_order(_order(price=0.5))
+
+    assert client.limit_order_calls == []  # the wire is NEVER touched
+
+
 # ---------------------------------------------------------------------------
 # HONEST FILL RECONCILIATION (SEC-004, AC-2D-405 fill leg) — THE trust item
 # ---------------------------------------------------------------------------
