@@ -293,6 +293,7 @@ async def run_execution_lane(
                 slippage_bps=slippage,
                 quote_age_s=max(0, event_ts - quote.ts),
                 stake=stake,
+                quoted_size=quote.size,  # book depth feeds the post-quote liquidity guardrail
             ),
             envelope,
         )
@@ -498,6 +499,7 @@ async def resolve_approval(
                     slippage_bps=slippage,
                     quote_age_s=max(0, event_ts - quote.ts),
                     stake=stake,
+                    quoted_size=quote.size,  # book depth feeds the post-quote liquidity guardrail
                 ),
                 envelope,
             )
