@@ -1,0 +1,6 @@
+.group { display: inline-flex; gap: 2px; padding: 2px; border: 1px solid var(--border-strong); border-radius: var(--radius-control); background: var(--panel-2); }
+.seg { padding: 5px 10px; border: 1px solid transparent; border-radius: var(--radius-badge); background: transparent; color: var(--text-2); font-family: var(--font-mono), monospace; font-size: 10px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.04em; cursor: pointer; }
+.seg:hover { color: var(--text-1); }
+.active { color: var(--accent-hi); background: var(--accent-bg); border-color: var(--border-strong); }
+.locked { color: var(--text-3); cursor: not-allowed; }
+.locked:hover { color: var(--text-3); }

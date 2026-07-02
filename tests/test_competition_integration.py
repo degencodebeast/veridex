@@ -12,15 +12,18 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from tests._arena_fixtures import finished_run_result
 from veridex.chain.anchor import run_manifest, run_manifest_hash
 from veridex.ingest.marketstate import MarketState
 from veridex.runtime.agent import emit_agent_action_async  # noqa: F401  (documented stub seam)
 from veridex.runtime.competition import (
     CompetitionResult,
+    _default_checks,
     run_demo_competition,
 )
 from veridex.runtime.orchestrator import Agent, deterministic_agent, llm_agent
 from veridex.runtime.schemas import AgentAction, SportsActionType
+from veridex.scoring import score_run
 from veridex.store import InMemoryStore
 
 KEY = "OU_2_5"
@@ -129,7 +132,10 @@ async def test_end_to_end_competition_is_scored_anchored_and_ranked() -> None:
     card = result.proof_card
     assert card["lineage"]["proof_mode_map"] == result.run.proof_mode_map
     assert "checks" in card
-    assert card["checks"]["clv"]["result"] == "pass"  # top agent has positive avg CLV
+    # SEC-001: CLV is NOT a check — it lives in the separate Performance-Metrics block.
+    assert "clv" not in card["checks"]
+    assert card["metrics"]["clv"] > 0  # top agent has positive avg CLV (over drifts +300)
+    assert card["checks"]["metrics_recomputed"]["result"] == "pass"
     assert card["anchor"]["status"] == "anchored"
     assert card["anchor"]["signature"] == result.signature
     assert result.signature is not None and result.signature.startswith("FAKE_SIG_")
@@ -227,33 +233,25 @@ async def test_no_anchor_path_is_not_anchored() -> None:
 # ---------------------------------------------------------------------------
 
 
-async def test_default_checks_summary_shape() -> None:
-    result = await run_demo_competition(
-        _marketstates(), _agents(), source_mode="replay", store=InMemoryStore(), anchor_fn=_mock_anchor
-    )
-
-    checks = result.proof_card["checks"]
-    assert set(checks) == {"clv", "evidence_integrity", "llm_boundary"}
-    assert checks["clv"]["result"] in ("pass", "fail")
-    assert isinstance(checks["clv"]["scored_actions"], int)
-
-    # evidence_integrity is a self-describing dict (method + note), not a bare string.
-    assert checks["evidence_integrity"]["result"] == "pass"  # evidence_hash present
-    assert checks["evidence_integrity"]["method"] == "sha256_evidence_hash"
-    assert isinstance(checks["evidence_integrity"]["note"], str)
-
-    # llm_boundary is self-describing: a judge can see WHAT was proven and OVER WHAT.
-    assert checks["llm_boundary"]["result"] == "pass"  # import audit guarantees the boundary
-    assert checks["llm_boundary"]["method"] == "static_import_audit"
-    assert checks["llm_boundary"]["scope"] == [
-        "checks/",
-        "verifier/",
-        "law/",
-        "ingest/",
-        "scoring.py",
-        "leaderboard.py",
-    ]
-    assert isinstance(checks["llm_boundary"]["note"], str)
+def test_default_checks_summary_shape() -> None:
+    run = finished_run_result()
+    scores = score_run(run)
+    checks = _default_checks(scores, run)
+    # SEC-001: exactly the 7 CheckIds, and CLV is NOT one of them.
+    assert set(checks) == {
+        "evidence_integrity",
+        "llm_boundary",
+        "metrics_recomputed",
+        "manifest_bound",
+        "policy_obeyed",
+        "receipt_separation",
+        "anchor",
+    }
+    assert "clv" not in checks
+    assert checks["evidence_integrity"]["result"] == "pass"
+    assert checks["llm_boundary"]["result"] == "pass"
+    assert checks["metrics_recomputed"]["result"] == "pass"
+    assert checks["anchor"]["result"] == "not_applicable"  # offline replay
 
 
 async def test_checks_fn_is_injectable() -> None:
@@ -321,4 +319,7 @@ def test_run_manifest_uses_run_fields() -> None:
         proof_mode_map=manifest["proof_mode_map"],
         code_prompt_schema_versions=manifest["code_prompt_schema_versions"],
     )
+    # The per-domain root forest (Pre-2C) is bound into the canonical manifest before hashing,
+    # so a faithful rebuild must carry it too (it is part of what manifest_hash commits to).
+    rebuilt["root_forest"] = manifest["root_forest"]
     assert run_manifest_hash(rebuilt) == result.manifest_hash

@@ -4,14 +4,22 @@
 
 # --- re-include the Veridex deliverable ---
 !/.gitignore
+!/.dockerignore
 !/README.md
 !/pyproject.toml
 !/veridex/
+!/veridex_agent/
 !/tests/
 !/scripts/
+!/contracts/
+!/apps/
+!/docs/
+!/Dockerfile.agent
 
 # planning/spec docs stay LOCAL — never pushed (per project decision)
 spec/
+# local strategy notes stay LOCAL (docs/ is allowlisted for the committed WD-3 deploy guide only)
+docs/strategy/
 
 # --- within the allowed trees, still exclude secrets + build artifacts ---
 veridex/.env

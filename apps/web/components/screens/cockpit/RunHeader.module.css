@@ -1,0 +1,23 @@
+.header {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--space-3);
+  padding: var(--pad-panel);
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-panel);
+}
+.titleRow { display: flex; align-items: baseline; gap: var(--space-2); }
+.title { margin: 0; font-size: 19px; font-weight: 600; letter-spacing: -0.01em; }
+.competition { color: var(--text-3); font-size: 11px; }
+.badges { display: flex; align-items: center; gap: var(--space-2); margin-left: auto; }
+.exec {
+  padding: 3px 7px; border: 1px solid var(--border-strong); border-radius: var(--radius-badge);
+  color: var(--text-2); font-size: 9px; letter-spacing: 0.04em;
+}
+.ws { display: inline-flex; align-items: center; gap: 5px; font-size: 10px; text-transform: uppercase; letter-spacing: 0.04em; }
+.wsOk { color: var(--accent-hi); }
+.wsWarn { color: var(--warning-hi); }
+.stats { display: flex; gap: var(--space-3); }
+.stat { color: var(--text-2); font-size: 11px; }

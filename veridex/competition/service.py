@@ -27,6 +27,7 @@ canonical Phase-2A values via :func:`veridex.competition.models.normalize_proof_
 from __future__ import annotations
 
 import hashlib
+from collections.abc import Awaitable, Callable
 from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
@@ -44,18 +45,53 @@ from veridex.competition.models import (
     ExecutionMode,
     normalize_proof_mode,
 )
+from veridex.execution.runner import run_execution_lane
+from veridex.policy.envelope import PolicyEnvelope
 from veridex.runtime.evidence import serialize_payload
 from veridex.runtime.orchestrator import run_competition
+from veridex.venues.sx_bet import FakeVenueAdapter, SXBetAdapter
 
 if TYPE_CHECKING:  # the heavy/offline-safe types are only needed for annotations
     from veridex.ingest.marketstate import MarketState
-    from veridex.runtime.orchestrator import Agent
+    from veridex.runtime.orchestrator import Agent, RunResult
     from veridex.store import Store
+
+# A live-broadcast callback: persist-before-broadcast is the caller's responsibility, so this is
+# invoked only AFTER the event is durably appended. Errors are swallowed by the service so a dead
+# spectator never aborts the run (REQ-2B-30).
+BroadcastFn = Callable[[CompetitionEvent], Awaitable[None]]
+
+
+def _default_policy_envelope() -> PolicyEnvelope:
+    """Build the conservative, deny-by-default envelope used when none is configured.
+
+    Fail-closed posture: empty venue/market allowlists deny every action, and a zero
+    human-approval threshold escalates any otherwise-clean action. An operator that wants
+    real fills MUST commit an explicit ``policy_envelope`` on the competition config.
+
+    Returns:
+        A restrictive :class:`~veridex.policy.envelope.PolicyEnvelope`.
+    """
+    return PolicyEnvelope(
+        max_stake=10.0,
+        max_orders_per_run=5,
+        max_orders_per_session=5,
+        max_orders_per_day=5,
+        venue_allowlist=[],
+        market_allowlist=[],
+        min_edge_bps=0,
+        max_slippage_bps=0,
+        max_price=1_000.0,
+        max_quote_age_s=300,
+        cooldown_s=0,
+        human_approval_threshold=0.0,
+        kill_switch=False,
+    )
+
 
 # Stable reason strings (tests match on these EXACTLY — do not edit casually).
 _ALREADY_FINALIZED = "competition_already_finalized"
 _ALREADY_RUNNING = "competition_already_running"
-_EXECUTION_MODE_UNAVAILABLE = "execution_mode_not_available_in_phase_2a"
 _PREFIX_MISMATCH = "live_evidence_prefix_diverged_from_projection"
 
 
@@ -145,20 +181,24 @@ async def start_competition(
     competition_id: str,
     marketstates: list[MarketState],
     agents: list[Agent],
+    *,
+    broadcast: BroadcastFn | None = None,
 ) -> Competition:
-    """Run a paper competition and seal its canonical event log (live ≡ projection).
+    """Run a competition, seal its canonical log, then (non-paper) run the executor lane.
 
     Flow (codex-corrected ordering):
 
-      1. Load the competition; if already ``FINALIZED`` raise (idempotency gate).
-      2. Reject any non-``PAPER`` execution mode (REQ-204A) BEFORE creating any run/events.
-      3. Pre-generate ``run_id`` (so the live seq0 + evidence events share the run id
+      1. Load the competition; if already ``FINALIZED``/``RUNNING`` raise (idempotency gate).
+      2. Pre-generate ``run_id`` (so the live seq0 + evidence events share the run id
          ``build_event_log`` will project) and advance status to ``RUNNING``.
-      4. Persist the seq=0 ``COMPETITION_STARTED`` event.
-      5. Run with ``store=store`` (persists the sealed ``RunResult`` for external verification)
+      3. Persist the seq=0 ``COMPETITION_STARTED`` event.
+      4. Run with ``store=store`` (persists the sealed ``RunResult`` for external verification)
          and a stateful live sink that persists one evidence event per sealed ``RunEvent``.
-      6. Project the sealed run, VERIFY the live evidence prefix == projection prefix, then
-         append ONLY the derived tail (no evidence re-append → no ``UNIQUE(seq)`` collision).
+      5. Project the sealed run, VERIFY the live evidence prefix == projection prefix (AC-213,
+         over the sealed seq 0..N ONLY), then append ONLY the 2A derived tail.
+      6. EXECUTION (non-paper only, DOWNSTREAM of the seal): run the policy-gated executor lane
+         and append its events as a SECOND derived block (seq strictly after the 2A tail) —
+         EXCLUDED from the AC-213 prefix check. ``paper`` keeps the exact no-execution behavior.
       7. Advance status to ``FINALIZED`` and return the competition with ``run_id`` set.
 
     Args:
@@ -166,6 +206,9 @@ async def start_competition(
         competition_id: The competition to start.
         marketstates: Ordered tick snapshots driving the run.
         agents: Participating agents (identical inputs per tick).
+        broadcast: Optional persist-before-broadcast callback. Each execution event is appended
+            to the store FIRST, then broadcast; broadcast errors are swallowed and never abort
+            the run (REQ-2B-17/30).
 
     Returns:
         The finalized :class:`~veridex.competition.models.Competition` (status ``FINALIZED``,
@@ -175,11 +218,11 @@ async def start_competition(
         CompetitionConflictError: If the competition is already finalized
             (``competition_already_finalized``) or already running
             (``competition_already_running``).
-        CompetitionStateError: If the execution mode is not paper
-            (``execution_mode_not_available_in_phase_2a``).
         CompetitionIntegrityError: If the live evidence prefix diverged from the projection
-            (``live_evidence_prefix_diverged_from_projection…``).  All three subclass
-            ``ValueError`` so existing ``match`` tests remain valid.
+            (``live_evidence_prefix_diverged_from_projection…``).  Both subclass ``ValueError``
+            so existing ``match`` tests remain valid.
+        NotImplementedError: If ``live_guarded`` is requested while the live venue adapter is
+            not enabled (the expected testnet-gated behavior).
     """
     competition = await store.get_competition(competition_id)
 
@@ -191,10 +234,7 @@ async def start_competition(
     if competition.status == CompetitionStatus.RUNNING:
         raise CompetitionConflictError(_ALREADY_RUNNING)
 
-    # 2. REQ-204A — only paper trading is available in Phase 2A; create NO run/events otherwise.
-    if competition.config.execution_mode != ExecutionMode.PAPER:
-        raise CompetitionStateError(_EXECUTION_MODE_UNAVAILABLE)
-
+    execution_mode = competition.config.execution_mode
     source_mode = competition.config.source_mode
     agent_ids = [agent.agent_id for agent in agents]
     # Deterministic base ts shared between seq0-build time and finalize (see build_event_log meta).
@@ -255,9 +295,98 @@ async def start_competition(
     derived_tail = [event for event in full_log if event.seq > prefix_end]
     await store.append_competition_events(competition_id, derived_tail)
 
+    # 6b. EXECUTION (non-paper only) — DOWNSTREAM of the seal + the 2A finalize. Appended as a
+    # SECOND derived block whose seq starts strictly after the 2A tail, so it is EXCLUDED from
+    # the AC-213 prefix-parity check above (which already ran over seq 0..N). ``paper`` skips this
+    # entirely, preserving the exact existing no-execution behavior.
+    if execution_mode != ExecutionMode.PAPER:
+        next_seq = max((event.seq for event in full_log), default=0) + 1
+        try:
+            await _run_execution_block(
+                store,
+                competition=competition,
+                run_result=run_result,
+                execution_mode=execution_mode,
+                base_seq=next_seq,
+                event_ts=base_ts,
+                broadcast=broadcast,
+            )
+        except Exception:
+            # The seal + the entire 2A tail (incl. COMPETITION_FINALIZED) are already durable.
+            # The executor lane is NON-SCORING and downstream-of-seal — the same best-effort tier
+            # as the spectator broadcast — so a venue failure (e.g. the testnet-gated live adapter
+            # raising NotImplementedError) must NOT strand the lifecycle in RUNNING. Finalize the
+            # status first, then re-raise so the router still surfaces the error (e.g. 501).
+            await store.update_competition_status(competition_id, CompetitionStatus.FINALIZED)
+            raise
+
     # 7. finalize the lifecycle; run_id is already in the store (A1), so a plain load suffices.
     await store.update_competition_status(competition_id, CompetitionStatus.FINALIZED)
     return await store.get_competition(competition_id)
+
+
+async def _run_execution_block(
+    store: Store,
+    *,
+    competition: Competition,
+    run_result: RunResult,
+    execution_mode: ExecutionMode,
+    base_seq: int,
+    event_ts: int,
+    broadcast: BroadcastFn | None,
+) -> None:
+    """Run the policy-gated executor lane and persist+broadcast its derived events.
+
+    Sources the :class:`~veridex.policy.envelope.PolicyEnvelope` from
+    ``competition.config.policy_envelope`` (or a conservative default), pins its ``policy_hash``
+    (REQ-2B-03 — recorded on every emitted ``POLICY_RESULT`` payload), and picks the venue
+    adapter by mode (``dry_run`` → fake, ``live_guarded`` → SX Bet skeleton). The returned events
+    are appended to the canonical log as ONE contiguous block (persist-before-broadcast), then
+    each is broadcast; a broadcast error never aborts the run.
+
+    Args:
+        store: The async repository.
+        competition: The competition (provides the roster + config envelope).
+        run_result: The sealed, frozen Phase-1 run (read-only).
+        execution_mode: ``dry_run`` or ``live_guarded`` (never ``paper`` — caller-gated).
+        base_seq: First competition ``seq`` for the execution block (strictly after the 2A tail).
+        event_ts: Deterministic event timestamp (the meta base ts).
+        broadcast: Optional persist-before-broadcast callback.
+    """
+    envelope = competition.config.policy_envelope or _default_policy_envelope()
+    # REQ-2B-03: pin the policy commitment. It is recorded on every POLICY_RESULT event the lane
+    # emits (result.policy_hash == envelope.policy_hash()), binding the persisted execution block
+    # to this exact envelope alongside the per-agent config_hash already in the evidence log.
+    _ = envelope.policy_hash()
+
+    adapter = FakeVenueAdapter() if execution_mode == ExecutionMode.DRY_RUN else SXBetAdapter()
+    entries_by_agent = {entry.agent_id: entry for entry in competition.entries}
+
+    events = await run_execution_lane(
+        store,
+        competition_id=competition.competition_id,
+        run_result=run_result,
+        envelope=envelope,
+        adapter=adapter,
+        entries_by_agent=entries_by_agent,
+        execution_mode=execution_mode.value,
+        base_seq=base_seq,
+        event_ts=event_ts,
+    )
+
+    # Persist the whole block FIRST (persist-before-broadcast), then fan out.
+    await store.append_competition_events(competition.competition_id, events)
+    if broadcast is not None:
+        for event in events:
+            await _safe_broadcast(broadcast, event)
+
+
+async def _safe_broadcast(broadcast: BroadcastFn, event: CompetitionEvent) -> None:
+    """Invoke ``broadcast`` swallowing any error — a dead spectator never aborts the run."""
+    try:
+        await broadcast(event)
+    except Exception:  # noqa: BLE001 — live fanout is best-effort; the run must not fail on it.
+        return
 
 
 def _assert_prefix_parity(persisted: list[CompetitionEvent], projection: list[CompetitionEvent]) -> None:

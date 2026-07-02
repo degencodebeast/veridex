@@ -3,6 +3,10 @@
 These tests pin the trust invariant (CON-203): every ``evidence=True`` event is hash-bound to
 a sealed Phase-1 ``RunEvent``; every ``evidence=False`` event is a deterministic derivation
 carrying ``derived_from`` refs. ``build_event_log`` is pure / sync / deterministic.
+
+Phase-2B Task 4 tests (below the 2A keystone block) cover the three new derived-event builders:
+``build_policy_result_event``, ``build_execution_submitted_event``, ``build_execution_receipt_event``.
+These builders are NEVER called by ``build_event_log`` — the 2A keystone tests remain the guard.
 """
 
 from __future__ import annotations
@@ -14,6 +18,9 @@ from veridex.competition.events import (
     CompetitionEvent,
     EventType,
     build_event_log,
+    build_execution_receipt_event,
+    build_execution_submitted_event,
+    build_policy_result_event,
     event_payload_hash,
     replay_from,
 )
@@ -122,3 +129,194 @@ def test_build_event_log_does_not_mutate_run_result() -> None:
     build_event_log(rr, competition_meta())
     after = serialize_payload([dict(e) for e in rr.run_events])
     assert before == after
+
+
+# ---------------------------------------------------------------------------
+# Phase-2B Task 4 — derived event builder tests
+# ---------------------------------------------------------------------------
+
+
+def test_policy_result_event_is_derived_nonevidence() -> None:
+    """build_policy_result_event produces evidence=False with non-empty derived_from."""
+    payload = {"decision": "approved", "reason_codes": [], "policy_hash": "ph"}
+    ev = build_policy_result_event(
+        competition_id="c",
+        run_id="r",
+        seq=20,
+        event_ts=0,
+        agent_id="a",
+        source_sequence_no_ref=3,
+        policy_result_payload=payload,
+    )
+    assert ev.event_type is EventType.POLICY_RESULT
+    assert ev.evidence is False
+    assert ev.source_sequence_no is None
+    assert ev.derived_from  # non-empty
+    assert ev.payload_hash == event_payload_hash(payload)
+
+
+def test_policy_result_event_derived_from_ref() -> None:
+    """build_policy_result_event derived_from encodes the score_row agent/seq reference."""
+    payload = {"decision": "rejected", "reason_codes": ["size_limit"], "policy_hash": "ph2"}
+    ev = build_policy_result_event(
+        competition_id="c",
+        run_id="r",
+        seq=30,
+        event_ts=100,
+        agent_id="agent-x",
+        source_sequence_no_ref=7,
+        policy_result_payload=payload,
+    )
+    assert ev.derived_from == ["score_row:agent-x:seq-7"]
+
+
+def test_policy_result_event_secret_free() -> None:
+    """policy_result payload must not contain token/auth keys."""
+    payload = {"decision": "approved", "reason_codes": [], "policy_hash": "ph"}
+    ev = build_policy_result_event(
+        competition_id="c",
+        run_id="r",
+        seq=20,
+        event_ts=0,
+        agent_id="a",
+        source_sequence_no_ref=3,
+        policy_result_payload=payload,
+    )
+    secret_keys = {"token", "auth", "secret", "password", "key", "api_key"}
+    assert secret_keys.isdisjoint(ev.payload.keys())
+
+
+def test_policy_result_event_threads_execution_id() -> None:
+    """Plan-A Task 4: execution_id is threaded into the policy_result payload so POLICY_OBEYED
+    can correlate a DENIED decision with a submit for the same execution."""
+    payload = {"decision": "denied", "reason_codes": ["slippage_over_max"], "policy_hash": "ph"}
+    ev = build_policy_result_event(
+        competition_id="c",
+        run_id="r",
+        seq=20,
+        event_ts=0,
+        agent_id="a",
+        source_sequence_no_ref=3,
+        policy_result_payload=payload,
+        execution_id="r:3",
+    )
+    assert ev.payload["execution_id"] == "r:3"
+    assert ev.payload_hash == event_payload_hash({**payload, "execution_id": "r:3"})
+    assert "execution_id" not in payload  # caller's dict is not mutated
+
+
+def test_policy_result_execution_id_is_additive_and_evidence_safe() -> None:
+    """AC-213: threading execution_id changes ONLY this derived event's own payload_hash and
+    never the sealed prefix — the event stays evidence=False / non-evidence."""
+    payload = {"decision": "denied", "reason_codes": [], "policy_hash": "ph"}
+    bare = build_policy_result_event(
+        competition_id="c",
+        run_id="r",
+        seq=20,
+        event_ts=0,
+        agent_id="a",
+        source_sequence_no_ref=3,
+        policy_result_payload=payload,
+    )
+    enriched = build_policy_result_event(
+        competition_id="c",
+        run_id="r",
+        seq=20,
+        event_ts=0,
+        agent_id="a",
+        source_sequence_no_ref=3,
+        policy_result_payload=payload,
+        execution_id="r:3",
+    )
+    assert bare.evidence is False and enriched.evidence is False
+    assert "execution_id" not in bare.payload  # default omits the key entirely
+    assert enriched.payload_hash != bare.payload_hash  # additive change is confined to this event
+
+
+def test_execution_submitted_event_is_derived() -> None:
+    """build_execution_submitted_event produces evidence=False with correct derived_from."""
+    payload = {"venue": "sx_bet", "market_ref": "OU|2.5|full", "side": "over", "size": 100.0}
+    ev = build_execution_submitted_event(
+        competition_id="c",
+        run_id="r",
+        seq=21,
+        event_ts=0,
+        execution_id="e1",
+        payload=payload,
+    )
+    assert ev.event_type is EventType.EXECUTION_SUBMITTED
+    assert ev.evidence is False
+    assert ev.derived_from == ["execution_record:e1"]
+    assert ev.payload_hash == event_payload_hash(payload)
+
+
+def test_execution_submitted_event_source_sequence_no_none() -> None:
+    """build_execution_submitted_event always sets source_sequence_no=None."""
+    payload = {"venue": "pinnacle", "market_ref": "1X2||home", "side": "home", "size": 50.0}
+    ev = build_execution_submitted_event(
+        competition_id="comp-1",
+        run_id="run-1",
+        seq=5,
+        event_ts=999,
+        execution_id="exec-42",
+        payload=payload,
+    )
+    assert ev.source_sequence_no is None
+
+
+def test_execution_receipt_event_is_derived() -> None:
+    """build_execution_receipt_event produces evidence=False with correct derived_from."""
+    payload = {
+        "execution_id": "e1",
+        "venue": "sx_bet",
+        "status": "filled",
+        "filled_size": 100.0,
+        "mode": "dry_run",
+    }
+    ev = build_execution_receipt_event(
+        competition_id="c",
+        run_id="r",
+        seq=22,
+        event_ts=0,
+        execution_id="e1",
+        receipt_payload=payload,
+    )
+    assert ev.event_type is EventType.EXECUTION_RECEIPT
+    assert ev.evidence is False
+    assert ev.derived_from == ["execution_record:e1"]
+    assert ev.payload_hash == event_payload_hash(payload)
+
+
+def test_execution_receipt_event_secret_free() -> None:
+    """execution_receipt payload must not contain token/auth keys."""
+    payload = {
+        "execution_id": "e2",
+        "venue": "pinnacle",
+        "status": "partial",
+        "filled_size": 30.0,
+        "mode": "live",
+    }
+    ev = build_execution_receipt_event(
+        competition_id="c",
+        run_id="r",
+        seq=22,
+        event_ts=0,
+        execution_id="e2",
+        receipt_payload=payload,
+    )
+    secret_keys = {"token", "auth", "secret", "password", "key", "api_key"}
+    assert secret_keys.isdisjoint(ev.payload.keys())
+
+
+def test_build_event_log_still_does_not_emit_2b_events() -> None:
+    """build_event_log MUST NOT emit any Phase-2B or 2D reserved event types."""
+    log = build_event_log(finished_run_result(), competition_meta())
+    emitted = {e.event_type for e in log}
+    assert emitted.isdisjoint(
+        {
+            EventType.POLICY_RESULT,
+            EventType.EXECUTION_SUBMITTED,
+            EventType.EXECUTION_RECEIPT,
+            EventType.PAYOUT_STATUS,
+        }
+    )

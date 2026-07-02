@@ -21,17 +21,21 @@ a live-mode state owned by B9).
 
 from __future__ import annotations
 
-import hashlib
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
-from veridex.chain.anchor import anchor_memo, run_manifest, run_manifest_hash
+from veridex.chain.anchor import anchor_memo, run_manifest_hash
+from veridex.checks.build import (
+    build_check_results,
+    build_performance_metrics,
+    check_results_to_proof_block,
+)
 from veridex.leaderboard import leaderboard
-from veridex.runtime.evidence import serialize_payload
 from veridex.runtime.orchestrator import RunResult, run_competition
 from veridex.scoring import score_run
 from veridex.verifier.proof_card import DEFAULT_SCHEMA_VERSIONS, proof_card_from_run_result
+from veridex.verifier.recompute import manifest_from_run, recompute_score_root, root_forest_for_run
 
 if TYPE_CHECKING:
     from veridex.ingest.marketstate import MarketState
@@ -97,7 +101,11 @@ def _fixture_or_window_id(marketstates: list[MarketState]) -> str:
 
 
 def _score_root(scores: list[dict[str, Any]]) -> str:
-    """SHA-256 over the canonically-serialized ranked score rows (the manifest score root).
+    """Back-compat alias for :func:`veridex.verifier.recompute.recompute_score_root`.
+
+    The score-root formula now lives in the verifier trust path (single source of truth, Task D2);
+    this thin re-export keeps existing importers (the API router) working without forking the
+    formula.
 
     Args:
         scores: The :func:`~veridex.scoring.score_run` output.
@@ -105,55 +113,31 @@ def _score_root(scores: list[dict[str, Any]]) -> str:
     Returns:
         A 64-character hex digest binding the scored result into the manifest.
     """
-    return hashlib.sha256(serialize_payload(scores).encode("utf-8")).hexdigest()
+    return recompute_score_root(scores)
 
 
 def _default_checks(scores: list[dict[str, Any]], run: RunResult) -> dict[str, Any]:
-    """Compose the default Proof-Checks summary from the scored run.
+    """Back-compat 2-arg builder: the serialized proof block keyed by CheckId value.
 
-    JUDGMENT CALL (surfaced for the gate): this composition is a harness convenience, not a
-    spec-mandated schema. The three checks are derived as follows:
+    Delegates to :func:`~veridex.checks.build.build_check_results` (WD-5b) — the typed 7-member
+    Proof-Check taxonomy. CLV is NOT a check here (SEC-001); it lives in the separate Performance-
+    Metrics block (:func:`~veridex.checks.build.build_performance_metrics`).
 
-      * ``clv``: ``"pass"`` iff the rank-1 agent has a positive average CLV (the run produced a
-        genuinely edge-positive winner), else ``"fail"``; ``scored_actions`` is the total number
-        of scored actions across all agents in the run.
-      * ``evidence_integrity``: a self-describing dict — ``"pass"`` when the run sealed a non-empty
-        ``evidence_hash``, with the ``method`` and a ``note`` so a judge can see WHAT was proven.
-      * ``llm_boundary``: a self-describing dict — always ``"pass"``, carrying the ``method``
-        (``"static_import_audit"``) and the audited ``scope`` so a judge sees exactly which modules
-        are proven LLM-SDK-free. The static import audit (``veridex.verifier.import_audit``) is what
-        actually guarantees the boundary; this block surfaces that guarantee (and its scope) on the
-        card rather than asking the judge to infer it.
-
-    All check values are structured dicts (no bare-string/dict mix) so the block is uniform.
+    Manifest/anchor/events are unavailable in this convenience path (used by the API read
+    endpoints), so MANIFEST_BOUND/POLICY_OBEYED/RECEIPT_SEPARATION are ``not_applicable`` and ANCHOR
+    follows the run's ``source_mode`` (SEC-002/SEC-008). The richer path in
+    :func:`run_demo_competition` passes the manifest/anchor for the full verdict.
 
     Args:
-        scores: The ranked per-agent metric stack (rank-1 first).
-        run: The completed run result (for the evidence hash).
+        scores: The ranked per-agent metric stack (rank-1 first) — the PERSISTED/VISIBLE table
+            also rendered in the Performance-Metrics block (so METRICS_RECOMPUTED is non-tautological).
+        run: The completed run result (evidence hash + run_events + score rows).
 
     Returns:
-        A Proof-Checks summary dict (exposed publicly as ``checks`` — never ``cats``).
+        A Proof-Checks block keyed by ``CheckId`` value (exposed publicly as ``checks`` — never ``cats``).
     """
-    top_avg = scores[0].get("avg_clv_bps") if scores else None
-    clv_result = "pass" if isinstance(top_avg, (int, float)) and top_avg > 0 else "fail"
-    scored_actions = sum(int(row.get("action_count", 0)) for row in scores)
-    return {
-        "clv": {"result": clv_result, "scored_actions": scored_actions},
-        "evidence_integrity": {
-            "result": "pass" if run.evidence_hash else "fail",
-            "method": "sha256_evidence_hash",
-            "note": "run events sealed in evidence_hash; scores bound via the prescore chain",
-        },
-        "llm_boundary": {
-            "result": "pass",
-            "method": "static_import_audit",
-            "scope": ["checks/", "verifier/", "law/", "ingest/", "scoring.py", "leaderboard.py"],
-            "note": (
-                "LLM SDK imports are forbidden in the deterministic trust path; "
-                "the LLM decision shell is outside this scope."
-            ),
-        },
-    }
+    results = build_check_results(scores=scores, run=run, source_mode=run.source_mode)
+    return check_results_to_proof_block(results)
 
 
 async def run_demo_competition(
@@ -186,7 +170,8 @@ async def run_demo_competition(
         source_mode: ``"replay"`` or ``"live"`` — carried through to the leaderboard rows.
         store: Optional async store; when given, the run is persisted by the orchestrator.
         anchor_fn: Injectable ``async (manifest_hash) -> signature``; ``None`` skips anchoring.
-        checks_fn: Injectable Proof-Checks builder; defaults to :func:`_default_checks`.
+        checks_fn: Injectable Proof-Checks builder (tests); when ``None`` the full typed taxonomy
+            is built via :func:`~veridex.checks.build.build_check_results` (manifest+anchor bound).
         run_id: Optional explicit run id (forwarded to the orchestrator) — pin it for a fully
             deterministic ``manifest_hash``.
 
@@ -196,15 +181,16 @@ async def run_demo_competition(
     run = await run_competition(marketstates, agents, source_mode=source_mode, store=store, run_id=run_id)
     scores = score_run(run)
 
-    manifest = run_manifest(
-        run_id=run.run_id,
+    # Build the anchored manifest through the verifier's shared helpers (Task D2 — single source of
+    # truth) so that ``verify_run(run).manifest`` reconstructs THIS manifest byte-for-byte.
+    score_root = recompute_score_root(scores)
+    manifest = manifest_from_run(
+        run,
         fixture_or_window_id=_fixture_or_window_id(marketstates),
-        agent_ids=run.agent_ids,
-        action_evidence_root=run.evidence_hash,
-        score_root=_score_root(scores),
-        proof_mode_map=run.proof_mode_map,
-        code_prompt_schema_versions=dict(SCHEMA_VERSIONS),
+        score_root=score_root,
+        schema_versions=dict(SCHEMA_VERSIONS),
     )
+    manifest["root_forest"] = root_forest_for_run(run, scores)
     manifest_hash = run_manifest_hash(manifest)
 
     # --- anchor (injectable; default real, mocked offline, skippable via None) ----------
@@ -215,12 +201,24 @@ async def run_demo_competition(
         signature = await anchor_fn(manifest_hash)
         anchor_status = "anchored"
 
-    # --- proof card: lineage + checks + anchor (schema_versions agree with the manifest) -
-    resolved_checks_fn = checks_fn if checks_fn is not None else _default_checks
-    checks = resolved_checks_fn(scores, run)
+    # --- proof card: 7 typed checks (manifest+anchor bound) + separate metrics block ----
     anchor_block = {"status": anchor_status, "signature": signature, "cluster": DEFAULT_CLUSTER}
+    if checks_fn is not None:
+        checks = checks_fn(scores, run)  # injected builder (tests) — kept for back-compat
+    else:
+        checks = check_results_to_proof_block(
+            build_check_results(
+                scores=scores,
+                run=run,
+                manifest=manifest,
+                manifest_hash=manifest_hash,
+                anchor=anchor_block,
+                source_mode=source_mode,
+            )
+        )
+    metrics = build_performance_metrics(scores)  # Performance Metrics (SEC-001): CLV lives here
     proof_card = proof_card_from_run_result(
-        run, checks=checks, anchor=anchor_block, schema_versions=dict(SCHEMA_VERSIONS)
+        run, checks=checks, anchor=anchor_block, schema_versions=dict(SCHEMA_VERSIONS), metrics=metrics
     )
 
     # --- leaderboard: tag each score row with this run's anchor_status + source_mode -----

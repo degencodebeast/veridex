@@ -1,0 +1,22 @@
+.stub {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  padding: var(--pad-panel);
+  border: 1px dashed var(--border-strong);
+  border-radius: var(--radius-panel);
+  background: var(--panel);
+  max-width: 560px;
+}
+.title { margin: 0; font-size: 19px; font-weight: 600; letter-spacing: -0.01em; color: var(--text-1); }
+.badge {
+  align-self: flex-start;
+  padding: 3px 7px;
+  border-radius: var(--radius-badge);
+  background: var(--warning-bg);
+  color: var(--warning-hi);
+  font-size: 9px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.note { margin: 0; color: var(--text-2); font-size: 12px; line-height: 1.6; }

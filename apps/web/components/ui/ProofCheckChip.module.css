@@ -1,0 +1,18 @@
+.chip {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  border-radius: var(--radius-control);
+  font-family: var(--font-mono), ui-monospace, monospace;
+  font-weight: 600;
+  font-size: 12px;
+  line-height: 1;
+}
+
+/* color over a 14%-opacity fill of the same hue (PAT-002). */
+.pass { color: var(--positive); background: color-mix(in srgb, var(--positive) 14%, transparent); }
+.fail { color: var(--negative); background: color-mix(in srgb, var(--negative) 14%, transparent); }
+.pending { color: var(--warning-hi); background: var(--warning-bg); }
+.notApplicable { color: var(--text-3); background: color-mix(in srgb, var(--text-3) 14%, transparent); }

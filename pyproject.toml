@@ -5,6 +5,17 @@ description = "Veridex — TxLINE Agent Proof Arena"
 requires-python = ">=3.11"
 dependencies = ["pydantic>=2", "pydantic-settings>=2"]
 
+# WD-3: the standalone agent ships as an installable console script (Dockerfile.agent pip-installs it).
+[project.scripts]
+veridex-agent = "veridex_agent.cli:main"
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["veridex*", "veridex_agent*"]
+
 [project.optional-dependencies]
 # Postgres persistence (PostgresStore) — lazy-imported; not needed for the offline suite.
 postgres = ["psycopg[binary]>=3"]

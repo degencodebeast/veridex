@@ -12,6 +12,8 @@ from typing import Literal
 
 from pydantic import BaseModel, Field
 
+from veridex.policy.envelope import PolicyEnvelope
+
 
 class CompetitionType(str, Enum):
     """Categorises the competition format."""
@@ -31,7 +33,13 @@ class ExecutionMode(str, Enum):
 
 
 class CompetitionStatus(str, Enum):
-    """Lifecycle state of a competition; transitions are strictly monotonic."""
+    """Lifecycle state of a competition; transitions are strictly monotonic.
+
+    Note:
+        ``OPEN`` is a reserved registration-window state. It is NOT used in the
+        Phase-2A / 2B happy path (draft → running → finalized); a future control-plane
+        endpoint (Task 7+) will use it for agent self-registration flows.
+    """
 
     DRAFT = "draft"
     OPEN = "open"
@@ -70,6 +78,11 @@ class CompetitionConfig(BaseModel):
         division: Optional bracket / tier label for multi-division events.
         reward_policy: Phase 2D reward configuration; ``None`` means badge-only.
         prize_vault_ref: Phase 2D vault reference; ``None`` means no on-chain prize.
+        operator_id: Optional identifier for the operator / control-plane account that
+            owns this competition; used by the Task-7 control-plane auth layer.
+        policy_envelope: Optional operator-set execution guardrail envelope (Phase-2B). When
+            ``None``, the service builds a conservative deny-by-default envelope for non-paper
+            runs. The control-plane kill-switch endpoint mutates ``kill_switch`` here.
     """
 
     competition_type: CompetitionType
@@ -81,6 +94,8 @@ class CompetitionConfig(BaseModel):
     division: str | None = None
     reward_policy: RewardPolicy | None = None
     prize_vault_ref: PrizeVaultRef | None = None
+    operator_id: str | None = None
+    policy_envelope: PolicyEnvelope | None = None
 
 
 class AgentEntry(BaseModel):

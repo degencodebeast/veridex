@@ -1,0 +1,22 @@
+.shell { display: flex; flex-direction: column; min-height: 100vh; }
+
+.header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  background: var(--bg-bar);
+  border-bottom: 1px solid var(--border);
+  padding-right: var(--pad-screen);
+}
+/* TopNav owns its own bottom border; collapse the duplicate. */
+.header :global(nav) { border-bottom: none; flex: 1; }
+
+.right { display: flex; align-items: center; }
+
+.main {
+  flex: 1;
+  padding: var(--pad-screen);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+}

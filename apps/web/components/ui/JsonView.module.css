@@ -1,0 +1,7 @@
+.pre { margin: 0; padding: var(--pad-panel); background: var(--bg-bar); border: 1px solid var(--border); border-radius: var(--radius-control); font-size: 11px; line-height: 1.7; overflow-x: auto; color: var(--text-2); white-space: pre; }
+.key { color: var(--accent-2); }
+.str { color: var(--positive); }
+.num { color: var(--warning-hi); }
+.bool { color: var(--positive); }
+.null { color: var(--text-3); }
+.punct { color: var(--text-3); }

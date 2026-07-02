@@ -17,6 +17,21 @@ from typing import Any
 from pydantic import BaseModel
 
 
+class ExplainRequest(BaseModel):
+    """Optional focus for the Proof Explainer (``POST /runs/{id}/explain``).
+
+    Both fields are optional: a bare ``{}`` requests a general narration. Neither is scored,
+    persisted, or fed to any trust-path code — they only steer the educational narration.
+
+    Attributes:
+        question: Free-form question about the already-produced proof.
+        target_field: A specific served field to explain.
+    """
+
+    question: str | None = None
+    target_field: str | None = None
+
+
 class LeaderboardRow(BaseModel):
     """One ranked agent row from the cross-run leaderboard.
 
@@ -37,6 +52,9 @@ class LeaderboardRow(BaseModel):
         eligibility_badge: ``"fully-proven"``, ``"partially-proven"``, or ``"unproven"``.
         anchor_status: ``"all-anchored"``, ``"some-pending"``, or ``"none-anchored"``.
         source_mode: ``"all-replay"``, ``"all-live"``, ``"mixed"``, or ``"unknown"``.
+        valid_count: Pooled number of law-valid decisions across runs (WD-7 sample size).
+        clv_confidence: Sample-size confidence tier — ``"low"``, ``"medium"``, or ``"high"``.
+        low_sample: ``True`` when the CLV is backed by a small sample (flag, not a rank input).
     """
 
     rank: int
@@ -53,6 +71,9 @@ class LeaderboardRow(BaseModel):
     eligibility_badge: str
     anchor_status: str
     source_mode: str
+    valid_count: int
+    clv_confidence: str
+    low_sample: bool
 
 
 class LeaderboardResponse(BaseModel):
@@ -174,6 +195,36 @@ class CompetitionStateResponse(BaseModel):
     latest_seq: int
     anchor_status: str
     run_id: str | None
+    proof_card: dict[str, Any] | None = None
+    execution: dict[str, Any] | None = None
+
+
+class KillSwitchResponse(BaseModel):
+    """Response envelope for ``POST /competitions/{id}/kill-switch``.
+
+    Attributes:
+        competition_id: The competition whose envelope was toggled.
+        kill_switch: The new (post-flip) kill-switch state.
+        status: Human-readable status (``"kill_switch_on"`` / ``"kill_switch_off"``).
+    """
+
+    competition_id: str
+    kill_switch: bool
+    status: str
+
+
+class ApprovalResponse(BaseModel):
+    """Response envelope for ``POST /executions/{id}/approve``.
+
+    Attributes:
+        execution_id: The resolved execution record.
+        decision: ``"approved"`` (re-check clean → submitted) or ``"rejected"`` (fail-closed).
+        status: The execution record's lifecycle status after resolution.
+    """
+
+    execution_id: str
+    decision: str
+    status: str
 
 
 class CompetitionSummaryResponse(BaseModel):
@@ -190,3 +241,95 @@ class CompetitionSummaryResponse(BaseModel):
     status: str
     config: dict[str, Any]
     run_id: str | None
+
+
+# ---------------------------------------------------------------------------
+# Phase-2C pinned view-model envelopes (Task 0 — API Surface Contract Freeze)
+#
+# These are the frozen read/control contracts the frontend (Plans C1/C2/D) binds to.
+# The backend returns assembled per-screen view-models, never a raw ``RunResult`` (CON-003).
+# SEC-001: the ``checks`` block holds ONLY the 7 CheckId; CLV/performance lives in ``metrics``.
+# ---------------------------------------------------------------------------
+
+
+class ProofArtifactResponse(BaseModel):
+    """The proof-card view-model the frontend renders (GET /runs/{run_id}). CLV lives in metrics."""
+
+    verifier_version: str
+    run: dict[str, Any]
+    lineage: dict[str, Any]
+    evidence: dict[str, Any]
+    checks: dict[str, Any]
+    anchor: dict[str, Any]
+    metrics: dict[str, Any] | None = None
+
+
+class VerifyResponse(BaseModel):
+    """WD-1 authoritative recompute (POST /runs/{run_id}/verify). C1's VerifyResult binds to this."""
+
+    run_id: str
+    verified: bool
+    evidence_hash: str
+    recomputed_evidence_hash: str
+    manifest_hash: str
+    checks: dict[str, Any]
+    metrics: dict[str, Any] | None = None
+    anchor: dict[str, Any]
+    proof_card: dict[str, Any]
+
+
+class InspectorRecord(BaseModel):
+    """Per-action forensic view-model (frontend adapter over GET /runs + events)."""
+
+    run_id: str
+    agent_id: str
+    tick_seq: int
+    market_state: dict[str, Any]
+    agent_action: dict[str, Any]
+    recompute: dict[str, Any]
+    clv_bps: int | str
+    untrusted_llm_metadata: dict[str, Any]
+
+
+class FeedHealthResponse(BaseModel):
+    """Feed-health view-model (Markets / cockpit feed-health strip).
+
+    Read-only OPERATIONAL TELEMETRY — never scored, never in ``evidence_hash``, never a proof
+    check or leaderboard input. Carries TWO complementary views of the same feed: A's throughput
+    view (``events_per_min`` / ``ws_live`` / ``anchor_status``) and the WD-4 staleness view
+    (``txline_configured`` / ``connected`` / ``ticks_seen`` / ``fixture_id`` / ``staleness_s`` /
+    ``stale``). ``ws_live`` mirrors ``connected`` so both views agree.
+
+    Attributes:
+        source_mode: ``"live"`` or ``"replay"``.
+        events_per_min: Tick throughput (``None`` when no live counter is wired).
+        ws_live: Whether the live WS stream is up (mirrors ``connected``).
+        last_tick_ts: Unix seconds of the most recent tick, or ``None`` when none seen.
+        anchor_status: Honest anchor state for the surface (``"not_anchored"`` offline).
+        txline_configured: Whether TxLINE credentials are present (never the secret values).
+        connected: Whether the stream is currently connected (best-effort).
+        ticks_seen: Count of ingested ticks.
+        fixture_id: The fixture being followed, or ``None``.
+        staleness_s: Seconds since the last tick, or ``None`` when none seen.
+        stale: Whether the feed has exceeded its staleness budget.
+    """
+
+    source_mode: str
+    events_per_min: float | None
+    ws_live: bool
+    last_tick_ts: int | None
+    anchor_status: str
+    txline_configured: bool
+    connected: bool
+    ticks_seen: int
+    fixture_id: int | None
+    staleness_s: int | None
+    stale: bool
+
+
+class RuntimeEventsResponse(BaseModel):
+    """Agent Ops drawer feed (§4.4 OPS channel). Single-field object wrapper (mirrors
+    ``LeaderboardResponse{rows}``) so C2 binds field-name-exact to ``.events``; the ``agent_id``
+    is already in the request path, never echoed in the body. ``events`` are RuntimeEvent dicts."""
+
+    events: list[dict[str, Any]]

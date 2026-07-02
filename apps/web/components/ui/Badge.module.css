@@ -1,0 +1,28 @@
+.badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 3px 7px;
+  border-radius: var(--radius-badge);
+  font-family: var(--font-mono), ui-monospace, monospace;
+  font-weight: 600;
+  font-size: 9px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  line-height: 1;
+  border: 1px solid transparent;
+}
+
+.replay { color: var(--text-2-alt); border-color: var(--border-strong); background: transparent; }
+.live { color: var(--accent-hi); background: var(--accent-bg); }
+.reproducible { color: var(--accent-2); background: var(--accent-bg-soft); }
+.verified { color: var(--accent-2); background: var(--accent-bg-soft); }
+.anchored { color: var(--accent-hi); background: var(--accent-bg-soft); }
+.pending { color: var(--warning-hi); background: var(--warning-bg); }
+.notAnchored { color: var(--text-3); border-color: var(--border-strong); background: transparent; }
+.valid { color: var(--positive); background: var(--positive-bg); }
+.invalid { color: var(--negative); background: var(--negative-bg); }
+.partial { color: var(--warning-hi); background: var(--warning-bg); }
+.eligible { color: var(--accent-hi); background: var(--accent-bg-soft); }
+.notEligible { color: var(--warning-hi); background: var(--warning-bg); }
+.llm { color: var(--warning); background: var(--warning-bg); }

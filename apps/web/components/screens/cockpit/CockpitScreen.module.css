@@ -1,0 +1,7 @@
+.cockpit { display: flex; flex-direction: column; gap: var(--space-3); }
+.grid { display: grid; grid-template-columns: minmax(0, 2.15fr) minmax(330px, 1fr); gap: var(--space-3); }
+.left { display: flex; flex-direction: column; gap: var(--space-3); min-width: 0; }
+.right { display: flex; flex-direction: column; gap: var(--space-3); }
+@media (max-width: 920px) {
+  .grid { grid-template-columns: 1fr; }
+}

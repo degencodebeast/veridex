@@ -1,0 +1,21 @@
+{
+  "fixture_id": 18172280,
+  "ticks": [
+    {
+      "ts": 1000, "phase": 1, "scores": {},
+      "markets": {"M": {"stable_prob_bps": {"home": 4800, "away": 5200}, "stable_price": {"home": 2.083, "away": 1.923}, "suspended": false}}
+    },
+    {
+      "ts": 2000, "phase": 1, "scores": {},
+      "markets": {"M": {"stable_prob_bps": {"home": 5000, "away": 5000}, "stable_price": {"home": 2.0, "away": 2.0}, "suspended": false}}
+    },
+    {
+      "ts": 3000, "phase": 1, "scores": {},
+      "markets": {"M": {"stable_prob_bps": {"home": 5300, "away": 4700}, "stable_price": {"home": 1.887, "away": 2.128}, "suspended": false}}
+    },
+    {
+      "ts": 4000, "phase": 1, "scores": {},
+      "markets": {"M": {"stable_prob_bps": {"home": 5600, "away": 4400}, "stable_price": {"home": 1.786, "away": 2.273}, "suspended": false}}
+    }
+  ]
+}

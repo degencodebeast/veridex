@@ -409,6 +409,10 @@ def test_output_row_has_all_required_keys() -> None:
         "eligibility_badge",
         "anchor_status",
         "source_mode",
+        "valid_count",
+        "clv_confidence",
+        "low_sample",
+        "sample_size",
         "rank",
     }
 

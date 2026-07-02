@@ -1,0 +1,63 @@
+/* StudioScreen — archetype/config base + the V5 preflight-density classes (threshold + rule-config). */
+.screen { display: flex; flex-direction: column; gap: var(--space-3); }
+.head { display: flex; align-items: center; justify-content: space-between; }
+.title { margin: 0; font-size: 19px; font-weight: 600; letter-spacing: -0.01em; }
+.roMode { font-size: 11px; color: var(--text-2); border: 1px solid var(--border-strong); border-radius: var(--radius-control); padding: 5px 10px; }
+.layout { display: grid; grid-template-columns: minmax(0, 1fr) minmax(300px, 360px); gap: var(--space-3); align-items: start; }
+.sections { display: flex; flex-direction: column; gap: var(--space-2); }
+.section { display: flex; flex-direction: column; gap: var(--space-2); padding: var(--pad-panel); border: 1px solid var(--border); border-radius: var(--radius-panel); background: var(--panel); }
+.inactive { opacity: 0.5; }
+.h2 { margin: 0; font-size: 11px; font-weight: 600; letter-spacing: 0.06em; text-transform: uppercase; color: var(--text-2); display: flex; gap: var(--space-2); align-items: center; }
+.num { font-family: var(--font-mono), monospace; color: var(--text-3); }
+.stub { margin: 0; color: var(--text-3); font-size: 11px; font-style: italic; }
+.field { display: flex; flex-direction: column; gap: var(--space-1); }
+.label { font-family: var(--font-mono), monospace; font-size: 9px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--text-3); }
+.select { padding: 7px 9px; border: 1px solid var(--border-strong); border-radius: var(--radius-control); background: var(--panel-2); color: var(--text-1); font-size: 12px; }
+.select:disabled { color: var(--text-3); cursor: not-allowed; }
+.hint { margin: 0; color: var(--text-3); font-size: 11px; }
+.fence { display: flex; flex-direction: column; gap: var(--space-2); padding: var(--pad-panel); border: 1px dashed var(--warning); border-radius: var(--radius-control); background: var(--warning-bg); }
+.fenceLabel { font-family: var(--font-mono), monospace; font-size: 10px; font-weight: 600; color: var(--warning-hi); letter-spacing: 0.04em; }
+.actionTypes { display: flex; flex-wrap: wrap; gap: var(--space-1); }
+.actionType { font-family: var(--font-mono), monospace; font-size: 9px; color: var(--warning-hi); border: 1px solid var(--warning); border-radius: var(--radius-badge); padding: 2px 6px; }
+.kv { display: flex; justify-content: space-between; align-items: center; font-size: 11px; color: var(--text-2); padding: 4px 0; border-bottom: 1px solid var(--border-soft); }
+.chips { display: flex; flex-wrap: wrap; gap: var(--space-1); }
+.chip { font-family: var(--font-mono), monospace; font-size: 9px; color: var(--text-2); border: 1px solid var(--border-soft); border-radius: var(--radius-badge); padding: 2px 6px; }
+.side { display: flex; flex-direction: column; gap: var(--space-2); position: sticky; top: var(--space-3); }
+.diffPanel { display: flex; flex-direction: column; gap: var(--space-1); padding: var(--pad-panel); border: 1px solid var(--border-strong); border-radius: var(--radius-panel); background: var(--panel-2); }
+.diffRow { display: flex; align-items: center; gap: var(--space-2); font-family: var(--font-mono), monospace; font-size: 10px; }
+.diffField { color: var(--text-3); min-width: 96px; }
+.diffBefore { color: var(--negative); text-decoration: line-through; }
+.diffArrow { color: var(--text-3); }
+.diffAfter { color: var(--positive); }
+.cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: var(--space-2); }
+.card { display: flex; flex-direction: column; gap: 4px; text-align: left; padding: var(--space-2); border: 1px solid var(--border-soft); border-radius: var(--radius-control); background: var(--panel-2); cursor: pointer; }
+.card:hover { border-color: var(--accent); }
+.card:disabled { cursor: not-allowed; }
+.cardPhase3 { opacity: 0.55; }
+.cardPhase3:hover { border-color: var(--border-soft); }
+.cardLabel { font-size: 12px; font-weight: 600; color: var(--text-1); }
+.cardComplexity { font-family: var(--font-mono), monospace; font-size: 8px; text-transform: uppercase; letter-spacing: 0.04em; color: var(--warning-hi); }
+.cardBlurb { font-size: 10px; color: var(--text-3); line-height: 1.4; }
+.pin { padding: 9px 14px; border: none; border-radius: var(--radius-control); background: var(--accent); color: var(--text-1); font-size: 12px; font-weight: 600; cursor: pointer; }
+.roBanner { margin: 0; padding: var(--space-2); border: 1px solid var(--warning); border-radius: var(--radius-control); background: var(--warning-bg); color: var(--warning-hi); font-size: 10px; }
+.pinnedOk { margin: 0; display: flex; align-items: center; gap: var(--space-1); color: var(--accent-hi); font-size: 11px; font-weight: 600; }
+.note { margin: 0; color: var(--warning-hi); font-size: 10px; }
+
+/* ── PREFLIGHT PREVIEW density (codex option 3) ─────────────────────────────── */
+.preflight { display: flex; flex-direction: column; gap: var(--space-2); padding: var(--pad-panel); border: 1px solid var(--accent); border-radius: var(--radius-panel); background: var(--panel); }
+
+/* Threshold row: "Minimum executable edge ≥ N bps" — the REAL config threshold, not a computed value. */
+.threshold { display: flex; align-items: center; justify-content: space-between; gap: var(--space-2); padding: var(--space-2); background: var(--panel-2); border: 1px solid var(--border-strong); border-radius: var(--radius-control); }
+.thresholdLabel { font-size: 11px; color: var(--text-2); display: flex; align-items: center; gap: 4px; }
+.thresholdValue { font-size: 13px; color: var(--text-1); font-weight: 600; }
+
+/* Rule-config table: all policy envelope fields in one place. */
+.ruleTable { display: flex; flex-direction: column; gap: 0; border: 1px solid var(--border-soft); border-radius: var(--radius-control); overflow: hidden; }
+.ruleHeader { font-family: var(--font-mono), monospace; font-size: 9px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--text-3); padding: 5px var(--space-2); background: var(--panel-2); border-bottom: 1px solid var(--border-soft); }
+.ruleRow { display: flex; justify-content: space-between; align-items: center; padding: 4px var(--space-2); font-size: 11px; border-bottom: 1px solid var(--border-soft); }
+.ruleRow:last-child { border-bottom: none; }
+.ruleField { color: var(--text-3); font-family: var(--font-mono), monospace; font-size: 10px; }
+.ruleValue { color: var(--text-2); font-size: 10px; }
+
+/* Disclaimer: verbatim text from PREFLIGHT_DISCLAIMER (no proof styling). */
+.disclaimer { margin: 0; color: var(--text-3); font-size: 10px; font-style: italic; line-height: 1.5; }

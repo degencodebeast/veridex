@@ -47,6 +47,10 @@ class Settings(BaseSettings):
     txline_base_url: str = "https://txline-dev.txodds.com/api"
     txline_jwt: str | None = Field(default=None, validation_alias="JWT")
     txline_api_token: str | None = Field(default=None, validation_alias="TXLINE_X_API_TOKEN")
+    # Auth host for guest-JWT / token-activate (CON-041); the ``/api`` base stays separate.
+    txline_auth_base_url: str = "https://txline-dev.txodds.com"
+    # Program id for the on-chain ``subscribe()`` tx; secret-by-policy, defaults ``None``.
+    txline_subscribe_program_id: str | None = Field(default=None, validation_alias="TXLINE_SUBSCRIBE_PROGRAM_ID")
 
     # ------------------------------------------------------------------
     # Solana
@@ -71,9 +75,32 @@ class Settings(BaseSettings):
     anthropic_api_key: str | None = Field(default=None, validation_alias="ANTHROPIC_API_KEY")
 
     # ------------------------------------------------------------------
+    # Control-plane operator auth (Phase-2B Task 7; async shell, CON-010)
+    # ------------------------------------------------------------------
+    # Bearer token required for control-plane WRITES (start non-paper / approve /
+    # kill-switch). ``None`` means no operator is configured and every write fails closed.
+    operator_token: str | None = Field(default=None, validation_alias="OPERATOR_TOKEN")
+    # Identifier of the authenticated operator principal; compared against a competition's
+    # ``operator_id`` for per-competition ownership (403 on mismatch).
+    operator_id: str | None = Field(default=None, validation_alias="OPERATOR_ID")
+
+    # ------------------------------------------------------------------
     # Tuning
     # ------------------------------------------------------------------
     decision_timeout_s: float = 30.0
+
+    # ------------------------------------------------------------------
+    # SX Bet venue adapter (async shell; CON-010)
+    # ------------------------------------------------------------------
+    # Set to true to enable the live SX Bet path (requires maker + key below).
+    sx_bet_enabled: bool = Field(default=False, validation_alias="SX_BET_ENABLED")
+    # SX Bet REST base URL.  Defaults to testnet (safe for Phase-2B guarded runs).
+    # Override to https://api.sx.bet for mainnet (chainId 4162) via SX_BET_BASE_URL.
+    sx_bet_base_url: str = Field(default="https://api.toronto.sx.bet", validation_alias="SX_BET_BASE_URL")
+    # EVM wallet address used as the maker on SX Bet (EIP-712 signing).
+    sx_bet_maker_address: str | None = Field(default=None, validation_alias="SX_BET_MAKER_ADDRESS")
+    # Private key for EIP-712 order signing — NEVER commit this value.
+    sx_bet_private_key: str | None = Field(default=None, validation_alias="SX_BET_PRIVATE_KEY")
 
 
 # ---------------------------------------------------------------------------
@@ -99,6 +126,29 @@ def require_txline(settings: Settings) -> tuple[str, str]:
     if settings.txline_jwt is None or settings.txline_api_token is None:
         raise ValueError("TxLINE creds missing: set JWT and TXLINE_X_API_TOKEN in veridex/.env")
     return settings.txline_jwt, settings.txline_api_token
+
+
+def require_txline_subscribe(settings: Settings) -> tuple[str, str]:
+    """Return ``(keypair_path, program_id)`` for the on-chain subscribe tx, or raise.
+
+    The on-chain ``subscribe()`` (CON-041) needs both a Solana keypair to sign the
+    free World-Cup subscribe tx and the target program id. Both come from typed
+    config only; the guard fires only when a live subscribe is attempted, so the
+    offline suite never triggers it.
+
+    Args:
+        settings: Application settings instance.
+
+    Returns:
+        A ``(keypair_path, program_id)`` tuple.
+
+    Raises:
+        ValueError: If either ``solana_keypair_path`` or
+            ``txline_subscribe_program_id`` is ``None``.
+    """
+    if settings.solana_keypair_path is None or settings.txline_subscribe_program_id is None:
+        raise ValueError("subscribe creds missing: set SOLANA_KEYPAIR_PATH and TXLINE_SUBSCRIBE_PROGRAM_ID")
+    return settings.solana_keypair_path, settings.txline_subscribe_program_id
 
 
 def require_database_url(settings: Settings) -> str:
@@ -174,6 +224,26 @@ def require_keypair_path(settings: Settings) -> str:
     if settings.solana_keypair_path is None:
         raise ValueError("set SOLANA_KEYPAIR_PATH to the Solana keypair JSON file path")
     return settings.solana_keypair_path
+
+
+def require_sx_bet(settings: Settings) -> tuple[str, str]:
+    """Return ``(maker_address, private_key)`` or raise if SX Bet creds are missing.
+
+    Secrets are validated only when a live SX Bet operation is attempted, so the
+    offline suite never triggers this guard.
+
+    Args:
+        settings: Application settings instance.
+
+    Returns:
+        A ``(maker_address, private_key)`` tuple of credential strings.
+
+    Raises:
+        ValueError: If either ``sx_bet_maker_address`` or ``sx_bet_private_key`` is ``None``.
+    """
+    if settings.sx_bet_maker_address is None or settings.sx_bet_private_key is None:
+        raise ValueError("SX Bet creds missing: set SX_BET_MAKER_ADDRESS and SX_BET_PRIVATE_KEY in veridex/.env")
+    return settings.sx_bet_maker_address, settings.sx_bet_private_key
 
 
 # ---------------------------------------------------------------------------

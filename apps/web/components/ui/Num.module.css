@@ -1,0 +1,4 @@
+.num { font-variant-numeric: tabular-nums; }
+.pos { color: var(--positive); }
+.neg { color: var(--negative); }
+.zero { color: var(--text-2); }

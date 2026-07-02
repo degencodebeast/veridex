@@ -38,12 +38,13 @@ def build_proof_card(
     proof_mode_map: dict[str, str] | None = None,
     schema_versions: dict[str, str] | None = None,
     anchor: dict[str, Any] | None = None,
+    metrics: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build the public proof-card JSON.
 
     Produces the judge-visible dict with ``verifier_version``, ``run``, ``lineage``,
-    ``evidence``, ``checks``, and ``anchor``.  The key ``cats`` never appears anywhere
-    in the returned structure (KILL-6 / AC-111).
+    ``evidence``, ``checks``, and ``anchor`` (plus an optional ``metrics`` block).  The key
+    ``cats`` never appears anywhere in the returned structure (KILL-6 / AC-111).
 
     Backward-compatible with the Phase-0 signature: existing callers that pass only
     ``run``, ``evidence``, ``checks``, and ``proof_mode`` receive a fully-enriched card
@@ -65,10 +66,12 @@ def build_proof_card(
         anchor: Anchor-status block; defaults to
             ``{"status": "not_anchored", "signature": None, "cluster": None}``.
             B8 does NOT perform anchoring — that is B9.
+        metrics: Optional Performance-Metrics block (SEC-001 — CLV + all metrics live here,
+            never in ``checks``). When ``None`` the ``metrics`` key is omitted (back-compat).
 
     Returns:
         A public proof-card dict with the keys ``verifier_version``, ``run``,
-        ``lineage``, ``evidence``, ``checks``, and ``anchor``.
+        ``lineage``, ``evidence``, ``checks``, and ``anchor`` (and ``metrics`` when supplied).
     """
     resolved_proof_mode_map: dict[str, str]
     if proof_mode_map is not None:
@@ -85,7 +88,7 @@ def build_proof_card(
         anchor if anchor is not None else {"status": "not_anchored", "signature": None, "cluster": None}
     )
 
-    return {
+    card: dict[str, Any] = {
         "verifier_version": verifier_version,
         "run": run,
         "lineage": {
@@ -96,6 +99,9 @@ def build_proof_card(
         "checks": checks,
         "anchor": resolved_anchor,
     }
+    if metrics is not None:
+        card["metrics"] = metrics  # Performance Metrics — separate from checks (SEC-001)
+    return card
 
 
 def proof_card_from_run_result(
@@ -105,6 +111,7 @@ def proof_card_from_run_result(
     anchor: dict[str, Any] | None = None,
     verifier_version: str = VERIFIER_VERSION,
     schema_versions: dict[str, str] | None = None,
+    metrics: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build a proof card directly from a ``RunResult``.
 
@@ -121,6 +128,7 @@ def proof_card_from_run_result(
         verifier_version: Verifier version string (default ``"v0"``).
         schema_versions: Schema-version map for ``lineage``; defaults to
             ``{"action_schema": "sports_v0", "verifier": "v0"}``.
+        metrics: Optional Performance-Metrics block (SEC-001); ``None`` ⇒ ``metrics`` key omitted.
 
     Returns:
         A public proof-card dict with ``lineage.proof_mode_map`` and
@@ -143,4 +151,5 @@ def proof_card_from_run_result(
         proof_mode_map=run_result.proof_mode_map,
         schema_versions=schema_versions,
         anchor=anchor,
+        metrics=metrics,
     )

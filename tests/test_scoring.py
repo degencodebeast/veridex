@@ -313,6 +313,7 @@ def test_row_has_full_metric_stack_keys() -> None:
         "max_drawdown",
         "action_count",
         "valid_pct",
+        "valid_count",
         "rank",
         "proof_mode",
     }

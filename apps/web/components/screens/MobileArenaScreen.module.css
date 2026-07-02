@@ -1,0 +1,11 @@
+.frame { position: relative; max-width: 392px; width: 100%; margin: 0 auto; min-height: 720px; display: flex; flex-direction: column; gap: var(--space-2); padding: var(--space-2) var(--space-2) 64px; border: 1px solid var(--border); border-radius: var(--radius-panel); background: var(--bg); }
+
+/* one scroll column — the reused Cockpit panels stacked */
+.column { display: flex; flex-direction: column; gap: var(--space-3); }
+/* the CLV table is wide for 392px; allow horizontal scroll rather than fork a mobile leaderboard */
+.scrollX { overflow-x: auto; -webkit-overflow-scrolling: touch; }
+
+/* fixed bottom tab bar — ≥44px touch targets (a11y) */
+.tabs { position: absolute; left: 0; right: 0; bottom: 0; display: flex; border-top: 1px solid var(--border); background: var(--bg-bar); border-radius: 0 0 var(--radius-panel) var(--radius-panel); }
+.tab { flex: 1; min-height: 44px; display: flex; align-items: center; justify-content: center; color: var(--text-2); font-size: 11px; font-weight: 600; text-decoration: none; }
+.tab:hover { color: var(--accent-hi); }
