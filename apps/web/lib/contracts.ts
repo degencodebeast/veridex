@@ -139,6 +139,10 @@ export interface PolicyDecision {
   reason: string;
   edge_bps?: number;
   min_edge_bps?: number;
+  // DISPLAY-GATE signal (REQ-2D-501): the `edge_bps` value is the executable edge AT the venue
+  // price — it renders ONLY when a REAL venue quote backs it (fail-closed). The min-edge THRESHOLD
+  // is a config value and always renders. A Fake/paper quote never surfaces edge_bps as edge.
+  real_venue_quote?: boolean;
 }
 
 // REQ-040 Match-State. NO `possession` field — not in the confirmed soccer stat set.
@@ -314,8 +318,16 @@ export interface ClvExplanation {
   fair_value_pct: number | null;          // de-margined consensus fair probability at entry
   closing_fair_value_pct: number | null;  // de-margined consensus fair probability at close
   venue_decimal_price: number | null;     // the actual venue decimal price
-  executable_edge_bps: number | null;     // EV at the venue price (NOT CLV)
+  // mispricing_gap = fair_prob_bps − venue_implied_prob_bps: a PROBABILITY-space dislocation.
+  // Explanatory only — NEVER edge, NEVER scored (REQ-2D-501). Distinct from executable_edge (EV).
+  mispricing_gap_bps: number | null;
+  executable_edge_bps: number | null;     // forward EV at the venue price (NOT CLV, NOT the gap)
+  // The DISPLAY-GATE honesty signal (REQ-2D-501 / AC-2D-501): true iff the venue price came from a
+  // REAL venue quote (not the FakeVenueAdapter's fixed 2.05). Venue price / mispricing_gap /
+  // executable_edge render ONLY when this is true — fail-closed. Live wire carries no quote → false.
+  real_venue_quote: boolean;
   clv_bps: number;                         // the proven skill metric (the real scored value)
+  clv_low_sample?: boolean;                // WD-7 sample-size flag — shown (never hidden), never a score
   stake_fraction: number | null;          // Kelly/policy sizing
   plain: string;
 }

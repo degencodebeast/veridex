@@ -256,11 +256,14 @@ export function adaptInspector(w: W.InspectorRecord): InspectorRecord {
     agent_action: w.agent_action as unknown as InspectorRecord['agent_action'],
     recompute: { recomputed_edge_bps: rec.recomputed_edge_bps ?? 0, clv_bps: rec.clv_bps ?? 0, valid: rec.valid ?? false },
     // GAP: the wire InspectorRecord carries no doctrine quantities (fair value,
-    // executable edge, venue price, stake) → null = honest "not in proof artifact"
-    // (rendered as "—"), NOT a plausible 0. CLV (the real score) is carried through.
+    // executable edge, venue price, mispricing gap, stake) → null = honest "not in proof
+    // artifact" (rendered as "—"), NOT a plausible 0. CLV (the real score) is carried through.
+    // real_venue_quote is FALSE on the live wire (no venue quote present) — the display gate
+    // fails closed so an edge number can NEVER render without a real quote (REQ-2D-501).
     clv_explanation: {
       fair_value_pct: null, closing_fair_value_pct: null, venue_decimal_price: null,
-      executable_edge_bps: null, clv_bps: clv, stake_fraction: null,
+      mispricing_gap_bps: null, executable_edge_bps: null, real_venue_quote: false,
+      clv_bps: clv, stake_fraction: null,
       plain: '',
     },
     untrusted_llm: llm

@@ -85,8 +85,9 @@ export const sampleInspectorRecord: InspectorRecord = {
   recompute: { recomputed_edge_bps: 22.0, clv_bps: 18.0, valid: true },
   clv_explanation: {
     fair_value_pct: 67.9, closing_fair_value_pct: 69.7, venue_decimal_price: 1.472,
-    executable_edge_bps: 22.0, clv_bps: 18.0, stake_fraction: 0.06,
-    plain: 'Fair value 67.9% → closing 69.7%; executable edge +22.0 bps at venue 1.472; CLV +18.0 bps.',
+    mispricing_gap_bps: 110, executable_edge_bps: 22.0, real_venue_quote: true,
+    clv_bps: 18.0, clv_low_sample: false, stake_fraction: 0.06,
+    plain: 'Fair value 67.9% → closing 69.7%; mispricing gap +110 bps; executable edge +22.0 bps at venue 1.472; CLV +18.0 bps.',
   },
   untrusted_llm: { model: 'claude-sonnet-4-6', confidence: 0.72, claimed_edge_bps: 30, rationale: 'France controlling tempo; expect goal.' },
 };
@@ -118,7 +119,7 @@ export const sampleCockpitState: CockpitState = {
     { execution_id: 'ex_01', venue: 'SX Bet', market_ref: '1X2:FRA', side: 'FRA', requested_size: 100, filled_size: 100, price: 1.472, status: 'filled', venue_order_id: 'sx_771', mode: 'paper', submitted_at: 1719663796, settled_at: 1719663797 },
   ],
   policy: [
-    { tick_seq: 89, decision: 'ALLOW', reason: 'edge ≥ min', edge_bps: 22, min_edge_bps: 8 },
+    { tick_seq: 89, decision: 'ALLOW', reason: 'edge ≥ min', edge_bps: 22, min_edge_bps: 8, real_venue_quote: true },
   ],
   kill_armed: true,
 };

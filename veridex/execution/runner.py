@@ -33,6 +33,7 @@ from veridex.competition.events import (
     build_execution_submitted_event,
     build_policy_result_event,
 )
+from veridex.execution.legibility import mispricing_gap_bps
 from veridex.execution.models import ExecutionRecord, ExecutionStatus
 from veridex.law.edge import executable_edge_bps
 from veridex.policy.engine import PolicyDecision
@@ -284,6 +285,10 @@ async def run_execution_lane(
         quote = await adapter.quote_market(proposal.market_key)
         slippage = _slippage_bps(proposal.reference_price, quote.price)
         exec_edge = executable_edge_bps(proposal.entry_prob_bps, quote.price)
+        # Edge-legibility explanatory quantity (REQ-2D-501): the prob-space dislocation between
+        # TxLINE's de-margined fair value and the venue's implied probability. NEVER an edge,
+        # NEVER scored — surfaced ALONGSIDE the law's executable_edge for the flagship story.
+        gap = mispricing_gap_bps(proposal.entry_prob_bps, quote.price)
 
         # --- POST-QUOTE gate (REAL slippage + forward executable edge) -----------------
         post = evaluate_post_quote(
@@ -315,6 +320,11 @@ async def run_execution_lane(
                     "phase": "post_quote",
                     "slippage_bps": slippage,
                     "executable_edge_bps": exec_edge,
+                    # Edge-legibility fields from the REAL quote (REQ-2D-501) — explanatory,
+                    # non-scoring; the display gate only renders them for a real venue quote.
+                    "mispricing_gap_bps": gap,
+                    "venue_decimal_price": quote.price,
+                    "native_price": quote.native_price,
                 },
                 execution_id=execution_id,
             )

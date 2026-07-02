@@ -10,6 +10,10 @@ export const GLOSSARY = {
     label: 'Fair Value',
     definition: 'TxLINE de-margined, market-implied consensus probability; not guaranteed truth.',
   },
+  mispricing_gap: {
+    label: 'Mispricing Gap',
+    definition: 'TxLINE fair value minus the venue-implied probability; a probability-space dislocation, explanatory only — never an edge, never a score.',
+  },
   executable_edge: {
     label: 'Executable Edge',
     definition: 'forward EV at the actual venue price; gates action; never a score.',
