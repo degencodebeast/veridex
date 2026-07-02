@@ -32,8 +32,9 @@ kept out of the `pip` dependency graph as a package so it can be reviewed and pi
 - `from quantpylib.throttler.aiohttp import request as _request` -> `from veridex.venues._vendor.polymarket_clob.throttler.aiohttp import request as _request`
 - `from quantpylib.throttler.exceptions import HTTPException` -> `from veridex.venues._vendor.polymarket_clob.throttler.exceptions import HTTPException`
 
-`markets.py` and `throttler/exceptions.py` have no internal `quantpylib.*` imports and are
-copied byte-for-byte.
+`markets.py` and `throttler/exceptions.py` have no internal `quantpylib.*` imports. Their logic
+is verbatim from upstream; `throttler/exceptions.py` is byte-identical, and `markets.py` differs
+only by trailing-whitespace normalization (a `diff -w` against upstream is clean).
 
 ### Import safety
 
