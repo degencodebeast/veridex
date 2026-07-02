@@ -26,10 +26,14 @@ signing stack. The vendored ``LOB`` is consumed (not re-implemented) only to SOR
 fill-to-size VWAP walk is done here over the sorted array, so the latent ``IndexError`` hazards in
 ``LOB.get_mid`` / ``LOB.get_cumulative_size`` (empty/one-sided books, over-sweep) are never hit.
 
-WRITE PATH DISABLED (AC-2D-203): Polymarket CLOB is MAINNET real money. :meth:`submit_order`,
-:meth:`cancel_order`, and :meth:`get_order_status` raise :class:`PolymarketWriteDisabled` unless
-``settings.polymarket_write_enabled`` is explicitly true (default ``False``). T17 wires the live
-write path behind the same gate.
+WRITE PATH (AC-2D-203, REQ-2D-403, AC-2D-405): Polymarket CLOB is MAINNET real money, so writes
+fail closed. :meth:`get_order_status` needs ``settings.polymarket_write_enabled`` (default
+``False``); a real :meth:`submit_order` / :meth:`cancel_order` additionally needs ``dry_run=False``
+(the safe default is ``True``) and an injected ``write_client``. When armed, ``submit_order``
+converts DECIMAL ODDS to a NATIVE tick-rounded share price so the wire NEVER carries decimal odds
+(§4.3), and ``get_order_status`` reports the REAL matched fill from ``get_order`` — never the
+request (SEC-004). The two-phase precondition gate lives in
+:mod:`veridex.venues.polymarket_preflight`; the 1-share operator smoke is ``scripts/polymarket_smoke.py``.
 """
 
 from __future__ import annotations
@@ -74,6 +78,35 @@ class BookClient(Protocol):
 
     async def get_book(self, token_id: str) -> dict[str, Any]:
         """Return the raw order book ``{"bids": [...], "asks": [...], "timestamp": ...}``."""
+        ...
+
+
+class WriteClient(Protocol):
+    """Structural protocol for the CLOB-shaped WRITE client the adapter submits/cancels through.
+
+    Matches the vendored ``Polymarket`` write surface (``limit_order`` / ``get_order`` /
+    ``cancel_all_orders``). Tests inject a fake that CAPTURES the payload — no network, no signing.
+    The live path (operator, real money) injects the vendored client after ``init_client``.
+    """
+
+    async def limit_order(
+        self,
+        ticker: str,
+        amount: float,
+        price: float,
+        tif: str = ...,
+        round_price: bool = ...,
+        tick_size: str | None = ...,
+    ) -> dict[str, Any]:
+        """Sign+POST an order; ``price`` is the NATIVE share price (tick units), ``amount`` signed."""
+        ...
+
+    async def get_order(self, order_id: str) -> dict[str, Any]:
+        """Return the raw order record (carries ``size_matched`` and the matched native ``price``)."""
+        ...
+
+    async def cancel_all_orders(self) -> dict[str, Any]:
+        """Cancel resting orders (FAK orders never rest, so this is a defensive cleanup)."""
         ...
 
 
@@ -210,6 +243,87 @@ def _book_ts_seconds(raw_ts: Any) -> int:
 
 
 # ---------------------------------------------------------------------------
+# Write-path reconciliation (pure, offline): venue response -> Veridex value types
+# ---------------------------------------------------------------------------
+
+# Polymarket order-status strings (from ``get_order``) that are terminal WITHOUT any fill.
+_POLY_DEAD_STATUSES: frozenset[str] = frozenset({"canceled", "cancelled"})
+_POLY_UNFILLED_STATUSES: frozenset[str] = frozenset({"unmatched", "rejected", "matched"})
+# Statuses that are still live/resting (non-terminal); a FAK order should never rest, but we keep
+# these transient so a stray poll degrades to a non-fill rather than a fabricated fill.
+_POLY_LIVE_STATUSES: frozenset[str] = frozenset({"live", "delayed", "open", "pending"})
+
+
+def _submit_ack_from_response(response: Any) -> SubmitAck:
+    """Map a vendored ``post_order`` response into a :class:`~veridex.venues.base.SubmitAck`.
+
+    Tolerant of the CLOB response key variants; ``accepted`` follows the venue's ``success`` flag
+    (defaulting to "accepted if an order id came back"). Never fabricates an id.
+    """
+    if not isinstance(response, dict):
+        return SubmitAck(venue_order_id="", accepted=False)
+    order_id = (
+        response.get("orderID")
+        or response.get("orderId")
+        or response.get("orderHash")
+        or response.get("id")
+        or ""
+    )
+    accepted = bool(response.get("success", bool(order_id)))
+    return SubmitAck(venue_order_id=str(order_id), accepted=accepted)
+
+
+def _reconcile_status(raw_status: str, size_matched: float, original_size: float) -> str:
+    """Reconcile a venue-native status from the MATCHED SIZE first — never trust a label over the number.
+
+    The honest fill (SEC-004) is the size the book actually matched, so a positive ``size_matched``
+    is a fill (``filled`` when it reaches the original size, else ``partial``) regardless of the
+    venue's status string. Only when nothing matched do we fall back to the label to distinguish a
+    killed/rejected FAK from a (transient) resting order.
+    """
+    if size_matched > 0.0:
+        if original_size > 0.0 and size_matched + 1e-9 >= original_size:
+            return "filled"
+        return "partial"
+    if raw_status in _POLY_LIVE_STATUSES:
+        return "open"  # non-terminal: poll_order_terminal keeps polling / times out to UNRESOLVED
+    if raw_status in _POLY_DEAD_STATUSES:
+        return "cancelled"
+    if raw_status in _POLY_UNFILLED_STATUSES:
+        return "rejected"
+    return raw_status or "unresolved"
+
+
+def _order_status_from_raw(venue_order_id: str, raw: Any) -> OrderStatus:
+    """Build an honest :class:`~veridex.venues.base.OrderStatus` from a vendored ``get_order`` record.
+
+    Reads the REAL matched fill: ``filled_size`` is ``size_matched`` and ``native_price`` is the
+    matched native share price ``q`` (audit); ``price`` is its decimal inverse. The request size is
+    NEVER used — the receipt reflects only what the venue matched.
+    """
+    if not isinstance(raw, dict):
+        raise ValueError(f"get_order returned a non-dict record: {raw!r}")
+    size_matched = float(raw.get("size_matched", 0.0) or 0.0)
+    original_size = float(raw.get("original_size", 0.0) or 0.0)
+
+    raw_price = raw.get("price")
+    native_price: float | None = None
+    price = 0.0
+    if raw_price is not None and raw_price != "":
+        native_price = float(raw_price)
+        price = native_to_decimal(native_price) if native_price > 0.0 else 0.0
+
+    status = _reconcile_status(str(raw.get("status", "")).strip().lower(), size_matched, original_size)
+    return OrderStatus(
+        venue_order_id=venue_order_id,
+        status=status,
+        filled_size=size_matched,
+        price=price,
+        native_price=native_price,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Adapter
 # ---------------------------------------------------------------------------
 
@@ -225,9 +339,12 @@ class PolymarketAdapter:
         _resolved: The :class:`~veridex.venues.polymarket_resolver.ResolvedMarket` (token IDs, tick).
         _book_client: Injected CLOB-shaped book client (no network in tests).
         _side: Which side of the market to price (mapped to a token via ``side_to_token``).
-        _for_size: Shares the quote's cost-to-fill is computed for.
+        _for_size: Default shares the quote's cost-to-fill is computed for (overridable per call).
         _venue: Venue slug for receipts.
         _settings: Optional injected settings; ``None`` resolves lazily via ``get_settings``.
+        _write_client: Injected CLOB-shaped WRITE client; ``None`` until the write path is wired.
+        _dry_run: Safety default — when true, ``submit_order`` / ``cancel_order`` NEVER touch the
+            wire (a real submit needs write-enabled AND ``dry_run=False``).
     """
 
     def __init__(
@@ -239,6 +356,8 @@ class PolymarketAdapter:
         for_size: float = 100.0,
         venue: str = "polymarket",
         settings: Settings | None = None,
+        write_client: WriteClient | None = None,
+        dry_run: bool = True,
     ) -> None:
         """Initialise the adapter.
 
@@ -246,9 +365,12 @@ class PolymarketAdapter:
             resolved: Resolved market with token IDs and tick size.
             book_client: Injected CLOB-shaped book client (``async get_book(token_id)``).
             side: Side to price (``"yes"``/``"over"``/``"home"`` or ``"no"``/``"under"``/``"away"``).
-            for_size: Shares the quote's cost-to-fill is computed for.
+            for_size: Default shares the quote's cost-to-fill is computed for.
             venue: Venue slug used on execution receipts.
             settings: Optional settings for the write gate; ``None`` → lazy ``get_settings()``.
+            write_client: Injected CLOB-shaped write client (``limit_order`` / ``get_order`` /
+                ``cancel_all_orders``); required to arm the live write path.
+            dry_run: When ``True`` (the SAFE default) the write methods never reach the wire.
         """
         self._resolved = resolved
         self._book_client = book_client
@@ -256,10 +378,12 @@ class PolymarketAdapter:
         self._for_size = for_size
         self._venue = venue
         self._settings = settings
+        self._write_client = write_client
+        self._dry_run = dry_run
 
     # -- read path ----------------------------------------------------------
 
-    async def quote_market(self, market_ref: str) -> Quote:
+    async def quote_market(self, market_ref: str, for_size: float | None = None) -> Quote:
         """Fetch a depth-aware DECIMAL-ODDS quote for the configured side.
 
         Fetches the book for the side's token, walks the ask ladder to compute the size-weighted
@@ -267,13 +391,19 @@ class PolymarketAdapter:
         An empty/one-sided/unfillable book degrades honestly (``size=0``, non-executable ``price``,
         ``native_price=None``) — never a fabricated or midpoint price, never an ``IndexError``.
 
+        QUOTE-SIZE COUPLING (gate B): pass ``for_size`` to price the depth-aware cost-to-fill for the
+        SIZE the order will actually submit, so slippage / ``executable_edge_bps`` are evaluated on
+        the right depth. When ``None`` the adapter's default ``for_size`` is used.
+
         Args:
             market_ref: Venue-specific market identifier (carried onto the returned quote).
+            for_size: Shares to price the cost-to-fill for; ``None`` → the adapter's default.
 
         Returns:
             A v2 :class:`~veridex.venues.base.Quote`: ``price`` decimal odds, ``native_price`` the
             native ``avg_q`` (audit), ``levels`` in NATIVE units, ``size`` the fillable liquidity.
         """
+        effective_for_size = self._for_size if for_size is None else for_size
         token_id = side_to_token(self._resolved, self._side)
         book = await self._book_client.get_book(token_id)
         ts = _book_ts_seconds(book.get("timestamp") if isinstance(book, dict) else None)
@@ -282,7 +412,7 @@ class PolymarketAdapter:
         ladder = self._sorted_ask_ladder(_parse_levels(asks_raw))
         levels = [QuoteLevel(native_price=price, size=size) for price, size in ladder]
 
-        fill = _fill_to_size(ladder, self._for_size)
+        fill = _fill_to_size(ladder, effective_for_size)
         if fill is None:
             # Honest degrade: no executable price. price=0.0 is the "no price" sentinel the edge law
             # (veridex.law.edge) already treats as no-edge; native_price stays None (nothing to audit).
@@ -291,7 +421,7 @@ class PolymarketAdapter:
                 price=0.0,
                 native_price=None,
                 size=0.0,
-                for_size=self._for_size,
+                for_size=effective_for_size,
                 levels=levels,
                 ts=ts,
             )
@@ -302,7 +432,7 @@ class PolymarketAdapter:
             price=native_to_decimal(avg_q),  # decimal odds — the ONE conversion
             native_price=avg_q,  # native q — audit only
             size=filled,
-            for_size=self._for_size,
+            for_size=effective_for_size,
             levels=levels,
             ts=ts,
         )
@@ -351,37 +481,100 @@ class PolymarketAdapter:
             )
         return settings
 
-    async def submit_order(self, order: Order) -> SubmitAck:
-        """Submit an order — DISABLED by default.
+    def _require_write_client(self) -> WriteClient:
+        """Return the injected write client or fail closed if the live path is not wired."""
+        if self._write_client is None:
+            raise PolymarketWriteDisabled(
+                "Polymarket write client not injected: cannot reach the live CLOB write path"
+            )
+        return self._write_client
 
-        Raises:
-            PolymarketWriteDisabled: Unless ``settings.polymarket_write_enabled`` is true. The live
-                submit path is wired in T17 behind this same gate.
+    def _require_armed(self, action: str) -> WriteClient:
+        """Gate a real-money action: write-enabled AND not DRY_RUN AND a write client present.
+
+        Returns the write client only when every safety condition holds; otherwise raises
+        :class:`PolymarketWriteDisabled` WITHOUT touching the wire. ``dry_run`` is the safe default,
+        so an armed real submit needs ``polymarket_write_enabled`` true AND ``dry_run=False``.
         """
         self._require_write_enabled()
-        raise PolymarketWriteDisabled("Polymarket live submit path not yet wired (T17)")
+        if self._dry_run:
+            raise PolymarketWriteDisabled(
+                f"Polymarket {action} refused: DRY_RUN active (the safe default). "
+                "Arm a real order with polymarket_write_enabled=true AND dry_run=False."
+            )
+        return self._require_write_client()
+
+    async def submit_order(self, order: Order) -> SubmitAck:
+        """Submit a FAK order — converts DECIMAL ODDS to a NATIVE tick-rounded share price on the wire.
+
+        Fails closed by default (see :meth:`_require_armed`): a real submit needs
+        ``polymarket_write_enabled`` true AND ``dry_run=False``. The wire carries the NATIVE price
+        ``round_to_tick(1/order.price)`` — a decimal-odds value NEVER reaches the venue (§4.3).
+
+        Args:
+            order: The order to submit; ``order.price`` is DECIMAL ODDS, ``order.size`` the shares.
+
+        Returns:
+            A :class:`~veridex.venues.base.SubmitAck` parsed from the venue response.
+
+        Raises:
+            PolymarketWriteDisabled: Unless armed (write-enabled AND not DRY_RUN AND client present).
+        """
+        client = self._require_armed("submit")
+        token_id = side_to_token(self._resolved, order.side)
+        # DECIMAL ODDS -> native share price q -> tick-rounded to the market's tick. NATIVE on the wire.
+        native_price = round_to_tick(decimal_to_native(order.price), self._resolved.tick_size)
+        response = await client.limit_order(
+            ticker=token_id,
+            amount=order.size,  # positive => BUY the side's token
+            price=native_price,  # NATIVE tick-rounded price — never decimal odds
+            tif=order.tif,  # FAK (fill-and-kill) by default; GTC is unrepresentable for this lane
+            round_price=False,  # already tick-rounded here; the client must not re-round
+            tick_size=str(self._resolved.tick_size),
+        )
+        return _submit_ack_from_response(response)
 
     async def get_order_status(self, venue_order_id: str) -> OrderStatus:
-        """Query an order's status — DISABLED by default.
+        """Query an order's HONEST fill — reads the REAL matched size/price from ``get_order``.
 
-        In read-only mode there are no live orders to query, so this fails closed behind the write
-        gate. T17 wires the live status path.
+        The receipt reflects only what the venue matched (SEC-004): ``filled_size`` is the venue's
+        ``size_matched`` and ``native_price`` the matched native ``q`` (``price`` its decimal
+        inverse) — the request size is NEVER echoed as a fill. Gated behind the write flag (in
+        read-only mode there are no live orders to query).
+
+        Args:
+            venue_order_id: Opaque order reference to query.
+
+        Returns:
+            An honest :class:`~veridex.venues.base.OrderStatus` built from the matched fill.
 
         Raises:
             PolymarketWriteDisabled: Unless ``settings.polymarket_write_enabled`` is true.
         """
         self._require_write_enabled()
-        raise PolymarketWriteDisabled("Polymarket live order-status path not yet wired (T17)")
+        client = self._require_write_client()
+        raw = await client.get_order(venue_order_id)
+        return _order_status_from_raw(venue_order_id, raw)
 
     async def cancel_order(self, venue_order_id: str) -> CancelAck:
-        """Cancel an order — DISABLED by default.
+        """Cancel via the vendored client — gated identically to a real submit.
+
+        FAK orders are fill-and-kill (they never rest), so a post-submit cancel is a defensive
+        cleanup; the vendored write surface exposes only ``cancel_all_orders`` (single-order lane).
+
+        Args:
+            venue_order_id: Opaque order reference (echoed on the ack).
+
+        Returns:
+            A :class:`~veridex.venues.base.CancelAck`.
 
         Raises:
-            PolymarketWriteDisabled: Unless ``settings.polymarket_write_enabled`` is true. The live
-                cancel path is wired in T17 behind this same gate.
+            PolymarketWriteDisabled: Unless armed (write-enabled AND not DRY_RUN AND client present).
         """
-        self._require_write_enabled()
-        raise PolymarketWriteDisabled("Polymarket live cancel path not yet wired (T17)")
+        client = self._require_armed("cancel")
+        response = await client.cancel_all_orders()
+        cancelled = bool(response.get("success", True)) if isinstance(response, dict) else False
+        return CancelAck(venue_order_id=venue_order_id, cancelled=cancelled)
 
     def normalize_receipt(
         self,
