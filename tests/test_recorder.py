@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
-from veridex.ingest.recorder import SessionMeta, envelope_line, gap_line, read_session
+import json
+
+from veridex.ingest.recorder import SessionMeta, envelope_line, finalize_meta, gap_line, read_session
 
 
 def test_envelope_and_gap_lines_roundtrip(tmp_path):
@@ -64,3 +66,50 @@ def test_read_session_empty_and_gap_only(tmp_path):
     meta, records, gaps = read_session(gap_only_dir)
     assert records == []
     assert gaps == [{"from_ts": 10, "to_ts": 20}]
+
+
+def test_session_meta_roundtrips_with_new_fields():
+    meta = SessionMeta(
+        started_ts=1,
+        endpoints=["/odds/stream"],
+        tool_version="t",
+        ended_ts=50,
+        fixture_ids=[3, 7],
+        record_counts={"3": 10, "7": 4},
+    )
+    parsed = SessionMeta.model_validate_json(meta.model_dump_json())
+    assert parsed.ended_ts == 50
+    assert parsed.fixture_ids == [3, 7]
+    assert parsed.record_counts == {"3": 10, "7": 4}
+
+
+def test_session_meta_defaults_when_new_fields_absent():
+    # a crash-partial meta.json written before shutdown never had the new fields
+    raw = json.dumps({"started_ts": 1, "endpoints": ["/odds/stream"], "tool_version": "t"})
+    meta = SessionMeta.model_validate_json(raw)
+    assert meta.ended_ts is None
+    assert meta.fixture_ids == []
+    assert meta.record_counts == {}
+
+
+def test_finalize_meta_builds_sorted_fixture_ids_and_counts():
+    start_meta = SessionMeta(started_ts=1, endpoints=["/odds/stream"], tool_version="t")
+    finalized = finalize_meta(start_meta, ended_ts=99, record_counts={"7": 4, "3": 10})
+    assert finalized.started_ts == 1
+    assert finalized.endpoints == ["/odds/stream"]
+    assert finalized.tool_version == "t"
+    assert finalized.ended_ts == 99
+    assert finalized.fixture_ids == [3, 7]
+    assert finalized.record_counts == {"7": 4, "3": 10}
+
+
+def test_read_session_parses_meta_with_only_old_fields(tmp_path):
+    (tmp_path / "records.jsonl").write_text("")
+    (tmp_path / "meta.json").write_text(
+        json.dumps({"started_ts": 5, "endpoints": ["/odds/stream"], "tool_version": "old"})
+    )
+    meta, records, gaps = read_session(tmp_path)
+    assert meta.started_ts == 5
+    assert meta.fixture_ids == []
+    assert meta.record_counts == {}
+    assert meta.ended_ts is None

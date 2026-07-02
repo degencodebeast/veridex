@@ -33,7 +33,7 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
 from veridex.ingest.marketstate import parse_sse_line  # noqa: E402
-from veridex.ingest.recorder import SessionMeta, envelope_line, gap_line  # noqa: E402
+from veridex.ingest.recorder import SessionMeta, envelope_line, finalize_meta, gap_line  # noqa: E402
 
 TOOL_VERSION = "record.py/1"
 ENDPOINT = "/odds/stream"
@@ -48,21 +48,27 @@ class _Session:
     def __init__(self, session_dir: Path) -> None:
         self.session_dir = session_dir
         self.seen_fixture_ids: set[int] = set()
+        self.record_counts: dict[str, int] = {}
+        self.start_meta: SessionMeta | None = None
         self._fh = None
 
     def start(self, started_ts: int, endpoints: list[str]) -> None:
         self.session_dir.mkdir(parents=True, exist_ok=True)
-        meta = SessionMeta(started_ts=started_ts, endpoints=endpoints, tool_version=TOOL_VERSION)
-        (self.session_dir / "meta.json").write_text(meta.model_dump_json())
+        self.start_meta = SessionMeta(started_ts=started_ts, endpoints=endpoints, tool_version=TOOL_VERSION)
+        (self.session_dir / "meta.json").write_text(self.start_meta.model_dump_json())
         self._fh = (self.session_dir / "records.jsonl").open("a")
 
     def write_record(self, record: dict[str, Any], received_ts: int) -> None:
         fid = record.get("FixtureId")
         if fid is not None:
             try:
-                self.seen_fixture_ids.add(int(fid))
+                fid_int = int(fid)
             except (TypeError, ValueError):
-                pass
+                fid_int = None
+            if fid_int is not None:
+                self.seen_fixture_ids.add(fid_int)
+                key = str(fid_int)
+                self.record_counts[key] = self.record_counts.get(key, 0) + 1
         self._append(envelope_line(record, received_ts))
 
     def write_gap(self, from_ts: int, to_ts: int) -> None:
@@ -73,6 +79,13 @@ class _Session:
             raise RuntimeError("session not started")
         self._fh.write(line + "\n")
         self._fh.flush()
+
+    def write_finalized_meta(self, ended_ts: int) -> None:
+        """Rewrite meta.json at shutdown with ended_ts/fixture_ids/record_counts (REQ-2D-002(e))."""
+        if self.start_meta is None:
+            raise RuntimeError("session not started")
+        finalized = finalize_meta(self.start_meta, ended_ts=ended_ts, record_counts=self.record_counts)
+        (self.session_dir / "meta.json").write_text(finalized.model_dump_json())
 
     def close(self) -> None:
         if self._fh is not None:
@@ -152,8 +165,9 @@ async def run(sessions_dir: Path, minutes: float | None) -> None:
     except KeyboardInterrupt:
         print("\nKeyboardInterrupt received, shutting down...")
     finally:
-        # Always runs — clean exit, SIGINT, or an escaped error — so the per-fixture
-        # updates fetch and file close are never skipped.
+        # Always runs — clean exit, SIGINT, or an escaped error — so the finalized meta,
+        # per-fixture updates fetch, and file close are never skipped.
+        session.write_finalized_meta(last_received_ts)
         print(f"fetching per-fixture updates for {len(session.seen_fixture_ids)} fixtures...")
         await _write_fixture_updates(session, settings.txline_base_url, (jwt, token))
         session.close()
