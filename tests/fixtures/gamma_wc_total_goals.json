@@ -1,0 +1,16 @@
+[
+  {
+    "id": "590211",
+    "question": "Will there be Over 2.5 goals in Argentina vs France (2026 World Cup Final)?",
+    "slug": "argentina-vs-france-2026-final-over-2-5-goals",
+    "conditionId": "0x9a8b7c6d5e4f3021a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f6071",
+    "active": true,
+    "closed": false,
+    "outcomes": "[\"Over\", \"Under\"]",
+    "outcomePrices": "[\"0.55\", \"0.45\"]",
+    "clobTokenIds": "[\"55566677788899900011122233344455566677788899900011122233344455\", \"66677788899900011122233344455566677788899900011122233344455566\"]",
+    "orderPriceMinTickSize": 0.01,
+    "orderMinSize": 5,
+    "endDate": "2026-07-19T00:00:00Z"
+  }
+]
