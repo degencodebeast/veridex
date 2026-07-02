@@ -61,10 +61,24 @@ from pydantic import BaseModel
 
 GAMMA_BASE_URL = "https://gamma-api.polymarket.com"
 
-# Outcome labels that map to the "yes" token, per the interface contract (REQ-2D-202):
-# over/home/yes -> yes-token; under/away/no -> no-token.
-_YES_LABELS = frozenset({"yes", "over", "home"})
-_NO_LABELS = frozenset({"no", "under", "away"})
+# TWO distinct vocabularies — do NOT merge them (a real-money side<->token bug lived in the
+# overlap). A market's OUTCOME LABELS and a caller's BET SIDE are different concerns:
+#
+# * OUTCOME LABELS are the literal strings a Gamma market carries. In every target family the
+#   labels are ``["Yes","No"]`` (per-team win / draw binaries) or ``["Over","Under"]`` (O/U);
+#   spreads carry team-name labels and fail closed. No target market uses "Home"/"Away" as an
+#   OUTCOME label, so those never belong here — :func:`_parse_gamma_market` uses THIS pair.
+_OUTCOME_YES_LABELS = frozenset({"yes", "over"})
+_OUTCOME_NO_LABELS = frozenset({"no", "under"})
+#
+# * BET SIDES are what a caller asks to buy. WC 1X2 is THREE per-team Yes/No markets, and each
+#   side resolves to ITS OWN "Will <team> win?"/draw market where the BET TEAM is the YES
+#   outcome — so home, away AND draw all buy the YES token of their resolved market (``draw``
+#   only via :attr:`ResolvedMarket.draw_market`, handled separately). over/yes -> yes token;
+#   under/no -> no token. :func:`side_to_token` uses THIS pair. ("away" here is the away-team-
+#   WINS bet — NOT the "No" outcome of some market; conflating them inverts a live away order.)
+_SIDE_YES_LABELS = frozenset({"yes", "over", "home", "away"})
+_SIDE_NO_LABELS = frozenset({"no", "under"})
 
 # Team-name aliases for robust TxLINE<->Polymarket matching. Keys/values are ALREADY
 # normalized (lowercased, accent-stripped, "&"->"and", punctuation removed). Only genuine,
@@ -161,10 +175,12 @@ def side_to_token(resolved: ResolvedMarket, side: str) -> str:
 
     Args:
         resolved: The resolved market to read token IDs from.
-        side: One of ``"over"``/``"home"``/``"yes"`` (-> :attr:`ResolvedMarket.token_id_yes`)
-            or ``"under"``/``"away"``/``"no"`` (-> :attr:`ResolvedMarket.token_id_no`),
-            case-insensitive. ``"draw"`` is accepted ONLY when
-            :attr:`ResolvedMarket.draw_market` is ``True`` (the "…end in a draw?" binary
+        side: A BET SIDE. ``"yes"``/``"over"``/``"home"``/``"away"`` map to
+            :attr:`ResolvedMarket.token_id_yes` — each 1X2 side resolves to its OWN per-team
+            "Will <team> win?" market whose YES outcome is that team winning, so ``"away"`` is
+            the away-team-WINS bet (NOT a market's "No" outcome). ``"under"``/``"no"`` map to
+            :attr:`ResolvedMarket.token_id_no`. Case-insensitive. ``"draw"`` is accepted ONLY
+            when :attr:`ResolvedMarket.draw_market` is ``True`` (the "…end in a draw?" binary
             market), where DRAW = YES -> :attr:`token_id_yes`.
 
     Returns:
@@ -185,9 +201,9 @@ def side_to_token(resolved: ResolvedMarket, side: str) -> str:
             "side 'draw' is only valid on the draw-binary market "
             "(resolved.draw_market is False) — failing closed"
         )
-    if normalized in _YES_LABELS:
+    if normalized in _SIDE_YES_LABELS:
         return resolved.token_id_yes
-    if normalized in _NO_LABELS:
+    if normalized in _SIDE_NO_LABELS:
         return resolved.token_id_no
     raise ValueError(f"Unknown side: {side!r}")
 
@@ -473,9 +489,9 @@ def _parse_gamma_market(
     token_id_no: str | None = None
     for outcome, token_id in zip(outcomes, token_ids, strict=True):
         label = str(outcome).strip().lower()
-        if label in _YES_LABELS:
+        if label in _OUTCOME_YES_LABELS:
             token_id_yes = token_id
-        elif label in _NO_LABELS:
+        elif label in _OUTCOME_NO_LABELS:
             token_id_no = token_id
 
     if token_id_yes is None or token_id_no is None:

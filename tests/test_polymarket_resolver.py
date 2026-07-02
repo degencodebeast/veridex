@@ -614,6 +614,71 @@ async def test_side_to_token_draw_on_non_draw_market_fails_closed() -> None:
 
 
 # ---------------------------------------------------------------------------
+# T20b-2 fold (CRITICAL, real money): a 1X2|away bet must hit the away-team-WINS token.
+#
+# WC 1X2 = THREE per-team Yes/No markets; each side (home/away/draw) resolves to ITS OWN
+# "Will <team> win?"/draw market where the BET TEAM is the YES outcome. So home, away AND
+# draw all bet YES on their resolved per-team market. The bug: "away" sat in the NO label
+# set, so a 1X2|away order mapped to token_id_no = "away does NOT win" (the OPPOSITE
+# outcome). These end-to-end tests prove resolve_market -> side_to_token hits the right token.
+# ---------------------------------------------------------------------------
+
+
+async def test_1x2_away_bet_maps_to_away_wins_token() -> None:
+    """A live 1X2|away bet maps to the away-team-WINS token (its market's YES), NOT away-loses."""
+    client = _FakeGammaClient("gamma_event_prt_hrv.json")
+
+    resolved = await resolve_market(
+        "1X2|away|full",
+        "fifwc-prt-hrv-2026-07-02",
+        home_team="Portugal",
+        away_team="Croatia",
+        client=client,
+    )
+
+    # Croatia (away) win market: YES token == "Croatia wins".
+    assert side_to_token(resolved, "away") == (
+        "33300000000000000000000000000000000000000000000000000000000001"
+    )
+    # Guard the inversion directly: away must NOT map to the "away does NOT win" token.
+    assert side_to_token(resolved, "away") != resolved.token_id_no
+
+
+async def test_1x2_home_bet_maps_to_home_wins_token() -> None:
+    """A live 1X2|home bet maps to the home-team-WINS token (symmetric with away, stays correct)."""
+    client = _FakeGammaClient("gamma_event_prt_hrv.json")
+
+    resolved = await resolve_market(
+        "1X2|home|full",
+        "fifwc-prt-hrv-2026-07-02",
+        home_team="Portugal",
+        away_team="Croatia",
+        client=client,
+    )
+
+    assert side_to_token(resolved, "home") == (
+        "11100000000000000000000000000000000000000000000000000000000001"
+    )
+
+
+async def test_1x2_draw_bet_maps_to_draw_token() -> None:
+    """A live 1X2|draw bet maps to the draw market's YES token (stays correct via draw_market)."""
+    client = _FakeGammaClient("gamma_event_prt_hrv.json")
+
+    resolved = await resolve_market(
+        "1X2|draw|full",
+        "fifwc-prt-hrv-2026-07-02",
+        home_team="Portugal",
+        away_team="Croatia",
+        client=client,
+    )
+
+    assert side_to_token(resolved, "draw") == (
+        "22200000000000000000000000000000000000000000000000000000000001"
+    )
+
+
+# ---------------------------------------------------------------------------
 # side_to_token: full alias mapping, unknown side -> ValueError (no silent fallback)
 # ---------------------------------------------------------------------------
 
@@ -628,12 +693,15 @@ def resolved_market() -> ResolvedMarket:
     )
 
 
-@pytest.mark.parametrize("side", ["over", "home", "yes", "Over", "HOME", "Yes"])
+# home AND away both map to token_id_yes: each 1X2 side resolves to its OWN per-team
+# "Will <team> win?" market where the BET TEAM is the YES outcome (verified WC 1X2 model).
+# A bet SIDE ("away") is NOT a market OUTCOME LABEL — away is the away-team-WINS bet.
+@pytest.mark.parametrize("side", ["over", "home", "away", "yes", "Over", "HOME", "AWAY", "Yes"])
 def test_side_to_token_yes_aliases(resolved_market: ResolvedMarket, side: str) -> None:
     assert side_to_token(resolved_market, side) == "tok-yes"
 
 
-@pytest.mark.parametrize("side", ["under", "away", "no", "Under", "AWAY", "No"])
+@pytest.mark.parametrize("side", ["under", "no", "Under", "No"])
 def test_side_to_token_no_aliases(resolved_market: ResolvedMarket, side: str) -> None:
     assert side_to_token(resolved_market, side) == "tok-no"
 
