@@ -1247,8 +1247,8 @@ def create_app(
     # Default deps (T21c): so the headline replay/paper deploy runs end-to-end from the REAL app
     # (no injected deps), the default route degrades anchoring HONESTLY — it anchors on-chain only
     # when a Solana keypair is configured, else the run is legitimately ``not_anchored`` (offline
-    # replay), NEVER a fabricated anchor and NEVER a crash on a missing keypair. The bundled replay
-    # SOURCE is wired inside ``register_deploy_routes`` (see :mod:`veridex.deploy.bundled_replay`).
+    # replay), NEVER a fabricated anchor and NEVER a crash on a missing keypair. The replay SOURCE
+    # is the in-code demo fixture (``build_demo_ticks``), wired inside ``register_deploy_routes``.
     resolved_deploy_deps = deploy_deps
     if resolved_deploy_deps is None:
         anchor_fn = anchor_memo if resolved_settings.solana_keypair_path is not None else None

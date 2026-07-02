@@ -26,8 +26,8 @@ from typing import TYPE_CHECKING, Any
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
+from veridex.api.demo_fixtures import build_demo_ticks
 from veridex.chain.anchor import anchor_memo
-from veridex.deploy.bundled_replay import load_bundled_replay_marketstates
 from veridex.deploy.preflight import DeployConfig, PreflightCheck, run_deploy_preflight
 from veridex.ingest.feed_health import FeedHealthReport
 from veridex.ingest.marketstate import MarketState
@@ -199,15 +199,17 @@ def register_deploy_routes(app: FastAPI, *, store: Store, deploy_deps: DeployDep
     app.state.deploy_instances = instances
 
     def _resolve_replay_marketstates() -> list[MarketState]:
-        """Resolve the REPLAY source ticks: injected fakes (tests) or the REAL bundled ReplayPack.
+        """Resolve the REPLAY source ticks: injected fakes (tests) or the in-code demo fixture.
 
         The default mounted route has no injected ``deps.marketstates``, so a ``replay`` deploy
-        sources a REAL bundled ReplayPack (recorded demo ticks; NEVER live) — this is what makes the
-        headline flow demonstrable from the real app without any test injection (REQ-2D-703).
+        sources the SAME deterministic, zero-I/O demo fixture the ``/demo/run`` route uses
+        (:func:`~veridex.api.demo_fixtures.build_demo_ticks`). This is a REAL replay over recorded
+        demo ticks (honestly labeled REPLAY, NEVER live) — it makes the headline flow demonstrable
+        from the real app with no injected deps and no bundled-pack file on disk (REQ-2D-703).
         """
         if deps.marketstates is not None:
             return list(deps.marketstates)
-        return list(load_bundled_replay_marketstates())
+        return build_demo_ticks()
 
     async def _launch(config: DeployConfig, run_id: str, marketstates: list[MarketState]) -> None:
         """Run the deployed agent through the SINGLE seam, persisting the seal under ``run_id``."""

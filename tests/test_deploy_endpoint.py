@@ -270,10 +270,11 @@ _REPLAY_STUDIO: dict[str, Any] = {**_VALID, "source_mode": "replay", "execution_
 
 
 async def test_default_app_replay_deploy_runs_and_verifies_without_injected_deps() -> None:
-    # The DEFAULT mounted app — create_app(store=InMemoryStore()) with NO deploy_deps: the app wires
-    # a REAL bundled ReplayPack source itself, so a REPLAY/PAPER deploy runs end-to-end and the
-    # deployed run VERIFIES via the SAME /runs/{id}/verify path. This is the M6 gap: previously the
-    # default route ran standalone_run([]) (empty) and never sealed a loadable run.
+    # The DEFAULT mounted app — create_app(store=InMemoryStore()) with NO deploy_deps: the app
+    # sources the in-code demo replay fixture (build_demo_ticks — the SAME zero-I/O source /demo/run
+    # uses), so a REPLAY/PAPER deploy runs end-to-end and the deployed run VERIFIES via the SAME
+    # /runs/{id}/verify path. This is the M6 gap: previously the default route ran standalone_run([])
+    # (empty) and crashed the seal on a live anchor with no keypair — never sealing a loadable run.
     app = create_app(store=InMemoryStore())
     async with _transport(app) as client:
         resp = await client.post("/agents/deploy", json=_REPLAY_STUDIO)
@@ -293,10 +294,10 @@ async def test_default_app_replay_deploy_runs_and_verifies_without_injected_deps
         await _drain(app)
         assert tasks[0].exception() is None  # clean seal — no pre-seal crash
 
-        # The deployed run actually EXECUTED over the bundled ReplayPack (non-empty event log),
+        # The deployed run actually EXECUTED over the demo replay fixture (non-empty event log),
         # then verifies via the SAME arena /runs/{id}/verify path (evidence_hash == recomputed).
         proof = (await client.get(f"/runs/{body['run_id']}")).json()
-        assert proof["evidence"]["run_event_count"] > 0  # ran over real bundled ticks, not []
+        assert proof["evidence"]["run_event_count"] > 0  # ran over real demo replay ticks, not []
 
         vresp = await client.post(f"/runs/{body['run_id']}/verify")
         assert vresp.status_code == 200, vresp.text
@@ -318,9 +319,9 @@ async def test_default_app_live_deploy_stays_fail_closed_without_a_feed() -> Non
 
 
 async def test_default_app_replay_preflight_checks_the_source_resolves() -> None:
-    # MODE-AWARE preflight: the replay/paper deploy's feed_health check passes because the bundled
-    # replay SOURCE resolves (not because a live feed is connected). The named check is honest about
-    # what it verified for a replay deploy.
+    # MODE-AWARE preflight: the replay/paper deploy's feed_health check passes because the replay
+    # SOURCE (the demo fixture) resolves (not because a live feed is connected). The named check is
+    # honest about what it verified for a replay deploy.
     app = create_app(store=InMemoryStore())
     async with _transport(app) as client:
         resp = await client.post("/agents/deploy", json=_REPLAY_STUDIO)

@@ -208,18 +208,18 @@ def _check_feed(
     """Feed/source readiness — MODE-AWARE (REQ-2D-703).
 
     A ``replay`` deploy needs no live feed; instead the named ``feed_health`` check verifies the
-    replay SOURCE resolves (the bundled/injected pack loaded to non-empty marketstates). When the
-    caller did not resolve a source (``source_resolved is None``) the check stays permissive —
+    replay SOURCE resolves (the injected/demo-fixture ticks loaded to non-empty marketstates). When
+    the caller did not resolve a source (``source_resolved is None``) the check stays permissive —
     replay has no live-feed precondition — preserving the pure-preflight contract. A ``live``
     deploy STAYS fail-closed: it must have a connected, fresh feed (the correct 422 until a live
     feed is wired — never weakened, never fabricated)."""
     if config.source_mode == "replay":
         if source_resolved is False:
             return PreflightCheck(
-                name="feed_health", ok=False, detail="replay source did not resolve (bundled pack missing/empty)"
+                name="feed_health", ok=False, detail="replay source did not resolve (no replay ticks)"
             )
         detail = (
-            "replay source resolved (bundled pack ready)"
+            "replay source resolved (demo replay ticks ready)"
             if source_resolved is True
             else "replay source — no live feed required"
         )
