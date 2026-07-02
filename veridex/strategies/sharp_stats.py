@@ -21,14 +21,21 @@ from __future__ import annotations
 
 import math
 from statistics import median
+from typing import Literal
 
 # Symmetric clamp epsilon for the logit domain guard. TxLINE probabilities live strictly inside
-# (0, 1); this only fires on a boundary/out-of-range feed value, keeping the log-odds finite (and
-# symmetric: a symmetric clamp preserves ``logit(p) == -logit(1 - p)``) rather than raising.
-_LOGIT_EPS = 1e-12
+# (0, 1); this only fires on a boundary/out-of-range feed value. It is deliberately a SANE size
+# (not machine-tiny): ``logit(1e-6) ≈ -13.8``, so a glitchy 0/1 (or 0/10000-bps) feed tick clamps
+# to a bounded value instead of exploding to a massive synthetic log-odds jump the detector would
+# mistake for a sharp move. The clamp is symmetric, so ``logit(p) == -logit(1 - p)`` still holds.
+_LOGIT_EPS = 1e-6
 
 # MAD -> sigma consistency constant (1 / 0.674489...): 1.4826 * MAD ≈ std for normal data.
 _MAD_TO_SIGMA = 1.4826
+
+# Page-Hinkley alarm direction: an UPWARD or DOWNWARD sustained level shift (never a bare bool, so
+# a downward change-point can never be mistaken for confirmation of an upward move).
+PageHinkleyDirection = Literal["up", "down"]
 
 
 def logit(p: float) -> float:
@@ -73,19 +80,22 @@ def ewma(values: list[float], alpha: float) -> float:
     return smoothed
 
 
-def robust_z(series: list[float]) -> float:
+def robust_z(series: list[float], *, scale_floor: float = 0.0) -> float:
     """Robust z-score of the LATEST point vs its reference window (median/MAD).
 
     The reference is ``series[:-1]`` (the latest point's own history), so the scored point never
     contaminates its own location/scale estimate. With ``med = median(reference)`` and
-    ``MAD = median(|x - med|)``, the score is ``(series[-1] - med) / (1.4826 * MAD)``.
+    ``MAD = median(|x - med|)``, the score is ``(series[-1] - med) / max(1.4826 * MAD, scale_floor)``.
 
-    Returns ``0.0`` (quiet — defer to the change-point detector) when there is no dispersion to
-    judge against: fewer than two points, or a flat reference where ``MAD == 0`` (which would
-    otherwise divide by zero).
+    ``scale_floor`` is a minimum scale (in the series' own units). Without it, a perfectly FLAT
+    reference (``MAD == 0``) returns ``0.0`` — which would MISS the important sports case of a flat
+    market that suddenly reprices. A positive ``scale_floor`` turns that jump into a finite, large
+    z instead. It still returns ``0.0`` only when there is genuinely no scale to judge against
+    (fewer than two points, or both ``MAD`` and ``scale_floor`` are zero).
 
     Args:
         series: Recent observations, oldest first; the last element is the point being scored.
+        scale_floor: Minimum denominator scale (>= 0); floors ``1.4826 * MAD``.
 
     Returns:
         The robust z-score of the latest point, or ``0.0`` when it cannot be estimated.
@@ -95,7 +105,7 @@ def robust_z(series: list[float]) -> float:
     reference = series[:-1]
     med = median(reference)
     mad = median([abs(x - med) for x in reference])
-    scale = _MAD_TO_SIGMA * mad
+    scale = max(_MAD_TO_SIGMA * mad, scale_floor)
     if scale == 0.0:
         return 0.0
     return (series[-1] - med) / scale
@@ -105,10 +115,12 @@ class PageHinkley:
     """Page-Hinkley change-point detector (deterministic, stateful per instance).
 
     Tracks a running mean and two cumulative sums — one that grows on a sustained *increase* and
-    one that grows on a sustained *decrease*. :meth:`update` returns ``True`` the moment either
-    accumulated deviation exceeds ``lambda_``. ``delta`` is the per-step magnitude tolerance that
-    absorbs zero-mean noise (so noise never trips the alarm); ``lambda_`` is the detection
-    threshold (larger → later, more conservative alarms).
+    one that grows on a sustained *decrease*. :meth:`update` returns the DIRECTION of the alarm
+    (``"up"`` / ``"down"``) the moment that side's accumulated deviation exceeds ``lambda_``, else
+    ``None``. Returning a direction (not a bare bool) is a correctness guard: a downward
+    change-point can never be read as confirmation of an upward move. ``delta`` is the per-step
+    magnitude tolerance that absorbs zero-mean noise (so noise never trips the alarm); ``lambda_``
+    is the detection threshold (larger → later, more conservative alarms).
     """
 
     def __init__(self, *, delta: float, lambda_: float) -> None:
@@ -127,14 +139,15 @@ class PageHinkley:
         self._m_lo = 0.0  # cumulative (x - mean + delta): sinks on a sustained decrease
         self._max_lo = 0.0
 
-    def update(self, x: float) -> bool:
-        """Feed the next observation; return whether a change-point is confirmed at this step.
+    def update(self, x: float) -> PageHinkleyDirection | None:
+        """Feed the next observation; return the alarm DIRECTION at this step, or ``None``.
 
         Args:
             x: The next scalar observation.
 
         Returns:
-            ``True`` iff the accumulated increase- or decrease-deviation now exceeds ``lambda_``.
+            ``"up"`` / ``"down"`` iff that side's accumulated deviation now exceeds ``lambda_``
+            (the larger exceedance wins if both trip on the same step); otherwise ``None``.
         """
         self._n += 1
         self._mean += (x - self._mean) / self._n
@@ -144,4 +157,12 @@ class PageHinkley:
         self._max_lo = max(self._max_lo, self._m_lo)
         ph_hi = self._m_hi - self._min_hi  # >= 0, grows on a sustained upward shift
         ph_lo = self._max_lo - self._m_lo  # >= 0, grows on a sustained downward shift
-        return ph_hi > self._lambda or ph_lo > self._lambda
+        hi_fired = ph_hi > self._lambda
+        lo_fired = ph_lo > self._lambda
+        if hi_fired and lo_fired:
+            return "up" if ph_hi >= ph_lo else "down"
+        if hi_fired:
+            return "up"
+        if lo_fired:
+            return "down"
+        return None

@@ -45,6 +45,9 @@ def test_logit_domain_guard_clamps_boundary() -> None:
     assert math.isfinite(lo) and math.isfinite(hi)
     assert lo < 0.0 < hi
     assert lo == pytest.approx(-hi)  # symmetric clamp preserves logit(0) == -logit(1)
+    # SANE epsilon: the boundary clamp is bounded (~13.8), NOT a machine-tiny eps (which would
+    # give ~27.6) — a glitchy 0/1 feed tick can't inject a massive synthetic log-odds jump.
+    assert abs(lo) < 20.0
     # Out-of-range inputs clamp to the same finite bounds (defensive against bad feeds).
     assert logit(-1.0) == pytest.approx(lo)
     assert logit(2.0) == pytest.approx(hi)
@@ -144,6 +147,22 @@ def test_robust_z_too_short_series_is_zero() -> None:
     assert robust_z([]) == 0.0
 
 
+def test_robust_z_scale_floor_catches_flat_market_jump() -> None:
+    # Flat reference (MAD == 0) then a sudden jump: the default returns 0.0 (misses it), but a
+    # positive scale_floor turns the jump into a finite, large z — the sports repricing case.
+    jump = [5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 5.4]  # +0.4 jump off a flat book
+    assert robust_z(jump) == 0.0  # default scale_floor=0.0 → MAD guard → quiet
+    z = robust_z(jump, scale_floor=0.05)
+    assert z == pytest.approx(0.4 / 0.05, rel=1e-9)  # (5.4 - 5.0) / floor
+    assert z > 3.0
+
+
+def test_robust_z_scale_floor_is_ignored_when_mad_dominates() -> None:
+    # When real dispersion exists, 1.4826*MAD > scale_floor, so a small floor changes nothing.
+    series = [*_UNIFORM_REF, 20.0]
+    assert robust_z(series, scale_floor=1e-6) == pytest.approx(robust_z(series), rel=1e-12)
+
+
 # --------------------------------------------------------------------------------------------
 # PageHinkley  (change-point detector)
 # --------------------------------------------------------------------------------------------
@@ -162,22 +181,24 @@ _SHIFT_DOWN = [10.0] * 8 + [0.0] * 8
 def test_page_hinkley_quiet_on_white_noise() -> None:
     ph = PageHinkley(delta=0.5, lambda_=5.0)
     fired = [ph.update(x) for x in _WHITE_NOISE]
-    assert not any(fired)  # a stable market never trips the change-point alarm
+    assert all(d is None for d in fired)  # a stable market never trips the change-point alarm
 
 
-def test_page_hinkley_fires_on_upward_shift() -> None:
+def test_page_hinkley_fires_up_on_upward_shift() -> None:
     ph = PageHinkley(delta=0.5, lambda_=5.0)
     fired = [ph.update(x) for x in _SHIFT_UP]
-    assert not any(fired[:8])  # quiet during the flat prefix
-    assert any(fired[8:])  # a genuine level shift raises the alarm
+    assert all(d is None for d in fired[:8])  # quiet during the flat prefix
+    assert any(d == "up" for d in fired[8:])  # a genuine level shift raises an UP alarm
+    assert "down" not in fired  # and never a spurious down alarm
 
 
-def test_page_hinkley_fires_on_downward_shift() -> None:
-    # Symmetric: the detector catches drops as well as rises.
+def test_page_hinkley_fires_down_on_downward_shift() -> None:
+    # Symmetric AND directional: the detector catches drops and labels them "down", never "up".
     ph = PageHinkley(delta=0.5, lambda_=5.0)
     fired = [ph.update(x) for x in _SHIFT_DOWN]
-    assert not any(fired[:8])
-    assert any(fired[8:])
+    assert all(d is None for d in fired[:8])
+    assert any(d == "down" for d in fired[8:])
+    assert "up" not in fired
 
 
 def test_page_hinkley_is_deterministic() -> None:
