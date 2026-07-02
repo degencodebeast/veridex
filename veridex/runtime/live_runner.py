@@ -232,6 +232,7 @@ async def run_live_window(
     store: Store | None = None,
     anchor_fn: Callable[[str], Awaitable[str]] | None = None,
     stop_event: asyncio.Event | None = None,
+    run_id: str | None = None,
 ) -> LiveRunResult:
     """Drive one windowed LIVE run: stream → feed (real time) → seal close → finalize → proof.
 
@@ -252,6 +253,8 @@ async def run_live_window(
         stop_event: For the ``manual_stop`` end rule — the loop ends when it is set. Checked between
             ticks AND raced against the next-tick await, so a stop is honored promptly even on an
             IDLE stream (no line moves) rather than blocking until the next tick.
+        run_id: Optional pre-known run id (T21 deploy) so a launcher can return the run id BEFORE the
+            window seals; ``None`` → a fresh id is minted at construction (the arena default).
 
     Returns:
         A :class:`LiveRunResult` bundle (the sealed run + the after-seal proof composition + ops).
@@ -268,7 +271,7 @@ async def run_live_window(
     Raises:
         Exception: Re-raises a mid-stream error from ``stream`` when NO ticks were fed yet.
     """
-    run = CompetitionRun(agents, source_mode="live", event_sink=event_sink)
+    run = CompetitionRun(agents, source_mode="live", event_sink=event_sink, run_id=run_id)
 
     if stream is None:
         from veridex.ingest.live_client import stream_marketstates  # noqa: PLC0415  (lazy httpx)

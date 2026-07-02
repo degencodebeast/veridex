@@ -34,8 +34,10 @@ No auth / Redis / rate-limiting — Phase-2 only (CON-009).
 
 from __future__ import annotations
 
+import contextlib
 import json
 import time
+from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
 
@@ -46,6 +48,7 @@ from veridex.api.demo_fixtures import (
     build_demo_ticks,
     contrarian_agent,
 )
+from veridex.api.deploy import DeployDeps, cancel_deploy_tasks, register_deploy_routes
 from veridex.api.schemas import (
     AgentRegisterResponse,
     ApprovalResponse,
@@ -198,6 +201,7 @@ def create_app(
     store: Store | None = None,
     settings: Settings | None = None,
     runtime_event_store: RuntimeEventStore | None = None,
+    deploy_deps: DeployDeps | None = None,
 ) -> FastAPI:
     """Create the Veridex demo FastAPI application.
 
@@ -225,10 +229,17 @@ def create_app(
         runtime_event_store if runtime_event_store is not None else RuntimeEventStore()
     )
 
+    @contextlib.asynccontextmanager
+    async def _lifespan(app_: FastAPI) -> AsyncIterator[None]:
+        """App lifespan — on shutdown, cancel any tracked background deploy-run tasks (T21)."""
+        yield
+        await cancel_deploy_tasks(app_)
+
     app = FastAPI(
         title="Veridex Demo API",
         description="TxLINE Agent Proof Arena — Phase 1 demo surface (REQ-115 / AC-115).",
         version="0.1.0",
+        lifespan=_lifespan,
     )
 
     # Per-app registry: run_id → {anchor_status, source_mode}.
@@ -1227,5 +1238,11 @@ def create_app(
     # ``arena_manager.broadcast`` for it (persist-before-broadcast), so spectators see a gapless
     # projection of the sealed log. ``broadcast`` never blocks the run loop (REQ-2B-30).
     register_arena_routes(app, store=resolved_store, manager=arena_manager)
+
+    # --- POST /agents/deploy (Studio deploy → pinned instance → async run → one flow to proof) ----
+    # Preflight fail-closed (422 named); pins config_hash+policy_hash+template+modes as an
+    # AgentInstance; launches via the SINGLE runner seam (standalone_run) and persists the sealed run
+    # to ``resolved_store`` so the deployed run verifies via the SAME /runs/{id}/verify path (T21).
+    register_deploy_routes(app, store=resolved_store, deploy_deps=deploy_deps)
 
     return app

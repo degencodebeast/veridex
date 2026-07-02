@@ -1,0 +1,227 @@
+"""T21 — Studio deploy endpoint: async launch + pinned instance + one flow to proof.
+
+``POST /agents/deploy`` pins the submitted config as an AgentInstance (config_hash + policy_hash
++ template + modes) and launches the run ASYNCHRONOUSLY through the SINGLE runner seam
+(``standalone_run``): the response returns ``run_id`` WITHOUT awaiting the window seal, the
+background task is tracked + cancellable on shutdown, and the deployed run's sealed window
+verifies via the SAME ``/runs/{id}/verify`` path as an arena run.
+
+All offline: an injected fake stream + fetch_updates + ``anchor_fn=None`` — ZERO network.
+"""
+
+from __future__ import annotations
+
+import asyncio
+from collections.abc import AsyncIterator
+from typing import Any
+
+import httpx
+from httpx import ASGITransport
+
+from veridex.api.deploy import DeployDeps
+from veridex.api.router import create_app
+from veridex.deploy.preflight import DeployConfig
+from veridex.ingest.feed_health import FeedHealthReport
+from veridex.ingest.marketstate import MarketState
+from veridex.store import InMemoryStore
+
+# --- offline live fixtures (mirror the T20 standalone-run live launch path) ------------------
+_LIVE_KEY = "OU|FT|2.5"
+
+
+def _live_market(over_bps: int) -> dict[str, Any]:
+    return {"stable_prob_bps": {"over": over_bps}, "stable_price": {"over": 1.6, "under": 2.4}, "suspended": False}
+
+
+def _live_ms(over_bps: int, *, tick_seq: int, ts: int, phase: int = 0) -> MarketState:
+    return MarketState(
+        fixture_id=1, tick_seq=tick_seq, ts=ts, phase=phase, markets={_LIVE_KEY: _live_market(over_bps)}, scores={}
+    )
+
+
+def _finite_ticks() -> list[MarketState]:
+    return [
+        _live_ms(5000, tick_seq=0, ts=1000, phase=0),
+        _live_ms(5200, tick_seq=1, ts=1100, phase=0),
+        _live_ms(5300, tick_seq=2, ts=9999, phase=1),  # kickoff → seals a pre_match window
+    ]
+
+
+async def _finite_stream(_config: DeployConfig) -> AsyncIterator[MarketState]:
+    for item in _finite_ticks():
+        yield item
+
+
+async def _never_ending_stream(_config: DeployConfig) -> AsyncIterator[MarketState]:
+    """Yield one pre-kickoff tick, then block forever — the seal never arrives on its own."""
+    yield _live_ms(5000, tick_seq=0, ts=1000, phase=0)
+    await asyncio.Event().wait()  # blocks until the task is cancelled on shutdown
+    yield _live_ms(5200, tick_seq=1, ts=1100, phase=0)  # unreachable
+
+
+async def _close(_fixture_id: int) -> list[dict[str, Any]]:
+    return [
+        {
+            "FixtureId": 1,
+            "Ts": 1_200_000,
+            "InRunning": 0,
+            "SuperOddsType": "OU",
+            "MarketPeriod": "FT",
+            "MarketParameters": "2.5",
+            "PriceNames": ["over", "under"],
+            "Prices": [1600, 2400],
+            "Pct": [66, 34],
+        }
+    ]
+
+
+def _healthy_live_feed() -> FeedHealthReport:
+    return FeedHealthReport(
+        source_mode="live",
+        txline_configured=True,
+        connected=True,
+        last_tick_ts=1000,
+        ticks_seen=5,
+        fixture_id=1,
+        staleness_s=1,
+        stale=False,
+    )
+
+
+_VALID: dict[str, Any] = {
+    "template_id": "sharp-momentum-v2",
+    "agent_id": "studio-agent",
+    "strategy": "momentum-sharp",
+    "source_mode": "live",
+    "execution_mode": "paper",
+    "market_allowlist": [_LIVE_KEY],
+    "venue_allowlist": ["fake"],
+    "min_edge_bps": 0,
+    "max_stake": 0.0,
+    "window_id": "w1",
+    "fixture_id": 1,
+    "end_rule": "pre_match",
+    "alpha": 0.4,
+    "z_threshold": 2.5,
+    "ph_delta": 0.01,
+    "ph_lambda": 0.15,
+    "cooldown_ticks": 3,
+    "warmup_ticks": 10,
+    "min_movements": 8,
+    "lookback": 64,
+    "scale_floor": 0.02,
+    "persistence_logit": 0.06,
+}
+
+
+def _app_and_deps(stream: Any) -> tuple[Any, InMemoryStore]:
+    store = InMemoryStore()
+    deps = DeployDeps(
+        feed_report=_healthy_live_feed(),
+        market_resolved=True,
+        stream_factory=stream,
+        fetch_updates=_close,
+        anchor_fn=None,  # offline: no on-chain anchor
+    )
+    return create_app(store=store, deploy_deps=deps), store
+
+
+def _transport(app: Any) -> httpx.AsyncClient:
+    return httpx.AsyncClient(transport=ASGITransport(app=app), base_url="http://test")
+
+
+async def _drain(app: Any) -> None:
+    tasks = list(getattr(app.state, "deploy_background_tasks", set()))
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+
+# ---------------------------------------------------------------------------
+# ASYNC — response returns run_id WITHOUT awaiting the seal
+# ---------------------------------------------------------------------------
+
+
+async def test_deploy_returns_run_id_without_awaiting_seal() -> None:
+    app, _store = _app_and_deps(_never_ending_stream)
+    try:
+        async with _transport(app) as client:
+            resp = await client.post("/agents/deploy", json=_VALID)
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["run_id"]
+        assert len(body["config_hash"]) == 64
+        assert len(body["policy_hash"]) == 64
+        assert body["instance_id"].startswith("inst_")
+
+        # The run was launched but its window is still open (the injected stream never ends),
+        # proving the response did NOT block on the seal.
+        tasks = getattr(app.state, "deploy_background_tasks", set())
+        assert len(tasks) == 1
+        assert not next(iter(tasks)).done()
+    finally:
+        for task in list(getattr(app.state, "deploy_background_tasks", set())):
+            task.cancel()
+        await _drain(app)
+
+
+async def test_deploy_background_task_is_tracked_and_cancellable() -> None:
+    app, _store = _app_and_deps(_never_ending_stream)
+    async with _transport(app) as client:
+        await client.post("/agents/deploy", json=_VALID)
+    tasks = list(getattr(app.state, "deploy_background_tasks", set()))
+    assert len(tasks) == 1
+    task = tasks[0]
+    task.cancel()
+    await _drain(app)
+    assert task.cancelled() or task.done()
+
+
+# ---------------------------------------------------------------------------
+# PINNED INSTANCE — config_hash + policy_hash + template + modes
+# ---------------------------------------------------------------------------
+
+
+async def test_deploy_pins_the_instance() -> None:
+    app, _store = _app_and_deps(_never_ending_stream)
+    try:
+        async with _transport(app) as client:
+            resp = await client.post("/agents/deploy", json=_VALID)
+        body = resp.json()
+        instances = getattr(app.state, "deploy_instances", {})
+        inst = instances[body["instance_id"]]
+        assert inst.config_hash == body["config_hash"]
+        assert inst.policy_hash == body["policy_hash"]
+        assert inst.template_id == "sharp-momentum-v2"
+        assert inst.source_mode == "live"
+        assert inst.execution_mode == "paper"
+        assert inst.market_allowlist == [_LIVE_KEY]
+        assert inst.run_id == body["run_id"]
+        # The pinned config_hash is exactly the submitted config's canonical hash.
+        assert inst.config_hash == DeployConfig(**_VALID).config_hash()
+    finally:
+        for task in list(getattr(app.state, "deploy_background_tasks", set())):
+            task.cancel()
+        await _drain(app)
+
+
+# ---------------------------------------------------------------------------
+# ONE FLOW TO PROOF — deployed run verifies via the SAME arena /runs/{id}/verify
+# ---------------------------------------------------------------------------
+
+
+async def test_deployed_run_verifies_via_the_same_arena_path() -> None:
+    app, _store = _app_and_deps(_finite_stream)
+    async with _transport(app) as client:
+        resp = await client.post("/agents/deploy", json=_VALID)
+        assert resp.status_code == 200, resp.text
+        run_id = resp.json()["run_id"]
+
+        # Drive the background run to its natural seal, then verify it exactly like an arena run.
+        await _drain(app)
+
+        vresp = await client.post(f"/runs/{run_id}/verify")
+        assert vresp.status_code == 200, vresp.text
+        verdict = vresp.json()
+        assert verdict["run_id"] == run_id
+        assert verdict["verified"] is True
+        assert verdict["evidence_hash"] == verdict["recomputed_evidence_hash"]

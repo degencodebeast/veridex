@@ -8,7 +8,34 @@ import { STRATEGY_TEMPLATES, COMPLEXITY_LABEL, type StrategyTemplate } from '@/l
 import { buildPreflightPreview, PREFLIGHT_DISCLAIMER } from '@/lib/studio/preflight';
 import { DEFAULT_POLICY_ENVELOPE } from '@/lib/fixtures/catalog';
 import { GLOSSARY } from '@/lib/glossary';
+import { deployAgent, DeployPreflightError, type DeployAgentPayload } from '@/lib/api';
 import styles from './StudioScreen.module.css';
+
+// Map the Studio archetype + mode onto a backend strategy family (deploy launches this agent).
+function toStrategy(archetype: Archetype, mode: StudioMode): string {
+  if (mode === 'llm') return 'llm';
+  if (archetype === 'momentum') return 'momentum-sharp';
+  if (archetype === 'baseline') return 'baseline';
+  return 'momentum-sharp';
+}
+
+// Build the non-secret deploy payload from the pinned Studio config + policy envelope.
+function buildDeployPayload(archetype: Archetype, mode: StudioMode, exec: ExecutionMode): DeployAgentPayload {
+  return {
+    template_id: archetype,
+    agent_id: `studio-${archetype}`,
+    strategy: toStrategy(archetype, mode),
+    source_mode: 'live',
+    execution_mode: exec,
+    market_allowlist: DEFAULT_POLICY_ENVELOPE.market_allowlist,
+    venue_allowlist: DEFAULT_POLICY_ENVELOPE.venue_allowlist,
+    min_edge_bps: DEFAULT_POLICY_ENVELOPE.min_edge_bps,
+    max_stake: DEFAULT_POLICY_ENVELOPE.max_stake,
+    window_id: `studio-${archetype}`,
+    fixture_id: 1,
+    end_rule: 'pre_match',
+  };
+}
 
 // Honesty (law_hash / Create-wizard ruling): the config pin is an affordance, NOT a fabricated
 // proof-flavored digest. The config is frozen at entry; real evidence/score/manifest hashes only
@@ -40,6 +67,11 @@ export function StudioScreen({
   );
   // Whether the current draft has been pinned (drives the honest "Config pinned ✓" affordance).
   const [pinned, setPinned] = useState(false);
+  // Server-owned deploy state — the run_id the pinned instance launched, or the NAMED preflight
+  // failure. There is NO client-fabricated deploy handle: the endpoint is the source of truth.
+  const [runId, setRunId] = useState<string | null>(null);
+  const [preflightFailure, setPreflightFailure] = useState<string[] | null>(null);
+  const [deploying, setDeploying] = useState(false);
 
   const modes = availableModes(archetype);
 
@@ -65,10 +97,24 @@ export function StudioScreen({
     { field: 'execution_mode', before: baseline.exec as string, after: exec as string },
   ].filter((e) => e.before !== e.after);
 
-  function pin() {
+  async function pin() {
     onPin();
     setBaseline({ archetype, mode, exec }); // applied as the new pinned version
     setPinned(true);
+    // DEPLOY for real: POST the config → fail-closed preflight → pinned instance + async run_id.
+    // The run_id / named preflight failure are server-owned (no loose client-only deploy state).
+    setDeploying(true);
+    setPreflightFailure(null);
+    setRunId(null);
+    try {
+      const result = await deployAgent(buildDeployPayload(archetype, mode, exec));
+      setRunId(result.run_id);
+    } catch (err) {
+      if (err instanceof DeployPreflightError) setPreflightFailure(err.failedChecks);
+      else setPreflightFailure(['deploy_unavailable']);
+    } finally {
+      setDeploying(false);
+    }
   }
 
   // PREFLIGHT PREVIEW — fully (A) real config (codex option 3): threshold + rule-config + disclaimer.
@@ -240,8 +286,8 @@ export function StudioScreen({
             {running ? (
               <p className={styles.roBanner} data-testid="run-readonly">Config is read-only during a scored run (SEC-006). Edits create a new version, never a live mutation.</p>
             ) : (
-              <button type="button" className={styles.pin} onClick={pin}>
-                PIN CONFIG &amp; QUEUE RUN →
+              <button type="button" className={styles.pin} onClick={pin} disabled={deploying}>
+                {deploying ? 'DEPLOYING…' : 'PIN CONFIG & QUEUE RUN →'}
               </button>
             )}
             {/* Honest pin affordance — NOT a fabricated hash (law_hash / Create-wizard ruling).
@@ -251,6 +297,19 @@ export function StudioScreen({
                 <span className="mono">Config pinned ✓</span>{' '}
                 <InfoTip label={GLOSSARY.config_pinned.label}>{GLOSSARY.config_pinned.definition}</InfoTip>
               </p>
+            ) : null}
+            {/* Server-owned deploy outcome: the real run_id (returned before the seal), or the NAMED
+                fail-closed preflight failure. Neither is client-fabricated — the endpoint decides. */}
+            {runId ? (
+              <p className={styles.deployedOk} data-testid="deploy-run-id">
+                Deployed · run <span className="mono">{runId}</span>
+              </p>
+            ) : null}
+            {preflightFailure && preflightFailure.length > 0 ? (
+              <div className={styles.deployError} data-testid="deploy-preflight-error" role="alert">
+                <span className={styles.deployErrorLabel}>Preflight failed (fail-closed):</span>{' '}
+                <span className="mono">{preflightFailure.join(', ')}</span>
+              </div>
             ) : null}
             <p className={styles.note}>Config is frozen at run start. Mid-run edits create a new version/run (SEC-009).</p>
           </aside>

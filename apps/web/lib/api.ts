@@ -360,6 +360,73 @@ export async function getFeedHealth(): Promise<FeedHealthState> {
   return adaptFeedHealth(await getJson<W.FeedHealth>(PATHS.feedHealth()));
 }
 
+// ---- Studio deploy (T21 — POST /agents/deploy) ----
+
+/** Non-secret config the Studio deploy button submits (mirrors the backend DeployConfig). */
+export interface DeployAgentPayload {
+  template_id: string;
+  agent_id: string;
+  strategy: string;
+  source_mode: 'replay' | 'live';
+  execution_mode: ExecutionMode;
+  market_allowlist: string[];
+  venue_allowlist: string[];
+  min_edge_bps: number;
+  max_stake: number;
+  window_id: string;
+  fixture_id: number;
+  end_rule: 'pre_match' | 'fixed_duration' | 'manual_stop';
+}
+
+/** The pinned-instance handle the deploy endpoint returns (run_id known BEFORE the seal). */
+export interface DeployAgentResult {
+  instance_id: string;
+  config_hash: string;
+  policy_hash: string;
+  run_id: string;
+}
+
+/** One named preflight verdict as returned in the 422 detail. */
+export interface DeployPreflightVerdict {
+  name: string;
+  ok: boolean | null;
+  detail: string;
+}
+
+/** Thrown when the deploy preflight fails closed (HTTP 422) — carries the NAMED failing checks. */
+export class DeployPreflightError extends Error {
+  constructor(
+    public failedChecks: string[],
+    public checks: DeployPreflightVerdict[],
+  ) {
+    super(`deploy preflight failed: ${failedChecks.join(', ')}`);
+    this.name = 'DeployPreflightError';
+  }
+}
+
+/**
+ * Deploy an agent instance: POST the config to /agents/deploy.
+ *
+ * On a fail-closed preflight (422) the backend returns ``{detail: {failed_checks, checks}}``; this
+ * surfaces it as a {@link DeployPreflightError} so the UI can name the failing check instead of a
+ * bare status. The 200 body is the pinned instance + the launched ``run_id`` (returned WITHOUT
+ * awaiting the seal).
+ */
+export async function deployAgent(payload: DeployAgentPayload): Promise<DeployAgentResult> {
+  const res = await fetch(`${API_BASE}/agents/deploy`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', accept: 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  if (res.status === 422) {
+    const body = (await res.json().catch(() => ({}))) as { detail?: { failed_checks?: string[]; checks?: DeployPreflightVerdict[] } };
+    const detail = body.detail ?? {};
+    throw new DeployPreflightError(detail.failed_checks ?? [], detail.checks ?? []);
+  }
+  if (!res.ok) throw new ApiError(res.status, `POST /agents/deploy failed: ${res.status}`);
+  return (await res.json()) as DeployAgentResult;
+}
+
 // MOCK status-bar seed (sync): when mock is on, the status bar populates app-wide from the mock
 // competition fixture (demoted source) so the full bar is inspectable — but WS is `disconnected`
 // (DEMO), NEVER a fabricated CONNECTED. Returns null when mock is off (⇒ honest idle bar).

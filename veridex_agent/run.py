@@ -130,6 +130,8 @@ async def _seal_replay(
     *,
     source_mode: str,
     anchor_fn: Callable[[str], Awaitable[str]] | None,
+    run_id: str | None = None,
+    store: Store | None = None,
 ) -> _SealedRun:
     """Seal one REPLAY run + build its proof (byte-identical to the pre-T20 standalone core).
 
@@ -137,9 +139,10 @@ async def _seal_replay(
     ``build_check_results`` EXACTLY as ``run_demo_competition`` does, so MANIFEST_BOUND and ANCHOR
     get real verdicts and a standalone-deployed agent's card reads identically to an in-competition
     one. This is the exact composition that shipped before T20; it is untouched so replay/paper stay
-    byte-for-byte identical.
+    byte-for-byte identical. ``run_id``/``store`` are the T21 deploy hooks: a pre-known run id +
+    persistence at seal time so ``/runs/{id}/verify`` can load the deployed run (both default off).
     """
-    run = await run_competition(marketstates, [agent], source_mode=source_mode)
+    run = await run_competition(marketstates, [agent], source_mode=source_mode, run_id=run_id, store=store)
     scores = score_run(run)
 
     score_root = recompute_score_root(scores)
@@ -195,13 +198,17 @@ async def _seal_live(
     fetch_updates: Callable[[int], Awaitable[list[dict[str, Any]]]] | None,
     event_sink: Callable[[dict[str, Any]], Awaitable[None]] | None,
     anchor_fn: Callable[[str], Awaitable[str]] | None,
+    run_id: str | None = None,
+    store: Store | None = None,
 ) -> _SealedRun:
     """Seal one windowed LIVE run by COMPOSING the T8 live runner (no re-implemented seal→proof).
 
     ``run_live_window`` already streams live TxLINE ticks in real time, seals the CON-040 close,
     finalizes, and builds the after-seal proof card / manifest / anchor — so the standalone core
     delegates the entire live composition to it rather than duplicating any of it. Tests inject
-    ``stream`` + ``fetch_updates`` for a fully offline live run (ZERO network).
+    ``stream`` + ``fetch_updates`` for a fully offline live run (ZERO network). ``run_id``/``store``
+    are the T21 deploy hooks: a pre-known run id + persistence at finalize so the deployed run is
+    loadable by ``/runs/{id}/verify`` (both default off — untouched for the CLI/arena callers).
     """
     live = await run_live_window(
         window,
@@ -210,6 +217,8 @@ async def _seal_live(
         fetch_updates=fetch_updates,
         event_sink=event_sink,
         anchor_fn=anchor_fn,
+        run_id=run_id,
+        store=store,
     )
     return _SealedRun(
         run=live.run,
@@ -334,6 +343,8 @@ async def standalone_run(
     adapter: VenueAdapter | None = None,
     execution_store: Store | None = None,
     config_hash: str | None = None,
+    run_id: str | None = None,
+    store: Store | None = None,
     event_sink: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
     anchor_fn: Callable[[str], Awaitable[str]] | None = anchor_memo,
 ) -> StandaloneRunResult:
@@ -365,6 +376,10 @@ async def standalone_run(
             in-memory store (the standalone core has no competition log to persist to).
         config_hash: The non-secret agent-config hash pinned into the run manifest (the launched
             instance). ``None`` when the caller did not compute one.
+        run_id: Optional pre-known run id (T21 deploy) so the launcher can return the id BEFORE the
+            seal; ``None`` → a fresh id is minted at construction (the CLI/arena default).
+        store: Optional async store the sealed run is persisted to at seal/finalize time (T21 deploy)
+            so ``/runs/{id}/verify`` can load it; ``None`` → no persistence (the CLI default).
         event_sink: Optional async observer forwarded to the live runner (projection only).
         anchor_fn: Injectable ``async (manifest_hash) -> signature``; ``None`` skips anchoring.
             Defaults to the real :func:`~veridex.chain.anchor.anchor_memo`.
@@ -380,10 +395,14 @@ async def standalone_run(
             fetch_updates=fetch_updates,
             event_sink=event_sink,
             anchor_fn=anchor_fn,
+            run_id=run_id,
+            store=store,
         )
         report = verify_run(sealed.run, fixture_or_window_id=window.window_id)
     else:
-        sealed = await _seal_replay(marketstates, agent, source_mode=source_mode, anchor_fn=anchor_fn)
+        sealed = await _seal_replay(
+            marketstates, agent, source_mode=source_mode, anchor_fn=anchor_fn, run_id=run_id, store=store
+        )
         report = verify_run(sealed.run)
 
     # --- opt-in EXECUTION LANE — downstream of the seal, NON-SCORING (SEC-004 / SEC-2D-401) -------
