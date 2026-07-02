@@ -34,3 +34,8 @@ veridex/.env.local
 scripts/txline_live/node_modules/
 scripts/txline_live/captured_*.json
 scripts/txline_live/*.tsbuildinfo
+
+# Frontend env (secrets — never commit)
+apps/web/.env
+apps/web/.env.local
+apps/web/.env.*.local
