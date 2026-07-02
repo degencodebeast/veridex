@@ -30,6 +30,7 @@ Async network shell
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Literal, TypedDict
 
@@ -61,6 +62,8 @@ class ProbeResult(ProbeTarget):
 
 
 _UNKNOWN = "UNKNOWN"
+_SKIPPED_NO_FIXTURE_NOTE = "no fixture_id supplied (set TXLINE_PROBE_FIXTURE_ID)"
+_FIXTURE_SCOPED_NAMES = frozenset({"odds_updates", "odds_snapshot", "scores_updates"})
 
 _MATRIX_HEADERS = (
     "capability",
@@ -86,8 +89,13 @@ def probe_targets(base: str, fixture_id: int | None) -> list[ProbeTarget]:
     Args:
         base: TxLINE API base URL (e.g. ``https://txline-dev.txodds.com/api``).
         fixture_id: A known fixture id to scope fixture-level probes to, or
-            ``None`` to use a placeholder (those targets are then skipped by
-            :func:`main`, not omitted here).
+            ``None`` to use a placeholder fid in the built URL. When
+            ``None``, :func:`main` does NOT actually probe these three
+            targets with the placeholder (a fid=0 GET/404 an operator could
+            misread as "endpoint down") — it records an honest ``SKIPPED``
+            status via :func:`build_skipped_result` instead. The targets
+            still appear here, by name, so the matrix documents them either
+            way.
 
     Returns:
         Probe targets covering odds/scores streams, fixture-scoped odds
@@ -110,6 +118,29 @@ def probe_targets(base: str, fixture_id: int | None) -> list[ProbeTarget]:
         {"name": "sports_discovery", "url": f"{base}/sports", "kind": "get"},
         {"name": "competitions_discovery", "url": f"{base}/competitions", "kind": "get"},
     ]
+
+
+def build_skipped_result(target: ProbeTarget) -> ProbeResult:
+    """Turn a fixture-scoped :class:`ProbeTarget` into an honest ``SKIPPED`` result.
+
+    Used by :func:`main` in place of actually GETing a ``fid=0`` placeholder
+    URL when no real fixture id is available — a fid=0 probe would return a
+    404 an operator could misread as "endpoint down" rather than "we never
+    asked with a real fixture." Pure — no I/O.
+
+    Args:
+        target: The fixture-scoped :class:`ProbeTarget` being skipped.
+
+    Returns:
+        A :class:`ProbeResult` with ``status="SKIPPED"`` and an explanatory
+        ``payload_note`` pointing at the env var that would supply a real id.
+    """
+    return {
+        **target,
+        "status": "SKIPPED",
+        "payload_note": _SKIPPED_NO_FIXTURE_NOTE,
+        "coverage_note": "",
+    }
 
 
 def render_matrix(results: list[ProbeResult]) -> str:
@@ -149,13 +180,17 @@ async def main() -> None:
     """Operator entrypoint: live-probe every target and write the §4.6 matrix.
 
     Loads TxLINE credentials via :func:`veridex.config.get_settings` +
-    :func:`veridex.config.require_txline`. For each target, does a GET
-    (``sse_head`` targets open the stream, read up to 3 lines, then close).
-    Never raises on a failed probe — the status/error is captured into the
-    :class:`ProbeResult` instead. Writes the rendered markdown to
-    ``.omc/research/txline-access-matrix.md`` at the workspace root (i.e.
-    one level above the repo root). Never writes secrets (JWT/token) into
-    the output.
+    :func:`veridex.config.require_txline`. Reads an optional fixture id from
+    the ``TXLINE_PROBE_FIXTURE_ID`` env var (coerced to ``int`` when set) to
+    scope the three fixture-level targets. When that env var is absent, those
+    three targets are NOT probed with a misleading fid=0 placeholder — they
+    are recorded ``SKIPPED`` via :func:`build_skipped_result` instead. For
+    every other target, does a GET (``sse_head`` targets open the stream,
+    read up to 3 lines, then close). Never raises on a failed probe — the
+    status/error is captured into the :class:`ProbeResult` instead. Writes
+    the rendered markdown to ``.omc/research/txline-access-matrix.md`` at
+    the workspace root (i.e. one level above the repo root). Never writes
+    secrets (JWT/token) into the output.
     """
     import httpx  # noqa: PLC0415
 
@@ -167,11 +202,17 @@ async def main() -> None:
     base = settings.txline_base_url
     headers = build_auth_headers(jwt, token)
 
-    targets = probe_targets(base, fixture_id=None)
+    fixture_id_env = os.environ.get("TXLINE_PROBE_FIXTURE_ID")
+    fixture_id = int(fixture_id_env) if fixture_id_env else None
+
+    targets = probe_targets(base, fixture_id)
     results: list[ProbeResult] = []
 
     async with httpx.AsyncClient() as client:
         for target in targets:
+            if fixture_id is None and target["name"] in _FIXTURE_SCOPED_NAMES:
+                results.append(build_skipped_result(target))
+                continue
             result: ProbeResult = {**target, "status": _UNKNOWN, "payload_note": "", "coverage_note": ""}
             try:
                 if target["kind"] == "sse_head":
