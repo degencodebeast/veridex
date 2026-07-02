@@ -190,7 +190,7 @@ def test_llm_boundary_fails_closed_on_non_assertion_error(monkeypatch: pytest.Mo
 # ---------------------------------------------------------------------------
 
 
-def testread_path_check_block_emits_seven_check_ids_and_no_clv() -> None:
+def test_read_path_check_block_emits_seven_check_ids_and_no_clv() -> None:
     """SEC-001: ``read_path_check_block`` emits exactly the 7 frozen CheckIds; CLV is NOT one of them.
 
     The 2-arg convenience path has no manifest/anchor/events, so the manifest/policy/receipt
@@ -214,7 +214,7 @@ def testread_path_check_block_emits_seven_check_ids_and_no_clv() -> None:
     assert "clv" in build_performance_metrics(scores)
 
 
-def testread_path_check_block_does_not_mutate_sealed_evidence() -> None:
+def test_read_path_check_block_does_not_mutate_sealed_evidence() -> None:
     """The migration changes the proof-card representation, NOT the sealed evidence.
 
     Building checks + metrics must leave ``run.run_events`` and ``run.evidence_hash``

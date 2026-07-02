@@ -233,7 +233,7 @@ async def test_no_anchor_path_is_not_anchored() -> None:
 # ---------------------------------------------------------------------------
 
 
-def testread_path_check_block_summary_shape() -> None:
+def test_read_path_check_block_summary_shape() -> None:
     run = finished_run_result()
     scores = score_run(run)
     checks = read_path_check_block(scores, run)
