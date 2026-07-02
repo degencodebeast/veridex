@@ -114,8 +114,9 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "run":
         try:
             result = asyncio.run(run_from_config(args.config, fixture_override=args.fixture))
-        except (ValueError, FileNotFoundError) as exc:
-            # Clean operator-facing error (bad/missing fixture, live mode without creds) — no traceback.
+        except (ValueError, FileNotFoundError, NotImplementedError) as exc:
+            # Clean operator-facing error (bad/missing fixture, or a not-yet-wired path such as a
+            # real live_guarded venue raising NotImplementedError) — a message, never a traceback.
             print(f"veridex-agent: error: {exc}", file=sys.stderr)
             return 1
         avg_clv = result.scores[0]["avg_clv_bps"] if result.scores else None

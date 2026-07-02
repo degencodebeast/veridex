@@ -111,6 +111,19 @@ async def _live_close(_fixture_id: int) -> list[dict[str, Any]]:
     return [_close_upd(66, 34, ts_ms=1_200_000)]
 
 
+class _RaisingVenueAdapter:
+    """A venue adapter that RAISES on quote — stands in for a not-yet-wired / failing live venue.
+
+    ``venue = "fake"`` so it clears the permissive envelope's venue allowlist and the lane reaches
+    the venue quote (where it raises), exercising the DOWNSTREAM lane-failure path.
+    """
+
+    venue = "fake"
+
+    async def quote_market(self, _market_ref: str) -> Any:
+        raise RuntimeError("venue down")
+
+
 async def test_standalone_run_produces_a_verified_proof() -> None:
     ticks = replay_marketstates(FIXTURE)
     result = await standalone_run(ticks, momentum_agent("mom"), source_mode="replay", anchor_fn=None)
@@ -266,3 +279,31 @@ async def test_standalone_run_manifest_pins_the_launched_instance() -> None:
     assert pin["window"]["window_id"] == "w1"
     assert pin["window"]["fixture_id"] == 1
     assert pin["window"]["end_rule"] == "pre_match"
+
+
+async def test_standalone_lane_failure_preserves_sealed_proof() -> None:
+    # FAILURE ISOLATION: the execution lane runs DOWNSTREAM of the seal + verify + anchor. A lane
+    # exception (adapter raises) must NOT vaporize the already-built, valid, possibly-anchored proof.
+    # standalone_run RETURNS the intact StandaloneRunResult with receipts=[] and the lane error
+    # surfaced honestly under the non-sealed ``ops`` channel — never swallowed, never a lost proof.
+    result = await standalone_run(
+        [],
+        _over_flagger(),
+        window=_live_window(),
+        stream=_live_stream(_live_ticks()),
+        fetch_updates=_live_close,
+        policy_envelope=_exec_envelope(),
+        execution_mode="dry_run",
+        adapter=_RaisingVenueAdapter(),
+        anchor_fn=None,
+    )
+    # The sealed proof SURVIVED the downstream lane failure.
+    assert isinstance(result, StandaloneRunResult)
+    assert result.verified is True
+    assert result.verify_report["evidence_match"] is True
+    assert result.scores  # the ranked score stack is intact
+    assert "checks" in result.proof_card
+    # No receipts on lane failure, and the cause is recorded honestly (not swallowed, no secrets).
+    assert result.receipts == []
+    assert "execution_lane_error" in result.ops
+    assert "venue down" in result.ops["execution_lane_error"]

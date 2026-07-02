@@ -390,16 +390,27 @@ async def standalone_run(
     # A paper run (or one without an envelope) is proof-only: no lane, no receipts, and the reported
     # execution_mode collapses to "paper" (the honest EFFECTIVE mode).
     receipts: list[dict[str, Any]] = []
+    ops = dict(sealed.ops)
     ran_lane = policy_envelope is not None and execution_mode != _PAPER
     if policy_envelope is not None and ran_lane:
-        receipts = await _run_execution_lane_for(
-            sealed,
-            agent,
-            policy_envelope=policy_envelope,  # narrowed non-None by the guard above
-            execution_mode=execution_mode,
-            adapter=adapter,
-            store=execution_store,
-        )
+        # FAILURE ISOLATION (same doctrine as the T8 interrupt-degrade): the lane runs STRICTLY
+        # downstream of the seal + verify + anchor, so a lane exception (e.g. a not-yet-wired
+        # live_guarded adapter raising, or any injected adapter that fails) must NEVER vaporize the
+        # already-built — possibly already-ANCHORED-ON-CHAIN — proof. Preserve and return the sealed
+        # result with NO receipts, recording the cause honestly under the non-sealed ``ops`` channel
+        # (never silently swallowed). The proof stays byte-identical to the no-lane run.
+        try:
+            receipts = await _run_execution_lane_for(
+                sealed,
+                agent,
+                policy_envelope=policy_envelope,  # narrowed non-None by the guard above
+                execution_mode=execution_mode,
+                adapter=adapter,
+                store=execution_store,
+            )
+        except Exception as exc:  # noqa: BLE001 — downstream, non-scoring lane; the seal must survive it.
+            receipts = []
+            ops["execution_lane_error"] = f"{type(exc).__name__}: {exc}"
     effective_execution_mode = execution_mode if ran_lane else _PAPER
 
     # --- agent-instance pin (NON-SCORING) — config_hash + policy_hash + window + modes -----------
@@ -424,5 +435,5 @@ async def standalone_run(
         verify_report=report.model_dump(),
         receipts=receipts,
         run_manifest=run_manifest,
-        ops=sealed.ops,
+        ops=ops,
     )
