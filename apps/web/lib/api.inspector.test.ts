@@ -34,4 +34,18 @@ describe('inspector doctrine quantities (mock-gated demo, honest-"—" live)', (
     expect(r.clv_explanation.executable_edge_bps).toBeNull();
     expect(r.clv_explanation.stake_fraction).toBeNull();
   });
+
+  it('LIVE: real_venue_quote is PROPAGATED from the wire, not hardcoded — absent ⇒ false (fail-closed)', async () => {
+    // The stock live wire carries no venue quote → the flag reads false and the edge gate stays shut.
+    stubFetch(async () => new Response(JSON.stringify(inspectorWire), { status: 200 }));
+    const r = await getInspectorRecord('run_x', '0');
+    expect(r.clv_explanation.real_venue_quote).toBe(false);
+  });
+
+  it('LIVE: when the wire recompute EARNS real_venue_quote=true, it propagates through (never fabricated)', async () => {
+    const earned = { ...inspectorWire, recompute: { ...inspectorWire.recompute, real_venue_quote: true } };
+    stubFetch(async () => new Response(JSON.stringify(earned), { status: 200 }));
+    const r = await getInspectorRecord('run_x', '0');
+    expect(r.clv_explanation.real_venue_quote).toBe(true);
+  });
 });

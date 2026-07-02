@@ -105,10 +105,16 @@ class PreflightReport(BaseModel):
     Attributes:
         ok: ``True`` only when EVERY boolean-verdict check passed; operator-pending checks
             (``ok=None``) are excluded from the AND.
+        live_ready: The LIVE-READINESS gate (REQ-2D-701 gate 2) — ``True`` ONLY when ``ok`` is True
+            AND the MANDATORY operator-verify checks are EXPLICITLY ``True`` (neg-risk approval AND
+            the 1-share FAK smoke). It is NOT ``ok`` alone: ``ok`` EXCLUDES the ``ok=None``
+            operator-verify items, so ``ok=True`` does NOT mean the operator confirmed neg-risk / FAK.
+            The live submit path arms ONLY when this is ``True`` (fail-closed: default ``False``).
         checks: The ordered list of named checks.
     """
 
     ok: bool
+    live_ready: bool
     checks: list[PreflightCheck]
 
 
@@ -181,6 +187,8 @@ async def run_preflight(
     max_slippage_bps: int = 100,
     reference_price: float | None = None,
     dry_run: bool = True,
+    neg_risk_approved: bool | None = None,
+    fak_smoke_passed: bool | None = None,
 ) -> PreflightReport:
     """Run every REQ-2D-403 precondition over the injected clients and return a named report.
 
@@ -202,9 +210,16 @@ async def run_preflight(
         max_slippage_bps: Slippage cap for the liquidity check.
         reference_price: Decimal-odds reference for slippage; ``None`` skips the slippage sub-check.
         dry_run: The DRY_RUN posture, recorded in ``dry_run_state`` (informational).
+        neg_risk_approved: OPERATOR confirmation of the neg-risk exchange's on-chain ERC-1155
+            approval (ASM-3). ``None`` (default) → the check stays operator-pending (``ok=None``,
+            unverified); ``True`` → the operator has confirmed it; ``False`` → an explicit fail. This
+            gates ``live_ready`` — it is NOT offline-verifiable, so it must be operator-supplied.
+        fak_smoke_passed: OPERATOR confirmation that the live 1-share FAK smoke passed. Same
+            tri-state semantics; also mandatory for ``live_ready``. NEVER auto-run here.
 
     Returns:
-        A :class:`PreflightReport` whose ``ok`` is the AND of every boolean-verdict check.
+        A :class:`PreflightReport` whose ``ok`` is the AND of every boolean-verdict check and whose
+        ``live_ready`` additionally requires the two operator-verify checks to be EXPLICITLY ``True``.
     """
     cheap: list[PreflightCheck] = []
 
@@ -270,10 +285,15 @@ async def run_preflight(
     cheap.append(
         PreflightCheck(
             name="ctf_approval_neg_risk",
-            ok=None,
+            # OPERATOR-supplied tri-state: None → unverified (default), True/False → operator verdict.
+            # NEVER a boolean the code fabricates from the balance-allowance surface (which cannot
+            # distinguish the neg-risk exchange) — that would false-green an unapproved neg-risk path.
+            ok=neg_risk_approved,
             detail=(
                 "operator-verify: the vendored balance-allowance surface cannot distinguish the "
                 "neg-risk exchange approval — confirm on-chain approval + the 1-share FAK smoke (ASM-3)"
+                if neg_risk_approved is None
+                else f"operator-confirmed neg-risk approval={neg_risk_approved} (on-chain ERC-1155, ASM-3)"
             ),
         )
     )
@@ -331,10 +351,20 @@ async def run_preflight(
     )
     operator_smoke = PreflightCheck(
         name="operator_fak_smoke",
-        ok=None,
-        detail="pending OPERATOR: run scripts/polymarket_smoke.py with POLYMARKET_SMOKE=yes (not auto-run)",
+        # OPERATOR-supplied tri-state (same as neg-risk): None → pending (default, never auto-run).
+        ok=fak_smoke_passed,
+        detail=(
+            "pending OPERATOR: run scripts/polymarket_smoke.py with POLYMARKET_SMOKE=yes (not auto-run)"
+            if fak_smoke_passed is None
+            else f"operator-confirmed 1-share FAK smoke={fak_smoke_passed}"
+        ),
     )
 
     checks = [*cheap, liquidity, dry_run_state, operator_smoke]
     overall_ok = all(check.ok for check in checks if check.ok is not None)
-    return PreflightReport(ok=overall_ok, checks=checks)
+    # LIVE-READINESS (gate 2): arm the live submit ONLY when every boolean check passes AND both
+    # MANDATORY operator-verify checks are EXPLICITLY True — never on ``ok`` alone (which excludes
+    # the ok=None operator items). Fail-closed: any unverified / failed operator check → not ready.
+    neg_risk_check = next(c for c in checks if c.name == "ctf_approval_neg_risk")
+    live_ready = overall_ok and neg_risk_check.ok is True and operator_smoke.ok is True
+    return PreflightReport(ok=overall_ok, live_ready=live_ready, checks=checks)

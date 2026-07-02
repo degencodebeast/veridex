@@ -138,6 +138,8 @@ async def _run(
     expected_sig_type: int = 2,
     max_slippage_bps: int = 500,
     reference_price: float | None = 1.90,
+    neg_risk_approved: bool | None = None,
+    fak_smoke_passed: bool | None = None,
 ) -> tuple[PreflightReport, _FakeQuoteAdapter]:
     adapter = quote_adapter or _FakeQuoteAdapter(_quote(size=50.0, price=1.90, native=0.526))
     report = await run_preflight(
@@ -154,6 +156,8 @@ async def _run(
         max_slippage_bps=max_slippage_bps,
         reference_price=reference_price,
         dry_run=True,
+        neg_risk_approved=neg_risk_approved,
+        fak_smoke_passed=fak_smoke_passed,
     )
     return report, adapter
 
@@ -351,3 +355,55 @@ async def test_two_phase_liquidity_fail_denies_post_quote_zero_submit_calls() ->
     assert post.decision == PolicyDecision.DENIED
     assert adapter.quote_calls == 1  # the quote DID run (quote-size coupled)
     assert adapter.submit_calls == 0  # but submit NEVER did
+
+
+# ---------------------------------------------------------------------------
+# live_ready — the LIVE-READINESS gate (T20b-1 gate 2): arm the live submit ONLY when the
+# MANDATORY operator checks (neg-risk approval + FAK smoke) are EXPLICITLY True — never on
+# ``.ok`` alone, which EXCLUDES the operator-verify (ok=None) items. FAIL-CLOSED by default.
+# ---------------------------------------------------------------------------
+
+
+async def test_live_ready_false_when_operator_checks_unverified_even_if_ok_true() -> None:
+    """``.ok`` True does NOT mean live-ready: neg-risk / FAK are ok=None (unverified) → live_ready False."""
+    report, _ = await _run()  # no operator confirmation supplied
+
+    assert report.ok is True  # every BOOLEAN check passed
+    checks = _by_name(report)
+    assert checks["ctf_approval_neg_risk"].ok is None  # operator-verify, unverified
+    assert checks["operator_fak_smoke"].ok is None
+    # The live submit must NOT arm on ok alone — the operator has not verified neg-risk / FAK.
+    assert report.live_ready is False
+
+
+async def test_live_ready_true_only_when_operator_checks_explicitly_true() -> None:
+    """When the operator EXPLICITLY confirms neg-risk approval AND the FAK smoke → live_ready True."""
+    report, _ = await _run(neg_risk_approved=True, fak_smoke_passed=True)
+
+    assert report.ok is True
+    checks = _by_name(report)
+    assert checks["ctf_approval_neg_risk"].ok is True  # operator confirmed on-chain neg-risk approval
+    assert checks["operator_fak_smoke"].ok is True  # operator ran the 1-share FAK smoke
+    assert report.live_ready is True
+
+
+async def test_live_ready_false_when_only_one_operator_check_confirmed() -> None:
+    """Both operator checks are MANDATORY: neg-risk True but FAK still pending → live_ready False."""
+    report, _ = await _run(neg_risk_approved=True, fak_smoke_passed=None)
+
+    checks = _by_name(report)
+    assert checks["ctf_approval_neg_risk"].ok is True
+    assert checks["operator_fak_smoke"].ok is None  # FAK smoke not yet run
+    assert report.live_ready is False
+
+
+async def test_live_ready_false_when_a_boolean_check_fails_despite_operator_confirmation() -> None:
+    """Operator confirmation cannot override a hard failure: an unfunded wallet → live_ready False."""
+    balances = _FakeBalances(
+        collateral={"balance": 0.0, "allowance": 100.0},  # unfunded
+        conditional={"balance": 5.0, "allowance": 5.0},
+    )
+    report, _ = await _run(balances=balances, neg_risk_approved=True, fak_smoke_passed=True)
+
+    assert report.ok is False  # a boolean check failed
+    assert report.live_ready is False  # fail-closed: never arm when any hard check fails

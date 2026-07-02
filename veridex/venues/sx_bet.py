@@ -134,12 +134,19 @@ class FakeVenueAdapter:
         self.submit_calls: int = 0
         self.status_calls: int = 0
 
-    async def quote_market(self, market_ref: str) -> Quote:
+    async def quote_market(self, market_ref: str, for_size: float | None = None) -> Quote:
         """Return a fixed deterministic quote for any market reference.
+
+        Accepts ``for_size`` for interface symmetry with a depth-aware live adapter (quote-size
+        coupling) and echoes it back on the quote; the fixed book price/size are unaffected. This is
+        NOT a real venue quote — :class:`FakeVenueAdapter` never sets the real-venue-quote marker, so
+        the execution lane keeps ``real_venue_quote=False`` for it (fail-closed display honesty).
 
         Args:
             market_ref: Venue-specific market identifier (ignored — fake
                 always returns the same quote).
+            for_size: Shares the quote is requested for; echoed onto ``Quote.for_size`` (the fake's
+                fixed depth does not change with it). ``None`` → the fake's fixed size.
 
         Returns:
             A v2 :class:`~veridex.venues.base.Quote`: ``price`` is decimal odds,
@@ -152,7 +159,7 @@ class FakeVenueAdapter:
             price=self._FIXED_PRICE,  # decimal odds
             native_price=native,  # audit only
             size=self._FIXED_SIZE,
-            for_size=self._FIXED_SIZE,
+            for_size=self._FIXED_SIZE if for_size is None else for_size,
             levels=[QuoteLevel(native_price=native, size=self._FIXED_SIZE)],
             ts=int(time.time()),
         )
@@ -326,13 +333,15 @@ class SXBetAdapter:
         maker_address, private_key = require_sx_bet(settings)
         return settings, settings.sx_bet_base_url, maker_address, private_key
 
-    async def quote_market(self, market_ref: str) -> Quote:
+    async def quote_market(self, market_ref: str, for_size: float | None = None) -> Quote:
         """Fetch a live price quote from SX Bet for *market_ref*.
 
         Calls ``GET /markets`` on the SX Bet REST API.
 
         Args:
             market_ref: Venue-specific market identifier.
+            for_size: Shares to price the depth-aware cost-to-fill for (quote-size coupling);
+                ``None`` → the adapter's default sizing. Consumed once the live path is wired.
 
         Returns:
             A :class:`~veridex.venues.base.Quote` snapshot.
