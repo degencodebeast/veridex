@@ -80,7 +80,13 @@ export function useArenaStream(
           lastSeqRef.current = event.seq;
           setState((prev) => applyEvent(prev, event));
           if (event.type === 'MARKET_TICK') {
-            setFeedHealth((prev) => ({ ...prev, ticks_seen: prev.ticks_seen + 1, last_tick_ts: event.ts }));
+            // A live tick is the freshest possible proof of liveness — clear stale here (never
+            // in onStatus('connected'), which fires before any tick has actually been seen).
+            // FOLD 1: without this, `stale` only ever gets FORCED true (connecting/disconnected)
+            // and never cleared, so a perfectly healthy ticking feed renders "feed stale" forever.
+            setFeedHealth((prev) => ({
+              ...prev, ticks_seen: prev.ticks_seen + 1, last_tick_ts: event.ts, stale: false,
+            }));
           }
         },
         // A sequence gap or slow-client overflow closes the socket (CON-002) — resync via a fresh
