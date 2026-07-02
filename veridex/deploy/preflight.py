@@ -191,8 +191,10 @@ def _check_config(config: DeployConfig) -> PreflightCheck:
             hi_b = "]" if high_incl else ")"
             offenders.append(f"{field}={value} out of range {lo_b}{low:g}, {high:g}{hi_b}")
 
-    # Cross-field sanity: robust-z can never fire if the window can't retain the required samples.
-    if config.lookback < config.min_movements:
+    # Cross-field sanity (momentum-sharp ONLY — v1 momentum never uses min_movements): the robust-z
+    # window can never fire if lookback can't retain the required samples. Scoped to match the
+    # AgentRunConfig validator so a non-sharp deploy is not falsely rejected.
+    if config.strategy == "momentum-sharp" and config.lookback < config.min_movements:
         offenders.append(f"lookback={config.lookback} < min_movements={config.min_movements} (can never fire)")
 
     if offenders:

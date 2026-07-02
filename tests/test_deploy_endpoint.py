@@ -12,10 +12,12 @@ All offline: an injected fake stream + fetch_updates + ``anchor_fn=None`` — ZE
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections.abc import AsyncIterator
 from typing import Any
 
 import httpx
+import pytest
 from httpx import ASGITransport
 
 from veridex.api.deploy import DeployDeps
@@ -57,6 +59,12 @@ async def _never_ending_stream(_config: DeployConfig) -> AsyncIterator[MarketSta
     yield _live_ms(5000, tick_seq=0, ts=1000, phase=0)
     await asyncio.Event().wait()  # blocks until the task is cancelled on shutdown
     yield _live_ms(5200, tick_seq=1, ts=1100, phase=0)  # unreachable
+
+
+async def _raising_stream(_config: DeployConfig) -> AsyncIterator[MarketState]:
+    """Raise before any tick is fed — the live runner re-raises (nothing to seal)."""
+    raise RuntimeError("stream boom pre-seal")
+    yield _live_ms(5000, tick_seq=0, ts=1000, phase=0)  # unreachable
 
 
 async def _close(_fixture_id: int) -> list[dict[str, Any]]:
@@ -207,6 +215,30 @@ async def test_deploy_pins_the_instance() -> None:
 # ---------------------------------------------------------------------------
 # ONE FLOW TO PROOF — deployed run verifies via the SAME arena /runs/{id}/verify
 # ---------------------------------------------------------------------------
+
+
+async def test_deploy_run_task_exception_is_logged_not_lost(caplog: pytest.LogCaptureFixture) -> None:
+    # A deployed run that RAISES pre-seal (not the isolated exec lane) must be SURFACED on the server
+    # log — not silently lost to asyncio GC — and the task is still discarded from the registry.
+    store = InMemoryStore()
+    deps = DeployDeps(
+        feed_report=_healthy_live_feed(),
+        market_resolved=True,
+        stream_factory=_raising_stream,
+        fetch_updates=_close,
+        anchor_fn=None,
+    )
+    app = create_app(store=store, deploy_deps=deps)
+    with caplog.at_level(logging.ERROR, logger="veridex.api.deploy"):
+        async with _transport(app) as client:
+            resp = await client.post("/agents/deploy", json=_VALID)
+        assert resp.status_code == 200, resp.text
+        run_id = resp.json()["run_id"]
+        await _drain(app)
+        await asyncio.sleep(0)  # let the done-callback (scheduled via call_soon) run
+
+    assert any("stream boom pre-seal" in rec.getMessage() or run_id in rec.getMessage() for rec in caplog.records)
+    assert not getattr(app.state, "deploy_background_tasks", set())  # discarded from the registry
 
 
 async def test_deployed_run_verifies_via_the_same_arena_path() -> None:

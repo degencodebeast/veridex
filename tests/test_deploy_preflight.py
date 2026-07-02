@@ -130,6 +130,27 @@ def test_negative_z_threshold_fails_named_config_check() -> None:
     assert _check(checks, "config").ok is False
 
 
+def test_v1_momentum_lookback_below_min_movements_is_not_cross_field_rejected() -> None:
+    # v1 "momentum" never uses min_movements — the sharp-only cross-field must NOT falsely reject it.
+    config = DeployConfig(
+        **{**_VALID, "strategy": "momentum", "source_mode": "replay", "lookback": 4, "min_movements": 8}
+    )
+    checks = run_deploy_preflight(
+        config, feed_report=None, market_resolved=None, envelope=config.to_policy_envelope()
+    )
+    assert _check(checks, "config").ok is True
+
+
+def test_sharp_lookback_below_min_movements_still_fails_cross_field() -> None:
+    config = DeployConfig(**{**_VALID, "strategy": "momentum-sharp", "lookback": 4, "min_movements": 8})
+    checks = run_deploy_preflight(
+        config, feed_report=_healthy_live_feed(), market_resolved=None, envelope=config.to_policy_envelope()
+    )
+    cfg = _check(checks, "config")
+    assert cfg.ok is False
+    assert "min_movements" in cfg.detail
+
+
 def test_min_movements_below_two_fails_named_config_check() -> None:
     config = DeployConfig(**{**_VALID, "min_movements": 1})  # robust-z needs >= 2 samples
     checks = run_deploy_preflight(

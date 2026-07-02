@@ -17,6 +17,7 @@ network. The defaults represent the real live path (real stream/fetch, real anch
 from __future__ import annotations
 
 import asyncio
+import logging
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass, field
@@ -36,6 +37,8 @@ from veridex_agent.run import standalone_run
 
 if TYPE_CHECKING:
     from veridex.store import Store
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -282,7 +285,23 @@ def register_deploy_routes(app: FastAPI, *, store: Store, deploy_deps: DeployDep
         # Launch ASYNCHRONOUSLY: track the task + auto-discard on completion (cancellable on shutdown).
         task: asyncio.Task[None] = asyncio.create_task(_launch(config, run_id))
         background_tasks.add(task)
-        task.add_done_callback(background_tasks.discard)
+
+        def _on_done(finished: asyncio.Task[None], *, launched_run_id: str = run_id) -> None:
+            """Discard the finished task AND SURFACE a pre-seal failure (never lose it to GC).
+
+            A cancelled task (shutdown) carries no error. Any other exception is a real failure of
+            the seal/verify/anchor/persist path (the execution lane is already isolated inside
+            ``standalone_run``) — log it with the ``run_id`` so an operator can explain why a
+            subsequent ``/runs/{id}/verify`` 404s, instead of relying on asyncio's GC warning.
+            """
+            background_tasks.discard(finished)
+            if finished.cancelled():
+                return
+            exc = finished.exception()
+            if exc is not None:
+                logger.error("deployed run %s failed pre-seal", launched_run_id, exc_info=exc)
+
+        task.add_done_callback(_on_done)
 
         return DeployResponse(
             instance_id=instance.instance_id,
