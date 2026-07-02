@@ -62,6 +62,16 @@ _MARKET_ALLOWLIST = ("OU",)
 HONEST_KINDS: frozenset[str] = frozenset({"backtest", "paper", "replay"})
 #: Data-provenance marker the shipped pack self-declares (its odds are illustrative, not captured).
 SYNTHETIC_PROVENANCE = "synthetic-illustrative"
+#: Fail-safe label for a pack that declares NEITHER synthetic NOR a positive real marker — we must
+#: never assert it was really captured, so it reads "unknown" and still carries a cautious caveat.
+UNKNOWN_PROVENANCE = "unknown-provenance"
+#: The three coherent CLV caveats — a metric never travels without its provenance, and none of the
+#: three can silently read as a real, live-executed edge.
+_SYNTHETIC_CLV_CAVEAT = (
+    "CLV over SYNTHETIC illustrative odds — demonstrates the sealed-CLV metric pipeline, NOT a real strategy edge."
+)
+_REAL_CLV_CAVEAT = "Backtested CLV over captured odds — a paper/backtest signal, NOT a live-executed real-money edge."
+_UNKNOWN_CLV_CAVEAT = "Provenance UNVERIFIED — a paper/backtest signal over unverified odds, NOT a claimed real edge."
 
 # --- synthetic illustrative odds tape ---------------------------------------
 # The "Under" de-vigged probability (bps) per tick for the OU line: a flat pre-move baseline then a
@@ -139,22 +149,36 @@ def build_reference_pack(dst: Path) -> Path:
     return dst
 
 
-def _pack_provenance(pack_dir: Path) -> tuple[str, bool]:
-    """Read a pack's SELF-DECLARED data provenance from its ``capture`` block.
+def _pack_provenance(pack_dir: Path) -> tuple[str, bool, str]:
+    """Read a pack's SELF-DECLARED data provenance from its ``capture`` block (coherent + fail-safe).
 
     Provenance TRAVELS from the pack into the manifest/console rather than being asserted by the
-    demo: the shipped pack self-declares ``synthetic: true`` (illustrative odds); a real captured
-    pack (built by the recorder) carries no such marker, so pointing ``--pack`` at real odds honestly
-    drops the synthetic caveat instead of mislabelling real data as synthetic (or vice-versa).
+    demo. Three coherent cases, none of which can silently read as a real, live-executed edge:
+
+    * **synthetic** — the ``synthetic`` bool is set OR the ``provenance`` string contains "synthetic".
+      Deriving the flag from EITHER signal means the bool and the string can never disagree in the
+      unsafe (caveat-dropped) direction: a synthetic pack ALWAYS keeps its caveat. (The shipped pack.)
+    * **positively-stamped real** — a non-synthetic ``provenance`` string the producer stamped (e.g.
+      a real captured fixture): an honest real-odds label, still a paper/backtest — never a live edge.
+    * **unmarked/ambiguous** — an empty/missing capture: we CANNOT verify it was really captured, so
+      it reads ``unknown-provenance`` with a cautious caveat rather than FALSELY asserting "captured"
+      (a genuinely real pack must be POSITIVELY stamped by its producer — unmarked never means real).
 
     Returns:
-        ``(data_provenance, is_synthetic)`` — e.g. ``("synthetic-illustrative", True)`` for the
-        shipped pack, or ``("captured-odds", False)`` for an unmarked (real capture) pack.
+        ``(data_provenance, is_synthetic, clv_caveat)`` — the label, the synthetic flag, and the
+        inline caveat that must ride with every CLV number derived from this pack.
     """
     capture = json.loads((pack_dir / "pack.json").read_text()).get("capture", {})
-    if bool(capture.get("synthetic", False)):
-        return str(capture.get("provenance", SYNTHETIC_PROVENANCE)), True
-    return str(capture.get("provenance", "captured-odds")), False
+    provenance_str = str(capture.get("provenance", "")).strip()
+    # Coherent by construction: bool OR provenance-string — the two cannot disagree caveat-off.
+    is_synthetic = capture.get("synthetic") is True or "synthetic" in provenance_str.lower()
+    if is_synthetic:
+        return provenance_str or SYNTHETIC_PROVENANCE, True, _SYNTHETIC_CLV_CAVEAT
+    if provenance_str:
+        # Positively stamped non-synthetic provenance — honest real-odds label, never a live edge.
+        return provenance_str, False, _REAL_CLV_CAVEAT
+    # Fail-safe: unmarked/empty capture never asserts "captured" — it reads unknown + a cautious caveat.
+    return UNKNOWN_PROVENANCE, False, _UNKNOWN_CLV_CAVEAT
 
 
 def _pack_content_hash(pack_dir: Path) -> str:
@@ -205,15 +229,9 @@ async def run_demo(
     """
     resolved_store: Store = store if store is not None else InMemoryStore()
     content_hash = _pack_content_hash(pack_dir)
-    data_provenance, is_synthetic = _pack_provenance(pack_dir)
-    # The CLV caveat travels INLINE with every avg_clv number so a parser can never read the metric
-    # without its provenance. Synthetic odds prove the pipeline, not an edge; real odds are still a
-    # paper/backtest signal, never a live-executed real-money edge.
-    clv_caveat = (
-        "CLV over SYNTHETIC illustrative odds — demonstrates the sealed-CLV metric pipeline, NOT a real strategy edge."
-        if is_synthetic
-        else "Backtested CLV over captured odds — a paper/backtest signal, NOT a live-executed edge."
-    )
+    # Provenance (label + synthetic flag + inline CLV caveat) travels FROM the pack, coherent and
+    # fail-safe — so every avg_clv number carries its caveat and can never read as a real edge.
+    data_provenance, is_synthetic, clv_caveat = _pack_provenance(pack_dir)
     runs: list[dict[str, Any]] = []
 
     # --- (1) flagship BACKTEST: Sharp Momentum v2 over the banked ReplayPack ---------------------
