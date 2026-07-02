@@ -250,6 +250,27 @@ def test_route_armed_live_routes_real_adapter_and_breaker() -> None:
     assert guards.breaker.state is CircuitState.CLOSED  # seeded closed; the runner owns transitions
 
 
+@pytest.mark.parametrize("unexpected_mode", [ExecutionMode.PAPER, "future_live_mode_v2"])
+def test_non_live_guarded_mode_never_arms_even_with_full_armed_deps(unexpected_mode: object) -> None:
+    """STRUCTURAL fail-closed: ONLY ``live_guarded`` mode can arm — any other mode degrades to dry.
+
+    Even with FULL armed operator deps (``live_ready=True`` + a real-marker adapter), a mode that is
+    NOT ``LIVE_GUARDED`` — a defensively-passed ``paper`` OR a future/unknown ExecutionMode value —
+    routes the Fake, ``dry_run``, and NO guards. This proves the arm predicate is gated on the mode
+    STRUCTURALLY (first conjunct), not by incidental enum arithmetic or a distant caller.
+    """
+    real = _MockRealVenueAdapter()
+    adapter, mode, guards = _select_execution_route(
+        unexpected_mode,  # type: ignore[arg-type]  # deliberately an unexpected/future mode value
+        _permissive_envelope(),
+        LiveExecutionDeps(adapter=real, live_ready=True),
+    )
+    assert adapter is not real  # the armed real adapter is NEVER routed off the live_guarded mode
+    assert isinstance(adapter, FakeVenueAdapter)
+    assert mode == ExecutionMode.DRY_RUN.value
+    assert guards is None
+
+
 # ---------------------------------------------------------------------------
 # 2. end-to-end through start_competition (the real seam)
 # ---------------------------------------------------------------------------

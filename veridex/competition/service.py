@@ -161,16 +161,22 @@ def _select_execution_route(
     if execution_mode == ExecutionMode.DRY_RUN:
         return FakeVenueAdapter(), ExecutionMode.DRY_RUN.value, None
 
-    # live_guarded: arm ONLY when every real-money gate is satisfied.
+    # ARM the real-money path ONLY when the mode is EXPLICITLY live_guarded AND every real-money gate
+    # holds. STRUCTURAL fail-closed (defense-in-depth): making ``execution_mode == LIVE_GUARDED`` the
+    # FIRST conjunct means ANY other mode — a defensively-passed ``paper`` or a future 4th ExecutionMode
+    # value — degrades to dry HERE, rather than relying on incidental enum arithmetic (that ``dry_run``
+    # is caught above and ``paper`` is gated at a distant caller). No mode outside live_guarded can ever
+    # reach a real submit, even with FULL armed operator deps.
     if (
-        live_deps is not None
+        execution_mode == ExecutionMode.LIVE_GUARDED
+        and live_deps is not None
         and live_deps.live_ready is True
         and _is_real_venue_quote(live_deps.adapter)
     ):
         guards = BreakerCell(CircuitBreaker(), cooldown_s=float(envelope.cooldown_s))
         return live_deps.adapter, ExecutionMode.LIVE_GUARDED.value, guards
 
-    # FAIL-CLOSED: live_guarded requested but not fully armed → degrade to a dry-run simulation.
+    # FAIL-CLOSED: not an armed live_guarded run → degrade to a dry-run simulation (no real order).
     return FakeVenueAdapter(), ExecutionMode.DRY_RUN.value, None
 
 
