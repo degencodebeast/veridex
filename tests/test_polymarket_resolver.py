@@ -26,6 +26,7 @@ from pathlib import Path
 
 import pytest
 
+from veridex.venues import polymarket_resolver
 from veridex.venues.polymarket_resolver import (
     MarketUnavailable,
     ResolvedMarket,
@@ -121,6 +122,284 @@ async def test_resolve_market_empty_gamma_response_raises_market_unavailable() -
 
     with pytest.raises(MarketUnavailable):
         await resolve_market("Anything", "anything", client=_EmptyGammaClient())
+
+
+# ---------------------------------------------------------------------------
+# T13b: event -> market SELECTION by structured market_ref + team name.
+#
+# A fixture slug names an EVENT holding MANY markets (verified live: 3 binary
+# 1X2 Yes/No markets + a full O/U goal ladder + team-name spreads). resolve_market
+# must pick the EXACT market for the ref -- by TEAM NAME for 1X2 win markets (not
+# positional), by "draw" for the draw market, by numeric line for O/U -- or fail
+# closed (MarketUnavailable). Never route to the wrong market (AC-2D-201 gates real money).
+# ---------------------------------------------------------------------------
+
+
+async def test_1x2_home_selects_home_team_win_market_by_name() -> None:
+    """`1X2|home|full` with home_team=Portugal selects the "Will Portugal win…" market."""
+    client = _FakeGammaClient("gamma_event_prt_hrv.json")
+
+    resolved = await resolve_market(
+        "1X2|home|full",
+        "fifwc-prt-hrv-2026-07-02",
+        home_team="Portugal",
+        away_team="Croatia",
+        client=client,
+    )
+
+    assert resolved.condition_id == (
+        "0xPRTWIN000000000000000000000000000000000000000000000000000000001"
+    )
+    assert resolved.token_id_yes == (
+        "11100000000000000000000000000000000000000000000000000000000001"
+    )
+    assert resolved.token_id_no == (
+        "11100000000000000000000000000000000000000000000000000000000002"
+    )
+    assert resolved.tick_size == 0.0025
+
+
+async def test_1x2_away_selects_away_team_win_market_by_name() -> None:
+    """`1X2|away|full` selects the AWAY team's win market (Croatia), by name."""
+    client = _FakeGammaClient("gamma_event_prt_hrv.json")
+
+    resolved = await resolve_market(
+        "1X2|away|full",
+        "fifwc-prt-hrv-2026-07-02",
+        home_team="Portugal",
+        away_team="Croatia",
+        client=client,
+    )
+
+    assert resolved.condition_id == (
+        "0xHRVWIN000000000000000000000000000000000000000000000000000000001"
+    )
+    assert resolved.token_id_yes == (
+        "33300000000000000000000000000000000000000000000000000000000001"
+    )
+
+
+async def test_1x2_home_selection_is_by_team_name_not_positional() -> None:
+    """Making Croatia the HOME team selects the Croatia market (3rd), proving non-positional."""
+    client = _FakeGammaClient("gamma_event_prt_hrv.json")
+
+    resolved = await resolve_market(
+        "1X2|home|full",
+        "fifwc-prt-hrv-2026-07-02",
+        home_team="Croatia",
+        away_team="Portugal",
+        client=client,
+    )
+
+    # Croatia's win market, not the first market in the event list.
+    assert resolved.condition_id == (
+        "0xHRVWIN000000000000000000000000000000000000000000000000000000001"
+    )
+
+
+async def test_1x2_draw_selects_draw_market_yes_token() -> None:
+    """`1X2|draw|full` selects the draw market; token_id_yes is the draw market's YES token."""
+    client = _FakeGammaClient("gamma_event_prt_hrv.json")
+
+    resolved = await resolve_market(
+        "1X2|draw|full",
+        "fifwc-prt-hrv-2026-07-02",
+        home_team="Portugal",
+        away_team="Croatia",
+        client=client,
+    )
+
+    assert resolved.condition_id == (
+        "0xDRAW00000000000000000000000000000000000000000000000000000000001"
+    )
+    assert resolved.token_id_yes == (
+        "22200000000000000000000000000000000000000000000000000000000001"
+    )
+
+
+async def test_1x2_draw_never_passes_draw_to_side_to_token(monkeypatch) -> None:
+    """resolve_market must canonicalize draw itself; side_to_token must never see side='draw'."""
+    seen: list[str] = []
+    real_side_to_token = polymarket_resolver.side_to_token
+
+    def _spy(resolved: ResolvedMarket, side: str) -> str:
+        seen.append(side)
+        return real_side_to_token(resolved, side)
+
+    monkeypatch.setattr(polymarket_resolver, "side_to_token", _spy)
+
+    client = _FakeGammaClient("gamma_event_prt_hrv.json")
+    resolved = await polymarket_resolver.resolve_market(
+        "1X2|draw|full",
+        "fifwc-prt-hrv-2026-07-02",
+        home_team="Portugal",
+        away_team="Croatia",
+        client=client,
+    )
+
+    assert resolved.token_id_yes == (
+        "22200000000000000000000000000000000000000000000000000000000001"
+    )
+    assert "draw" not in [s.strip().lower() for s in seen]
+
+
+async def test_ou_selects_market_matching_numeric_line() -> None:
+    """`OU|2.5|full` selects the O/U 2.5 market; Over->yes token, Under->no token."""
+    client = _FakeGammaClient("gamma_event_prt_hrv.json")
+
+    resolved = await resolve_market(
+        "OU|2.5|full",
+        "fifwc-prt-hrv-2026-07-02",
+        home_team="Portugal",
+        away_team="Croatia",
+        client=client,
+    )
+
+    assert resolved.condition_id == (
+        "0xOU25000000000000000000000000000000000000000000000000000000000001"
+    )
+    assert resolved.token_id_yes == (
+        "44400000000000000000000000000000000000000000000000000000000001"
+    )
+    assert resolved.token_id_no == (
+        "44400000000000000000000000000000000000000000000000000000000002"
+    )
+
+
+async def test_ou_different_line_selects_different_market() -> None:
+    """`OU|3.5|full` selects the 3.5 market, not 2.5 (numeric line disambiguation)."""
+    client = _FakeGammaClient("gamma_event_prt_hrv.json")
+
+    resolved = await resolve_market(
+        "OU|3.5|full",
+        "fifwc-prt-hrv-2026-07-02",
+        home_team="Portugal",
+        away_team="Croatia",
+        client=client,
+    )
+
+    assert resolved.condition_id == (
+        "0xOU35000000000000000000000000000000000000000000000000000000000001"
+    )
+
+
+async def test_team_name_alias_matches_usa_to_united_states() -> None:
+    """home_team='USA' matches a PM 'Will United States win…' market via normalization/alias."""
+    client = _FakeGammaClient("gamma_event_usa_bih.json")
+
+    resolved = await resolve_market(
+        "1X2|home|full",
+        "fifwc-usa-bih-2026-07-02",
+        home_team="USA",
+        away_team="Bosnia & Herzegovina",
+        client=client,
+    )
+
+    assert resolved.condition_id == (
+        "0xUSAWIN000000000000000000000000000000000000000000000000000000001"
+    )
+
+
+async def test_team_name_trivial_spelling_diff_matches() -> None:
+    """'Bosnia & Herzegovina' (TxLINE) matches 'Bosnia and Herzegovina' (PM): '&' vs 'and'."""
+    client = _FakeGammaClient("gamma_event_usa_bih.json")
+
+    resolved = await resolve_market(
+        "1X2|away|full",
+        "fifwc-usa-bih-2026-07-02",
+        home_team="USA",
+        away_team="Bosnia & Herzegovina",
+        client=client,
+    )
+
+    assert resolved.condition_id == (
+        "0xBIHWIN000000000000000000000000000000000000000000000000000000001"
+    )
+
+
+async def test_1x2_no_matching_team_fails_closed() -> None:
+    """A home_team present in neither market (France) fails closed, never a guess."""
+    client = _FakeGammaClient("gamma_event_prt_hrv.json")
+
+    with pytest.raises(MarketUnavailable):
+        await resolve_market(
+            "1X2|home|full",
+            "fifwc-prt-hrv-2026-07-02",
+            home_team="France",
+            away_team="Croatia",
+            client=client,
+        )
+
+
+async def test_1x2_home_without_team_identity_fails_closed() -> None:
+    """`1X2|home` with no home_team cannot be matched by name -> MarketUnavailable."""
+    client = _FakeGammaClient("gamma_event_prt_hrv.json")
+
+    with pytest.raises(MarketUnavailable):
+        await resolve_market(
+            "1X2|home|full",
+            "fifwc-prt-hrv-2026-07-02",
+            client=client,
+        )
+
+
+async def test_1x2_ambiguous_team_match_fails_closed() -> None:
+    """Two markets matching the same team is ambiguous -> MarketUnavailable, never a guess."""
+    client = _FakeGammaClient("gamma_event_ambiguous.json")
+
+    with pytest.raises(MarketUnavailable):
+        await resolve_market(
+            "1X2|home|full",
+            "fifwc-prt-hrv-2026-07-02",
+            home_team="Portugal",
+            away_team="Croatia",
+            client=client,
+        )
+
+
+async def test_ou_no_matching_line_fails_closed() -> None:
+    """An O/U line with no market in the event (9.5) fails closed."""
+    client = _FakeGammaClient("gamma_event_prt_hrv.json")
+
+    with pytest.raises(MarketUnavailable):
+        await resolve_market(
+            "OU|9.5|full",
+            "fifwc-prt-hrv-2026-07-02",
+            home_team="Portugal",
+            away_team="Croatia",
+            client=client,
+        )
+
+
+async def test_unknown_market_ref_type_fails_closed() -> None:
+    """An unsupported market_ref type (BTTS) fails closed, never mis-selects."""
+    client = _FakeGammaClient("gamma_event_prt_hrv.json")
+
+    with pytest.raises(MarketUnavailable):
+        await resolve_market(
+            "BTTS|yes|full",
+            "fifwc-prt-hrv-2026-07-02",
+            home_team="Portugal",
+            away_team="Croatia",
+            client=client,
+        )
+
+
+async def test_1x2_home_does_not_select_spread_market() -> None:
+    """A 1X2|home ref must never resolve to the team-name spread market (guarded twice)."""
+    client = _FakeGammaClient("gamma_event_prt_hrv.json")
+
+    resolved = await resolve_market(
+        "1X2|home|full",
+        "fifwc-prt-hrv-2026-07-02",
+        home_team="Portugal",
+        away_team="Croatia",
+        client=client,
+    )
+
+    assert resolved.condition_id != (
+        "0xSPREAD00000000000000000000000000000000000000000000000000000000001"
+    )
 
 
 # ---------------------------------------------------------------------------

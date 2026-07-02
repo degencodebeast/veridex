@@ -1,0 +1,28 @@
+[
+  {
+    "id": "720001",
+    "question": "Will Portugal win on 2026-07-02?",
+    "slug": "fifwc-prt-hrv-2026-07-02-portugal-win-a",
+    "conditionId": "0xAMBIG0000000000000000000000000000000000000000000000000000000001",
+    "active": true,
+    "closed": false,
+    "outcomes": "[\"Yes\", \"No\"]",
+    "outcomePrices": "[\"0.57\", \"0.43\"]",
+    "clobTokenIds": "[\"12300000000000000000000000000000000000000000000000000000000001\", \"12300000000000000000000000000000000000000000000000000000000002\"]",
+    "orderPriceMinTickSize": 0.0025,
+    "orderMinSize": 5
+  },
+  {
+    "id": "720002",
+    "question": "Will Portugal win on 2026-07-02?",
+    "slug": "fifwc-prt-hrv-2026-07-02-portugal-win-b",
+    "conditionId": "0xAMBIG0000000000000000000000000000000000000000000000000000000002",
+    "active": true,
+    "closed": false,
+    "outcomes": "[\"Yes\", \"No\"]",
+    "outcomePrices": "[\"0.58\", \"0.42\"]",
+    "clobTokenIds": "[\"45600000000000000000000000000000000000000000000000000000000001\", \"45600000000000000000000000000000000000000000000000000000000002\"]",
+    "orderPriceMinTickSize": 0.0025,
+    "orderMinSize": 5
+  }
+]

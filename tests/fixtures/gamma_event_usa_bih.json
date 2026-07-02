@@ -1,0 +1,41 @@
+[
+  {
+    "id": "710001",
+    "question": "Will United States win on 2026-07-02?",
+    "slug": "fifwc-usa-bih-2026-07-02-usa-win",
+    "conditionId": "0xUSAWIN000000000000000000000000000000000000000000000000000000001",
+    "active": true,
+    "closed": false,
+    "outcomes": "[\"Yes\", \"No\"]",
+    "outcomePrices": "[\"0.61\", \"0.39\"]",
+    "clobTokenIds": "[\"77700000000000000000000000000000000000000000000000000000000001\", \"77700000000000000000000000000000000000000000000000000000000002\"]",
+    "orderPriceMinTickSize": 0.0025,
+    "orderMinSize": 5
+  },
+  {
+    "id": "710002",
+    "question": "Will United States vs. Bosnia and Herzegovina end in a draw?",
+    "slug": "fifwc-usa-bih-2026-07-02-draw",
+    "conditionId": "0xUSADRAW0000000000000000000000000000000000000000000000000000001",
+    "active": true,
+    "closed": false,
+    "outcomes": "[\"Yes\", \"No\"]",
+    "outcomePrices": "[\"0.24\", \"0.76\"]",
+    "clobTokenIds": "[\"88800000000000000000000000000000000000000000000000000000000001\", \"88800000000000000000000000000000000000000000000000000000000002\"]",
+    "orderPriceMinTickSize": 0.0025,
+    "orderMinSize": 5
+  },
+  {
+    "id": "710003",
+    "question": "Will Bosnia and Herzegovina win on 2026-07-02?",
+    "slug": "fifwc-usa-bih-2026-07-02-bih-win",
+    "conditionId": "0xBIHWIN000000000000000000000000000000000000000000000000000000001",
+    "active": true,
+    "closed": false,
+    "outcomes": "[\"Yes\", \"No\"]",
+    "outcomePrices": "[\"0.15\", \"0.85\"]",
+    "clobTokenIds": "[\"99900000000000000000000000000000000000000000000000000000000001\", \"99900000000000000000000000000000000000000000000000000000000002\"]",
+    "orderPriceMinTickSize": 0.0025,
+    "orderMinSize": 5
+  }
+]
