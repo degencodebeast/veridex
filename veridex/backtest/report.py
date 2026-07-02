@@ -51,7 +51,8 @@ BACKTEST_EXECUTION_MODE = "paper"
 
 #: The fixed edge thresholds (bps) the threshold-sensitivity sweep reports over. Ascending; the
 #: first rung (0) is the NON-NEGATIVE (>=0 bps) edge rung — NOT the full scored set: it already
-#: drops negative-CLV picks, so it diverges from the headline avg_clv/sample_size when losers exist.
+#: drops negative-CLV picks, so it diverges from the headline avg_clv over EVERY scored pick
+#: (count == clv_distribution.count; distinct from sample_size = total decisions) when losers exist.
 #: Higher rungs then show how quickly coverage/CLV thin out as the min-edge bar rises.
 _THRESHOLD_LADDER_BPS: tuple[int, ...] = (0, 25, 50, 100, 200)
 
@@ -150,8 +151,14 @@ class BacktestReport(BaseModel):
     mode_label: str
 
     # --- sample size + CLV confidence (AC-2D-302) ---------------------------
+    #: TOTAL decisions evaluated (WAIT-inclusive) — the ``law_valid_rate`` denominator, NOT the
+    #: scored-pick count (that is ``clv_distribution.count``). ``clv_confidence`` is keyed off the
+    #: SCORED count, so ``sample_size`` and ``clv_confidence`` describe DIFFERENT populations: a
+    #: surface must not render ``sample_size`` next to ``clv_confidence`` as if it were the tier's basis.
     sample_size: int
+    #: LAW-acceptance count (``valid`` is True, INCLUDING valid WAIT abstentions) — feeds ``law_valid_rate``.
     valid_count: int
+    #: CLV confidence tier — keyed off the SCORED-pick count (``clv_distribution.count``), NOT ``sample_size``.
     clv_confidence: str
     low_sample_warning: str | None
 
@@ -194,7 +201,9 @@ def _threshold_sensitivity(scored_clv: list[int]) -> list[ThresholdSensitivityPo
     value), so thresholding on edge is thresholding on the scored CLV itself: each rung reports how
     many picks cleared the bar (``clv >= threshold``) and the mean CLV they realized. Rung 0 is the
     NON-NEGATIVE (>=0 bps) rung — it already excludes losers, so it is deliberately NOT the headline
-    ``avg_clv``/``sample_size`` (those cover every scored pick, winners and losers alike)."""
+    ``avg_clv``, which covers every scored pick (winners and losers alike; that scored-pick count is
+    ``clv_distribution.count``). ``sample_size`` is a DIFFERENT quantity — total decisions evaluated
+    (WAIT-inclusive), the ``law_valid_rate`` denominator, NOT the scored-pick count."""
     points: list[ThresholdSensitivityPoint] = []
     for threshold in _THRESHOLD_LADDER_BPS:
         survivors = [clv for clv in scored_clv if clv >= threshold]

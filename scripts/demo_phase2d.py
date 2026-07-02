@@ -181,6 +181,28 @@ def _pack_provenance(pack_dir: Path) -> tuple[str, bool, str]:
     return UNKNOWN_PROVENANCE, False, _UNKNOWN_CLV_CAVEAT
 
 
+def _odds_desc(data_provenance: str, is_synthetic: bool) -> str:
+    """The honest console/notes phrase for a pack's odds — three-way, keyed off ``data_provenance``.
+
+    Matches the STRUCTURED provenance so the prose never overclaims, mirroring the three
+    :func:`_pack_provenance` cases:
+
+    * **synthetic** → ``"SYNTHETIC illustrative odds"``.
+    * **positively-stamped real** → ``"captured odds"`` (an honest real-odds label).
+    * **unmarked/unknown** → ``"unverified-provenance odds"`` — NEVER "captured", because an
+      unmarked pack cannot be asserted to have been really captured.
+
+    Keying off ``data_provenance`` (not the ``is_synthetic`` bool alone) is what keeps the rare
+    unknown-provenance case OUT of the "captured" branch — the prose then matches the structured
+    ``data_provenance`` a machine reader sees.
+    """
+    if is_synthetic:
+        return "SYNTHETIC illustrative odds"
+    if data_provenance == UNKNOWN_PROVENANCE:
+        return "unverified-provenance odds"
+    return "captured odds"
+
+
 def _pack_content_hash(pack_dir: Path) -> str:
     """Read the pack's stored ``content_hash`` (bound into the demo's deterministic run ids)."""
     return str(json.loads((pack_dir / "pack.json").read_text())["content_hash"])
@@ -254,7 +276,11 @@ async def run_demo(
             "mode_label": bt_report.mode_label,  # "Backtest" — honest, never "Live"
             "source_mode": bt_report.source_mode,  # "replay"
             "execution_mode": bt_report.execution_mode,  # "paper"
+            # sample_size = TOTAL decisions evaluated (WAIT-inclusive); scored_count = the SCORED-pick
+            # count clv_confidence is actually keyed off (== clv_distribution.count). Both travel so a
+            # reader never mistakes sample_size for the confidence basis (an overclaim otherwise).
             "sample_size": bt_report.sample_size,
+            "scored_count": bt_report.clv_distribution.count,
             "valid_count": bt_report.valid_count,
             "clv_confidence": bt_report.clv_confidence,
             "avg_clv_bps": bt_report.avg_clv,
@@ -299,7 +325,7 @@ async def run_demo(
         }
     )
 
-    odds_desc = "SYNTHETIC illustrative odds" if is_synthetic else "captured odds"
+    odds_desc = _odds_desc(data_provenance, is_synthetic)
     manifest: dict[str, Any] = {
         "generated_ts": int(time.time()),
         "pack_id": pack_dir.name,
@@ -317,6 +343,9 @@ async def run_demo(
                 "The default pack ships SYNTHETIC illustrative odds: the runs over them are genuine "
                 "sealed proofs and the CLV demonstrates the sealed pipeline, NOT a real strategy edge. "
                 if is_synthetic
+                else "This pack's odds provenance is UNVERIFIED; the CLV is a paper/backtest signal over "
+                "unverified odds, not a live-executed edge. "
+                if data_provenance == UNKNOWN_PROVENANCE
                 else "This pack carries captured odds; the CLV is a paper/backtest signal, not a live-executed edge. "
             )
             + "Point --pack at a real captured ReplayPack for a real-odds artifact."
@@ -331,7 +360,7 @@ async def run_demo(
 def _print_summary(manifest: dict[str, Any], out_path: Path, *, base_url: str) -> None:
     """Print a judge-facing summary: the flagship, the honest labels, and the verify URLs."""
     is_synthetic = bool(manifest.get("synthetic_data", False))
-    odds_desc = "SYNTHETIC illustrative odds" if is_synthetic else "captured odds"
+    odds_desc = _odds_desc(str(manifest.get("data_provenance", UNKNOWN_PROVENANCE)), is_synthetic)
     print("=== Veridex Phase-2D demo ===")
     print(f"flagship strategy : {manifest['flagship_strategy']}")
     print(f"pack              : {manifest['pack_id']}  (content_hash {manifest['content_hash'][:12]}…)")
@@ -342,7 +371,14 @@ def _print_summary(manifest: dict[str, Any], out_path: Path, *, base_url: str) -
         print(f"  [{run['kind']:<8}] {run['mode_label']:<9} run_id={run['run_id']}")
         clv = run.get("avg_clv_bps")
         if clv is not None:
-            print(f"             avg_clv={clv} bps  sample={run.get('sample_size')}  ({run.get('clv_confidence')})")
+            # Render the SCORED-pick count next to the confidence tier (clv_confidence is keyed off
+            # it), with total decisions labelled separately — so "sample=N (low)" can't read as an
+            # overclaim (a run can be law-valid on many WAITs yet score few picks -> honest "low").
+            scored = run.get("scored_count")
+            print(
+                f"             avg_clv={clv} bps  scored={scored} picks of "
+                f"{run.get('sample_size')} decisions  ({run.get('clv_confidence')})"
+            )
             # The provenance caveat prints IN the CLV block so the number never stands alone.
             caveat = run.get("clv_caveat")
             if caveat:

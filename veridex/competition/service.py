@@ -37,6 +37,7 @@ from veridex.competition.events import (
     build_competition_started_event,
     build_event_log,
     build_evidence_event,
+    build_execution_route_event,
 )
 from veridex.competition.models import (
     AgentEntry,
@@ -124,6 +125,35 @@ class LiveExecutionDeps:
     live_ready: bool = False
 
 
+# Honest-degrade reason enum (T23) — WHY a configured live_guarded run degraded to a dry-run
+# simulation. Checked in fail-closed order; stable strings (telemetry + tests match on these).
+_DEGRADE_MISSING_LIVE_DEPS = "missing_live_deps"  # no operator LiveExecutionDeps bundle supplied
+_DEGRADE_LIVE_READY_FALSE = "live_ready_false"  # deps present but preflight live-readiness not verified
+_DEGRADE_NON_REAL_ADAPTER = "non_real_adapter"  # live_ready but the adapter is not a genuine real venue
+
+
+def _live_arm_gate(live_deps: LiveExecutionDeps | None) -> str | None:
+    """The SINGLE authority for the live_guarded MONEY gates (everything past the mode conjunct).
+
+    Returns ``None`` when EVERY money gate holds — the operator deps are supplied AND ``live_ready``
+    is ``True`` AND the adapter is a GENUINE real-venue adapter — i.e. a ``live_guarded`` request may
+    ARM. Otherwise returns the SPECIFIC gate-failure reason (checked in fail-closed order), so a
+    degrade can describe WHY it fell back to dry. This is meaningful ONLY for a ``live_guarded``
+    request; the mode conjunct itself is owned STRUCTURALLY by :func:`_select_execution_route`.
+
+    Both the arm decision (:func:`_select_execution_route`) and the degrade telemetry
+    (:func:`_run_execution_block`) read this ONE predicate, so the reason can never disagree with the
+    arm outcome (single-authority).
+    """
+    if live_deps is None:
+        return _DEGRADE_MISSING_LIVE_DEPS
+    if live_deps.live_ready is not True:
+        return _DEGRADE_LIVE_READY_FALSE
+    if not _is_real_venue_quote(live_deps.adapter):
+        return _DEGRADE_NON_REAL_ADAPTER
+    return None
+
+
 def _select_execution_route(
     execution_mode: ExecutionMode,
     envelope: PolicyEnvelope,
@@ -167,12 +197,12 @@ def _select_execution_route(
     # value — degrades to dry HERE, rather than relying on incidental enum arithmetic (that ``dry_run``
     # is caught above and ``paper`` is gated at a distant caller). No mode outside live_guarded can ever
     # reach a real submit, even with FULL armed operator deps.
-    if (
-        execution_mode == ExecutionMode.LIVE_GUARDED
-        and live_deps is not None
-        and live_deps.live_ready is True
-        and _is_real_venue_quote(live_deps.adapter)
-    ):
+    if execution_mode == ExecutionMode.LIVE_GUARDED and _live_arm_gate(live_deps) is None:
+        # STRUCTURAL fail-closed: ``execution_mode == LIVE_GUARDED`` stays the FIRST conjunct (no
+        # other mode can arm), and the three MONEY gates are the single-authority ``_live_arm_gate``
+        # (``None`` ⇒ deps present AND live_ready AND a genuine real adapter). The same predicate
+        # backs the degrade telemetry, so arm-outcome and degrade-reason can never disagree.
+        assert live_deps is not None  # narrowed by the gate returning None; defense-in-depth
         guards = BreakerCell(CircuitBreaker(), cooldown_s=float(envelope.cooldown_s))
         return live_deps.adapter, ExecutionMode.LIVE_GUARDED.value, guards
 
@@ -477,6 +507,32 @@ async def _run_execution_block(
     adapter, effective_mode, guards = _select_execution_route(execution_mode, envelope, live_deps)
     entries_by_agent = {entry.agent_id: entry for entry in competition.entries}
 
+    # Honest-degrade telemetry (T23): a CONFIGURED live_guarded run that FAILED a money gate was
+    # routed to a dry-run simulation above (fail-closed — no real order). Record WHY as an
+    # EXECUTION_ROUTE event: evidence=False OPS telemetry an auditor reads in the log, so the degrade
+    # SELF-DESCRIBES rather than being inferred from config=live vs events=dry. The reason comes from
+    # the SAME _live_arm_gate the router armed on (single-authority). Sealed evidence is untouched —
+    # this derived event lands strictly after the 2A tail (base_seq), so the lane block follows it.
+    lane_seq = base_seq
+    if execution_mode == ExecutionMode.LIVE_GUARDED and effective_mode != ExecutionMode.LIVE_GUARDED.value:
+        degrade_event = build_execution_route_event(
+            competition_id=competition.competition_id,
+            run_id=run_result.run_id,
+            seq=lane_seq,
+            event_ts=event_ts,
+            payload={
+                "requested_execution_mode": ExecutionMode.LIVE_GUARDED.value,
+                "effective_execution_mode": effective_mode,
+                "degraded_because_not_armed": True,
+                "degrade_reason": _live_arm_gate(live_deps),
+            },
+        )
+        # Persist-before-broadcast, exactly like the lane block below.
+        await store.append_competition_events(competition.competition_id, [degrade_event])
+        if broadcast is not None:
+            await _safe_broadcast(broadcast, degrade_event)
+        lane_seq += 1
+
     events = await run_execution_lane(
         store,
         competition_id=competition.competition_id,
@@ -485,7 +541,7 @@ async def _run_execution_block(
         adapter=adapter,
         entries_by_agent=entries_by_agent,
         execution_mode=effective_mode,
-        base_seq=base_seq,
+        base_seq=lane_seq,
         event_ts=event_ts,
         guards=guards,
     )

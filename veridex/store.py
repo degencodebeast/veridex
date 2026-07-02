@@ -59,6 +59,7 @@ _EVENT_TYPE_VALUES: tuple[str, ...] = (
     "approval_audit",
     "score_update",
     "proof_anchor",
+    "execution_route",
     "payout_status",
     "competition_finalized",
 )

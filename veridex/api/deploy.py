@@ -345,19 +345,23 @@ def register_deploy_routes(app: FastAPI, *, store: Store, deploy_deps: DeployDep
         background_tasks.add(task)
 
         def _on_done(finished: asyncio.Task[None], *, launched_run_id: str = run_id) -> None:
-            """Discard the finished task AND SURFACE a pre-seal failure (never lose it to GC).
+            """Discard the finished task AND SURFACE a background-task failure (never lose it to GC).
 
             A cancelled task (shutdown) carries no error. Any other exception is a real failure of
-            the seal/verify/anchor/persist path (the execution lane is already isolated inside
-            ``standalone_run``) — log it with the ``run_id`` so an operator can explain why a
-            subsequent ``/runs/{id}/verify`` 404s, instead of relying on asyncio's GC warning.
+            the deploy background task — the pre-seal seal/verify/anchor/persist path OR the POST-seal
+            status write to ``SEALED`` (the execution lane is already isolated inside
+            ``standalone_run``). Log it with the ``run_id`` so an operator can explain why a
+            subsequent ``/runs/{id}/verify`` 404s (a pre-seal failure) or why the instance status is
+            stale (a post-seal write failure), instead of relying on asyncio's GC warning.
             """
             background_tasks.discard(finished)
             if finished.cancelled():
                 return
             exc = finished.exception()
             if exc is not None:
-                logger.error("deployed run %s failed pre-seal", launched_run_id, exc_info=exc)
+                # "background task failed" — accurate whether the exception was raised pre-seal or in
+                # the post-seal status write; asserting "pre-seal" here would mislabel the latter.
+                logger.error("deployed run %s background task failed", launched_run_id, exc_info=exc)
 
         task.add_done_callback(_on_done)
 

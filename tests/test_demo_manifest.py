@@ -20,6 +20,7 @@ from scripts.demo_phase2d import (
     HONEST_KINDS,
     SYNTHETIC_PROVENANCE,
     UNKNOWN_PROVENANCE,
+    _odds_desc,
     _pack_provenance,
     run_demo,
 )
@@ -126,6 +127,28 @@ def test_unmarked_pack_reads_unknown_not_captured(tmp_path: Path) -> None:
     assert provenance != "captured-odds"
     assert is_synthetic is False
     assert "unverified" in caveat.lower() and "not a claimed real edge" in caveat.lower()
+
+
+def test_odds_desc_unknown_provenance_reads_unverified_not_captured() -> None:
+    """The console/notes phrase matches the STRUCTURED provenance three-way: an unknown pack reads
+    "unverified-provenance odds", NEVER "captured odds" (the is_synthetic=False overclaim fixed)."""
+    assert _odds_desc(SYNTHETIC_PROVENANCE, True) == "SYNTHETIC illustrative odds"
+    assert _odds_desc("captured-txline-fixture-18172379", False) == "captured odds"
+    unknown = _odds_desc(UNKNOWN_PROVENANCE, False)
+    assert unknown == "unverified-provenance odds"
+    assert "captured" not in unknown  # the unknown case must not claim it was captured
+
+
+async def test_backtest_run_entry_carries_scored_count(tmp_path: Path) -> None:
+    """The backtest run entry carries scored_count (the clv_confidence basis) ALONGSIDE sample_size
+    (total decisions) — so a reader never mistakes sample_size for the confidence population."""
+    store = InMemoryStore()
+    manifest = await run_demo(DEFAULT_PACK_DIR, DEFAULT_FIXTURE_ID, out_path=tmp_path / "m.json", store=store)
+
+    flagship = next(run for run in manifest["runs"] if run["kind"] == "backtest")
+    assert isinstance(flagship["scored_count"], int)
+    # scored picks are a SUBSET of the total decisions evaluated (WAIT-inclusive).
+    assert 0 <= flagship["scored_count"] <= flagship["sample_size"]
 
 
 def test_positively_stamped_real_pack_reads_real_not_synthetic(tmp_path: Path) -> None:

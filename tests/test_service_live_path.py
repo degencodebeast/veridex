@@ -35,7 +35,11 @@ from veridex.competition.models import (
     ExecutionMode,
 )
 from veridex.competition.service import (
+    _DEGRADE_LIVE_READY_FALSE,
+    _DEGRADE_MISSING_LIVE_DEPS,
+    _DEGRADE_NON_REAL_ADAPTER,
     LiveExecutionDeps,
+    _live_arm_gate,
     _select_execution_route,
     create_competition,
     register_agent,
@@ -378,3 +382,75 @@ async def test_no_live_deps_default_is_fail_closed(mode: ExecutionMode) -> None:
     submitted = [e for e in events if e.event_type == EventType.EXECUTION_SUBMITTED]
     # With no operator deps there is never a live_guarded submit (dry_run simulates; live degrades).
     assert all(e.payload["mode"] == ExecutionMode.DRY_RUN.value for e in submitted)
+
+
+# ---------------------------------------------------------------------------
+# 3. Honest-degrade reason (T23) — a configured live_guarded run that degrades to
+#    dry MUST self-describe WHY, as evidence=false ops telemetry (not sealed evidence).
+# ---------------------------------------------------------------------------
+
+
+def test_live_arm_gate_names_each_failed_money_gate() -> None:
+    """``_live_arm_gate`` is the SINGLE authority for the live money gates: ``None`` iff FULLY armed,
+    else the SPECIFIC gate-failure reason (checked in fail-closed order)."""
+    real = _MockRealVenueAdapter()
+    fake = FakeVenueAdapter()  # no PROVIDES_REAL_VENUE_QUOTE marker
+    assert _live_arm_gate(None) == _DEGRADE_MISSING_LIVE_DEPS
+    assert _live_arm_gate(LiveExecutionDeps(adapter=real, live_ready=False)) == _DEGRADE_LIVE_READY_FALSE
+    assert _live_arm_gate(LiveExecutionDeps(adapter=fake, live_ready=True)) == _DEGRADE_NON_REAL_ADAPTER
+    # FULLY armed → no degrade reason (the run may arm the real path).
+    assert _live_arm_gate(LiveExecutionDeps(adapter=real, live_ready=True)) is None
+
+
+@pytest.mark.parametrize(
+    "make_deps,expected_reason",
+    [
+        (lambda real: None, _DEGRADE_MISSING_LIVE_DEPS),
+        (lambda real: LiveExecutionDeps(adapter=real, live_ready=False), _DEGRADE_LIVE_READY_FALSE),
+        (lambda real: LiveExecutionDeps(adapter=FakeVenueAdapter(), live_ready=True), _DEGRADE_NON_REAL_ADAPTER),
+    ],
+)
+async def test_degraded_live_run_records_reason_end_to_end(make_deps: object, expected_reason: str) -> None:
+    """A CONFIGURED live_guarded run that FAILS a money gate degrades to dry (no real order) AND
+    records an EXECUTION_ROUTE telemetry event naming the specific gate that failed — evidence=False
+    ops telemetry an auditor sees, never sealed into the evidence hash."""
+    store = InMemoryStore()
+    real = _MockRealVenueAdapter(fill_status="filled")
+    cid = await _seed_live_competition(store, envelope=_permissive_envelope())
+    await start_competition(store, cid, _ticks(), _agents(), live_deps=make_deps(real))  # type: ignore[operator]
+
+    # Fail-closed UNCHANGED: the operator's real adapter is NEVER reached (no real order path).
+    assert real.submit_calls == 0
+    events = await store.list_competition_events(cid, since_seq=-1)
+    route = [e for e in events if e.event_type == EventType.EXECUTION_ROUTE]
+    assert len(route) == 1, "exactly one degrade-telemetry event per degraded run"
+    ev = route[0]
+    assert ev.evidence is False  # ops/telemetry, NOT sealed evidence
+    assert ev.payload["degraded_because_not_armed"] is True
+    assert ev.payload["degrade_reason"] == expected_reason
+    assert ev.payload["requested_execution_mode"] == ExecutionMode.LIVE_GUARDED.value
+    assert ev.payload["effective_execution_mode"] == ExecutionMode.DRY_RUN.value
+    # Any submit that still happened is the dry-run simulation, never a live_guarded order.
+    submitted = [e for e in events if e.event_type == EventType.EXECUTION_SUBMITTED]
+    assert all(e.payload["mode"] == ExecutionMode.DRY_RUN.value for e in submitted)
+
+
+async def test_armed_live_run_records_no_degrade_event() -> None:
+    """A FULLY-armed live_guarded run does NOT degrade, so it emits NO degrade-telemetry event."""
+    store = InMemoryStore()
+    real = _MockRealVenueAdapter(fill_status="filled")
+    cid = await _seed_live_competition(store, envelope=_permissive_envelope())
+    await start_competition(
+        store, cid, _ticks(), _agents(), live_deps=LiveExecutionDeps(adapter=real, live_ready=True)
+    )
+    events = await store.list_competition_events(cid, since_seq=-1)
+    assert not [e for e in events if e.event_type == EventType.EXECUTION_ROUTE]
+
+
+async def test_dry_run_competition_records_no_degrade_event() -> None:
+    """A configured DRY_RUN run is not a degrade (it asked for dry) — no degrade telemetry emitted."""
+    store = InMemoryStore()
+    cid = await _seed_live_competition(store, envelope=_permissive_envelope(), execution_mode=ExecutionMode.DRY_RUN)
+    await start_competition(store, cid, _ticks(), _agents())
+    events = await store.list_competition_events(cid, since_seq=-1)
+    assert not [e for e in events if e.event_type == EventType.EXECUTION_ROUTE]
