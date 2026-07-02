@@ -13,11 +13,13 @@ core the live loop uses, scored into an honest ``BacktestReport``, and persisted
 ``/runs/{run_id}/verify`` URL recomputes the sealed evidence hash and re-derives the edge. A second
 run exercises the standalone PAPER lane (proof-only, no venue orders) over the same banked ticks.
 
-Honesty doctrine at the judge surface (REQ-2D-304): mode labels never overclaim. The offline demo is
-a **Backtest** over BANKED odds — NOT a live run, NOT real money, NOT a fabricated result. The
-default pack ships SYNTHETIC illustrative odds (clearly documented); ``--pack`` points at a real
-captured pack for a real-odds artifact (REQ-2D-503). No live network, no real orders, ``anchor_fn``
-off — the whole default path runs with ZERO network.
+Honesty doctrine at the judge surface (REQ-2D-304): mode labels never overclaim, and a metric never
+travels without its provenance. The offline demo is a **Backtest** over SYNTHETIC illustrative odds
+(banked in the shipped pack) — NOT a live run, NOT real money, NOT a fabricated result. The pack
+self-declares ``synthetic: true``, and that provenance rides INLINE with every CLV number on all
+three machine/console surfaces (manifest run entry, printed summary, pack ``capture``) so the CLV can
+never read as a real strategy edge. ``--pack`` points at a real captured pack for a real-odds
+artifact (REQ-2D-503). No live network, no real orders, ``anchor_fn`` off — ZERO network by default.
 
 Importable: ``from scripts.demo_phase2d import run_demo`` lets the test suite invoke it in-process
 against an injected store with no network.
@@ -58,8 +60,10 @@ FLAGSHIP_STRATEGY_LABEL = SHARP_MOMENTUM_V2_LABEL
 _MARKET_ALLOWLIST = ("OU",)
 #: The truthful ``kind`` labels a manifest row may carry — a proof-only demo NEVER emits "live".
 HONEST_KINDS: frozenset[str] = frozenset({"backtest", "paper", "replay"})
+#: Data-provenance marker the shipped pack self-declares (its odds are illustrative, not captured).
+SYNTHETIC_PROVENANCE = "synthetic-illustrative"
 
-# --- illustrative banked odds tape ------------------------------------------
+# --- synthetic illustrative odds tape ---------------------------------------
 # The "Under" de-vigged probability (bps) per tick for the OU line: a flat pre-move baseline then a
 # SHARP, SUSTAINED repricing UP — the exact shape Sharp Momentum v2 is built to catch (its v1
 # predecessor false-fires on noise; v2 confirms with robust-z + Page-Hinkley + persistence). These
@@ -100,6 +104,12 @@ def build_reference_pack(dst: Path) -> Path:
     transform live capture uses, so the shipped pack is a genuine, content-hashed ReplayPack (its
     ``run_backtest`` replay path verifies the hash and refuses a tampered pack).
 
+    The pack SELF-DECLARES its synthetic provenance in its ``capture`` block (``synthetic: true`` +
+    ``provenance``) so a downstream reader can never separate the numbers from the fact that the odds
+    are illustrative. ``endpoints`` is empty — a synthetic tape was never streamed from a real feed.
+    Both markers live in ``capture`` metadata, which ``content_hash`` does NOT cover (it hashes the
+    DATA files), so the pack's ``content_hash`` — and therefore the demo's run ids — are unchanged.
+
     Args:
         dst: Destination pack directory (recreated from scratch if it already exists).
 
@@ -115,14 +125,36 @@ def build_reference_pack(dst: Path) -> Path:
         ]
         (session_dir / "records.jsonl").write_text("\n".join(lines) + "\n")
         (session_dir / "meta.json").write_text(
-            SessionMeta(
-                started_ts=99, endpoints=["/odds/stream"], tool_version="veridex-demo-phase2d"
-            ).model_dump_json()
+            SessionMeta(started_ts=99, endpoints=[], tool_version="veridex-demo-phase2d-synthetic").model_dump_json()
         )
         if dst.exists():
             shutil.rmtree(dst)
         pack_from_session(session_dir, dst)
+    # Stamp the synthetic-provenance markers INTO the pack's capture block (open dict; not hashed).
+    pack_path = dst / "pack.json"
+    pack_doc = json.loads(pack_path.read_text())
+    pack_doc["capture"]["provenance"] = SYNTHETIC_PROVENANCE
+    pack_doc["capture"]["synthetic"] = True
+    pack_path.write_text(json.dumps(pack_doc))
     return dst
+
+
+def _pack_provenance(pack_dir: Path) -> tuple[str, bool]:
+    """Read a pack's SELF-DECLARED data provenance from its ``capture`` block.
+
+    Provenance TRAVELS from the pack into the manifest/console rather than being asserted by the
+    demo: the shipped pack self-declares ``synthetic: true`` (illustrative odds); a real captured
+    pack (built by the recorder) carries no such marker, so pointing ``--pack`` at real odds honestly
+    drops the synthetic caveat instead of mislabelling real data as synthetic (or vice-versa).
+
+    Returns:
+        ``(data_provenance, is_synthetic)`` — e.g. ``("synthetic-illustrative", True)`` for the
+        shipped pack, or ``("captured-odds", False)`` for an unmarked (real capture) pack.
+    """
+    capture = json.loads((pack_dir / "pack.json").read_text()).get("capture", {})
+    if bool(capture.get("synthetic", False)):
+        return str(capture.get("provenance", SYNTHETIC_PROVENANCE)), True
+    return str(capture.get("provenance", "captured-odds")), False
 
 
 def _pack_content_hash(pack_dir: Path) -> str:
@@ -173,6 +205,15 @@ async def run_demo(
     """
     resolved_store: Store = store if store is not None else InMemoryStore()
     content_hash = _pack_content_hash(pack_dir)
+    data_provenance, is_synthetic = _pack_provenance(pack_dir)
+    # The CLV caveat travels INLINE with every avg_clv number so a parser can never read the metric
+    # without its provenance. Synthetic odds prove the pipeline, not an edge; real odds are still a
+    # paper/backtest signal, never a live-executed real-money edge.
+    clv_caveat = (
+        "CLV over SYNTHETIC illustrative odds — demonstrates the sealed-CLV metric pipeline, NOT a real strategy edge."
+        if is_synthetic
+        else "Backtested CLV over captured odds — a paper/backtest signal, NOT a live-executed edge."
+    )
     runs: list[dict[str, Any]] = []
 
     # --- (1) flagship BACKTEST: Sharp Momentum v2 over the banked ReplayPack ---------------------
@@ -199,6 +240,11 @@ async def run_demo(
             "valid_count": bt_report.valid_count,
             "clv_confidence": bt_report.clv_confidence,
             "avg_clv_bps": bt_report.avg_clv,
+            # Provenance travels IN the same dict as avg_clv_bps — a parser reading this run entry
+            # gets the caveat with the number (never a bare metric that could read as a real edge).
+            "data_provenance": data_provenance,
+            "synthetic_data": is_synthetic,
+            "clv_caveat": clv_caveat,
             "real_executable_edge_bps": bt_report.real_executable_edge_bps,  # None on paper (honest)
             "content_hash": content_hash,
             "evidence_hash": bt_report.evidence_hash,
@@ -228,11 +274,14 @@ async def run_demo(
             "mode_label": mode_ladder_label(paper.source_mode, paper.execution_mode),
             "source_mode": paper.source_mode,  # "replay"
             "execution_mode": paper.execution_mode,  # "paper" — proof-only, no orders
+            "data_provenance": data_provenance,
+            "synthetic_data": is_synthetic,
             "verified": paper.verified,
             "anchor_status": paper.anchor_status,  # "not_anchored" (offline)
         }
     )
 
+    odds_desc = "SYNTHETIC illustrative odds" if is_synthetic else "captured odds"
     manifest: dict[str, Any] = {
         "generated_ts": int(time.time()),
         "pack_id": pack_dir.name,
@@ -240,11 +289,19 @@ async def run_demo(
         "fixture_id": fixture_id,
         "flagship_strategy": FLAGSHIP_STRATEGY_LABEL,
         "offline": True,
+        # Structured provenance at the top level AND on every run — never prose-only.
+        "data_provenance": data_provenance,
+        "synthetic_data": is_synthetic,
         "notes": (
             "Proof-only demo: no live network, no real-money orders (anchor off). Mode labels are "
-            "honest — a Backtest over BANKED odds, never 'Live'. The default pack ships SYNTHETIC "
-            "illustrative odds; the runs over them are genuine sealed proofs. Point --pack at a real "
-            "captured ReplayPack for a real-odds artifact."
+            f"honest — a Backtest over {odds_desc}, never 'Live'. "
+            + (
+                "The default pack ships SYNTHETIC illustrative odds: the runs over them are genuine "
+                "sealed proofs and the CLV demonstrates the sealed pipeline, NOT a real strategy edge. "
+                if is_synthetic
+                else "This pack carries captured odds; the CLV is a paper/backtest signal, not a live-executed edge. "
+            )
+            + "Point --pack at a real captured ReplayPack for a real-odds artifact."
         ),
         "runs": runs,
     }
@@ -255,16 +312,23 @@ async def run_demo(
 
 def _print_summary(manifest: dict[str, Any], out_path: Path, *, base_url: str) -> None:
     """Print a judge-facing summary: the flagship, the honest labels, and the verify URLs."""
+    is_synthetic = bool(manifest.get("synthetic_data", False))
+    odds_desc = "SYNTHETIC illustrative odds" if is_synthetic else "captured odds"
     print("=== Veridex Phase-2D demo ===")
     print(f"flagship strategy : {manifest['flagship_strategy']}")
     print(f"pack              : {manifest['pack_id']}  (content_hash {manifest['content_hash'][:12]}…)")
+    print(f"data provenance   : {manifest.get('data_provenance', 'unknown')}")
     print(f"manifest          : {out_path}")
-    print("mode labels are HONEST — a Backtest over BANKED odds, never 'Live'; no real-money orders.\n")
+    print(f"mode labels are HONEST — a Backtest over {odds_desc}, never 'Live'; no real-money orders.\n")
     for run in manifest["runs"]:
         print(f"  [{run['kind']:<8}] {run['mode_label']:<9} run_id={run['run_id']}")
         clv = run.get("avg_clv_bps")
         if clv is not None:
             print(f"             avg_clv={clv} bps  sample={run.get('sample_size')}  ({run.get('clv_confidence')})")
+            # The provenance caveat prints IN the CLV block so the number never stands alone.
+            caveat = run.get("clv_caveat")
+            if caveat:
+                print(f"             ↳ {caveat}")
         url = run["verify_url"] if base_url else f"{base_url}{run['verify_url']}"
         print(f"             verify → {url}")
     print()

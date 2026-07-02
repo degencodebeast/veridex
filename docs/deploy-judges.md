@@ -13,7 +13,8 @@ What you will see:
 - A **Verify** endpoint that re-runs the deterministic law over the sealed event log and returns a
   per-check verdict — tamper with one sealed byte and the proof goes red.
 
-Honest by construction: the offline demo is labelled **Backtest** over **banked** odds. It is
+Honest by construction: the offline demo is labelled **Backtest** over **synthetic illustrative**
+odds (banked in the shipped pack), and that provenance rides inline with every CLV number. It is
 **not** a live run, **not** real money, and **not** a fabricated result. The default pack ships
 *synthetic illustrative* odds (see the last section); the run over them is a genuine sealed proof.
 
@@ -55,11 +56,13 @@ writes `demo_manifest.json` to the repo root. It prints a summary like:
 === Veridex Phase-2D demo ===
 flagship strategy : Sharp Momentum v2
 pack              : demo_pack  (content_hash cd7e0daa53a0…)
+data provenance   : synthetic-illustrative
 manifest          : demo_manifest.json
-mode labels are HONEST — a Backtest over BANKED odds, never 'Live'; no real-money orders.
+mode labels are HONEST — a Backtest over SYNTHETIC illustrative odds, never 'Live'; no real-money orders.
 
   [backtest] Backtest  run_id=bt_cd7e0daa53a0_wc_demo
              avg_clv=626.5 bps  sample=35  (high)
+             ↳ CLV over SYNTHETIC illustrative odds — demonstrates the sealed-CLV metric pipeline, NOT a real strategy edge.
              verify → /runs/bt_cd7e0daa53a0_wc_demo/verify
   [paper   ] Backtest  run_id=paper_cd7e0daa53a0
              verify → /runs/paper_cd7e0daa53a0/verify
@@ -105,6 +108,12 @@ Press `Ctrl-C` to stop the server.
   pair raises rather than mislabelling.
 - **`real_executable_edge_bps` is `null`** on the paper/replay path — there is no live venue fill to
   claim, so the report says so explicitly instead of implying one.
+- **A number never travels without its provenance.** Every CLV number carries its data provenance in
+  the same place: the pack self-declares `synthetic: true`, each manifest run entry carries
+  `data_provenance` / `synthetic_data` / an inline `clv_caveat` next to `avg_clv_bps`, and the
+  console prints the caveat in the CLV block. So the `+626.5 bps` demonstrates the sealed-CLV
+  *pipeline* over illustrative odds — it is **not** a claim of real strategy edge. Point `--pack` at
+  a real captured pack (below) and the synthetic caveat honestly drops away.
 - **The proof is the product.** `verified: true` is a recomputation, not a checkmark image.
 
 ## 6. Running against a real captured pack (operator, optional)

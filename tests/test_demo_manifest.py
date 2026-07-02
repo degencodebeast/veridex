@@ -18,6 +18,7 @@ from scripts.demo_phase2d import (
     DEFAULT_PACK_DIR,
     FLAGSHIP_STRATEGY_LABEL,
     HONEST_KINDS,
+    SYNTHETIC_PROVENANCE,
     run_demo,
 )
 from veridex.store import InMemoryStore
@@ -41,6 +42,10 @@ async def test_manifest_matches_schema_and_persists_resolvable_runs(tmp_path: Pa
     assert isinstance(manifest["generated_ts"], (int, str))
     assert manifest["runs"], "manifest must contain at least one run"
 
+    # Structured data-provenance at the top level (the shipped pack is synthetic-illustrative).
+    assert manifest["data_provenance"] == SYNTHETIC_PROVENANCE
+    assert manifest["synthetic_data"] is True
+
     # --- per-run schema + honesty + resolvability ---------------------------
     seen: set[str] = set()
     for run in manifest["runs"]:
@@ -53,6 +58,14 @@ async def test_manifest_matches_schema_and_persists_resolvable_runs(tmp_path: Pa
         assert run["kind"] in HONEST_KINDS, f"dishonest/unknown kind: {run['kind']!r}"
         assert "live" not in run["kind"].lower(), "a proof-only demo must never label a run 'live'"
         assert run.get("mode_label") not in _OVERCLAIMING_MODES
+
+        # Provenance travels WITH every run entry — a parser reading one run dict gets the caveat.
+        assert run["data_provenance"] == SYNTHETIC_PROVENANCE
+        assert run["synthetic_data"] is True
+        # Any run carrying a CLV number must carry its inline caveat in the SAME dict.
+        if run.get("avg_clv_bps") is not None:
+            caveat = run["clv_caveat"].lower()
+            assert "synthetic" in caveat and "not a real" in caveat
 
         assert run["verify_url"] == f"/runs/{run_id}/verify"
 
@@ -74,3 +87,7 @@ async def test_flagship_backtest_is_present_and_honestly_labelled(tmp_path: Path
     assert flagship.get("strategy_label") == FLAGSHIP_STRATEGY_LABEL == "Sharp Momentum v2"
     assert flagship.get("mode_label") == "Backtest"
     assert "Live" not in flagship.get("mode_label", "")
+    # The CLV can never read as a real edge: its synthetic caveat rides in the same dict.
+    assert flagship["avg_clv_bps"] is not None
+    assert "synthetic" in flagship["clv_caveat"].lower()
+    assert "not a real" in flagship["clv_caveat"].lower()
