@@ -131,8 +131,11 @@ Executable edge decides whether an agent should act now.
 For venue execution, edge should compare TxLINE de-margined fair value against the actual executable venue price:
 
 ```text
-executable_edge = TxLINE fair probability - venue implied probability
+mispricing_gap_bps = txline_fair_probability_bps - venue_implied_probability_bps
+executable_edge = txline_fair_probability * venue_decimal_odds - 1
 ```
+
+The first line is the probability-space dislocation. It is useful for explanation, but it is not executable edge. Executable edge is the EV form used for action/risk decisions.
 
 CLV is different. CLV measures whether the entry beat the later closing line:
 
@@ -141,6 +144,37 @@ clv = closing TxLINE probability - entry TxLINE probability
 ```
 
 Edge gates action. CLV ranks performance.
+
+## What strategy should Veridex build first?
+
+The first flagship strategy should be **fair-value dislocation**, not a deep sports prediction model.
+
+The agent should compare TxLINE de-margined consensus fair value against an executable venue price:
+
+```text
+executable_edge = txline_fair_probability * venue_decimal_odds - 1
+```
+
+If the edge clears threshold and policy allows it, the agent can propose an action. Later, Veridex proves whether the action beat the close with CLV.
+
+Reason: in a short hackathon window, finding stale/mispriced executable prices is more credible than claiming to predict soccer outcomes better than the market.
+
+## Does TxLINE alone create executable alpha?
+
+No. TxLINE is the fair-value/reference feed.
+
+To claim executable edge, Veridex also needs an executable venue price, or a replay/paper venue quote. Without that second price, the agent can still produce a signal and CLV record, but it cannot claim live execution edge.
+
+## Should proof integrity be part of an Agent Score?
+
+No.
+
+Proof Checks and performance metrics must stay separate:
+
+- Checks answer: can this run be trusted?
+- Metrics answer: how well did the agent perform?
+
+Evidence integrity, manifest binding, receipt separation, and anchor status are eligibility/trust guarantees. They should not add performance points. CLV remains the primary rank metric, with PnL, Brier, drawdown, hit rate, and sample size as supporting metrics.
 
 ## Does dry run count as proof of skill?
 
