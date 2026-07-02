@@ -38,6 +38,7 @@ from veridex.runtime.orchestrator import (
     RunResult,
 )
 from veridex.runtime.window import CLV_FIELD_WINDOW
+from veridex.scoring import is_window_scored
 
 
 class EventType(str, Enum):
@@ -615,6 +616,12 @@ def build_event_log(run_result: RunResult, competition_meta: dict[str, Any]) -> 
         valid_count = sum(1 for r in agent_rows if r["valid"])
         total_clv = sum(numeric_clvs)
         mean_clv = (total_clv / len(numeric_clvs)) if numeric_clvs else None
+        # DEC-2D-1 window CLV — a DISTINCT, LABELED aggregate carried alongside the true-CLV mean,
+        # NEVER blended into it and NEVER dropped. Uses scoring.is_window_scored (the single source
+        # of truth, mirroring score_run) so this projection can never desync from the metric stack.
+        window_clvs = [r[CLV_FIELD_WINDOW] for r in agent_rows if is_window_scored(r)]
+        total_window_clv = sum(window_clvs)
+        mean_window_clv = (total_window_clv / len(window_clvs)) if window_clvs else None
         proof_mode = run_result.proof_mode_map.get(agent_id)
         _emit_derived(
             EventType.SCORE_UPDATE,
@@ -625,6 +632,8 @@ def build_event_log(run_result: RunResult, competition_meta: dict[str, Any]) -> 
                 "valid_count": valid_count,
                 "total_clv_bps": total_clv,
                 "mean_clv_bps": mean_clv,
+                "total_window_clv_bps": total_window_clv,
+                "mean_window_clv_bps": mean_window_clv,
             },
             [f"score_row:{agent_id}:tick-{r['tick_seq']}" for r in agent_rows],
         )

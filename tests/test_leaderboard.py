@@ -65,6 +65,28 @@ def _row(
     return row
 
 
+def _window_row(
+    agent_id: str,
+    *,
+    total_window_clv_bps: int,
+    window_action_count: int,
+    proof_mode: str = "reproducible",
+) -> dict[str, Any]:
+    """A ``score_run`` output row for a fixed_duration/manual_stop run (DEC-2D-1 window CLV).
+
+    A windowed run populates the WINDOW-CLV fields and leaves the true-CLV fields empty (a run has
+    ONE end_rule, so its scored rows are all one kind). ``avg_window_clv_bps`` mirrors the
+    ``score_run`` contract: ``total_window_clv_bps / window_action_count`` (``None`` when 0).
+    """
+    row = _row(agent_id, total_clv_bps=0, action_count=0, proof_mode=proof_mode)
+    row["total_window_clv_bps"] = total_window_clv_bps
+    row["window_action_count"] = window_action_count
+    row["avg_window_clv_bps"] = (
+        (total_window_clv_bps / window_action_count) if window_action_count > 0 else None
+    )
+    return row
+
+
 def _by_id(board: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
     return {r["agent_id"]: r for r in board}
 
@@ -413,8 +435,52 @@ def test_output_row_has_all_required_keys() -> None:
         "clv_confidence",
         "low_sample",
         "sample_size",
+        "avg_window_clv_bps",
+        "total_window_clv_bps",
+        "window_action_count",
         "rank",
     }
+
+
+# ---------------------------------------------------------------------------
+# 9b — DEC-2D-1 window CLV: pooled + labeled, NEVER the rank axis
+# ---------------------------------------------------------------------------
+
+
+def test_window_clv_surfaced_but_not_ranked() -> None:
+    """A windowed agent surfaces pooled window CLV as a labeled field; rank stays on true CLV."""
+    # W has a huge window CLV but NO true CLV; T has a small true CLV. Rank is on true CLV, so T
+    # (avg_clv 10) MUST outrank W (avg_clv None) — window CLV never enters the rank order.
+    records = [
+        _window_row("W", total_window_clv_bps=1000, window_action_count=2),
+        _row("T", total_clv_bps=10, action_count=1),
+    ]
+    board = leaderboard(records)
+    out = _by_id(board)
+    assert out["T"]["rank"] == 1  # true CLV ranks; window CLV does NOT re-rank
+    assert out["W"]["rank"] == 2
+    assert out["W"]["avg_clv_bps"] is None  # window CLV never blended into the rank axis
+    # Window CLV surfaced as a labeled, pooled supporting metric.
+    assert out["W"]["avg_window_clv_bps"] == pytest.approx(500.0)
+    assert out["W"]["total_window_clv_bps"] == 1000
+    assert out["W"]["window_action_count"] == 2
+    # The true-CLV agent's window aggregate stays empty (never contaminated).
+    assert out["T"]["avg_window_clv_bps"] is None
+    assert out["T"]["window_action_count"] == 0
+
+
+def test_window_clv_pooled_across_runs() -> None:
+    """Window CLV pools across runs like true CLV: Σtotal / Σcount, not mean-of-run-means."""
+    records = [
+        _window_row("W", total_window_clv_bps=100, window_action_count=2),  # per-run avg 50
+        _window_row("W", total_window_clv_bps=300, window_action_count=1),  # per-run avg 300
+    ]
+    board = leaderboard(records)
+    row = board[0]
+    assert row["window_action_count"] == 3
+    assert row["total_window_clv_bps"] == 400
+    assert row["avg_window_clv_bps"] == pytest.approx(400 / 3)  # pooled, NOT (50+300)/2
+    assert row["avg_clv_bps"] is None  # still no true CLV
 
 
 # ---------------------------------------------------------------------------

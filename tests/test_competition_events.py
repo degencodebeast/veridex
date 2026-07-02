@@ -434,3 +434,44 @@ def test_pending_horizon_row_projects_without_crash() -> None:
     assert laws[0].payload["clv_bps"] == PENDING  # sentinel emitted honestly, not a numeric 0
     (score_update,) = _score_update_events(log)
     assert score_update.payload["mean_clv_bps"] == 50  # pending excluded from the numeric mean
+
+
+# ---------------------------------------------------------------------------
+# T10c — SCORE_UPDATE carries the window-CLV aggregate alongside true CLV
+# (DEC-2D-1: window CLV is labeled + never dropped, never blended into the true mean)
+# ---------------------------------------------------------------------------
+
+
+def test_score_update_carries_window_aggregate() -> None:
+    """A windowed run's SCORE_UPDATE carries mean/total window CLV; true CLV stays honest None."""
+    rows = [
+        _score_row("agent-alpha", 0, **{CLV_FIELD_WINDOW: 184}),
+        _score_row("agent-alpha", 1, **{CLV_FIELD_WINDOW: 42}),
+    ]
+    for row in rows:
+        del row["clv_bps"]
+
+    log = build_event_log(_run_with_rows(rows), competition_meta())
+    (score_update,) = _score_update_events(log)
+    # Window CLV is aggregated under its OWN labeled fields — never dropped.
+    assert score_update.payload["total_window_clv_bps"] == 226
+    assert score_update.payload["mean_window_clv_bps"] == 113.0  # (184 + 42) / 2, exact
+    # True CLV is empty for this window run — window CLV is NEVER blended into the true mean.
+    assert score_update.payload["mean_clv_bps"] is None
+    assert score_update.payload["total_clv_bps"] == 0
+
+
+def test_score_update_window_aggregate_excludes_true_clv() -> None:
+    """The reciprocal separation: a numeric true clv_bps is NOT counted into the window aggregate."""
+    true_row = _score_row("agent-alpha", 0, clv_bps=100)
+    window_row = _score_row("agent-alpha", 1, **{CLV_FIELD_WINDOW: 999})
+    del window_row["clv_bps"]
+
+    log = build_event_log(_run_with_rows([true_row, window_row]), competition_meta())
+    (score_update,) = _score_update_events(log)
+    # window aggregate sees ONLY the window row (999), never the true 100.
+    assert score_update.payload["total_window_clv_bps"] == 999
+    assert score_update.payload["mean_window_clv_bps"] == 999
+    # true aggregate sees ONLY the true row (100), never the window 999.
+    assert score_update.payload["total_clv_bps"] == 100
+    assert score_update.payload["mean_clv_bps"] == 100

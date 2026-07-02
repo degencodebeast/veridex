@@ -476,13 +476,17 @@ def build_performance_metrics(scores: list[dict[str, Any]]) -> dict[str, Any]:
         scores: The ranked metric stack (``score_run`` output).
 
     Returns:
-        ``{clv, sim_pnl, brier, hit_rate, max_drawdown, per_agent}`` — rank-1 headline values
-        plus a per-agent breakdown. ``clv`` is the rank-1 ``avg_clv_bps`` (``None`` if unscored).
+        ``{clv, window_clv, sim_pnl, brier, hit_rate, max_drawdown, per_agent}`` — rank-1 headline
+        values plus a per-agent breakdown. ``clv`` is the rank-1 ``avg_clv_bps`` (``None`` if
+        unscored). ``window_clv`` is the rank-1 ``avg_window_clv_bps`` — the DEC-2D-1 WINDOW-CLV
+        metric surfaced DISTINCTLY beside true CLV (a windowed run's supporting metric), never
+        blended into ``clv``.
     """
     top = scores[0] if scores else {}
     total_actions = sum(int(r.get("action_count", 0)) for r in scores)
     return {
         "clv": top.get("avg_clv_bps"),
+        "window_clv": top.get("avg_window_clv_bps"),
         "sim_pnl": top.get("sim_pnl"),
         "brier": top.get("brier"),
         "max_drawdown": top.get("max_drawdown"),
@@ -498,6 +502,10 @@ def build_performance_metrics(scores: list[dict[str, Any]]) -> dict[str, Any]:
                 "brier": r.get("brier"),
                 "max_drawdown": r.get("max_drawdown"),
                 "action_count": r.get("action_count"),
+                # DEC-2D-1 window CLV — labeled beside true CLV, never folded into avg_clv_bps.
+                "avg_window_clv_bps": r.get("avg_window_clv_bps"),
+                "total_window_clv_bps": r.get("total_window_clv_bps"),
+                "window_action_count": r.get("window_action_count"),
             }
             for r in scores
         ],
