@@ -202,10 +202,28 @@ def _check_config(config: DeployConfig) -> PreflightCheck:
     return PreflightCheck(name="config", ok=True, detail="all config knobs within bounds")
 
 
-def _check_feed(config: DeployConfig, feed_report: FeedHealthReport | None) -> PreflightCheck:
-    """Feed-health check — replay needs no live feed; live must be connected + not stale."""
+def _check_feed(
+    config: DeployConfig, feed_report: FeedHealthReport | None, source_resolved: bool | None
+) -> PreflightCheck:
+    """Feed/source readiness — MODE-AWARE (REQ-2D-703).
+
+    A ``replay`` deploy needs no live feed; instead the named ``feed_health`` check verifies the
+    replay SOURCE resolves (the bundled/injected pack loaded to non-empty marketstates). When the
+    caller did not resolve a source (``source_resolved is None``) the check stays permissive —
+    replay has no live-feed precondition — preserving the pure-preflight contract. A ``live``
+    deploy STAYS fail-closed: it must have a connected, fresh feed (the correct 422 until a live
+    feed is wired — never weakened, never fabricated)."""
     if config.source_mode == "replay":
-        return PreflightCheck(name="feed_health", ok=True, detail="replay source — no live feed required")
+        if source_resolved is False:
+            return PreflightCheck(
+                name="feed_health", ok=False, detail="replay source did not resolve (bundled pack missing/empty)"
+            )
+        detail = (
+            "replay source resolved (bundled pack ready)"
+            if source_resolved is True
+            else "replay source — no live feed required"
+        )
+        return PreflightCheck(name="feed_health", ok=True, detail=detail)
     if feed_report is None or not feed_report.connected:
         return PreflightCheck(name="feed_health", ok=False, detail="live feed not connected")
     if feed_report.stale:
@@ -264,6 +282,7 @@ def run_deploy_preflight(
     feed_report: FeedHealthReport | None,
     market_resolved: bool | None,
     envelope: PolicyEnvelope,
+    source_resolved: bool | None = None,
 ) -> list[PreflightCheck]:
     """Evaluate every NAMED deploy precondition over already-fetched inputs (pure, offline).
 
@@ -273,6 +292,10 @@ def run_deploy_preflight(
         market_resolved: Whether the target market resolved to concrete identifiers, or ``None``
             when not checked (only gates a ``live_guarded`` deploy).
         envelope: The policy envelope built from ``config`` (checked for sane limits).
+        source_resolved: For a ``replay`` deploy, whether the replay SOURCE resolved to non-empty
+            marketstates (the route resolves the bundled/injected pack and passes the verdict).
+            ``None`` → not resolved by the caller (pure-preflight default; replay stays permissive).
+            Ignored for a ``live`` deploy, which is gated by ``feed_report``.
 
     Returns:
         The ordered list of :class:`PreflightCheck` verdicts (``config``, ``feed_health``,
@@ -280,7 +303,7 @@ def run_deploy_preflight(
     """
     return [
         _check_config(config),
-        _check_feed(config, feed_report),
+        _check_feed(config, feed_report, source_resolved),
         _check_market(config, market_resolved),
         _check_policy(config, envelope),
     ]

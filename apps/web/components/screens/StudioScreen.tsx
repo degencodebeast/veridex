@@ -3,7 +3,7 @@ import { useMemo, useState, type ReactNode } from 'react';
 import { SegmentedControl } from '@/components/ui/SegmentedControl';
 import { InfoTip } from '@/components/ui/InfoTip';
 import { availableModes, resolveMode, type StudioMode } from '@/lib/studio/coupling';
-import { ARCHETYPES, SPORTS_ACTION_TYPES, type Archetype, type ExecutionMode } from '@/lib/catalog';
+import { ARCHETYPES, SPORTS_ACTION_TYPES, type Archetype, type ExecutionMode, type SourceMode } from '@/lib/catalog';
 import { STRATEGY_TEMPLATES, COMPLEXITY_LABEL, type StrategyTemplate } from '@/lib/studio/templates';
 import { buildPreflightPreview, PREFLIGHT_DISCLAIMER } from '@/lib/studio/preflight';
 import { DEFAULT_POLICY_ENVELOPE } from '@/lib/fixtures/catalog';
@@ -20,12 +20,17 @@ function toStrategy(archetype: Archetype, mode: StudioMode): string {
 }
 
 // Build the non-secret deploy payload from the pinned Studio config + policy envelope.
-function buildDeployPayload(archetype: Archetype, mode: StudioMode, exec: ExecutionMode): DeployAgentPayload {
+// source_mode is the OPERATOR's choice (never hardcoded 'live'): the demo defaults to a working
+// REPLAY deploy (recorded pack, proof-only). A 'live' deploy stays fail-closed on the backend
+// (named feed_health 422) until a live feed is wired — the honest live path is T20b/operator.
+function buildDeployPayload(
+  archetype: Archetype, mode: StudioMode, exec: ExecutionMode, source: SourceMode,
+): DeployAgentPayload {
   return {
     template_id: archetype,
     agent_id: `studio-${archetype}`,
     strategy: toStrategy(archetype, mode),
-    source_mode: 'live',
+    source_mode: source,
     execution_mode: exec,
     market_allowlist: DEFAULT_POLICY_ENVELOPE.market_allowlist,
     venue_allowlist: DEFAULT_POLICY_ENVELOPE.venue_allowlist,
@@ -61,6 +66,9 @@ export function StudioScreen({
   const [archetype, setArchetype] = useState<Archetype>('value_clv');
   const [mode, setMode] = useState<StudioMode>('numeric');
   const [exec, setExec] = useState<ExecutionMode>('paper');
+  // Demo-safe default: a working REPLAY deploy (recorded pack). 'live' stays fail-closed on the
+  // backend until a live feed is wired — never dressed up as live/real-money from the demo.
+  const [source, setSource] = useState<SourceMode>('replay');
   // The last-pinned snapshot — edits are diffed against it and applied as a NEW version on pin.
   const [baseline, setBaseline] = useState<{ archetype: Archetype; mode: StudioMode; exec: ExecutionMode }>(
     { archetype: 'value_clv', mode: 'numeric', exec: 'paper' },
@@ -107,7 +115,7 @@ export function StudioScreen({
     setPreflightFailure(null);
     setRunId(null);
     try {
-      const result = await deployAgent(buildDeployPayload(archetype, mode, exec));
+      const result = await deployAgent(buildDeployPayload(archetype, mode, exec, source));
       setRunId(result.run_id);
     } catch (err) {
       if (err instanceof DeployPreflightError) setPreflightFailure(err.failedChecks);
@@ -204,6 +212,26 @@ export function StudioScreen({
               <span className="mono">{DEFAULT_POLICY_ENVELOPE.max_stake}</span>
             </div>
             <div className={styles.kv}><span>kill_switch</span><span className="mono">{String(DEFAULT_POLICY_ENVELOPE.kill_switch)}</span></div>
+            <label className={styles.field}>
+              <span className={styles.label}>
+                Source mode{' '}
+                <InfoTip label={GLOSSARY.source_mode.label}>{GLOSSARY.source_mode.definition}</InfoTip>
+              </span>
+              {running ? (
+                <span className="mono" data-testid="source-mode-ro">{source}</span>
+              ) : (
+                <SegmentedControl<SourceMode>
+                  ariaLabel="Source mode" value={source} onChange={setSource}
+                  options={[{ value: 'replay', label: 'Replay' }, { value: 'live', label: 'Live' }]}
+                />
+              )}
+            </label>
+            {source === 'live' ? (
+              <p className={styles.hint} data-testid="live-fail-closed-note">
+                Live deploy stays fail-closed (named <span className="mono">feed_health</span> preflight) until a live
+                feed is wired — the demo runs a recorded REPLAY pack, never real-money execution.
+              </p>
+            ) : null}
             <label className={styles.field}>
               <span className={styles.label}>
                 Execution mode{' '}

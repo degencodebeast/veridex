@@ -1,0 +1,869 @@
+{
+  "fixture_id": 18172280,
+  "ticks": [
+    {
+      "ts": 1000,
+      "phase": 1,
+      "scores": {},
+      "markets": {
+        "OVERUNDER_PARTICIPANT_GOALS": {
+          "stable_prob_bps": {
+            "home": 4640,
+            "away": 5360
+          },
+          "stable_price": {
+            "home": 2.155,
+            "away": 1.866
+          },
+          "suspended": false
+        }
+      }
+    },
+    {
+      "ts": 2000,
+      "phase": 1,
+      "scores": {},
+      "markets": {
+        "OVERUNDER_PARTICIPANT_GOALS": {
+          "stable_prob_bps": {
+            "home": 4695,
+            "away": 5305
+          },
+          "stable_price": {
+            "home": 2.13,
+            "away": 1.885
+          },
+          "suspended": false
+        }
+      }
+    },
+    {
+      "ts": 3000,
+      "phase": 1,
+      "scores": {},
+      "markets": {
+        "OVERUNDER_PARTICIPANT_GOALS": {
+          "stable_prob_bps": {
+            "home": 4750,
+            "away": 5250
+          },
+          "stable_price": {
+            "home": 2.105,
+            "away": 1.905
+          },
+          "suspended": false
+        }
+      }
+    },
+    {
+      "ts": 4000,
+      "phase": 1,
+      "scores": {},
+      "markets": {
+        "OVERUNDER_PARTICIPANT_GOALS": {
+          "stable_prob_bps": {
+            "home": 4790,
+            "away": 5210
+          },
+          "stable_price": {
+            "home": 2.088,
+            "away": 1.919
+          },
+          "suspended": false
+        }
+      }
+    },
+    {
+      "ts": 5000,
+      "phase": 1,
+      "scores": {},
+      "markets": {
+        "OVERUNDER_PARTICIPANT_GOALS": {
+          "stable_prob_bps": {
+            "home": 4845,
+            "away": 5155
+          },
+          "stable_price": {
+            "home": 2.064,
+            "away": 1.94
+          },
+          "suspended": false
+        }
+      }
+    },
+    {
+      "ts": 6000,
+      "phase": 1,
+      "scores": {},
+      "markets": {
+        "OVERUNDER_PARTICIPANT_GOALS": {
+          "stable_prob_bps": {
+            "home": 4900,
+            "away": 5100
+          },
+          "stable_price": {
+            "home": 2.041,
+            "away": 1.961
+          },
+          "suspended": false
+        }
+      }
+    },
+    {
+      "ts": 7000,
+      "phase": 1,
+      "scores": {},
+      "markets": {
+        "OVERUNDER_PARTICIPANT_GOALS": {
+          "stable_prob_bps": {
+            "home": 4940,
+            "away": 5060
+          },
+          "stable_price": {
+            "home": 2.024,
+            "away": 1.976
+          },
+          "suspended": false
+        }
+      }
+    },
+    {
+      "ts": 8000,
+      "phase": 1,
+      "scores": {},
+      "markets": {
+        "OVERUNDER_PARTICIPANT_GOALS": {
+          "stable_prob_bps": {
+            "home": 4995,
+            "away": 5005
+          },
+          "stable_price": {
+            "home": 2.002,
+            "away": 1.998
+          },
+          "suspended": false
+        }
+      }
+    },
+    {
+      "ts": 9000,
+      "phase": 1,
+      "scores": {},
+      "markets": {
+        "OVERUNDER_PARTICIPANT_GOALS": {
+          "stable_prob_bps": {
+            "home": 5050,
+            "away": 4950
+          },
+          "stable_price": {
+            "home": 1.98,
+            "away": 2.02
+          },
+          "suspended": false
+        }
+      }
+    },
+    {
+      "ts": 10000,
+      "phase": 1,
+      "scores": {},
+      "markets": {
+        "OVERUNDER_PARTICIPANT_GOALS": {
+          "stable_prob_bps": {
+            "home": 5090,
+            "away": 4910
+          },
+          "stable_price": {
+            "home": 1.965,
+            "away": 2.037
+          },
+          "suspended": false
+        }
+      }
+    },
+    {
+      "ts": 11000,
+      "phase": 1,
+      "scores": {},
+      "markets": {
+        "OVERUNDER_PARTICIPANT_GOALS": {
+          "stable_prob_bps": {
+            "home": 5145,
+            "away": 4855
+          },
+          "stable_price": {
+            "home": 1.944,
+            "away": 2.06
+          },
+          "suspended": false
+        }
+      }
+    },
+    {
+      "ts": 12000,
+      "phase": 1,
+      "scores": {},
+      "markets": {
+        "OVERUNDER_PARTICIPANT_GOALS": {
+          "stable_prob_bps": {
+            "home": 5200,
+            "away": 4800
+          },
+          "stable_price": {
+            "home": 1.923,
+            "away": 2.083
+          },
+          "suspended": false
+        }
+      }
+    },
+    {
+      "ts": 13000,
+      "phase": 1,
+      "scores": {},
+      "markets": {
+        "OVERUNDER_PARTICIPANT_GOALS": {
+          "stable_prob_bps": {
+            "home": 5240,
+            "away": 4760
+          },
+          "stable_price": {
+            "home": 1.908,
+            "away": 2.101
+          },
+          "suspended": false
+        }
+      }
+    },
+    {
+      "ts": 14000,
+      "phase": 1,
+      "scores": {},
+      "markets": {
+        "OVERUNDER_PARTICIPANT_GOALS": {
+          "stable_prob_bps": {
+            "home": 5295,
+            "away": 4705
+          },
+          "stable_price": {
+            "home": 1.889,
+            "away": 2.125
+          },
+          "suspended": false
+        }
+      }
+    },
+    {
+      "ts": 15000,
+      "phase": 1,
+      "scores": {},
+      "markets": {
+        "OVERUNDER_PARTICIPANT_GOALS": {
+          "stable_prob_bps": {
+            "home": 5350,
+            "away": 4650
+          },
+          "stable_price": {
+            "home": 1.869,
+            "away": 2.151
+          },
+          "suspended": false
+        }
+      }
+    },
+    {
+      "ts": 16000,
+      "phase": 1,
+      "scores": {},
+      "markets": {
+        "OVERUNDER_PARTICIPANT_GOALS": {
+          "stable_prob_bps": {
+            "home": 5390,
+            "away": 4610
+          },
+          "stable_price": {
+            "home": 1.855,
+            "away": 2.169
+          },
+          "suspended": false
+        }
+      }
+    },
+    {
+      "ts": 17000,
+      "phase": 1,
+      "scores": {},
+      "markets": {
+        "OVERUNDER_PARTICIPANT_GOALS": {
+          "stable_prob_bps": {
+            "home": 5445,
+            "away": 4555
+          },
+          "stable_price": {
+            "home": 1.837,
+            "away": 2.195
+          },
+          "suspended": false
+        }
+      }
+    },
+    {
+      "ts": 18000,
+      "phase": 1,
+      "scores": {},
+      "markets": {
+        "OVERUNDER_PARTICIPANT_GOALS": {
+          "stable_prob_bps": {
+            "home": 5500,
+            "away": 4500
+          },
+          "stable_price": {
+            "home": 1.818,
+            "away": 2.222
+          },
+          "suspended": false
+        }
+      }
+    },
+    {
+      "ts": 19000,
+      "phase": 1,
+      "scores": {},
+      "markets": {
+        "OVERUNDER_PARTICIPANT_GOALS": {
+          "stable_prob_bps": {
+            "home": 5540,
+            "away": 4460
+          },
+          "stable_price": {
+            "home": 1.805,
+            "away": 2.242
+          },
+          "suspended": false
+        }
+      }
+    },
+    {
+      "ts": 20000,
+      "phase": 1,
+      "scores": {},
+      "markets": {
+        "OVERUNDER_PARTICIPANT_GOALS": {
+          "stable_prob_bps": {
+            "home": 5595,
+            "away": 4405
+          },
+          "stable_price": {
+            "home": 1.787,
+            "away": 2.27
+          },
+          "suspended": false
+        }
+      }
+    },
+    {
+      "ts": 21000,
+      "phase": 1,
+      "scores": {},
+      "markets": {
+        "OVERUNDER_PARTICIPANT_GOALS": {
+          "stable_prob_bps": {
+            "home": 5650,
+            "away": 4350
+          },
+          "stable_price": {
+            "home": 1.77,
+            "away": 2.299
+          },
+          "suspended": false
+        }
+      }
+    },
+    {
+      "ts": 22000,
+      "phase": 1,
+      "scores": {},
+      "markets": {
+        "OVERUNDER_PARTICIPANT_GOALS": {
+          "stable_prob_bps": {
+            "home": 5690,
+            "away": 4310
+          },
+          "stable_price": {
+            "home": 1.757,
+            "away": 2.32
+          },
+          "suspended": false
+        }
+      }
+    },
+    {
+      "ts": 23000,
+      "phase": 1,
+      "scores": {},
+      "markets": {
+        "OVERUNDER_PARTICIPANT_GOALS": {
+          "stable_prob_bps": {
+            "home": 5745,
+            "away": 4255
+          },
+          "stable_price": {
+            "home": 1.741,
+            "away": 2.35
+          },
+          "suspended": false
+        }
+      }
+    },
+    {
+      "ts": 24000,
+      "phase": 1,
+      "scores": {},
+      "markets": {
+        "OVERUNDER_PARTICIPANT_GOALS": {
+          "stable_prob_bps": {
+            "home": 5800,
+            "away": 4200
+          },
+          "stable_price": {
+            "home": 1.724,
+            "away": 2.381
+          },
+          "suspended": false
+        }
+      }
+    },
+    {
+      "ts": 25000,
+      "phase": 1,
+      "scores": {},
+      "markets": {
+        "OVERUNDER_PARTICIPANT_GOALS": {
+          "stable_prob_bps": {
+            "home": 5840,
+            "away": 4160
+          },
+          "stable_price": {
+            "home": 1.712,
+            "away": 2.404
+          },
+          "suspended": false
+        }
+      }
+    },
+    {
+      "ts": 26000,
+      "phase": 1,
+      "scores": {},
+      "markets": {
+        "OVERUNDER_PARTICIPANT_GOALS": {
+          "stable_prob_bps": {
+            "home": 5895,
+            "away": 4105
+          },
+          "stable_price": {
+            "home": 1.696,
+            "away": 2.436
+          },
+          "suspended": false
+        }
+      }
+    },
+    {
+      "ts": 27000,
+      "phase": 1,
+      "scores": {},
+      "markets": {
+        "OVERUNDER_PARTICIPANT_GOALS": {
+          "stable_prob_bps": {
+            "home": 5950,
+            "away": 4050
+          },
+          "stable_price": {
+            "home": 1.681,
+            "away": 2.469
+          },
+          "suspended": false
+        }
+      }
+    },
+    {
+      "ts": 28000,
+      "phase": 1,
+      "scores": {},
+      "markets": {
+        "OVERUNDER_PARTICIPANT_GOALS": {
+          "stable_prob_bps": {
+            "home": 5990,
+            "away": 4010
+          },
+          "stable_price": {
+            "home": 1.669,
+            "away": 2.494
+          },
+          "suspended": false
+        }
+      }
+    },
+    {
+      "ts": 29000,
+      "phase": 1,
+      "scores": {},
+      "markets": {
+        "OVERUNDER_PARTICIPANT_GOALS": {
+          "stable_prob_bps": {
+            "home": 6045,
+            "away": 3955
+          },
+          "stable_price": {
+            "home": 1.654,
+            "away": 2.528
+          },
+          "suspended": false
+        }
+      }
+    },
+    {
+      "ts": 30000,
+      "phase": 1,
+      "scores": {},
+      "markets": {
+        "OVERUNDER_PARTICIPANT_GOALS": {
+          "stable_prob_bps": {
+            "home": 6100,
+            "away": 3900
+          },
+          "stable_price": {
+            "home": 1.639,
+            "away": 2.564
+          },
+          "suspended": false
+        }
+      }
+    },
+    {
+      "ts": 31000,
+      "phase": 1,
+      "scores": {},
+      "markets": {
+        "OVERUNDER_PARTICIPANT_GOALS": {
+          "stable_prob_bps": {
+            "home": 6140,
+            "away": 3860
+          },
+          "stable_price": {
+            "home": 1.629,
+            "away": 2.591
+          },
+          "suspended": false
+        }
+      }
+    },
+    {
+      "ts": 32000,
+      "phase": 1,
+      "scores": {},
+      "markets": {
+        "OVERUNDER_PARTICIPANT_GOALS": {
+          "stable_prob_bps": {
+            "home": 6195,
+            "away": 3805
+          },
+          "stable_price": {
+            "home": 1.614,
+            "away": 2.628
+          },
+          "suspended": false
+        }
+      }
+    },
+    {
+      "ts": 33000,
+      "phase": 1,
+      "scores": {},
+      "markets": {
+        "OVERUNDER_PARTICIPANT_GOALS": {
+          "stable_prob_bps": {
+            "home": 6250,
+            "away": 3750
+          },
+          "stable_price": {
+            "home": 1.6,
+            "away": 2.667
+          },
+          "suspended": false
+        }
+      }
+    },
+    {
+      "ts": 34000,
+      "phase": 1,
+      "scores": {},
+      "markets": {
+        "OVERUNDER_PARTICIPANT_GOALS": {
+          "stable_prob_bps": {
+            "home": 6290,
+            "away": 3710
+          },
+          "stable_price": {
+            "home": 1.59,
+            "away": 2.695
+          },
+          "suspended": false
+        }
+      }
+    },
+    {
+      "ts": 35000,
+      "phase": 1,
+      "scores": {},
+      "markets": {
+        "OVERUNDER_PARTICIPANT_GOALS": {
+          "stable_prob_bps": {
+            "home": 6345,
+            "away": 3655
+          },
+          "stable_price": {
+            "home": 1.576,
+            "away": 2.736
+          },
+          "suspended": false
+        }
+      }
+    },
+    {
+      "ts": 36000,
+      "phase": 1,
+      "scores": {},
+      "markets": {
+        "OVERUNDER_PARTICIPANT_GOALS": {
+          "stable_prob_bps": {
+            "home": 6400,
+            "away": 3600
+          },
+          "stable_price": {
+            "home": 1.562,
+            "away": 2.778
+          },
+          "suspended": false
+        }
+      }
+    },
+    {
+      "ts": 37000,
+      "phase": 1,
+      "scores": {},
+      "markets": {
+        "OVERUNDER_PARTICIPANT_GOALS": {
+          "stable_prob_bps": {
+            "home": 6440,
+            "away": 3560
+          },
+          "stable_price": {
+            "home": 1.553,
+            "away": 2.809
+          },
+          "suspended": false
+        }
+      }
+    },
+    {
+      "ts": 38000,
+      "phase": 1,
+      "scores": {},
+      "markets": {
+        "OVERUNDER_PARTICIPANT_GOALS": {
+          "stable_prob_bps": {
+            "home": 6495,
+            "away": 3505
+          },
+          "stable_price": {
+            "home": 1.54,
+            "away": 2.853
+          },
+          "suspended": false
+        }
+      }
+    },
+    {
+      "ts": 39000,
+      "phase": 1,
+      "scores": {},
+      "markets": {
+        "OVERUNDER_PARTICIPANT_GOALS": {
+          "stable_prob_bps": {
+            "home": 6550,
+            "away": 3450
+          },
+          "stable_price": {
+            "home": 1.527,
+            "away": 2.899
+          },
+          "suspended": false
+        }
+      }
+    },
+    {
+      "ts": 40000,
+      "phase": 1,
+      "scores": {},
+      "markets": {
+        "OVERUNDER_PARTICIPANT_GOALS": {
+          "stable_prob_bps": {
+            "home": 6590,
+            "away": 3410
+          },
+          "stable_price": {
+            "home": 1.517,
+            "away": 2.933
+          },
+          "suspended": false
+        }
+      }
+    },
+    {
+      "ts": 41000,
+      "phase": 1,
+      "scores": {},
+      "markets": {
+        "OVERUNDER_PARTICIPANT_GOALS": {
+          "stable_prob_bps": {
+            "home": 6645,
+            "away": 3355
+          },
+          "stable_price": {
+            "home": 1.505,
+            "away": 2.981
+          },
+          "suspended": false
+        }
+      }
+    },
+    {
+      "ts": 42000,
+      "phase": 1,
+      "scores": {},
+      "markets": {
+        "OVERUNDER_PARTICIPANT_GOALS": {
+          "stable_prob_bps": {
+            "home": 6700,
+            "away": 3300
+          },
+          "stable_price": {
+            "home": 1.493,
+            "away": 3.03
+          },
+          "suspended": false
+        }
+      }
+    },
+    {
+      "ts": 43000,
+      "phase": 1,
+      "scores": {},
+      "markets": {
+        "OVERUNDER_PARTICIPANT_GOALS": {
+          "stable_prob_bps": {
+            "home": 6740,
+            "away": 3260
+          },
+          "stable_price": {
+            "home": 1.484,
+            "away": 3.067
+          },
+          "suspended": false
+        }
+      }
+    },
+    {
+      "ts": 44000,
+      "phase": 1,
+      "scores": {},
+      "markets": {
+        "OVERUNDER_PARTICIPANT_GOALS": {
+          "stable_prob_bps": {
+            "home": 6795,
+            "away": 3205
+          },
+          "stable_price": {
+            "home": 1.472,
+            "away": 3.12
+          },
+          "suspended": false
+        }
+      }
+    },
+    {
+      "ts": 45000,
+      "phase": 1,
+      "scores": {},
+      "markets": {
+        "OVERUNDER_PARTICIPANT_GOALS": {
+          "stable_prob_bps": {
+            "home": 6850,
+            "away": 3150
+          },
+          "stable_price": {
+            "home": 1.46,
+            "away": 3.175
+          },
+          "suspended": false
+        }
+      }
+    },
+    {
+      "ts": 46000,
+      "phase": 1,
+      "scores": {},
+      "markets": {
+        "OVERUNDER_PARTICIPANT_GOALS": {
+          "stable_prob_bps": {
+            "home": 6890,
+            "away": 3110
+          },
+          "stable_price": {
+            "home": 1.451,
+            "away": 3.215
+          },
+          "suspended": false
+        }
+      }
+    },
+    {
+      "ts": 47000,
+      "phase": 1,
+      "scores": {},
+      "markets": {
+        "OVERUNDER_PARTICIPANT_GOALS": {
+          "stable_prob_bps": {
+            "home": 6945,
+            "away": 3055
+          },
+          "stable_price": {
+            "home": 1.44,
+            "away": 3.273
+          },
+          "suspended": false
+        }
+      }
+    },
+    {
+      "ts": 48000,
+      "phase": 1,
+      "scores": {},
+      "markets": {
+        "OVERUNDER_PARTICIPANT_GOALS": {
+          "stable_prob_bps": {
+            "home": 7000,
+            "away": 3000
+          },
+          "stable_price": {
+            "home": 1.429,
+            "away": 3.333
+          },
+          "suspended": false
+        }
+      }
+    }
+  ]
+}

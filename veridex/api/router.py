@@ -72,7 +72,7 @@ from veridex.api.schemas import (
 from veridex.api.ws import ArenaConnectionManager, register_arena_routes
 from veridex.backtest.report import BacktestReport
 from veridex.backtest.runner import run_backtest
-from veridex.chain.anchor import explorer_tx_url
+from veridex.chain.anchor import anchor_memo, explorer_tx_url
 from veridex.checks.build import (
     build_check_results,
     build_performance_metrics,
@@ -1243,6 +1243,16 @@ def create_app(
     # Preflight fail-closed (422 named); pins config_hash+policy_hash+template+modes as an
     # AgentInstance; launches via the SINGLE runner seam (standalone_run) and persists the sealed run
     # to ``resolved_store`` so the deployed run verifies via the SAME /runs/{id}/verify path (T21).
-    register_deploy_routes(app, store=resolved_store, deploy_deps=deploy_deps)
+    #
+    # Default deps (T21c): so the headline replay/paper deploy runs end-to-end from the REAL app
+    # (no injected deps), the default route degrades anchoring HONESTLY — it anchors on-chain only
+    # when a Solana keypair is configured, else the run is legitimately ``not_anchored`` (offline
+    # replay), NEVER a fabricated anchor and NEVER a crash on a missing keypair. The bundled replay
+    # SOURCE is wired inside ``register_deploy_routes`` (see :mod:`veridex.deploy.bundled_replay`).
+    resolved_deploy_deps = deploy_deps
+    if resolved_deploy_deps is None:
+        anchor_fn = anchor_memo if resolved_settings.solana_keypair_path is not None else None
+        resolved_deploy_deps = DeployDeps(anchor_fn=anchor_fn)
+    register_deploy_routes(app, store=resolved_store, deploy_deps=resolved_deploy_deps)
 
     return app

@@ -257,3 +257,74 @@ async def test_deployed_run_verifies_via_the_same_arena_path() -> None:
         assert verdict["run_id"] == run_id
         assert verdict["verified"] is True
         assert verdict["evidence_hash"] == verdict["recomputed_evidence_hash"]
+
+
+# ---------------------------------------------------------------------------
+# DEFAULT MOUNTED APP — honest replay/paper deploy works with ZERO injected deps
+# (Codex M6 repro: the headline configure→preflight→deploy→observe→verify flow must be
+# demonstrable from the REAL app, not only with test-injected DeployDeps.)
+# ---------------------------------------------------------------------------
+
+# The demo-safe Studio-shaped payload: a REPLAY / PAPER deploy (never 'live', never real money).
+_REPLAY_STUDIO: dict[str, Any] = {**_VALID, "source_mode": "replay", "execution_mode": "paper"}
+
+
+async def test_default_app_replay_deploy_runs_and_verifies_without_injected_deps() -> None:
+    # The DEFAULT mounted app — create_app(store=InMemoryStore()) with NO deploy_deps: the app wires
+    # a REAL bundled ReplayPack source itself, so a REPLAY/PAPER deploy runs end-to-end and the
+    # deployed run VERIFIES via the SAME /runs/{id}/verify path. This is the M6 gap: previously the
+    # default route ran standalone_run([]) (empty) and never sealed a loadable run.
+    app = create_app(store=InMemoryStore())
+    async with _transport(app) as client:
+        resp = await client.post("/agents/deploy", json=_REPLAY_STUDIO)
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["run_id"]
+        assert len(body["config_hash"]) == 64
+        assert len(body["policy_hash"]) == 64
+        assert body["instance_id"].startswith("inst_")
+
+        # Drive the background replay run to its seal. The seal MUST complete cleanly — a real
+        # bundled source + honest (unconfigured → not_anchored) anchoring, NOT a background
+        # ValueError from a live-anchor with no keypair. (An empty run + anchor-crash still
+        # "verifies" trivially; these assertions forbid that false-green.)
+        tasks = list(getattr(app.state, "deploy_background_tasks", set()))
+        assert len(tasks) == 1
+        await _drain(app)
+        assert tasks[0].exception() is None  # clean seal — no pre-seal crash
+
+        # The deployed run actually EXECUTED over the bundled ReplayPack (non-empty event log),
+        # then verifies via the SAME arena /runs/{id}/verify path (evidence_hash == recomputed).
+        proof = (await client.get(f"/runs/{body['run_id']}")).json()
+        assert proof["evidence"]["run_event_count"] > 0  # ran over real bundled ticks, not []
+
+        vresp = await client.post(f"/runs/{body['run_id']}/verify")
+        assert vresp.status_code == 200, vresp.text
+        verdict = vresp.json()
+        assert verdict["run_id"] == body["run_id"]
+        assert verdict["verified"] is True
+        assert verdict["evidence_hash"] == verdict["recomputed_evidence_hash"]
+
+
+async def test_default_app_live_deploy_stays_fail_closed_without_a_feed() -> None:
+    # HONEST fail-closed preserved: a LIVE deploy in the default app (no live feed wired) must STILL
+    # 422 on feed_health and start NO run — the live 422 is CORRECT (do not weaken _check_feed).
+    app = create_app(store=InMemoryStore())
+    async with _transport(app) as client:
+        resp = await client.post("/agents/deploy", json={**_VALID, "source_mode": "live"})
+    assert resp.status_code == 422, resp.text
+    assert "feed_health" in resp.json()["detail"]["failed_checks"]
+    assert not getattr(app.state, "deploy_background_tasks", set())  # fail-closed: no run launched
+
+
+async def test_default_app_replay_preflight_checks_the_source_resolves() -> None:
+    # MODE-AWARE preflight: the replay/paper deploy's feed_health check passes because the bundled
+    # replay SOURCE resolves (not because a live feed is connected). The named check is honest about
+    # what it verified for a replay deploy.
+    app = create_app(store=InMemoryStore())
+    async with _transport(app) as client:
+        resp = await client.post("/agents/deploy", json=_REPLAY_STUDIO)
+        assert resp.status_code == 200, resp.text
+        for task in list(getattr(app.state, "deploy_background_tasks", set())):
+            task.cancel()
+        await _drain(app)

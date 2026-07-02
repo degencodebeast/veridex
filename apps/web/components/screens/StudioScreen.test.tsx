@@ -178,6 +178,24 @@ describe('StudioScreen (REQ-018 / AC-007 / SEC-006/007/009)', () => {
       expect(await screen.findByTestId('deploy-run-id')).toHaveTextContent('run_deadbeefcafe');
     });
 
+    it('posts a demo-safe source_mode (replay, NOT hardcoded live) and surfaces the run_id (M6 honest default path)', async () => {
+      // Codex M6: the Studio deploy must WORK from the default app. It hardcoded source_mode:'live',
+      // which fails-closed on feed_health in the default app. The demo deploy defaults to a WORKING
+      // REPLAY deploy (never dressed up as 'live'/live-money), so the headline flow is demonstrable.
+      const user = userEvent.setup();
+      const fetchMock = vi.fn(async () => okDeploy());
+      vi.stubGlobal('fetch', fetchMock);
+      render(<StudioScreen />);
+
+      await user.click(screen.getByRole('button', { name: /pin config & queue run/i }));
+
+      const [, init] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
+      const body = JSON.parse(init.body as string);
+      expect(body.source_mode).toBe('replay'); // demo-safe: NOT hardcoded 'live'
+      expect(body.execution_mode).toBe('paper'); // paper: proof-only, never real money
+      expect(await screen.findByTestId('deploy-run-id')).toHaveTextContent('run_deadbeefcafe');
+    });
+
     it('surfaces the NAMED preflight failure fail-closed (422) and shows no run_id', async () => {
       const user = userEvent.setup();
       vi.stubGlobal('fetch', vi.fn(async () => failClosedDeploy('feed_health')));

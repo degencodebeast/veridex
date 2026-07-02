@@ -27,6 +27,7 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
 from veridex.chain.anchor import anchor_memo
+from veridex.deploy.bundled_replay import load_bundled_replay_marketstates
 from veridex.deploy.preflight import DeployConfig, PreflightCheck, run_deploy_preflight
 from veridex.ingest.feed_health import FeedHealthReport
 from veridex.ingest.marketstate import MarketState
@@ -197,7 +198,18 @@ def register_deploy_routes(app: FastAPI, *, store: Store, deploy_deps: DeployDep
     app.state.deploy_background_tasks = background_tasks
     app.state.deploy_instances = instances
 
-    async def _launch(config: DeployConfig, run_id: str) -> None:
+    def _resolve_replay_marketstates() -> list[MarketState]:
+        """Resolve the REPLAY source ticks: injected fakes (tests) or the REAL bundled ReplayPack.
+
+        The default mounted route has no injected ``deps.marketstates``, so a ``replay`` deploy
+        sources a REAL bundled ReplayPack (recorded demo ticks; NEVER live) — this is what makes the
+        headline flow demonstrable from the real app without any test injection (REQ-2D-703).
+        """
+        if deps.marketstates is not None:
+            return list(deps.marketstates)
+        return list(load_bundled_replay_marketstates())
+
+    async def _launch(config: DeployConfig, run_id: str, marketstates: list[MarketState]) -> None:
         """Run the deployed agent through the SINGLE seam, persisting the seal under ``run_id``."""
         agent = _build_agent(config)
         envelope = config.to_policy_envelope()
@@ -222,7 +234,7 @@ def register_deploy_routes(app: FastAPI, *, store: Store, deploy_deps: DeployDep
             )
         else:
             await standalone_run(
-                list(deps.marketstates or []),
+                marketstates,
                 agent,
                 source_mode="replay",
                 policy_envelope=lane_envelope,
@@ -249,11 +261,21 @@ def register_deploy_routes(app: FastAPI, *, store: Store, deploy_deps: DeployDep
             HTTPException: 422 naming every failing preflight check; NO run starts on failure.
         """
         envelope = config.to_policy_envelope()
+        # MODE-AWARE source resolution: a replay deploy resolves its SOURCE (bundled/injected pack)
+        # BEFORE preflight, so the named feed_health check verifies the replay source resolves
+        # (non-empty) rather than a live feed. Live resolves nothing here — it is gated fail-closed
+        # by the feed report (the correct 422 until a live feed is wired).
+        replay_marketstates: list[MarketState] = []
+        source_resolved: bool | None = None
+        if config.source_mode == "replay":
+            replay_marketstates = _resolve_replay_marketstates()
+            source_resolved = len(replay_marketstates) > 0
         checks: list[PreflightCheck] = run_deploy_preflight(
             config,
             feed_report=deps.feed_report,
             market_resolved=deps.market_resolved,
             envelope=envelope,
+            source_resolved=source_resolved,
         )
         failed = [c.name for c in checks if c.ok is False]
         if failed:
@@ -283,7 +305,7 @@ def register_deploy_routes(app: FastAPI, *, store: Store, deploy_deps: DeployDep
         instances[instance.instance_id] = instance
 
         # Launch ASYNCHRONOUSLY: track the task + auto-discard on completion (cancellable on shutdown).
-        task: asyncio.Task[None] = asyncio.create_task(_launch(config, run_id))
+        task: asyncio.Task[None] = asyncio.create_task(_launch(config, run_id, replay_marketstates))
         background_tasks.add(task)
 
         def _on_done(finished: asyncio.Task[None], *, launched_run_id: str = run_id) -> None:
