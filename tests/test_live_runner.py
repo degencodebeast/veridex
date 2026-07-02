@@ -259,6 +259,77 @@ async def test_closing_divergence_uses_reconstructed_close_and_seals_it() -> Non
 
 
 # ===========================================================================
+# 5b — completeness gate: a close must cover EVERY scored market to yield true CLV
+# ===========================================================================
+
+KEY_B = "OU|HT|1.5"  # a second allowlisted market (prefix "OU"), scored by a second agent
+
+
+def _two_market_ms(a_over: int, b_over: int, *, tick_seq: int, ts: int) -> MarketState:
+    return _ms(0, tick_seq=tick_seq, ts=ts, phase=0, markets={KEY: _market(a_over), KEY_B: _market(b_over)})
+
+
+async def test_complete_close_over_all_scored_markets_stays_true_clv() -> None:
+    # Two agents score two markets (A, B); the reconstructed close covers BOTH -> TRUE clv_bps.
+    ticks = [
+        _two_market_ms(6000, 5000, tick_seq=0, ts=1000),
+        _two_market_ms(6100, 5200, tick_seq=1, ts=1100),
+    ]
+
+    async def fetch(fid: int) -> list[dict[str, Any]]:
+        # Pre-InRunning closes for BOTH markets (A: over=6600 @ FT/2.5, B: over=5500 @ HT/1.5).
+        return [
+            _upd(66, 34, ts_ms=1_900_000, in_running=0, period="FT", params="2.5"),
+            _upd(55, 45, ts_ms=1_900_000, in_running=0, period="HT", params="1.5"),
+        ]
+
+    agents = [_flag_agent("agentA", market_key=KEY), _flag_agent("agentB", market_key=KEY_B)]
+    bundle = await run_live_window(
+        _window("pre_match"), agents, stream=_astream(ticks), fetch_updates=fetch, anchor_fn=None
+    )
+
+    # COMPLETE close -> every row carries TRUE clv_bps, no window_clv_bps, no degrade marker.
+    for row in bundle.run.score_rows:
+        assert "clv_bps" in row
+        assert "window_clv_bps" not in row
+    assert bundle.ops.get("closing_source") is None
+    assert "closing_incomplete_markets" not in bundle.ops
+    # Sanity: agentB's tick0 true CLV = B close 5500 - entry 5000 = 500.
+    b0 = next(r for r in bundle.run.score_rows if r["agent_id"] == "agentB" and r["tick_seq"] == 0)
+    assert b0["clv_bps"] == 500
+
+
+async def test_incomplete_close_degrades_to_window_clv_never_true_clv() -> None:
+    # The reconstructed close covers ONLY market A, but market B was ALSO scored during the window.
+    # Honesty: B would otherwise close against its last STREAM tick while being labeled true CLV.
+    ticks = [
+        _two_market_ms(6000, 5000, tick_seq=0, ts=1000),
+        _two_market_ms(6100, 5200, tick_seq=1, ts=1100),
+    ]
+
+    async def fetch(fid: int) -> list[dict[str, Any]]:
+        # Only market A has a pre-InRunning close; market B is MISSING from the close.
+        return [_upd(66, 34, ts_ms=1_900_000, in_running=0, period="FT", params="2.5")]
+
+    agents = [_flag_agent("agentA", market_key=KEY), _flag_agent("agentB", market_key=KEY_B)]
+    bundle = await run_live_window(
+        _window("pre_match"), agents, stream=_astream(ticks), fetch_updates=fetch, anchor_fn=None
+    )
+
+    # DEGRADE: NO row may be labeled true clv_bps -> every row is WINDOW CLV.
+    for row in bundle.run.score_rows:
+        assert "window_clv_bps" in row
+        assert "clv_bps" not in row
+    # The ops marker names the uncovered scored market ...
+    assert bundle.ops.get("closing_source") == "stream_observed_fallback"
+    assert bundle.ops.get("closing_incomplete_markets") == [KEY_B]
+    # ... and NEITHER the marker NOR the incomplete-markets annotation is inside the sealed evidence.
+    assert "stream_observed_fallback" not in json.dumps(bundle.run.run_events)
+    assert "closing_incomplete_markets" not in json.dumps(bundle.run.run_events)
+    assert "stream_observed_fallback" not in json.dumps(bundle.run.score_rows)
+
+
+# ===========================================================================
 # 6 — fetch-failure degrade: no fabricated close, window_clv_bps + honest ops marker
 # ===========================================================================
 

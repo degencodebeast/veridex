@@ -264,13 +264,26 @@ async def run_live_window(
             closing_state = None
 
         if closing_state is not None:
-            # Completeness contract: the close must carry every scored market or a market's closing
-            # silently falls back to its entry tick (CLV 0). Surface any gap honestly (don't hide it).
+            # Seal the (possibly partial) authoritative close first, so covered markets score against
+            # real CON-040 data even if the close turns out incomplete.
+            await run.feed_closing(closing_state)
+
+            # Completeness gate (REQ-2D-104): true clv_bps requires a COMPLETE authoritative close
+            # covering EVERY scored market. ``seen_markets`` (every allowlisted market fed during the
+            # window) is the conservative coverage requirement — a SUPERSET of the actually-scored
+            # set, so a close that covers every seen market can NEVER leave a scored market on a
+            # stream fallback. Any gap means a scored market would close against its last STREAM tick.
             missing = seen_markets - set(closing_state.markets)
             if missing:
+                # An INCOMPLETE close is a DEGRADE — a third trigger alongside fetch-fail / reconstruct
+                # None. Labeling this run true clv_bps would present stream-observed CLV as true
+                # closing CLV for the missing markets (a per-row honesty lie). Because finalize labels
+                # every row uniformly by end_rule, the whole run degrades to WINDOW CLV
+                # (window_clv_bps) plus an honest, NON-sealed ops marker naming the uncovered markets.
+                ops["closing_source"] = CLOSING_SOURCE_FALLBACK
                 ops["closing_incomplete_markets"] = sorted(missing)
-            await run.feed_closing(closing_state)
-            # effective_window stays the pre_match window -> rows carry TRUE clv_bps.
+                effective_window = window.model_copy(update={"end_rule": "manual_stop"})
+            # else: a COMPLETE close -> effective_window stays pre_match -> rows carry TRUE clv_bps.
         else:
             # No authoritative close (fetch failed OR no pre-InRunning update). NO fabricated close,
             # NO feed_closing: the run's last fed tick is the de-facto close via _closing_snapshots.
