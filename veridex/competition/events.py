@@ -37,8 +37,8 @@ from veridex.runtime.orchestrator import (
     EVENT_TICK,
     RunResult,
 )
-from veridex.runtime.window import CLV_FIELD_WINDOW
-from veridex.scoring import is_window_scored
+from veridex.runtime.window import CLV_FIELD_WINDOW, WINDOW_CONFIG_EVENT_TYPE
+from veridex.scoring import is_scored, is_window_scored
 
 
 class EventType(str, Enum):
@@ -57,6 +57,7 @@ class EventType(str, Enum):
 
     COMPETITION_STARTED = "competition_started"
     MARKET_TICK = "market_tick"
+    WINDOW_CONFIG = "window_config"  # T8c — the sealed coverage-window config (windowed runs only)
     AGENT_ACTION = "agent_action"
     LAW_RESULT = "law_result"
     POLICY_RESULT = "policy_result"  # Phase 2B (executor lane) — never emitted by build_event_log
@@ -215,11 +216,6 @@ def _action_payload(run_event: dict[str, Any]) -> dict[str, Any]:
         "market_key": params.get("market_key"),
         "side": params.get("side"),
     }
-
-
-def _is_number(value: Any) -> bool:
-    """True for real numeric scores (excludes bools and the ``"pending"`` sentinel)."""
-    return isinstance(value, int | float) and not isinstance(value, bool)
 
 
 # ---------------------------------------------------------------------------
@@ -487,7 +483,15 @@ def build_evidence_event(
     elif event_type in (EVENT_DECISION, EVENT_ERROR):
         comp_event_type = EventType.AGENT_ACTION
         payload = _action_payload(run_event)
-    else:  # defensive: orchestrator emits only the three known types
+    elif event_type == WINDOW_CONFIG_EVENT_TYPE:
+        # T8c: the sealed coverage-window config (end_rule / min_clv_horizon_s / window_end_ts). It is
+        # already secret-free, so the display payload IS the config; the binding payload_hash still
+        # covers the FULL sealed RunEvent. event_ts stays the carried-forward tick ts (config is
+        # emitted at finalize, after every tick). Handled in BOTH the offline projection and the live
+        # sink because both route through this constructor — neither may crash on a windowed run.
+        comp_event_type = EventType.WINDOW_CONFIG
+        payload = json.loads(run_event["result_payload_json"]) if run_event.get("result_payload_json") else {}
+    else:  # defensive: orchestrator emits only the four known sealed types
         raise ValueError(f"unknown sealed run_event type: {event_type!r}")
 
     event = CompetitionEvent(
@@ -608,11 +612,12 @@ def build_event_log(run_result: RunResult, competition_meta: dict[str, Any]) -> 
 
     for agent_id in sorted(rows_by_agent):
         agent_rows = sorted(rows_by_agent[agent_id], key=lambda r: r["tick_seq"])
-        # true-CLV aggregation only: a window row carries its value under window_clv_bps (no clv_bps),
-        # and WAIT/pending_horizon carry the "pending" sentinel. r.get("clv_bps") is None for a window
-        # row, so _is_number excludes it — window CLV is NEVER blended into the true-CLV mean/total,
-        # exactly like scoring.is_scored / score_run (which never scores a window row).
-        numeric_clvs = [r["clv_bps"] for r in agent_rows if _is_number(r.get("clv_bps"))]
+        # true-CLV aggregation only, via scoring.is_scored — the SINGLE SOURCE of the "is this row
+        # scored?" predicate the leaderboard ranks on. is_scored requires BOTH valid is True AND a
+        # real int clv_bps, so a window row (no clv_bps), a WAIT/pending_horizon ("pending" sentinel),
+        # AND an invalid row with a stray numeric clv_bps are all excluded — the SCORE_UPDATE mean can
+        # never diverge from score_run's avg over a divergence a bare numeric check alone would miss.
+        numeric_clvs = [r["clv_bps"] for r in agent_rows if is_scored(r)]
         valid_count = sum(1 for r in agent_rows if r["valid"])
         total_clv = sum(numeric_clvs)
         mean_clv = (total_clv / len(numeric_clvs)) if numeric_clvs else None

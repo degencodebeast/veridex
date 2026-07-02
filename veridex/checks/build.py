@@ -27,7 +27,7 @@ from veridex.ingest.marketstate import MarketState
 from veridex.law.recompute import PENDING, recompute
 from veridex.runtime.evidence import compute_evidence_hash, serialize_payload
 from veridex.runtime.schemas import AgentAction
-from veridex.runtime.window import CLV_FIELD_WINDOW
+from veridex.runtime.window import CLV_FIELD_WINDOW, WINDOW_CONFIG_EVENT_TYPE, is_pending_horizon
 from veridex.scoring import score_run
 from veridex.verifier.import_audit import assert_no_llm_imports
 
@@ -164,6 +164,21 @@ def _actions_from_events(run_events: list[dict[str, Any]]) -> dict[tuple[Any, An
     return actions
 
 
+def _window_config_from_events(run_events: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """Read the sealed coverage-window config (T8c) from the hash-covered ``run_events``, or ``None``.
+
+    A windowed run seals ONE ``window_config`` RunEvent carrying ``{end_rule, min_clv_horizon_s,
+    window_end_ts}`` in ``result_payload_json`` (see ``orchestrator.finalize``). It is part of the
+    evidence-hash prefix, so a tampered config is caught by EVIDENCE_INTEGRITY; reading it here lets
+    METRICS_RECOMPUTED re-derive (rather than trust) a row's ``pending_horizon`` label. A no-window
+    run seals no such event ⇒ ``None`` (the label is then not derivable from sealed evidence).
+    """
+    for e in run_events:
+        if e.get("event_type") == WINDOW_CONFIG_EVENT_TYPE and e.get("result_payload_json"):
+            return json.loads(e["result_payload_json"])
+    return None
+
+
 def _metrics_recomputed(scores: list[dict[str, Any]], run: RunResult) -> CheckResult:
     """Re-derive every persisted action metric from the SEALED evidence and confirm it matches.
 
@@ -183,8 +198,20 @@ def _metrics_recomputed(scores: list[dict[str, Any]], run: RunResult) -> CheckRe
     evidence prefix, tampering a displayed ``clv_bps`` is invisible to EVIDENCE_INTEGRITY and caught
     ONLY here: the fresh recompute diverges from the doctored row ⇒ ``fail`` (with the discrepancy in
     ``rules``). Sourcing the action from the sealed decision event also closes the coordinated-tamper
-    evasion (editing ``clv_bps`` + ``raw_action`` together in a row). A run with no score rows is an
-    honest ``not_applicable`` (nothing to recompute). Fail-closed on any recompute error (CON-2B-02).
+    evasion (editing ``clv_bps`` + ``raw_action`` together in a row).
+
+    T8c — pending_horizon labels are VERIFIED, not trusted. A ``pending_horizon`` row carries the
+    ``"pending"`` sentinel (an abstention with no numeric metric), so a coordinated relabel of a
+    genuinely-scored row to ``reason="pending_horizon"`` + ``clv_bps="pending"`` would otherwise hide a
+    real row from the CLV mean with EVIDENCE_INTEGRITY still green. This check re-derives
+    :func:`~veridex.runtime.window.is_pending_horizon` from the SEALED window config
+    (``end_rule``/``min_clv_horizon_s``/``window_end_ts``, evidence-hash covered) + the row's sealed
+    entry tick, and FAILS a pending_horizon-labelled row that does not genuinely qualify (or whose
+    label is not derivable because no window config was sealed) — closing the rank/metric-omission
+    relabel evasion.
+
+    A run with no score rows is an honest ``not_applicable`` (nothing to recompute). Fail-closed on any
+    recompute error (CON-2B-02).
     """
     # Honest not_applicable (mirrors POLICY_OBEYED / RECEIPT_SEPARATION): nothing to recompute.
     if not run.score_rows:
@@ -197,6 +224,7 @@ def _metrics_recomputed(scores: list[dict[str, Any]], run: RunResult) -> CheckRe
         entry_by_tick: dict[Any, MarketState] = {ms.tick_seq: ms for ms in marketstates}
         closing_by_market = _closings_from_marketstates(marketstates)
         action_by_key = _actions_from_events(run.run_events)  # (tick_seq, agent_id) -> sealed raw action
+        window_cfg = _window_config_from_events(run.run_events)  # T8c: sealed {end_rule, horizon, end_ts}
 
         mismatches: list[dict[str, Any]] = []
         for row in run.score_rows:
@@ -208,21 +236,39 @@ def _metrics_recomputed(scores: list[dict[str, Any]], run: RunResult) -> CheckRe
                 reason = "entry_snapshot_missing" if entry is None else "sealed_action_missing"
                 mismatches.append({"tick_seq": tick_seq, "agent_id": agent_id, "reason": reason})
                 continue
-            # DEC-2D-2 honest abstention: a pending_horizon row carries the SAME "pending" sentinel
-            # as WAIT/pending_closing — no numeric displayed metric to anti-tamper. Its exclusion is a
-            # window-horizon (timing) decision made in finalize, NOT in the law the recompute replays,
-            # so the recompute can't reproduce "pending" here; skip it exactly like the other pending
-            # abstentions rather than flag a spurious mismatch. Gated on BOTH the reason AND the
-            # sentinel so a doctored numeric clv can never hide behind a relabelled reason.
-            #
-            # KNOWN TRUST BOUNDARY (tracked as T8c): this skip TRUSTS the row's self-declared label.
-            # The check cannot re-derive is_pending_horizon because the window config (min_clv_horizon_s,
-            # end_rule, window_end_ts) is NOT yet sealed into run_events, so a COORDINATED tamper —
-            # setting BOTH reason="pending_horizon" AND clv_bps="pending" on a genuinely-scored row —
-            # is skipped here and, since score_rows are not evidence-hashed, is NOT caught by
-            # EVIDENCE_INTEGRITY either. T8c closes this by sealing the window config and re-deriving +
-            # verifying the label. (Numeric window_clv_bps / true-clv anti-tamper below is unaffected.)
+            # DEC-2D-2 honest abstention, VERIFIED from sealed evidence (T8c): a pending_horizon row
+            # carries the SAME "pending" sentinel as WAIT/pending_closing, so there is no numeric
+            # displayed metric to anti-tamper — but the LABEL itself is now re-derived, not trusted.
+            # Because score_rows are NOT evidence-hashed, a coordinated relabel (setting BOTH
+            # reason="pending_horizon" AND clv_bps="pending" on a genuinely-scored row) would otherwise
+            # hide a real row from the CLV mean with EVIDENCE_INTEGRITY still green. So re-derive
+            # is_pending_horizon(entry_ts, window_end_ts, min_clv_horizon_s) from the SEALED window
+            # config (evidence-hash covered) + the row's sealed entry tick: a row that does NOT
+            # genuinely qualify — OR whose label is not derivable because no window config was sealed —
+            # is a mismatch ⇒ FAIL (the relabel evasion is caught). An honest, genuinely-within-horizon
+            # row is skipped exactly like the other pending abstentions. Gated on BOTH the reason AND
+            # the sentinel so a doctored numeric clv can never hide behind a relabelled reason.
             if row.get("reason") == "pending_horizon" and row.get("clv_bps") == PENDING:
+                if window_cfg is None:
+                    # The label claims a window-horizon exclusion, but no window config was sealed —
+                    # the label is not derivable from sealed evidence, so it cannot be trusted.
+                    mismatches.append(
+                        {"agent_id": agent_id, "tick_seq": tick_seq, "reason": "pending_horizon_not_sealed"}
+                    )
+                elif not is_pending_horizon(entry.ts, window_cfg["window_end_ts"], window_cfg["min_clv_horizon_s"]):
+                    # The sealed entry tick is NOT within min_clv_horizon_s of the sealed window close,
+                    # so the row does not genuinely qualify — the label is a lie (relabel evasion).
+                    mismatches.append(
+                        {
+                            "agent_id": agent_id,
+                            "tick_seq": tick_seq,
+                            "reason": "pending_horizon_mislabeled",
+                            "entry_ts": entry.ts,
+                            "window_end_ts": window_cfg["window_end_ts"],
+                            "min_clv_horizon_s": window_cfg["min_clv_horizon_s"],
+                        }
+                    )
+                # Honest or flagged, a pending abstention carries no numeric metric to recompute here.
                 continue
             action = AgentAction(**raw_action)
             market_key = (action.params or {}).get("market_key")

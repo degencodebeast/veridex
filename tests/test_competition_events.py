@@ -475,3 +475,27 @@ def test_score_update_window_aggregate_excludes_true_clv() -> None:
     # true aggregate sees ONLY the true row (100), never the window 999.
     assert score_update.payload["total_clv_bps"] == 100
     assert score_update.payload["mean_clv_bps"] == 100
+
+
+# ---------------------------------------------------------------------------
+# T8c coherence fold — SCORE_UPDATE's true-CLV mean uses scoring.is_scored (the single source),
+# NOT _is_number(clv_bps) alone. is_scored ALSO requires valid is True, so an invalid row with a
+# numeric clv_bps must be EXCLUDED from the SCORE_UPDATE mean/total exactly as score_run excludes it.
+# ---------------------------------------------------------------------------
+
+
+def test_score_update_excludes_invalid_numeric_clv_from_true_mean() -> None:
+    """An invalid row (valid=False) that still carries a numeric clv_bps must NOT enter the true-CLV
+    aggregate — matching scoring.is_scored / score_run (which require valid is True).
+
+    RED before the fold: the filter used ``_is_number(r.get("clv_bps"))`` alone, so the invalid row's
+    9999 was wrongly blended into the SCORE_UPDATE mean, diverging from score_run's avg.
+    """
+    valid_row = _score_row("agent-alpha", 0, clv_bps=100)  # valid True -> scored
+    invalid_row = _score_row("agent-alpha", 1, clv_bps=9999, valid=False)  # numeric but NOT scored
+
+    log = build_event_log(_run_with_rows([valid_row, invalid_row]), competition_meta())
+    (score_update,) = _score_update_events(log)
+    # 9999 is excluded (invalid) — the true mean/total sees ONLY the scored 100.
+    assert score_update.payload["total_clv_bps"] == 100
+    assert score_update.payload["mean_clv_bps"] == 100

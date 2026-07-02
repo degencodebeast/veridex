@@ -25,6 +25,11 @@ from pydantic import BaseModel, model_validator
 CLV_FIELD_TRUE = "clv_bps"
 #: The CLV value-field name a ``fixed_duration``/``manual_stop`` window uses — WINDOW (in-play) CLV.
 CLV_FIELD_WINDOW = "window_clv_bps"
+#: The ``RunEvent.event_type`` a windowed run seals its coverage-window config under (T8c). Defined
+#: HERE — the pure, trust-path-clean window module both the orchestrator (seal), the event-log
+#: projection, and the Proof-Check re-derivation import, so the string can never drift between the
+#: writer and the verifier. Emitted ONLY for windowed runs, so the legacy path stays byte-identical.
+WINDOW_CONFIG_EVENT_TYPE = "window_config"
 
 
 class RunWindow(BaseModel):

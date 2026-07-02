@@ -14,6 +14,7 @@ watched fail (wrong verdict), then the minimal implementation turns them GREEN.
 from __future__ import annotations
 
 import copy
+import json
 
 import pytest
 
@@ -21,7 +22,7 @@ from tests._arena_fixtures import finished_run_result
 from veridex.checks.build import build_performance_metrics
 from veridex.ingest.marketstate import MarketState
 from veridex.runtime.competition import read_path_check_block
-from veridex.runtime.evidence import compute_evidence_hash
+from veridex.runtime.evidence import compute_evidence_hash, serialize_payload
 from veridex.runtime.orchestrator import Agent, CompetitionRun
 from veridex.runtime.schemas import AgentAction, SportsActionType
 from veridex.runtime.window import RunWindow
@@ -421,3 +422,113 @@ async def test_metrics_recomputed_fails_on_tampered_window_clv() -> None:
     assert any(rule.get("persisted_clv_bps") == 300 + 9999 for rule in checks["metrics_recomputed"]["rules"])
     # The tamper touched only the non-hashed score_rows, so the evidence prefix still verifies.
     assert checks["evidence_integrity"]["result"] == "pass"
+
+
+# ---------------------------------------------------------------------------
+# T8c — seal the window config + VERIFY pending_horizon from SEALED evidence.
+#
+# The relabel evasion (the whole point): score_rows are NOT evidence-hashed, so a coordinated
+# tamper — relabel a genuinely-SCORED losing row to reason="pending_horizon" + clv_bps="pending" —
+# hides it from the CLV mean while EVIDENCE_INTEGRITY still passes. Before T8c the check TRUSTED the
+# label and skipped it (evasion succeeds). After T8c the check re-derives is_pending_horizon from the
+# SEALED window config + the row's sealed entry tick and FAILS a row that does not genuinely qualify.
+# These runs go through the REAL orchestrator (finalize(window=...)) so the sealed shapes are
+# byte-identical to production.
+# ---------------------------------------------------------------------------
+
+_WINDOW_CONFIG_EVENT = "window_config"
+
+
+async def _evasion_run() -> object:
+    """A pre_match run with ONE genuinely-scored losing row FAR from close (NOT pending_horizon).
+
+    tick0 (ts=1000) is 1000s from the window close (2000) — far outside any 60s horizon — so it is a
+    real scored true-CLV row. The closing line (over 5000 < entry 6000) makes it a LOSING row: exactly
+    the row an attacker wants to hide from the CLV mean by relabelling it a horizon abstention.
+    """
+    run = CompetitionRun([_wflag_agent()], source_mode="replay", run_id="t8c-evasion")
+    await run.feed(_wms({"over": 6000}, tick_seq=0, ts=1000))
+    await run.feed_closing(_wms({"over": 5000}, tick_seq=1, ts=2000))  # window_end_ts = 2000
+    return await run.finalize(window=_window("pre_match", min_clv_horizon_s=60))
+
+
+async def test_window_config_is_sealed_into_run_events() -> None:
+    """The windowed run seals end_rule + min_clv_horizon_s + the effective window_end_ts as evidence."""
+    result = await _evasion_run()
+    cfg_events = [e for e in result.run_events if e["event_type"] == _WINDOW_CONFIG_EVENT]  # type: ignore[attr-defined]
+    assert len(cfg_events) == 1
+    cfg = json.loads(cfg_events[0]["result_payload_json"])
+    assert cfg["end_rule"] == "pre_match"
+    assert cfg["min_clv_horizon_s"] == 60
+    assert cfg["window_end_ts"] == 2000
+
+
+async def test_no_window_run_seals_no_window_config() -> None:
+    """A window=None run seals NO window_config event (keeps the legacy path byte-identical)."""
+    run = CompetitionRun([_wflag_agent()], source_mode="replay", run_id="t8c-nowin")
+    await run.feed(_wms({"over": 6000}, tick_seq=0, ts=1000))
+    result = await run.finalize()  # window=None
+    assert not [e for e in result.run_events if e["event_type"] == _WINDOW_CONFIG_EVENT]
+
+
+async def test_sealed_window_config_is_tamper_evident() -> None:
+    """Tampering the sealed window config diverges the evidence hash ⇒ EVIDENCE_INTEGRITY fails."""
+    result = await _evasion_run()
+    # Baseline: the clean run's sealed prefix verifies.
+    assert read_path_check_block(score_run(result), result)["evidence_integrity"]["result"] == "pass"
+
+    for e in result.run_events:  # type: ignore[attr-defined]
+        if e["event_type"] == _WINDOW_CONFIG_EVENT:
+            e["result_payload_json"] = serialize_payload(
+                {"end_rule": "pre_match", "min_clv_horizon_s": 999_999, "window_end_ts": 2000}
+            )
+
+    checks = read_path_check_block(score_run(result), result)
+    assert checks["evidence_integrity"]["result"] == "fail"
+
+
+async def test_relabel_evasion_is_caught() -> None:
+    """THE evasion: a genuinely-scored losing row relabelled pending_horizon+pending must FAIL.
+
+    Before T8c METRICS_RECOMPUTED trusted the label and skipped this row (PASS — the hole). After
+    T8c it re-derives is_pending_horizon(entry_ts, window_end_ts, min_clv_horizon_s) from SEALED data;
+    the entry is 1000s from close (not within 60s) so the label is a LIE ⇒ FAIL.
+    """
+    result = await _evasion_run()
+    row0 = {r["tick_seq"]: r for r in result.score_rows}[0]  # type: ignore[attr-defined]
+    # Sanity: genuinely scored (numeric clv, valid) — a real row, not an abstention.
+    assert row0["valid"] is True
+    assert isinstance(row0["clv_bps"], int) and not isinstance(row0["clv_bps"], bool)
+
+    # Baseline: the honest run passes, so a subsequent fail is attributable ONLY to the relabel.
+    assert read_path_check_block(score_run(result), result)["metrics_recomputed"]["result"] == "pass"
+
+    # The attack: hide the losing row from the CLV mean by relabelling it a horizon abstention.
+    row0["reason"] = "pending_horizon"
+    row0["clv_bps"] = "pending"
+
+    checks = read_path_check_block(score_run(result), result)
+    assert checks["metrics_recomputed"]["result"] == "fail"
+    assert checks["metrics_recomputed"]["error"] is not None
+    # The discrepancy is surfaced as a mislabelled-horizon row (re-derived, not trusted).
+    assert any(rule.get("reason") == "pending_horizon_mislabeled" for rule in checks["metrics_recomputed"]["rules"])
+    # The tamper touched only the non-hashed score_rows, so the evidence prefix still verifies.
+    assert checks["evidence_integrity"]["result"] == "pass"
+
+
+async def test_honest_pending_horizon_still_passes_after_t8c() -> None:
+    """A row that GENUINELY qualifies (entry within the horizon) re-derives True ⇒ still passes.
+
+    Proves T8c verifies rather than blanket-rejects: the same sealed-evidence re-derivation that
+    catches the relabel confirms an honest pending_horizon row and skips it like WAIT.
+    """
+    run = CompetitionRun([_wflag_agent()], source_mode="replay", run_id="t8c-honest")
+    await run.feed(_wms({"over": 6000}, tick_seq=0, ts=1000))  # far from close -> scored true CLV
+    await run.feed(_wms({"over": 6300}, tick_seq=1, ts=1970))  # 30s before close -> genuine pending
+    await run.feed_closing(_wms({"over": 6600}, tick_seq=2, ts=2000))  # window_end_ts = 2000
+    result = await run.finalize(window=_window("pre_match", min_clv_horizon_s=60))
+
+    horizoned = {r["tick_seq"]: r for r in result.score_rows}[1]
+    assert horizoned["reason"] == "pending_horizon" and horizoned["clv_bps"] == "pending"
+
+    assert read_path_check_block(score_run(result), result)["metrics_recomputed"]["result"] == "pass"

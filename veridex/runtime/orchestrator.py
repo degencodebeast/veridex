@@ -49,7 +49,13 @@ from veridex.runtime.evidence import (
     serialize_payload,
 )
 from veridex.runtime.schemas import AgentAction, RunEvent
-from veridex.runtime.window import CLV_FIELD_TRUE, RunWindow, clv_field_name, is_pending_horizon
+from veridex.runtime.window import (
+    CLV_FIELD_TRUE,
+    WINDOW_CONFIG_EVENT_TYPE,
+    RunWindow,
+    clv_field_name,
+    is_pending_horizon,
+)
 from veridex.scoring import is_scored
 
 if TYPE_CHECKING:  # avoid a runtime import cycle (store lazily imports RunResult)
@@ -451,6 +457,29 @@ class CompetitionRun:
                 # pre_match window, or the last feed() for fixed_duration/manual_stop.
                 window_end_ts = self._snapshots[-1].ts
             clv_field = clv_field_name(window.end_rule)
+
+        # --- T8c: seal the coverage-window config as EVIDENCE (windowed runs only) ----------
+        # A verifier re-derives is_pending_horizon(entry_ts, window_end_ts, min_clv_horizon_s) to
+        # VERIFY (not trust) any pending_horizon label, so end_rule + min_clv_horizon_s + the
+        # effective window_end_ts must live inside the hash-covered run_events. Emitted via _emit so
+        # the live sink stays a faithful projection, and ONLY when window is not None (window=None
+        # seals no such event → the legacy/golden path is byte-identical). window_end_ts is None only
+        # for an empty run, which has no scored rows to protect, so the guard also skips that case.
+        if window is not None and window_end_ts is not None:
+            await self._emit(
+                {
+                    "sequence_no": self._sequence_no,
+                    "event_type": WINDOW_CONFIG_EVENT_TYPE,
+                    "result_payload_json": serialize_payload(
+                        {
+                            "end_rule": window.end_rule,
+                            "min_clv_horizon_s": window.min_clv_horizon_s,
+                            "window_end_ts": window_end_ts,
+                        }
+                    ),
+                }
+            )
+            self._sequence_no += 1
 
         # --- seal the evidence boundary: validate THEN hash (carry-forward 1) --------------
         run_events = validate_run_events(self._raw_events)

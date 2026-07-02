@@ -49,6 +49,7 @@ _COMPETITION_STATUS_VALUES: tuple[str, ...] = ("draft", "open", "running", "fina
 _EVENT_TYPE_VALUES: tuple[str, ...] = (
     "competition_started",
     "market_tick",
+    "window_config",
     "agent_action",
     "law_result",
     "policy_result",
