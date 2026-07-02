@@ -27,6 +27,7 @@ import signal
 import sys
 import time
 from pathlib import Path
+from typing import Any
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
@@ -55,7 +56,7 @@ class _Session:
         (self.session_dir / "meta.json").write_text(meta.model_dump_json())
         self._fh = (self.session_dir / "records.jsonl").open("a")
 
-    def write_record(self, record: dict, received_ts: int) -> None:
+    def write_record(self, record: dict[str, Any], received_ts: int) -> None:
         fid = record.get("FixtureId")
         if fid is not None:
             try:
@@ -68,7 +69,8 @@ class _Session:
         self._append(gap_line(from_ts, to_ts))
 
     def _append(self, line: str) -> None:
-        assert self._fh is not None
+        if self._fh is None:
+            raise RuntimeError("session not started")
         self._fh.write(line + "\n")
         self._fh.flush()
 
@@ -149,11 +151,13 @@ async def run(sessions_dir: Path, minutes: float | None) -> None:
                 last_received_ts = int(time.time())
     except KeyboardInterrupt:
         print("\nKeyboardInterrupt received, shutting down...")
-
-    print(f"fetching per-fixture updates for {len(session.seen_fixture_ids)} fixtures...")
-    await _write_fixture_updates(session, settings.txline_base_url, (jwt, token))
-    session.close()
-    print("done.")
+    finally:
+        # Always runs — clean exit, SIGINT, or an escaped error — so the per-fixture
+        # updates fetch and file close are never skipped.
+        print(f"fetching per-fixture updates for {len(session.seen_fixture_ids)} fixtures...")
+        await _write_fixture_updates(session, settings.txline_base_url, (jwt, token))
+        session.close()
+        print("done.")
 
 
 def main() -> None:

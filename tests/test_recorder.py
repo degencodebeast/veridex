@@ -43,3 +43,24 @@ def test_read_session_tolerates_truncated_final_line(tmp_path):
     )
     meta, records, gaps = read_session(tmp_path)
     assert [r["record"]["x"] for r in records] == [1, 2]
+
+
+def test_read_session_empty_and_gap_only(tmp_path):
+    empty_dir = tmp_path / "empty"
+    empty_dir.mkdir()
+    (empty_dir / "records.jsonl").write_text("")
+    (empty_dir / "meta.json").write_text(
+        SessionMeta(started_ts=1, endpoints=["/odds/stream"], tool_version="t").model_dump_json()
+    )
+    meta, records, gaps = read_session(empty_dir)
+    assert (records, gaps) == ([], [])
+
+    gap_only_dir = tmp_path / "gap_only"
+    gap_only_dir.mkdir()
+    (gap_only_dir / "records.jsonl").write_text(gap_line(10, 20) + "\n")
+    (gap_only_dir / "meta.json").write_text(
+        SessionMeta(started_ts=1, endpoints=["/odds/stream"], tool_version="t").model_dump_json()
+    )
+    meta, records, gaps = read_session(gap_only_dir)
+    assert records == []
+    assert gaps == [{"from_ts": 10, "to_ts": 20}]
