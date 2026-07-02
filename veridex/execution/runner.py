@@ -43,7 +43,7 @@ from veridex.policy.gate import (
     evaluate_pre_quote,
 )
 from veridex.strategies.value import value_proposals
-from veridex.venues.base import Order, OrderStatus
+from veridex.venues.base import Order, OrderStatus, poll_order_terminal
 
 if TYPE_CHECKING:
     from veridex.competition.models import AgentEntry
@@ -334,6 +334,7 @@ async def run_execution_lane(
                 size=stake,
                 price=quote.price,
                 venue=venue,
+                client_order_id=execution_id,
             )
             if execution_mode == _DRY_RUN:
                 # SIMULATED: build the status directly — never touch the network/submit path.
@@ -345,8 +346,10 @@ async def run_execution_lane(
                 )
                 receipt = adapter.normalize_receipt(execution_id, order, status, mode=_DRY_RUN)
             else:  # live_guarded
+                # Poll until a TERMINAL status (or an honest UNRESOLVED on timeout) — never build a
+                # receipt from a transient status, and never fabricate a fill.
                 ack = await adapter.submit_order(order)
-                status = await adapter.get_order_status(ack.venue_order_id)
+                status = await poll_order_terminal(adapter, ack.venue_order_id)
                 receipt = adapter.normalize_receipt(execution_id, order, status, mode=_LIVE_GUARDED)
 
             _advance_through(record, _POST_POLICY_PATH.get(receipt.status, (ExecutionStatus.SUBMITTED,)))
@@ -521,6 +524,7 @@ async def resolve_approval(
             size=stake,
             price=quote.price,
             venue=venue,
+            client_order_id=record.execution_id,
         )
         if execution_mode == _DRY_RUN:
             status = OrderStatus(
@@ -531,8 +535,10 @@ async def resolve_approval(
             )
             receipt = adapter.normalize_receipt(record.execution_id, order, status, mode=_DRY_RUN)
         else:  # live_guarded
+            # Poll until a TERMINAL status (or an honest UNRESOLVED on timeout) — never build a
+            # receipt from a transient status, and never fabricate a fill.
             ack = await adapter.submit_order(order)
-            status = await adapter.get_order_status(ack.venue_order_id)
+            status = await poll_order_terminal(adapter, ack.venue_order_id)
             receipt = adapter.normalize_receipt(record.execution_id, order, status, mode=_LIVE_GUARDED)
 
         _advance_through(record, _POST_POLICY_PATH.get(receipt.status, (ExecutionStatus.SUBMITTED,)))

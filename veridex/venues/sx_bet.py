@@ -45,12 +45,37 @@ from veridex.venues.base import (
     Order,
     OrderStatus,
     Quote,
+    QuoteLevel,
     SubmitAck,
     build_receipt,
 )
 
 if TYPE_CHECKING:
     from veridex.config import Settings
+
+# ---------------------------------------------------------------------------
+# Fake native<->decimal conversion (explicit, documented)
+# ---------------------------------------------------------------------------
+#
+# PRICE-UNIT DOCTRINE demo: the Fake keeps decimal odds (Veridex lingua franca) and a venue-native
+# value strictly separate, with an EXPLICIT relationship so tests can prove no native value leaks
+# into a decimal-odds field. The Fake's native unit is "implied probability in PERCENT" (a made-up
+# but self-consistent stand-in for a real venue unit like SX implied odds or Polymarket
+# probability): ``native = 100 / decimal`` and ``decimal = 100 / native``. A real adapter (T12-14,
+# T17) substitutes its own venue formula here — the CONTRACT is only that ``Quote.price`` /
+# ``OrderStatus.price`` stay decimal odds and ``native_price`` stays audit-only.
+_FAKE_NATIVE_SCALE: float = 100.0
+
+
+def _fake_decimal_to_native(decimal_odds: float) -> float:
+    """Convert decimal odds to the Fake's native unit (implied probability, percent)."""
+    return _FAKE_NATIVE_SCALE / decimal_odds
+
+
+def _fake_native_to_decimal(native_price: float) -> float:
+    """Convert the Fake's native unit (implied probability, percent) back to decimal odds."""
+    return _FAKE_NATIVE_SCALE / native_price
+
 
 # ---------------------------------------------------------------------------
 # FakeVenueAdapter — deterministic, offline, no network
@@ -68,12 +93,21 @@ class FakeVenueAdapter:
     Attributes:
         submit_calls: Counter incremented on each :meth:`submit_order` call;
             useful for asserting call counts in tests.
+        status_calls: Counter incremented on each :meth:`get_order_status` call;
+            lets poll tests assert exactly how many times the order was polled.
     """
 
-    _FIXED_PRICE: float = 2.05
+    _FIXED_PRICE: float = 2.05  # decimal odds (Veridex lingua franca)
     _FIXED_SIZE: float = 500.0
 
-    def __init__(self, *, fill: bool = True, fill_size: float | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        fill: bool = True,
+        fill_size: float | None = None,
+        stay_pending: bool = False,
+        pending_polls: int = 0,
+    ) -> None:
         """Initialise the fake adapter.
 
         Args:
@@ -84,11 +118,21 @@ class FakeVenueAdapter:
                 :meth:`get_order_status`.  When ``None``, a full fill is
                 simulated (size equals the submitted order size).  Set to a
                 value less than the order size to force a ``"partial"`` status.
+            stay_pending: When ``True`` every :meth:`get_order_status` call
+                returns a non-terminal ``"pending"`` status — drives the
+                ``poll_order_terminal`` timeout path (honest UNRESOLVED, no
+                fabricated fill).
+            pending_polls: The first *N* :meth:`get_order_status` calls return
+                ``"pending"`` before the terminal status is returned — drives
+                the "flips to terminal on the Nth poll" path.
         """
         self._fill = fill
         self._fill_size = fill_size
+        self._stay_pending = stay_pending
+        self._pending_polls = pending_polls
         self._orders: dict[str, Order] = {}
         self.submit_calls: int = 0
+        self.status_calls: int = 0
 
     async def quote_market(self, market_ref: str) -> Quote:
         """Return a fixed deterministic quote for any market reference.
@@ -98,12 +142,18 @@ class FakeVenueAdapter:
                 always returns the same quote).
 
         Returns:
-            A :class:`~veridex.venues.base.Quote` with fixed price/size.
+            A v2 :class:`~veridex.venues.base.Quote`: ``price`` is decimal odds,
+            ``native_price`` is the venue-native value it derived from (audit only),
+            and ``levels`` carry NATIVE book units.
         """
+        native = _fake_decimal_to_native(self._FIXED_PRICE)
         return Quote(
             market_ref=market_ref,
-            price=self._FIXED_PRICE,
+            price=self._FIXED_PRICE,  # decimal odds
+            native_price=native,  # audit only
             size=self._FIXED_SIZE,
+            for_size=self._FIXED_SIZE,
+            levels=[QuoteLevel(native_price=native, size=self._FIXED_SIZE)],
             ts=int(time.time()),
         )
 
@@ -126,9 +176,15 @@ class FakeVenueAdapter:
 
         The status string is chosen as follows:
 
+        - ``stay_pending`` or within the first ``pending_polls`` calls → ``"pending"``
+          (non-terminal; ``poll_order_terminal`` keeps polling / eventually times out)
         - ``fill=False``  → ``"rejected"``
         - ``fill=True`` and ``fill_size < order.size`` → ``"partial"``
         - ``fill=True`` and full fill → ``"filled"``
+
+        The returned ``price`` is DECIMAL ODDS of the matched price; ``native_price`` carries
+        the venue-native matched value for audit. A partial fill reports the MATCHED
+        ``filled_size`` (``fill_size``), never the requested order size (SEC-004).
 
         Args:
             venue_order_id: The order reference to query.
@@ -136,12 +192,26 @@ class FakeVenueAdapter:
         Returns:
             An :class:`~veridex.venues.base.OrderStatus` snapshot.
         """
+        self.status_calls += 1
+        native = _fake_decimal_to_native(self._FIXED_PRICE)
+
+        # Transient non-terminal states: perpetual (timeout) or first N polls (flip-on-Nth).
+        if self._stay_pending or self.status_calls <= self._pending_polls:
+            return OrderStatus(
+                venue_order_id=venue_order_id,
+                status="pending",
+                filled_size=0.0,
+                price=self._FIXED_PRICE,
+                native_price=native,
+            )
+
         if not self._fill:
             return OrderStatus(
                 venue_order_id=venue_order_id,
                 status="rejected",
                 filled_size=0.0,
                 price=self._FIXED_PRICE,
+                native_price=native,
             )
 
         order = self._orders.get(venue_order_id)
@@ -151,8 +221,9 @@ class FakeVenueAdapter:
             return OrderStatus(
                 venue_order_id=venue_order_id,
                 status="partial",
-                filled_size=self._fill_size,
+                filled_size=self._fill_size,  # MATCHED, not requested
                 price=self._FIXED_PRICE,
+                native_price=native,
             )
 
         return OrderStatus(
@@ -160,6 +231,7 @@ class FakeVenueAdapter:
             status="filled",
             filled_size=requested_size,
             price=self._FIXED_PRICE,
+            native_price=native,
         )
 
     async def cancel_order(self, venue_order_id: str) -> CancelAck:
