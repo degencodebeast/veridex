@@ -214,6 +214,14 @@ def _metrics_recomputed(scores: list[dict[str, Any]], run: RunResult) -> CheckRe
             # so the recompute can't reproduce "pending" here; skip it exactly like the other pending
             # abstentions rather than flag a spurious mismatch. Gated on BOTH the reason AND the
             # sentinel so a doctored numeric clv can never hide behind a relabelled reason.
+            #
+            # KNOWN TRUST BOUNDARY (tracked as T8c): this skip TRUSTS the row's self-declared label.
+            # The check cannot re-derive is_pending_horizon because the window config (min_clv_horizon_s,
+            # end_rule, window_end_ts) is NOT yet sealed into run_events, so a COORDINATED tamper —
+            # setting BOTH reason="pending_horizon" AND clv_bps="pending" on a genuinely-scored row —
+            # is skipped here and, since score_rows are not evidence-hashed, is NOT caught by
+            # EVIDENCE_INTEGRITY either. T8c closes this by sealing the window config and re-deriving +
+            # verifying the label. (Numeric window_clv_bps / true-clv anti-tamper below is unaffected.)
             if row.get("reason") == "pending_horizon" and row.get("clv_bps") == PENDING:
                 continue
             action = AgentAction(**raw_action)
