@@ -1,0 +1,1 @@
+{"pack_version":1,"capture":{"started_ts":99,"ended_ts":450,"endpoints":["/odds/stream"],"tool":"veridex-demo-phase2d","gaps":[]},"fixtures":[{"fixture_id":17588404,"records":"odds_17588404.jsonl"}],"closing_policy":"con-040_last_pre_inrunning","content_hash":"cd7e0daa53a066e08d46f98588e6b06845e16ffdce251f28d6b94a4005788249"}
