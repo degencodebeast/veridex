@@ -22,6 +22,7 @@ from httpx import ASGITransport
 
 from veridex.api.deploy import DeployDeps
 from veridex.api.router import create_app
+from veridex.deploy.instance import DeployStatus, deploy_status_values
 from veridex.deploy.preflight import DeployConfig
 from veridex.ingest.feed_health import FeedHealthReport
 from veridex.ingest.marketstate import MarketState
@@ -190,19 +191,20 @@ async def test_deploy_background_task_is_tracked_and_cancellable() -> None:
 
 
 async def test_deploy_pins_the_instance() -> None:
-    app, _store = _app_and_deps(_never_ending_stream)
+    app, store = _app_and_deps(_never_ending_stream)
     try:
         async with _transport(app) as client:
             resp = await client.post("/agents/deploy", json=_VALID)
         body = resp.json()
-        instances = getattr(app.state, "deploy_instances", {})
-        inst = instances[body["instance_id"]]
+        # The pinned instance is the DURABLE Store record (source of truth) — NOT an app.state entry.
+        inst = await store.get_agent_instance(body["instance_id"])
         assert inst.config_hash == body["config_hash"]
         assert inst.policy_hash == body["policy_hash"]
         assert inst.template_id == "sharp-momentum-v2"
         assert inst.source_mode == "live"
         assert inst.execution_mode == "paper"
         assert inst.market_allowlist == [_LIVE_KEY]
+        assert inst.venue_allowlist == ["fake"]
         assert inst.run_id == body["run_id"]
         # The pinned config_hash is exactly the submitted config's canonical hash.
         assert inst.config_hash == DeployConfig(**_VALID).config_hash()
@@ -210,6 +212,137 @@ async def test_deploy_pins_the_instance() -> None:
         for task in list(getattr(app.state, "deploy_background_tasks", set())):
             task.cancel()
         await _drain(app)
+
+
+# ---------------------------------------------------------------------------
+# DURABLE AGENT-INSTANCE — Store/Postgres-backed source of truth (REQ-2D-701A / AC-2D-701A)
+# The deployed instance is a PERSISTED record, not an app.state-only entry: it survives an
+# app.state clear (loadable from the Store), preflight failure pins NO row + NO run, and the
+# background seal/failure durably updates the STORED status.
+# ---------------------------------------------------------------------------
+
+
+async def test_deployed_instance_is_durable_through_the_store_after_app_state_cleared() -> None:
+    # The STRONGEST durability test: a successful deploy → the AgentInstance loads through the Store
+    # even after every process-local app.state deploy registry is cleared. app.state carries ONLY the
+    # live background task handle (cancellation bookkeeping) — never the durable instance record.
+    app, store = _app_and_deps(_never_ending_stream)
+    try:
+        async with _transport(app) as client:
+            resp = await client.post("/agents/deploy", json=_VALID)
+        body = resp.json()
+        instance_id = body["instance_id"]
+
+        # app.state holds NO instance registry — the source of truth is the Store, not memory.
+        assert getattr(app.state, "deploy_instances", None) is None
+        # Belt-and-braces: even if a future refactor caches instances in app.state, prove the record
+        # does not depend on it — wipe any such cache before loading.
+        app.state.deploy_instances = {}
+
+        # The record survives in the Store. For Postgres this is a FRESH AsyncConnection to the same
+        # DB; for InMemoryStore the store object IS the durable backing (independent of app.state).
+        loaded = await store.get_agent_instance(instance_id)
+        assert loaded.instance_id == instance_id
+        assert loaded.config_hash == body["config_hash"]
+        assert loaded.policy_hash == body["policy_hash"]
+        assert loaded.run_id == body["run_id"]
+        assert loaded.template_id == "sharp-momentum-v2"
+        assert loaded.agent_id == "studio-agent"
+        assert loaded.market_allowlist == [_LIVE_KEY]
+        assert loaded.venue_allowlist == ["fake"]
+        # The pinned submitted + effective config snapshots round-trip through the Store.
+        assert loaded.submitted_config["agent_id"] == "studio-agent"
+        assert loaded.effective_config["strategy"] == "momentum-sharp"
+        assert loaded.created_at
+        assert loaded.updated_at
+    finally:
+        for task in list(getattr(app.state, "deploy_background_tasks", set())):
+            task.cancel()
+        await _drain(app)
+
+
+async def test_preflight_failure_persists_no_instance_and_launches_no_run() -> None:
+    # Persist-then-launch ordering: a FAILING preflight pins NO AgentInstance row AND starts NO run.
+    # (Default app + a LIVE deploy with no live feed wired → the honest feed_health 422.)
+    store = InMemoryStore()
+    app = create_app(store=store)
+    async with _transport(app) as client:
+        resp = await client.post("/agents/deploy", json={**_VALID, "source_mode": "live"})
+    assert resp.status_code == 422, resp.text
+    assert not getattr(app.state, "deploy_background_tasks", set())  # fail-closed: no run launched
+    # No AgentInstance row was persisted — query the store → absent (the persist is gated behind
+    # preflight success).
+    assert store._agent_instances == {}  # noqa: SLF001 (white-box durability assertion)
+
+
+async def test_background_seal_updates_stored_instance_status() -> None:
+    # After the background run seals cleanly, the STORED instance's status is durably ``sealed``.
+    app, store = _app_and_deps(_finite_stream)
+    async with _transport(app) as client:
+        resp = await client.post("/agents/deploy", json=_VALID)
+        assert resp.status_code == 200, resp.text
+        instance_id = resp.json()["instance_id"]
+        await _drain(app)  # drive the background run to its natural seal
+
+    loaded = await store.get_agent_instance(instance_id)
+    assert loaded.status == DeployStatus.SEALED
+    assert loaded.last_failure_reason is None
+
+
+async def test_background_failure_updates_stored_instance_status_and_reason(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # After the background run FAILS pre-seal, the STORED instance is durably ``failed`` and carries
+    # a bounded, honest ``last_failure_reason`` (never a raw framework trace dump).
+    store = InMemoryStore()
+    deps = DeployDeps(
+        feed_report=_healthy_live_feed(),
+        market_resolved=True,
+        stream_factory=_raising_stream,
+        fetch_updates=_close,
+        anchor_fn=None,
+    )
+    app = create_app(store=store, deploy_deps=deps)
+    with caplog.at_level(logging.ERROR, logger="veridex.api.deploy"):
+        async with _transport(app) as client:
+            resp = await client.post("/agents/deploy", json=_VALID)
+            assert resp.status_code == 200, resp.text
+            instance_id = resp.json()["instance_id"]
+            await _drain(app)
+            await asyncio.sleep(0)  # let the done-callback (call_soon) run
+
+    loaded = await store.get_agent_instance(instance_id)
+    assert loaded.status == DeployStatus.FAILED
+    assert loaded.last_failure_reason  # a bounded reason is recorded durably
+    assert "stream boom pre-seal" in loaded.last_failure_reason
+
+
+async def test_deploy_response_is_narrow() -> None:
+    # The public deploy response exposes ONLY the narrow deployment identity/status fields — no
+    # secrets, no private runtime handles, no asyncio.Task object, no raw framework trace shape.
+    app, _store = _app_and_deps(_never_ending_stream)
+    try:
+        async with _transport(app) as client:
+            resp = await client.post("/agents/deploy", json=_VALID)
+        body = resp.json()
+        assert set(body.keys()) == {"instance_id", "config_hash", "policy_hash", "run_id"}
+        # Every exposed value is a plain string identity/hash — never a nested handle/task/trace.
+        assert all(isinstance(v, str) for v in body.values())
+        forbidden = ("task", "trace", "secret", "keypair", "adapter", "envelope", "stream", "anchor_fn")
+        blob = resp.text.lower()
+        assert not any(word in blob for word in forbidden)
+    finally:
+        for task in list(getattr(app.state, "deploy_background_tasks", set())):
+            task.cancel()
+        await _drain(app)
+
+
+def test_deploy_status_values_drift_guard() -> None:
+    # The store CHECK-constraint literal tuple stays in lockstep with the DeployStatus enum.
+    from veridex.store import _INSTANCE_STATUS_VALUES
+
+    assert deploy_status_values() == _INSTANCE_STATUS_VALUES
+    assert deploy_status_values() == ("pending", "running", "sealed", "failed")
 
 
 # ---------------------------------------------------------------------------
