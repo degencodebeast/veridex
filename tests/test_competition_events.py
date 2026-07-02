@@ -11,7 +11,9 @@ These builders are NEVER called by ``build_event_log`` — the 2A keystone tests
 
 from __future__ import annotations
 
+import dataclasses
 from pathlib import Path
+from typing import Any
 
 from tests._arena_fixtures import competition_meta, finished_run_result
 from veridex.competition.events import (
@@ -24,7 +26,10 @@ from veridex.competition.events import (
     event_payload_hash,
     replay_from,
 )
+from veridex.law.recompute import PENDING
 from veridex.runtime.evidence import serialize_payload
+from veridex.runtime.orchestrator import RunResult
+from veridex.runtime.window import CLV_FIELD_WINDOW
 from veridex.verifier.import_audit import assert_no_llm_imports
 
 
@@ -320,3 +325,112 @@ def test_build_event_log_still_does_not_emit_2b_events() -> None:
             EventType.PAYOUT_STATUS,
         }
     )
+
+
+# ---------------------------------------------------------------------------
+# T10b — build_event_log is window-aware (DEC-2D-1/2 honesty; REQ-2D-105)
+# ---------------------------------------------------------------------------
+#
+# A fixed_duration/manual_stop window's finalize renames a SCORED row's numeric CLV out of
+# clv_bps into window_clv_bps (row.pop("clv_bps")); a pending_horizon row keeps the "pending"
+# sentinel under clv_bps. build_event_log must project BOTH without a KeyError, must emit window
+# CLV under window_clv_bps (never mislabelled as true clv_bps), and must NEVER blend window CLV
+# into the true-CLV SCORE_UPDATE mean — exactly like scoring.is_scored / score_run.
+
+
+def _score_row(agent_id: str, tick_seq: int, **overrides: Any) -> dict[str, Any]:
+    """A minimal score_rows entry carrying every key build_event_log reads."""
+    row: dict[str, Any] = {
+        "agent_id": agent_id,
+        "tick_seq": tick_seq,
+        "valid": True,
+        "reason": "value_flag",
+        "recomputed_edge_bps": 0,
+        "clv_bps": 0,
+    }
+    row.update(overrides)
+    return row
+
+
+def _run_with_rows(rows: list[dict[str, Any]]) -> RunResult:
+    """A real sealed RunResult (fixture run_events) with hand-built windowed score_rows."""
+    base = finished_run_result()
+    return dataclasses.replace(base, score_rows=rows)
+
+
+def _law_result_events(log: list[CompetitionEvent]) -> list[CompetitionEvent]:
+    return [e for e in log if e.event_type == EventType.LAW_RESULT]
+
+
+def _score_update_events(log: list[CompetitionEvent]) -> list[CompetitionEvent]:
+    return [e for e in log if e.event_type == EventType.SCORE_UPDATE]
+
+
+def test_windowed_run_does_not_crash() -> None:
+    """A windowed run whose scored rows carry window_clv_bps (no clv_bps) must project cleanly.
+
+    This is the RED for the T10b crash: build_event_log read row["clv_bps"] unconditionally, so a
+    finalize()-renamed window row (which pops clv_bps) raised KeyError.
+    """
+    rows = [
+        _score_row("agent-alpha", 0, clv_bps=None, **{CLV_FIELD_WINDOW: 184}),
+        _score_row("agent-alpha", 1, clv_bps=None, **{CLV_FIELD_WINDOW: 42}),
+    ]
+    # The renamed row never carries both fields (finalize did window_clv_bps = row.pop("clv_bps")).
+    for row in rows:
+        del row["clv_bps"]
+
+    log = build_event_log(_run_with_rows(rows), competition_meta())
+    assert log[-1].event_type == EventType.COMPETITION_FINALIZED  # completed without KeyError
+
+
+def test_law_result_emits_window_clv_under_window_field() -> None:
+    """A window row's LAW_RESULT carries the value under window_clv_bps, never as true clv_bps."""
+    row = _score_row("agent-alpha", 0, **{CLV_FIELD_WINDOW: 184})
+    del row["clv_bps"]
+
+    log = build_event_log(_run_with_rows([row]), competition_meta())
+    (law,) = _law_result_events(log)
+    assert law.payload[CLV_FIELD_WINDOW] == 184
+    assert "clv_bps" not in law.payload  # window CLV is NEVER mislabelled as true CLV
+
+
+def test_score_update_excludes_window_clv_from_true_mean() -> None:
+    """The true-CLV total/mean aggregate ONLY numeric clv_bps rows — window_clv_bps is excluded."""
+    true_row = _score_row("agent-alpha", 0, clv_bps=100)
+    window_row = _score_row("agent-alpha", 1, **{CLV_FIELD_WINDOW: 999})
+    del window_row["clv_bps"]
+
+    log = build_event_log(_run_with_rows([true_row, window_row]), competition_meta())
+    (score_update,) = _score_update_events(log)
+    # 999 (window CLV) must NOT be blended into the true-CLV mean/total.
+    assert score_update.payload["total_clv_bps"] == 100
+    assert score_update.payload["mean_clv_bps"] == 100
+
+
+def test_score_update_all_window_rows_true_mean_is_none() -> None:
+    """An agent with only window_clv rows has NO true CLV — mean is honest None, no crash."""
+    rows = [
+        _score_row("agent-alpha", 0, **{CLV_FIELD_WINDOW: 184}),
+        _score_row("agent-alpha", 1, **{CLV_FIELD_WINDOW: 42}),
+    ]
+    for row in rows:
+        del row["clv_bps"]
+
+    log = build_event_log(_run_with_rows(rows), competition_meta())
+    (score_update,) = _score_update_events(log)
+    assert score_update.payload["mean_clv_bps"] is None
+    assert score_update.payload["total_clv_bps"] == 0
+
+
+def test_pending_horizon_row_projects_without_crash() -> None:
+    """A pending_horizon row keeps the "pending" sentinel; it is emitted honestly and excluded."""
+    pending_row = _score_row("agent-alpha", 0, clv_bps=PENDING, reason="pending_horizon")
+    numeric_row = _score_row("agent-alpha", 1, clv_bps=50)
+
+    log = build_event_log(_run_with_rows([pending_row, numeric_row]), competition_meta())
+
+    laws = {law.payload["tick_seq"]: law for law in _law_result_events(log)}
+    assert laws[0].payload["clv_bps"] == PENDING  # sentinel emitted honestly, not a numeric 0
+    (score_update,) = _score_update_events(log)
+    assert score_update.payload["mean_clv_bps"] == 50  # pending excluded from the numeric mean

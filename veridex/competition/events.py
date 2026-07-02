@@ -37,6 +37,7 @@ from veridex.runtime.orchestrator import (
     EVENT_TICK,
     RunResult,
 )
+from veridex.runtime.window import CLV_FIELD_WINDOW
 
 
 class EventType(str, Enum):
@@ -579,13 +580,19 @@ def build_event_log(run_result: RunResult, competition_meta: dict[str, Any]) -> 
         derived_seq += 1
 
     # (1) LAW_RESULT — one per scored decision, ordered by (agent_id, tick_seq).
+    # DEC-2D-1 honesty: a fixed_duration/manual_stop window's finalize renamed the numeric CLV out of
+    # clv_bps into window_clv_bps (row.pop("clv_bps")), so a window row carries NO clv_bps. Emit the
+    # value under whichever field the row actually holds — window_clv_bps for a window row, clv_bps for
+    # a true-CLV / WAIT / pending_horizon row — so downstream can never mistake window CLV for the true
+    # closing-line value, and so this projection never KeyErrors on a windowed run (mirrors T8b).
     for row in sorted(run_result.score_rows, key=lambda r: (r["agent_id"], r["tick_seq"])):
+        clv_field = CLV_FIELD_WINDOW if CLV_FIELD_WINDOW in row else "clv_bps"
         _emit_derived(
             EventType.LAW_RESULT,
             {
                 "agent_id": row["agent_id"],
                 "tick_seq": row["tick_seq"],
-                "clv_bps": row["clv_bps"],
+                clv_field: row[clv_field],
                 "valid": row["valid"],
                 "reason": row["reason"],
                 "recomputed_edge_bps": row["recomputed_edge_bps"],
@@ -600,7 +607,11 @@ def build_event_log(run_result: RunResult, competition_meta: dict[str, Any]) -> 
 
     for agent_id in sorted(rows_by_agent):
         agent_rows = sorted(rows_by_agent[agent_id], key=lambda r: r["tick_seq"])
-        numeric_clvs = [r["clv_bps"] for r in agent_rows if _is_number(r["clv_bps"])]
+        # true-CLV aggregation only: a window row carries its value under window_clv_bps (no clv_bps),
+        # and WAIT/pending_horizon carry the "pending" sentinel. r.get("clv_bps") is None for a window
+        # row, so _is_number excludes it — window CLV is NEVER blended into the true-CLV mean/total,
+        # exactly like scoring.is_scored / score_run (which never scores a window row).
+        numeric_clvs = [r["clv_bps"] for r in agent_rows if _is_number(r.get("clv_bps"))]
         valid_count = sum(1 for r in agent_rows if r["valid"])
         total_clv = sum(numeric_clvs)
         mean_clv = (total_clv / len(numeric_clvs)) if numeric_clvs else None
