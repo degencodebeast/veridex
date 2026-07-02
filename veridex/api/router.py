@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import json
 import time
+from pathlib import Path
 from typing import Any
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query
@@ -48,6 +49,8 @@ from veridex.api.demo_fixtures import (
 from veridex.api.schemas import (
     AgentRegisterResponse,
     ApprovalResponse,
+    BacktestRunRequest,
+    BacktestRunResponse,
     CompetitionCreateResponse,
     CompetitionLeaderboardRow,
     CompetitionStartResponse,
@@ -64,6 +67,8 @@ from veridex.api.schemas import (
     VerifyResponse,
 )
 from veridex.api.ws import ArenaConnectionManager, register_arena_routes
+from veridex.backtest.report import BacktestReport
+from veridex.backtest.runner import run_backtest
 from veridex.chain.anchor import explorer_tx_url
 from veridex.checks.build import (
     build_check_results,
@@ -101,6 +106,7 @@ from veridex.runtime.competition import (
 )
 from veridex.runtime.orchestrator import deterministic_agent
 from veridex.runtime.runtime_store import RuntimeEventStore
+from veridex.runtime.window import RunWindow
 from veridex.scoring import score_run
 from veridex.store import InMemoryStore, Store
 from veridex.venues.sx_bet import FakeVenueAdapter, SXBetAdapter
@@ -228,6 +234,10 @@ def create_app(
     # Per-app registry: run_id → {anchor_status, source_mode}.
     # Populated by POST /demo/run; consumed by GET /leaderboard.
     _run_meta: dict[str, dict[str, str]] = {}
+
+    # Per-app registry: backtest_id → BacktestReport (T15).
+    # Populated by POST /backtests; consumed by GET /backtests/{backtest_id}.
+    _backtest_reports: dict[str, BacktestReport] = {}
 
     # Per-app live-fanout manager (owns per-client bounded broadcast queues). The live producer
     # (start_competition's broadcast callback) persists each event BEFORE broadcasting it.
@@ -368,6 +378,56 @@ def create_app(
 
         rows_data = _build_leaderboard(all_score_rows) if all_score_rows else []
         return LeaderboardResponse(rows=[LeaderboardRow(**r) for r in rows_data])
+
+    # --- POST /backtests (T15 — replay a ReplayPack → honest BacktestReport) ----
+
+    @app.post("/backtests", response_model=BacktestRunResponse)
+    async def create_backtest(body: BacktestRunRequest) -> BacktestRunResponse:
+        """Replay a ReplayPack fixture through the live core and store its BacktestReport.
+
+        Deterministic + offline: the run is driven over a single reproducible baseline agent (no
+        LLM, no network). The report is a pure projection of the sealed run (SEC-003) and its mode
+        label is always ``"Backtest"`` (REQ-2D-304 — a replay is never dressed up as live).
+
+        Args:
+            body: The backtest request (pack path, fixture, window spec).
+
+        Returns:
+            A :class:`~veridex.api.schemas.BacktestRunResponse` with the ``backtest_id`` to fetch.
+
+        Raises:
+            HTTPException: 400 if the window spec is invalid or the pack cannot be loaded/verified.
+        """
+        try:
+            window = RunWindow(
+                window_id=body.window_id,
+                fixture_id=body.fixture_id,
+                market_allowlist=body.market_allowlist,
+                end_rule=body.end_rule,  # type: ignore[arg-type]  # validated by RunWindow
+                duration_s=body.duration_s,
+                min_clv_horizon_s=body.min_clv_horizon_s,
+            )
+            _, report = await run_backtest(
+                Path(body.pack_dir),
+                body.fixture_id,
+                [deterministic_agent("baseline")],
+                window=window,
+            )
+        except (ValueError, FileNotFoundError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+        _backtest_reports[report.run_id] = report
+        return BacktestRunResponse(backtest_id=report.run_id, mode_label=report.mode_label, run_id=report.run_id)
+
+    # --- GET /backtests/{backtest_id} (fetch the stored BacktestReport) --------
+
+    @app.get("/backtests/{backtest_id}", response_model=BacktestReport)
+    async def get_backtest(backtest_id: str) -> BacktestReport:
+        """Return a previously-produced :class:`BacktestReport` by its id (404 if unknown)."""
+        report = _backtest_reports.get(backtest_id)
+        if report is None:
+            raise HTTPException(status_code=404, detail=f"unknown backtest_id: {backtest_id}")
+        return report
 
     # --- GET /feed/health (WD-4: live-feed shown + judge-testable) --------
 
