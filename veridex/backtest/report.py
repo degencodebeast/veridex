@@ -50,7 +50,9 @@ _MODE_LADDER: dict[tuple[str, str | None], str] = {
 BACKTEST_EXECUTION_MODE = "paper"
 
 #: The fixed edge thresholds (bps) the threshold-sensitivity sweep reports over. Ascending; the
-#: first (0) is the unfiltered baseline so a reader can see how quickly coverage/CLV thin out.
+#: first rung (0) is the NON-NEGATIVE (>=0 bps) edge rung — NOT the full scored set: it already
+#: drops negative-CLV picks, so it diverges from the headline avg_clv/sample_size when losers exist.
+#: Higher rungs then show how quickly coverage/CLV thin out as the min-edge bar rises.
 _THRESHOLD_LADDER_BPS: tuple[int, ...] = (0, 25, 50, 100, 200)
 
 
@@ -183,7 +185,9 @@ def _scored_clv_values(score_rows: list[dict[str, Any]]) -> list[int]:
 def _threshold_sensitivity(scored_clv: list[int]) -> list[ThresholdSensitivityPoint]:
     """Sweep the fixed min-edge ladder. Phase 1 has ``edge_bps == clv_bps`` (no independent fair
     value), so thresholding on edge is thresholding on the scored CLV itself: each rung reports how
-    many picks cleared the bar and the mean CLV they realized."""
+    many picks cleared the bar (``clv >= threshold``) and the mean CLV they realized. Rung 0 is the
+    NON-NEGATIVE (>=0 bps) rung — it already excludes losers, so it is deliberately NOT the headline
+    ``avg_clv``/``sample_size`` (those cover every scored pick, winners and losers alike)."""
     points: list[ThresholdSensitivityPoint] = []
     for threshold in _THRESHOLD_LADDER_BPS:
         survivors = [clv for clv in scored_clv if clv >= threshold]
