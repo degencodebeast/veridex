@@ -1,7 +1,7 @@
 """Import-boundary audit (gate 2/7). Test-driven (T3).
 
-AST-walks a package dir and raises if any forbidden LLM SDK import is present. Adapted from
-`agent-rank/backend/tests/test_rebalance_cat_no_llm_imports.py` (the "Hamel-pattern" static audit).
+AST-walks a package dir and raises if any forbidden LLM SDK import is present. This is a
+static no-LLM-imports audit over the trust-path package.
 """
 
 from __future__ import annotations

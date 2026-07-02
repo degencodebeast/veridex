@@ -1,4 +1,4 @@
-"""CLV Check — a deterministic Proof Check (sibling of agent-rank's "Cat" modules). Test-driven (T5).
+"""CLV Check — a deterministic Proof Check module. Test-driven (T5).
 
 TRUST PATH: this module MUST NOT import agno/openai/anthropic/litellm (gate 2). It recomputes
 edge/CLV from evidence; the LLM-claimed edge is IGNORED (gate 1).
@@ -15,7 +15,7 @@ class ClvCheckResult(BaseModel):
     """A single legacy CLV-Check verdict (renamed from ``CheckResult`` to avoid colliding with the
     canonical 7-member :class:`veridex.checks.result.CheckResult` taxonomy, WD-5b Task 5).
 
-    Surfaced publicly as a ``checks`` entry, never "cat". Still consumed only by the sealed CLV law
+    Surfaced publicly as a ``checks`` entry, never a legacy internal name. Still consumed only by the sealed CLV law
     (:func:`veridex.law.recompute.recompute`) via :func:`compute_clv_check` — its ``reason`` string
     rides along on every recompute verdict as untrusted-edge metadata.
     """

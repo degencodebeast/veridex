@@ -1,7 +1,7 @@
 """Deterministic serialization + evidence hashing + the raw pre-score record (gate 3).
 
 Behavior is test-driven (T6) — stubs raise NotImplementedError so T1 fails meaningfully.
-Adapted from `agent-rank/backend/src/services/serialization.py` + `.../integrity/run_auditor.py`.
+Implements canonical serialization plus a run-integrity auditor over the evidence record.
 """
 
 from __future__ import annotations
@@ -12,7 +12,7 @@ from typing import Any
 
 
 def serialize_payload(payload: Any) -> str:
-    """Canonical JSON: sorted keys, compact separators. (agent-rank parity.)"""
+    """Canonical JSON: sorted keys, compact separators. (canonical-serialization parity.)"""
     return json.dumps(payload, sort_keys=True, separators=(",", ":"))
 
 

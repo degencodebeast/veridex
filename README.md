@@ -85,7 +85,7 @@ We also verified live that TxLINE's **StablePrice odds are de-margined consensus
                                                                  │
                                        (3) GATE                  ▼
                                 ┌─────────────────────────────────────────────┐
-                                │  Aegis two-phase POLICY                       │
+                                │  Two-phase POLICY gate                        │
                                 │  pre-quote: kill-switch · stake · allowlist   │
                                 │  post-quote: staleness · slippage · exec-edge │
                                 └─────────────────────────────────────────────┘
@@ -160,7 +160,7 @@ Veridex's hackathon build is five reviewed plans — **~90 tasks, each shipped t
 
 | Area | What shipped |
 |---|---|
-| **Proof engine** (backend) | The 7-CheckId taxonomy, the deterministic law (`law/recompute.py`), CLV scoring, the Merkle root-forest, the Solana Memo anchor, the two-phase Aegis policy gate, the live TxLINE auth/odds client. |
+| **Proof engine** (backend) | The 7-CheckId taxonomy, the deterministic law (`law/recompute.py`), CLV scoring, the Merkle root-forest, the Solana Memo anchor, the two-phase policy gate, the live TxLINE auth/odds client. |
 | **WD-1 — Verify** | `POST /runs/{id}/verify` recompute-from-sealed-evidence + explorer link. **Anyone can independently re-prove a run.** |
 | **WD-2 — Momentum agent** | A deterministic momentum strategy with a real (no-look-ahead) **+CLV benchmark** that out-ranks a baseline on a recorded fixture. |
 | **WD-3 — Agent SDK** | `veridex-agent` CLI + typed config + `Dockerfile.agent` — **deploy your own agent**, same law/policy/proof, byte-identical `evidence_hash`. Secret-safe (no creds in image). |
@@ -195,7 +195,7 @@ Veridex's hackathon build is five reviewed plans — **~90 tasks, each shipped t
 
 - AgentOS accepts a `base_app` → **Veridex's existing FastAPI proof API becomes the base**; AgentOS adds agent-serving routes + control plane on top.
 - Veridex already builds the constrained Agno agents (`output_schema=AgentAction`, `tools=[]`, `temperature=0`) and exposes the runtime-neutral `AgentRuntime`/`AgnoRuntime` protocol AgentOS plugs into.
-- **The critical boundary (already designed):** AgentOS sessions/memory/tracing are exactly the non-deterministic, stateful features the proof doctrine forbids in a scored run. So the agentos_app runs in **two modes** — *interactive/control-plane* (full AgentOS sessions/memory/AgentUI) and *scored* (history/memory/tools disabled, deterministic, feeding the existing law→checks→proof path). AgentOS traces feed the Ops drawer as **observability, never `evidence_hash`** (`SEC-003`/`SEC-010`). agent-rank treats AgentOS as the product; **Veridex treats it as a swappable runtime _under_ the proof** — the whole point of the runtime-neutral seam.
+- **The critical boundary (already designed):** AgentOS sessions/memory/tracing are exactly the non-deterministic, stateful features the proof doctrine forbids in a scored run. So the agentos_app runs in **two modes** — *interactive/control-plane* (full AgentOS sessions/memory/AgentUI) and *scored* (history/memory/tools disabled, deterministic, feeding the existing law→checks→proof path). AgentOS traces feed the Ops drawer as **observability, never `evidence_hash`** (`SEC-003`/`SEC-010`). Where a runtime-as-product framing would treat AgentOS as the product, **Veridex treats it as a swappable runtime _under_ the proof** — the whole point of the runtime-neutral seam.
 
 ---
 
@@ -246,7 +246,7 @@ veridex-arena/
 │   ├── law/            #   deterministic recompute (recompute.py) — the trust core
 │   ├── checks/         #   the 7-CheckId taxonomy + builders (no LLM imports)
 │   ├── verifier/       #   recompute-from-sealed verify (WD-1)
-│   ├── policy/         #   the two-phase Aegis gate
+│   ├── policy/         #   the two-phase policy gate
 │   ├── strategies/     #   value + momentum (WD-2)
 │   ├── chain/          #   Solana Merkle root-forest + Memo anchor
 │   ├── ingest/         #   live TxLINE auth/odds client + feed-health (WD-4)
