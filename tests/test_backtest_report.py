@@ -77,6 +77,7 @@ def test_report_has_every_spec_4_4_field() -> None:
         "threshold_sensitivity",
         "stale_rejected_quote_rate",
         "policy_pass_fail_rate",
+        "law_valid_rate",
         "low_sample_warning",
         "assumptions",
         "pack_id",
@@ -139,6 +140,31 @@ def test_low_sample_warning_does_not_mutate_ranking_or_means() -> None:
     assert report.leaderboard == baseline
     # And avg_clv is the honest pooled scored-CLV mean, computed independently of the warning.
     assert report.avg_clv is not None
+
+
+def test_policy_pass_fail_rate_is_null_without_real_policy_eval() -> None:
+    """Codex M3: the policy-named field stays None until a real envelope evaluation backs it.
+
+    The backtest lane never runs the execution policy envelope, so law-validity is exposed under its
+    honest name (``law_valid_rate``) — never under the policy name. Passing an envelope only feeds
+    ``config_hash``; it does NOT populate ``policy_pass_fail_rate``.
+    """
+    run = finished_run_result(source_mode="replay")
+    report = build_backtest_report(
+        run,
+        window=_window(),
+        pack_id="p",
+        content_hash="h",
+        source_mode="replay",
+        execution_mode="paper",
+        policy_envelope=None,
+    )
+
+    assert report.policy_pass_fail_rate is None
+    # The law-acceptance rate is still reported — under an honest, non-policy name.
+    total = report.sample_size
+    expected = (report.valid_count / total) if total else 0.0
+    assert report.law_valid_rate == expected
 
 
 def test_no_real_executable_edge_on_paper_venue() -> None:

@@ -165,7 +165,14 @@ class BacktestReport(BaseModel):
     # --- sensitivity + operational rates ------------------------------------
     threshold_sensitivity: list[ThresholdSensitivityPoint]
     stale_rejected_quote_rate: float
-    policy_pass_fail_rate: float
+    #: PASS fraction of the operator POLICY ENVELOPE (§4.4). ``None`` until a real policy-envelope
+    #: evaluation actually backs it — the backtest lane does NOT yet run the execution envelope
+    #: (that wiring arrives in M4/T17), so this is honestly null here rather than a law-validity
+    #: number wearing a policy name. LAW-acceptance lives under ``law_valid_rate`` instead.
+    policy_pass_fail_rate: float | None
+    #: LAW-acceptance pass fraction (valid decisions / total decisions) — the honest name for what
+    #: the replay law actually verifies. Distinct from the (policy-envelope) ``policy_pass_fail_rate``.
+    law_valid_rate: float
 
     # --- explicit assumptions + the untouched score stack -------------------
     assumptions: BacktestAssumptions
@@ -297,8 +304,11 @@ def build_backtest_report(
         if confidence["low_sample"]
         else None
     )
-    # policy_pass_fail_rate is the law-acceptance PASS rate over all decisions (valid / total).
-    policy_pass_fail_rate = (valid_count / sample_size) if sample_size else 0.0
+    # law_valid_rate is the LAW-acceptance PASS rate over all decisions (valid / total). The
+    # POLICY-envelope pass/fail rate stays None until a real envelope evaluation backs it (M4/T17) —
+    # the backtest lane does not run the execution policy envelope, so naming law-validity as a
+    # "policy" rate would overclaim (Codex M3). policy_envelope here only feeds config_hash.
+    law_valid_rate = (valid_count / sample_size) if sample_size else 0.0
 
     return BacktestReport(
         pack_id=pack_id,
@@ -330,7 +340,8 @@ def build_backtest_report(
         real_executable_edge_bps=None,
         threshold_sensitivity=_threshold_sensitivity(scored_clv),
         stale_rejected_quote_rate=_stale_rejected_quote_rate(score_rows),
-        policy_pass_fail_rate=policy_pass_fail_rate,
+        policy_pass_fail_rate=None,  # no real policy-envelope evaluation on this path yet (M4/T17)
+        law_valid_rate=law_valid_rate,
         assumptions=resolved_assumptions,
         leaderboard=score_run(run),
         generated_ts=generated_ts if generated_ts is not None else 0,

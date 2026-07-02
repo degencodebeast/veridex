@@ -90,6 +90,7 @@ async def test_run_backtest_populates_all_report_fields(tmp_path: Path) -> None:
         "threshold_sensitivity",
         "stale_rejected_quote_rate",
         "policy_pass_fail_rate",
+        "law_valid_rate",
         "low_sample_warning",
         "assumptions",
         "pack_id",
@@ -104,6 +105,10 @@ async def test_run_backtest_populates_all_report_fields(tmp_path: Path) -> None:
     # The run actually scored something (the pack is well-formed).
     assert report.sample_size > 0
     assert report.avg_clv is not None
+    # Codex M3: the policy-named field is honestly null (no envelope evaluated); law-acceptance
+    # lives under law_valid_rate instead.
+    assert report.policy_pass_fail_rate is None
+    assert 0.0 <= report.law_valid_rate <= 1.0
 
 
 async def test_small_sample_is_low_confidence_with_warning(tmp_path: Path) -> None:
