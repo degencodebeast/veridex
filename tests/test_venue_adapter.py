@@ -75,11 +75,22 @@ def test_normalize_receipt_pure_deterministic() -> None:
 
 
 def test_import_sx_bet_is_offline_safe() -> None:
-    """Importing veridex.venues.sx_bet must not pull in httpx or aiohttp."""
-    import veridex.venues.sx_bet  # noqa: F401
+    """Importing veridex.venues.sx_bet must not eagerly pull in httpx or aiohttp.
 
-    assert "httpx" not in sys.modules
-    assert "aiohttp" not in sys.modules
+    Checked in a fresh interpreter: other tests in this process (e.g. the vendored
+    Polymarket client's import test) legitimately import httpx/aiohttp, which would
+    pollute this process's ``sys.modules`` and make an in-process check order-fragile.
+    A subprocess isolates the assertion to sx_bet's OWN import graph.
+    """
+    import subprocess
+
+    code = (
+        "import sys, veridex.venues.sx_bet\n"
+        "assert 'httpx' not in sys.modules, 'sx_bet eagerly imported httpx'\n"
+        "assert 'aiohttp' not in sys.modules, 'sx_bet eagerly imported aiohttp'\n"
+    )
+    result = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
 
 
 def test_venues_no_secrets_in_module() -> None:
