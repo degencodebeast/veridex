@@ -190,6 +190,23 @@ async def test_fixed_duration_rows_use_window_clv_bps_and_no_clv_bps() -> None:
     assert "clv_bps" not in scored
 
 
+async def test_pending_horizon_wins_over_window_clv_rename_in_fixed_duration() -> None:
+    # Precedence pin: in a fixed_duration window, a horizon'd row must come out clv_bps == "pending"
+    # (the pending_horizon override) and NOT window_clv_bps — the if/elif guarantees pending_horizon
+    # takes precedence over the window_clv rename. The final tick (entry AT close, 0s runway) is
+    # always within any positive horizon, so it is the horizon'd row here.
+    run = CompetitionRun([_flag_agent()], source_mode="replay", run_id="prec-1")
+    await run.feed(_ms({"over": 6000}, tick_seq=0, ts=1000))
+    await run.feed(_ms({"over": 6300}, tick_seq=1, ts=1100))  # window_end_ts = 1100; entry AT close
+    result = await run.finalize(window=_window("fixed_duration", duration_s=100, min_clv_horizon_s=60))
+
+    horizoned = {r["tick_seq"]: r for r in result.score_rows}[1]
+    # pending_horizon WINS: the row carries the "pending" sentinel under clv_bps, never window_clv_bps.
+    assert horizoned["reason"] == "pending_horizon"
+    assert horizoned["clv_bps"] == "pending"
+    assert "window_clv_bps" not in horizoned
+
+
 async def test_pre_match_rows_use_clv_bps_not_window_clv_bps() -> None:
     run = CompetitionRun([_flag_agent()], source_mode="replay", run_id="pm-1")
     await run.feed(_ms({"over": 6000}, tick_seq=0, ts=1000))

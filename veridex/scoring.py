@@ -46,12 +46,17 @@ if TYPE_CHECKING:  # type-only import keeps the trust path free of a runtime dep
     from veridex.runtime.orchestrator import RunResult
 
 
-def _is_scored(row: dict[str, Any]) -> bool:
+def is_scored(row: dict[str, Any]) -> bool:
     """An action is scored IFF ``valid is True`` AND ``clv_bps`` is a real ``int``.
 
     The ``bool`` guard matters: ``isinstance(True, int)`` is ``True`` in Python, so a stray boolean
     ``clv_bps`` must not masquerade as a numeric score. The ``"pending"`` sentinel (WAIT and
     live-pending) is a ``str`` and is excluded here without ever inspecting ``reason``.
+
+    This is the SINGLE SOURCE OF TRUTH for the "is this row scored?" predicate: the orchestrator's
+    windowed DEC-2D-1/2 overrides (``finalize(window=...)``) import THIS function to decide which
+    rows they may touch, so the override set can never silently desync from the scored set that
+    ranks the leaderboard.
 
     Args:
         row: A single ``RunResult.score_rows`` entry.
@@ -141,7 +146,7 @@ def _agent_metrics(agent_id: str, proof_mode: str, agent_rows: list[dict[str, An
     Returns:
         A metric-stack dict for this agent, without the ``rank`` field.
     """
-    scored = sorted((r for r in agent_rows if _is_scored(r)), key=lambda r: r["tick_seq"])
+    scored = sorted((r for r in agent_rows if is_scored(r)), key=lambda r: r["tick_seq"])
     scored_clv: list[int] = [r["clv_bps"] for r in scored]
 
     action_count = len(scored)

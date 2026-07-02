@@ -50,6 +50,7 @@ from veridex.runtime.evidence import (
 )
 from veridex.runtime.schemas import AgentAction, RunEvent
 from veridex.runtime.window import CLV_FIELD_TRUE, RunWindow, clv_field_name, is_pending_horizon
+from veridex.scoring import is_scored
 
 if TYPE_CHECKING:  # avoid a runtime import cycle (store lazily imports RunResult)
     from veridex.store import Store
@@ -214,19 +215,6 @@ def _closing_snapshots(marketstates: list[MarketState]) -> dict[str, MarketState
         for market_key in state.markets:
             closing_by_market[market_key] = state
     return closing_by_market
-
-
-def _is_scored_row(row: dict[str, Any]) -> bool:
-    """A row IS scored IFF ``valid is True`` AND ``clv_bps`` is a real ``int`` (not ``bool``).
-
-    Mirrors ``veridex.scoring._is_scored`` exactly (kept local to avoid inverting the module
-    layering — ``scoring`` depends on this module's ``RunResult``, not the reverse). Used ONLY to
-    decide which rows the windowed DEC-2D-1/2 overrides may touch: WAIT/live-pending (``"pending"``
-    sentinel) and invalid (``valid is False``) rows are deliberately excluded so an override can
-    never mislabel an abstention or flip an invalid action's validity.
-    """
-    clv = row.get("clv_bps")
-    return row.get("valid") is True and isinstance(clv, int) and not isinstance(clv, bool)
 
 
 # ---------------------------------------------------------------------------
@@ -504,11 +492,12 @@ class CompetitionRun:
                 "kelly_fraction": result["kelly_fraction"],
                 "raw_prescore": prescore,
             }
-            # Windowed honesty overrides (DEC-2D-1/2) apply ONLY to rows that ARE scored — the
-            # exact scoring.py predicate (valid AND real int clv_bps). This deliberately leaves
-            # WAIT/live-pending (clv_bps == "pending") and invalid (valid is False) rows UNTOUCHED,
-            # so pending_horizon never mislabels an abstention and the rename never flips validity.
-            if window is not None and window_end_ts is not None and _is_scored_row(row):
+            # Windowed honesty overrides (DEC-2D-1/2) apply ONLY to rows that ARE scored — using
+            # scoring.is_scored, the SINGLE SOURCE OF TRUTH the leaderboard ranks on (so the override
+            # set can never desync from the scored set). This deliberately leaves WAIT/live-pending
+            # (clv_bps == "pending") and invalid (valid is False) rows UNTOUCHED, so pending_horizon
+            # never mislabels an abstention and the rename never flips validity.
+            if window is not None and window_end_ts is not None and is_scored(row):
                 if is_pending_horizon(snapshot.ts, window_end_ts, window.min_clv_horizon_s):
                     # DEC-2D-2: too little runway to close → excluded from CLV means like WAIT, via
                     # the EXISTING "pending" sentinel (scoring.py excludes it for free — no numeric 0,
