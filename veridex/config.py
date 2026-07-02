@@ -102,6 +102,14 @@ class Settings(BaseSettings):
     # Private key for EIP-712 order signing — NEVER commit this value.
     sx_bet_private_key: str | None = Field(default=None, validation_alias="SX_BET_PRIVATE_KEY")
 
+    # ------------------------------------------------------------------
+    # Polymarket venue adapter (async shell; CON-010)
+    # ------------------------------------------------------------------
+    # Polymarket CLOB is MAINNET real money, so the write path is DISABLED by default:
+    # submit_order / cancel_order raise PolymarketWriteDisabled until this is explicitly true.
+    # The READ path (depth-aware quotes) is always available and needs no credential.
+    polymarket_write_enabled: bool = Field(default=False, validation_alias="POLYMARKET_WRITE_ENABLED")
+
 
 # ---------------------------------------------------------------------------
 # Fail-fast-at-use helpers
