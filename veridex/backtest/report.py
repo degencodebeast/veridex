@@ -283,12 +283,16 @@ def build_backtest_report(
 
     score_rows = run.score_rows
     sample_size = len(score_rows)
-    # valid_count is LAW-ACCEPTANCE (valid is True) — the WD-7 CLV sample-size source, single-sourced
-    # so the report's tier can never desync from the leaderboard's. Includes valid abstentions.
+    # valid_count is LAW-ACCEPTANCE (valid is True), INCLUDING valid WAIT abstentions. It feeds
+    # law_valid_rate below — a legitimate, DISTINCT metric — but it is NOT the CLV confidence source.
     valid_count = sum(1 for row in score_rows if row.get("valid") is True)
-    confidence = clv_confidence(valid_count)
 
     scored_clv = _scored_clv_values(score_rows)
+    # CLV confidence keys off the SCORED sample (actual picks carrying a real CLV), NEVER valid_count:
+    # a run can be law-valid on thousands of WAIT abstentions yet score ZERO picks, and a zero-scored
+    # run MUST read "low" confidence, never "high" (honesty — the tier reflects CLV coverage, not
+    # acceptance). Keying off valid_count here was an overclaim; the scored count is the honest source.
+    confidence = clv_confidence(len(scored_clv))
     avg_clv = (sum(scored_clv) / len(scored_clv)) if scored_clv else None
     distribution = ClvDistribution(
         count=len(scored_clv),
@@ -299,7 +303,7 @@ def build_backtest_report(
     )
 
     low_sample_warning = (
-        f"Only {valid_count} law-valid decisions (< 10): CLV confidence is LOW — "
+        f"Only {len(scored_clv)} scored picks (< 10): CLV confidence is LOW — "
         "treat the ranking as indicative, not conclusive."
         if confidence["low_sample"]
         else None

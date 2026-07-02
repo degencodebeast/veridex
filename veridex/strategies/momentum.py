@@ -212,8 +212,11 @@ def momentum_agent(agent_id: str = "momentum", *, lookback: int = 8, min_momentu
 
 # Clean market families v2 will act on. Props (player points/assists, anytime-scorer, …) are
 # DEFERRED — their price process is noisier and less liquid, so the sharp-move model does not
-# apply cleanly yet. Matched by a case-insensitive key prefix.
-CLEAN_FAMILY_PREFIXES: tuple[str, ...] = ("1X2", "OU", "TOTAL", "OVER_UNDER", "WLD")
+# apply cleanly yet. Matched by a case-insensitive key prefix. ``OVERUNDER_PARTICIPANT_GOALS`` is
+# the REAL normalized TxLINE totals family (deepest liquidity — see
+# ``veridex.ingest.txline_normalize.market_key``); the synthetic-demo literal "OU" masked its
+# absence, so real totals were silently ineligible until it was added here.
+CLEAN_FAMILY_PREFIXES: tuple[str, ...] = ("1X2", "OU", "TOTAL", "OVER_UNDER", "OVERUNDER_PARTICIPANT_GOALS", "WLD")
 
 
 def is_clean_family(market_key: str) -> bool:
