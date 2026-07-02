@@ -27,6 +27,10 @@ from veridex.strategies.momentum import momentum_agent
 MARKET_KEY = "OU_2_5"
 RUN_ID = "golden-run-1"
 GOLDEN_DIR = pathlib.Path(__file__).parent
+# Both explicit (symmetric) so the golden is provably env-independent — neither case relies on
+# the ambient `get_settings().decision_timeout_s` (env `DECISION_TIMEOUT_S`). HAPPY_DECISION_TIMEOUT_S
+# never actually fires (both agents are synchronous and fast); it just removes the env-coupling.
+HAPPY_DECISION_TIMEOUT_S = 30.0
 ERROR_DECISION_TIMEOUT_S = 0.01
 
 
@@ -94,10 +98,10 @@ def _result_to_dict(result: RunResult) -> dict[str, Any]:
 
 async def _run(case: str) -> dict[str, Any]:
     marketstates, agents = build_inputs(case)
-    kwargs: dict[str, Any] = {"source_mode": "replay", "run_id": RUN_ID}
-    if case == "error":
-        kwargs["decision_timeout_s"] = ERROR_DECISION_TIMEOUT_S
-    result = await run_competition(marketstates, agents, **kwargs)
+    timeout_s = ERROR_DECISION_TIMEOUT_S if case == "error" else HAPPY_DECISION_TIMEOUT_S
+    result = await run_competition(
+        marketstates, agents, source_mode="replay", run_id=RUN_ID, decision_timeout_s=timeout_s
+    )
     return _result_to_dict(result)
 
 
@@ -110,12 +114,20 @@ def _dump(payload: dict[str, Any]) -> str:
     return json.dumps(payload, sort_keys=True, indent=1)
 
 
+def run_case_dump(case: str) -> str:
+    """Run `case` and return the SAME canonical JSON string used to write the fixture.
+
+    The single source of truth for "sealed bytes": both the writer (``main``) and the pinning
+    test (``tests/test_orchestrator_golden.py``) go through this + ``_dump`` so the write path
+    and the compare path can never diverge.
+    """
+    return _dump(run_case(case))
+
+
 def main() -> None:
     for case in ("happy", "error"):
-        first = run_case(case)
-        second = run_case(case)
-        first_json = _dump(first)
-        second_json = _dump(second)
+        first_json = run_case_dump(case)
+        second_json = run_case_dump(case)
         if first_json != second_json:
             raise SystemExit(f"non-deterministic golden output for case={case!r}: two runs differ")
         path = GOLDEN_DIR / f"run_baseline_{case}.json"
