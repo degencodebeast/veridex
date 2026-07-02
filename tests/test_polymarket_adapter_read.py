@@ -229,3 +229,15 @@ async def test_cancel_order_raises_write_disabled_under_default_config() -> None
     )
     with pytest.raises(PolymarketWriteDisabled):
         await adapter.cancel_order("venue-order-1")
+
+
+async def test_get_order_status_raises_write_disabled_under_default_config() -> None:
+    """get_order_status is gated identically to submit/cancel: in read-only mode there are no live
+    orders to query, so it fails closed behind the write gate (real-money safety — all three pinned)."""
+    adapter = PolymarketAdapter(
+        _RESOLVED,
+        _FakeBookClient({"bids": [], "asks": [], "timestamp": 0}),
+        settings=_default_disabled_settings(),
+    )
+    with pytest.raises(PolymarketWriteDisabled):
+        await adapter.get_order_status("venue-order-1")
