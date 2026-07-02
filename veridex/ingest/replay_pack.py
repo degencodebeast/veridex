@@ -107,11 +107,28 @@ def pack_from_session(session_dir: Path, out_dir: Path) -> ReplayPack:
     return pack
 
 
-def load_pack_marketstates(pack_dir: Path, fixture_id: int, *, batch_size: int = 1) -> list[MarketState]:
-    """Read a fixture's odds file and feed the raw records through the SAME normalizer live uses."""
-    path = pack_dir / f"odds_{fixture_id}.jsonl"
-    if not path.exists():
-        raise FileNotFoundError(f"fixture_id {fixture_id} not found in pack {pack_dir} (missing {path.name})")
+def load_pack_marketstates(
+    pack_dir: Path, fixture_id: int, *, batch_size: int = 1, verify: bool = True
+) -> list[MarketState]:
+    """Read a fixture's odds file and feed the raw records through the SAME normalizer live uses.
+
+    Manifest-gated: the file to read comes from the pack's `fixtures` manifest entry for
+    `fixture_id`, NEVER from a filename guessed off `fixture_id` alone. A file sitting in
+    `pack_dir` that isn't referenced by the manifest (e.g. a stale leftover from a prior build
+    into the same directory) is rejected even if it exists and is well-formed.
+
+    `verify=True` (default) refuses to replay a pack whose stored content_hash doesn't match
+    its data files — pass `verify=False` to opt out for trusted/perf-sensitive paths.
+    """
+    if verify and not verify_content_hash(pack_dir):
+        raise ValueError(f"pack at {pack_dir} failed content_hash verification (tampered or corrupt)")
+
+    manifest = json.loads((pack_dir / "pack.json").read_text())
+    entry = next((f for f in manifest["fixtures"] if f["fixture_id"] == fixture_id), None)
+    if entry is None:
+        raise FileNotFoundError(f"fixture_id {fixture_id} not present in pack manifest at {pack_dir}")
+
+    path = pack_dir / entry["records"]
     records = [json.loads(line) for line in path.read_text().splitlines() if line]
     return list(marketstates_from_record_stream(records, batch_size=batch_size))
 

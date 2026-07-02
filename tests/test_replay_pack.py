@@ -110,3 +110,41 @@ def test_capture_gaps_populated(tmp_path):
     pack = pack_from_session(session_dir, out_dir)
 
     assert pack.capture["gaps"] == [{"from_ts": 100, "to_ts": 130}]
+
+
+def test_load_pack_marketstates_rejects_unmanifested_stale_fixture(tmp_path):
+    session_dir = _write_session(tmp_path)
+    out_dir = tmp_path / "pack"
+    pack_from_session(session_dir, out_dir)
+
+    # WELL-FORMED stale file dropped in AFTER build — content that WOULD normalize cleanly if
+    # loaded, so a rejection here proves the MANIFEST gate rejects it, not an incidental
+    # normalizer crash on garbage data.
+    (out_dir / "odds_99.jsonl").write_text(json.dumps(_odds_record(99, 200_000)) + "\n")
+
+    assert verify_content_hash(out_dir) is True  # stale file still excluded from the hash
+
+    with pytest.raises(FileNotFoundError, match="fixture_id 99"):
+        load_pack_marketstates(out_dir, 99)  # manifest rejects it despite being loadable
+
+    assert [ms.tick_seq for ms in load_pack_marketstates(out_dir, 5)] == [0, 1]  # manifested fixture still works
+
+
+def test_load_pack_marketstates_refuses_tampered_pack_by_default(tmp_path):
+    session_dir = _write_session(tmp_path)
+    out_dir = tmp_path / "pack"
+    pack_from_session(session_dir, out_dir)
+
+    # A tamper that stays valid, parseable JSON (unlike a raw byte flip) — proves the rejection
+    # below is verify's doing, not an incidental JSON/UTF-8 parse error.
+    data_file = out_dir / "odds_5.jsonl"
+    tampered_text = data_file.read_text().replace('"InRunning": false', '"InRunning": true')
+    assert tampered_text != data_file.read_text()
+    data_file.write_text(tampered_text)
+
+    with pytest.raises(ValueError, match="content_hash"):
+        load_pack_marketstates(out_dir, 5)
+
+    # verify=False opts out for trusted/perf paths — same tampered content still loads.
+    states = load_pack_marketstates(out_dir, 5, verify=False)
+    assert len(states) == 2
