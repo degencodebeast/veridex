@@ -28,20 +28,32 @@ class ReplayPack(BaseModel):
     content_hash: str  # sha256 over canonically-ordered data-file bytes
 
 
-def _data_files(pack_dir: Path) -> list[Path]:
-    """The pack's hashed data files (odds_*.jsonl, updates_*.json), sorted for a canonical order."""
-    return sorted(
-        p for p in pack_dir.iterdir() if p.name.startswith(("odds_", "updates_")) and p.suffix in {".jsonl", ".json"}
-    )
+def _manifest_filenames(fixtures: list[dict[str, Any]]) -> list[str]:
+    """Sorted filenames the `fixtures` manifest references — the hash-scope contract."""
+    names: list[str] = []
+    for entry in fixtures:
+        names.append(entry["records"])
+        if "odds_updates" in entry:
+            names.append(entry["odds_updates"])
+    return sorted(names)
 
 
-def _compute_content_hash(pack_dir: Path) -> str:
-    """sha256 over name + b"\\0" + bytes for each data file, concatenated in sorted-name order."""
+def _compute_content_hash(pack_dir: Path, fixtures: list[dict[str, Any]]) -> str:
+    """sha256 over length-prefixed (name, bytes) pairs for each MANIFEST-referenced data file,
+    in sorted-filename order. Hash scope == the `fixtures` manifest exactly: a file present in
+    `pack_dir` but not referenced by `fixtures` (e.g. a stale leftover from a prior build into
+    the same directory) is excluded, so content_hash always describes exactly what `fixtures`
+    lists — never more, never less. Length-prefixing (rather than a bare separator byte) makes
+    the (name, bytes) decomposition provably injective.
+    """
     digest = hashlib.sha256()
-    for path in _data_files(pack_dir):
-        digest.update(path.name.encode("utf-8"))
-        digest.update(b"\0")
-        digest.update(path.read_bytes())
+    for name in _manifest_filenames(fixtures):
+        name_bytes = name.encode("utf-8")
+        file_bytes = (pack_dir / name).read_bytes()
+        digest.update(len(name_bytes).to_bytes(4, "big"))
+        digest.update(name_bytes)
+        digest.update(len(file_bytes).to_bytes(8, "big"))
+        digest.update(file_bytes)
     return digest.hexdigest()
 
 
@@ -59,6 +71,10 @@ def pack_from_session(session_dir: Path, out_dir: Path) -> ReplayPack:
     ended_ts = meta.started_ts
     for envelope in records:
         raw = envelope["record"]
+        # Fail loud on a malformed record (missing/non-coercible FixtureId). This intentionally
+        # differs from marketstates_from_record_stream, which silently drops such records at
+        # replay time — a corrupt CAPTURE should surface immediately at pack-build time rather
+        # than silently producing a pack that quietly omits data.
         fid = int(raw["FixtureId"])
         by_fixture.setdefault(fid, []).append(raw)
         ended_ts = max(ended_ts, int(envelope["received_ts"]))
@@ -86,7 +102,7 @@ def pack_from_session(session_dir: Path, out_dir: Path) -> ReplayPack:
         "gaps": gaps,
     }
 
-    pack = ReplayPack(capture=capture, fixtures=fixtures, content_hash=_compute_content_hash(out_dir))
+    pack = ReplayPack(capture=capture, fixtures=fixtures, content_hash=_compute_content_hash(out_dir, fixtures))
     (out_dir / "pack.json").write_text(pack.model_dump_json())
     return pack
 
@@ -94,11 +110,19 @@ def pack_from_session(session_dir: Path, out_dir: Path) -> ReplayPack:
 def load_pack_marketstates(pack_dir: Path, fixture_id: int, *, batch_size: int = 1) -> list[MarketState]:
     """Read a fixture's odds file and feed the raw records through the SAME normalizer live uses."""
     path = pack_dir / f"odds_{fixture_id}.jsonl"
+    if not path.exists():
+        raise FileNotFoundError(f"fixture_id {fixture_id} not found in pack {pack_dir} (missing {path.name})")
     records = [json.loads(line) for line in path.read_text().splitlines() if line]
     return list(marketstates_from_record_stream(records, batch_size=batch_size))
 
 
 def verify_content_hash(pack_dir: Path) -> bool:
-    """Recompute content_hash from the pack's data files; compare to pack.json's stored value."""
-    stored = json.loads((pack_dir / "pack.json").read_text())["content_hash"]
-    return _compute_content_hash(pack_dir) == stored
+    """Recompute content_hash from the manifest's referenced data files; compare to pack.json's
+    stored value. A corrupt/missing manifest, or a manifest-referenced file that's gone, counts
+    as a FAILED verification (returns False) rather than raising.
+    """
+    try:
+        manifest = json.loads((pack_dir / "pack.json").read_text())
+        return _compute_content_hash(pack_dir, manifest["fixtures"]) == manifest["content_hash"]
+    except (json.JSONDecodeError, KeyError, FileNotFoundError):
+        return False

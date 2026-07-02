@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
+
+import pytest
 
 from veridex.ingest.recorder import SessionMeta, envelope_line, gap_line
 from veridex.ingest.replay_pack import (
@@ -78,3 +81,32 @@ def test_tampered_pack_detected(tmp_path):
     data_file.write_bytes(bytes(tampered))
 
     assert verify_content_hash(out_dir) is False
+
+
+def test_stale_file_excluded_from_hash(tmp_path):
+    session_dir = _write_session(tmp_path)
+    out_dir = tmp_path / "pack"
+    pack_from_session(session_dir, out_dir)
+
+    # A leftover file from a prior build into the same out_dir, NOT part of this session's
+    # fixtures manifest — must not affect the content_hash (manifest-scoped, not glob-scoped).
+    (out_dir / "odds_99.jsonl").write_text(json.dumps({"FixtureId": 99, "Ts": 1}) + "\n")
+
+    assert verify_content_hash(out_dir) is True
+
+
+def test_load_pack_marketstates_unknown_fixture_raises_clear_error(tmp_path):
+    session_dir = _write_session(tmp_path)
+    out_dir = tmp_path / "pack"
+    pack_from_session(session_dir, out_dir)
+
+    with pytest.raises(FileNotFoundError, match="fixture_id 99"):
+        load_pack_marketstates(out_dir, 99)
+
+
+def test_capture_gaps_populated(tmp_path):
+    session_dir = _write_session(tmp_path)
+    out_dir = tmp_path / "pack"
+    pack = pack_from_session(session_dir, out_dir)
+
+    assert pack.capture["gaps"] == [{"from_ts": 100, "to_ts": 130}]
