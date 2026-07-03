@@ -36,6 +36,7 @@ from veridex.competition.events import (
 from veridex.execution.legibility import mispricing_gap_bps
 from veridex.execution.models import ExecutionRecord, ExecutionStatus
 from veridex.law.edge import executable_edge_bps
+from veridex.policy.circuit_breaker import CircuitBreaker
 from veridex.policy.engine import PolicyDecision
 from veridex.policy.gate import (
     PostQuoteContext,
@@ -57,6 +58,56 @@ if TYPE_CHECKING:
 _PAPER = "paper"
 _DRY_RUN = "dry_run"
 _LIVE_GUARDED = "live_guarded"
+
+# Receipt terminals that count as an EXECUTED FAILURE for the circuit breaker (REQ-2D-404). A
+# rejected / expired / cancelled / honestly-UNRESOLVED live fill is a real venue failure; only a
+# FILLED / PARTIAL is a success. NOTE: this moves the breaker ONLY for a REAL executed (live_guarded)
+# outcome — a policy DENY never reaches a receipt, so a denial can never trip the breaker.
+_EXECUTED_FAILURE_TERMINALS: frozenset[ExecutionStatus] = frozenset(
+    {
+        ExecutionStatus.REJECTED,
+        ExecutionStatus.EXPIRED,
+        ExecutionStatus.CANCELLED,
+        ExecutionStatus.UNRESOLVED,
+    }
+)
+
+# The adapter attribute a GENUINE real-venue adapter (e.g. PolymarketAdapter) sets True to declare
+# that its ``quote_market`` is a real venue quote. FAIL-CLOSED: absent/False for Fake/paper/dry
+# adapters, so ``real_venue_quote`` defaults False and is EARNED only by an explicit real adapter —
+# NEVER inferred from the presence of a venue price / edge in the payload.
+_REAL_VENUE_QUOTE_MARKER = "PROVIDES_REAL_VENUE_QUOTE"
+
+
+class BreakerCell:
+    """Mutable carrier threading the live circuit-breaker state across a single lane run.
+
+    ``run_execution_lane`` (and :func:`resolve_approval`) read the breaker into EACH proposal's
+    pre-quote context and, on the LIVE-guarded path ONLY, update it around EXECUTED outcomes
+    (success/failure). Threading it through one mutable cell means a mid-lane trip blocks the
+    remaining proposals (fail-closed) and the caller can observe the final state. Passing ``None``
+    (the default) makes the lane use a transparent, always-``CLOSED`` breaker so paper/dry-run — and
+    any caller that does not opt in — are byte-for-byte unaffected.
+
+    Attributes:
+        breaker: The current (immutable) :class:`CircuitBreaker` state; reassigned as it transitions.
+        cooldown_s: Seconds the breaker must stay ``OPEN`` before the lane admits a recovery probe
+            (applied once, via :meth:`CircuitBreaker.resolve`, at the start of the run).
+    """
+
+    def __init__(self, breaker: CircuitBreaker | None = None, *, cooldown_s: float = 0.0) -> None:
+        self.breaker = breaker if breaker is not None else CircuitBreaker()
+        self.cooldown_s = cooldown_s
+
+
+def _is_real_venue_quote(adapter: VenueAdapter) -> bool:
+    """Return whether ``adapter`` declares its quotes as GENUINE real-venue quotes (fail-closed).
+
+    Reads the explicit :data:`_REAL_VENUE_QUOTE_MARKER` class flag a real adapter sets; a missing
+    or falsey marker (Fake / SX-skeleton / any paper-dry adapter) yields ``False``. This is the ONLY
+    input to ``real_venue_quote`` — the flag is never inferred from the quote's numbers.
+    """
+    return bool(getattr(adapter, _REAL_VENUE_QUOTE_MARKER, False))
 
 # Stake sizing. The order is sized from the SEALED law ``kelly_fraction`` (never re-derived from
 # a venue price) using a conservative half-Kelly fraction against a fixed deterministic bankroll,
@@ -165,6 +216,8 @@ async def run_execution_lane(
     event_ts: int,
     bankroll: float = _DEFAULT_BANKROLL,
     broadcast: Callable[[CompetitionEvent], Awaitable[None]] | None = None,
+    guards: BreakerCell | None = None,
+    now: float | None = None,
 ) -> list[CompetitionEvent]:
     """Run the policy-gated executor lane over a SEALED run and return derived events.
 
@@ -208,6 +261,14 @@ async def run_execution_lane(
         event_ts: Deterministic event timestamp stamped on emitted events and used for quote age.
         bankroll: Fixed deterministic bankroll the sealed half-Kelly fraction is sized against.
         broadcast: Optional async hook invoked once per emitted event for live streaming.
+        guards: Optional mutable :class:`BreakerCell` threading the T16 circuit-breaker state
+            through the run (REQ-2D-404). ``None`` → a transparent ``CLOSED`` breaker (paper/dry and
+            any non-opt-in caller are byte-for-byte unaffected). On the live-guarded path ONLY, the
+            breaker STATE is threaded into the pre-quote context (an OPEN breaker makes the gate deny
+            before any venue I/O — the deny reason is minted inside the gate, never here) and the
+            breaker is updated around EXECUTED outcomes (a real fill/failure — never a denial).
+        now: Injected clock instant for the breaker's time-based recovery / failure anchoring; the
+            breaker NEVER reads a wall clock. Defaults to ``float(event_ts)`` so a run is deterministic.
 
     Returns:
         The emitted derived :class:`~veridex.competition.events.CompetitionEvent` objects, in
@@ -218,6 +279,15 @@ async def run_execution_lane(
     events: list[CompetitionEvent] = []
     seq = base_seq
     orders_this_run = 0
+
+    # Live-money safety context (fail-closed). ``live_guarded`` enables the tighter live stake cap;
+    # the breaker blocks a live submit when OPEN. Both are inert off the live path.
+    live_guarded = execution_mode == _LIVE_GUARDED
+    real_venue_quote = _is_real_venue_quote(adapter)
+    clock = float(event_ts) if now is None else now
+    if guards is not None:
+        # Apply the time-based OPEN -> HALF_OPEN recovery ONCE up front (pure; injected clock).
+        guards.breaker = guards.breaker.resolve(now=clock, cooldown_s=guards.cooldown_s)
 
     async def _emit(event: CompetitionEvent) -> None:
         events.append(event)
@@ -230,6 +300,10 @@ async def run_execution_lane(
         agent_eligible = bool(entry.execution_eligibility) if entry is not None else False
 
         # --- PRE-QUOTE gate (cheap, deterministic, NO venue I/O) -----------------------
+        # Thread the CURRENT breaker state + live-guarded flag so an OPEN breaker (fail-closed) and
+        # the tighter live stake cap are enforced BEFORE any venue I/O. The breaker is re-read every
+        # iteration, so a mid-run trip (from an executed failure below) blocks the remaining proposals.
+        breaker = guards.breaker if guards is not None else CircuitBreaker()
         pre = evaluate_pre_quote(
             PreQuoteContext(
                 recomputed_edge_bps=proposal.recomputed_edge_bps,
@@ -239,6 +313,8 @@ async def run_execution_lane(
                 orders_this_run=orders_this_run,
                 seconds_since_last_order=None,
                 agent_eligible=agent_eligible,
+                breaker=breaker,
+                live_guarded=live_guarded,
             ),
             envelope,
         )
@@ -282,7 +358,10 @@ async def run_execution_lane(
             continue  # NO venue quote — saved the I/O.
 
         # --- venue quote (only reached when the pre-quote gate passes) -----------------
-        quote = await adapter.quote_market(proposal.market_key)
+        # QUOTE-SIZE COUPLING (REQ-2D-701 gate 1): price the quote for the SAME ``stake`` the order
+        # will submit, so the slippage / executable_edge the post-quote gate acts on reflect the
+        # size that actually fills (no size mismatch between the quoted edge and the submitted order).
+        quote = await adapter.quote_market(proposal.market_key, for_size=stake)
         slippage = _slippage_bps(proposal.reference_price, quote.price)
         exec_edge = executable_edge_bps(proposal.entry_prob_bps, quote.price)
         # Edge-legibility explanatory quantity (REQ-2D-501): the prob-space dislocation between
@@ -325,6 +404,11 @@ async def run_execution_lane(
                     "mispricing_gap_bps": gap,
                     "venue_decimal_price": quote.price,
                     "native_price": quote.native_price,
+                    # DISPLAY-HONESTY gate (REQ-2D-701 gate 4): EARNED, never inferred. True ONLY
+                    # when a GENUINE real-venue adapter produced this quote; Fake/paper/dry → False,
+                    # even though the price-dependent numbers above are present. The frontend edge
+                    # gate keys on this so an edge NEVER renders without a real venue quote.
+                    "real_venue_quote": real_venue_quote,
                 },
                 execution_id=execution_id,
             )
@@ -366,6 +450,18 @@ async def run_execution_lane(
             _advance_through(record, _POST_POLICY_PATH.get(receipt.status, (ExecutionStatus.SUBMITTED,)))
             record.receipt = receipt
             orders_this_run += 1
+
+            # BREAKER (REQ-2D-404): move it ONLY on a REAL executed (live_guarded) outcome — a
+            # dry_run fill is simulated, not executed, and must never touch the breaker. A rejected /
+            # expired / cancelled / UNRESOLVED live receipt is a failure; a FILLED/PARTIAL is a
+            # success. (A policy DENY never reaches here, so a denial can never trip the breaker.)
+            if guards is not None and execution_mode == _LIVE_GUARDED:
+                if receipt.status in _EXECUTED_FAILURE_TERMINALS:
+                    guards.breaker = guards.breaker.record_failure(
+                        threshold=envelope.circuit_breaker_threshold, now=clock
+                    )
+                else:
+                    guards.breaker = guards.breaker.record_success()
 
             await _emit(
                 build_execution_submitted_event(
@@ -424,6 +520,8 @@ async def resolve_approval(
     approver_id: str | None,
     note: str | None = None,
     bankroll: float = _DEFAULT_BANKROLL,
+    guards: BreakerCell | None = None,
+    now: float | None = None,
 ) -> tuple[ExecutionRecord, list[CompetitionEvent], str]:
     """Resolve an ``awaiting_human`` record: audit, RE-CHECK law+policy+eligibility, submit-or-reject.
 
@@ -453,6 +551,10 @@ async def resolve_approval(
         approver_id: The authenticated operator principal recorded in the audit event.
         note: Optional free-form operator note recorded in the audit event.
         bankroll: Fixed deterministic bankroll the sealed half-Kelly fraction is sized against.
+        guards: Optional mutable :class:`BreakerCell` (REQ-2D-404); an OPEN breaker denies the
+            human-approved live submit (fail-closed) and a live executed outcome moves it. ``None``
+            → a transparent ``CLOSED`` breaker (no change for dry_run / non-opt-in callers).
+        now: Injected clock instant for the breaker; defaults to ``float(event_ts)`` (never a wall clock).
 
     Returns:
         ``(updated_record, events, decision)`` where ``decision`` is ``"approved"`` or
@@ -478,10 +580,18 @@ async def resolve_approval(
     quote = None
     stake = 0.0
 
+    live_guarded = execution_mode == _LIVE_GUARDED
+    clock = float(event_ts) if now is None else now
+    if guards is not None:
+        guards.breaker = guards.breaker.resolve(now=clock, cooldown_s=guards.cooldown_s)
+
     if proposal is not None:
-        # 2. RE-CHECK policy + eligibility against the CURRENT envelope (two-phase).
+        # 2. RE-CHECK policy + eligibility against the CURRENT envelope (two-phase). Thread the same
+        # live-money safety context as the main lane — an OPEN breaker + the live stake cap gate the
+        # human-approved live submit too (fail-closed; a human approval never bypasses the breaker).
         agent_eligible = bool(entry.execution_eligibility) if entry is not None else False
         stake = _size_stake(proposal.kelly_fraction, bankroll=bankroll, max_stake=envelope.max_stake)
+        breaker = guards.breaker if guards is not None else CircuitBreaker()
         pre = evaluate_pre_quote(
             PreQuoteContext(
                 recomputed_edge_bps=proposal.recomputed_edge_bps,
@@ -491,15 +601,18 @@ async def resolve_approval(
                 orders_this_run=0,
                 seconds_since_last_order=None,
                 agent_eligible=agent_eligible,
+                breaker=breaker,
+                live_guarded=live_guarded,
             ),
             envelope,
         )
         result_policy_hash = pre.policy_hash
         if pre.decision == PolicyDecision.DENIED:
-            # Cheap deny (e.g. a flipped kill-switch) fails closed BEFORE any venue I/O.
+            # Cheap deny (e.g. a flipped kill-switch / OPEN breaker) fails closed BEFORE any venue I/O.
             reason_codes = list(pre.reason_codes)
         else:
-            quote = await adapter.quote_market(proposal.market_key)
+            # QUOTE-SIZE COUPLING (gate 1): price the quote for the stake that will submit.
+            quote = await adapter.quote_market(proposal.market_key, for_size=stake)
             slippage = _slippage_bps(proposal.reference_price, quote.price)
             exec_edge = executable_edge_bps(proposal.entry_prob_bps, quote.price)
             post = evaluate_post_quote(
@@ -555,6 +668,15 @@ async def resolve_approval(
 
         _advance_through(record, _POST_POLICY_PATH.get(receipt.status, (ExecutionStatus.SUBMITTED,)))
         record.receipt = receipt
+
+        # BREAKER: move it ONLY on a REAL executed (live_guarded) outcome (see the main lane).
+        if guards is not None and execution_mode == _LIVE_GUARDED:
+            if receipt.status in _EXECUTED_FAILURE_TERMINALS:
+                guards.breaker = guards.breaker.record_failure(
+                    threshold=envelope.circuit_breaker_threshold, now=clock
+                )
+            else:
+                guards.breaker = guards.breaker.record_success()
 
         events.append(
             build_execution_submitted_event(

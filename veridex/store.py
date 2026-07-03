@@ -32,6 +32,7 @@ from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 from veridex.competition.events import CompetitionEvent
 from veridex.competition.models import AgentEntry, Competition, CompetitionConfig, CompetitionStatus
 from veridex.config import get_settings, require_database_url
+from veridex.deploy.instance import AgentInstance, DeployFailureReason, DeployStatus
 from veridex.execution.models import ExecutionRecord
 from veridex.runtime.evidence import serialize_payload
 
@@ -58,6 +59,7 @@ _EVENT_TYPE_VALUES: tuple[str, ...] = (
     "approval_audit",
     "score_update",
     "proof_anchor",
+    "execution_route",
     "payout_status",
     "competition_finalized",
 )
@@ -80,6 +82,11 @@ _EXECUTION_STATUS_VALUES: tuple[str, ...] = (
     "voided",
     "unresolved",
 )
+
+# CHECK-constraint literal tuple for agent_instances.status (Phase-2D deploy — REQ-2D-701A).
+# Values MUST stay in DeployStatus enum-definition order; the drift-guard test asserts exact
+# equality with veridex.deploy.instance.deploy_status_values().
+_INSTANCE_STATUS_VALUES: tuple[str, ...] = ("pending", "running", "sealed", "failed")
 
 
 # ---------------------------------------------------------------------------
@@ -251,6 +258,59 @@ class Store(Protocol):
         """
         ...
 
+    async def persist_agent_instance(self, instance: AgentInstance) -> None:
+        """Persist a deployed :class:`~veridex.deploy.instance.AgentInstance` (source of truth).
+
+        Called by the deploy route AFTER preflight passes and BEFORE the run is launched
+        (persist-then-launch): a preflight failure therefore never reaches this method, so no
+        row exists for a rejected deploy.
+
+        Args:
+            instance: The pinned instance record to persist (keyed by ``instance_id``).
+        """
+        ...
+
+    async def get_agent_instance(self, instance_id: str) -> AgentInstance:
+        """Load a persisted deployed instance by id.
+
+        Args:
+            instance_id: The id used at :meth:`persist_agent_instance`.
+
+        Returns:
+            The reconstructed :class:`~veridex.deploy.instance.AgentInstance`.
+
+        Raises:
+            KeyError: If no instance with ``instance_id`` exists.
+        """
+        ...
+
+    async def update_agent_instance_status(
+        self,
+        instance_id: str,
+        status: DeployStatus,
+        *,
+        last_failure_reason: DeployFailureReason | None = None,
+        updated_at: str,
+    ) -> None:
+        """Durably update a deployed instance's lifecycle status (background success/failure).
+
+        The background run task calls this to advance the STORED record to ``running`` then to a
+        terminal ``sealed`` / ``failed`` — so the outcome survives beyond process memory. On
+        ``failed`` the caller supplies a controlled :class:`~veridex.deploy.instance.DeployFailureReason`
+        (never a raw framework trace).
+
+        Args:
+            instance_id: The instance to update.
+            status: The new :class:`~veridex.deploy.instance.DeployStatus`.
+            last_failure_reason: Controlled taxonomy value to persist (only meaningful for
+                ``failed``); when ``None`` the stored reason is left unchanged.
+            updated_at: ISO-8601 UTC timestamp of this write (caller owns the clock).
+
+        Raises:
+            KeyError: If no instance with ``instance_id`` exists.
+        """
+        ...
+
 
 # ---------------------------------------------------------------------------
 # Private reconstruction helpers
@@ -323,6 +383,7 @@ class InMemoryStore:
         self._competitions: dict[str, Competition] = {}
         self._competition_events: dict[str, list[CompetitionEvent]] = {}
         self._execution_records: dict[str, ExecutionRecord] = {}
+        self._agent_instances: dict[str, AgentInstance] = {}
 
     # --- run methods (Phase-1, unchanged) ---
 
@@ -557,6 +618,59 @@ class InMemoryStore:
             )
         ]
 
+    # --- agent-instance methods (Phase-2D deploy — REQ-2D-701A) ---
+
+    async def persist_agent_instance(self, instance: AgentInstance) -> None:
+        """Store a deep copy of the deployed instance keyed by ``instance_id``.
+
+        Args:
+            instance: The pinned instance record to persist.
+        """
+        self._agent_instances[instance.instance_id] = instance.model_copy(deep=True)
+
+    async def get_agent_instance(self, instance_id: str) -> AgentInstance:
+        """Return a deep copy of the stored deployed instance.
+
+        Args:
+            instance_id: The id used at :meth:`persist_agent_instance`.
+
+        Returns:
+            A fresh deep copy of the stored :class:`~veridex.deploy.instance.AgentInstance`.
+
+        Raises:
+            KeyError: If no instance with ``instance_id`` exists.
+        """
+        if instance_id not in self._agent_instances:
+            raise KeyError(f"no agent instance with instance_id={instance_id!r}")
+        return self._agent_instances[instance_id].model_copy(deep=True)
+
+    async def update_agent_instance_status(
+        self,
+        instance_id: str,
+        status: DeployStatus,
+        *,
+        last_failure_reason: DeployFailureReason | None = None,
+        updated_at: str,
+    ) -> None:
+        """Update the stored instance's status (and optional failure reason) in place.
+
+        Args:
+            instance_id: The instance to update.
+            status: The new lifecycle status.
+            last_failure_reason: Controlled taxonomy value to persist; ``None`` leaves it unchanged.
+            updated_at: ISO-8601 UTC timestamp of this write.
+
+        Raises:
+            KeyError: If no instance with ``instance_id`` exists.
+        """
+        if instance_id not in self._agent_instances:
+            raise KeyError(f"no agent instance with instance_id={instance_id!r}")
+        stored = self._agent_instances[instance_id]
+        stored.status = status
+        if last_failure_reason is not None:
+            stored.last_failure_reason = last_failure_reason
+        stored.updated_at = updated_at
+
 
 # ---------------------------------------------------------------------------
 # PostgresStore column helpers
@@ -719,6 +833,22 @@ class PostgresStore:
             await cur.execute(
                 "CREATE INDEX IF NOT EXISTS idx_execution_records_comp_id ON execution_records(competition_id)"
             )
+
+            # --- Phase-2D deploy table (REQ-2D-701A) ---
+            instance_status_in = ", ".join(f"'{v}'" for v in _INSTANCE_STATUS_VALUES)
+            await cur.execute(
+                f"""
+                CREATE TABLE IF NOT EXISTS agent_instances (
+                    instance_id TEXT PRIMARY KEY,
+                    run_id TEXT,
+                    agent_id TEXT,
+                    template_id TEXT,
+                    status TEXT NOT NULL CHECK (status IN ({instance_status_in})),
+                    record_json TEXT NOT NULL
+                )
+                """
+            )
+            await cur.execute("CREATE INDEX IF NOT EXISTS idx_agent_instances_run_id ON agent_instances(run_id)")
         await conn.commit()
 
     # --- run methods (Phase-1, unchanged) ---
@@ -1145,3 +1275,114 @@ class PostgresStore:
             await conn.close()
 
         return [ExecutionRecord.model_validate(json.loads(row[0])) for row in rows]
+
+    # --- agent-instance methods (Phase-2D deploy — REQ-2D-701A) ---
+
+    async def persist_agent_instance(self, instance: AgentInstance) -> None:
+        """Insert the deployed instance row (queryable columns + full ``record_json`` blob).
+
+        Mirrors the ``execution_records`` idiom: a few extracted columns for querying plus the
+        canonical JSON of the whole record. Uses ``ON CONFLICT (instance_id) DO UPDATE`` so a
+        re-persist is idempotent. All SQL is parameterized; psycopg stays lazy.
+
+        Args:
+            instance: The pinned instance record to persist.
+        """
+        conn = await self._connect()
+        try:
+            async with conn.transaction(), conn.cursor() as cur:
+                await cur.execute(
+                    """
+                    INSERT INTO agent_instances
+                        (instance_id, run_id, agent_id, template_id, status, record_json)
+                    VALUES (%s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (instance_id) DO UPDATE SET
+                        run_id      = EXCLUDED.run_id,
+                        agent_id    = EXCLUDED.agent_id,
+                        template_id = EXCLUDED.template_id,
+                        status      = EXCLUDED.status,
+                        record_json = EXCLUDED.record_json
+                    """,
+                    (
+                        instance.instance_id,
+                        instance.run_id,
+                        instance.agent_id,
+                        instance.template_id,
+                        instance.status.value,
+                        serialize_payload(instance.model_dump(mode="json")),
+                    ),
+                )
+        finally:
+            await conn.close()
+
+    async def get_agent_instance(self, instance_id: str) -> AgentInstance:
+        """Fetch and reconstruct a deployed instance by id.
+
+        Args:
+            instance_id: The id used at :meth:`persist_agent_instance`.
+
+        Returns:
+            The reconstructed :class:`~veridex.deploy.instance.AgentInstance`.
+
+        Raises:
+            KeyError: If no instance with ``instance_id`` exists.
+        """
+        conn = await self._connect()
+        try:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "SELECT record_json FROM agent_instances WHERE instance_id = %s",
+                    (instance_id,),
+                )
+                row = await cur.fetchone()
+        finally:
+            await conn.close()
+
+        if row is None:
+            raise KeyError(f"no agent instance with instance_id={instance_id!r}")
+        return AgentInstance.model_validate(json.loads(row[0]))
+
+    async def update_agent_instance_status(
+        self,
+        instance_id: str,
+        status: DeployStatus,
+        *,
+        last_failure_reason: DeployFailureReason | None = None,
+        updated_at: str,
+    ) -> None:
+        """Read-modify-write the instance's status column + ``record_json`` in one transaction.
+
+        Loads the row ``FOR UPDATE``, mutates the reconstructed record's ``status`` /
+        ``last_failure_reason`` / ``updated_at``, and writes both the extracted ``status`` column
+        and the re-serialized blob so the two stay consistent.
+
+        Args:
+            instance_id: The instance to update.
+            status: The new lifecycle status.
+            last_failure_reason: Controlled taxonomy value to persist; ``None`` leaves it unchanged.
+            updated_at: ISO-8601 UTC timestamp of this write.
+
+        Raises:
+            KeyError: If no instance with ``instance_id`` exists.
+        """
+        conn = await self._connect()
+        try:
+            async with conn.transaction(), conn.cursor() as cur:
+                await cur.execute(
+                    "SELECT record_json FROM agent_instances WHERE instance_id = %s FOR UPDATE",
+                    (instance_id,),
+                )
+                row = await cur.fetchone()
+                if row is None:
+                    raise KeyError(f"no agent instance with instance_id={instance_id!r}")
+                record = AgentInstance.model_validate(json.loads(row[0]))
+                record.status = status
+                if last_failure_reason is not None:
+                    record.last_failure_reason = last_failure_reason
+                record.updated_at = updated_at
+                await cur.execute(
+                    "UPDATE agent_instances SET status = %s, record_json = %s WHERE instance_id = %s",
+                    (status.value, serialize_payload(record.model_dump(mode="json")), instance_id),
+                )
+        finally:
+            await conn.close()

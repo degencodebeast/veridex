@@ -403,6 +403,282 @@ async def test_1x2_home_does_not_select_spread_market() -> None:
 
 
 # ---------------------------------------------------------------------------
+# T20b-2 gate 6: OU MULTI-SLUG resolution (REQ-2D-701).
+#
+# Verified overlap (2026-07-02): O/U totals do NOT live on the base fixture event —
+# they live in the `<slug>-more-markets` event (the full O/U ladder + 2nd-half + team
+# totals). So resolve_market must fetch the RIGHT event slug per market TYPE: 1X2 from
+# the base event, OU from `-more-markets`, then select the FULL-MATCH market for the
+# line (never a 2nd-half or team-total). Fail closed on wrong line / ambiguous scope.
+# ---------------------------------------------------------------------------
+
+
+class _SlugAwareGammaClient:
+    """Fake Gamma client that returns a DIFFERENT market list per event slug.
+
+    Mirrors the real Gamma structure the resolver must navigate: 1X2 markets on the
+    base event slug, the O/U ladder on the ``<slug>-more-markets`` event. A slug with no
+    recorded fixture returns ``[]`` (event absent) — so a test can prove the resolver does
+    NOT silently fall back to the base event for OU.
+    """
+
+    def __init__(self, slug_to_fixture: dict[str, str]) -> None:
+        self._by_slug: dict[str, list[dict]] = {
+            slug: json.loads((FIXTURES_DIR / name).read_text())
+            for slug, name in slug_to_fixture.items()
+        }
+
+    async def get_markets(self, **params: object) -> list[dict]:
+        slug = params.get("slug")
+        return self._by_slug.get(slug if isinstance(slug, str) else "", [])
+
+
+_PRT_HRV_SLUG = "fifwc-prt-hrv-2026-07-02"
+_PRT_HRV_MORE_SLUG = "fifwc-prt-hrv-2026-07-02-more-markets"
+
+
+def _prt_hrv_multi_slug_client(more_fixture: str = "gamma_event_prt_hrv_more_markets.json") -> _SlugAwareGammaClient:
+    """Slug-aware client: base event = 1X2-only (NO OU), -more-markets = the O/U ladder."""
+    return _SlugAwareGammaClient(
+        {
+            _PRT_HRV_SLUG: "gamma_event_prt_hrv_base_no_ou.json",
+            _PRT_HRV_MORE_SLUG: more_fixture,
+        }
+    )
+
+
+async def test_ou_resolves_via_more_markets_event_not_base() -> None:
+    """`OU|2.5|full` resolves from the `-more-markets` event (base event carries no OU)."""
+    client = _prt_hrv_multi_slug_client()
+
+    resolved = await resolve_market(
+        "OU|2.5|full",
+        _PRT_HRV_SLUG,
+        home_team="Portugal",
+        away_team="Croatia",
+        client=client,
+    )
+
+    # The FULL-MATCH O/U 2.5 from the -more-markets event; Over -> yes token, Under -> no token.
+    assert resolved.condition_id == (
+        "0xOU25MORE00000000000000000000000000000000000000000000000000001"
+    )
+    assert resolved.token_id_yes == (
+        "45250000000000000000000000000000000000000000000000000000000001"
+    )
+    assert resolved.token_id_no == (
+        "45250000000000000000000000000000000000000000000000000000000002"
+    )
+
+
+async def test_ou_full_scope_excludes_second_half_and_team_total() -> None:
+    """`OU|2.5|full` picks the full-match market, NEVER the 2nd-half or team-total O/U 2.5."""
+    client = _prt_hrv_multi_slug_client()
+
+    resolved = await resolve_market(
+        "OU|2.5|full",
+        _PRT_HRV_SLUG,
+        home_team="Portugal",
+        away_team="Croatia",
+        client=client,
+    )
+
+    # Not the 2nd-half (0xOU25HALF…) and not the team-total (0xOU25TEAM…) O/U 2.5 markets.
+    assert resolved.condition_id != (
+        "0xOU25HALF00000000000000000000000000000000000000000000000000001"
+    )
+    assert resolved.condition_id != (
+        "0xOU25TEAM00000000000000000000000000000000000000000000000000001"
+    )
+
+
+async def test_ou_does_not_fall_back_to_base_event() -> None:
+    """If the `-more-markets` event is absent, OU fails closed — never silently uses the base event."""
+    # Base event is present (1X2), but the -more-markets event returns [] (not recorded).
+    client = _SlugAwareGammaClient({_PRT_HRV_SLUG: "gamma_event_prt_hrv_base_no_ou.json"})
+
+    with pytest.raises(MarketUnavailable):
+        await resolve_market(
+            "OU|2.5|full",
+            _PRT_HRV_SLUG,
+            home_team="Portugal",
+            away_team="Croatia",
+            client=client,
+        )
+
+
+async def test_ou_nonexistent_line_in_more_markets_fails_closed() -> None:
+    """An O/U line absent from the -more-markets ladder (9.5) fails closed."""
+    client = _prt_hrv_multi_slug_client()
+
+    with pytest.raises(MarketUnavailable):
+        await resolve_market(
+            "OU|9.5|full",
+            _PRT_HRV_SLUG,
+            home_team="Portugal",
+            away_team="Croatia",
+            client=client,
+        )
+
+
+async def test_ou_ambiguous_full_scope_fails_closed() -> None:
+    """Two full-match O/U 2.5 markets is ambiguous -> MarketUnavailable, never a guessed token."""
+    client = _prt_hrv_multi_slug_client(more_fixture="gamma_more_markets_ou_ambiguous.json")
+
+    with pytest.raises(MarketUnavailable):
+        await resolve_market(
+            "OU|2.5|full",
+            _PRT_HRV_SLUG,
+            home_team="Portugal",
+            away_team="Croatia",
+            client=client,
+        )
+
+
+async def test_1x2_still_resolves_from_base_event_under_multi_slug() -> None:
+    """1X2 keeps using the BASE event slug (not -more-markets) — types route to different events."""
+    client = _prt_hrv_multi_slug_client()
+
+    resolved = await resolve_market(
+        "1X2|home|full",
+        _PRT_HRV_SLUG,
+        home_team="Portugal",
+        away_team="Croatia",
+        client=client,
+    )
+
+    assert resolved.condition_id == (
+        "0xPRTWIN000000000000000000000000000000000000000000000000000000001"
+    )
+
+
+# ---------------------------------------------------------------------------
+# T20b-2 gate 5: DRAW VENUE-SIDE mapping (REQ-2D-701).
+#
+# The resolver already selects the draw-binary market for `1X2|draw`, but a LIVE draw
+# order carries side="draw" — which side_to_token rejected, so the order could not map
+# to a token. A resolved DRAW market must map side="draw" to the draw-binary market's
+# YES token (DRAW = YES on the "…end in a draw?" market, per the verified overlap), OR
+# fail closed. side="draw" on a NON-draw market must NEVER mis-map to that market's YES.
+# ---------------------------------------------------------------------------
+
+
+async def test_resolved_draw_market_flags_draw_market_true() -> None:
+    """`1X2|draw|full` produces a ResolvedMarket carrying the draw-binary marker."""
+    client = _FakeGammaClient("gamma_event_prt_hrv.json")
+
+    resolved = await resolve_market(
+        "1X2|draw|full",
+        "fifwc-prt-hrv-2026-07-02",
+        home_team="Portugal",
+        away_team="Croatia",
+        client=client,
+    )
+
+    assert resolved.draw_market is True
+
+
+async def test_side_to_token_maps_draw_to_yes_on_draw_market() -> None:
+    """A live draw order (side='draw') maps to the draw-binary market's YES token."""
+    client = _FakeGammaClient("gamma_event_prt_hrv.json")
+
+    resolved = await resolve_market(
+        "1X2|draw|full",
+        "fifwc-prt-hrv-2026-07-02",
+        home_team="Portugal",
+        away_team="Croatia",
+        client=client,
+    )
+
+    # DRAW = YES on the draw market -> the draw market's YES token (22200…001).
+    assert side_to_token(resolved, "draw") == (
+        "22200000000000000000000000000000000000000000000000000000000001"
+    )
+
+
+async def test_side_to_token_draw_on_non_draw_market_fails_closed() -> None:
+    """side='draw' on a non-draw (team-win) market fails closed — never mis-maps to its YES token."""
+    client = _FakeGammaClient("gamma_event_prt_hrv.json")
+
+    resolved = await resolve_market(
+        "1X2|home|full",
+        "fifwc-prt-hrv-2026-07-02",
+        home_team="Portugal",
+        away_team="Croatia",
+        client=client,
+    )
+
+    assert resolved.draw_market is False
+    with pytest.raises(ValueError):
+        side_to_token(resolved, "draw")
+
+
+# ---------------------------------------------------------------------------
+# T20b-2 fold (CRITICAL, real money): a 1X2|away bet must hit the away-team-WINS token.
+#
+# WC 1X2 = THREE per-team Yes/No markets; each side (home/away/draw) resolves to ITS OWN
+# "Will <team> win?"/draw market where the BET TEAM is the YES outcome. So home, away AND
+# draw all bet YES on their resolved per-team market. The bug: "away" sat in the NO label
+# set, so a 1X2|away order mapped to token_id_no = "away does NOT win" (the OPPOSITE
+# outcome). These end-to-end tests prove resolve_market -> side_to_token hits the right token.
+# ---------------------------------------------------------------------------
+
+
+async def test_1x2_away_bet_maps_to_away_wins_token() -> None:
+    """A live 1X2|away bet maps to the away-team-WINS token (its market's YES), NOT away-loses."""
+    client = _FakeGammaClient("gamma_event_prt_hrv.json")
+
+    resolved = await resolve_market(
+        "1X2|away|full",
+        "fifwc-prt-hrv-2026-07-02",
+        home_team="Portugal",
+        away_team="Croatia",
+        client=client,
+    )
+
+    # Croatia (away) win market: YES token == "Croatia wins".
+    assert side_to_token(resolved, "away") == (
+        "33300000000000000000000000000000000000000000000000000000000001"
+    )
+    # Guard the inversion directly: away must NOT map to the "away does NOT win" token.
+    assert side_to_token(resolved, "away") != resolved.token_id_no
+
+
+async def test_1x2_home_bet_maps_to_home_wins_token() -> None:
+    """A live 1X2|home bet maps to the home-team-WINS token (symmetric with away, stays correct)."""
+    client = _FakeGammaClient("gamma_event_prt_hrv.json")
+
+    resolved = await resolve_market(
+        "1X2|home|full",
+        "fifwc-prt-hrv-2026-07-02",
+        home_team="Portugal",
+        away_team="Croatia",
+        client=client,
+    )
+
+    assert side_to_token(resolved, "home") == (
+        "11100000000000000000000000000000000000000000000000000000000001"
+    )
+
+
+async def test_1x2_draw_bet_maps_to_draw_token() -> None:
+    """A live 1X2|draw bet maps to the draw market's YES token (stays correct via draw_market)."""
+    client = _FakeGammaClient("gamma_event_prt_hrv.json")
+
+    resolved = await resolve_market(
+        "1X2|draw|full",
+        "fifwc-prt-hrv-2026-07-02",
+        home_team="Portugal",
+        away_team="Croatia",
+        client=client,
+    )
+
+    assert side_to_token(resolved, "draw") == (
+        "22200000000000000000000000000000000000000000000000000000000001"
+    )
+
+
+# ---------------------------------------------------------------------------
 # side_to_token: full alias mapping, unknown side -> ValueError (no silent fallback)
 # ---------------------------------------------------------------------------
 
@@ -417,12 +693,15 @@ def resolved_market() -> ResolvedMarket:
     )
 
 
-@pytest.mark.parametrize("side", ["over", "home", "yes", "Over", "HOME", "Yes"])
+# home AND away both map to token_id_yes: each 1X2 side resolves to its OWN per-team
+# "Will <team> win?" market where the BET TEAM is the YES outcome (verified WC 1X2 model).
+# A bet SIDE ("away") is NOT a market OUTCOME LABEL — away is the away-team-WINS bet.
+@pytest.mark.parametrize("side", ["over", "home", "away", "yes", "Over", "HOME", "AWAY", "Yes"])
 def test_side_to_token_yes_aliases(resolved_market: ResolvedMarket, side: str) -> None:
     assert side_to_token(resolved_market, side) == "tok-yes"
 
 
-@pytest.mark.parametrize("side", ["under", "away", "no", "Under", "AWAY", "No"])
+@pytest.mark.parametrize("side", ["under", "no", "Under", "No"])
 def test_side_to_token_no_aliases(resolved_market: ResolvedMarket, side: str) -> None:
     assert side_to_token(resolved_market, side) == "tok-no"
 

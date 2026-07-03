@@ -125,6 +125,33 @@ describe('normalizeWireEvent (real backend wire ⇒ CanonicalEvent view-model)',
       seq: 12, event_type: 'policy_result', event_ts: 1, evidence: false, payload_hash: '0xee',
       payload: { tick_seq: 6, decision: 'ALLOW', reason: 'edge >= min', edge_bps: 22, min_edge_bps: 8 },
     });
-    expect(event.policy).toEqual({ tick_seq: 6, decision: 'ALLOW', reason: 'edge >= min', edge_bps: 22, min_edge_bps: 8 });
+    // real_venue_quote defaults false (fail-closed) when the payload carries no earned flag.
+    expect(event.policy).toEqual({
+      tick_seq: 6, decision: 'ALLOW', reason: 'edge >= min', edge_bps: 22, min_edge_bps: 8, real_venue_quote: false,
+    });
+  });
+
+  it('propagates the EARNED real_venue_quote + executable_edge_bps from the backend post-quote payload', () => {
+    // The real runner emits `executable_edge_bps` (not `edge_bps`) + a real_venue_quote=true it earned.
+    const event = normalizeWireEvent({
+      seq: 13, event_type: 'policy_result', event_ts: 1, evidence: false, payload_hash: '0xff',
+      payload: {
+        tick_seq: 7, decision: 'ALLOW', reason_codes: [], phase: 'post_quote',
+        executable_edge_bps: 512, min_edge_bps: 8, real_venue_quote: true,
+      },
+    });
+    expect(event.policy?.real_venue_quote).toBe(true); // propagated verbatim, never fabricated
+    expect(event.policy?.edge_bps).toBe(512); // executable edge maps into the edge cell
+  });
+
+  it('never fabricates real_venue_quote: a Fake/dry post-quote payload stays false despite a venue price', () => {
+    const event = normalizeWireEvent({
+      seq: 14, event_type: 'policy_result', event_ts: 1, evidence: false, payload_hash: '0xab',
+      payload: {
+        tick_seq: 8, decision: 'ALLOW', reason_codes: [], phase: 'post_quote',
+        executable_edge_bps: 300, venue_decimal_price: 2.05, real_venue_quote: false,
+      },
+    });
+    expect(event.policy?.real_venue_quote).toBe(false); // fail-closed: a venue price never earns it
   });
 });

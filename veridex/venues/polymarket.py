@@ -347,6 +347,12 @@ class PolymarketAdapter:
             wire (a real submit needs write-enabled AND ``dry_run=False``).
     """
 
+    # DISPLAY-HONESTY marker (REQ-2D-701 gate 4): declares that this adapter's ``quote_market`` is a
+    # GENUINE real-venue quote (depth-aware, from the real CLOB book). The execution lane keys the
+    # POLICY_RESULT ``real_venue_quote`` flag on this — so the flagship edge renders ONLY on a real
+    # venue quote. Fail-closed: Fake / SX-skeleton adapters do not set it, so they stay False.
+    PROVIDES_REAL_VENUE_QUOTE: bool = True
+
     def __init__(
         self,
         resolved: ResolvedMarket,

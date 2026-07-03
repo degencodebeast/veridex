@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import hashlib
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
@@ -36,6 +37,7 @@ from veridex.competition.events import (
     build_competition_started_event,
     build_event_log,
     build_evidence_event,
+    build_execution_route_event,
 )
 from veridex.competition.models import (
     AgentEntry,
@@ -45,16 +47,18 @@ from veridex.competition.models import (
     ExecutionMode,
     normalize_proof_mode,
 )
-from veridex.execution.runner import run_execution_lane
+from veridex.execution.runner import BreakerCell, _is_real_venue_quote, run_execution_lane
+from veridex.policy.circuit_breaker import CircuitBreaker
 from veridex.policy.envelope import PolicyEnvelope
 from veridex.runtime.evidence import serialize_payload
 from veridex.runtime.orchestrator import run_competition
-from veridex.venues.sx_bet import FakeVenueAdapter, SXBetAdapter
+from veridex.venues.sx_bet import FakeVenueAdapter
 
 if TYPE_CHECKING:  # the heavy/offline-safe types are only needed for annotations
     from veridex.ingest.marketstate import MarketState
     from veridex.runtime.orchestrator import Agent, RunResult
     from veridex.store import Store
+    from veridex.venues.base import VenueAdapter
 
 # A live-broadcast callback: persist-before-broadcast is the caller's responsibility, so this is
 # invoked only AFTER the event is durably appended. Errors are swallowed by the service so a dead
@@ -87,6 +91,123 @@ def _default_policy_envelope() -> PolicyEnvelope:
         human_approval_threshold=0.0,
         kill_switch=False,
     )
+
+
+@dataclass(frozen=True)
+class LiveExecutionDeps:
+    """Operator-supplied dependencies that ARM the live_guarded (real-money) execution path.
+
+    Real money is OPERATOR-ONLY. The operator (not this service) builds an ARMED real-venue
+    adapter — a :class:`~veridex.venues.polymarket.PolymarketAdapter` that is
+    ``polymarket_write_enabled`` AND ``dry_run=False`` AND has an injected ``write_client`` (its
+    ``_require_armed`` triple gate), bound to a :func:`~veridex.venues.polymarket_resolver.resolve_market`
+    ``ResolvedMarket`` + side (the T20b-2 resolver: draw→YES on the draw-binary market, O/U on the
+    ``-more-markets`` event). The operator also runs
+    :func:`~veridex.venues.polymarket_preflight.run_preflight` and passes its
+    :attr:`~veridex.venues.polymarket_preflight.PreflightReport.live_ready` verdict here.
+
+    FAIL-CLOSED: when this bundle is absent (the default ``None`` on ``start_competition``) OR
+    ``live_ready`` is not ``True`` OR the adapter is not a GENUINE real-venue adapter, the live path
+    arms NOTHING and degrades to a dry-run simulation (:func:`_select_execution_route`). No real
+    order is ever placed without EVERY gate: ``write_enabled`` AND ``not dry_run`` (inside the
+    adapter) AND ``live_ready`` AND a real adapter (here).
+
+    Attributes:
+        adapter: The ARMED real-venue adapter (carries ``PROVIDES_REAL_VENUE_QUOTE`` so the lane
+            earns ``real_venue_quote``, plus the ``_require_armed`` money gate + resolver-bound
+            market/side). Never a Fake / SX-skeleton on the armed path.
+        live_ready: The preflight live-readiness gate — ``True`` ONLY when the operator has
+            EXPLICITLY verified the neg-risk approval AND the 1-share FAK smoke. The live submit
+            arms ONLY when this is ``True`` (fail-closed default ``False``).
+    """
+
+    adapter: VenueAdapter
+    live_ready: bool = False
+
+
+# Honest-degrade reason enum (T23) — WHY a configured live_guarded run degraded to a dry-run
+# simulation. Checked in fail-closed order; stable strings (telemetry + tests match on these).
+_DEGRADE_MISSING_LIVE_DEPS = "missing_live_deps"  # no operator LiveExecutionDeps bundle supplied
+_DEGRADE_LIVE_READY_FALSE = "live_ready_false"  # deps present but preflight live-readiness not verified
+_DEGRADE_NON_REAL_ADAPTER = "non_real_adapter"  # live_ready but the adapter is not a genuine real venue
+
+
+def _live_arm_gate(live_deps: LiveExecutionDeps | None) -> str | None:
+    """The SINGLE authority for the live_guarded MONEY gates (everything past the mode conjunct).
+
+    Returns ``None`` when EVERY money gate holds — the operator deps are supplied AND ``live_ready``
+    is ``True`` AND the adapter is a GENUINE real-venue adapter — i.e. a ``live_guarded`` request may
+    ARM. Otherwise returns the SPECIFIC gate-failure reason (checked in fail-closed order), so a
+    degrade can describe WHY it fell back to dry. This is meaningful ONLY for a ``live_guarded``
+    request; the mode conjunct itself is owned STRUCTURALLY by :func:`_select_execution_route`.
+
+    Both the arm decision (:func:`_select_execution_route`) and the degrade telemetry
+    (:func:`_run_execution_block`) read this ONE predicate, so the reason can never disagree with the
+    arm outcome (single-authority).
+    """
+    if live_deps is None:
+        return _DEGRADE_MISSING_LIVE_DEPS
+    if live_deps.live_ready is not True:
+        return _DEGRADE_LIVE_READY_FALSE
+    if not _is_real_venue_quote(live_deps.adapter):
+        return _DEGRADE_NON_REAL_ADAPTER
+    return None
+
+
+def _select_execution_route(
+    execution_mode: ExecutionMode,
+    envelope: PolicyEnvelope,
+    live_deps: LiveExecutionDeps | None,
+) -> tuple[VenueAdapter, str, BreakerCell | None]:
+    """Pick ``(adapter, effective_mode_label, guards)`` for the executor lane — FAIL-CLOSED.
+
+    * ``dry_run`` → the deterministic offline :class:`~veridex.venues.sx_bet.FakeVenueAdapter`, the
+      ``dry_run`` mode label, and NO breaker guards (paper/dry stay byte-for-byte unaffected).
+    * ``live_guarded`` → ARM the operator's real adapter ONLY when EVERY money gate holds:
+      ``live_deps`` was supplied AND ``live_deps.live_ready is True`` AND the adapter declares itself
+      a GENUINE real-venue adapter (``PROVIDES_REAL_VENUE_QUOTE`` via
+      :func:`~veridex.execution.runner._is_real_venue_quote`). When armed, build a FRESH
+      :class:`~veridex.execution.runner.BreakerCell` (REQ-2D-404) seeded ``CLOSED`` with the
+      envelope's ``cooldown_s``, and run the lane in ``live_guarded`` mode so the runner enforces the
+      tighter live stake cap (``live_guarded=True``) and trips the breaker at
+      ``envelope.circuit_breaker_threshold`` consecutive live failures. SINGLE-AUTHORITY: this only
+      CONSTRUCTS + threads the cell; the runner's policy gate owns every breaker decision.
+
+    Otherwise (no deps / not ``live_ready`` / not a real adapter) FAIL CLOSED: degrade to a dry-run
+    simulation (Fake + ``dry_run`` label + no guards) so NO real order path is ever reached — the run
+    stays dry and finalizes honestly rather than touching real money.
+
+    Args:
+        execution_mode: The competition's configured mode (never ``paper`` — the caller gates that).
+        envelope: The policy envelope (supplies ``cooldown_s`` for the breaker; the runner reads
+            ``circuit_breaker_threshold`` / ``max_stake_live_guarded`` directly).
+        live_deps: The operator's armed live dependencies, or ``None`` (fail-closed default).
+
+    Returns:
+        ``(adapter, effective_mode, guards)`` — ``effective_mode`` is the string the runner receives
+        (may be degraded to ``"dry_run"``); ``guards`` is a ``BreakerCell`` ONLY on the armed live
+        path, else ``None``.
+    """
+    if execution_mode == ExecutionMode.DRY_RUN:
+        return FakeVenueAdapter(), ExecutionMode.DRY_RUN.value, None
+
+    # ARM the real-money path ONLY when the mode is EXPLICITLY live_guarded AND every real-money gate
+    # holds. STRUCTURAL fail-closed (defense-in-depth): making ``execution_mode == LIVE_GUARDED`` the
+    # FIRST conjunct means ANY other mode — a defensively-passed ``paper`` or a future 4th ExecutionMode
+    # value — degrades to dry HERE, rather than relying on incidental enum arithmetic (that ``dry_run``
+    # is caught above and ``paper`` is gated at a distant caller). No mode outside live_guarded can ever
+    # reach a real submit, even with FULL armed operator deps.
+    if execution_mode == ExecutionMode.LIVE_GUARDED and _live_arm_gate(live_deps) is None:
+        # STRUCTURAL fail-closed: ``execution_mode == LIVE_GUARDED`` stays the FIRST conjunct (no
+        # other mode can arm), and the three MONEY gates are the single-authority ``_live_arm_gate``
+        # (``None`` ⇒ deps present AND live_ready AND a genuine real adapter). The same predicate
+        # backs the degrade telemetry, so arm-outcome and degrade-reason can never disagree.
+        assert live_deps is not None  # narrowed by the gate returning None; defense-in-depth
+        guards = BreakerCell(CircuitBreaker(), cooldown_s=float(envelope.cooldown_s))
+        return live_deps.adapter, ExecutionMode.LIVE_GUARDED.value, guards
+
+    # FAIL-CLOSED: not an armed live_guarded run → degrade to a dry-run simulation (no real order).
+    return FakeVenueAdapter(), ExecutionMode.DRY_RUN.value, None
 
 
 # Stable reason strings (tests match on these EXACTLY — do not edit casually).
@@ -183,6 +304,7 @@ async def start_competition(
     agents: list[Agent],
     *,
     broadcast: BroadcastFn | None = None,
+    live_deps: LiveExecutionDeps | None = None,
 ) -> Competition:
     """Run a competition, seal its canonical log, then (non-paper) run the executor lane.
 
@@ -209,6 +331,9 @@ async def start_competition(
         broadcast: Optional persist-before-broadcast callback. Each evidence event (live sink)
             and each execution event is appended to the store FIRST, then broadcast; broadcast
             errors are swallowed and never abort the run (REQ-2B-17/30, REQ-2D-105).
+        live_deps: Operator-supplied :class:`LiveExecutionDeps` that ARM the live_guarded path
+            (real adapter + ``live_ready``). ``None`` (the default) FAILS CLOSED: a ``live_guarded``
+            run degrades to a dry-run simulation and no real order is ever placed (REQ-2D-701).
 
     Returns:
         The finalized :class:`~veridex.competition.models.Competition` (status ``FINALIZED``,
@@ -316,6 +441,7 @@ async def start_competition(
                 base_seq=next_seq,
                 event_ts=base_ts,
                 broadcast=broadcast,
+                live_deps=live_deps,
             )
         except Exception:
             # The seal + the entire 2A tail (incl. COMPETITION_FINALIZED) are already durable.
@@ -340,15 +466,24 @@ async def _run_execution_block(
     base_seq: int,
     event_ts: int,
     broadcast: BroadcastFn | None,
+    live_deps: LiveExecutionDeps | None = None,
 ) -> None:
     """Run the policy-gated executor lane and persist+broadcast its derived events.
 
     Sources the :class:`~veridex.policy.envelope.PolicyEnvelope` from
     ``competition.config.policy_envelope`` (or a conservative default), pins its ``policy_hash``
-    (REQ-2B-03 — recorded on every emitted ``POLICY_RESULT`` payload), and picks the venue
-    adapter by mode (``dry_run`` → fake, ``live_guarded`` → SX Bet skeleton). The returned events
-    are appended to the canonical log as ONE contiguous block (persist-before-broadcast), then
-    each is broadcast; a broadcast error never aborts the run.
+    (REQ-2B-03 — recorded on every emitted ``POLICY_RESULT`` payload), then routes the venue adapter
+    + effective mode + breaker guards via :func:`_select_execution_route` (FAIL-CLOSED):
+
+    * ``dry_run`` → the deterministic Fake, no guards.
+    * ``live_guarded`` ARMED (``live_deps`` present, ``live_ready`` True, real adapter) → the
+      operator's real :class:`~veridex.venues.polymarket.PolymarketAdapter` (resolver-bound market/
+      side, ``_require_armed`` money gate) + a :class:`~veridex.execution.runner.BreakerCell`
+      threaded as ``guards`` so the runner enforces the live stake cap + circuit breaker (REQ-2D-404).
+    * ``live_guarded`` NOT armed → degrades to a dry-run simulation (no real order).
+
+    The returned events are appended to the canonical log as ONE contiguous block
+    (persist-before-broadcast), then each is broadcast; a broadcast error never aborts the run.
 
     Args:
         store: The async repository.
@@ -358,6 +493,7 @@ async def _run_execution_block(
         base_seq: First competition ``seq`` for the execution block (strictly after the 2A tail).
         event_ts: Deterministic event timestamp (the meta base ts).
         broadcast: Optional persist-before-broadcast callback.
+        live_deps: Operator-supplied armed live dependencies, or ``None`` (fail-closed default).
     """
     envelope = competition.config.policy_envelope or _default_policy_envelope()
     # REQ-2B-03: pin the policy commitment. It is recorded on every POLICY_RESULT event the lane
@@ -365,8 +501,37 @@ async def _run_execution_block(
     # to this exact envelope alongside the per-agent config_hash already in the evidence log.
     _ = envelope.policy_hash()
 
-    adapter = FakeVenueAdapter() if execution_mode == ExecutionMode.DRY_RUN else SXBetAdapter()
+    # FAIL-CLOSED routing: pick the adapter, the effective mode label the runner receives (a
+    # not-fully-armed live_guarded run degrades to "dry_run"), and the breaker guards (armed live
+    # ONLY). service.py CONSTRUCTS the BreakerCell; the runner's policy gate owns every decision.
+    adapter, effective_mode, guards = _select_execution_route(execution_mode, envelope, live_deps)
     entries_by_agent = {entry.agent_id: entry for entry in competition.entries}
+
+    # Honest-degrade telemetry (T23): a CONFIGURED live_guarded run that FAILED a money gate was
+    # routed to a dry-run simulation above (fail-closed — no real order). Record WHY as an
+    # EXECUTION_ROUTE event: evidence=False OPS telemetry an auditor reads in the log, so the degrade
+    # SELF-DESCRIBES rather than being inferred from config=live vs events=dry. The reason comes from
+    # the SAME _live_arm_gate the router armed on (single-authority). Sealed evidence is untouched —
+    # this derived event lands strictly after the 2A tail (base_seq), so the lane block follows it.
+    lane_seq = base_seq
+    if execution_mode == ExecutionMode.LIVE_GUARDED and effective_mode != ExecutionMode.LIVE_GUARDED.value:
+        degrade_event = build_execution_route_event(
+            competition_id=competition.competition_id,
+            run_id=run_result.run_id,
+            seq=lane_seq,
+            event_ts=event_ts,
+            payload={
+                "requested_execution_mode": ExecutionMode.LIVE_GUARDED.value,
+                "effective_execution_mode": effective_mode,
+                "degraded_because_not_armed": True,
+                "degrade_reason": _live_arm_gate(live_deps),
+            },
+        )
+        # Persist-before-broadcast, exactly like the lane block below.
+        await store.append_competition_events(competition.competition_id, [degrade_event])
+        if broadcast is not None:
+            await _safe_broadcast(broadcast, degrade_event)
+        lane_seq += 1
 
     events = await run_execution_lane(
         store,
@@ -375,9 +540,10 @@ async def _run_execution_block(
         envelope=envelope,
         adapter=adapter,
         entries_by_agent=entries_by_agent,
-        execution_mode=execution_mode.value,
-        base_seq=base_seq,
+        execution_mode=effective_mode,
+        base_seq=lane_seq,
         event_ts=event_ts,
+        guards=guards,
     )
 
     # Persist the whole block FIRST (persist-before-broadcast), then fan out.

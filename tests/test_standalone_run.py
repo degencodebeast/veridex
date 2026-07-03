@@ -120,7 +120,7 @@ class _RaisingVenueAdapter:
 
     venue = "fake"
 
-    async def quote_market(self, _market_ref: str) -> Any:
+    async def quote_market(self, _market_ref: str, for_size: float | None = None) -> Any:
         raise RuntimeError("venue down")
 
 

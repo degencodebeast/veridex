@@ -1,0 +1,28 @@
+[
+  {
+    "id": "700205",
+    "question": "Portugal vs. Croatia: O/U 2.5",
+    "slug": "fifwc-prt-hrv-2026-07-02-ou-2-5-a",
+    "conditionId": "0xOU25AMBIG0000000000000000000000000000000000000000000000000001",
+    "active": true,
+    "closed": false,
+    "outcomes": "[\"Over\", \"Under\"]",
+    "outcomePrices": "[\"0.48\", \"0.52\"]",
+    "clobTokenIds": "[\"46250000000000000000000000000000000000000000000000000000000001\", \"46250000000000000000000000000000000000000000000000000000000002\"]",
+    "orderPriceMinTickSize": 0.0025,
+    "orderMinSize": 5
+  },
+  {
+    "id": "700206",
+    "question": "Portugal vs. Croatia: O/U 2.5",
+    "slug": "fifwc-prt-hrv-2026-07-02-ou-2-5-b",
+    "conditionId": "0xOU25AMBIG0000000000000000000000000000000000000000000000000002",
+    "active": true,
+    "closed": false,
+    "outcomes": "[\"Over\", \"Under\"]",
+    "outcomePrices": "[\"0.49\", \"0.51\"]",
+    "clobTokenIds": "[\"46260000000000000000000000000000000000000000000000000000000001\", \"46260000000000000000000000000000000000000000000000000000000002\"]",
+    "orderPriceMinTickSize": 0.0025,
+    "orderMinSize": 5
+  }
+]

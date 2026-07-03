@@ -208,6 +208,24 @@ def test_is_clean_family_accepts_1x2_and_totals_defers_props() -> None:
     assert not is_clean_family("ANYTIME_SCORER")
 
 
+def test_is_clean_family_matches_real_txline_totals_key() -> None:
+    """The REAL TxLINE totals family (deepest liquidity) is eligible — not just the synthetic "OU".
+
+    Live/replay totals normalize to ``OVERUNDER_PARTICIPANT_GOALS|half=…|line=…`` (see
+    ``veridex.ingest.txline_normalize.market_key``). The old prefix set ("OU"/"OVER_UNDER") never
+    matched that shape, so real totals were silently ineligible — only 1X2 markets were considered.
+    """
+    # Real normalized totals keys (both lines) must be clean.
+    assert is_clean_family("OVERUNDER_PARTICIPANT_GOALS|half=1|line=1")
+    assert is_clean_family("OVERUNDER_PARTICIPANT_GOALS|half=1|line=2")
+    # Existing families still match (1X2 real key shape + synthetic OU/props unchanged).
+    assert is_clean_family("1X2_PARTICIPANT_RESULT||")
+    assert is_clean_family("OU_2_5")
+    # A genuine spread/handicap family stays DEFERRED (noisier process — never clean).
+    assert not is_clean_family("ASIAN_HANDICAP_PARTICIPANT|line=-0.5")
+    assert not is_clean_family("HANDICAP_PARTICIPANT_GOALS|half=1|line=1")
+
+
 def test_v2_ignores_prop_markets() -> None:
     # The same sharp ramp on a prop-family market never produces a signal.
     assert _fire_indices(_run_v2(TAPE_SHARP, market_key="PLAYER_PROP_POINTS")) == []

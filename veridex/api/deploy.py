@@ -21,6 +21,7 @@ import logging
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
 from fastapi import FastAPI, HTTPException
@@ -28,6 +29,7 @@ from pydantic import BaseModel
 
 from veridex.api.demo_fixtures import build_demo_ticks
 from veridex.chain.anchor import anchor_memo
+from veridex.deploy.instance import AgentInstance, DeployFailureReason, DeployStatus
 from veridex.deploy.preflight import DeployConfig, PreflightCheck, run_deploy_preflight
 from veridex.ingest.feed_health import FeedHealthReport
 from veridex.ingest.marketstate import MarketState
@@ -42,35 +44,14 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _now_iso() -> str:
+    """Return the current UTC time as an ISO-8601 string (the deploy-record timestamp stamp)."""
+    return datetime.now(tz=UTC).isoformat()
+
+
 # ---------------------------------------------------------------------------
-# Pinned instance + response envelope
+# Response envelope (the durable AgentInstance record lives in veridex.deploy.instance)
 # ---------------------------------------------------------------------------
-
-
-class AgentInstance(BaseModel):
-    """The PINNED deployment record — the instance IS the deployment (no separate deployment_id).
-
-    Attributes:
-        instance_id: Stable identifier for this deployed instance.
-        agent_id: The deployed agent's identifier.
-        template_id: The strategy-archetype template the instance was configured from.
-        config_hash: SHA-256 of the submitted (validated) config — pinned only after preflight.
-        policy_hash: SHA-256 of the committed policy envelope.
-        market_allowlist: The pinned market universe.
-        source_mode: ``replay`` or ``live``.
-        execution_mode: ``paper`` | ``dry_run`` | ``live_guarded``.
-        run_id: The run this instance launched (known before the seal — the async handle).
-    """
-
-    instance_id: str
-    agent_id: str
-    template_id: str
-    config_hash: str
-    policy_hash: str
-    market_allowlist: list[str]
-    source_mode: str
-    execution_mode: str
-    run_id: str
 
 
 class DeployResponse(BaseModel):
@@ -127,16 +108,14 @@ class DeployDeps:
 # ---------------------------------------------------------------------------
 
 
-def _build_agent(config: DeployConfig) -> Agent:
-    """Construct the deployed agent through the SINGLE ``build_agent`` dispatch (no parallel builder).
+def _build_run_config(config: DeployConfig) -> AgentRunConfig:
+    """Map the validated wire config onto the typed, bounded :class:`AgentRunConfig` (single seam).
 
-    Maps the validated wire config onto an :class:`~veridex_agent.config.AgentRunConfig` (the typed,
-    bounded config the CLI also uses) and delegates to :func:`~veridex_agent.config.build_agent`, so
-    the flagship ``momentum-sharp`` v2 (and every strategy) is constructed in exactly one place. The
-    AgentRunConfig's own Field bounds re-validate here as defense-in-depth — preflight already passed,
-    so construction is safe.
+    This is the ONE place a :class:`DeployConfig` becomes the runner's config — used both to build
+    the agent and to snapshot the EFFECTIVE (normalized) config onto the durable instance record.
+    The AgentRunConfig's own Field bounds re-validate here as defense-in-depth (preflight passed).
     """
-    run_config = AgentRunConfig(
+    return AgentRunConfig(
         agent_id=config.agent_id,
         strategy=config.strategy,
         source_mode=config.source_mode,
@@ -161,7 +140,15 @@ def _build_agent(config: DeployConfig) -> Agent:
         scale_floor=config.scale_floor,
         persistence_logit=config.persistence_logit,
     )
-    return build_agent(run_config)
+
+
+def _build_agent(config: DeployConfig) -> Agent:
+    """Construct the deployed agent through the SINGLE ``build_agent`` dispatch (no parallel builder).
+
+    Delegates to :func:`~veridex_agent.config.build_agent` via :func:`_build_run_config`, so the
+    flagship ``momentum-sharp`` v2 (and every strategy) is constructed in exactly one place.
+    """
+    return build_agent(_build_run_config(config))
 
 
 def _build_window(config: DeployConfig) -> RunWindow:
@@ -192,11 +179,11 @@ def register_deploy_routes(app: FastAPI, *, store: Store, deploy_deps: DeployDep
     """
     deps = deploy_deps if deploy_deps is not None else DeployDeps()
 
-    # app.state registries: tracked background run tasks (cancellable on shutdown) + pinned instances.
+    # app.state holds ONLY the live background run-task handles (cancellable on shutdown) — the
+    # cancellation bookkeeping. The durable AgentInstance record is the STORE's job (source of
+    # truth), NOT app.state: it survives a process restart and an app.state clear.
     background_tasks: set[asyncio.Task[None]] = set()
-    instances: dict[str, AgentInstance] = {}
     app.state.deploy_background_tasks = background_tasks
-    app.state.deploy_instances = instances
 
     def _resolve_replay_marketstates() -> list[MarketState]:
         """Resolve the REPLAY source ticks: injected fakes (tests) or the in-code demo fixture.
@@ -211,42 +198,73 @@ def register_deploy_routes(app: FastAPI, *, store: Store, deploy_deps: DeployDep
             return list(deps.marketstates)
         return build_demo_ticks()
 
-    async def _launch(config: DeployConfig, run_id: str, marketstates: list[MarketState]) -> None:
-        """Run the deployed agent through the SINGLE seam, persisting the seal under ``run_id``."""
-        agent = _build_agent(config)
-        envelope = config.to_policy_envelope()
-        # paper is proof-only (no envelope → no execution lane); non-paper engages the lane.
-        lane_envelope = None if config.execution_mode == "paper" else envelope
-        config_hash = config.config_hash()
+    async def _launch(
+        config: DeployConfig, run_id: str, instance_id: str, marketstates: list[MarketState]
+    ) -> None:
+        """Run the deployed agent through the SINGLE seam, durably tracking the instance status.
 
-        if config.source_mode == "live":
-            await standalone_run(
-                [],
-                agent,
-                window=_build_window(config),
-                stream=deps.stream_factory(config) if deps.stream_factory is not None else None,
-                fetch_updates=deps.fetch_updates,
-                policy_envelope=lane_envelope,
-                execution_mode=config.execution_mode,
-                adapter=deps.adapter,
-                config_hash=config_hash,
-                run_id=run_id,
-                store=store,
-                anchor_fn=deps.anchor_fn,
+        Advances the STORED instance ``running`` → ``sealed`` (clean seal, run persisted under
+        ``run_id``) or ``failed`` (pre-seal error, with a bounded ``last_failure_reason``) — so the
+        outcome survives beyond process memory. A shutdown cancellation is neither: the record is
+        left in ``running`` (honest — it was running when the process was cancelled).
+        """
+        await store.update_agent_instance_status(instance_id, DeployStatus.RUNNING, updated_at=_now_iso())
+        # Controlled failure taxonomy (never a raw trace): a failure while constructing the agent is
+        # a RUNTIME_ERROR; once we enter the runner seam it is a SEAL_FAILED. The FULL diagnostic is
+        # logged with exc_info by the done-callback below — only this short reason is persisted.
+        phase = DeployFailureReason.RUNTIME_ERROR
+        try:
+            agent = _build_agent(config)
+            envelope = config.to_policy_envelope()
+            # paper is proof-only (no envelope → no execution lane); non-paper engages the lane.
+            lane_envelope = None if config.execution_mode == "paper" else envelope
+            config_hash = config.config_hash()
+
+            phase = DeployFailureReason.SEAL_FAILED
+            if config.source_mode == "live":
+                await standalone_run(
+                    [],
+                    agent,
+                    window=_build_window(config),
+                    stream=deps.stream_factory(config) if deps.stream_factory is not None else None,
+                    fetch_updates=deps.fetch_updates,
+                    policy_envelope=lane_envelope,
+                    execution_mode=config.execution_mode,
+                    adapter=deps.adapter,
+                    config_hash=config_hash,
+                    run_id=run_id,
+                    store=store,
+                    anchor_fn=deps.anchor_fn,
+                )
+            else:
+                await standalone_run(
+                    marketstates,
+                    agent,
+                    source_mode="replay",
+                    policy_envelope=lane_envelope,
+                    execution_mode=config.execution_mode,
+                    adapter=deps.adapter,
+                    config_hash=config_hash,
+                    run_id=run_id,
+                    store=store,
+                    anchor_fn=deps.anchor_fn,
+                )
+        except asyncio.CancelledError:
+            # Shutdown cancellation is neither a seal nor a failure — leave the record RUNNING.
+            raise
+        except Exception:
+            # Pre-seal failure: durably mark FAILED with the CONTROLLED reason (no raw trace), then
+            # re-raise so the done-callback surfaces the FULL diagnostic on the server log (never
+            # lost to GC, never persisted to the record).
+            await store.update_agent_instance_status(
+                instance_id,
+                DeployStatus.FAILED,
+                last_failure_reason=phase,
+                updated_at=_now_iso(),
             )
-        else:
-            await standalone_run(
-                marketstates,
-                agent,
-                source_mode="replay",
-                policy_envelope=lane_envelope,
-                execution_mode=config.execution_mode,
-                adapter=deps.adapter,
-                config_hash=config_hash,
-                run_id=run_id,
-                store=store,
-                anchor_fn=deps.anchor_fn,
-            )
+            raise
+        # Clean seal: the run is persisted under run_id — durably mark the instance SEALED.
+        await store.update_agent_instance_status(instance_id, DeployStatus.SEALED, updated_at=_now_iso())
 
     @app.post("/agents/deploy", response_model=DeployResponse)
     async def deploy_agent(config: DeployConfig) -> DeployResponse:
@@ -293,37 +311,57 @@ def register_deploy_routes(app: FastAPI, *, store: Store, deploy_deps: DeployDep
 
         # Preflight passed → pin config_hash (only now) + policy_hash into the AgentInstance.
         run_id = uuid.uuid4().hex
+        now = _now_iso()
         instance = AgentInstance(
             instance_id=f"inst_{uuid.uuid4().hex}",
-            agent_id=config.agent_id,
             template_id=config.template_id,
+            agent_id=config.agent_id,
+            submitted_config=config.model_dump(mode="json"),
+            effective_config=_build_run_config(config).model_dump(mode="json"),
             config_hash=config.config_hash(),
             policy_hash=envelope.policy_hash(),
-            market_allowlist=list(config.market_allowlist),
             source_mode=config.source_mode,
             execution_mode=config.execution_mode,
+            market_allowlist=list(config.market_allowlist),
+            venue_allowlist=list(config.venue_allowlist),
             run_id=run_id,
+            # Durable "why did this launch?" audit: the named preflight verdicts that GATED it
+            # (all passing/not-applicable — a failing preflight never reaches here).
+            preflight_checks=list(checks),
+            status=DeployStatus.PENDING,
+            last_failure_reason=None,
+            created_at=now,
+            updated_at=now,
         )
-        instances[instance.instance_id] = instance
+        # PERSIST-THEN-LAUNCH: the durable record is written to the STORE (source of truth) AFTER
+        # preflight passes and BEFORE the run launches — so a preflight failure leaves no row, and a
+        # deployed instance is never app.state-only. app.state carries only the task handle below.
+        await store.persist_agent_instance(instance)
 
         # Launch ASYNCHRONOUSLY: track the task + auto-discard on completion (cancellable on shutdown).
-        task: asyncio.Task[None] = asyncio.create_task(_launch(config, run_id, replay_marketstates))
+        task: asyncio.Task[None] = asyncio.create_task(
+            _launch(config, run_id, instance.instance_id, replay_marketstates)
+        )
         background_tasks.add(task)
 
         def _on_done(finished: asyncio.Task[None], *, launched_run_id: str = run_id) -> None:
-            """Discard the finished task AND SURFACE a pre-seal failure (never lose it to GC).
+            """Discard the finished task AND SURFACE a background-task failure (never lose it to GC).
 
             A cancelled task (shutdown) carries no error. Any other exception is a real failure of
-            the seal/verify/anchor/persist path (the execution lane is already isolated inside
-            ``standalone_run``) — log it with the ``run_id`` so an operator can explain why a
-            subsequent ``/runs/{id}/verify`` 404s, instead of relying on asyncio's GC warning.
+            the deploy background task — the pre-seal seal/verify/anchor/persist path OR the POST-seal
+            status write to ``SEALED`` (the execution lane is already isolated inside
+            ``standalone_run``). Log it with the ``run_id`` so an operator can explain why a
+            subsequent ``/runs/{id}/verify`` 404s (a pre-seal failure) or why the instance status is
+            stale (a post-seal write failure), instead of relying on asyncio's GC warning.
             """
             background_tasks.discard(finished)
             if finished.cancelled():
                 return
             exc = finished.exception()
             if exc is not None:
-                logger.error("deployed run %s failed pre-seal", launched_run_id, exc_info=exc)
+                # "background task failed" — accurate whether the exception was raised pre-seal or in
+                # the post-seal status write; asserting "pre-seal" here would mislabel the latter.
+                logger.error("deployed run %s background task failed", launched_run_id, exc_info=exc)
 
         task.add_done_callback(_on_done)
 

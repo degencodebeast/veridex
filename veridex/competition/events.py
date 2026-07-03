@@ -66,6 +66,7 @@ class EventType(str, Enum):
     APPROVAL_AUDIT = "approval_audit"  # Phase 2B (human-approval resolution) — never emitted by build_event_log
     SCORE_UPDATE = "score_update"
     PROOF_ANCHOR = "proof_anchor"
+    EXECUTION_ROUTE = "execution_route"  # T23 honest-degrade telemetry — evidence=False; never emitted by build_event_log
     PAYOUT_STATUS = "payout_status"  # reserved (Phase 2D) — not emitted by any current lane
     COMPETITION_FINALIZED = "competition_finalized"
 
@@ -318,6 +319,48 @@ def build_policy_result_event(
         evidence=False,
         source_sequence_no=None,
         derived_from=[f"score_row:{agent_id}:seq-{source_sequence_no_ref}"],
+        payload=payload,
+        payload_hash=event_payload_hash(payload),
+    )
+
+
+def build_execution_route_event(
+    *,
+    competition_id: str,
+    run_id: str,
+    seq: int,
+    event_ts: int,
+    payload: dict[str, Any],
+) -> CompetitionEvent:
+    """Build a T23 ``EXECUTION_ROUTE`` honest-degrade telemetry event (derived, ``evidence=False``).
+
+    Emitted by the competition service ONLY when a CONFIGURED ``live_guarded`` run degrades to a
+    dry-run simulation because a money gate failed — so an auditor sees the fail-closed reason
+    EXPLICITLY (``degraded_because_not_armed`` + the specific ``degrade_reason``) rather than only
+    inferring it from ``config=live`` vs ``events=dry``. This is OPS/telemetry: ``evidence=False``,
+    non-scoring, and never bound into the sealed evidence hash. MUST NOT be called by
+    :func:`build_event_log` — the 2A canonical log stays byte-identical to Phase 2A.
+
+    Args:
+        competition_id: Owning competition identifier.
+        run_id: Sealed Phase-1 run identifier.
+        seq: Monotonic competition sequence number for this event.
+        event_ts: Deterministic event timestamp.
+        payload: The secret-free degrade descriptor (requested/effective mode, the reason enum).
+
+    Returns:
+        A :class:`CompetitionEvent` with ``evidence=False``, ``source_sequence_no=None``, and
+        ``derived_from=["execution_route"]``.
+    """
+    return CompetitionEvent(
+        competition_id=competition_id,
+        run_id=run_id,
+        seq=seq,
+        event_type=EventType.EXECUTION_ROUTE,
+        event_ts=event_ts,
+        evidence=False,
+        source_sequence_no=None,
+        derived_from=["execution_route"],
         payload=payload,
         payload_hash=event_payload_hash(payload),
     )

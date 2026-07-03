@@ -456,9 +456,9 @@ class _RecordingAdapter(FakeVenueAdapter):
         self._price = price
         self.quote_calls = 0
 
-    async def quote_market(self, market_ref: str) -> Quote:
+    async def quote_market(self, market_ref: str, for_size: float | None = None) -> Quote:
         self.quote_calls += 1
-        return Quote(market_ref=market_ref, price=self._price, size=500.0, ts=int(time.time()))
+        return Quote(market_ref=market_ref, price=self._price, size=500.0, for_size=for_size, ts=int(time.time()))
 
 
 async def test_pre_quote_kill_switch_skips_venue_quote(rr: RunResult) -> None:

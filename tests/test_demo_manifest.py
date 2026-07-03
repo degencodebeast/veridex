@@ -19,6 +19,9 @@ from scripts.demo_phase2d import (
     FLAGSHIP_STRATEGY_LABEL,
     HONEST_KINDS,
     SYNTHETIC_PROVENANCE,
+    UNKNOWN_PROVENANCE,
+    _odds_desc,
+    _pack_provenance,
     run_demo,
 )
 from veridex.store import InMemoryStore
@@ -91,3 +94,71 @@ async def test_flagship_backtest_is_present_and_honestly_labelled(tmp_path: Path
     assert flagship["avg_clv_bps"] is not None
     assert "synthetic" in flagship["clv_caveat"].lower()
     assert "not a real" in flagship["clv_caveat"].lower()
+
+
+def _pack_with_capture(tmp_path: Path, capture: dict[str, object]) -> Path:
+    """Write a minimal pack dir whose ``pack.json`` carries just the given ``capture`` block."""
+    pack_dir = tmp_path / "pack"
+    pack_dir.mkdir()
+    (pack_dir / "pack.json").write_text(json.dumps({"capture": capture}))
+    return pack_dir
+
+
+def test_provenance_string_without_bool_still_reads_synthetic(tmp_path: Path) -> None:
+    """Coherence: a ``provenance`` string that says synthetic — even with NO ``synthetic`` bool —
+    keeps the synthetic flag + caveat (the two signals can't disagree in the caveat-off direction)."""
+    pack = _pack_with_capture(tmp_path, {"provenance": SYNTHETIC_PROVENANCE})  # no synthetic bool
+
+    provenance, is_synthetic, caveat = _pack_provenance(pack)
+
+    assert is_synthetic is True
+    assert provenance == SYNTHETIC_PROVENANCE
+    assert "synthetic" in caveat.lower() and "not a real" in caveat.lower()
+
+
+def test_unmarked_pack_reads_unknown_not_captured(tmp_path: Path) -> None:
+    """Fail-safe: an unmarked/empty capture must NOT assert 'captured' — it reads unknown and still
+    carries a cautious caveat, so an unverifiable pack never silently claims a real edge."""
+    pack = _pack_with_capture(tmp_path, {})  # no synthetic, no provenance
+
+    provenance, is_synthetic, caveat = _pack_provenance(pack)
+
+    assert provenance == UNKNOWN_PROVENANCE
+    assert provenance != "captured-odds"
+    assert is_synthetic is False
+    assert "unverified" in caveat.lower() and "not a claimed real edge" in caveat.lower()
+
+
+def test_odds_desc_unknown_provenance_reads_unverified_not_captured() -> None:
+    """The console/notes phrase matches the STRUCTURED provenance three-way: an unknown pack reads
+    "unverified-provenance odds", NEVER "captured odds" (the is_synthetic=False overclaim fixed)."""
+    assert _odds_desc(SYNTHETIC_PROVENANCE, True) == "SYNTHETIC illustrative odds"
+    assert _odds_desc("captured-txline-fixture-18172379", False) == "captured odds"
+    unknown = _odds_desc(UNKNOWN_PROVENANCE, False)
+    assert unknown == "unverified-provenance odds"
+    assert "captured" not in unknown  # the unknown case must not claim it was captured
+
+
+async def test_backtest_run_entry_carries_scored_count(tmp_path: Path) -> None:
+    """The backtest run entry carries scored_count (the clv_confidence basis) ALONGSIDE sample_size
+    (total decisions) — so a reader never mistakes sample_size for the confidence population."""
+    store = InMemoryStore()
+    manifest = await run_demo(DEFAULT_PACK_DIR, DEFAULT_FIXTURE_ID, out_path=tmp_path / "m.json", store=store)
+
+    flagship = next(run for run in manifest["runs"] if run["kind"] == "backtest")
+    assert isinstance(flagship["scored_count"], int)
+    # scored picks are a SUBSET of the total decisions evaluated (WAIT-inclusive).
+    assert 0 <= flagship["scored_count"] <= flagship["sample_size"]
+
+
+def test_positively_stamped_real_pack_reads_real_not_synthetic(tmp_path: Path) -> None:
+    """A producer-stamped non-synthetic provenance reads as an honest real-odds label — still a
+    paper/backtest signal, never a bare live-executed edge claim."""
+    pack = _pack_with_capture(tmp_path, {"provenance": "captured-txline-fixture-18172379"})
+
+    provenance, is_synthetic, caveat = _pack_provenance(pack)
+
+    assert is_synthetic is False
+    assert provenance == "captured-txline-fixture-18172379"
+    assert "synthetic" not in caveat.lower()
+    assert "not a live-executed" in caveat.lower()

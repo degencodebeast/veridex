@@ -1,9 +1,9 @@
-"""Proof card — VerifierRunResponse-shaped JSON (read-only, JSON/static; NO UI). Test-driven (T7, B8).
+"""Proof card — verifier-run-response-shaped JSON (read-only, JSON/static; NO UI). Test-driven (T7, B8).
 
-The judge-visible artifact. ``agent-rank``'s ``VerifierRunResponse`` names its block ``cats``; the
-PUBLIC proof card must surface it as ``checks`` / Proof Checks via a thin response adapter
-(KILL-6 if that needs broad schema rewrites). Must never expose ``cats`` in any public JSON field
-name (AC-111 / KILL-6).
+The judge-visible artifact. An earlier internal run-model named its checks block with a legacy
+internal name; the PUBLIC proof card must surface it as ``checks`` / Proof Checks via a thin
+response adapter (KILL-6 if that needs broad schema rewrites). Must never expose that legacy
+internal name in any public JSON field name (AC-111 / KILL-6).
 
 Phase 1 B8 enriches the Phase-0 card with ``verifier_version``, ``lineage`` (proof-mode map +
 schema versions), and ``anchor`` status. The ``proof_card_from_run_result`` helper builds the
@@ -44,7 +44,7 @@ def build_proof_card(
 
     Produces the judge-visible dict with ``verifier_version``, ``run``, ``lineage``,
     ``evidence``, ``checks``, and ``anchor`` (plus an optional ``metrics`` block).  The key
-    ``cats`` never appears anywhere in the returned structure (KILL-6 / AC-111).
+    The legacy internal name never appears anywhere in the returned structure (KILL-6 / AC-111).
 
     Backward-compatible with the Phase-0 signature: existing callers that pass only
     ``run``, ``evidence``, ``checks``, and ``proof_mode`` receive a fully-enriched card
@@ -53,7 +53,7 @@ def build_proof_card(
     Args:
         run: Run metadata dict (e.g. ``{"run_id": ..., "source_mode": ...}``).
         evidence: Evidence block (e.g. ``{"evidence_hash": ..., "run_event_count": ...}``).
-        checks: Proof-Checks mapping — always exposed as ``checks``, never ``cats``.
+        checks: Proof-Checks mapping — always exposed as ``checks``, never a legacy internal name.
         proof_mode: Proof-mode label for the run (``"reproducible"`` or
             ``"LLM/evidence-verified"``); used to synthesise a default ``proof_mode_map``
             when none is provided.
@@ -123,7 +123,7 @@ def proof_card_from_run_result(
     Args:
         run_result: A :class:`~veridex.runtime.orchestrator.RunResult` from
             :func:`~veridex.runtime.orchestrator.run_competition`.
-        checks: Proof-Checks mapping to embed in the card (PUBLIC name — never ``cats``).
+        checks: Proof-Checks mapping to embed in the card (PUBLIC name — never a legacy internal name).
         anchor: Anchor-status block supplied by B9; defaults to ``"not_anchored"``.
         verifier_version: Verifier version string (default ``"v0"``).
         schema_versions: Schema-version map for ``lineage``; defaults to

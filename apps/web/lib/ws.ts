@@ -59,8 +59,17 @@ function policyFromPayload(payload: Record<string, unknown>, seq: number): Polic
     tick_seq: typeof payload.tick_seq === 'number' ? payload.tick_seq : seq,
     decision: (payload.decision as PolicyDecision['decision']) ?? 'DENY',
     reason: typeof payload.reason === 'string' ? payload.reason : reasonCodes ? reasonCodes.join(', ') : '',
-    edge_bps: typeof payload.edge_bps === 'number' ? payload.edge_bps : undefined,
+    // The executable edge AT the venue price: the post-quote gate emits it as `executable_edge_bps`
+    // (fall back to a legacy `edge_bps`). It renders as EDGE only behind the real-venue-quote gate.
+    edge_bps:
+      typeof payload.edge_bps === 'number' ? payload.edge_bps
+      : typeof payload.executable_edge_bps === 'number' ? payload.executable_edge_bps
+      : undefined,
     min_edge_bps: typeof payload.min_edge_bps === 'number' ? payload.min_edge_bps : undefined,
+    // DISPLAY-HONESTY (REQ-2D-701 gate 4): propagate the backend's EARNED flag verbatim — the edge
+    // renders ONLY when a genuine venue quote backed it. Fail-closed: absent/false ⇒ false, never
+    // fabricated from the presence of edge_bps / a venue price.
+    real_venue_quote: payload.real_venue_quote === true,
   };
 }
 

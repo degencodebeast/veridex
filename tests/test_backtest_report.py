@@ -15,6 +15,7 @@ from veridex.backtest.report import (
     build_backtest_report,
     mode_ladder_label,
 )
+from veridex.runtime.orchestrator import RunResult
 from veridex.runtime.window import RunWindow
 from veridex.scoring import score_run
 
@@ -165,6 +166,82 @@ def test_policy_pass_fail_rate_is_null_without_real_policy_eval() -> None:
     total = report.sample_size
     expected = (report.valid_count / total) if total else 0.0
     assert report.law_valid_rate == expected
+
+
+# ---------------------------------------------------------------------------------------------
+# CLV confidence keys off the SCORED sample, not law-valid WAITs (honesty — no overclaim).
+# A run can abstain (valid WAIT) on thousands of decisions and score ZERO picks; the CLV
+# confidence must then read "low", never "high" — it reflects scored-CLV coverage, not acceptance.
+# ---------------------------------------------------------------------------------------------
+
+
+def _run_with_rows(rows: list[dict]) -> RunResult:
+    """A sealed RunResult wrapping hand-built score_rows (report path reads only these + lineage)."""
+    return RunResult(
+        run_id="r_clv_conf",
+        source_mode="replay",
+        agent_ids=["a"],
+        run_events=[],
+        score_rows=rows,
+        evidence_hash="h",
+        proof_mode_map={"a": "reproducible"},
+    )
+
+
+def _wait_row(tick_seq: int) -> dict:
+    """A law-VALID abstention: valid is True but clv_bps is the ``"pending"`` sentinel (not scored)."""
+    return {"agent_id": "a", "tick_seq": tick_seq, "valid": True, "clv_bps": "pending"}
+
+
+def _scored_row(tick_seq: int, clv_bps: int) -> dict:
+    """A scored pick: valid is True AND clv_bps is a real int (contributes to CLV coverage)."""
+    return {"agent_id": "a", "tick_seq": tick_seq, "valid": True, "clv_bps": clv_bps}
+
+
+def _report(run: RunResult) -> BacktestReport:
+    return build_backtest_report(
+        run,
+        window=_window(),
+        pack_id="p",
+        content_hash="h",
+        source_mode="replay",
+        execution_mode="paper",
+        policy_envelope=None,
+    )
+
+
+def test_clv_confidence_keys_off_scored_picks_not_valid_waits() -> None:
+    """A zero-scored-pick run (all valid WAITs) reads LOW confidence — NEVER 'high' (no overclaim).
+
+    30 law-valid abstentions would map to 'high' if confidence keyed off ``valid_count``; it must
+    instead reflect the SCORED-CLV sample (0 picks → low). The law-valid rate stays exposed.
+    """
+    report = _report(_run_with_rows([_wait_row(i) for i in range(30)]))
+
+    assert report.valid_count == 30  # law-acceptance is still reported (a distinct, honest metric)
+    assert report.clv_distribution.count == 0  # nothing was scored
+    assert report.avg_clv is None
+    assert report.clv_confidence == "low"  # the CLV CONFIDENCE reflects scored coverage, not WAITs
+    assert report.low_sample_warning is not None
+
+
+def test_clv_confidence_boundary_is_on_scored_count_not_valid_count() -> None:
+    """The tier boundary keys off the SCORED count (9 → low, 10 → medium) regardless of valid_count.
+
+    Both runs carry 100 valid WAITs (so ``valid_count`` alone would say 'high'); only the number of
+    scored picks moves the tier — pinning the LOW_SAMPLE_MAX=9 boundary against the scored sample.
+    """
+    waits = [_wait_row(i) for i in range(100)]
+    nine_scored = [_scored_row(1000 + i, 12) for i in range(9)]
+    ten_scored = [_scored_row(1000 + i, 12) for i in range(10)]
+
+    low = _report(_run_with_rows(waits + nine_scored))
+    medium = _report(_run_with_rows(waits + ten_scored))
+
+    assert low.valid_count == 109 and low.clv_distribution.count == 9
+    assert low.clv_confidence == "low"
+    assert medium.valid_count == 110 and medium.clv_distribution.count == 10
+    assert medium.clv_confidence == "medium"
 
 
 def test_no_real_executable_edge_on_paper_venue() -> None:

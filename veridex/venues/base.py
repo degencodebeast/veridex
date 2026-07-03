@@ -277,11 +277,17 @@ class VenueAdapter(Protocol):
     methods so that ``import veridex.venues.<adapter>`` is offline-safe.
     """
 
-    async def quote_market(self, market_ref: str) -> Quote:
+    async def quote_market(self, market_ref: str, for_size: float | None = None) -> Quote:
         """Fetch a current price/size quote for *market_ref*.
+
+        QUOTE-SIZE COUPLING: ``for_size`` is the number of shares the quote should be priced to
+        fill, so a depth-aware adapter returns the executable cost-to-fill for the SAME size the
+        order will submit (its slippage / executable edge then match the size that fills). ``None``
+        leaves the adapter's own default sizing; a Fake/fixed adapter may ignore it.
 
         Args:
             market_ref: Venue-specific market identifier.
+            for_size: Shares to price the cost-to-fill for; ``None`` → the adapter's default.
 
         Returns:
             A :class:`Quote` snapshot.

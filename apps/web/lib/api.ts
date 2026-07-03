@@ -243,7 +243,7 @@ export function adaptCompetitionState(w: W.CompetitionStateResponse): CockpitSta
 }
 
 export function adaptInspector(w: W.InspectorRecord): InspectorRecord {
-  const rec = w.recompute as { recomputed_edge_bps?: number; clv_bps?: number; valid?: boolean };
+  const rec = w.recompute as { recomputed_edge_bps?: number; clv_bps?: number; valid?: boolean; real_venue_quote?: boolean };
   const llm = w.untrusted_llm_metadata as { reason?: string; confidence?: number; claimed_edge_bps?: number; model?: string };
   const clv = typeof w.clv_bps === 'number' ? w.clv_bps : Number(w.clv_bps) || 0;
   return {
@@ -258,11 +258,13 @@ export function adaptInspector(w: W.InspectorRecord): InspectorRecord {
     // GAP: the wire InspectorRecord carries no doctrine quantities (fair value,
     // executable edge, venue price, mispricing gap, stake) → null = honest "not in proof
     // artifact" (rendered as "—"), NOT a plausible 0. CLV (the real score) is carried through.
-    // real_venue_quote is FALSE on the live wire (no venue quote present) — the display gate
-    // fails closed so an edge number can NEVER render without a real quote (REQ-2D-501).
+    // real_venue_quote is PROPAGATED from the wire (REQ-2D-701 gate 4), never hardcoded — it is
+    // true ONLY when the backend earned it from a genuine venue quote. The live InspectorRecord
+    // carries no venue quote today, so this reads false; the display gate still fails closed so an
+    // edge number can NEVER render without a real quote (REQ-2D-501).
     clv_explanation: {
       fair_value_pct: null, closing_fair_value_pct: null, venue_decimal_price: null,
-      mispricing_gap_bps: null, executable_edge_bps: null, real_venue_quote: false,
+      mispricing_gap_bps: null, executable_edge_bps: null, real_venue_quote: rec.real_venue_quote === true,
       clv_bps: clv, stake_fraction: null,
       plain: '',
     },

@@ -56,7 +56,7 @@ CHECK_SEVERITY: dict[CheckId, CheckSeverity] = {
 
 
 class CheckResult(BaseModel):
-    """A single Proof-Check verdict (PUBLIC name — never ``cat``).
+    """A single Proof-Check verdict (PUBLIC name — never a legacy internal name).
 
     Attributes:
         id: The frozen check identifier.

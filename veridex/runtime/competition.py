@@ -136,7 +136,7 @@ def read_path_check_block(scores: list[dict[str, Any]], run: RunResult) -> dict[
         run: The completed run result (evidence hash + run_events + score rows).
 
     Returns:
-        A Proof-Checks block keyed by ``CheckId`` value (exposed publicly as ``checks`` — never ``cats``).
+        A Proof-Checks block keyed by ``CheckId`` value (exposed publicly as ``checks`` — never a legacy internal name).
     """
     results = build_check_results(scores=scores, run=run, source_mode=run.source_mode)
     return check_results_to_proof_block(results)

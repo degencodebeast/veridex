@@ -7,9 +7,9 @@ The deterministic law (``veridex.law.recompute``), evidence binding/hashing
 (``veridex.runtime.evidence``) and the baseline strategy stay SYNC and are CALLED from the
 async loop — concurrency NEVER reaches the deterministic core.
 
-This module diverges deliberately from agent-rank's run model: **one run / N concurrent agents
-on identical inputs** (head-to-head comparability) rather than one-agent-per-run. The agent-rank
-pitfall we fix: their agent calls had NO timeout and could hang the loop — here EVERY decide is
+This module diverges deliberately from a prior one-agent-per-run model: **one run / N concurrent
+agents on identical inputs** (head-to-head comparability) rather than one-agent-per-run. The
+pitfall we fix: in that prior model agent calls had NO timeout and could hang the loop — here EVERY decide is
 ``asyncio.timeout``-wrapped and a timeout/exception becomes an ``error`` event, never an abort.
 
 The three codex carry-forwards baked in:
