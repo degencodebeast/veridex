@@ -70,7 +70,8 @@ class DeployConfig(BaseModel):
     Attributes:
         template_id: Strategy-archetype identifier (the template the instance was configured from).
         agent_id: Stable identifier for the deployed agent.
-        strategy: Strategy family — ``baseline`` | ``momentum`` | ``momentum-sharp`` | ``llm``.
+        strategy: Strategy family — ``baseline`` | ``momentum`` | ``momentum-sharp`` |
+            ``cumulative-drift`` | ``llm``.
         source_mode: ``replay`` or ``live``.
         execution_mode: ``paper`` | ``dry_run`` | ``live_guarded`` (capital-exposure guard).
         market_allowlist: Markets the agent may score / route to (policy + live-window scope).
