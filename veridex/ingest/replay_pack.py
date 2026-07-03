@@ -29,12 +29,20 @@ class ReplayPack(BaseModel):
 
 
 def _manifest_filenames(fixtures: list[dict[str, Any]]) -> list[str]:
-    """Sorted filenames the `fixtures` manifest references — the hash-scope contract."""
+    """Sorted filenames the `fixtures` manifest references — the hash-scope contract.
+
+    An OPTIONAL ``venue_quotes`` leg (recorded venue quotes for the fixture) joins the hash scope
+    when present, so tampering with the recorded quotes is detected exactly like the records/odds
+    files. Venue quotes remain a NON-EVIDENCE sibling (:func:`load_pack_venue_quotes` marks each
+    frame ``evidence=False``); being content-hashed here never makes them sealed evidence.
+    """
     names: list[str] = []
     for entry in fixtures:
         names.append(entry["records"])
         if "odds_updates" in entry:
             names.append(entry["odds_updates"])
+        if "venue_quotes" in entry:
+            names.append(entry["venue_quotes"])
     return sorted(names)
 
 
@@ -131,6 +139,53 @@ def load_pack_marketstates(
     path = pack_dir / entry["records"]
     records = [json.loads(line) for line in path.read_text().splitlines() if line]
     return list(marketstates_from_record_stream(records, batch_size=batch_size))
+
+
+def load_pack_venue_quotes(
+    pack_dir: Path, fixture_id: int, *, verify: bool = True
+) -> list[dict[str, Any]]:
+    """Load a fixture's OPTIONAL ``venue_quotes`` leg as NON-EVIDENCE rows (each ``evidence=False``).
+
+    Manifest-gated exactly like :func:`load_pack_marketstates`: the quote file comes from the pack's
+    ``fixtures`` manifest entry for ``fixture_id`` (``entry["venue_quotes"]``), NEVER a filename
+    guessed off ``fixture_id`` alone. A fixture with no quote leg yields ``[]``.
+
+    Venue quotes are a content-hashed SIBLING artifact, never sealed evidence: every returned row is
+    stamped ``evidence=False`` so a caller can never mistake a recorded quote for a sealed tick event
+    (AC-015 — the quote leg joins ``content_hash`` but never the ``evidence_hash``).
+
+    Args:
+        pack_dir: Directory of the self-describing ReplayPack (must contain ``pack.json``).
+        fixture_id: The fixture whose quote leg to load.
+        verify: When ``True`` (default), refuse a pack whose stored ``content_hash`` no longer
+            matches its data files (tampered/corrupt) — pass ``False`` for trusted/perf paths.
+
+    Returns:
+        The recorded quote rows, each with an added ``evidence`` key set to ``False``. Empty when the
+        fixture carries no ``venue_quotes`` leg.
+
+    Raises:
+        ValueError: If ``verify`` is ``True`` and content-hash verification fails.
+        FileNotFoundError: If ``fixture_id`` is absent from the pack manifest.
+    """
+    if verify and not verify_content_hash(pack_dir):
+        raise ValueError(f"pack at {pack_dir} failed content_hash verification (tampered or corrupt)")
+
+    manifest = json.loads((pack_dir / "pack.json").read_text())
+    entry = next((f for f in manifest["fixtures"] if f["fixture_id"] == fixture_id), None)
+    if entry is None:
+        raise FileNotFoundError(f"fixture_id {fixture_id} not present in pack manifest at {pack_dir}")
+
+    quotes_name = entry.get("venue_quotes")
+    if quotes_name is None:
+        return []
+
+    path = pack_dir / quotes_name
+    rows = [json.loads(line) for line in path.read_text().splitlines() if line]
+    for row in rows:
+        # NON-EVIDENCE marker: a recorded venue quote is never a sealed tick event.
+        row["evidence"] = False
+    return rows
 
 
 def verify_content_hash(pack_dir: Path) -> bool:
