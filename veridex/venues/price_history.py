@@ -10,10 +10,11 @@ lower evidence rung than a recorded live quote or a live fill receipt.
 from __future__ import annotations
 
 import hashlib
+import math
 from pathlib import Path
 from typing import Any, Protocol
 
-from pydantic import BaseModel
+from pydantic import BaseModel, model_validator
 
 from veridex.venues.polymarket import native_to_decimal
 from veridex.venues.polymarket_resolver import ResolvedMarket, side_to_token
@@ -27,6 +28,12 @@ class VenuePriceHistoryFrame(BaseModel):
     :func:`veridex.venues.polymarket.native_to_decimal` — NEVER the raw ``q`` itself and
     NEVER independently computed. This module carries no bid/ask/size/status fields — it is
     a price-only backfill artifact, not a live orderbook snapshot.
+
+    The invariant is enforced STRUCTURALLY at the model boundary (see
+    :meth:`_check_venue_decimal_price_matches_native`), not just on the ``from_native``/
+    ``fetch_price_history`` construction path — a direct construction (or a deserialized/
+    loaded frame) with a mismatched pair fails closed with a :class:`ValidationError` rather
+    than silently carrying a wrong decimal price into downstream edge math.
     """
 
     ts: int
@@ -40,6 +47,23 @@ class VenuePriceHistoryFrame(BaseModel):
     price_kind: str
     fidelity_s: int
     provenance: str = "backfilled-price-history"
+
+    @model_validator(mode="after")
+    def _check_venue_decimal_price_matches_native(self) -> VenuePriceHistoryFrame:
+        """Fail closed (AC-014) unless ``venue_decimal_price == native_to_decimal(native_price)``.
+
+        Relative tolerance (not a bare absolute epsilon): decimal odds scale with
+        ``1/native_price``, so a fixed absolute tolerance would be too strict for tiny
+        native prices (e.g. ``native_price=0.01`` -> decimal ``100``) and too loose for
+        native prices near 1.
+        """
+        expected = native_to_decimal(self.native_price)
+        if not math.isclose(self.venue_decimal_price, expected, rel_tol=1e-9):
+            raise ValueError(
+                f"venue_decimal_price={self.venue_decimal_price!r} does not match "
+                f"native_to_decimal(native_price={self.native_price!r})={expected!r} (AC-014)"
+            )
+        return self
 
     @classmethod
     def from_native(

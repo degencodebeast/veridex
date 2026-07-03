@@ -1,4 +1,5 @@
 import pytest
+from pydantic import ValidationError
 
 from veridex.venues.polymarket import native_to_decimal
 from veridex.venues.polymarket_resolver import ResolvedMarket
@@ -25,6 +26,33 @@ def test_from_native_sets_decimal_via_native_to_decimal_not_the_raw_q():
     assert f.venue_decimal_price == native_to_decimal(0.62)
     assert f.venue_decimal_price != 0.62
     assert f.provenance == "backfilled-price-history"
+
+
+def test_frame_rejects_native_decimal_mismatch():
+    with pytest.raises(ValidationError):
+        VenuePriceHistoryFrame(
+            ts=1,
+            fixture_id=1,
+            market_ref="m",
+            condition_id="c",
+            token_id="t",
+            native_price=0.62,
+            venue_decimal_price=0.62,  # mismatched: should be native_to_decimal(0.62)
+            price_kind="x",
+            fidelity_s=60,
+        )
+    # from_native still works and is the preferred path:
+    f = VenuePriceHistoryFrame.from_native(
+        ts=1,
+        fixture_id=1,
+        market_ref="m",
+        condition_id="c",
+        token_id="t",
+        native_price=0.62,
+        price_kind="x",
+        fidelity_s=60,
+    )
+    assert f.venue_decimal_price == native_to_decimal(0.62)
 
 
 def test_price_history_hash_is_injective_and_changes_with_content(tmp_path):
