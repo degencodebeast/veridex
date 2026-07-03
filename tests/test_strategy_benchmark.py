@@ -2,9 +2,16 @@
 
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 
-from veridex.backtest.benchmark import CompetitorReplicationConfig, StrategyBenchmarkResult
+from veridex.backtest.benchmark import (
+    CompetitorReplicationConfig,
+    StrategyBenchmarkResult,
+    run_strategy_benchmark,
+    translate_sharpline,
+)
 
 
 def test_benchmark_result_rung_must_be_txline_only():
@@ -37,3 +44,24 @@ def test_benchmark_result_rejects_venue_edge_rung():
             abstain_count=0,
             provenance="live-fill-receipt",
         )
+
+
+def test_sharpline_benchmark_is_scored_through_injected_veridex_scoring_only():
+    cfg = translate_sharpline(
+        {"zGate": 1.5, "phThresh": 0.25, "lambda": 0.92, "cooldown": 3, "warmup": 10}
+    )
+    assert cfg.source_repo == "sharpline" and cfg.strategy in {"momentum-sharp", "cumulative-drift"}
+    calls = {"n": 0}
+
+    def fake_score_fn(fires):  # the ONLY source of scored numbers
+        calls["n"] += 1
+        return {"scored_count": len(fires), "avg_clv_bps": 0.0}
+
+    class _Pack:  # minimal deterministic pack stub
+        content_hash = "2" * 64
+        ticks = [0.50, 0.52, 0.58, 0.70]  # a sharp move
+
+    res = asyncio.run(run_strategy_benchmark(cfg, pack=_Pack(), score_fn=fake_score_fn))
+    assert calls["n"] == 1  # scoring came from Veridex seam, not competitor code
+    assert res.evidence_rung == "txline-only"
+    assert res.pack_content_hash == "2" * 64

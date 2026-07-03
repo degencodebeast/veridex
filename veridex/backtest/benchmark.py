@@ -15,11 +15,16 @@ allowed to borrow a venue-fill-grade evidence rung it never earned.
 from __future__ import annotations
 
 import hashlib
+from typing import Any, Callable
 
 from pydantic import BaseModel, field_validator
 
 from veridex.provenance import EvidenceRung
 from veridex.runtime.evidence import serialize_payload
+from veridex.strategies.sharp_stats import PageHinkley, logit, robust_z
+
+#: Signature of the injected Veridex scoring seam — the ONLY source of scored numbers here.
+ScoreFn = Callable[[list[int]], dict[str, Any]]
 
 
 class CompetitorReplicationConfig(BaseModel):
@@ -64,3 +69,122 @@ class StrategyBenchmarkResult(BaseModel):
                 f"(competitors are rung-1 only, REQ-SX-004), got {value!r}"
             )
         return value
+
+
+def translate_sharpline(params: dict[str, float]) -> CompetitorReplicationConfig:
+    """Translate sharpline's z-score + Page-Hinkley detector into a Veridex config (CON-007).
+
+    Re-expresses sharpline's published tuning knobs (`zGate`, `phThresh`, `lambda`, `cooldown`,
+    `warmup`) over Veridex's own `sharp_stats` primitives (`robust_z`, `PageHinkley`) — no
+    sharpline code is imported or executed, only its algorithm as described by these parameters.
+    """
+    translated = {
+        "z_gate": float(params["zGate"]),
+        "ph_delta": float(params["phThresh"]),
+        "ph_lambda": float(params["lambda"]),
+        "cooldown_ticks": float(params["cooldown"]),
+        "warmup_ticks": float(params["warmup"]),
+    }
+    return CompetitorReplicationConfig(
+        source_repo="sharpline",
+        source_strategy="sharpline",
+        strategy="momentum-sharp",
+        translated_params=translated,
+        notes=(
+            "sharpline's robust z-score gate + Page-Hinkley change-point detector, re-expressed "
+            "over Veridex's own sharp_stats primitives (robust_z, PageHinkley) — no sharpline "
+            "code imported."
+        ),
+    )
+
+
+def translate_threshold(params: dict[str, float]) -> CompetitorReplicationConfig:
+    """Translate sports-workbench's flat percent-move-threshold detector into a Veridex config.
+
+    Sibling translator for the M5 baseline lane. Re-expresses a plain "fire when price moves
+    more than X%" rule as a Veridex threshold config — no sports-workbench code imported.
+    """
+    translated = {
+        "move_threshold_pct": float(params["moveThreshold"]),
+        "cooldown_ticks": float(params.get("cooldown", 0.0)),
+    }
+    return CompetitorReplicationConfig(
+        source_repo="sports-workbench",
+        source_strategy="sports-workbench",
+        strategy="threshold-move",
+        translated_params=translated,
+        notes=(
+            "sports-workbench's flat percent-move-threshold detector, re-expressed as a Veridex "
+            "threshold config — no sports-workbench code imported."
+        ),
+    )
+
+
+def _sharp_detector_fires(series: list[float], params: dict[str, float]) -> list[int]:
+    """Replay the translated sharpline detector over `series`; return firing tick indices.
+
+    A tick fires when EITHER the robust z-score of its logit-space move against its own recent
+    window exceeds `z_gate`, OR the Page-Hinkley change-point detector confirms a sustained
+    level shift — mirroring sharpline's two-signal (sharp-move + confirmed-drift) design. The
+    first `warmup_ticks` ticks are skipped (no reference window yet); a fire holds off the next
+    `cooldown_ticks` ticks from firing again (sharpline's own cooldown semantics).
+    """
+    z_gate = params["z_gate"]
+    warmup = int(params["warmup_ticks"])
+    cooldown = int(params["cooldown_ticks"])
+    ph = PageHinkley(delta=params["ph_delta"], lambda_=params["ph_lambda"])
+
+    logits = [logit(p) for p in series]
+    fires: list[int] = []
+    cooldown_remaining = 0
+    for i, value in enumerate(logits):
+        direction = ph.update(value)
+        if i < warmup:
+            continue
+        if cooldown_remaining > 0:
+            cooldown_remaining -= 1
+            continue
+        z = robust_z(logits[: i + 1])
+        if abs(z) >= z_gate or direction is not None:
+            fires.append(i)
+            cooldown_remaining = cooldown
+    return fires
+
+
+def _assemble_result(
+    config: CompetitorReplicationConfig,
+    fires: list[int],
+    score_result: dict[str, Any],
+    *,
+    pack_content_hash: str,
+) -> StrategyBenchmarkResult:
+    """Assemble the sealed result — every scored field copied verbatim from `score_result`."""
+    fire_count = len(fires)
+    scored_count = int(score_result.get("scored_count", 0))
+    return StrategyBenchmarkResult(
+        benchmark_id=f"{config.source_strategy}_{pack_content_hash[:12]}",
+        source_strategy=config.source_strategy,
+        veridex_config_hash=config.veridex_config_hash(),
+        pack_content_hash=pack_content_hash,
+        evidence_rung=EvidenceRung.TXLINE_ONLY.value,
+        fire_count=fire_count,
+        scored_count=scored_count,
+        avg_clv_bps=score_result.get("avg_clv_bps"),
+        abstain_count=max(fire_count - scored_count, 0),
+        provenance=EvidenceRung.TXLINE_ONLY.value,
+    )
+
+
+async def run_strategy_benchmark(
+    config: CompetitorReplicationConfig, *, pack: Any, score_fn: ScoreFn
+) -> StrategyBenchmarkResult:
+    """Replay `config`'s translated detector over `pack.ticks`; score ONLY via `score_fn`.
+
+    This function computes fire indices — WHEN the translated competitor detector would have
+    acted — and nothing else. Every scored number (`scored_count`, `avg_clv_bps`, ...) comes
+    exclusively from the injected `score_fn` seam (the real Veridex scoring path in production,
+    a deterministic fake in tests): the benchmark never computes CLV itself.
+    """
+    fires = _sharp_detector_fires(list(pack.ticks), config.translated_params)
+    score_result = score_fn(fires)
+    return _assemble_result(config, fires, score_result, pack_content_hash=pack.content_hash)
