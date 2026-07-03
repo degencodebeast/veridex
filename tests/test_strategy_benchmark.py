@@ -7,8 +7,8 @@ from pathlib import Path
 
 import pytest
 
+from tests.test_replay_pack import _write_session
 from veridex.backtest.benchmark import (
-    CompetitorReplicationConfig,
     StrategyBenchmarkResult,
     benchmark_on_pack,
     extract_prob_series,
@@ -16,7 +16,6 @@ from veridex.backtest.benchmark import (
     translate_sharpline,
 )
 from veridex.ingest.replay_pack import load_pack_marketstates, pack_from_session
-from tests.test_replay_pack import _write_session
 
 
 def test_benchmark_result_rung_must_be_txline_only():
