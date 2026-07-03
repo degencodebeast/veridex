@@ -49,6 +49,10 @@ def _run(agent, series: list[int], *, mk: str = "1X2|home", side: str = "home") 
     return asyncio.run(go())
 
 
+def _typed(actions: list[AgentAction]) -> list[tuple[str, str | None]]:
+    return [(a.type.value, a.params.get("side")) for a in actions]
+
+
 # ------------------------------------------------------------------------------------------
 # Task 11 — abstains on thin data, fires on sustained smooth drift, config_hash is real
 # ------------------------------------------------------------------------------------------
@@ -95,3 +99,25 @@ def test_cumulative_drift_strategy_is_accepted_by_preflight() -> None:
     )
     cfg = next(c for c in checks if c.name == "config")
     assert cfg.ok is True
+
+
+# ------------------------------------------------------------------------------------------
+# Task 12 — prefix-invariance / no-lookahead (trust test: each agent owns its rolling state)
+# ------------------------------------------------------------------------------------------
+
+
+def test_decision_at_t_is_prefix_invariant() -> None:
+    # Discriminating params: firing happens INSIDE a 4-tick prefix, so a global/cross-agent-shared
+    # detector would leak one agent's history into the next and change the decision (proven RED).
+    kw = dict(min_tick_count=3, min_horizon_s=0, cum_drift_logit_min=0.05, cooldown_ticks=0)
+    prefix = [3000, 4000, 5000, 6000]
+
+    a = _typed(_run(cumulative_drift_agent(**kw), prefix))
+    b = _typed(_run(cumulative_drift_agent(**kw), prefix))  # a SECOND, independent fresh agent
+    assert a == b  # two fresh agents on the same prefix decide identically (no shared/global state)
+    assert any(t != "WAIT" for t, _ in a)  # ...and the prefix actually fires (the test discriminates)
+
+    # A separate agent's LONGER future must not perturb the prefix-4 decisions (causal, no lookahead).
+    longer = prefix + [5000, 4000, 3000, 2000]  # continues, then reverses
+    full = _typed(_run(cumulative_drift_agent(**kw), longer))
+    assert full[: len(prefix)] == a
