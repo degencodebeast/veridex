@@ -11,9 +11,25 @@ a venue-derived value, because ``AgentAction.model_dump()`` is sealed into the `
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
 
 from tests.test_drift_agent import _ms
+from tests.test_replay_pack import _write_session
+from veridex.ingest.replay_pack import pack_from_session
+from veridex.runtime.window import RunWindow
 from veridex.venues.polymarket import native_to_decimal
+
+_FIXTURE_ID = 5
+
+
+def _window() -> RunWindow:
+    return RunWindow(
+        window_id="w_vvv_report",
+        fixture_id=_FIXTURE_ID,
+        market_allowlist=["1X2"],
+        end_rule="pre_match",
+        min_clv_horizon_s=0,
+    )
 
 
 def test_no_executable_edge_without_a_quote() -> None:
@@ -89,3 +105,39 @@ def test_value_vs_venue_strategy_is_accepted_by_preflight() -> None:
     )
     cfg = next(c for c in checks if c.name == "config")
     assert cfg.ok is True
+
+
+# ------------------------------------------------------------------------------------------
+# Task 18b — the VvV PRODUCER: a real BacktestReport with a POST-BUILD estimated edge (S5).
+# ------------------------------------------------------------------------------------------
+
+
+async def test_vvv_produces_report_with_estimated_edge_but_scored_path_stays_venue_blind(tmp_path: Path) -> None:
+    """The producer attaches an estimated edge POST-build; the scored/ranked path stays venue-blind."""
+    from veridex.backtest.vvv_report import vvv_report_with_estimated_edge
+
+    session_dir = _write_session(tmp_path)
+    pack_dir = tmp_path / "pack"
+    pack_from_session(session_dir, pack_dir)
+
+    assumptions = {"no_interpolation": True, "slippage_bps": 0, "costs_bps": 0}
+    result, report = await vvv_report_with_estimated_edge(
+        pack_dir,
+        _FIXTURE_ID,
+        venue_price_source=lambda mk: 2.0,
+        window=_window(),
+        min_edge_bps=0,
+        assumptions=assumptions,
+    )
+
+    # An estimated (venue-derived) edge IS produced, with a machine-readable rung + explicit assumptions.
+    assert report.estimated_executable_edge_bps is not None
+    assert report.estimated_edge_rung in {"backfilled-price-history", "recorded-live-quote"}
+    assert report.estimated_edge_assumptions["no_interpolation"] is True
+    # ...but the REAL executable edge stays null (paper venue — no live fill).
+    assert report.real_executable_edge_bps is None
+    # ...and the estimated edge NEVER enters any ranked leaderboard row (SEC-005).
+    for row in report.leaderboard:
+        assert "estimated_executable_edge_bps" not in row
+    # The report is for the same sealed run the producer scored.
+    assert report.run_id == result.run_id
