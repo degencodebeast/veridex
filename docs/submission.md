@@ -58,7 +58,7 @@ The run also caught a second bug — the CLV-confidence metric was counting law-
 
 ## Why this should win
 
-- **It answers the track literally:** live autonomous agents, trading sports markets, on TxLINE data, with Solana in the trust path — plus the piece every other agent demo is missing: *verifiability*.
+- **It answers the track literally — including its own starter ideas.** The track's "ideas to get started" #1 (*a sharp-movement detector that flags odds shifts and tracks whether it predicted the outcome*) is Sharp Momentum v2 + CLV scoring; idea #2 (*an agent-vs-agent arena on the same TxLINE feed where the better strategy wins*) is our head-to-head arena on identical sealed inputs. We built both — then added the layer that makes them trustworthy: *verifiability*. And because the demo is deterministic replay over sealed data, judges can re-run and re-verify it **after the World Cup ends** — exactly the review constraint the brief calls out.
 - **The proof is falsifiable, not decorative.** Verify recomputes; checks fail on tampering (we tampered on purpose to prove it); receipts are structurally non-scoring; the leaderboard can't be gamed by abstaining or by an agent's own claims.
 - **It's a platform and a competition, not a demo bot.** Templates + typed configs + pinned instances + a durable deploy loop + an SDK that runs *your* agent through the same sealed pipeline — into an arena where agents race on identical inputs and the leaderboard is a fair fight by construction.
 - **Real-venue execution is engineered like money is real** — because it is. Two independent locks, a structural mode conjunct, operator-verified `live_ready`, a circuit breaker, and a resolver that raises rather than guesses. Our own review process caught a side↔token swap that would have sent an away bet to the away-*loses* token — while it was still latent. It's a regression test now.
@@ -74,6 +74,21 @@ The run also caught a second bug — the CLV-confidence metric was counting law-
 ## Stack
 
 Python 3.11 · FastAPI + Pydantic v2 · Solana (Memo anchor, devnet) · TxLINE StablePrice (de-margined consensus) · Polymarket CLOB (vendored, pinned client) · Agno + OpenRouter for the propose-only LLM layer (outside the audited trust path) · Next.js / React / TypeScript strict.
+
+## TxLINE endpoints used
+
+| Endpoint | How Veridex uses it |
+|---|---|
+| `POST /auth/guest/start` | Guest JWT mint/refresh for all data calls |
+| `POST /api/token/activate` | Activates the API token after the on-chain devnet subscription |
+| `GET /api/fixtures/sports/competitions` | Fixture bundle — fixture ids, kickoff times, team identities (drives market resolution) |
+| `GET /api/odds/stream` (SSE) | Live StablePrice odds into the live runner / recorder |
+| `GET /api/odds/updates/{fixtureId}` | Full odds movement history for a fixture — the backbone of ReplayPacks and the real-fixture backtest (65k+ updates for one match) |
+| `GET /api/odds/snapshot/{fixtureId}?asOf=` | Point-in-time odds (closing-line reconstruction, historical probes) |
+| `GET /api/odds/validation` | Merkle proof of an odds message (data-integrity probe) |
+| `GET /api/scores/stream` (SSE) · `GET /api/scores/updates/{fixtureId}` | Live/updated scores — match phase (pre-match vs in-running) for honest closing-line semantics |
+
+Integration experience feedback (what worked, where we hit friction): [`docs/txline-feedback.md`](txline-feedback.md).
 
 ## Links
 
