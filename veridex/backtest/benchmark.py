@@ -15,10 +15,14 @@ allowed to borrow a venue-fill-grade evidence rung it never earned.
 from __future__ import annotations
 
 import hashlib
+import json
+from pathlib import Path
 from typing import Any, Callable
 
 from pydantic import BaseModel, field_validator
 
+from veridex.ingest.marketstate import MarketState
+from veridex.ingest.replay_pack import load_pack_marketstates
 from veridex.provenance import EvidenceRung
 from veridex.runtime.evidence import serialize_payload
 from veridex.strategies.sharp_stats import PageHinkley, logit, robust_z
@@ -188,3 +192,48 @@ async def run_strategy_benchmark(
     fires = _sharp_detector_fires(list(pack.ticks), config.translated_params)
     score_result = score_fn(fires)
     return _assemble_result(config, fires, score_result, pack_content_hash=pack.content_hash)
+
+
+def extract_prob_series(marketstates: list[MarketState], market_key: str, side: str) -> list[float]:
+    """One market/side's probability series from real `MarketState`s, oldest first.
+
+    Reads `ms.markets[market_key]["stable_prob_bps"][side] / 10000.0` per tick. A tick where the
+    market is suspended (`stable_prob_bps` empty) or doesn't carry `side` is SKIPPED, not
+    interpolated — the detector only ever sees ticks that genuinely priced.
+    """
+    series: list[float] = []
+    for ms in marketstates:
+        market = ms.markets.get(market_key)
+        if market is None:
+            continue
+        prob_bps = market.get("stable_prob_bps") or {}
+        if side not in prob_bps:
+            continue
+        series.append(prob_bps[side] / 10000.0)
+    return series
+
+
+def _pack_content_hash(pack_dir: Path) -> str:
+    """Read the pack's stored `content_hash` from its manifest."""
+    return str(json.loads((pack_dir / "pack.json").read_text())["content_hash"])
+
+
+async def benchmark_on_pack(
+    config: CompetitorReplicationConfig,
+    *,
+    pack_dir: Path,
+    fixture_id: int,
+    market_key: str,
+    side: str,
+    score_fn: ScoreFn,
+) -> StrategyBenchmarkResult:
+    """Replay `config`'s translated detector over a REAL loaded ReplayPack (AC-003).
+
+    Loads MarketStates through the same tamper-evident, verified loader the live/backtest paths
+    use (`verify=True` — never a hand-faked pack). Scoring happens ONLY via `score_fn`.
+    """
+    marketstates = load_pack_marketstates(pack_dir, fixture_id, verify=True)
+    series = extract_prob_series(marketstates, market_key, side)
+    fires = _sharp_detector_fires(series, config.translated_params)
+    score_result = score_fn(fires)
+    return _assemble_result(config, fires, score_result, pack_content_hash=_pack_content_hash(pack_dir))

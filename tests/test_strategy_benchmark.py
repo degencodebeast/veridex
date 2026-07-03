@@ -3,15 +3,20 @@
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
 
 import pytest
 
 from veridex.backtest.benchmark import (
     CompetitorReplicationConfig,
     StrategyBenchmarkResult,
+    benchmark_on_pack,
+    extract_prob_series,
     run_strategy_benchmark,
     translate_sharpline,
 )
+from veridex.ingest.replay_pack import load_pack_marketstates, pack_from_session
+from tests.test_replay_pack import _write_session
 
 
 def test_benchmark_result_rung_must_be_txline_only():
@@ -65,3 +70,48 @@ def test_sharpline_benchmark_is_scored_through_injected_veridex_scoring_only():
     assert calls["n"] == 1  # scoring came from Veridex seam, not competitor code
     assert res.evidence_rung == "txline-only"
     assert res.pack_content_hash == "2" * 64
+
+
+def _real_pack(tmp_path: Path) -> Path:
+    session_dir = _write_session(tmp_path)  # records.jsonl + meta.json (fixture 5, 1X2)
+    pack_dir = tmp_path / "pack"
+    pack_from_session(session_dir, pack_dir)  # builds pack.json + odds file + real content_hash
+    return pack_dir
+
+
+def _first_market_side(marketstates):
+    ms0 = next(m for m in marketstates if m.markets)  # first tick with a non-suspended market
+    market_key = next(iter(ms0.markets))
+    side = next(iter(ms0.markets[market_key]["stable_prob_bps"]))
+    return market_key, side
+
+
+def test_benchmark_runs_on_a_real_loaded_pack_and_scores_via_veridex_seam(tmp_path):
+    pack_dir = _real_pack(tmp_path)
+    ms = load_pack_marketstates(pack_dir, fixture_id=5, verify=True)  # real loader, hash verified
+    assert ms and hasattr(ms[0], "markets")
+    market_key, side = _first_market_side(ms)  # derived from real data, not hardcoded
+    series = extract_prob_series(ms, market_key=market_key, side=side)
+    assert isinstance(series, list) and all(isinstance(x, float) for x in series)
+    cfg = translate_sharpline(
+        {"zGate": 1.5, "phThresh": 0.25, "lambda": 0.92, "cooldown": 3, "warmup": 10}
+    )
+    calls = {"n": 0}
+
+    def fake_score_fn(fires):
+        calls["n"] += 1
+        return {"scored_count": len(fires), "avg_clv_bps": 0.0}
+
+    res = asyncio.run(
+        benchmark_on_pack(
+            cfg,
+            pack_dir=pack_dir,
+            fixture_id=5,
+            market_key=market_key,
+            side=side,
+            score_fn=fake_score_fn,
+        )
+    )
+    assert calls["n"] == 1  # scored ONLY through the injected Veridex seam
+    assert res.evidence_rung == "txline-only"  # competitors are rung-1
+    assert len(res.pack_content_hash) == 64  # from the REAL loaded pack, not a stub
