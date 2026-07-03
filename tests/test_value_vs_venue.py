@@ -139,10 +139,12 @@ async def test_vvv_produces_report_with_estimated_edge_but_scored_path_stays_ven
     pack_from_session(session_dir, pack_dir)
 
     assumptions = {"no_interpolation": True, "slippage_bps": 0, "costs_bps": 0}
+    # venue decimal 5.0 makes every fixture-5 side's edge strongly positive, so the agent FIRES —
+    # the estimated edge then reflects an ACTUAL taken pick (F2), not an unfired opportunity.
     result, report = await vvv_report_with_estimated_edge(
         pack_dir,
         _FIXTURE_ID,
-        venue_price_source=lambda mk: 2.0,
+        venue_price_source=lambda mk: 5.0,
         window=_window(),
         min_edge_bps=0,
         assumptions=assumptions,
@@ -159,3 +161,103 @@ async def test_vvv_produces_report_with_estimated_edge_but_scored_path_stays_ven
         assert "estimated_executable_edge_bps" not in row
     # The report is for the same sealed run the producer scored.
     assert report.run_id == result.run_id
+
+
+def _write_1x2_session(tmp_path: Path, pct: list[float]) -> Path:
+    """A real, hashed 1X2 pack (fixture 5) whose de-vigged fair probs come from ``pct`` (percent).
+
+    Two identical ticks so the pre_match window splits the last as the reconstructed close and the
+    agent decides on exactly one tick.
+    """
+    from veridex.ingest.recorder import SessionMeta, envelope_line
+
+    def _rec(ts: int) -> dict:
+        return {
+            "FixtureId": _FIXTURE_ID,
+            "Ts": ts,
+            "InRunning": False,
+            "SuperOddsType": "1X2",
+            "MarketPeriod": None,
+            "MarketParameters": None,
+            "PriceNames": ["Home", "Draw", "Away"],
+            "Prices": [2500, 3200, 2800],
+            "Pct": pct,
+        }
+
+    session_dir = tmp_path / "s"
+    session_dir.mkdir()
+    (session_dir / "records.jsonl").write_text(
+        envelope_line(_rec(100_000), 100) + "\n" + envelope_line(_rec(131_000), 131) + "\n"
+    )
+    (session_dir / "meta.json").write_text(
+        SessionMeta(started_ts=99, endpoints=["/odds/stream"], tool_version="t").model_dump_json()
+    )
+    pack_dir = tmp_path / "pack"
+    pack_from_session(session_dir, pack_dir)
+    return pack_dir
+
+
+def _fired_picks(result) -> list[dict]:
+    """The (market_key, side) params of the agent's ACTUAL fired (FOLLOW_MOMENTUM) sealed picks."""
+    return [
+        row["raw_prescore"]["raw_action"]["params"]
+        for row in result.score_rows
+        if row.get("raw_prescore", {}).get("raw_action", {}).get("type") == "FOLLOW_MOMENTUM"
+    ]
+
+
+async def test_estimated_edge_is_none_when_the_strategy_fires_no_picks(tmp_path: Path) -> None:
+    """F2: a strategy that takes ZERO positions reports NO estimated edge — never an unfired one.
+
+    On fixture-5 every side is < 5000 bps, so at decimal 2.0 every edge is NEGATIVE and the agent
+    WAITs on every tick. The old global-max aggregate would still report the least-negative UNFIRED
+    opportunity; the honest answer is ``None`` (the strategy took nothing to estimate an edge over).
+    """
+    from veridex.backtest.vvv_report import vvv_report_with_estimated_edge
+
+    session_dir = _write_session(tmp_path)
+    pack_dir = tmp_path / "pack"
+    pack_from_session(session_dir, pack_dir)
+
+    result, report = await vvv_report_with_estimated_edge(
+        pack_dir,
+        _FIXTURE_ID,
+        venue_price_source=lambda mk: 2.0,
+        window=_window(),
+        min_edge_bps=0,
+        assumptions={"no_interpolation": True},
+    )
+
+    assert _fired_picks(result) == []  # the strategy took ZERO positions...
+    assert report.estimated_executable_edge_bps is None  # ...so there is no estimated edge to report
+
+
+async def test_estimated_edge_reflects_the_fired_pick_not_a_larger_unfired_opportunity(tmp_path: Path) -> None:
+    """F2: the reported edge is the STRATEGY'S taken pick's edge, not the best market opportunity.
+
+    Pct makes Home (4000 bps) the max-fair side, but ``Away`` (3500 bps) sorts first, so the agent
+    FIRES on Away and never takes Home. The old global-max aggregate reported Home's (larger) edge —
+    an opportunity the strategy declined; the honest answer is Away's edge (the position it took).
+    """
+    from veridex.backtest.vvv_report import vvv_report_with_estimated_edge
+    from veridex.strategies.value_vs_venue import vvv_signal
+
+    pack_dir = _write_1x2_session(tmp_path, [40.0, 25.0, 35.0])  # Home 4000 > Away 3500 > Draw 2500
+
+    result, report = await vvv_report_with_estimated_edge(
+        pack_dir,
+        _FIXTURE_ID,
+        venue_price_source=lambda mk: 3.0,
+        window=_window(),
+        min_edge_bps=-(10**9),  # everything clears → agent fires the first-sorted side (Away)
+        assumptions={"no_interpolation": True},
+    )
+
+    picks = _fired_picks(result)
+    assert picks and picks[0]["side"] == "Away"  # the strategy actually took Away, not Home
+
+    away_edge = vvv_signal(3500, 3.0)["estimated_executable_edge_bps"]  # the FIRED pick's edge
+    home_edge = vvv_signal(4000, 3.0)["estimated_executable_edge_bps"]  # the larger UNFIRED edge
+    assert away_edge < home_edge  # the discrimination is real (Away < Home)
+    assert report.estimated_executable_edge_bps == away_edge  # reflects the FIRED pick...
+    assert report.estimated_executable_edge_bps != home_edge  # ...NOT the larger unfired opportunity
