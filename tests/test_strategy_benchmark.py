@@ -14,6 +14,7 @@ from veridex.backtest.benchmark import (
     extract_prob_series,
     run_strategy_benchmark,
     translate_sharpline,
+    translate_threshold,
 )
 from veridex.ingest.replay_pack import load_pack_marketstates, pack_from_session
 
@@ -114,3 +115,18 @@ def test_benchmark_runs_on_a_real_loaded_pack_and_scores_via_veridex_seam(tmp_pa
     assert calls["n"] == 1  # scored ONLY through the injected Veridex seam
     assert res.evidence_rung == "txline-only"  # competitors are rung-1
     assert len(res.pack_content_hash) == 64  # from the REAL loaded pack, not a stub
+
+
+def test_translate_threshold_maps_sports_workbench_params_into_a_veridex_config():
+    cfg = translate_threshold({"moveThreshold": 2.5, "cooldown": 4})
+    assert cfg.source_repo == "sports-workbench"
+    assert cfg.source_strategy == "sports-workbench"
+    assert cfg.strategy == "threshold-move"
+    # translated_params carries Veridex-side names, not the competitor's own keys.
+    assert cfg.translated_params == {"move_threshold_pct": 2.5, "cooldown_ticks": 4.0}
+    assert "sports-workbench" in cfg.notes and "no sports-workbench code imported" in cfg.notes
+
+
+def test_translate_threshold_defaults_cooldown_when_absent():
+    cfg = translate_threshold({"moveThreshold": 1.0})
+    assert cfg.translated_params["cooldown_ticks"] == 0.0
