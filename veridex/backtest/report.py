@@ -168,6 +168,19 @@ class BacktestReport(BaseModel):
     sim_pnl: int | None
     #: Real venue-executable edge — ALWAYS None on the paper/replay path (fake venue, Codex M2).
     real_executable_edge_bps: int | None
+    #: ESTIMATED venue-executable edge (bps) — a VENUE-DERIVED, EXPLANATORY quantity. DISTINCT from
+    #: ``real_executable_edge_bps`` (which needs a live fill and stays None): this is what the
+    #: de-margined fair probability WOULD have earned at a recorded/backfilled venue price. It is
+    #: attached ONLY AFTER the pure venue-free build (via ``model_copy``); ``build_backtest_report``
+    #: NEVER sets it, so the builder stays venue-blind. NEVER a ranked axis (CLV alone ranks — SEC-005).
+    estimated_executable_edge_bps: int | None = None
+    #: Machine-readable evidence rung the estimated edge was priced from (e.g.
+    #: ``"backfilled-price-history"`` / ``"recorded-live-quote"`` — a ``veridex.provenance.EvidenceRung``
+    #: value). ``None`` until a producer attaches an estimated edge.
+    estimated_edge_rung: str | None = None
+    #: The EXPLICIT assumptions the estimated edge was computed under (e.g. ``no_interpolation``).
+    #: ``None`` until a producer attaches an estimated edge.
+    estimated_edge_assumptions: dict[str, Any] | None = None
 
     # --- sensitivity + operational rates ------------------------------------
     threshold_sensitivity: list[ThresholdSensitivityPoint]
