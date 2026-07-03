@@ -1,9 +1,9 @@
 """T12: vendored Polymarket CLOB client — offline import + LOB sanity + hygiene (REQ-2D-201).
 
-The vendor source is oracle-arb's BUNDLED quantpylib tree (self-contained, inline ``LOB`` —
-no Cython ``hft/lob.pyx`` dependency), copied into ``veridex/venues/_vendor/polymarket_clob/``
-under a neutral namespace. Importing must NOT require credentials or hit the network; the only
-permitted edits vs. the upstream source are ``quantpylib.*`` -> vendored-namespace import rewrites.
+The vendored client is a self-contained, pure-Python, MIT-licensed Polymarket CLOB client
+distribution, copied into ``veridex/venues/_vendor/polymarket_clob/`` under a neutral namespace.
+Importing must NOT require credentials or hit the network; the only permitted edits vs. the
+upstream source are upstream-namespace -> vendored-namespace import rewrites.
 """
 
 from __future__ import annotations
@@ -40,8 +40,12 @@ def test_lob_get_mid_and_cumulative_size_on_synthetic_book() -> None:
     assert notional == pytest.approx(0.42 * 15.0)
 
 
-def test_no_dangling_quantpylib_imports_under_veridex() -> None:
-    """Repo hygiene: no dangling `import quantpylib` reference anywhere under veridex/."""
+def test_no_dangling_upstream_namespace_imports_under_veridex() -> None:
+    """Repo hygiene: no dangling upstream-namespace import survives anywhere under veridex/.
+
+    The literal grep target below is the vendored client's ORIGINAL import namespace — it is
+    functionally required here (this test hunts un-rewritten imports), not a provenance reference.
+    """
     result = subprocess.run(
         ["grep", "-r", "import quantpylib", "veridex/"],
         cwd=None,
@@ -49,7 +53,7 @@ def test_no_dangling_quantpylib_imports_under_veridex() -> None:
         text=True,
     )
     # grep exit code 1 == no matches found (what we want); 0 == matches found (fail).
-    assert result.returncode == 1, f"dangling quantpylib import(s) found:\n{result.stdout}"
+    assert result.returncode == 1, f"dangling upstream-namespace import(s) found:\n{result.stdout}"
 
 
 if __name__ == "__main__":
