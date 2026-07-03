@@ -162,3 +162,35 @@ def test_detector_fires_on_a_flat_then_jump_sharp_move():
     res = asyncio.run(run_strategy_benchmark(cfg, pack=_Pack(), score_fn=score_fn))
     assert res.fire_count > 0  # F1: the detector's firing substance is exercised
     assert seen["fires"]  # F3: flat-then-jump actually fires
+
+
+def test_benchmark_fails_closed_when_score_fn_omits_scored_count():
+    cfg = translate_sharpline(
+        {"zGate": 1.5, "phThresh": 0.25, "lambda": 0.92, "cooldown": 1, "warmup": 3}
+    )
+
+    class _Pack:
+        content_hash = "4" * 64
+        ticks = [0.50, 0.50, 0.50, 0.50, 0.70, 0.70]
+
+    with pytest.raises((KeyError, ValueError)):
+        asyncio.run(run_strategy_benchmark(cfg, pack=_Pack(), score_fn=lambda fires: {}))  # empty payload
+
+
+def test_benchmark_copies_score_fn_values_verbatim_not_recomputed():
+    cfg = translate_sharpline(
+        {"zGate": 1.5, "phThresh": 0.25, "lambda": 0.92, "cooldown": 1, "warmup": 3}
+    )
+
+    class _Pack:
+        content_hash = "5" * 64
+        ticks = [0.50, 0.50, 0.50, 0.50, 0.70, 0.70]
+
+    # sentinels NOT equal to len(fires) / 0.0 — if the code recomputed, these wouldn't appear.
+    res = asyncio.run(
+        run_strategy_benchmark(
+            cfg, pack=_Pack(), score_fn=lambda fires: {"scored_count": 777, "avg_clv_bps": 13.5}
+        )
+    )
+    assert res.scored_count == 777  # copied verbatim from score_fn, not len(fires)
+    assert res.avg_clv_bps == 13.5

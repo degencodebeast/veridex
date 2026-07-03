@@ -169,9 +169,20 @@ def _assemble_result(
     *,
     pack_content_hash: str,
 ) -> StrategyBenchmarkResult:
-    """Assemble the sealed result — every scored field copied verbatim from `score_result`."""
+    """Assemble the sealed result — every scored field copied verbatim from `score_result`.
+
+    Fails closed (`KeyError`) if `score_result` is missing `scored_count` or `avg_clv_bps`: a
+    malformed/incomplete `score_fn` must never let this layer invent a scored number by
+    defaulting one in. Key PRESENCE is what's required — `avg_clv_bps=None` is a legitimate
+    value (zero scored picks), so its presence is checked, not its truthiness.
+    """
+    if "scored_count" not in score_result or "avg_clv_bps" not in score_result:
+        raise KeyError(
+            "score_fn must return both 'scored_count' and 'avg_clv_bps' — the benchmark layer "
+            f"never invents a scored number, got keys {sorted(score_result.keys())!r}"
+        )
     fire_count = len(fires)
-    scored_count = int(score_result.get("scored_count", 0))
+    scored_count = score_result["scored_count"]
     return StrategyBenchmarkResult(
         benchmark_id=f"{config.source_strategy}_{pack_content_hash[:12]}",
         source_strategy=config.source_strategy,
@@ -180,7 +191,7 @@ def _assemble_result(
         evidence_rung=EvidenceRung.TXLINE_ONLY.value,
         fire_count=fire_count,
         scored_count=scored_count,
-        avg_clv_bps=score_result.get("avg_clv_bps"),
+        avg_clv_bps=score_result["avg_clv_bps"],
         abstain_count=max(fire_count - scored_count, 0),
         provenance=EvidenceRung.TXLINE_ONLY.value,
     )
