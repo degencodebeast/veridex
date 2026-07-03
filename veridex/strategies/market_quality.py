@@ -32,3 +32,61 @@ class MarketQualityConfig(BaseModel):
 DEFAULT_MARKET_QUALITY_CONFIG = MarketQualityConfig(
     band_lo=0.05, band_hi=0.95, min_tick_count=30, min_horizon_s=600
 )
+
+
+class MarketQualityResult(BaseModel):
+    """Eligibility verdict for one market, with a named reason per failing rule."""
+
+    market_ref: str
+    eligible: bool
+    reasons: list[str]
+    near_certain: bool
+    tick_count: int
+    horizon_s: int
+    mapping_valid: bool
+    close_quality: str
+    filter_config_hash: str
+
+
+def evaluate_market_quality(
+    *,
+    market_ref: str,
+    implied_prob: float,
+    tick_count: int,
+    horizon_s: int,
+    mapping_valid: bool,
+    close_quality: str,
+    config: MarketQualityConfig,
+) -> MarketQualityResult:
+    """Judge one market against ``config`` and surface every failing rule by name.
+
+    Never hides a failure mode behind a single generic "ineligible" flag — each rule that
+    fails appends its own named reason so operators can see exactly why a market was excluded
+    (e.g. a suspended close is surfaced as ``"close_suspended"``, not silently dropped).
+    """
+    near_certain = implied_prob < config.band_lo or implied_prob > config.band_hi
+    reasons: list[str] = []
+    if near_certain:
+        reasons.append("near_certain")
+    if tick_count < config.min_tick_count:
+        reasons.append("insufficient_ticks")
+    if horizon_s < config.min_horizon_s:
+        reasons.append("insufficient_horizon")
+    if not mapping_valid:
+        reasons.append("unmapped")
+    if close_quality == "suspended":
+        reasons.append("close_suspended")
+    elif close_quality != "priced":
+        reasons.append("close_missing")  # covers "missing" and any other non-priced value
+
+    return MarketQualityResult(
+        market_ref=market_ref,
+        eligible=not reasons,
+        reasons=reasons,
+        near_certain=near_certain,
+        tick_count=tick_count,
+        horizon_s=horizon_s,
+        mapping_valid=mapping_valid,
+        close_quality=close_quality,
+        filter_config_hash=config.filter_config_hash(),
+    )
