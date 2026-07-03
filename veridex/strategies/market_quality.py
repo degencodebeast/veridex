@@ -3,8 +3,8 @@
 Eligibility, NOT proof scoring: a market-quality filter decides whether a market is worth
 strategizing on (degenerate near-certain lines, thin ticks, short horizon, unmapped, or a
 close that never priced) — it never touches the deterministic-law score. CON-S2-005: this
-module MUST NOT import from ``veridex.law`` or ``veridex.scoring``, and MUST NOT mutate any
-score. It only returns a :class:`MarketQualityResult`.
+module stays outside the scoring/law trust boundary entirely and MUST NOT mutate any score.
+It only returns a :class:`MarketQualityResult`.
 """
 
 from __future__ import annotations
