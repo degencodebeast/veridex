@@ -88,7 +88,7 @@ class DeployConfig(BaseModel):
 
     template_id: str
     agent_id: str
-    strategy: Literal["baseline", "momentum", "momentum-sharp", "llm"] = "momentum-sharp"
+    strategy: Literal["baseline", "momentum", "momentum-sharp", "cumulative-drift", "llm"] = "momentum-sharp"
     source_mode: Literal["replay", "live"] = "live"
     execution_mode: Literal["paper", "dry_run", "live_guarded"] = "paper"
     market_allowlist: list[str] = Field(default_factory=list)
