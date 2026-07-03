@@ -25,15 +25,29 @@ Both are counted honestly (never dropped, never scored as 0), and the rows feed 
 
 from __future__ import annotations
 
-from typing import Any
+from collections.abc import Callable
+from pathlib import Path
+from typing import Any, Literal
 
 from pydantic import BaseModel
 
+from veridex.backtest.baselines import BASELINES
 from veridex.backtest.calibration import CalibrationReport, build_calibration_report
+from veridex.backtest.runner import run_backtest
+from veridex.backtest.vvv_report import vvv_report_with_estimated_edge
+from veridex.ingest.marketstate import MarketState
+from veridex.ingest.replay_pack import load_pack_marketstates
 from veridex.provenance import EvidenceRung
+from veridex.runtime.orchestrator import RunResult
+from veridex.runtime.schemas import AgentAction
+from veridex.runtime.window import RunWindow
+from veridex.scoring import is_scored
+from veridex.strategies.drift import cumulative_drift_agent
 
 #: The strategy-config id that names the (cadence-gated) StaleLine decision strategy (M8).
 STALE_LINE_CONFIG = "stale-line"
+#: The strategy-config id that names the CumulativeDrift agent (run through ``run_backtest``, S3).
+CUMULATIVE_DRIFT_CONFIG = "cumulative-drift"
 #: The strategy-config id that names the venue-priced ValueVsVenue strategy (its estimated edge is
 #: the one metric surfaced at a venue rung rather than the TxLINE-sealed CLV rung).
 VALUE_VS_VENUE_CONFIG = "value-vs-venue"
@@ -133,3 +147,212 @@ def run_multi_fixture_evaluation(
         "stale_line_included": stale_line_included,
         "calibration": calibration,
     }
+
+
+# ==========================================================================================
+# Task 19b — the S6 PRODUCER: run the predeclared roster over REAL packs into results_by_fixture.
+# ==========================================================================================
+
+#: The window end rule for an unknown/unspecified ``close_semantics`` — the true-CLV ``pre_match``
+#: rule, never a silent mislabel. ``fixed_duration`` needs a ``duration_s`` the protocol does not
+#: carry, so a protocol demanding it is under-specified and fails loud inside RunWindow.
+_DEFAULT_END_RULE: Literal["pre_match", "fixed_duration", "manual_stop"] = "pre_match"
+
+
+def _end_rule(close_semantics: str) -> Literal["pre_match", "fixed_duration", "manual_stop"]:
+    """Narrow a protocol's ``close_semantics`` string to a RunWindow end rule (unknown → pre_match)."""
+    if close_semantics == "fixed_duration":
+        return "fixed_duration"
+    if close_semantics == "manual_stop":
+        return "manual_stop"
+    return _DEFAULT_END_RULE
+
+
+def _window_allowlist(marketstates: list[MarketState]) -> list[str]:
+    """The distinct market-key PREFIXES (the part before ``|``) seen across the fixture's ticks.
+
+    ``RunWindow.market_allowlist`` scores by prefix (e.g. ``"1X2"`` for a ``"1X2||"`` key), so the
+    producer derives the allowlist from the ACTUAL replayed markets rather than guessing it.
+    """
+    prefixes = {
+        str(mk).split("|", 1)[0]
+        for state in marketstates
+        for mk in (getattr(state, "markets", {}) or {})
+    }
+    return sorted(prefixes)
+
+
+def _build_window(protocol: EvalProtocol, fixture_id: int, marketstates: list[MarketState]) -> RunWindow:
+    """Build the coverage window a fixture's roster is scored under, from the committed protocol.
+
+    ``min_clv_horizon_s`` is 0 so every decision tick is scoreable (the protocol's fixtures are the
+    unit of evaluation, not an intra-window pending horizon). An unknown ``close_semantics`` falls
+    back to the true-CLV ``pre_match`` rule rather than silently mislabelling the close.
+    """
+    return RunWindow(
+        window_id=protocol.window,
+        fixture_id=fixture_id,
+        market_allowlist=_window_allowlist(marketstates),
+        end_rule=_end_rule(protocol.close_semantics),
+        min_clv_horizon_s=0,
+    )
+
+
+def _rows_from_run(result: RunResult, *, fixture_id: int, kind: str) -> list[dict[str, Any]]:
+    """Project a sealed run's ``score_rows`` into calibration-shaped rows (one per decision).
+
+    Reuses the SINGLE-SOURCE-OF-TRUTH :func:`~veridex.scoring.is_scored` predicate: a row carries a
+    real ``clv_bps`` only when it is scored, otherwise ``None`` (a WAIT/pending abstention — never a
+    fabricated 0). ``action`` normalizes the sealed action type (enum-or-string), and ``market`` is
+    the fired pick's ``market_key`` (``"n/a"`` for a no-position row).
+    """
+    rows: list[dict[str, Any]] = []
+    for row in result.score_rows:
+        raw_action = row.get("raw_prescore", {}).get("raw_action", {})
+        action_type = raw_action.get("type")
+        action = getattr(action_type, "value", action_type)
+        market = raw_action.get("params", {}).get("market_key") or "n/a"
+        clv_bps = row["clv_bps"] if is_scored(row) else None
+        rows.append(
+            {"fixture_id": fixture_id, "kind": kind, "market": str(market), "action": action, "clv_bps": clv_bps}
+        )
+    return rows
+
+
+def _venue_source_id(venue_price_source: Callable[[str], float | None]) -> str:
+    """A stable, non-empty identity for the injected venue source (bound into the VvV config_hash).
+
+    ``value_vs_venue_agent`` REQUIRES a non-empty ``venue_source_id`` (reproducibility, DRIFT-2); the
+    callable's ``__name__`` is a stable tag, with a fixed fallback so an anonymous callable still binds.
+    """
+    return getattr(venue_price_source, "__name__", None) or "injected-venue-source"
+
+
+def _baseline_inputs(marketstates: list[MarketState]) -> dict[str, Any] | None:
+    """Extract the inputs the heterogeneous baselines need from a fixture's ticks, or ``None``.
+
+    DRIFT-1: the baselines take DIFFERENT inputs — a ``prices`` series (``no_trade`` / ``threshold_move``
+    / ``seeded_random``), a ``fair_probs`` dict (``favorite``), and a horizon. All are derived from the
+    first market (sorted) in the LAST tick. Returns ``None`` when no market is present (honest skip).
+    """
+    if not marketstates:
+        return None
+    last_markets = getattr(marketstates[-1], "markets", {}) or {}
+    if not last_markets:
+        return None
+    market_key = sorted(last_markets)[0]
+    prob_map: dict[str, Any] = last_markets[market_key].get("stable_prob_bps") or {}
+    sides = sorted(prob_map)
+    if not sides:
+        return None
+    side0 = sides[0]
+
+    prices: list[float] = []
+    for state in marketstates:
+        market = (getattr(state, "markets", {}) or {}).get(market_key, {})
+        price_map = market.get("stable_price") or {}
+        tick_probs = market.get("stable_prob_bps") or {}
+        if side0 in price_map:
+            prices.append(float(price_map[side0]))
+        elif side0 in tick_probs and tick_probs[side0]:
+            prices.append(10000.0 / float(tick_probs[side0]))  # decimal price from the fair prob
+
+    fair_probs = {side: float(bps) / 10000.0 for side, bps in prob_map.items()}
+    horizon_s = int(getattr(marketstates[-1], "ts", 0)) - int(getattr(marketstates[0], "ts", 0))
+    return {"market": market_key, "prices": prices, "fair_probs": fair_probs, "horizon_s": horizon_s}
+
+
+def _baseline_action(name: str, fn: Callable, inputs: dict[str, Any], *, seed: int) -> AgentAction | None:
+    """Call one baseline with ITS OWN signature (DRIFT-1); ``None`` for an unknown baseline shape."""
+    prices = inputs["prices"]
+    horizon_s = inputs["horizon_s"]
+    if name == "no_trade":
+        return fn(prices, horizon_s)
+    if name == "favorite":
+        return fn(inputs["fair_probs"], horizon_s)
+    if name == "threshold_move":
+        return fn(prices, horizon_s)
+    if name == "seeded_random":
+        return fn(prices, horizon_s, seed)
+    return None  # a baseline whose signature the producer doesn't know — skip honestly, never guess
+
+
+async def produce_results_by_fixture(
+    protocol: EvalProtocol,
+    *,
+    packs: dict[int, Path],
+    venue_price_source: Callable[[str], float | None] | None = None,
+) -> dict[int, list[dict[str, Any]]]:
+    """Run the committed roster over each fixture's REAL pack into the ``results_by_fixture`` dict.
+
+    For every ``fixture_id`` in ``protocol.fixture_ids`` the producer replays that fixture's pack and:
+
+      * ``"cumulative-drift"`` → :func:`~veridex.backtest.runner.run_backtest` (the S3 real path).
+      * ``"value-vs-venue"`` → :func:`~veridex.backtest.vvv_report.vvv_report_with_estimated_edge`
+        ONLY when a ``venue_price_source`` is injected (DRIFT-2 — a bound ``venue_source_id`` is
+        required); otherwise the strategy is HONESTLY SKIPPED (no row, no faked venue price).
+      * ``"stale-line"`` → NOT run here — it is cadence-gated inside
+        :func:`run_multi_fixture_evaluation` (AC-009).
+      * each named baseline → dispatched DIRECTLY with its own heterogeneous signature (DRIFT-1),
+        one row per fixture; a baseline whose inputs can't be derived is skipped, never faked.
+
+    No scoring logic is duplicated: the strategy rows come from the SAME sealed
+    ``RunResult.score_rows`` those real paths produce.
+
+    Args:
+        protocol: The committed evaluation contract (its fixtures/roster/baselines drive the run).
+        packs: ``{fixture_id: pack_dir}`` — the self-describing ReplayPack for each protocol fixture.
+        venue_price_source: Optional injected venue DECIMAL-price source; when ``None`` the
+            ValueVsVenue strategy is skipped for every fixture.
+
+    Returns:
+        ``{fixture_id: [row, ...]}`` where each row is calibration-shaped
+        (``{"fixture_id", "kind", "market", "action", "clv_bps"}``) — the exact input
+        :func:`run_multi_fixture_evaluation` consumes.
+    """
+    results: dict[int, list[dict[str, Any]]] = {}
+    for fixture_id in protocol.fixture_ids:
+        pack_dir = packs[fixture_id]
+        marketstates = load_pack_marketstates(pack_dir, fixture_id)
+        window = _build_window(protocol, fixture_id, marketstates)
+        rows: list[dict[str, Any]] = []
+
+        for config in protocol.strategy_configs:
+            if config == CUMULATIVE_DRIFT_CONFIG:
+                result, _ = await run_backtest(pack_dir, fixture_id, [cumulative_drift_agent()], window=window)
+                rows.extend(_rows_from_run(result, fixture_id=fixture_id, kind=config))
+            elif config == VALUE_VS_VENUE_CONFIG:
+                if venue_price_source is None:
+                    continue  # DRIFT-2 honest skip: VvV cannot be priced without a venue source
+                result, _ = await vvv_report_with_estimated_edge(
+                    pack_dir,
+                    fixture_id,
+                    venue_price_source=venue_price_source,
+                    venue_source_id=_venue_source_id(venue_price_source),
+                    window=window,
+                    min_edge_bps=0,
+                    assumptions={"no_interpolation": True, "source": "s6-producer"},
+                )
+                rows.extend(_rows_from_run(result, fixture_id=fixture_id, kind=config))
+            # STALE_LINE_CONFIG (cadence-gated in the evaluation) and any unknown config: skip here.
+
+        baseline_inputs = _baseline_inputs(marketstates)
+        for name in protocol.baselines:
+            fn = BASELINES.get(name)
+            if fn is None or baseline_inputs is None:
+                continue  # unknown baseline / no derivable inputs — honest skip (never a faked row)
+            action = _baseline_action(name, fn, baseline_inputs, seed=fixture_id)
+            if action is None:
+                continue
+            rows.append(
+                {
+                    "fixture_id": fixture_id,
+                    "kind": name,
+                    "market": str(baseline_inputs["market"]),
+                    "action": action.type.value,
+                    "clv_bps": None,  # baselines are called directly — no law-scored CLV to report
+                }
+            )
+
+        results[fixture_id] = rows
+    return results
