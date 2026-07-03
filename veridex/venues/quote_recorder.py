@@ -14,7 +14,6 @@ cadence was actually achieved; it must never claim sufficiency it can't back up.
 from __future__ import annotations
 
 import statistics
-from typing import Literal
 
 from pydantic import BaseModel, field_validator
 

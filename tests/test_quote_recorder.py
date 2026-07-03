@@ -4,7 +4,32 @@ from __future__ import annotations
 
 import pytest
 
-from veridex.venues.quote_recorder import VenueQuoteFrame
+from veridex.venues.quote_recorder import VenueQuoteFrame, cadence_report
+
+
+def _f(ts: int) -> VenueQuoteFrame:
+    return VenueQuoteFrame(
+        ts=ts,
+        fixture_id=1,
+        market_ref="m",
+        condition_id="0x",
+        token_id="t",
+        best_bid_decimal=1.9,
+        best_ask_decimal=2.1,
+        bid_size=1,
+        ask_size=1,
+        quote_status="live",
+    )
+
+
+def test_cadence_sufficient_when_sub_minute():
+    rep = cadence_report([_f(0), _f(10), _f(20), _f(30)])
+    assert rep["median_interval_s"] == 10.0 and rep["cadence_sufficient"] is True
+
+
+def test_cadence_insufficient_when_sparse():
+    rep = cadence_report([_f(0), _f(120), _f(240)])
+    assert rep["cadence_sufficient"] is False
 
 
 def test_quote_frame_stores_primitives_and_valid_status():
