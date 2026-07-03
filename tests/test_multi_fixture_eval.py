@@ -165,7 +165,12 @@ def test_producer_runs_value_vs_venue_only_with_a_source(tmp_path: Path) -> None
 
     # venue decimal 5.0 makes every fixture-5 side's edge positive, so the agent FIRES.
     results = asyncio.run(
-        produce_results_by_fixture(proto, packs={5: pack_dir}, venue_price_source=lambda mk: 5.0)
+        produce_results_by_fixture(
+            proto,
+            packs={5: pack_dir},
+            venue_price_source=lambda mk: 5.0,
+            venue_source_id="quote-artifact-hash-abc",
+        )
     )
 
     vvv_rows = [row for row in results[5] if row["kind"] == "value-vs-venue"]
@@ -185,3 +190,40 @@ def test_producer_skips_value_vs_venue_without_a_source(tmp_path: Path) -> None:
 
     assert 5 in results
     assert [row for row in results[5] if row["kind"] == "value-vs-venue"] == []
+
+
+def test_producer_requires_explicit_venue_source_identity_for_vvv(tmp_path: Path) -> None:
+    """VvV needs an EXPLICIT venue_source_id (Codex M7): a price source alone must NOT auto-derive one.
+
+    The old producer synthesized the identity from ``callable.__name__`` — two different lambdas both
+    resolve to ``"<lambda>"``, so ``lambda:2.0`` (fires) and ``lambda:None`` (waits) would share a
+    config_hash while sealing DIFFERENT actions: the exact M6 reproducibility gap, re-opened. The
+    producer must instead fail CLOSED: run VvV only when a distinct explicit identity is supplied.
+    """
+    pack_dir = _real_pack(tmp_path)
+    proto = _proto(fixture_ids=[5], strategy_configs=["value-vs-venue"], baselines=[])
+
+    # Source present but NO explicit identity -> VvV is SKIPPED (fail closed), never run with "<lambda>".
+    res = asyncio.run(
+        produce_results_by_fixture(proto, packs={5: pack_dir}, venue_price_source=lambda mk: 2.0)
+    )
+    assert [row for row in res.get(5, []) if row["kind"] == "value-vs-venue"] == []
+
+    # An empty identity is no identity — still skipped.
+    res_empty = asyncio.run(
+        produce_results_by_fixture(
+            proto, packs={5: pack_dir}, venue_price_source=lambda mk: 2.0, venue_source_id=""
+        )
+    )
+    assert [row for row in res_empty.get(5, []) if row["kind"] == "value-vs-venue"] == []
+
+    # WITH a distinct explicit identity -> VvV runs and is bound to THAT identity.
+    res2 = asyncio.run(
+        produce_results_by_fixture(
+            proto,
+            packs={5: pack_dir},
+            venue_price_source=lambda mk: 2.0,
+            venue_source_id="quote-artifact-hash-abc",
+        )
+    )
+    assert [row for row in res2.get(5, []) if row["kind"] == "value-vs-venue"]

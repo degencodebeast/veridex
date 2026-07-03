@@ -220,15 +220,6 @@ def _rows_from_run(result: RunResult, *, fixture_id: int, kind: str) -> list[dic
     return rows
 
 
-def _venue_source_id(venue_price_source: Callable[[str], float | None]) -> str:
-    """A stable, non-empty identity for the injected venue source (bound into the VvV config_hash).
-
-    ``value_vs_venue_agent`` REQUIRES a non-empty ``venue_source_id`` (reproducibility, DRIFT-2); the
-    callable's ``__name__`` is a stable tag, with a fixed fallback so an anonymous callable still binds.
-    """
-    return getattr(venue_price_source, "__name__", None) or "injected-venue-source"
-
-
 def _baseline_inputs(marketstates: list[MarketState]) -> dict[str, Any] | None:
     """Extract the inputs the heterogeneous baselines need from a fixture's ticks, or ``None``.
 
@@ -283,6 +274,7 @@ async def produce_results_by_fixture(
     *,
     packs: dict[int, Path],
     venue_price_source: Callable[[str], float | None] | None = None,
+    venue_source_id: str | None = None,
 ) -> dict[int, list[dict[str, Any]]]:
     """Run the committed roster over each fixture's REAL pack into the ``results_by_fixture`` dict.
 
@@ -290,8 +282,10 @@ async def produce_results_by_fixture(
 
       * ``"cumulative-drift"`` → :func:`~veridex.backtest.runner.run_backtest` (the S3 real path).
       * ``"value-vs-venue"`` → :func:`~veridex.backtest.vvv_report.vvv_report_with_estimated_edge`
-        ONLY when a ``venue_price_source`` is injected (DRIFT-2 — a bound ``venue_source_id`` is
-        required); otherwise the strategy is HONESTLY SKIPPED (no row, no faked venue price).
+        ONLY when BOTH a ``venue_price_source`` AND a distinct, non-empty ``venue_source_id`` are
+        supplied (DRIFT-2 / Codex M7). The producer NEVER synthesizes the identity from the callable
+        — a low-entropy tag would re-open the M6 reproducibility gap — so a missing/empty
+        ``venue_source_id`` FAILS CLOSED: the strategy is HONESTLY SKIPPED (no row, no faked price).
       * ``"stale-line"`` → NOT run here — it is cadence-gated inside
         :func:`run_multi_fixture_evaluation` (AC-009).
       * each named baseline → dispatched DIRECTLY with its own heterogeneous signature (DRIFT-1),
@@ -305,6 +299,10 @@ async def produce_results_by_fixture(
         packs: ``{fixture_id: pack_dir}`` — the self-describing ReplayPack for each protocol fixture.
         venue_price_source: Optional injected venue DECIMAL-price source; when ``None`` the
             ValueVsVenue strategy is skipped for every fixture.
+        venue_source_id: The EXPLICIT, distinct identity of that venue source (in production, the
+            content_hash of the quote / price-history artifact), bound into the VvV ``config_hash``
+            for reproducibility. Required for VvV: a missing/empty value skips VvV (fail closed). The
+            producer never derives it from ``venue_price_source``.
 
     Returns:
         ``{fixture_id: [row, ...]}`` where each row is calibration-shaped
@@ -323,13 +321,18 @@ async def produce_results_by_fixture(
                 result, _ = await run_backtest(pack_dir, fixture_id, [cumulative_drift_agent()], window=window)
                 rows.extend(_rows_from_run(result, fixture_id=fixture_id, kind=config))
             elif config == VALUE_VS_VENUE_CONFIG:
-                if venue_price_source is None:
-                    continue  # DRIFT-2 honest skip: VvV cannot be priced without a venue source
+                # DRIFT-2 / Codex M7 — FAIL CLOSED: run VvV only when a venue source AND a DISTINCT
+                # explicit ``venue_source_id`` are BOTH supplied. The producer NEVER synthesizes the
+                # identity (e.g. from a callable's ``__name__``): a low-entropy tag would let two
+                # different sources share a config_hash while sealing different actions — the exact
+                # M6 reproducibility gap. No explicit identity ⇒ honest skip, never a derived one.
+                if venue_price_source is None or not venue_source_id:
+                    continue
                 result, _ = await vvv_report_with_estimated_edge(
                     pack_dir,
                     fixture_id,
                     venue_price_source=venue_price_source,
-                    venue_source_id=_venue_source_id(venue_price_source),
+                    venue_source_id=venue_source_id,
                     window=window,
                     min_edge_bps=0,
                     assumptions={"no_interpolation": True, "source": "s6-producer"},
