@@ -10,6 +10,7 @@
 !/veridex/
 !/veridex_agent/
 !/tests/
+!/eval_protocols/
 !/scripts/
 !/contracts/
 !/apps/
