@@ -96,7 +96,8 @@ def _per_metric_rung(protocol: EvalProtocol) -> dict[str, str]:
         "avg_clv_bps": EvidenceRung.TXLINE_ONLY.value,
         "nulls": EvidenceRung.TXLINE_ONLY.value,
         "abstentions": EvidenceRung.TXLINE_ONLY.value,
-        "concentration_top_match_share_pct": EvidenceRung.TXLINE_ONLY.value,
+        # Key name matches the real CalibrationReport.breadth field so a consumer can join rung→metric.
+        "top_match_share_of_net_pct": EvidenceRung.TXLINE_ONLY.value,
     }
     if VALUE_VS_VENUE_CONFIG in protocol.strategy_configs:
         rung["estimated_executable_edge_bps"] = EvidenceRung.BACKFILLED_PRICE_HISTORY.value

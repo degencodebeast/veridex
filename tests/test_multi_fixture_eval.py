@@ -132,6 +132,9 @@ def test_producer_generates_results_then_feeds_the_evaluation(tmp_path: Path) ->
     # REAL rows for the fixture — not an empty stub.
     assert 5 in results and isinstance(results[5], list)
     assert results[5], "the producer must yield real rows (drift decisions + the no_trade baseline)"
+    # The load-bearing 19b claim: the drift Agent actually produced rows via run_backtest (not just
+    # the baseline row satisfying non-emptiness).
+    assert any(row["kind"] == "cumulative-drift" for row in results[5])
     assert any(row["kind"] == "no_trade" for row in results[5])
 
     out = run_multi_fixture_evaluation(proto, results_by_fixture=results, cadence_ok=True)
