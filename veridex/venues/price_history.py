@@ -9,6 +9,9 @@ lower evidence rung than a recorded live quote or a live fill receipt.
 
 from __future__ import annotations
 
+import hashlib
+from pathlib import Path
+
 from pydantic import BaseModel
 
 from veridex.venues.polymarket import native_to_decimal
@@ -61,3 +64,39 @@ class VenuePriceHistoryFrame(BaseModel):
             price_kind=price_kind,
             fidelity_s=fidelity_s,
         )
+
+
+class VenuePriceHistoryPack(BaseModel):
+    """Self-describing, hashed manifest for a backfilled price-history artifact.
+
+    TRUST INVARIANT (AC-015): this pack has NO ``evidence_hash`` field. Its
+    ``artifact_content_hash`` is a SIBLING artifact hash over the backfill frames file — a
+    completely separate hash scope from the sealed TxLINE evidence hash
+    (:mod:`veridex.runtime.evidence`) or the :class:`veridex.ingest.replay_pack.ReplayPack`
+    content-hash scope. Never conflate the two: this pack does not participate in evidence
+    sealing, it only proves the backfill frames file it ships wasn't corrupted/tampered.
+    """
+
+    pack_version: int = 1
+    fixture_id: int
+    frames_file: str
+    artifact_content_hash: str
+    provenance: str = "backfilled-price-history"
+
+
+def compute_price_history_hash(pack_dir: Path, frames_file: str) -> str:
+    """sha256 over the length-prefixed (name, bytes) pair for *frames_file* in *pack_dir*.
+
+    Mirrors :func:`veridex.ingest.replay_pack._compute_content_hash`'s length-prefixing
+    scheme (4-byte name length + name + 8-byte file length + file bytes) so the (name,
+    bytes) decomposition is provably injective — a single-file instance of that same scheme,
+    applied to this SIBLING artifact (AC-015), not the ReplayPack's own hash scope.
+    """
+    name_bytes = frames_file.encode("utf-8")
+    file_bytes = (pack_dir / frames_file).read_bytes()
+    digest = hashlib.sha256()
+    digest.update(len(name_bytes).to_bytes(4, "big"))
+    digest.update(name_bytes)
+    digest.update(len(file_bytes).to_bytes(8, "big"))
+    digest.update(file_bytes)
+    return digest.hexdigest()
