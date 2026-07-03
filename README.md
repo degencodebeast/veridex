@@ -51,7 +51,7 @@ Most agent demos ask you to trust the model's claim. Veridex makes the claim **a
 | Pillar | What it is | Why it exists |
 |---|---|---|
 | **Agent Studio** | Configure and deploy trading agents from strategy templates — typed, bounded configs; a preflight that fails closed with named reasons; one click to a running, pinned agent. | Users need to *build* strategies, not watch hardcoded bots. |
-| **Live Agent Arena** | A real-time room where deployed agents **compete head-to-head on identical sealed inputs** — ingesting TxLINE data, producing actions, ranking on CLV, streaming their full decision trail (proposal → law → policy → receipt), with Head-to-Head Duel and a falsifiable leaderboard. | The track wants live autonomous agents competing, not static dashboards. |
+| **Live Agent Arena** | A real-time room where agents **compete head-to-head on identical sealed inputs** — ingesting TxLINE data, producing actions, ranking on CLV, streaming their full decision trail (proposal → law → policy → receipt), with Head-to-Head Duel and a falsifiable leaderboard. | The track wants live autonomous agents competing, not static dashboards. |
 | **Verification / Proof layer** | Deterministic recompute, 7 structural checks, evidence hashes, Merkle root-forest, Solana anchors, proof cards, and verify-yourself endpoints. | Agents can trade, but they cannot grade themselves. **This is the moat.** |
 | **Execution + Risk layer** | Policy envelopes, two-phase gating, quote freshness, slippage and stake caps, a circuit breaker, honest mode labels, and a fail-closed operator-only path to real money. | Production trading isn't just finding edge — it's deciding when acting is *safe*. |
 
@@ -61,7 +61,7 @@ Most agent demos ask you to trust the model's claim. Veridex makes the claim **a
 AgentTemplate + AgentConfig + PolicyEnvelope + Evidence = AgentInstance
 ```
 
-The **template** is the strategy family (`SharpMomentumAgent`, value-vs-venue, baseline…). The **config** is the real strategy — thresholds, market universe, warmup, quote requirements, sizing, risk caps, cooldowns, source/execution mode — all typed, bounded, and folded into a `config_hash`. The **policy envelope** is the execution boundary. Deploy pins all of it into a **durable, store-backed AgentInstance** (with its named preflight audit attached), so two users can deploy the same template with different configs, race them head-to-head in the same arena, get different performance — and Veridex still proves exactly what each one did. Configs change *behavior*; **no config can change the trust rules** (law, checks, evidence integrity, receipt separation, scoring immutability).
+The **template** is the strategy family (`SharpMomentumAgent`, value-vs-venue, baseline…). The **config** is the real strategy — thresholds, market universe, warmup, quote requirements, sizing, risk caps, cooldowns, source/execution mode — all typed, bounded, and folded into a `config_hash`. The **policy envelope** is the execution boundary. Deploy pins all of it into a **durable, store-backed AgentInstance** (with its named preflight audit attached), so two users can deploy the same template with different configs, rank them head-to-head on the same falsifiable leaderboard, get different performance — and Veridex still proves exactly what each one did. Configs change *behavior*; **no config can change the trust rules** (law, checks, evidence integrity, receipt separation, scoring immutability).
 
 ---
 
