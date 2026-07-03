@@ -1,13 +1,13 @@
 import pytest
 
+from veridex.venues.polymarket import native_to_decimal
+from veridex.venues.polymarket_resolver import ResolvedMarket
 from veridex.venues.price_history import (
     VenuePriceHistoryFrame,
     VenuePriceHistoryPack,
     compute_price_history_hash,
     fetch_price_history,
 )
-from veridex.venues.polymarket import native_to_decimal
-from veridex.venues.polymarket_resolver import ResolvedMarket
 
 
 def test_from_native_sets_decimal_via_native_to_decimal_not_the_raw_q():
