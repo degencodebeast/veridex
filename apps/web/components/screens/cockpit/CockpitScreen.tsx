@@ -2,7 +2,7 @@
 import { useMemo } from 'react';
 import { useArenaStream } from '@/hooks/useArenaStream';
 import { usePublishStatus } from '@/components/layout/StatusBarContext';
-import type { CockpitState } from '@/lib/contracts';
+import type { CockpitState, FeedHealthState } from '@/lib/contracts';
 import type { StatusBarState } from '@/lib/status';
 import { RunHeader } from './RunHeader';
 import { ProofTraceStrip } from './ProofTraceStrip';
@@ -11,11 +11,14 @@ import { ClvLeaderboard } from './ClvLeaderboard';
 import { CanonicalEventStream } from './CanonicalEventStream';
 import { ExecutionLane } from './ExecutionLane';
 import { PolicyDecisions } from './PolicyDecisions';
+import { FeedHealthPanel } from './FeedHealthPanel';
 import { QuantityLegend } from '@/components/ui/QuantityLegend';
 import styles from './CockpitScreen.module.css';
 
-export function CockpitScreen({ competitionId, initial }: { competitionId: string; initial: CockpitState }) {
-  const { state, wsStatus } = useArenaStream(competitionId, initial);
+export function CockpitScreen({
+  competitionId, initial, initialFeedHealth,
+}: { competitionId: string; initial: CockpitState; initialFeedHealth?: FeedHealthState }) {
+  const { state, wsStatus, feedHealth } = useArenaStream(competitionId, initial, initialFeedHealth);
 
   // Publish the active competition to the shared status bar (the Cockpit is the sole writer);
   // it resets to idle on unmount. source_mode is whatever the header carries (mock ⇒ replay).
@@ -46,6 +49,7 @@ export function CockpitScreen({ competitionId, initial }: { competitionId: strin
           <MatchStatePanel match={state.match} />
           <ExecutionLane receipts={state.receipts} />
           <PolicyDecisions decisions={state.policy} killArmed={state.kill_armed} />
+          <FeedHealthPanel feedHealth={feedHealth} wsStatus={wsStatus} />
         </div>
       </div>
     </div>

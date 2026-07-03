@@ -1,0 +1,421 @@
+"""Polymarket market resolver (REQ-2D-202, AC-2D-201).
+
+READ-ONLY, OFFLINE-TESTED: turns a market reference for a WC soccer fixture into concrete
+Polymarket on-chain identifiers (``condition_id`` + yes/no ``token_id`` + tick size) by
+SELECTING the right market out of a Gamma *event* and parsing it. Tests always inject a fake
+client returning recorded fixture JSON — no network in tests; only the operator's separate
+live resolve step hits the real Gamma API.
+
+Event, not single market (T13b, verified live 2026-07-02 against ``gamma-api.polymarket.com``):
+a fixture slug (e.g. ``fifwc-prt-hrv-2026-07-02``) names an EVENT that contains MANY markets —
+1X2 is THREE binary Yes/No markets (``"Will Portugal win…"``, ``"Will … end in a draw?"``,
+``"Will Croatia win…"``), Totals is an Over/Under ladder (``"… : O/U 2.5"``), plus team-name
+spreads (out of scope). So :func:`resolve_market` takes a STRUCTURED ``market_ref`` — one of
+``"1X2|home|full"``, ``"1X2|away|full"``, ``"1X2|draw|full"``, ``"OU|<line>|full"`` — and
+SELECTS the exact market:
+
+* ``1X2|home`` / ``1X2|away`` → the ``"Will <TEAM> win…"`` market matched by TEAM NAME (the
+  fixture's home/away team, normalized — NOT positional). Team names may differ between TxLINE
+  and Polymarket ("USA" vs "United States", "Bosnia & Herzegovina" vs "Bosnia and Herzegovina");
+  see :func:`_normalize_team`. Ambiguous or absent match → :class:`MarketUnavailable`.
+* ``1X2|draw`` → the ``"… end in a draw?"`` market. Draw is canonicalized HERE to the draw
+  market's YES token — ``side="draw"`` is NEVER passed to :func:`side_to_token` (Codex M2).
+* ``OU|<line>`` → the ``"… : O/U <line>"`` market whose numeric line equals ``<line>``.
+
+A market_ref without ``"|"`` is treated as a LEGACY direct reference: select the market whose
+``slug`` equals ``fixture_hint`` (the pre-T13b behavior, kept backward-usable and fail-closed).
+
+Gamma market shape (verified via Context7 against the official Polymarket OpenAPI spec and
+cross-checked against independent references): each market object carries ``conditionId``,
+``slug``, ``question``, and three JSON-*encoded-as-string* fields — ``outcomes``,
+``outcomePrices``, ``clobTokenIds`` — that must be ``json.loads``'d a SECOND time and are
+index-aligned (``clobTokenIds[i]`` is the token for ``outcomes[i]``). Tick size lives in
+``orderPriceMinTickSize``.
+
+The vendored CLOB wrapper (``veridex/venues/_vendor/polymarket_clob/client.py``) has no
+Gamma/discovery surface — its only market method, ``get_market(condition_id)``, requires a
+condition_id you don't have yet, so it can't resolve a human reference. The ``client``
+injected here is therefore a small Gamma-shaped duck type
+(``async def get_markets(self, **params) -> list[dict]``), independent of the vendored CLOB
+client. This module has no LLM SDK imports and is not in the LLM trust path; the default
+live Gamma client lazily imports ``httpx`` inside :func:`resolve_market` so importing this
+module is offline-safe (like ``sx_bet``).
+
+Cardinal honesty rule (AC-2D-201): an unknown/unavailable/malformed/ambiguous market raises
+:class:`MarketUnavailable` — NEVER a fabricated, partially-guessed, or wrong-outcome
+:class:`ResolvedMarket`. A wrong selection would route a real order to the WRONG outcome, so
+selection fails closed on any ambiguity rather than guess. No default/placeholder ids.
+"""
+
+from __future__ import annotations
+
+import json
+import re
+import unicodedata
+from typing import Any, Protocol
+
+from pydantic import BaseModel
+
+GAMMA_BASE_URL = "https://gamma-api.polymarket.com"
+
+# Outcome labels that map to the "yes" token, per the interface contract (REQ-2D-202):
+# over/home/yes -> yes-token; under/away/no -> no-token.
+_YES_LABELS = frozenset({"yes", "over", "home"})
+_NO_LABELS = frozenset({"no", "under", "away"})
+
+# Team-name aliases for robust TxLINE<->Polymarket matching. Keys/values are ALREADY
+# normalized (lowercased, accent-stripped, "&"->"and", punctuation removed). Only genuine,
+# well-known naming differences belong here — never a fuzzy/partial guess (AC-2D-201).
+_TEAM_ALIASES: dict[str, str] = {
+    "usa": "united states",
+    "us": "united states",
+    "usmnt": "united states",
+    "united states of america": "united states",
+    "uae": "united arab emirates",
+    "south korea": "korea republic",
+    "north korea": "korea dpr",
+    "ivory coast": "cote divoire",
+    "cote d ivoire": "cote divoire",
+    "czech republic": "czechia",
+    "cape verde": "cabo verde",
+}
+
+# "Will <TEAM> win…"  — capture the team name up to " win".
+_WIN_RE = re.compile(r"^will\s+(.+?)\s+win\b", re.IGNORECASE)
+# "… end in a draw?" — the draw market.
+_DRAW_RE = re.compile(r"\bend in a draw\b", re.IGNORECASE)
+# "… : O/U 2.5" — capture the numeric goal line.
+_OU_RE = re.compile(r"\bo\s*/\s*u\s*([0-9]+(?:\.[0-9]+)?)", re.IGNORECASE)
+
+
+def _normalize_team(name: str) -> str:
+    """Normalize a team name for robust, fail-closed matching.
+
+    Lowercases, strips accents, expands ``&`` to ``and``, drops punctuation, collapses
+    whitespace, then applies the :data:`_TEAM_ALIASES` table. This absorbs trivial spelling
+    differences ("Bosnia & Herzegovina" vs "Bosnia and Herzegovina") and known aliases
+    ("USA" -> "United States") while a genuinely different team stays distinct (so a wrong
+    fixture fails closed rather than mis-matching).
+    """
+    decomposed = unicodedata.normalize("NFKD", name)
+    ascii_only = "".join(ch for ch in decomposed if not unicodedata.combining(ch))
+    lowered = ascii_only.lower().strip().replace("&", " and ").replace("-", " ")
+    stripped = re.sub(r"[^a-z0-9 ]", " ", lowered)
+    collapsed = re.sub(r"\s+", " ", stripped).strip()
+    return _TEAM_ALIASES.get(collapsed, collapsed)
+
+
+class ResolvedMarket(BaseModel):
+    """Concrete Polymarket identifiers resolved from a human market reference.
+
+    Attributes:
+        condition_id: The market's on-chain condition ID (from Gamma ``conditionId``).
+        token_id_yes: CLOB token ID for the "yes"-side outcome (Yes/Over/Home).
+        token_id_no: CLOB token ID for the "no"-side outcome (No/Under/Away).
+        tick_size: Minimum price increment (from Gamma ``orderPriceMinTickSize``).
+    """
+
+    condition_id: str
+    token_id_yes: str
+    token_id_no: str
+    tick_size: float
+
+
+class MarketUnavailable(Exception):
+    """Raised when a market reference cannot be resolved to real Polymarket identifiers.
+
+    This is the ONLY failure mode for an unknown, unavailable, or malformed market
+    (AC-2D-201) — callers must never receive a fabricated or partially-guessed
+    :class:`ResolvedMarket`.
+    """
+
+
+class GammaClient(Protocol):
+    """Structural protocol for the Gamma-shaped read client :func:`resolve_market` needs.
+
+    Tests inject a fake implementation that returns recorded fixture JSON; the default
+    (``client=None``) lazily constructs a real client that hits ``gamma-api.polymarket.com``.
+    """
+
+    async def get_markets(self, **params: Any) -> list[dict[str, Any]]:
+        """Return Gamma market objects matching *params* (e.g. ``slug=...``)."""
+        ...
+
+
+def side_to_token(resolved: ResolvedMarket, side: str) -> str:
+    """Map a bet side to the matching token ID on *resolved*.
+
+    Args:
+        resolved: The resolved market to read token IDs from.
+        side: One of ``"over"``/``"home"``/``"yes"`` (-> :attr:`ResolvedMarket.token_id_yes`)
+            or ``"under"``/``"away"``/``"no"`` (-> :attr:`ResolvedMarket.token_id_no`),
+            case-insensitive.
+
+    Returns:
+        The token ID for *side*.
+
+    Raises:
+        ValueError: If *side* is not a recognised alias. Never silently picks a side.
+    """
+    normalized = side.strip().lower()
+    if normalized in _YES_LABELS:
+        return resolved.token_id_yes
+    if normalized in _NO_LABELS:
+        return resolved.token_id_no
+    raise ValueError(f"Unknown side: {side!r}")
+
+
+async def resolve_market(
+    market_ref: str,
+    fixture_hint: str,
+    *,
+    home_team: str | None = None,
+    away_team: str | None = None,
+    client: GammaClient | None = None,
+) -> ResolvedMarket:
+    """Resolve a structured market reference to concrete Polymarket identifiers.
+
+    Fetches the fixture EVENT's market list (the injected client returns the event's
+    markets), SELECTS the one market matching *market_ref*, and parses it. A wrong
+    selection would route a real order to the wrong outcome, so selection fails closed on
+    any ambiguity (AC-2D-201).
+
+    Args:
+        market_ref: Structured reference — ``"1X2|home|full"``, ``"1X2|away|full"``,
+            ``"1X2|draw|full"``, or ``"OU|<line>|full"``. A ref without ``"|"`` is treated
+            as a LEGACY direct reference (select the market whose ``slug`` == *fixture_hint*).
+        fixture_hint: The Gamma EVENT ``slug`` to look up (e.g. ``fifwc-prt-hrv-2026-07-02``).
+        home_team: Fixture home team name (TxLINE ``Participant`` with ``IsHome`` true), used
+            to match the ``"Will <home> win…"`` market for ``1X2|home``. Team-identity params
+            are passed by T14/T17/T20 from the TxLINE fixture snapshot.
+        away_team: Fixture away team name, used to match the away-team win market.
+        client: Injectable Gamma-shaped client. Tests ALWAYS inject a fake returning
+            recorded fixture JSON. ``None`` lazily constructs the real live client
+            (network, offline-safe to import — only touched when actually called).
+
+    Returns:
+        A :class:`ResolvedMarket` with condition_id, both token IDs, and tick_size. For
+        ``1X2|draw`` the draw market's YES token is :attr:`ResolvedMarket.token_id_yes`
+        (draw canonicalized here — ``side="draw"`` never reaches :func:`side_to_token`).
+
+    Raises:
+        MarketUnavailable: If the client lookup fails; no market matches the ref; the match
+            is ambiguous (more than one candidate); *market_ref* has an unknown type; a
+            name-matched ref is missing the needed team identity; or the selected market is
+            malformed. Never fabricates, guesses, or routes to the wrong outcome.
+    """
+    if client is None:
+        client = _DefaultGammaClient()
+
+    try:
+        raw = await client.get_markets(slug=fixture_hint)
+    except Exception as exc:
+        raise MarketUnavailable(
+            f"Gamma lookup failed for market_ref={market_ref!r} slug={fixture_hint!r}: {exc}"
+        ) from exc
+
+    if not isinstance(raw, list):
+        raw = [raw]
+    markets = [m for m in raw if isinstance(m, dict)]
+
+    if "|" not in market_ref:
+        # Legacy direct reference: exact slug match within the returned markets.
+        match = next((m for m in markets if m.get("slug") == fixture_hint), None)
+        if match is None:
+            raise MarketUnavailable(
+                f"No Gamma market found for slug={fixture_hint!r} (market_ref={market_ref!r})"
+            )
+        return _parse_gamma_market(match, market_ref=market_ref, fixture_hint=fixture_hint)
+
+    selected = _select_market(
+        markets,
+        market_ref=market_ref,
+        fixture_hint=fixture_hint,
+        home_team=home_team,
+        away_team=away_team,
+    )
+    return _parse_gamma_market(selected, market_ref=market_ref, fixture_hint=fixture_hint)
+
+
+def _select_market(
+    markets: list[dict[str, Any]],
+    *,
+    market_ref: str,
+    fixture_hint: str,
+    home_team: str | None,
+    away_team: str | None,
+) -> dict[str, Any]:
+    """Select the one event market matching *market_ref*, or fail closed.
+
+    Parses ``TYPE|param|period`` and dispatches to the per-type matcher. Exactly one
+    candidate must match: zero (no such market) or more than one (ambiguous) both raise
+    :class:`MarketUnavailable` — never a guessed or partial selection (AC-2D-201).
+    """
+    parts = market_ref.split("|")
+    kind = parts[0].strip().lower()
+    param = parts[1].strip() if len(parts) > 1 else ""
+    period = parts[2].strip().lower() if len(parts) > 2 else "full"
+
+    # Only full-time markets are verified/supported; other periods fail closed (honest).
+    if period not in ("", "full"):
+        raise MarketUnavailable(
+            f"Unsupported period {period!r} in market_ref={market_ref!r} "
+            f"(only full-time supported)"
+        )
+
+    if kind == "1x2":
+        candidates = _match_1x2(
+            markets,
+            param=param.lower(),
+            market_ref=market_ref,
+            home_team=home_team,
+            away_team=away_team,
+        )
+    elif kind == "ou":
+        candidates = _match_ou(markets, line=param, market_ref=market_ref)
+    else:
+        raise MarketUnavailable(
+            f"Unknown market_ref type {kind!r} in market_ref={market_ref!r} "
+            f"(supported: 1X2, OU)"
+        )
+
+    if len(candidates) == 1:
+        return candidates[0]
+    if not candidates:
+        raise MarketUnavailable(
+            f"No market in event slug={fixture_hint!r} matched market_ref={market_ref!r}"
+        )
+    raise MarketUnavailable(
+        f"Ambiguous market selection for market_ref={market_ref!r} in event "
+        f"slug={fixture_hint!r}: {len(candidates)} markets matched — failing closed"
+    )
+
+
+def _match_1x2(
+    markets: list[dict[str, Any]],
+    *,
+    param: str,
+    market_ref: str,
+    home_team: str | None,
+    away_team: str | None,
+) -> list[dict[str, Any]]:
+    """Return event markets matching a ``1X2|{home,away,draw}`` ref (0, 1, or many)."""
+    if param == "draw":
+        return [m for m in markets if _DRAW_RE.search(str(m.get("question", "")))]
+
+    if param == "home":
+        team = home_team
+    elif param == "away":
+        team = away_team
+    else:
+        raise MarketUnavailable(
+            f"Unknown 1X2 side {param!r} in market_ref={market_ref!r} "
+            f"(supported: home, away, draw)"
+        )
+
+    if not team or not team.strip():
+        raise MarketUnavailable(
+            f"market_ref={market_ref!r} needs the {param} team identity to match by name, "
+            f"but none was provided — failing closed"
+        )
+
+    target = _normalize_team(team)
+    hits: list[dict[str, Any]] = []
+    for market in markets:
+        win_match = _WIN_RE.match(str(market.get("question", "")).strip())
+        if win_match is not None and _normalize_team(win_match.group(1)) == target:
+            hits.append(market)
+    return hits
+
+
+def _match_ou(
+    markets: list[dict[str, Any]],
+    *,
+    line: str,
+    market_ref: str,
+) -> list[dict[str, Any]]:
+    """Return event markets whose ``O/U <line>`` numeric line equals *line* (0, 1, or many)."""
+    try:
+        target_line = float(line)
+    except ValueError as exc:
+        raise MarketUnavailable(
+            f"Malformed O/U line {line!r} in market_ref={market_ref!r}: {exc}"
+        ) from exc
+
+    hits: list[dict[str, Any]] = []
+    for market in markets:
+        question = str(market.get("question", ""))
+        if any(
+            abs(float(found.group(1)) - target_line) < 1e-9
+            for found in _OU_RE.finditer(question)
+        ):
+            hits.append(market)
+    return hits
+
+
+def _parse_gamma_market(market: dict[str, Any], *, market_ref: str, fixture_hint: str) -> ResolvedMarket:
+    """Parse a single Gamma market object into a :class:`ResolvedMarket`.
+
+    Fails closed: any missing/malformed field raises :class:`MarketUnavailable` rather than
+    crashing or guessing (AC-2D-201).
+    """
+    try:
+        condition_id = market["conditionId"]
+        outcomes = json.loads(market["outcomes"])
+        token_ids = json.loads(market["clobTokenIds"])
+        tick_size = float(market["orderPriceMinTickSize"])
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise MarketUnavailable(
+            f"Malformed Gamma market for slug={fixture_hint!r} (market_ref={market_ref!r}): {exc}"
+        ) from exc
+
+    if not condition_id or not isinstance(condition_id, str):
+        raise MarketUnavailable(f"Gamma market slug={fixture_hint!r} has no condition_id")
+
+    if (
+        not isinstance(outcomes, list)
+        or not isinstance(token_ids, list)
+        or not outcomes
+        or len(outcomes) != len(token_ids)
+    ):
+        raise MarketUnavailable(
+            f"Gamma market slug={fixture_hint!r} has malformed outcomes/clobTokenIds"
+        )
+
+    token_id_yes: str | None = None
+    token_id_no: str | None = None
+    for outcome, token_id in zip(outcomes, token_ids, strict=True):
+        label = str(outcome).strip().lower()
+        if label in _YES_LABELS:
+            token_id_yes = token_id
+        elif label in _NO_LABELS:
+            token_id_no = token_id
+
+    if token_id_yes is None or token_id_no is None:
+        raise MarketUnavailable(
+            f"Gamma market slug={fixture_hint!r} outcomes {outcomes!r} did not map to a yes/no pair"
+        )
+
+    return ResolvedMarket(
+        condition_id=condition_id,
+        token_id_yes=token_id_yes,
+        token_id_no=token_id_no,
+        tick_size=tick_size,
+    )
+
+
+class _DefaultGammaClient:
+    """Live Gamma client used when :func:`resolve_market` is called without an injected client.
+
+    ``httpx`` is imported lazily inside :meth:`get_markets` (not at module scope) so
+    importing ``veridex.venues.polymarket_resolver`` stays offline-safe.
+    """
+
+    async def get_markets(self, **params: Any) -> list[dict[str, Any]]:
+        import httpx
+
+        async with httpx.AsyncClient(base_url=GAMMA_BASE_URL, timeout=10.0) as http:
+            response = await http.get("/markets", params=params)
+            response.raise_for_status()
+            data = response.json()
+        return data if isinstance(data, list) else [data]

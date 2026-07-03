@@ -27,12 +27,12 @@ async def test_fake_quote_submit_status_normalize() -> None:
     """Full fake adapter round-trip returns a valid ExecutionReceipt."""
     a = FakeVenueAdapter(fill=True)
     q = await a.quote_market("OU|2.5|full")
-    ack = await a.submit_order(Order(market_ref="OU|2.5|full", side="over", size=100.0, price=q.price, venue="sx_bet"))
+    ack = await a.submit_order(Order(market_ref="OU|2.5|full", side="over", size=100.0, price=q.price, venue="sx_bet", client_order_id="c1"))
     assert ack.accepted and a.submit_calls == 1
     st = await a.get_order_status(ack.venue_order_id)
     rcpt = a.normalize_receipt(
         "e1",
-        Order(market_ref="OU|2.5|full", side="over", size=100.0, price=q.price, venue="sx_bet"),
+        Order(market_ref="OU|2.5|full", side="over", size=100.0, price=q.price, venue="sx_bet", client_order_id="c1"),
         st,
         mode="dry_run",
     )
@@ -62,7 +62,7 @@ def test_normalize_receipt_pure_deterministic() -> None:
     """normalize_receipt is pure: identical inputs produce identical receipts."""
     a = FakeVenueAdapter()
     st = OrderStatus(venue_order_id="o1", status="filled", filled_size=100.0, price=2.0)
-    o = Order(market_ref="m", side="over", size=100.0, price=2.0, venue="sx_bet")
+    o = Order(market_ref="m", side="over", size=100.0, price=2.0, venue="sx_bet", client_order_id="c1")
     r1 = a.normalize_receipt("e1", o, st, mode="dry_run")
     r2 = a.normalize_receipt("e1", o, st, mode="dry_run")
     assert r1.model_dump() == r2.model_dump()
@@ -75,11 +75,22 @@ def test_normalize_receipt_pure_deterministic() -> None:
 
 
 def test_import_sx_bet_is_offline_safe() -> None:
-    """Importing veridex.venues.sx_bet must not pull in httpx or aiohttp."""
-    import veridex.venues.sx_bet  # noqa: F401
+    """Importing veridex.venues.sx_bet must not eagerly pull in httpx or aiohttp.
 
-    assert "httpx" not in sys.modules
-    assert "aiohttp" not in sys.modules
+    Checked in a fresh interpreter: other tests in this process (e.g. the vendored
+    Polymarket client's import test) legitimately import httpx/aiohttp, which would
+    pollute this process's ``sys.modules`` and make an in-process check order-fragile.
+    A subprocess isolates the assertion to sx_bet's OWN import graph.
+    """
+    import subprocess
+
+    code = (
+        "import sys, veridex.venues.sx_bet\n"
+        "assert 'httpx' not in sys.modules, 'sx_bet eagerly imported httpx'\n"
+        "assert 'aiohttp' not in sys.modules, 'sx_bet eagerly imported aiohttp'\n"
+    )
+    result = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
 
 
 def test_venues_no_secrets_in_module() -> None:
@@ -102,11 +113,11 @@ async def test_fake_partial_fill() -> None:
     """FakeVenueAdapter with fill_size < order size returns PARTIAL status."""
     a = FakeVenueAdapter(fill=True, fill_size=50.0)
     q = await a.quote_market("OU|2.5|full")
-    ack = await a.submit_order(Order(market_ref="OU|2.5|full", side="under", size=100.0, price=q.price, venue="sx_bet"))
+    ack = await a.submit_order(Order(market_ref="OU|2.5|full", side="under", size=100.0, price=q.price, venue="sx_bet", client_order_id="c1"))
     st = await a.get_order_status(ack.venue_order_id)
     rcpt = a.normalize_receipt(
         "e2",
-        Order(market_ref="OU|2.5|full", side="under", size=100.0, price=q.price, venue="sx_bet"),
+        Order(market_ref="OU|2.5|full", side="under", size=100.0, price=q.price, venue="sx_bet", client_order_id="c1"),
         st,
         mode="paper",
     )
@@ -123,11 +134,11 @@ async def test_fake_rejection() -> None:
     """FakeVenueAdapter with fill=False returns a rejected status."""
     a = FakeVenueAdapter(fill=False)
     q = await a.quote_market("OU|2.5|full")
-    ack = await a.submit_order(Order(market_ref="OU|2.5|full", side="over", size=100.0, price=q.price, venue="sx_bet"))
+    ack = await a.submit_order(Order(market_ref="OU|2.5|full", side="over", size=100.0, price=q.price, venue="sx_bet", client_order_id="c1"))
     st = await a.get_order_status(ack.venue_order_id)
     rcpt = a.normalize_receipt(
         "e3",
-        Order(market_ref="OU|2.5|full", side="over", size=100.0, price=q.price, venue="sx_bet"),
+        Order(market_ref="OU|2.5|full", side="over", size=100.0, price=q.price, venue="sx_bet", client_order_id="c1"),
         st,
         mode="dry_run",
     )

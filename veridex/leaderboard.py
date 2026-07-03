@@ -145,6 +145,16 @@ def _aggregate(agent_id: str, rows: list[dict[str, Any]]) -> dict[str, Any]:
     # POOLED avg — true mean over all scored actions, NOT mean-of-run-means.
     avg_clv_bps: float | None = (total_clv_bps / action_count) if action_count > 0 else None
 
+    # DEC-2D-1: WINDOW CLV pooled across runs like true CLV (Σtotal / Σcount), surfaced as a LABELED
+    # supporting metric. It is NEVER folded into avg_clv_bps and NEVER enters _rank_key — the board
+    # rank stays on true CLV. Consumes the per-run score_run window fields (defaulting to 0/absent so
+    # a pre-T10c or no-window record still aggregates cleanly).
+    total_window_clv_bps: int = sum(int(r.get("total_window_clv_bps", 0)) for r in rows)
+    window_action_count: int = sum(int(r.get("window_action_count", 0)) for r in rows)
+    avg_window_clv_bps: float | None = (
+        (total_window_clv_bps / window_action_count) if window_action_count > 0 else None
+    )
+
     # JUDGMENT: max_drawdown = min (worst / most-negative) across runs.
     max_drawdown: float = min(r["max_drawdown"] for r in rows)
 
@@ -176,6 +186,10 @@ def _aggregate(agent_id: str, rows: list[dict[str, Any]]) -> dict[str, Any]:
         "anchor_status": _summarize_anchor_status(anchor_statuses),
         "source_mode": _summarize_source_mode(source_modes),
         "valid_count": valid_count,
+        # DEC-2D-1 window CLV — pooled + labeled; a supporting metric, NEVER a rank input (see _rank_key).
+        "avg_window_clv_bps": avg_window_clv_bps,
+        "total_window_clv_bps": total_window_clv_bps,
+        "window_action_count": window_action_count,
         **clv_confidence(valid_count),  # adds clv_confidence + low_sample + sample_size (display-only)
     }
 

@@ -1,7 +1,8 @@
 """B5 — the ASYNC run orchestrator (REQ-105 / AC-105, gate CON-003/CON-006).
 
-CON-010 (async shell / sync core): ``run_competition`` is the ASYNC SHELL. It gathers every
-agent's decision CONCURRENTLY per tick, each wrapped in ``asyncio.timeout`` and fail-closed.
+CON-010 (async shell / sync core): ``CompetitionRun`` is the ASYNC SHELL (``run_competition`` is a
+thin batch wrapper over it). Its ``feed()`` gathers every agent's decision CONCURRENTLY per tick,
+each wrapped in ``asyncio.timeout`` and fail-closed; its ``finalize()`` holds the SYNC seal.
 The deterministic law (``veridex.law.recompute``), evidence binding/hashing
 (``veridex.runtime.evidence``) and the baseline strategy stay SYNC and are CALLED from the
 async loop — concurrency NEVER reaches the deterministic core.
@@ -32,7 +33,7 @@ from typing import TYPE_CHECKING, Any
 
 from veridex.config import get_settings
 from veridex.ingest.marketstate import MarketState
-from veridex.law.recompute import LIVE, REPLAY, recompute
+from veridex.law.recompute import LIVE, PENDING, REPLAY, recompute
 from veridex.runtime.agent import (
     AGENT_ACTION_SCHEMA_VERSION,
     DEFAULT_MODEL_ID,
@@ -48,6 +49,14 @@ from veridex.runtime.evidence import (
     serialize_payload,
 )
 from veridex.runtime.schemas import AgentAction, RunEvent
+from veridex.runtime.window import (
+    CLV_FIELD_TRUE,
+    WINDOW_CONFIG_EVENT_TYPE,
+    RunWindow,
+    clv_field_name,
+    is_pending_horizon,
+)
+from veridex.scoring import is_scored
 
 if TYPE_CHECKING:  # avoid a runtime import cycle (store lazily imports RunResult)
     from veridex.store import Store
@@ -244,7 +253,312 @@ async def _decide(
 
 
 # ---------------------------------------------------------------------------
-# run_competition — the async loop
+# CompetitionRun — the incremental core (feed per tick, finalize once)
+# ---------------------------------------------------------------------------
+
+
+class CompetitionRun:
+    """The incremental heart of a competition: ``feed()`` a snapshot per tick, ``finalize()`` once.
+
+    This is the per-tick loop of the batch ``run_competition`` extracted into an object with an
+    explicit lifecycle so live drivers (Tasks 8/15/20) can push snapshots as they arrive rather
+    than pre-materializing the whole ``marketstates`` list. The split is TRUST-CRITICAL and purely
+    MECHANICAL: ``feed()`` holds the ASYNC concurrency (per-tick ``asyncio.gather`` of every
+    agent's fail-closed ``_decide``, REQ-2D-101 — decisions are gathered in REAL TIME, never
+    buffered to finalize), and ``finalize()`` holds the SYNC deterministic seal
+    (``validate_run_events`` → ``compute_evidence_hash``) and scoring pass (CON-2D-102). Driving a
+    ``CompetitionRun`` via ``feed()``* + one ``finalize()`` produces a ``RunResult`` byte-identical
+    to the batch wrapper on identical inputs (pinned by the golden fixtures).
+
+    Args:
+        agents: Participating agents (≥1; typically ≥1 LLM + the deterministic baseline).
+        source_mode: ``"replay"`` or ``"live"`` (validated at construction — CON-005).
+        run_id: Optional explicit run id (defaults to a fresh UUID hex, resolved at construction).
+        decision_timeout_s: Per-decide timeout (defaults to ``get_settings().decision_timeout_s``).
+        event_sink: Optional async observer. When given, EACH event appended to the run is also
+            validated through ``RunEvent`` and awaited on the sink (in ``sequence_no`` order) for
+            live observation/persistence. This is an ADDITIVE SHELL: the sink NEVER feeds back into
+            the deterministic seal (the seal + sync scoring pass are byte-identical with or without).
+
+    Raises:
+        ValueError: If ``source_mode`` is not ``"replay"`` or ``"live"``.
+    """
+
+    def __init__(
+        self,
+        agents: list[Agent],
+        *,
+        source_mode: str,
+        run_id: str | None = None,
+        decision_timeout_s: float | None = None,
+        event_sink: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
+    ) -> None:
+        if source_mode not in (REPLAY, LIVE):
+            raise ValueError(f"source_mode must be 'replay' or 'live', got {source_mode!r}")
+
+        self._agents = agents
+        self._source_mode = source_mode
+        self._run_id = run_id or uuid.uuid4().hex
+        self._timeout_s = decision_timeout_s if decision_timeout_s is not None else get_settings().decision_timeout_s
+        self._event_sink = event_sink
+
+        self._raw_events: list[dict[str, Any]] = []
+        # Successful decisions deferred to the SYNC scoring pass (after the evidence hash is sealed).
+        self._decisions: list[tuple[Agent, AgentAction, MarketState]] = []
+        # Ordered fed snapshots — finalize() builds the closing-horizon map over the full list.
+        self._snapshots: list[MarketState] = []
+        self._sequence_no = 0
+        self._finalized = False
+
+    async def _emit(self, ev: dict[str, Any]) -> None:
+        """Append ``ev`` to the run AND (when present) mirror it to the live ``event_sink``.
+
+        The sink only ever receives ``RunEvent``-validated dicts — identical in shape to what
+        ``validate_run_events`` later produces for the seal — so the live stream stays a faithful
+        projection of the sealed record. ``_raw_events`` keeps the original (unvalidated) dict so
+        the finalize-time seal is byte-identical to the no-sink path.
+        """
+        self._raw_events.append(ev)
+        if self._event_sink is not None:
+            await self._event_sink(RunEvent.model_validate(ev).model_dump())
+
+    async def feed(self, snapshot: MarketState) -> None:
+        """Ingest one tick: emit the tick event, gather ALL agents' decisions NOW, record them.
+
+        Every agent decides CONCURRENTLY (``asyncio.gather``), each wrapped in ``asyncio.timeout``
+        and fail-closed (timeout/exception → an ``error`` event). Successful ``(agent, action,
+        snapshot)`` triples accumulate for the finalize-time scoring pass; the snapshot itself is
+        retained so ``finalize()`` can rebuild the closing-horizon map over the full run.
+
+        Raises:
+            RuntimeError: If called after ``finalize()`` (a sealed run accepts no further ticks —
+                feeding past the seal would run ``agent.decide`` and push events to ``event_sink``
+                that can NEVER appear in the sealed evidence, breaking the faithful-projection
+                invariant the live broadcast relies on).
+        """
+        if self._finalized:
+            raise RuntimeError("run already finalized")
+
+        self._snapshots.append(snapshot)
+        await self._emit(
+            {
+                "sequence_no": self._sequence_no,
+                "event_type": EVENT_TICK,
+                "state_snapshot_json": serialize_payload(snapshot.model_dump()),
+            }
+        )
+        self._sequence_no += 1
+
+        results = await asyncio.gather(*[_decide(agent, snapshot, self._timeout_s) for agent in self._agents])
+
+        for agent, action, error in results:
+            if error is not None or action is None:
+                await self._emit(
+                    {
+                        "sequence_no": self._sequence_no,
+                        "event_type": EVENT_ERROR,
+                        "result_payload_json": serialize_payload(
+                            {
+                                "agent_id": agent.agent_id,
+                                "error": type(error).__name__ if error is not None else "NoAction",
+                                "message": str(error) if error is not None else "agent returned no action",
+                            }
+                        ),
+                    }
+                )
+            else:
+                await self._emit(
+                    {
+                        "sequence_no": self._sequence_no,
+                        "event_type": EVENT_DECISION,
+                        "action_payload_json": serialize_payload(action.model_dump()),
+                        "result_payload_json": serialize_payload({"agent_id": agent.agent_id}),
+                    }
+                )
+                self._decisions.append((agent, action, snapshot))
+            self._sequence_no += 1
+
+    async def feed_closing(self, snapshot: MarketState) -> None:
+        """Ingest the CLOSING tick: emit it as a normal TICK evidence event, gather NO decisions.
+
+        The live runner (Task 8) supplies the reconstructed/observed closing snapshot for a
+        ``pre_match`` window (the CON-040 close). Unlike :meth:`feed`, agents NEVER act on the
+        closing tick — it is the line they are scored AGAINST, not a fresh decision point — so this
+        emits exactly ONE ``EVENT_TICK`` (same payload shape as ``feed``'s tick) and gathers no
+        agent decisions. The snapshot is appended to ``self._snapshots`` so ``finalize``'s
+        ``_closing_snapshots`` picks it as the closing line for its markets, and the tick event
+        enters ``_raw_events`` so it is inside the sealed, evidence-hash-covered ``run_events``.
+        ``sequence_no`` advances exactly as for a fed tick.
+
+        Raises:
+            RuntimeError: If called after ``finalize()`` (the SAME seal guard as ``feed`` — a sealed
+                run accepts no further ticks; a post-seal closing tick could never appear in the
+                sealed evidence).
+        """
+        if self._finalized:
+            raise RuntimeError("run already finalized")
+
+        self._snapshots.append(snapshot)
+        await self._emit(
+            {
+                "sequence_no": self._sequence_no,
+                "event_type": EVENT_TICK,
+                "state_snapshot_json": serialize_payload(snapshot.model_dump()),
+            }
+        )
+        self._sequence_no += 1
+
+    async def finalize(self, *, store: Store | None = None, window: RunWindow | None = None) -> RunResult:
+        """Seal the run EXACTLY once: validate → hash → SYNC score → build (and persist) RunResult.
+
+        The evidence boundary is sealed by validating every emitted event through ``RunEvent`` then
+        hashing the canonical, sequence-ordered list. Scoring then runs SYNC: per successful (tick,
+        agent) decision, ``recompute`` derives CLV against the SAME per-market closing snapshot
+        (built over ALL fed snapshots), a raw pre-score record binds the run evidence + action +
+        order + proof mode, and the score row derives ONLY from that bound hash + recomputed values
+        (gate-3 ordering: tick → decision → pre-score → score).
+
+        The ``_finalized`` guard is set only AFTER ``store.persist_run`` returns, so a transient
+        store failure can be retried; that retry is safe only because ``persist_run`` is expected to
+        be idempotent/keyed on ``run_id`` (fixed at construction) and the seal is deterministic, so a
+        re-run re-produces a byte-identical ``RunResult``.
+
+        Args:
+            store: Optional async store; when given, the run is persisted before the seal is set.
+            window: Optional live :class:`~veridex.runtime.window.RunWindow` (DEC-2D-1/2). When
+                ``None`` (the batch/legacy path) the scoring pass is BYTE-IDENTICAL to before. When
+                supplied it (a) stamps ``window.started_ts`` from the first accepted tick, (b) marks
+                any decision entered within ``min_clv_horizon_s`` of the window close as
+                ``pending_horizon`` (``clv_bps == "pending"``, excluded from CLV means like WAIT),
+                and (c) names the CLV value field per :func:`~veridex.runtime.window.clv_field_name`
+                — ``clv_bps`` for ``pre_match`` (true CLV) or ``window_clv_bps`` for
+                ``fixed_duration``/``manual_stop`` (window CLV; the row never carries a numeric
+                ``clv_bps`` alongside it, so window CLV is never mistaken for true CLV).
+
+        Raises:
+            RuntimeError: If called more than once (a run seals exactly once).
+        """
+        if self._finalized:
+            raise RuntimeError("run already finalized")
+
+        closing_by_market = _closing_snapshots(self._snapshots)
+
+        # --- windowed-CLV setup (DEC-2D-1/2): window=None leaves everything below untouched, so
+        # the legacy (batch) path stays BYTE-IDENTICAL (pinned by tests/test_orchestrator_golden.py).
+        window_end_ts: int | None = None
+        clv_field = CLV_FIELD_TRUE
+        if window is not None:
+            if self._snapshots:
+                if window.started_ts is None:
+                    # (a) stamp the coverage window's start from the FIRST accepted tick's ts —
+                    # an evidence-derived start (never overwritten if the caller preset one).
+                    window.started_ts = self._snapshots[0].ts
+                # (b) the close is the last accumulated snapshot: the feed_closing tick for a
+                # pre_match window, or the last feed() for fixed_duration/manual_stop.
+                window_end_ts = self._snapshots[-1].ts
+            clv_field = clv_field_name(window.end_rule)
+
+        # --- T8c: seal the coverage-window config as EVIDENCE (windowed runs only) ----------
+        # A verifier re-derives is_pending_horizon(entry_ts, window_end_ts, min_clv_horizon_s) to
+        # VERIFY (not trust) any pending_horizon label, so end_rule + min_clv_horizon_s + the
+        # effective window_end_ts must live inside the hash-covered run_events. Emitted via _emit so
+        # the live sink stays a faithful projection, and ONLY when window is not None (window=None
+        # seals no such event → the legacy/golden path is byte-identical). window_end_ts is None only
+        # for an empty run, which has no scored rows to protect, so the guard also skips that case.
+        if window is not None and window_end_ts is not None:
+            await self._emit(
+                {
+                    "sequence_no": self._sequence_no,
+                    "event_type": WINDOW_CONFIG_EVENT_TYPE,
+                    "result_payload_json": serialize_payload(
+                        {
+                            "end_rule": window.end_rule,
+                            "min_clv_horizon_s": window.min_clv_horizon_s,
+                            "window_end_ts": window_end_ts,
+                        }
+                    ),
+                }
+            )
+            self._sequence_no += 1
+
+        # --- seal the evidence boundary: validate THEN hash (carry-forward 1) --------------
+        run_events = validate_run_events(self._raw_events)
+        evidence_hash = compute_evidence_hash(run_events)
+
+        # --- SYNC scoring pass: pre-score precedes score (gate-3) --------------------------
+        score_rows: list[dict[str, Any]] = []
+        for agent, action, snapshot in self._decisions:
+            market_key = (action.params or {}).get("market_key")
+            closing = closing_by_market.get(market_key) if market_key else None
+            result = recompute(snapshot, action, closing=closing, source_mode=self._source_mode)
+
+            config_hash = (
+                agent.config_hash(snapshot)
+                if agent.config_hash is not None
+                else agent_config_hash(agent.agent_id, "", AGENT_ACTION_SCHEMA_VERSION)
+            )
+            prescore = build_raw_prescore_record(
+                evidence_hash=evidence_hash,
+                raw_action=action.model_dump(),
+                action_schema_version=AGENT_ACTION_SCHEMA_VERSION,
+                agent_id=agent.agent_id,
+                model_prompt_config_hash=config_hash,
+                tick_seq=snapshot.tick_seq,
+                proof_mode=agent.proof_mode,
+            )
+            score = score_row_from_prescore(
+                raw_prescore_hash=prescore["raw_prescore_hash"],
+                recomputed_edge_bps=int(result["edge_bps"]),
+            )
+            row = {
+                **score,
+                "agent_id": agent.agent_id,
+                "tick_seq": snapshot.tick_seq,
+                "proof_mode": agent.proof_mode,
+                "clv_bps": result["clv_bps"],
+                "valid": result["valid"],
+                "reason": result["reason"],
+                "kelly_fraction": result["kelly_fraction"],
+                "raw_prescore": prescore,
+            }
+            # Windowed honesty overrides (DEC-2D-1/2) apply ONLY to rows that ARE scored — using
+            # scoring.is_scored, the SINGLE SOURCE OF TRUTH the leaderboard ranks on (so the override
+            # set can never desync from the scored set). This deliberately leaves WAIT/live-pending
+            # (clv_bps == "pending") and invalid (valid is False) rows UNTOUCHED, so pending_horizon
+            # never mislabels an abstention and the rename never flips validity.
+            if window is not None and window_end_ts is not None and is_scored(row):
+                if is_pending_horizon(snapshot.ts, window_end_ts, window.min_clv_horizon_s):
+                    # DEC-2D-2: too little runway to close → excluded from CLV means like WAIT, via
+                    # the EXISTING "pending" sentinel (scoring.py excludes it for free — no numeric 0,
+                    # no new sentinel, no parallel exclusion logic). valid stays True (abstention).
+                    row["reason"] = "pending_horizon"
+                    row["clv_bps"] = PENDING
+                elif clv_field != CLV_FIELD_TRUE:
+                    # DEC-2D-1: a fixed_duration/manual_stop window closes on the in-play line, so
+                    # its value is WINDOW CLV — the rename REPLACES clv_bps with window_clv_bps (the
+                    # row never carries both) so downstream can't mistake it for TRUE closing CLV.
+                    row[clv_field] = row.pop("clv_bps")
+            score_rows.append(row)
+
+        run_result = RunResult(
+            run_id=self._run_id,
+            source_mode=self._source_mode,
+            agent_ids=[agent.agent_id for agent in self._agents],
+            run_events=run_events,
+            score_rows=score_rows,
+            evidence_hash=evidence_hash,
+            proof_mode_map={agent.agent_id: agent.proof_mode for agent in self._agents},
+        )
+
+        if store is not None:
+            await store.persist_run(run_result)
+
+        self._finalized = True
+        return run_result
+
+
+# ---------------------------------------------------------------------------
+# run_competition — the batch wrapper over CompetitionRun
 # ---------------------------------------------------------------------------
 
 
@@ -260,13 +574,16 @@ async def run_competition(
 ) -> RunResult:
     """Drive ingest → concurrent agent decisions → law recompute → evidence → score rows.
 
-    For each tick, all agents decide CONCURRENTLY (``asyncio.gather``), each wrapped in
-    ``asyncio.timeout`` and fail-closed (timeout/exception → an ``error`` event). RunEvents
-    (tick + decision + error) form the hashed evidence boundary; they are validated through
-    ``RunEvent`` before hashing. Scoring then runs SYNC: per successful (tick, agent) decision,
-    ``recompute`` derives CLV against the SAME per-market closing snapshot, a raw pre-score record
-    binds the run evidence + action + order + proof mode, and the score row derives ONLY from that
-    bound hash + recomputed values (gate-3 ordering: tick → decision → pre-score → score).
+    Thin batch wrapper over :class:`CompetitionRun`: construct the run, ``feed()`` every snapshot
+    in order, then ``finalize()`` once. Byte-identical output to the pre-extraction loop (pinned by
+    ``tests/test_orchestrator_golden.py``). For each tick, all agents decide CONCURRENTLY
+    (``asyncio.gather``), each wrapped in ``asyncio.timeout`` and fail-closed (timeout/exception →
+    an ``error`` event). RunEvents (tick + decision + error) form the hashed evidence boundary;
+    they are validated through ``RunEvent`` before hashing. Scoring then runs SYNC: per successful
+    (tick, agent) decision, ``recompute`` derives CLV against the SAME per-market closing snapshot,
+    a raw pre-score record binds the run evidence + action + order + proof mode, and the score row
+    derives ONLY from that bound hash + recomputed values (gate-3 ordering: tick → decision →
+    pre-score → score).
 
     Args:
         marketstates: Ordered tick snapshots of the run (identical inputs for every agent).
@@ -287,124 +604,13 @@ async def run_competition(
     Raises:
         ValueError: If ``source_mode`` is not ``"replay"`` or ``"live"``.
     """
-    if source_mode not in (REPLAY, LIVE):
-        raise ValueError(f"source_mode must be 'replay' or 'live', got {source_mode!r}")
-
-    timeout_s = decision_timeout_s if decision_timeout_s is not None else get_settings().decision_timeout_s
-    resolved_run_id = run_id or uuid.uuid4().hex
-    closing_by_market = _closing_snapshots(marketstates)
-
-    raw_events: list[dict[str, Any]] = []
-    # Successful decisions deferred to the SYNC scoring pass (after the evidence hash is sealed).
-    decisions: list[tuple[Agent, AgentAction, MarketState]] = []
-    sequence_no = 0
-
-    async def _emit(ev: dict[str, Any]) -> None:
-        """Append ``ev`` to the run AND (when present) mirror it to the live ``event_sink``.
-
-        The sink only ever receives ``RunEvent``-validated dicts — identical in shape to what
-        ``validate_run_events`` later produces for the seal — so the live stream stays a faithful
-        projection of the sealed record. ``raw_events`` keeps the original (unvalidated) dict so
-        the post-loop seal is byte-identical to the no-sink path.
-        """
-        raw_events.append(ev)
-        if event_sink is not None:
-            await event_sink(RunEvent.model_validate(ev).model_dump())
-
-    # --- async decision loop: gather all agents per tick, fail-closed -----------------
-    for snapshot in marketstates:
-        await _emit(
-            {
-                "sequence_no": sequence_no,
-                "event_type": EVENT_TICK,
-                "state_snapshot_json": serialize_payload(snapshot.model_dump()),
-            }
-        )
-        sequence_no += 1
-
-        results = await asyncio.gather(*[_decide(agent, snapshot, timeout_s) for agent in agents])
-
-        for agent, action, error in results:
-            if error is not None or action is None:
-                await _emit(
-                    {
-                        "sequence_no": sequence_no,
-                        "event_type": EVENT_ERROR,
-                        "result_payload_json": serialize_payload(
-                            {
-                                "agent_id": agent.agent_id,
-                                "error": type(error).__name__ if error is not None else "NoAction",
-                                "message": str(error) if error is not None else "agent returned no action",
-                            }
-                        ),
-                    }
-                )
-            else:
-                await _emit(
-                    {
-                        "sequence_no": sequence_no,
-                        "event_type": EVENT_DECISION,
-                        "action_payload_json": serialize_payload(action.model_dump()),
-                        "result_payload_json": serialize_payload({"agent_id": agent.agent_id}),
-                    }
-                )
-                decisions.append((agent, action, snapshot))
-            sequence_no += 1
-
-    # --- seal the evidence boundary: validate THEN hash (carry-forward 1) --------------
-    run_events = validate_run_events(raw_events)
-    evidence_hash = compute_evidence_hash(run_events)
-
-    # --- SYNC scoring pass: pre-score precedes score (gate-3) --------------------------
-    score_rows: list[dict[str, Any]] = []
-    for agent, action, snapshot in decisions:
-        market_key = (action.params or {}).get("market_key")
-        closing = closing_by_market.get(market_key) if market_key else None
-        result = recompute(snapshot, action, closing=closing, source_mode=source_mode)
-
-        config_hash = (
-            agent.config_hash(snapshot)
-            if agent.config_hash is not None
-            else agent_config_hash(agent.agent_id, "", AGENT_ACTION_SCHEMA_VERSION)
-        )
-        prescore = build_raw_prescore_record(
-            evidence_hash=evidence_hash,
-            raw_action=action.model_dump(),
-            action_schema_version=AGENT_ACTION_SCHEMA_VERSION,
-            agent_id=agent.agent_id,
-            model_prompt_config_hash=config_hash,
-            tick_seq=snapshot.tick_seq,
-            proof_mode=agent.proof_mode,
-        )
-        score = score_row_from_prescore(
-            raw_prescore_hash=prescore["raw_prescore_hash"],
-            recomputed_edge_bps=int(result["edge_bps"]),
-        )
-        score_rows.append(
-            {
-                **score,
-                "agent_id": agent.agent_id,
-                "tick_seq": snapshot.tick_seq,
-                "proof_mode": agent.proof_mode,
-                "clv_bps": result["clv_bps"],
-                "valid": result["valid"],
-                "reason": result["reason"],
-                "kelly_fraction": result["kelly_fraction"],
-                "raw_prescore": prescore,
-            }
-        )
-
-    run_result = RunResult(
-        run_id=resolved_run_id,
+    run = CompetitionRun(
+        agents,
         source_mode=source_mode,
-        agent_ids=[agent.agent_id for agent in agents],
-        run_events=run_events,
-        score_rows=score_rows,
-        evidence_hash=evidence_hash,
-        proof_mode_map={agent.agent_id: agent.proof_mode for agent in agents},
+        run_id=run_id,
+        decision_timeout_s=decision_timeout_s,
+        event_sink=event_sink,
     )
-
-    if store is not None:
-        await store.persist_run(run_result)
-
-    return run_result
+    for snapshot in marketstates:
+        await run.feed(snapshot)
+    return await run.finalize(store=store)

@@ -34,8 +34,11 @@ No auth / Redis / rate-limiting — Phase-2 only (CON-009).
 
 from __future__ import annotations
 
+import contextlib
 import json
 import time
+from collections.abc import AsyncIterator
+from pathlib import Path
 from typing import Any
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query
@@ -45,9 +48,12 @@ from veridex.api.demo_fixtures import (
     build_demo_ticks,
     contrarian_agent,
 )
+from veridex.api.deploy import DeployDeps, cancel_deploy_tasks, register_deploy_routes
 from veridex.api.schemas import (
     AgentRegisterResponse,
     ApprovalResponse,
+    BacktestRunRequest,
+    BacktestRunResponse,
     CompetitionCreateResponse,
     CompetitionLeaderboardRow,
     CompetitionStartResponse,
@@ -64,7 +70,9 @@ from veridex.api.schemas import (
     VerifyResponse,
 )
 from veridex.api.ws import ArenaConnectionManager, register_arena_routes
-from veridex.chain.anchor import explorer_tx_url
+from veridex.backtest.report import BacktestReport
+from veridex.backtest.runner import run_backtest
+from veridex.chain.anchor import anchor_memo, explorer_tx_url
 from veridex.checks.build import (
     build_check_results,
     build_performance_metrics,
@@ -96,11 +104,12 @@ from veridex.leaderboard import leaderboard as _build_leaderboard
 from veridex.runtime.competition import (
     DEFAULT_CLUSTER,
     SCHEMA_VERSIONS,
-    _default_checks,
+    read_path_check_block,
     run_demo_competition,
 )
 from veridex.runtime.orchestrator import deterministic_agent
 from veridex.runtime.runtime_store import RuntimeEventStore
+from veridex.runtime.window import RunWindow
 from veridex.scoring import score_run
 from veridex.store import InMemoryStore, Store
 from veridex.venues.sx_bet import FakeVenueAdapter, SXBetAdapter
@@ -192,6 +201,7 @@ def create_app(
     store: Store | None = None,
     settings: Settings | None = None,
     runtime_event_store: RuntimeEventStore | None = None,
+    deploy_deps: DeployDeps | None = None,
 ) -> FastAPI:
     """Create the Veridex demo FastAPI application.
 
@@ -219,15 +229,26 @@ def create_app(
         runtime_event_store if runtime_event_store is not None else RuntimeEventStore()
     )
 
+    @contextlib.asynccontextmanager
+    async def _lifespan(app_: FastAPI) -> AsyncIterator[None]:
+        """App lifespan — on shutdown, cancel any tracked background deploy-run tasks (T21)."""
+        yield
+        await cancel_deploy_tasks(app_)
+
     app = FastAPI(
         title="Veridex Demo API",
         description="TxLINE Agent Proof Arena — Phase 1 demo surface (REQ-115 / AC-115).",
         version="0.1.0",
+        lifespan=_lifespan,
     )
 
     # Per-app registry: run_id → {anchor_status, source_mode}.
     # Populated by POST /demo/run; consumed by GET /leaderboard.
     _run_meta: dict[str, dict[str, str]] = {}
+
+    # Per-app registry: backtest_id → BacktestReport (T15).
+    # Populated by POST /backtests; consumed by GET /backtests/{backtest_id}.
+    _backtest_reports: dict[str, BacktestReport] = {}
 
     # Per-app live-fanout manager (owns per-client bounded broadcast queues). The live producer
     # (start_competition's broadcast callback) persists each event BEFORE broadcasting it.
@@ -369,6 +390,56 @@ def create_app(
         rows_data = _build_leaderboard(all_score_rows) if all_score_rows else []
         return LeaderboardResponse(rows=[LeaderboardRow(**r) for r in rows_data])
 
+    # --- POST /backtests (T15 — replay a ReplayPack → honest BacktestReport) ----
+
+    @app.post("/backtests", response_model=BacktestRunResponse)
+    async def create_backtest(body: BacktestRunRequest) -> BacktestRunResponse:
+        """Replay a ReplayPack fixture through the live core and store its BacktestReport.
+
+        Deterministic + offline: the run is driven over a single reproducible baseline agent (no
+        LLM, no network). The report is a pure projection of the sealed run (SEC-003) and its mode
+        label is always ``"Backtest"`` (REQ-2D-304 — a replay is never dressed up as live).
+
+        Args:
+            body: The backtest request (pack path, fixture, window spec).
+
+        Returns:
+            A :class:`~veridex.api.schemas.BacktestRunResponse` with the ``backtest_id`` to fetch.
+
+        Raises:
+            HTTPException: 400 if the window spec is invalid or the pack cannot be loaded/verified.
+        """
+        try:
+            window = RunWindow(
+                window_id=body.window_id,
+                fixture_id=body.fixture_id,
+                market_allowlist=body.market_allowlist,
+                end_rule=body.end_rule,  # type: ignore[arg-type]  # validated by RunWindow
+                duration_s=body.duration_s,
+                min_clv_horizon_s=body.min_clv_horizon_s,
+            )
+            _, report = await run_backtest(
+                Path(body.pack_dir),
+                body.fixture_id,
+                [deterministic_agent("baseline")],
+                window=window,
+            )
+        except (ValueError, FileNotFoundError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+        _backtest_reports[report.run_id] = report
+        return BacktestRunResponse(backtest_id=report.run_id, mode_label=report.mode_label, run_id=report.run_id)
+
+    # --- GET /backtests/{backtest_id} (fetch the stored BacktestReport) --------
+
+    @app.get("/backtests/{backtest_id}", response_model=BacktestReport)
+    async def get_backtest(backtest_id: str) -> BacktestReport:
+        """Return a previously-produced :class:`BacktestReport` by its id (404 if unknown)."""
+        report = _backtest_reports.get(backtest_id)
+        if report is None:
+            raise HTTPException(status_code=404, detail=f"unknown backtest_id: {backtest_id}")
+        return report
+
     # --- GET /feed/health (WD-4: live-feed shown + judge-testable) --------
 
     @app.get("/feed/health", response_model=FeedHealthResponse)
@@ -441,7 +512,7 @@ def create_app(
             raise HTTPException(status_code=404, detail=f"run {run_id!r} not found") from None
 
         scores = score_run(run_result)
-        checks = _default_checks(scores, run_result)
+        checks = read_path_check_block(scores, run_result)
         metrics = build_performance_metrics(scores)  # SEC-001: CLV lives here, not in checks
         # Recover anchor_status from the registry; fall back to not_anchored for
         # runs loaded from an externally supplied store.
@@ -577,7 +648,7 @@ def create_app(
             "explorer_url": explorer_tx_url(signature, cluster=DEFAULT_CLUSTER),
         }
         # Bind the FULL verdict: pass the reconstructed manifest/manifest_hash + anchor so
-        # MANIFEST_BOUND confirms the seal — the 2-arg _default_checks omits them, leaving
+        # MANIFEST_BOUND confirms the seal — the 2-arg read_path_check_block omits them, leaving
         # manifest_bound=not_applicable, which false-reds the manifest hash on an honest run.
         check_results = build_check_results(
             scores=report.score_rows,
@@ -882,7 +953,7 @@ def create_app(
                 run_result = None
             if run_result is not None:
                 scores = score_run(run_result)
-                checks = _default_checks(scores, run_result)
+                checks = read_path_check_block(scores, run_result)
                 metrics = build_performance_metrics(scores)  # SEC-001: CLV lives here, not in checks
                 anchor_block: dict[str, Any] = {
                     "status": str(anchor_status),
@@ -1167,5 +1238,21 @@ def create_app(
     # ``arena_manager.broadcast`` for it (persist-before-broadcast), so spectators see a gapless
     # projection of the sealed log. ``broadcast`` never blocks the run loop (REQ-2B-30).
     register_arena_routes(app, store=resolved_store, manager=arena_manager)
+
+    # --- POST /agents/deploy (Studio deploy → pinned instance → async run → one flow to proof) ----
+    # Preflight fail-closed (422 named); pins config_hash+policy_hash+template+modes as an
+    # AgentInstance; launches via the SINGLE runner seam (standalone_run) and persists the sealed run
+    # to ``resolved_store`` so the deployed run verifies via the SAME /runs/{id}/verify path (T21).
+    #
+    # Default deps (T21c): so the headline replay/paper deploy runs end-to-end from the REAL app
+    # (no injected deps), the default route degrades anchoring HONESTLY — it anchors on-chain only
+    # when a Solana keypair is configured, else the run is legitimately ``not_anchored`` (offline
+    # replay), NEVER a fabricated anchor and NEVER a crash on a missing keypair. The replay SOURCE
+    # is the in-code demo fixture (``build_demo_ticks``), wired inside ``register_deploy_routes``.
+    resolved_deploy_deps = deploy_deps
+    if resolved_deploy_deps is None:
+        anchor_fn = anchor_memo if resolved_settings.solana_keypair_path is not None else None
+        resolved_deploy_deps = DeployDeps(anchor_fn=anchor_fn)
+    register_deploy_routes(app, store=resolved_store, deploy_deps=resolved_deploy_deps)
 
     return app

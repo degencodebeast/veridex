@@ -109,7 +109,7 @@ def test_verify_manifest_bound_passes_on_honest_run() -> None:
     """BLOCKER: verify must CONFIRM the manifest hash on an honest run.
 
     The endpoint reconstructs the manifest + manifest_hash; passing them to ``build_check_results``
-    makes MANIFEST_BOUND ``pass``. The prior 2-arg ``_default_checks`` omitted them → ``not_applicable``
+    makes MANIFEST_BOUND ``pass``. The prior 2-arg ``read_path_check_block`` omitted them → ``not_applicable``
     → the Proof Card false-red "manifest hash mismatch" on a perfectly honest run. Regression guard.
     """
     client = TestClient(create_app(store=InMemoryStore()))

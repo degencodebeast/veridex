@@ -27,6 +27,12 @@ _REASON_ORDER_CAP_RUN = "order_cap_run"
 _REASON_COOLDOWN_ACTIVE = "cooldown_active"
 _REASON_AGENT_NOT_ELIGIBLE = "agent_not_eligible"
 _REASON_MISSING_FIELD = "missing_field"
+# Guardrail lift (REQ-2D-404/405): breaker (cheap/pre-quote) + liquidity (quote-dependent/post-quote)
+# + the tighter live-money stake cap (cheap/pre-quote). All are ordinary deny reasons inside the
+# ONE policy gate — never a second authority.
+_REASON_CIRCUIT_OPEN = "circuit_open"
+_REASON_INSUFFICIENT_LIQUIDITY = "insufficient_liquidity"
+_REASON_STAKE_OVER_LIVE_GUARDED = "stake_over_live_guarded"
 
 
 class PolicyDecision(str, Enum):

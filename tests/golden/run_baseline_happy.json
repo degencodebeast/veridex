@@ -1,0 +1,344 @@
+{
+ "agent_ids": [
+  "deterministic-baseline",
+  "momentum"
+ ],
+ "evidence_hash": "ea1a9abcc43ba8af380423f792b8ac85aa6326761d8b82a85989531c624818ef",
+ "proof_mode_map": {
+  "deterministic-baseline": "reproducible",
+  "momentum": "reproducible"
+ },
+ "run_events": [
+  {
+   "action_payload_json": null,
+   "event_type": "tick",
+   "result_payload_json": null,
+   "sequence_no": 0,
+   "state_snapshot_json": "{\"fixture_id\":1,\"markets\":{\"OU_2_5\":{\"stable_price\":{\"over\":1.6,\"under\":2.4},\"stable_prob_bps\":{\"over\":6000,\"under\":4000},\"suspended\":false}},\"phase\":2,\"scores\":{},\"tick_seq\":0,\"ts\":1000}",
+   "validation_payload_json": null
+  },
+  {
+   "action_payload_json": "{\"params\":{\"market_key\":\"OU_2_5\",\"side\":\"over\",\"stable_prob_bps\":6000},\"type\":\"FLAG_VALUE\"}",
+   "event_type": "decision",
+   "result_payload_json": "{\"agent_id\":\"deterministic-baseline\"}",
+   "sequence_no": 1,
+   "state_snapshot_json": null,
+   "validation_payload_json": null
+  },
+  {
+   "action_payload_json": "{\"params\":{},\"type\":\"WAIT\"}",
+   "event_type": "decision",
+   "result_payload_json": "{\"agent_id\":\"momentum\"}",
+   "sequence_no": 2,
+   "state_snapshot_json": null,
+   "validation_payload_json": null
+  },
+  {
+   "action_payload_json": null,
+   "event_type": "tick",
+   "result_payload_json": null,
+   "sequence_no": 3,
+   "state_snapshot_json": "{\"fixture_id\":1,\"markets\":{\"OU_2_5\":{\"stable_price\":{\"over\":1.6,\"under\":2.4},\"stable_prob_bps\":{\"over\":6200,\"under\":3800},\"suspended\":false}},\"phase\":2,\"scores\":{},\"tick_seq\":1,\"ts\":1001}",
+   "validation_payload_json": null
+  },
+  {
+   "action_payload_json": "{\"params\":{\"market_key\":\"OU_2_5\",\"side\":\"over\",\"stable_prob_bps\":6200},\"type\":\"FLAG_VALUE\"}",
+   "event_type": "decision",
+   "result_payload_json": "{\"agent_id\":\"deterministic-baseline\"}",
+   "sequence_no": 4,
+   "state_snapshot_json": null,
+   "validation_payload_json": null
+  },
+  {
+   "action_payload_json": "{\"params\":{\"claimed_edge_bps\":200,\"market_key\":\"OU_2_5\",\"reason\":\"prob momentum +200bps\",\"side\":\"over\"},\"type\":\"FOLLOW_MOMENTUM\"}",
+   "event_type": "decision",
+   "result_payload_json": "{\"agent_id\":\"momentum\"}",
+   "sequence_no": 5,
+   "state_snapshot_json": null,
+   "validation_payload_json": null
+  },
+  {
+   "action_payload_json": null,
+   "event_type": "tick",
+   "result_payload_json": null,
+   "sequence_no": 6,
+   "state_snapshot_json": "{\"fixture_id\":1,\"markets\":{\"OU_2_5\":{\"stable_price\":{\"over\":1.6,\"under\":2.4},\"stable_prob_bps\":{\"over\":6400,\"under\":3600},\"suspended\":false}},\"phase\":2,\"scores\":{},\"tick_seq\":2,\"ts\":1002}",
+   "validation_payload_json": null
+  },
+  {
+   "action_payload_json": "{\"params\":{\"market_key\":\"OU_2_5\",\"side\":\"over\",\"stable_prob_bps\":6400},\"type\":\"FLAG_VALUE\"}",
+   "event_type": "decision",
+   "result_payload_json": "{\"agent_id\":\"deterministic-baseline\"}",
+   "sequence_no": 7,
+   "state_snapshot_json": null,
+   "validation_payload_json": null
+  },
+  {
+   "action_payload_json": "{\"params\":{\"claimed_edge_bps\":400,\"market_key\":\"OU_2_5\",\"reason\":\"prob momentum +400bps\",\"side\":\"over\"},\"type\":\"FOLLOW_MOMENTUM\"}",
+   "event_type": "decision",
+   "result_payload_json": "{\"agent_id\":\"momentum\"}",
+   "sequence_no": 8,
+   "state_snapshot_json": null,
+   "validation_payload_json": null
+  },
+  {
+   "action_payload_json": null,
+   "event_type": "tick",
+   "result_payload_json": null,
+   "sequence_no": 9,
+   "state_snapshot_json": "{\"fixture_id\":1,\"markets\":{\"OU_2_5\":{\"stable_price\":{\"over\":1.6,\"under\":2.4},\"stable_prob_bps\":{\"over\":6600,\"under\":3400},\"suspended\":false}},\"phase\":2,\"scores\":{},\"tick_seq\":3,\"ts\":1003}",
+   "validation_payload_json": null
+  },
+  {
+   "action_payload_json": "{\"params\":{\"market_key\":\"OU_2_5\",\"side\":\"over\",\"stable_prob_bps\":6600},\"type\":\"FLAG_VALUE\"}",
+   "event_type": "decision",
+   "result_payload_json": "{\"agent_id\":\"deterministic-baseline\"}",
+   "sequence_no": 10,
+   "state_snapshot_json": null,
+   "validation_payload_json": null
+  },
+  {
+   "action_payload_json": "{\"params\":{\"claimed_edge_bps\":600,\"market_key\":\"OU_2_5\",\"reason\":\"prob momentum +600bps\",\"side\":\"over\"},\"type\":\"FOLLOW_MOMENTUM\"}",
+   "event_type": "decision",
+   "result_payload_json": "{\"agent_id\":\"momentum\"}",
+   "sequence_no": 11,
+   "state_snapshot_json": null,
+   "validation_payload_json": null
+  }
+ ],
+ "run_id": "golden-run-1",
+ "score_rows": [
+  {
+   "agent_id": "deterministic-baseline",
+   "clv_bps": 600,
+   "kelly_fraction": 0.0,
+   "proof_mode": "reproducible",
+   "raw_prescore": {
+    "action_schema_version": "sports_v0",
+    "agent_id": "deterministic-baseline",
+    "evidence_hash": "ea1a9abcc43ba8af380423f792b8ac85aa6326761d8b82a85989531c624818ef",
+    "model_prompt_config_hash": "1b4fe60c2d213c09947e6e0151d21a182ea2558ee7c2f0681780bd28fb0bfd21",
+    "proof_mode": "reproducible",
+    "raw_action": {
+     "params": {
+      "market_key": "OU_2_5",
+      "side": "over",
+      "stable_prob_bps": 6000
+     },
+     "type": "FLAG_VALUE"
+    },
+    "raw_prescore_hash": "be4ec3621def9aa812928e76a0b77095ff1f91bac3caae402ccc1f77f93ac55e",
+    "record_kind": "raw_prescore",
+    "tick_seq": 0
+   },
+   "raw_prescore_hash": "be4ec3621def9aa812928e76a0b77095ff1f91bac3caae402ccc1f77f93ac55e",
+   "reason": "recomputed_edge_bps=600bps; claimed_edge_bps recorded as untrusted metadata only",
+   "recomputed_edge_bps": 600,
+   "tick_seq": 0,
+   "valid": true
+  },
+  {
+   "agent_id": "momentum",
+   "clv_bps": "pending",
+   "kelly_fraction": 0.0,
+   "proof_mode": "reproducible",
+   "raw_prescore": {
+    "action_schema_version": "sports_v0",
+    "agent_id": "momentum",
+    "evidence_hash": "ea1a9abcc43ba8af380423f792b8ac85aa6326761d8b82a85989531c624818ef",
+    "model_prompt_config_hash": "ba07870df2e60d00bcda6bd3dc479f748133947c13e46f16acfa97297e453161",
+    "proof_mode": "reproducible",
+    "raw_action": {
+     "params": {},
+     "type": "WAIT"
+    },
+    "raw_prescore_hash": "2f4f875785e87d3f802e1bcc01e1089aebc5fd9974389ea0cf8514a7a972d2ba",
+    "record_kind": "raw_prescore",
+    "tick_seq": 0
+   },
+   "raw_prescore_hash": "2f4f875785e87d3f802e1bcc01e1089aebc5fd9974389ea0cf8514a7a972d2ba",
+   "reason": "wait_unscored",
+   "recomputed_edge_bps": 0,
+   "tick_seq": 0,
+   "valid": true
+  },
+  {
+   "agent_id": "deterministic-baseline",
+   "clv_bps": 400,
+   "kelly_fraction": 0.0,
+   "proof_mode": "reproducible",
+   "raw_prescore": {
+    "action_schema_version": "sports_v0",
+    "agent_id": "deterministic-baseline",
+    "evidence_hash": "ea1a9abcc43ba8af380423f792b8ac85aa6326761d8b82a85989531c624818ef",
+    "model_prompt_config_hash": "1b4fe60c2d213c09947e6e0151d21a182ea2558ee7c2f0681780bd28fb0bfd21",
+    "proof_mode": "reproducible",
+    "raw_action": {
+     "params": {
+      "market_key": "OU_2_5",
+      "side": "over",
+      "stable_prob_bps": 6200
+     },
+     "type": "FLAG_VALUE"
+    },
+    "raw_prescore_hash": "224cb977a0b3977b810fff03d12c4f7821c05799bce7a20bbdd735e6932083c5",
+    "record_kind": "raw_prescore",
+    "tick_seq": 1
+   },
+   "raw_prescore_hash": "224cb977a0b3977b810fff03d12c4f7821c05799bce7a20bbdd735e6932083c5",
+   "reason": "recomputed_edge_bps=400bps; claimed_edge_bps recorded as untrusted metadata only",
+   "recomputed_edge_bps": 400,
+   "tick_seq": 1,
+   "valid": true
+  },
+  {
+   "agent_id": "momentum",
+   "clv_bps": 400,
+   "kelly_fraction": 0.0,
+   "proof_mode": "reproducible",
+   "raw_prescore": {
+    "action_schema_version": "sports_v0",
+    "agent_id": "momentum",
+    "evidence_hash": "ea1a9abcc43ba8af380423f792b8ac85aa6326761d8b82a85989531c624818ef",
+    "model_prompt_config_hash": "ba07870df2e60d00bcda6bd3dc479f748133947c13e46f16acfa97297e453161",
+    "proof_mode": "reproducible",
+    "raw_action": {
+     "params": {
+      "claimed_edge_bps": 200,
+      "market_key": "OU_2_5",
+      "reason": "prob momentum +200bps",
+      "side": "over"
+     },
+     "type": "FOLLOW_MOMENTUM"
+    },
+    "raw_prescore_hash": "9065ef62e0cc062b67bb961c94cef6014fa757a299854654bceed592b5884e74",
+    "record_kind": "raw_prescore",
+    "tick_seq": 1
+   },
+   "raw_prescore_hash": "9065ef62e0cc062b67bb961c94cef6014fa757a299854654bceed592b5884e74",
+   "reason": "recomputed_edge_bps=400bps; claimed_edge_bps recorded as untrusted metadata only",
+   "recomputed_edge_bps": 400,
+   "tick_seq": 1,
+   "valid": true
+  },
+  {
+   "agent_id": "deterministic-baseline",
+   "clv_bps": 200,
+   "kelly_fraction": 0.04000000000000012,
+   "proof_mode": "reproducible",
+   "raw_prescore": {
+    "action_schema_version": "sports_v0",
+    "agent_id": "deterministic-baseline",
+    "evidence_hash": "ea1a9abcc43ba8af380423f792b8ac85aa6326761d8b82a85989531c624818ef",
+    "model_prompt_config_hash": "1b4fe60c2d213c09947e6e0151d21a182ea2558ee7c2f0681780bd28fb0bfd21",
+    "proof_mode": "reproducible",
+    "raw_action": {
+     "params": {
+      "market_key": "OU_2_5",
+      "side": "over",
+      "stable_prob_bps": 6400
+     },
+     "type": "FLAG_VALUE"
+    },
+    "raw_prescore_hash": "c97b57179c25091b674d3dd8f91eddf8e8f07510c02a94ce9b43a72445a43cca",
+    "record_kind": "raw_prescore",
+    "tick_seq": 2
+   },
+   "raw_prescore_hash": "c97b57179c25091b674d3dd8f91eddf8e8f07510c02a94ce9b43a72445a43cca",
+   "reason": "recomputed_edge_bps=200bps; claimed_edge_bps recorded as untrusted metadata only",
+   "recomputed_edge_bps": 200,
+   "tick_seq": 2,
+   "valid": true
+  },
+  {
+   "agent_id": "momentum",
+   "clv_bps": 200,
+   "kelly_fraction": 0.04000000000000012,
+   "proof_mode": "reproducible",
+   "raw_prescore": {
+    "action_schema_version": "sports_v0",
+    "agent_id": "momentum",
+    "evidence_hash": "ea1a9abcc43ba8af380423f792b8ac85aa6326761d8b82a85989531c624818ef",
+    "model_prompt_config_hash": "ba07870df2e60d00bcda6bd3dc479f748133947c13e46f16acfa97297e453161",
+    "proof_mode": "reproducible",
+    "raw_action": {
+     "params": {
+      "claimed_edge_bps": 400,
+      "market_key": "OU_2_5",
+      "reason": "prob momentum +400bps",
+      "side": "over"
+     },
+     "type": "FOLLOW_MOMENTUM"
+    },
+    "raw_prescore_hash": "d2e7e06e31e0a8d5f69eb7f18eb54de9579d0bdc4745086d38dab491edfd4857",
+    "record_kind": "raw_prescore",
+    "tick_seq": 2
+   },
+   "raw_prescore_hash": "d2e7e06e31e0a8d5f69eb7f18eb54de9579d0bdc4745086d38dab491edfd4857",
+   "reason": "recomputed_edge_bps=200bps; claimed_edge_bps recorded as untrusted metadata only",
+   "recomputed_edge_bps": 200,
+   "tick_seq": 2,
+   "valid": true
+  },
+  {
+   "agent_id": "deterministic-baseline",
+   "clv_bps": 0,
+   "kelly_fraction": 0.09333333333333349,
+   "proof_mode": "reproducible",
+   "raw_prescore": {
+    "action_schema_version": "sports_v0",
+    "agent_id": "deterministic-baseline",
+    "evidence_hash": "ea1a9abcc43ba8af380423f792b8ac85aa6326761d8b82a85989531c624818ef",
+    "model_prompt_config_hash": "1b4fe60c2d213c09947e6e0151d21a182ea2558ee7c2f0681780bd28fb0bfd21",
+    "proof_mode": "reproducible",
+    "raw_action": {
+     "params": {
+      "market_key": "OU_2_5",
+      "side": "over",
+      "stable_prob_bps": 6600
+     },
+     "type": "FLAG_VALUE"
+    },
+    "raw_prescore_hash": "f5b2412804ff9bb6d8e79e78c23c3ea8978b2b84807e2b0dd2f49410c4e66129",
+    "record_kind": "raw_prescore",
+    "tick_seq": 3
+   },
+   "raw_prescore_hash": "f5b2412804ff9bb6d8e79e78c23c3ea8978b2b84807e2b0dd2f49410c4e66129",
+   "reason": "recomputed_edge_bps=0bps; claimed_edge_bps recorded as untrusted metadata only",
+   "recomputed_edge_bps": 0,
+   "tick_seq": 3,
+   "valid": true
+  },
+  {
+   "agent_id": "momentum",
+   "clv_bps": 0,
+   "kelly_fraction": 0.09333333333333349,
+   "proof_mode": "reproducible",
+   "raw_prescore": {
+    "action_schema_version": "sports_v0",
+    "agent_id": "momentum",
+    "evidence_hash": "ea1a9abcc43ba8af380423f792b8ac85aa6326761d8b82a85989531c624818ef",
+    "model_prompt_config_hash": "ba07870df2e60d00bcda6bd3dc479f748133947c13e46f16acfa97297e453161",
+    "proof_mode": "reproducible",
+    "raw_action": {
+     "params": {
+      "claimed_edge_bps": 600,
+      "market_key": "OU_2_5",
+      "reason": "prob momentum +600bps",
+      "side": "over"
+     },
+     "type": "FOLLOW_MOMENTUM"
+    },
+    "raw_prescore_hash": "f136a3270a953f1ab90363ad02a2c0c4390aaf5c9abbf9ec9cd3944c9e569160",
+    "record_kind": "raw_prescore",
+    "tick_seq": 3
+   },
+   "raw_prescore_hash": "f136a3270a953f1ab90363ad02a2c0c4390aaf5c9abbf9ec9cd3944c9e569160",
+   "reason": "recomputed_edge_bps=0bps; claimed_edge_bps recorded as untrusted metadata only",
+   "recomputed_edge_bps": 0,
+   "tick_seq": 3,
+   "valid": true
+  }
+ ],
+ "source_mode": "replay"
+}

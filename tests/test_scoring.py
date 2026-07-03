@@ -21,6 +21,7 @@ from typing import Any
 import pytest
 
 from veridex.runtime.orchestrator import RunResult
+from veridex.runtime.window import CLV_FIELD_WINDOW
 from veridex.scoring import score_run
 
 # ---------------------------------------------------------------------------
@@ -74,6 +75,25 @@ def _run(score_rows: list[dict[str, Any]], *, source_mode: str = "replay") -> Ru
         evidence_hash="",
         proof_mode_map=proof_mode_map,
     )
+
+
+def _window_row(
+    agent_id: str,
+    tick_seq: int,
+    window_clv_bps: int,
+    *,
+    confidence: float | None = None,
+    proof_mode: str = "reproducible",
+) -> dict[str, Any]:
+    """A scored fixed_duration/manual_stop window row (DEC-2D-1 shape from finalize).
+
+    Mirrors ``orchestrator`` exactly: finalize renames a SCORED window row's numeric CLV out of
+    ``clv_bps`` into ``window_clv_bps`` (``row[clv_field] = row.pop("clv_bps")``), so the row carries
+    ``window_clv_bps`` and NO ``clv_bps`` key — it is NOT ``is_scored`` (no numeric ``clv_bps``).
+    """
+    row = _row(agent_id, tick_seq, window_clv_bps, True, reason="value_flag", confidence=confidence, proof_mode=proof_mode)
+    row[CLV_FIELD_WINDOW] = row.pop("clv_bps")
+    return row
 
 
 def _by_id(rows: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
@@ -133,6 +153,60 @@ def test_scored_iff_excludes_wait_pending_and_invalid() -> None:
     # valid_pct (law-acceptance) is a DISTINCT metric from scored coverage (action_count / total).
     coverage_pct = out["action_count"] / 4 * 100.0  # = 25.0
     assert out["valid_pct"] != pytest.approx(coverage_pct)
+
+
+# ---------------------------------------------------------------------------
+# 2b — DEC-2D-1 window CLV: a labeled aggregation, NEVER dropped, NEVER blended
+#      into the true-CLV (leaderboard-rank) axis.
+# ---------------------------------------------------------------------------
+
+
+def test_windowed_run_scores_window_clv_not_dropped() -> None:
+    # A fixed_duration/manual_stop run's scored rows carry numeric window_clv_bps (no clv_bps).
+    # Before T10c these rows were SILENTLY DROPPED (is_scored is False for them), leaving the
+    # metric stack with avg_clv_bps=None AND no window aggregate at all — "the worst middle".
+    rows = score_run(_run([_window_row("A", 0, 100), _window_row("A", 1, 200)]))
+    out = _by_id(rows)["A"]
+    # Window CLV is aggregated under its OWN labeled fields — the mean of the window values.
+    assert out["avg_window_clv_bps"] == pytest.approx(150.0)
+    assert out["total_window_clv_bps"] == 300
+    assert out["window_action_count"] == 2
+    # True CLV (the leaderboard rank axis) is EMPTY for this run — window CLV never blended in.
+    assert out["avg_clv_bps"] is None
+    assert out["action_count"] == 0
+    assert out["total_clv_bps"] == 0
+
+
+def test_true_clv_run_has_empty_window_aggregate() -> None:
+    # The reciprocal: a pre_match (true-CLV) run's window aggregate stays empty (None / 0) —
+    # true CLV is NEVER counted as window CLV.
+    rows = score_run(_run([_row("A", 0, 100, True), _row("A", 1, 200, True)]))
+    out = _by_id(rows)["A"]
+    assert out["avg_clv_bps"] == pytest.approx(150.0)
+    assert out["action_count"] == 2
+    assert out["avg_window_clv_bps"] is None
+    assert out["total_window_clv_bps"] == 0
+    assert out["window_action_count"] == 0
+
+
+def test_window_abstentions_excluded_from_both_means() -> None:
+    # pending_horizon (DEC-2D-2) and WAIT keep the "pending" sentinel — honest abstentions excluded
+    # from BOTH the true-CLV mean AND the window-CLV mean (never scored as a numeric 0).
+    rows = score_run(
+        _run(
+            [
+                _window_row("A", 0, 80),  # the ONE scored window action
+                _row("A", 1, "pending", True, reason="pending_horizon"),
+                _row("A", 2, "pending", True, reason="wait_unscored", action_type="WAIT"),
+            ]
+        )
+    )
+    out = _by_id(rows)["A"]
+    # If the two pending rows leaked in as 0, avg_window would be 80/3 ≈ 26.7, not 80.0.
+    assert out["avg_window_clv_bps"] == pytest.approx(80.0)
+    assert out["window_action_count"] == 1
+    assert out["avg_clv_bps"] is None
+    assert out["action_count"] == 0
 
 
 # ---------------------------------------------------------------------------
@@ -314,6 +388,9 @@ def test_row_has_full_metric_stack_keys() -> None:
         "action_count",
         "valid_pct",
         "valid_count",
+        "avg_window_clv_bps",
+        "total_window_clv_bps",
+        "window_action_count",
         "rank",
         "proof_mode",
     }

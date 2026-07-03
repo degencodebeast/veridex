@@ -1,9 +1,10 @@
-"""Aegis two-phase policy gate — pre-quote (no I/O) then post-quote (price-dependent)."""
+"""Two-phase policy gate — pre-quote (no I/O) then post-quote (price-dependent)."""
 
 from __future__ import annotations
 
 from pathlib import Path
 
+from veridex.policy.circuit_breaker import CircuitBreaker, CircuitState
 from veridex.policy.engine import PolicyDecision
 from veridex.policy.envelope import PolicyEnvelope
 from veridex.policy.gate import (
@@ -98,3 +99,67 @@ def test_post_quote_over_threshold_requires_human() -> None:
 
 def test_gate_import_audit_clean() -> None:
     assert_no_llm_imports(Path("veridex/policy"))
+
+
+# --- Guardrail lift (REQ-2D-404/405): circuit breaker + liquidity + live-guarded cap ---------
+
+
+def test_pre_quote_open_breaker_denies_circuit_open() -> None:
+    """A cheap PRE-quote precondition: an OPEN breaker denies BEFORE any venue I/O."""
+    r = evaluate_pre_quote(_pre(breaker=CircuitBreaker(state=CircuitState.OPEN, opened_at=0.0)), _env())
+    assert r.decision is PolicyDecision.DENIED
+    assert "circuit_open" in r.reason_codes
+
+
+def test_pre_quote_half_open_allows_single_probe() -> None:
+    """HALF_OPEN admits exactly one probe: unused -> approved, dispatched -> denied."""
+    half = CircuitBreaker(state=CircuitState.HALF_OPEN)
+    assert evaluate_pre_quote(_pre(breaker=half), _env()).decision is PolicyDecision.APPROVED
+    used = half.start_probe()
+    denied = evaluate_pre_quote(_pre(breaker=used), _env())
+    assert denied.decision is PolicyDecision.DENIED and "circuit_open" in denied.reason_codes
+
+
+def test_pre_quote_closed_breaker_is_transparent() -> None:
+    """A CLOSED breaker (the default) never contributes a reason code."""
+    r = evaluate_pre_quote(_pre(breaker=CircuitBreaker()), _env())
+    assert r.decision is PolicyDecision.APPROVED and "circuit_open" not in r.reason_codes
+
+
+def test_pre_quote_live_guarded_cap_denies() -> None:
+    """The tighter live-money cap denies only when the action is live-guarded."""
+    over = _pre(stake=250.0, live_guarded=True)
+    r = evaluate_pre_quote(over, _env(max_stake=1000.0, max_stake_live_guarded=200.0))
+    assert r.decision is PolicyDecision.DENIED and "stake_over_live_guarded" in r.reason_codes
+
+
+def test_pre_quote_live_guarded_cap_not_applied_off_live() -> None:
+    """Off the live path (default), the live-guarded cap is inert."""
+    ok = _pre(stake=250.0, live_guarded=False)
+    r = evaluate_pre_quote(ok, _env(max_stake=1000.0, max_stake_live_guarded=200.0))
+    assert "stake_over_live_guarded" not in r.reason_codes
+
+
+def test_post_quote_thin_book_denies_insufficient_liquidity() -> None:
+    """A quote-dependent precondition: quoted size below the intended fill denies POST-quote."""
+    r = evaluate_post_quote(_post(stake=100.0, quoted_size=40.0), _env())
+    assert r.decision is PolicyDecision.DENIED and "insufficient_liquidity" in r.reason_codes
+
+
+def test_post_quote_deep_book_approves() -> None:
+    """Ample book depth (quoted size >= intended fill) does not trip the liquidity rule."""
+    r = evaluate_post_quote(_post(stake=100.0, quoted_size=500.0), _env())
+    assert r.decision is PolicyDecision.APPROVED and "insufficient_liquidity" not in r.reason_codes
+
+
+def test_runner_has_no_second_authority() -> None:
+    """Single-authority invariant: the runner delegates ALL gating to the policy two-phase gate.
+
+    The breaker's allow/deny decision belongs to the gate, not the runner: the runner never
+    calls ``.allows()`` and never manufactures the ``circuit_open`` reason itself. It consults
+    ONLY ``evaluate_pre_quote`` / ``evaluate_post_quote`` -- there is no parallel guardrail gate.
+    """
+    src = Path("veridex/execution/runner.py").read_text(encoding="utf-8")
+    assert "evaluate_pre_quote" in src and "evaluate_post_quote" in src
+    assert ".allows(" not in src  # the gate owns the breaker verdict, not the runner
+    assert "circuit_open" not in src  # the deny reason is minted inside the gate only

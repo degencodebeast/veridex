@@ -333,3 +333,48 @@ class RuntimeEventsResponse(BaseModel):
     is already in the request path, never echoed in the body. ``events`` are RuntimeEvent dicts."""
 
     events: list[dict[str, Any]]
+
+
+# ---------------------------------------------------------------------------
+# T15 — Backtest endpoints (REQ-2D-302/303/304)
+# ---------------------------------------------------------------------------
+
+
+class BacktestRunRequest(BaseModel):
+    """Request body for ``POST /backtests`` — triggers a replay-sourced backtest run.
+
+    The run is driven over a deterministic, offline agent (no LLM, no network). ``pack_dir`` points
+    at a self-describing ReplayPack directory (containing ``pack.json``); the pack is verified
+    (content-hash) before replay.
+
+    Attributes:
+        pack_dir: Filesystem path to the ReplayPack directory.
+        fixture_id: The fixture within the pack to replay.
+        window_id: Stable id for the coverage window (echoed onto the report).
+        market_allowlist: Market-key prefixes the window scores (the report's ``market_universe``).
+        end_rule: Window close rule — ``"pre_match"`` (default), ``"fixed_duration"``, or ``"manual_stop"``.
+        duration_s: Required IFF ``end_rule == "fixed_duration"`` (else must be ``None``).
+        min_clv_horizon_s: DEC-2D-2 pending-horizon guard (seconds); defaults to 60.
+    """
+
+    pack_dir: str
+    fixture_id: int
+    window_id: str
+    market_allowlist: list[str]
+    end_rule: str = "pre_match"
+    duration_s: int | None = None
+    min_clv_horizon_s: int = 60
+
+
+class BacktestRunResponse(BaseModel):
+    """Response envelope for ``POST /backtests``.
+
+    Attributes:
+        backtest_id: Deterministic id for the produced report (fetch it via ``GET /backtests/{id}``).
+        mode_label: The honest mode-ladder label (always ``"Backtest"`` on this path — REQ-2D-304).
+        run_id: The sealed ``RunResult`` id backing the report.
+    """
+
+    backtest_id: str
+    mode_label: str
+    run_id: str

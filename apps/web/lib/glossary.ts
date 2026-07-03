@@ -10,6 +10,10 @@ export const GLOSSARY = {
     label: 'Fair Value',
     definition: 'TxLINE de-margined, market-implied consensus probability; not guaranteed truth.',
   },
+  mispricing_gap: {
+    label: 'Mispricing Gap',
+    definition: 'TxLINE fair value minus the venue-implied probability; a probability-space dislocation, explanatory only — never an edge, never a score.',
+  },
   executable_edge: {
     label: 'Executable Edge',
     definition: 'forward EV at the actual venue price; gates action; never a score.',
@@ -57,6 +61,14 @@ export const GLOSSARY = {
   verifier_version: {
     label: 'Verifier version',
     definition: 'version of the deterministic verifier/law used for recompute.',
+  },
+  window_clv: {
+    label: 'window CLV',
+    definition: 'CLV measured against the run window\'s close (fixed_duration/manual_stop), not the true match closing line — never shown as CLV.',
+  },
+  clv_pending: {
+    label: 'pending',
+    definition: 'too little runway remains before the window closes to score CLV; excluded from CLV means, never shown as a fabricated number.',
   },
 } as const satisfies Record<string, GlossaryEntry>;
 

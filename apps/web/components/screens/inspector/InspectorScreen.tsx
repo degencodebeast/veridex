@@ -7,6 +7,7 @@ import { proofHref } from '@/lib/deeplinks';
 import { fmtBps, fmtPct } from '@/lib/format';
 import { QUANTITIES, STABLE_PRICE_CAPTION } from '@/lib/doctrine';
 import { GLOSSARY } from '@/lib/glossary';
+import { hasRealVenueQuote } from '@/lib/edge-gate';
 import type { InspectorRecord } from '@/lib/contracts';
 import styles from './InspectorScreen.module.css';
 
@@ -19,9 +20,15 @@ export function InspectorScreen({ record }: { record: InspectorRecord }) {
   const fairValueText = clv.fair_value_pct == null || clv.closing_fair_value_pct == null
     ? '—'
     : `${fmtPct(String(clv.fair_value_pct))} → ${fmtPct(String(clv.closing_fair_value_pct))}`;
-  const execEdgeText = clv.executable_edge_bps == null || clv.venue_decimal_price == null
-    ? '—'
-    : `${fmtBps(clv.executable_edge_bps)} @ ${clv.venue_decimal_price.toFixed(3)}`;
+  // DISPLAY GATE (REQ-2D-501 / AC-2D-501): the venue price, the mispricing gap, and the executable
+  // edge derive from the venue quote — they render ONLY when a REAL venue quote backs them. A
+  // Fake/paper quote (FakeVenueAdapter's fixed 2.05) has real_venue_quote=false and reads "—".
+  const realQuote = hasRealVenueQuote(clv);
+  // Mispricing gap is a PROBABILITY-space dislocation, distinct from the EV-space executable edge.
+  const mispricingGapText = realQuote && clv.mispricing_gap_bps != null ? fmtBps(clv.mispricing_gap_bps) : '—';
+  const execEdgeText = realQuote
+    ? `${fmtBps(clv.executable_edge_bps as number)} @ ${(clv.venue_decimal_price as number).toFixed(3)}`
+    : '—';
   // Kelly/stake sizing is UNSERVED in both mock and live (SEC-005) — never surfaced regardless of value.
   const stakeText = '—';
   return (
@@ -64,8 +71,10 @@ export function InspectorScreen({ record }: { record: InspectorRecord }) {
           <div className={styles.clvTitle}>CLV Explanation</div>
           <dl className={styles.quantities}>
             <div className={styles.qrow}><dt className={styles.qlabel}>{QLABEL.fair_value} <InfoTip label={GLOSSARY.fair_value.label}>{GLOSSARY.fair_value.definition}</InfoTip></dt><dd className={`${styles.qval} mono`}>{fairValueText}</dd></div>
+            {/* Mispricing Gap — prob-space dislocation; glossary-sourced label, DISTINCT from Executable Edge (never labeled "edge"). */}
+            <div className={styles.qrow}><dt className={styles.qlabel}>{GLOSSARY.mispricing_gap.label} <InfoTip label={GLOSSARY.mispricing_gap.label}>{GLOSSARY.mispricing_gap.definition}</InfoTip></dt><dd className={`${styles.qval} mono`}>{mispricingGapText}</dd></div>
             <div className={styles.qrow}><dt className={styles.qlabel}>{QLABEL.executable_edge} <InfoTip label={GLOSSARY.executable_edge.label}>{GLOSSARY.executable_edge.definition}</InfoTip></dt><dd className={`${styles.qval} mono`}>{execEdgeText}</dd></div>
-            <div className={styles.qrow}><dt className={styles.qlabel}>{QLABEL.clv} <InfoTip label={GLOSSARY.clv.label}>{GLOSSARY.clv.definition}</InfoTip></dt><dd className={`${styles.qval} mono`}>{fmtBps(clv.clv_bps)}</dd></div>
+            <div className={styles.qrow}><dt className={styles.qlabel}>{QLABEL.clv} <InfoTip label={GLOSSARY.clv.label}>{GLOSSARY.clv.definition}</InfoTip></dt><dd className={`${styles.qval} mono`}>{fmtBps(clv.clv_bps)}{clv.clv_low_sample ? <span className={`${styles.lowSample} mono`}> · low sample</span> : null}</dd></div>
             <div className={styles.qrow}><dt className={styles.qlabel}>{QLABEL.stake} <InfoTip label={GLOSSARY.kelly.label}>{GLOSSARY.kelly.definition}</InfoTip></dt><dd className={`${styles.qval} mono`}>{stakeText}</dd></div>
           </dl>
           <p className={styles.clvPlain}>{clv.plain}</p>

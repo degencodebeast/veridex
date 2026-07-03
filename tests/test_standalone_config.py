@@ -4,6 +4,9 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+from pydantic import ValidationError
+
 from veridex_agent.config import AgentRunConfig, build_agent, build_policy_envelope, load_agent_run_config
 
 SAMPLE = str(Path(__file__).parent.parent / "veridex_agent" / "sample_agent.toml")
@@ -31,6 +34,44 @@ def test_build_agent_momentum() -> None:
 def test_build_agent_baseline() -> None:
     agent = build_agent(AgentRunConfig(agent_id="b", strategy="baseline"))
     assert agent.proof_mode == "reproducible"
+
+
+def test_build_agent_momentum_sharp_is_the_flagship_v2() -> None:
+    # The flagship sharp-momentum v2 is deployable from the typed config (build_agent dispatch).
+    config = AgentRunConfig(
+        agent_id="v2",
+        strategy="momentum-sharp",
+        alpha=0.4,
+        z_threshold=2.5,
+        min_movements=8,
+        lookback=64,
+    )
+    agent = build_agent(config)
+    assert agent.agent_id == "v2"
+    assert agent.proof_mode == "reproducible"
+
+
+def test_v2_knobs_flow_into_config_hash() -> None:
+    # Reproducibility: every behavioural v2 knob enters config_hash (same config ⇒ same identity).
+    base = AgentRunConfig(agent_id="v2", strategy="momentum-sharp", alpha=0.4, min_movements=8, lookback=64)
+    tweaked = base.model_copy(update={"alpha": 0.5})
+    assert base.config_hash() != tweaked.config_hash()
+
+
+def test_out_of_range_v2_knob_raises_at_config_load() -> None:
+    # TYPED + BOUNDED: an out-of-range knob raises at construction (never a weird hashable instance).
+    with pytest.raises(ValidationError):
+        AgentRunConfig(agent_id="v2", strategy="momentum-sharp", alpha=1.5)  # alpha must be in (0, 1]
+    with pytest.raises(ValidationError):
+        AgentRunConfig(agent_id="v2", strategy="momentum-sharp", z_threshold=-1.0)  # must be > 0
+    with pytest.raises(ValidationError):
+        AgentRunConfig(agent_id="v2", strategy="momentum-sharp", min_movements=1)  # robust-z needs >= 2
+
+
+def test_lookback_below_min_movements_raises_cross_field() -> None:
+    # Cross-field: the robust-z window can never fire if lookback < min_movements — reject it.
+    with pytest.raises(ValidationError):
+        AgentRunConfig(agent_id="v2", strategy="momentum-sharp", lookback=4, min_movements=8)
 
 
 def test_build_policy_envelope_from_config() -> None:

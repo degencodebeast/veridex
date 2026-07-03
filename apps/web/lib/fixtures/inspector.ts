@@ -16,8 +16,11 @@ import type { ClvExplanation } from '@/lib/contracts';
 export const INSPECTOR_DEMO_QUANTITIES: Omit<ClvExplanation, 'clv_bps'> = {
   fair_value_pct: 67.9,          // de-margined consensus fair probability at entry
   closing_fair_value_pct: 69.7,  // ... at close
-  venue_decimal_price: 1.472,    // the actual venue decimal price
-  executable_edge_bps: 22.0,     // EV at the venue price (NOT CLV) — Inspector-only
+  venue_decimal_price: 1.472,    // the actual venue decimal price (a REAL venue quote in this demo)
+  mispricing_gap_bps: 110,       // prob-space dislocation (fair − venue-implied) — NOT edge, never scored
+  executable_edge_bps: 22.0,     // forward EV at the venue price (NOT CLV, NOT the gap) — Inspector-only
+  real_venue_quote: true,        // DEMO models a real venue quote (Polymarket-like) → edge legibly renders
+  clv_low_sample: false,         // WD-7 sample-size flag (shown, never hidden; never a score)
   stake_fraction: null,          // Kelly/policy sizing — UNSERVED even in mock (SEC-005)
-  plain: 'Fair value 67.9% → closing 69.7%; executable edge +22.0 bps at venue 1.472.',
+  plain: 'Fair value 67.9% → closing 69.7%; mispricing gap +110 bps; executable edge +22.0 bps at venue 1.472.',
 };

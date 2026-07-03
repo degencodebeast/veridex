@@ -5,10 +5,17 @@ import { InspectorScreen } from '@/components/screens/inspector/InspectorScreen'
 import { ProofCardScreen } from '@/components/screens/proof/ProofCardScreen';
 import { inspectorHref, proofHref } from '@/lib/deeplinks';
 import { sampleCockpitState, sampleInspectorRecord, sampleProofArtifact } from '@/__tests__/fixtures/contracts';
+import type { FeedHealthState } from '@/lib/contracts';
+
+const SAMPLE_FEED_HEALTH: FeedHealthState = {
+  source_mode: 'live', ws_live: true, connected: true, txline_configured: true,
+  events_per_min: 12, ticks_seen: 40, staleness_s: 2, stale: false, fixture_id: 18172280,
+  anchor_status: 'pending', last_tick_ts: 100,
+};
 
 vi.mock('next/navigation', () => ({ usePathname: () => '/arena/wc-fra-bra' }));
 vi.mock('@/hooks/useArenaStream', () => ({
-  useArenaStream: () => ({ state: sampleCockpitState, wsStatus: 'connected' }),
+  useArenaStream: () => ({ state: sampleCockpitState, wsStatus: 'connected', feedHealth: SAMPLE_FEED_HEALTH }),
 }));
 vi.mock('@/lib/api', () => ({ verifyProof: vi.fn() }));
 

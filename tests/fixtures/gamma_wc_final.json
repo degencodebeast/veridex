@@ -1,0 +1,16 @@
+[
+  {
+    "id": "590128",
+    "question": "Will Argentina win the 2026 FIFA World Cup Final?",
+    "slug": "argentina-wins-2026-world-cup-final",
+    "conditionId": "0x3b1f3f5c2e1a4d6b8f0c9e7a5d4b3c2a1f0e9d8c7b6a5f4e3d2c1b0a9f8e7d6c",
+    "active": true,
+    "closed": false,
+    "outcomes": "[\"Yes\", \"No\"]",
+    "outcomePrices": "[\"0.62\", \"0.38\"]",
+    "clobTokenIds": "[\"71234567890123456789012345678901234567890123456789012345678901\", \"10987654321098765432109876543210987654321098765432109876543210\"]",
+    "orderPriceMinTickSize": 0.01,
+    "orderMinSize": 5,
+    "endDate": "2026-07-19T00:00:00Z"
+  }
+]

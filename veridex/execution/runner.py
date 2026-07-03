@@ -33,6 +33,7 @@ from veridex.competition.events import (
     build_execution_submitted_event,
     build_policy_result_event,
 )
+from veridex.execution.legibility import mispricing_gap_bps
 from veridex.execution.models import ExecutionRecord, ExecutionStatus
 from veridex.law.edge import executable_edge_bps
 from veridex.policy.engine import PolicyDecision
@@ -43,7 +44,7 @@ from veridex.policy.gate import (
     evaluate_pre_quote,
 )
 from veridex.strategies.value import value_proposals
-from veridex.venues.base import Order, OrderStatus
+from veridex.venues.base import Order, OrderStatus, poll_order_terminal
 
 if TYPE_CHECKING:
     from veridex.competition.models import AgentEntry
@@ -284,6 +285,10 @@ async def run_execution_lane(
         quote = await adapter.quote_market(proposal.market_key)
         slippage = _slippage_bps(proposal.reference_price, quote.price)
         exec_edge = executable_edge_bps(proposal.entry_prob_bps, quote.price)
+        # Edge-legibility explanatory quantity (REQ-2D-501): the prob-space dislocation between
+        # TxLINE's de-margined fair value and the venue's implied probability. NEVER an edge,
+        # NEVER scored — surfaced ALONGSIDE the law's executable_edge for the flagship story.
+        gap = mispricing_gap_bps(proposal.entry_prob_bps, quote.price)
 
         # --- POST-QUOTE gate (REAL slippage + forward executable edge) -----------------
         post = evaluate_post_quote(
@@ -293,6 +298,7 @@ async def run_execution_lane(
                 slippage_bps=slippage,
                 quote_age_s=max(0, event_ts - quote.ts),
                 stake=stake,
+                quoted_size=quote.size,  # book depth feeds the post-quote liquidity guardrail
             ),
             envelope,
         )
@@ -314,6 +320,11 @@ async def run_execution_lane(
                     "phase": "post_quote",
                     "slippage_bps": slippage,
                     "executable_edge_bps": exec_edge,
+                    # Edge-legibility fields from the REAL quote (REQ-2D-501) — explanatory,
+                    # non-scoring; the display gate only renders them for a real venue quote.
+                    "mispricing_gap_bps": gap,
+                    "venue_decimal_price": quote.price,
+                    "native_price": quote.native_price,
                 },
                 execution_id=execution_id,
             )
@@ -334,6 +345,7 @@ async def run_execution_lane(
                 size=stake,
                 price=quote.price,
                 venue=venue,
+                client_order_id=execution_id,
             )
             if execution_mode == _DRY_RUN:
                 # SIMULATED: build the status directly — never touch the network/submit path.
@@ -345,8 +357,10 @@ async def run_execution_lane(
                 )
                 receipt = adapter.normalize_receipt(execution_id, order, status, mode=_DRY_RUN)
             else:  # live_guarded
+                # Poll until a TERMINAL status (or an honest UNRESOLVED on timeout) — never build a
+                # receipt from a transient status, and never fabricate a fill.
                 ack = await adapter.submit_order(order)
-                status = await adapter.get_order_status(ack.venue_order_id)
+                status = await poll_order_terminal(adapter, ack.venue_order_id)
                 receipt = adapter.normalize_receipt(execution_id, order, status, mode=_LIVE_GUARDED)
 
             _advance_through(record, _POST_POLICY_PATH.get(receipt.status, (ExecutionStatus.SUBMITTED,)))
@@ -495,6 +509,7 @@ async def resolve_approval(
                     slippage_bps=slippage,
                     quote_age_s=max(0, event_ts - quote.ts),
                     stake=stake,
+                    quoted_size=quote.size,  # book depth feeds the post-quote liquidity guardrail
                 ),
                 envelope,
             )
@@ -521,6 +536,7 @@ async def resolve_approval(
             size=stake,
             price=quote.price,
             venue=venue,
+            client_order_id=record.execution_id,
         )
         if execution_mode == _DRY_RUN:
             status = OrderStatus(
@@ -531,8 +547,10 @@ async def resolve_approval(
             )
             receipt = adapter.normalize_receipt(record.execution_id, order, status, mode=_DRY_RUN)
         else:  # live_guarded
+            # Poll until a TERMINAL status (or an honest UNRESOLVED on timeout) — never build a
+            # receipt from a transient status, and never fabricate a fill.
             ack = await adapter.submit_order(order)
-            status = await adapter.get_order_status(ack.venue_order_id)
+            status = await poll_order_terminal(adapter, ack.venue_order_id)
             receipt = adapter.normalize_receipt(record.execution_id, order, status, mode=_LIVE_GUARDED)
 
         _advance_through(record, _POST_POLICY_PATH.get(receipt.status, (ExecutionStatus.SUBMITTED,)))

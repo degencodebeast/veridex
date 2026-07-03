@@ -1,4 +1,4 @@
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { render, screen, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { StudioScreen } from '@/components/screens/StudioScreen';
@@ -6,7 +6,46 @@ import { PREFLIGHT_DISCLAIMER } from '@/lib/studio/preflight';
 import { DEFAULT_POLICY_ENVELOPE } from '@/lib/fixtures/catalog';
 import { GLOSSARY } from '@/lib/glossary';
 
+// A resolved deploy response (the pinned instance + the async run_id). run_id is a REAL server hex
+// handle (never a fabricated 0x-prefixed digest — the honesty doctrine still holds).
+function okDeploy(body?: Record<string, unknown>) {
+  return {
+    ok: true,
+    status: 200,
+    json: async () => body ?? {
+      instance_id: 'inst_demo',
+      config_hash: 'a'.repeat(64),
+      policy_hash: 'b'.repeat(64),
+      run_id: 'run_deadbeefcafe',
+    },
+  } as unknown as Response;
+}
+
+// A fail-closed preflight 422 body that NAMES the failing check(s).
+function failClosedDeploy(...failed: string[]) {
+  return {
+    ok: false,
+    status: 422,
+    json: async () => ({
+      detail: {
+        error: 'preflight_failed',
+        failed_checks: failed,
+        checks: failed.map((name) => ({ name, ok: false, detail: `${name} not ready` })),
+      },
+    }),
+  } as unknown as Response;
+}
+
 describe('StudioScreen (REQ-018 / AC-007 / SEC-006/007/009)', () => {
+  // The deploy button POSTs to /agents/deploy; stub fetch so unit tests never hit the network.
+  // Default = a clean deploy; the fail-closed case overrides fetch in-test.
+  beforeEach(() => {
+    vi.stubGlobal('fetch', vi.fn(async () => okDeploy()));
+  });
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
   // ── Archetype cards + mode coupling (AC-007) ────────────────────────────────
   it('locks LLM mode for value_clv and prevents selecting it; momentum unlocks it (AC-007)', async () => {
     const user = userEvent.setup();
@@ -104,6 +143,7 @@ describe('StudioScreen (REQ-018 / AC-007 / SEC-006/007/009)', () => {
     expect(screen.getByTestId('config-pinned')).toHaveTextContent(/config pinned ✓/i);
     // After pin, baseline advances → no pending changes
     expect(within(screen.getByTestId('config-diff')).getByText(/no pending changes/i)).toBeInTheDocument();
+    await screen.findByTestId('deploy-run-id'); // flush the async deploy state update
   });
 
   it('DOCTRINE: renders NO fabricated proof-flavored hash (no 0x… / config_hash / fiction hex) anywhere on Studio', async () => {
@@ -111,7 +151,62 @@ describe('StudioScreen (REQ-018 / AC-007 / SEC-006/007/009)', () => {
     const { container } = render(<StudioScreen />);
     // Even after pinning, the pin is "Config pinned ✓" — never a fabricated 0x-prefixed digest.
     await user.click(screen.getByRole('button', { name: /pin config & queue run/i }));
+    await screen.findByTestId('deploy-run-id'); // flush the async deploy; run_id is real, not 0x
     expect(container.textContent).not.toMatch(/0x[0-9a-z_]/i); // no 0xcfg_/0xpol_/0x… fiction hex
+  });
+
+  // ── T21: deploy button → real /agents/deploy endpoint ──────────────────────
+  describe('deploy button → real endpoint (T21 / REQ-2D-701)', () => {
+    it('POSTs the config to /agents/deploy and surfaces the returned run_id', async () => {
+      const user = userEvent.setup();
+      const fetchMock = vi.fn(async () => okDeploy());
+      vi.stubGlobal('fetch', fetchMock);
+      render(<StudioScreen />);
+
+      await user.click(screen.getByRole('button', { name: /pin config & queue run/i }));
+
+      // The real client POSTed to /agents/deploy (not loose client-only state).
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      const [url, init] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
+      expect(url).toMatch(/\/agents\/deploy$/);
+      expect(init.method).toBe('POST');
+      const body = JSON.parse(init.body as string);
+      expect(body.execution_mode).toBe('paper');
+      expect(body.market_allowlist).toEqual(DEFAULT_POLICY_ENVELOPE.market_allowlist);
+
+      // The server-owned run_id is surfaced.
+      expect(await screen.findByTestId('deploy-run-id')).toHaveTextContent('run_deadbeefcafe');
+    });
+
+    it('posts a demo-safe source_mode (replay, NOT hardcoded live) and surfaces the run_id (M6 honest default path)', async () => {
+      // Codex M6: the Studio deploy must WORK from the default app. It hardcoded source_mode:'live',
+      // which fails-closed on feed_health in the default app. The demo deploy defaults to a WORKING
+      // REPLAY deploy (never dressed up as 'live'/live-money), so the headline flow is demonstrable.
+      const user = userEvent.setup();
+      const fetchMock = vi.fn(async () => okDeploy());
+      vi.stubGlobal('fetch', fetchMock);
+      render(<StudioScreen />);
+
+      await user.click(screen.getByRole('button', { name: /pin config & queue run/i }));
+
+      const [, init] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
+      const body = JSON.parse(init.body as string);
+      expect(body.source_mode).toBe('replay'); // demo-safe: NOT hardcoded 'live'
+      expect(body.execution_mode).toBe('paper'); // paper: proof-only, never real money
+      expect(await screen.findByTestId('deploy-run-id')).toHaveTextContent('run_deadbeefcafe');
+    });
+
+    it('surfaces the NAMED preflight failure fail-closed (422) and shows no run_id', async () => {
+      const user = userEvent.setup();
+      vi.stubGlobal('fetch', vi.fn(async () => failClosedDeploy('feed_health')));
+      render(<StudioScreen />);
+
+      await user.click(screen.getByRole('button', { name: /pin config & queue run/i }));
+
+      const err = await screen.findByTestId('deploy-preflight-error');
+      expect(err).toHaveTextContent(/feed_health/);
+      expect(screen.queryByTestId('deploy-run-id')).toBeNull(); // no run started on preflight failure
+    });
   });
 
   // ── PREFLIGHT PREVIEW — codex option 3 (TEETH) ─────────────────────────────

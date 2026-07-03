@@ -42,16 +42,23 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
+from veridex.runtime.window import CLV_FIELD_WINDOW  # pure model (pydantic only) — trust-path clean
+
 if TYPE_CHECKING:  # type-only import keeps the trust path free of a runtime dependency / cycle.
     from veridex.runtime.orchestrator import RunResult
 
 
-def _is_scored(row: dict[str, Any]) -> bool:
+def is_scored(row: dict[str, Any]) -> bool:
     """An action is scored IFF ``valid is True`` AND ``clv_bps`` is a real ``int``.
 
     The ``bool`` guard matters: ``isinstance(True, int)`` is ``True`` in Python, so a stray boolean
     ``clv_bps`` must not masquerade as a numeric score. The ``"pending"`` sentinel (WAIT and
     live-pending) is a ``str`` and is excluded here without ever inspecting ``reason``.
+
+    This is the SINGLE SOURCE OF TRUTH for the "is this row scored?" predicate: the orchestrator's
+    windowed DEC-2D-1/2 overrides (``finalize(window=...)``) import THIS function to decide which
+    rows they may touch, so the override set can never silently desync from the scored set that
+    ranks the leaderboard.
 
     Args:
         row: A single ``RunResult.score_rows`` entry.
@@ -60,6 +67,32 @@ def _is_scored(row: dict[str, Any]) -> bool:
         ``True`` if the row contributes to the CLV/PnL metrics.
     """
     return row.get("valid") is True and isinstance(row.get("clv_bps"), int) and not isinstance(row.get("clv_bps"), bool)
+
+
+def is_window_scored(row: dict[str, Any]) -> bool:
+    """An action carries WINDOW CLV IFF ``window_clv_bps`` is a real ``int`` (DEC-2D-1).
+
+    The SINGLE SOURCE OF TRUTH for the "is this a scored WINDOW row?" predicate — mirrors
+    :func:`is_scored` (same ``bool`` guard, since ``isinstance(True, int)`` is ``True``) but keys on
+    the DISTINCT ``window_clv_bps`` field a ``fixed_duration``/``manual_stop`` window uses. Downstream
+    (``competition.events``) imports THIS rather than re-deriving the check, so the window aggregate
+    can never silently desync from the leaderboard-facing scored set.
+
+    Mutually exclusive with :func:`is_scored` per row BY CONSTRUCTION: finalize renames a scored
+    window row's value with ``row[window_clv_bps] = row.pop("clv_bps")``, so a window row physically
+    carries NO ``clv_bps`` (``is_scored`` is ``False``) and a true-CLV row carries NO
+    ``window_clv_bps`` (``is_window_scored`` is ``False``). A pending_horizon/WAIT row carries the
+    ``"pending"`` ``str`` sentinel under ``clv_bps`` and no ``window_clv_bps`` → neither predicate
+    fires (honest abstention, excluded from BOTH means).
+
+    Args:
+        row: A single ``RunResult.score_rows`` entry.
+
+    Returns:
+        ``True`` if the row contributes to the WINDOW-CLV aggregate (never to the true-CLV metrics).
+    """
+    value = row.get(CLV_FIELD_WINDOW)
+    return isinstance(value, int) and not isinstance(value, bool)
 
 
 def _confidence(row: dict[str, Any]) -> float | None:
@@ -141,12 +174,21 @@ def _agent_metrics(agent_id: str, proof_mode: str, agent_rows: list[dict[str, An
     Returns:
         A metric-stack dict for this agent, without the ``rank`` field.
     """
-    scored = sorted((r for r in agent_rows if _is_scored(r)), key=lambda r: r["tick_seq"])
+    scored = sorted((r for r in agent_rows if is_scored(r)), key=lambda r: r["tick_seq"])
     scored_clv: list[int] = [r["clv_bps"] for r in scored]
 
     action_count = len(scored)
     total_clv_bps = sum(scored_clv)
     avg_clv_bps = (total_clv_bps / action_count) if action_count else None
+
+    # DEC-2D-1: WINDOW CLV (fixed_duration/manual_stop rows) is a DISTINCT, LABELED aggregate — it is
+    # NEVER blended into avg_clv_bps (the leaderboard rank axis) and NEVER silently dropped. A run has
+    # ONE end_rule, so its scored rows are all one kind: this populates the window fields OR the true
+    # fields, never both. window_scored ∩ scored is empty by construction (see is_window_scored).
+    window_scored = [r[CLV_FIELD_WINDOW] for r in agent_rows if is_window_scored(r)]
+    window_action_count = len(window_scored)
+    total_window_clv_bps = sum(window_scored)
+    avg_window_clv_bps = (total_window_clv_bps / window_action_count) if window_action_count else None
     total_decisions = len(agent_rows)
     # valid_pct is law-acceptance, NOT scored coverage: WAIT/live-pending are valid abstentions
     # (valid is True) and count here even though they are NOT scored. Reuses the `valid is True`
@@ -164,6 +206,10 @@ def _agent_metrics(agent_id: str, proof_mode: str, agent_rows: list[dict[str, An
         "action_count": action_count,
         "valid_pct": valid_pct,
         "valid_count": valid_count,  # WD-7: CLV sample-size source (law-valid decisions)
+        # DEC-2D-1 window CLV — a labeled SUPPORTING metric, never the rank axis (see _rank_key).
+        "avg_window_clv_bps": avg_window_clv_bps,
+        "total_window_clv_bps": total_window_clv_bps,
+        "window_action_count": window_action_count,
         "proof_mode": proof_mode,
     }
 
@@ -207,8 +253,11 @@ def score_run(run: RunResult) -> list[dict[str, Any]]:
     Returns:
         Metric-stack rows sorted best-first, each with ``rank`` (1..N) assigned. Each row is
         ``{agent_id, avg_clv_bps, total_clv_bps, sim_pnl, brier, max_drawdown, action_count,
-        valid_pct, valid_count, rank, proof_mode}`` (``valid_count`` is the WD-7 CLV sample size;
-        it is display-only and never enters the rank key — SEC-005).
+        valid_pct, valid_count, avg_window_clv_bps, total_window_clv_bps, window_action_count,
+        rank, proof_mode}`` (``valid_count`` is the WD-7 CLV sample size; it is display-only and
+        never enters the rank key — SEC-005). The ``*_window_clv_bps`` / ``window_action_count``
+        fields are the DEC-2D-1 WINDOW-CLV aggregate for fixed_duration/manual_stop runs — a labeled
+        supporting metric, NEVER blended into ``avg_clv_bps`` and NEVER entering ``_rank_key``.
     """
     rows_by_agent: dict[str, list[dict[str, Any]]] = {agent_id: [] for agent_id in run.agent_ids}
     for row in run.score_rows:

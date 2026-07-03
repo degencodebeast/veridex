@@ -1,0 +1,16 @@
+[
+  {
+    "id": "590399",
+    "question": "Will Brazil win the 2026 FIFA World Cup Final?",
+    "slug": "brazil-wins-2026-world-cup-final",
+    "conditionId": "0x1122334455667788990011223344556677889900112233445566778899001",
+    "active": true,
+    "closed": false,
+    "outcomes": "[\"Yes\", \"No\"]",
+    "outcomePrices": "[\"0.10\", \"0.90\"]",
+    "clobTokenIds": null,
+    "orderPriceMinTickSize": 0.01,
+    "orderMinSize": 5,
+    "endDate": "2026-07-19T00:00:00Z"
+  }
+]

@@ -23,4 +23,5 @@
 .evYes { color: var(--accent-2); }
 .evNo { color: var(--text-4); }
 .summary { color: var(--text-2); }
+.clv { color: var(--text-2); font-weight: 600; }
 .chevron { color: var(--text-3); text-align: center; }

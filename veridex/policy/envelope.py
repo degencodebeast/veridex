@@ -32,6 +32,10 @@ class PolicyEnvelope(BaseModel):
         cooldown_s: Minimum seconds that must elapse between consecutive orders.
         human_approval_threshold: Stake at or above which a clean action escalates
             to human approval instead of auto-approving.
+        max_stake_live_guarded: Tighter per-order stake cap that applies ONLY on the
+            live-guarded (real-money) path; ``<= 0`` leaves ``max_stake`` as the only cap.
+        circuit_breaker_threshold: Consecutive execution failures that trip the circuit
+            breaker OPEN (blocking further execution); ``<= 0`` disables the breaker.
         kill_switch: When true, denies everything unconditionally.
     """
 
@@ -47,6 +51,8 @@ class PolicyEnvelope(BaseModel):
     max_quote_age_s: int
     cooldown_s: int
     human_approval_threshold: float
+    max_stake_live_guarded: float = 0.0
+    circuit_breaker_threshold: int = 0
     kill_switch: bool = False
 
     def policy_hash(self) -> str:
