@@ -57,19 +57,25 @@ def test_sharpline_benchmark_is_scored_through_injected_veridex_scoring_only():
     )
     assert cfg.source_repo == "sharpline" and cfg.strategy in {"momentum-sharp", "cumulative-drift"}
     calls = {"n": 0}
+    seen = {}
 
     def fake_score_fn(fires):  # the ONLY source of scored numbers
         calls["n"] += 1
+        seen["fires"] = fires
         return {"scored_count": len(fires), "avg_clv_bps": 0.0}
 
-    class _Pack:  # minimal deterministic pack stub
+    class _Pack:  # minimal deterministic pack stub — a translator-seam/scoring test, not a firing
+        # test (warmup=10 exceeds this series' length, so fires is always empty here by design)
         content_hash = "2" * 64
-        ticks = [0.50, 0.52, 0.58, 0.70]  # a sharp move
+        ticks = [0.50, 0.52, 0.58, 0.70]
 
     res = asyncio.run(run_strategy_benchmark(cfg, pack=_Pack(), score_fn=fake_score_fn))
     assert calls["n"] == 1  # scoring came from Veridex seam, not competitor code
     assert res.evidence_rung == "txline-only"
     assert res.pack_content_hash == "2" * 64
+    # AC-003: the result's scored fields are score_fn's return, copied verbatim, not recomputed.
+    assert res.scored_count == len(seen["fires"])
+    assert res.avg_clv_bps == 0.0
 
 
 def _real_pack(tmp_path: Path) -> Path:
@@ -97,9 +103,11 @@ def test_benchmark_runs_on_a_real_loaded_pack_and_scores_via_veridex_seam(tmp_pa
         {"zGate": 1.5, "phThresh": 0.25, "lambda": 0.92, "cooldown": 3, "warmup": 10}
     )
     calls = {"n": 0}
+    seen = {}
 
     def fake_score_fn(fires):
         calls["n"] += 1
+        seen["fires"] = fires
         return {"scored_count": len(fires), "avg_clv_bps": 0.0}
 
     res = asyncio.run(
@@ -115,6 +123,9 @@ def test_benchmark_runs_on_a_real_loaded_pack_and_scores_via_veridex_seam(tmp_pa
     assert calls["n"] == 1  # scored ONLY through the injected Veridex seam
     assert res.evidence_rung == "txline-only"  # competitors are rung-1
     assert len(res.pack_content_hash) == 64  # from the REAL loaded pack, not a stub
+    # AC-003: the result's scored fields are score_fn's return, copied verbatim, not recomputed.
+    assert res.scored_count == len(seen["fires"])
+    assert res.avg_clv_bps == 0.0
 
 
 def test_translate_threshold_maps_sports_workbench_params_into_a_veridex_config():
@@ -130,3 +141,24 @@ def test_translate_threshold_maps_sports_workbench_params_into_a_veridex_config(
 def test_translate_threshold_defaults_cooldown_when_absent():
     cfg = translate_threshold({"moveThreshold": 1.0})
     assert cfg.translated_params["cooldown_ticks"] == 0.0
+
+
+def test_detector_fires_on_a_flat_then_jump_sharp_move():
+    # flat reference then a single-tick reprice — the canonical sharp move; must FIRE
+    cfg = translate_sharpline(
+        {"zGate": 1.5, "phThresh": 0.25, "lambda": 0.92, "cooldown": 1, "warmup": 3}
+    )
+
+    class _Pack:
+        content_hash = "3" * 64
+        ticks = [0.50, 0.50, 0.50, 0.50, 0.70, 0.70]  # flat, then jump
+
+    seen = {}
+
+    def score_fn(fires):
+        seen["fires"] = fires
+        return {"scored_count": len(fires), "avg_clv_bps": 0.0}
+
+    res = asyncio.run(run_strategy_benchmark(cfg, pack=_Pack(), score_fn=score_fn))
+    assert res.fire_count > 0  # F1: the detector's firing substance is exercised
+    assert seen["fires"]  # F3: flat-then-jump actually fires

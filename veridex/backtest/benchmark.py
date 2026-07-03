@@ -31,6 +31,12 @@ from veridex.strategies.sharp_stats import PageHinkley, logit, robust_z
 #: Signature of the injected Veridex scoring seam — the ONLY source of scored numbers here.
 ScoreFn = Callable[[list[int]], dict[str, Any]]
 
+#: Minimum robust-z denominator scale (logit units), mirroring momentum v2's own default
+#: (`veridex/strategies/momentum.py`'s `scale_floor=0.02`) — without it, a flat reference window
+#: (MAD == 0) makes `robust_z` return 0.0 regardless of how sharp the next move is, so the
+#: canonical "flat market suddenly reprices" case would silently never fire.
+_ROBUST_Z_SCALE_FLOOR = 0.02
+
 
 class CompetitorReplicationConfig(BaseModel):
     """A competitor detector translated into Veridex terms — never the competitor's own code."""
@@ -149,7 +155,7 @@ def _sharp_detector_fires(series: list[float], params: dict[str, float]) -> list
         if cooldown_remaining > 0:
             cooldown_remaining -= 1
             continue
-        z = robust_z(logits[: i + 1])
+        z = robust_z(logits[: i + 1], scale_floor=_ROBUST_Z_SCALE_FLOOR)
         if abs(z) >= z_gate or direction is not None:
             fires.append(i)
             cooldown_remaining = cooldown
