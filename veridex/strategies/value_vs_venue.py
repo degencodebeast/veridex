@@ -76,6 +76,7 @@ def vvv_signal(
 def value_vs_venue_agent(
     *,
     venue_price_source: Callable[[str], float | None],
+    venue_source_id: str,
     min_edge_bps: int = 0,
     agent_id: str = "value-vs-venue",
 ) -> Agent:
@@ -85,15 +86,34 @@ def value_vs_venue_agent(
     ``market_state`` (SEC-003). The emitted action carries ONLY TxLINE-derived params (INVARIANT 4):
     market_key/side + a static reason; the venue-derived estimated edge/gap NEVER ride into evidence.
 
+    REPRODUCIBILITY (Codex M6): because ``decide`` reads ``venue_price_source`` — which changes the
+    agent's sealed actions (fire vs wait) — the venue source's IDENTITY is a behaviour-determining
+    input and MUST be pinned in ``config_hash``. ``venue_source_id`` is that identity (an artifact
+    hash/name, NOT a price): folding it into the config hash makes "same config + same TxLINE
+    evidence ⇒ same decision" true again. It is a CONFIG-HASH input ONLY — it NEVER enters
+    ``AgentAction.params`` (identity, not venue data), so the no-smuggling boundary is untouched.
+
     Args:
         venue_price_source: Injected ``Callable[[str], float | None]`` returning the venue DECIMAL
             price for a market_key (``None`` when no quote is available).
+        venue_source_id: A stable identity for the venue price source (in production, the
+            content/artifact hash of the quote/price-history pack it prices against). Bound into
+            ``config_hash`` for reproducibility. Must be non-empty.
         min_edge_bps: Minimum estimated executable edge (bps) required to fire.
         agent_id: Identifier for this agent.
 
     Returns:
         An :class:`~veridex.runtime.orchestrator.Agent` whose ``proof_mode`` is ``"reproducible"``.
+
+    Raises:
+        ValueError: If ``venue_source_id`` is empty/falsy — a reproducible agent cannot have a
+            behaviour-determining venue source with no identity to pin into its config hash.
     """
+    if not venue_source_id:
+        raise ValueError(
+            "venue_source_id must be a non-empty identity for the venue price source — a reproducible "
+            "VvV agent's config_hash must pin the (behaviour-determining) venue source it prices against"
+        )
 
     async def decide(market_state: MarketState) -> AgentAction:
         markets: dict[str, dict[str, Any]] = getattr(market_state, "markets", {}) or {}
@@ -121,10 +141,11 @@ def value_vs_venue_agent(
         return AgentAction(type=SportsActionType.WAIT, params={})
 
     def config_hash(market_state: MarketState) -> str:
-        # min_edge_bps is the only behavioural param → same config ⇒ same sealed identity.
+        # Behaviour-determining inputs = min_edge_bps AND the venue source identity (venue_source_id):
+        # both change the sealed decision, so both enter the hash → same config ⇒ same sealed identity.
         return agent_config_hash(
             agent_id,
-            f"value_vs_venue:min_edge_bps={min_edge_bps}",
+            f"value_vs_venue:min_edge_bps={min_edge_bps}:venue_source_id={venue_source_id}",
             AGENT_ACTION_SCHEMA_VERSION,
         )
 

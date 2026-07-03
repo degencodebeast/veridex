@@ -79,6 +79,7 @@ async def vvv_report_with_estimated_edge(
     fixture_id: int,
     *,
     venue_price_source: Callable[[str], float | None],
+    venue_source_id: str,
     window: RunWindow,
     min_edge_bps: int = 0,
     assumptions: dict[str, Any],
@@ -102,6 +103,9 @@ async def vvv_report_with_estimated_edge(
         fixture_id: The fixture within the pack to replay.
         venue_price_source: Injected ``Callable[[str], float | None]`` returning the venue DECIMAL
             price for a market_key (the ONLY venue input; never read from sealed evidence).
+        venue_source_id: Stable identity of the venue price source (e.g. the quote/price-history
+            artifact hash). Bound into the VvV agent's ``config_hash`` for reproducibility — ties the
+            report's reproducible config to the venue source it priced against. Must be non-empty.
         window: The coverage window (drives closing behaviour + the report's window id/allowlist).
         min_edge_bps: Minimum estimated executable edge (bps) the VvV agent requires to fire.
         assumptions: The EXPLICIT assumptions the estimated edge is computed under (never implied);
@@ -113,7 +117,9 @@ async def vvv_report_with_estimated_edge(
         post-build estimated executable edge (over the strategy's fired picks) + its machine-readable
         rung + the assumptions.
     """
-    agent = value_vs_venue_agent(venue_price_source=venue_price_source, min_edge_bps=min_edge_bps)
+    agent = value_vs_venue_agent(
+        venue_price_source=venue_price_source, venue_source_id=venue_source_id, min_edge_bps=min_edge_bps
+    )
     result, report = await run_backtest(pack_dir, fixture_id, [agent], window=window)
 
     # Map each decision tick to its marketstate so a fired pick's fair prob is read from the SAME

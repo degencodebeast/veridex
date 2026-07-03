@@ -78,7 +78,7 @@ def test_agent_is_a_real_veridex_agent_with_injected_venue_source() -> None:
     """The factory returns a REAL reproducible-proof Agent with a callable decide + config_hash."""
     from veridex.strategies.value_vs_venue import value_vs_venue_agent
 
-    agent = value_vs_venue_agent(venue_price_source=lambda mk: 2.0)
+    agent = value_vs_venue_agent(venue_price_source=lambda mk: 2.0, venue_source_id="test-venue-src")
     snapshot = _ms(6000)
 
     assert agent.proof_mode == "reproducible"
@@ -86,15 +86,45 @@ def test_agent_is_a_real_veridex_agent_with_injected_venue_source() -> None:
     assert agent.config_hash is not None
     # CALLABLE config_hash (the orchestrator's finalize calls config_hash(market_state)):
     assert agent.config_hash(snapshot) == agent.config_hash(snapshot)  # stable across calls
-    other = value_vs_venue_agent(venue_price_source=lambda mk: 2.0, min_edge_bps=9999)
+    other = value_vs_venue_agent(
+        venue_price_source=lambda mk: 2.0, venue_source_id="test-venue-src", min_edge_bps=9999
+    )
     assert agent.config_hash(snapshot) != other.config_hash(snapshot)  # param-sensitive
+
+
+def test_venue_source_identity_is_bound_into_config_hash() -> None:
+    """Reproducibility (Codex M6): the venue source identity is pinned in the agent's config_hash.
+
+    ``decide`` reads ``venue_price_source`` (which flips fire/wait), so two agents differing ONLY in
+    their venue source must NOT share a config_hash — otherwise "same config ⇒ same sealed decision"
+    is false.
+    """
+    from veridex.strategies.value_vs_venue import value_vs_venue_agent
+
+    ms = _ms(6000)
+    a = value_vs_venue_agent(venue_price_source=lambda mk: 2.0, venue_source_id="src-A", min_edge_bps=0)
+    b = value_vs_venue_agent(venue_price_source=lambda mk: 2.0, venue_source_id="src-B", min_edge_bps=0)
+    assert a.config_hash(ms) != b.config_hash(ms)  # different venue source -> different config hash
+
+    c = value_vs_venue_agent(venue_price_source=lambda mk: 2.0, venue_source_id="src-A", min_edge_bps=0)
+    assert a.config_hash(ms) == c.config_hash(ms)  # same source -> same (stable) hash
+
+
+def test_vvv_agent_rejects_missing_venue_source_identity() -> None:
+    """A reproducible VvV agent REFUSES to exist without a bound venue source identity."""
+    from veridex.strategies.value_vs_venue import value_vs_venue_agent
+
+    with pytest.raises((TypeError, ValueError)):
+        value_vs_venue_agent(venue_price_source=lambda mk: 2.0, min_edge_bps=0)  # no venue_source_id
+    with pytest.raises(ValueError):
+        value_vs_venue_agent(venue_price_source=lambda mk: 2.0, venue_source_id="", min_edge_bps=0)
 
 
 def test_vvv_action_params_do_not_smuggle_venue_data_into_evidence() -> None:
     """THE trust test: the fired action's params carry NO venue-derived value (INVARIANT 4)."""
     from veridex.strategies.value_vs_venue import value_vs_venue_agent
 
-    agent = value_vs_venue_agent(venue_price_source=lambda mk: 2.0)
+    agent = value_vs_venue_agent(venue_price_source=lambda mk: 2.0, venue_source_id="test-venue-src")
     action = asyncio.run(agent.decide(_ms(6000)))
 
     assert action.type != "WAIT", "fair 6000 @ decimal 2.0 clears a 0 min-edge and must fire"
@@ -145,6 +175,7 @@ async def test_vvv_produces_report_with_estimated_edge_but_scored_path_stays_ven
         pack_dir,
         _FIXTURE_ID,
         venue_price_source=lambda mk: 5.0,
+        venue_source_id="test-venue-src",
         window=_window(),
         min_edge_bps=0,
         assumptions=assumptions,
@@ -223,6 +254,7 @@ async def test_estimated_edge_is_none_when_the_strategy_fires_no_picks(tmp_path:
         pack_dir,
         _FIXTURE_ID,
         venue_price_source=lambda mk: 2.0,
+        venue_source_id="test-venue-src",
         window=_window(),
         min_edge_bps=0,
         assumptions={"no_interpolation": True},
@@ -248,6 +280,7 @@ async def test_estimated_edge_reflects_the_fired_pick_not_a_larger_unfired_oppor
         pack_dir,
         _FIXTURE_ID,
         venue_price_source=lambda mk: 3.0,
+        venue_source_id="test-venue-src",
         window=_window(),
         min_edge_bps=-(10**9),  # everything clears → agent fires the first-sorted side (Away)
         assumptions={"no_interpolation": True},
