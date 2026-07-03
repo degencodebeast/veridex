@@ -11,10 +11,15 @@ deterministic law scores edge/CLV. Any ``reason``/``claimed_edge_bps`` is untrus
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
 
+from tests.test_replay_pack import _write_session
+from veridex.backtest.runner import run_backtest
 from veridex.deploy.preflight import DeployConfig, run_deploy_preflight
 from veridex.ingest.marketstate import MarketState
+from veridex.ingest.replay_pack import pack_from_session
 from veridex.runtime.schemas import AgentAction
+from veridex.runtime.window import RunWindow
 from veridex.strategies.drift import cumulative_drift_agent
 
 
@@ -109,7 +114,7 @@ def test_cumulative_drift_strategy_is_accepted_by_preflight() -> None:
 def test_decision_at_t_is_prefix_invariant() -> None:
     # Discriminating params: firing happens INSIDE a 4-tick prefix, so a global/cross-agent-shared
     # detector would leak one agent's history into the next and change the decision (proven RED).
-    kw = dict(min_tick_count=3, min_horizon_s=0, cum_drift_logit_min=0.05, cooldown_ticks=0)
+    kw = {"min_tick_count": 3, "min_horizon_s": 0, "cum_drift_logit_min": 0.05, "cooldown_ticks": 0}
     prefix = [3000, 4000, 5000, 6000]
 
     a = _typed(_run(cumulative_drift_agent(**kw), prefix))
@@ -121,3 +126,40 @@ def test_decision_at_t_is_prefix_invariant() -> None:
     longer = prefix + [5000, 4000, 3000, 2000]  # continues, then reverses
     full = _typed(_run(cumulative_drift_agent(**kw), longer))
     assert full[: len(prefix)] == a
+
+
+# ------------------------------------------------------------------------------------------
+# Task 12b — drift COMPOSES with run_backtest: a real hashed pack → a real BacktestReport (S3)
+# ------------------------------------------------------------------------------------------
+
+
+def _real_pack(tmp_path: Path) -> Path:
+    session_dir = _write_session(tmp_path)  # records.jsonl + meta.json (fixture 5, 1X2)
+    pack_dir = tmp_path / "pack"
+    pack_from_session(session_dir, pack_dir)  # builds pack.json + odds file + real content_hash
+    return pack_dir
+
+
+def _window() -> RunWindow:
+    return RunWindow(
+        window_id="w_drift_bt",
+        fixture_id=5,
+        market_allowlist=["1X2"],
+        end_rule="pre_match",
+        min_clv_horizon_s=0,
+    )
+
+
+async def test_drift_produces_a_real_backtest_report_via_run_backtest(tmp_path: Path) -> None:
+    # THE anti-false-green proof: run_backtest awaits agent.decide and calls agent.config_hash(ms)
+    # during finalize. If drift were not a REAL Agent (bad await / bare-string config_hash) this
+    # raises inside run_backtest. A returned BacktestReport therefore PROVES drift is a valid Agent.
+    pack_dir = _real_pack(tmp_path)
+    drift = cumulative_drift_agent()
+
+    result, report = await run_backtest(pack_dir, 5, [drift], window=_window())
+
+    assert report.run_id == result.run_id  # the sealed run and its report are the same run
+    assert report.real_executable_edge_bps is None  # rung-3 stays honest null (no fabricated edge)
+    assert hasattr(report, "avg_clv")
+    assert hasattr(report, "clv_distribution")
