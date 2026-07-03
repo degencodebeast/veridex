@@ -53,9 +53,20 @@ def vvv_signal(
     Returns:
         ``{"gap_bps": int | None, "estimated_executable_edge_bps": int | None, "fired": bool}``.
         ``fired`` is ``True`` iff an edge was computable AND ``>= min_edge_bps``.
+
+    Raises:
+        ValueError: If ``venue_decimal_price`` is not ``None`` and ``<= 1.0`` — decimal odds are
+            ``1/q`` and thus ALWAYS ``> 1.0``, so a value ``<= 1.0`` is a native-q (share price)
+            passed where decimal odds are required. Fail fast at the boundary (AC-014 lesson from
+            M0) rather than silently mispricing to an all-negative edge that never fires.
     """
     if venue_decimal_price is None:
         return {"gap_bps": None, "estimated_executable_edge_bps": None, "fired": False}
+    if venue_decimal_price <= 1.0:
+        raise ValueError(
+            f"venue_decimal_price must be DECIMAL odds (> 1.0), got {venue_decimal_price!r} — this "
+            "looks like a native share price q; convert via veridex.venues.polymarket.native_to_decimal"
+        )
     gap_bps = mispricing_gap_bps(fair_prob_bps, venue_decimal_price)
     estimated_edge_bps = executable_edge_bps(fair_prob_bps, venue_decimal_price)
     fired = estimated_edge_bps is not None and estimated_edge_bps >= min_edge_bps

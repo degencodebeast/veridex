@@ -13,6 +13,8 @@ from __future__ import annotations
 import asyncio
 from pathlib import Path
 
+import pytest
+
 from tests.test_drift_agent import _ms
 from tests.test_replay_pack import _write_session
 from veridex.ingest.replay_pack import pack_from_session
@@ -41,6 +43,22 @@ def test_no_executable_edge_without_a_quote() -> None:
     assert signal["gap_bps"] is None
     assert signal["estimated_executable_edge_bps"] is None
     assert signal["fired"] is False
+
+
+def test_vvv_signal_rejects_a_native_q_masquerading_as_decimal() -> None:
+    """F1: a native q (<= 1.0) passed where DECIMAL odds are required must fail-fast (AC-014 lesson).
+
+    Decimal odds are ``1/q`` and thus ALWAYS > 1.0; a value <= 1.0 is a native-q misuse that would
+    silently misprice (all-negative edge, never fires). Reject it at the boundary rather than lie.
+    """
+    from veridex.strategies.value_vs_venue import vvv_signal
+
+    with pytest.raises(ValueError):
+        vvv_signal(fair_prob_bps=6000, venue_decimal_price=0.50)  # 0.50 is native q, not decimal odds
+
+    # None (no quote) and real decimal odds still work:
+    assert vvv_signal(fair_prob_bps=6000, venue_decimal_price=None)["fired"] is False
+    assert vvv_signal(fair_prob_bps=6000, venue_decimal_price=2.0)["estimated_executable_edge_bps"] is not None
 
 
 def test_edge_uses_decimal_price_not_native_q() -> None:
