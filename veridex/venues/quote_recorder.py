@@ -101,7 +101,7 @@ def cadence_report(
         return {"median_interval_s": float("inf"), "cadence_sufficient": False, "n": n}
 
     timestamps = sorted(f.ts for f in frames)
-    intervals = [b - a for a, b in zip(timestamps, timestamps[1:])]
+    intervals = [b - a for a, b in zip(timestamps, timestamps[1:], strict=False)]
     median_interval_s = float(statistics.median(intervals))
     cadence_sufficient = median_interval_s < sub_minute_threshold_s
     return {"median_interval_s": median_interval_s, "cadence_sufficient": cadence_sufficient, "n": n}
