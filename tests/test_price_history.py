@@ -4,8 +4,10 @@ from veridex.venues.price_history import (
     VenuePriceHistoryFrame,
     VenuePriceHistoryPack,
     compute_price_history_hash,
+    fetch_price_history,
 )
 from veridex.venues.polymarket import native_to_decimal
+from veridex.venues.polymarket_resolver import ResolvedMarket
 
 
 def test_from_native_sets_decimal_via_native_to_decimal_not_the_raw_q():
@@ -58,3 +60,41 @@ def test_pack_carries_artifact_content_hash_field(tmp_path):
     assert p.artifact_content_hash == content_hash
     assert p.provenance == "backfilled-price-history"
     assert not hasattr(p, "evidence_hash")
+
+
+class _FakeClient:
+    """No-network fake — records the requested token_id and returns fixed points."""
+
+    def __init__(self, points: list[dict]) -> None:
+        self.points = points
+        self.requested_token_id: str | None = None
+
+    async def get_prices_history(self, token_id: str) -> list[dict]:
+        self.requested_token_id = token_id
+        return self.points
+
+
+async def test_fetch_price_history_converts_every_point_to_decimal():
+    resolved = ResolvedMarket(
+        condition_id="0xabc",
+        token_id_yes="tok-yes",
+        token_id_no="tok-no",
+        tick_size=0.01,
+    )
+    client = _FakeClient([{"t": 1000, "p": 0.62}, {"t": 1060, "p": 0.62}])
+
+    frames = await fetch_price_history(
+        resolved,
+        "home",
+        fixture_id=17952170,
+        market_ref="1X2|home|full",
+        fidelity_s=60,
+        client=client,
+    )
+
+    assert client.requested_token_id == "tok-yes"
+    assert len(frames) == 2
+    for frame in frames:
+        assert frame.native_price == 0.62
+        assert frame.venue_decimal_price == pytest.approx(native_to_decimal(0.62))
+        assert frame.provenance == "backfilled-price-history"

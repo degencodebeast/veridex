@@ -11,10 +11,12 @@ from __future__ import annotations
 
 import hashlib
 from pathlib import Path
+from typing import Any, Protocol
 
 from pydantic import BaseModel
 
 from veridex.venues.polymarket import native_to_decimal
+from veridex.venues.polymarket_resolver import ResolvedMarket, side_to_token
 
 
 class VenuePriceHistoryFrame(BaseModel):
@@ -100,3 +102,49 @@ def compute_price_history_hash(pack_dir: Path, frames_file: str) -> str:
     digest.update(len(file_bytes).to_bytes(8, "big"))
     digest.update(file_bytes)
     return digest.hexdigest()
+
+
+class PriceHistoryClient(Protocol):
+    """Structural protocol for a venue's price-history read client.
+
+    Tests ALWAYS inject a fake returning recorded points — no network in tests; only the
+    operator's separate live backfill step hits a real venue endpoint (mirrors
+    :class:`veridex.venues.polymarket_resolver.GammaClient`'s injection pattern).
+    """
+
+    async def get_prices_history(self, token_id: str) -> list[dict[str, Any]]:
+        """Return recorded price points for *token_id*, each ``{"t": <ts>, "p": <native price>}``."""
+        ...
+
+
+async def fetch_price_history(
+    resolved: ResolvedMarket,
+    side: str,
+    *,
+    fixture_id: int,
+    market_ref: str,
+    fidelity_s: int,
+    client: PriceHistoryClient,
+) -> list[VenuePriceHistoryFrame]:
+    """Backfill a bet side's price history into frames (AC-014: native->decimal enforced).
+
+    Resolves *side* to its token via :func:`veridex.venues.polymarket_resolver.side_to_token`,
+    fetches that token's recorded points from *client*, and converts each point to a
+    :class:`VenuePriceHistoryFrame` via :meth:`VenuePriceHistoryFrame.from_native` — never
+    hand-computing ``venue_decimal_price``.
+    """
+    token_id = side_to_token(resolved, side)
+    points = await client.get_prices_history(token_id)
+    return [
+        VenuePriceHistoryFrame.from_native(
+            ts=int(point["t"]),
+            fixture_id=fixture_id,
+            market_ref=market_ref,
+            condition_id=resolved.condition_id,
+            token_id=token_id,
+            native_price=float(point["p"]),
+            price_kind="clob-prices-history",
+            fidelity_s=fidelity_s,
+        )
+        for point in points
+    ]
