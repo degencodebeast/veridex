@@ -17,12 +17,78 @@ import pytest
 
 from tests.test_drift_agent import _ms
 from tests.test_replay_pack import _write_session
+from veridex.ingest.marketstate import MarketState
 from veridex.ingest.replay_pack import pack_from_session
 from veridex.runtime.window import RunWindow
-from veridex.venues.polymarket import native_to_decimal
-from veridex.venues.venue_price_source import TimedVenueQuote, VenuePriceSource
+from veridex.venues.polymarket import decimal_to_native, native_to_decimal
+from veridex.venues.price_history import VenuePriceHistoryFrame
+from veridex.venues.venue_price_source import (
+    TimedVenueQuote,
+    VenuePriceSource,
+    build_backfilled_venue_source,
+)
 
 _FIXTURE_ID = 5
+
+# ── Units regression fixtures (Run-002-VvV) ─────────────────────────────────────────────────
+# TxLINE ``MarketState.ts`` is unix MILLISECONDS (13-digit); a ``VenuePriceSource`` is contractually
+# keyed by unix SECONDS (Polymarket-canonical, matching the backfilled frames). These realistic
+# mismatched-scale fixtures (a ms query ts vs seconds frames) drive a REAL ts-sensitive
+# ``build_backfilled_venue_source`` — unlike the fixed ``_src`` stubs above, which ignore ``ts`` and
+# so never exercised the unit contract. Every call site must convert ms→s or staleness ≈ 1e12 >> the
+# 900s bound → source returns ``None`` → 0% coverage (the Run-002 artifact).
+_FRAME_TS_EARLY_S = 1_782_641_900  # unix SECONDS (10-digit), Polymarket-canonical frame ts
+_FRAME_TS_LATE_S = 1_782_642_000  # latest frame at/before the query
+_QUERY_TS_MS = 1_782_642_003_000  # TxLINE decision ts in unix MILLISECONDS (13-digit) == 1_782_642_003 s
+_EXPECTED_STALENESS_S = 3  # 1_782_642_003 - 1_782_642_000, comfortably inside the 900s bound
+
+
+def _seconds_frames() -> list[VenuePriceHistoryFrame]:
+    """Two backfilled 1X2|home frames at SECONDS-scale ts (matching real Polymarket frames)."""
+    return [
+        VenuePriceHistoryFrame(
+            ts=ts,
+            fixture_id=_FIXTURE_ID,
+            market_ref="1X2|home|full",
+            condition_id="0xcond",
+            token_id="tok-home",
+            native_price=decimal_to_native(2.0),
+            venue_decimal_price=2.0,
+            price_kind="clob-prices-history",
+            fidelity_s=60,
+        )
+        for ts in (_FRAME_TS_EARLY_S, _FRAME_TS_LATE_S)
+    ]
+
+
+def _seconds_frame_source() -> VenuePriceSource:
+    """A REAL ts-sensitive source over seconds-scale frames (900s freshness bound)."""
+    src, _sid = build_backfilled_venue_source(
+        _seconds_frames(),
+        price_history_artifact_hashes=["ph#1"],
+        coverage_artifact_hash="cov#1",
+        freshness_s=900,
+        haircut_ladder_bps=[0, 100, 200, 300],
+    )
+    return src
+
+
+def _ms_query_state() -> MarketState:
+    """A TxLINE tick whose ``ts`` is unix MILLISECONDS (13-digit) — the real decision-query scale."""
+    return MarketState(
+        fixture_id=_FIXTURE_ID,
+        tick_seq=0,
+        ts=_QUERY_TS_MS,
+        phase=0,
+        markets={
+            "1X2|home|full": {
+                "stable_prob_bps": {"home": 6000},
+                "stable_price": {"home": 2.0},
+                "suspended": False,
+            }
+        },
+        scores={},
+    )
 
 
 def _q(price: float, *, staleness_s: int = 0) -> TimedVenueQuote:
@@ -176,6 +242,29 @@ def test_venue_numbers_never_in_action_params() -> None:
     payload = action.model_dump_json()
     for forbidden_value in ("1.9", "120", "450"):
         assert forbidden_value not in payload
+
+
+def test_agent_prices_ms_decision_ts_against_seconds_frames_and_fires() -> None:
+    """Units regression (Run-002-VvV): a TxLINE ms decision ts priced against seconds frames MUST match.
+
+    ``MarketState.ts`` is unix MILLISECONDS but the source is keyed by unix SECONDS. The ``decide`` call
+    site must convert ms→s before querying, so the (900s-bounded) source returns the latest frame at 3s
+    staleness and the agent FIRES (fair 6000 bps @ decimal 2.0 → edge +0.20). On the pre-fix code the raw
+    ms ts made staleness ≈ 1.78e12 ≫ 900 → source ``None`` → the agent WAITs on every tick (the Run-002
+    0%-coverage artifact). The fixed ``_src`` stubs above ignore ``ts`` and never caught this — only a
+    REAL ts-sensitive ``build_backfilled_venue_source`` does.
+    """
+    from veridex.strategies.value_vs_venue import value_vs_venue_agent
+
+    agent = value_vs_venue_agent(venue_price_source=_seconds_frame_source(), venue_source_id="src-seconds")
+    action = asyncio.run(agent.decide(_ms_query_state()))
+
+    assert action.type != "WAIT", (
+        "a ms decision ts vs seconds frames must convert to seconds and MATCH (staleness 3s ≤ 900), "
+        "not overrun the freshness bound → None → WAIT"
+    )
+    assert action.params.get("market_key") == "1X2|home|full"
+    assert action.params.get("side") == "home"
 
 
 def test_agent_waits_when_source_returns_none() -> None:

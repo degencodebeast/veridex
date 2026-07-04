@@ -55,7 +55,11 @@ from veridex.scoring import is_scored
 from veridex.strategies.drift import cumulative_drift_agent
 from veridex.strategies.market_quality import MarketQualityConfig
 from veridex.strategies.value_vs_venue import vvv_signal
-from veridex.venues.venue_price_source import TimedVenueQuote, VenuePriceSource
+from veridex.venues.venue_price_source import (
+    TimedVenueQuote,
+    VenuePriceSource,
+    txline_ts_to_venue_seconds,
+)
 
 #: The strategy-config id that names the (cadence-gated) StaleLine decision strategy (M8).
 STALE_LINE_CONFIG = "stale-line"
@@ -284,7 +288,10 @@ def _first_matched_quote(
         if not isinstance(prob_bps, dict):
             continue
         for side in sorted(prob_bps):
-            quote = venue_price_source(state.fixture_id, market_key, side, state.ts)
+            # Source is keyed by unix SECONDS; state.ts is unix MILLISECONDS → convert at the seam.
+            quote = venue_price_source(
+                state.fixture_id, market_key, side, txline_ts_to_venue_seconds(state.ts)
+            )
             if quote is not None:
                 return quote
     return None
@@ -334,8 +341,11 @@ def _collect_vvv_venue_behavior(
         params = raw_action.get("params", {})
         market_key = params.get("market_key")
         side = params.get("side")
+        # Source is keyed by unix SECONDS; state.ts is unix MILLISECONDS → convert at the seam.
         quote = (
-            venue_price_source(state.fixture_id, market_key, side, state.ts)
+            venue_price_source(
+                state.fixture_id, market_key, side, txline_ts_to_venue_seconds(state.ts)
+            )
             if market_key is not None and side is not None
             else None
         )

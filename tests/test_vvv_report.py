@@ -16,9 +16,15 @@ import pytest
 
 from tests.test_drift_agent import _ms
 from tests.test_replay_pack import _write_session
+from veridex.ingest.marketstate import MarketState
 from veridex.ingest.replay_pack import pack_from_session
 from veridex.runtime.window import RunWindow
-from veridex.venues.venue_price_source import TimedVenueQuote
+from veridex.venues.polymarket import decimal_to_native
+from veridex.venues.price_history import VenuePriceHistoryFrame
+from veridex.venues.venue_price_source import (
+    TimedVenueQuote,
+    build_backfilled_venue_source,
+)
 
 _FIXTURE_ID = 5
 
@@ -75,6 +81,80 @@ def test_estimated_edge_seam_calls_the_4arg_timed_source_and_rejects_market_key_
             venue_price_source=lambda mk: 2.0,  # type: ignore[arg-type,misc]
             min_edge_bps=0,
         )
+
+
+def test_estimated_edge_prices_ms_tick_against_seconds_frames() -> None:
+    """Units regression (Run-002-VvV): the producer re-prices a fired pick via a SECONDS-keyed source.
+
+    ``_estimated_edge_over_fired_picks`` queries the source with the tick's TxLINE ``ts`` (unix
+    MILLISECONDS). Without an ms→s conversion at that call site, a realistic ms ts against seconds
+    frames makes staleness ≈ 1.78e12 ≫ the 900s bound → source ``None`` → the fired pick is skipped →
+    the estimated edge is ``None``. The fixed ``_q`` stubs above ignore ``ts``, so only a REAL
+    ts-sensitive ``build_backfilled_venue_source`` catches the units mismatch.
+    """
+    from types import SimpleNamespace
+
+    from veridex.backtest.vvv_report import _estimated_edge_over_fired_picks
+    from veridex.strategies.value_vs_venue import vvv_signal
+
+    frame_late_s = 1_782_642_000  # unix SECONDS (10-digit), Polymarket-canonical
+    query_ts_ms = 1_782_642_003_000  # TxLINE decision ts in unix MILLISECONDS (13-digit)
+    frames = [
+        VenuePriceHistoryFrame(
+            ts=ts,
+            fixture_id=_FIXTURE_ID,
+            market_ref="1X2|home|full",
+            condition_id="0xcond",
+            token_id="tok-home",
+            native_price=decimal_to_native(2.0),
+            venue_decimal_price=2.0,
+            price_kind="clob-prices-history",
+            fidelity_s=60,
+        )
+        for ts in (1_782_641_900, frame_late_s)
+    ]
+    src, _sid = build_backfilled_venue_source(
+        frames,
+        price_history_artifact_hashes=["ph#1"],
+        coverage_artifact_hash="cov#1",
+        freshness_s=900,
+        haircut_ladder_bps=[0, 100, 200, 300],
+    )
+    state = MarketState(
+        fixture_id=_FIXTURE_ID,
+        tick_seq=0,
+        ts=query_ts_ms,
+        phase=0,
+        markets={
+            "1X2|home|full": {
+                "stable_prob_bps": {"home": 6000},
+                "stable_price": {"home": 2.0},
+                "suspended": False,
+            }
+        },
+        scores={},
+    )
+    row = {
+        "raw_prescore": {
+            "raw_action": {
+                "type": "FOLLOW_MOMENTUM",
+                "params": {"market_key": "1X2|home|full", "side": "home"},
+            }
+        },
+        "tick_seq": 0,
+    }
+    result = SimpleNamespace(score_rows=[row])
+
+    edge = _estimated_edge_over_fired_picks(
+        result,  # type: ignore[arg-type]
+        {0: state},
+        venue_price_source=src,
+        min_edge_bps=0,
+    )
+
+    # 6000 bps (0.60) @ decimal 2.0 → edge +0.20 → +2000 bps; None here means the ms tick overran the bound.
+    assert edge is not None, "seconds frames priced at a ms tick must MATCH (staleness 3s), not be skipped"
+    assert edge == vvv_signal(6000, 2.0)["estimated_executable_edge_bps"] == 2000
 
 
 async def test_vvv_report_uses_4arg_timed_source(tmp_path: Path) -> None:

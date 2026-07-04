@@ -24,7 +24,7 @@ from veridex.runtime.orchestrator import RunResult
 from veridex.runtime.schemas import SportsActionType
 from veridex.runtime.window import RunWindow
 from veridex.strategies.value_vs_venue import value_vs_venue_agent, vvv_signal
-from veridex.venues.venue_price_source import VenuePriceSource
+from veridex.venues.venue_price_source import VenuePriceSource, txline_ts_to_venue_seconds
 
 
 def _estimated_edge_over_fired_picks(
@@ -69,7 +69,10 @@ def _estimated_edge_over_fired_picks(
         except (TypeError, ValueError):
             continue
         # Time-aligned venue quote for THIS fired pick's coordinate (same tick's fixture_id + ts).
-        quote = venue_price_source(state.fixture_id, market_key, side, state.ts)
+        # Source is keyed by unix SECONDS; state.ts is unix MILLISECONDS → convert at the seam.
+        quote = venue_price_source(
+            state.fixture_id, market_key, side, txline_ts_to_venue_seconds(state.ts)
+        )
         venue_decimal_price = quote.venue_decimal_price if quote is not None else None
         estimated = vvv_signal(
             fair_prob_bps, venue_decimal_price, min_edge_bps=min_edge_bps

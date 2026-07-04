@@ -32,7 +32,12 @@ from veridex.ingest.replay_pack import pack_from_session
 from veridex.provenance import EvidenceRung
 from veridex.runtime.window import RunWindow
 from veridex.strategies.value_vs_venue import value_vs_venue_agent
-from veridex.venues.venue_price_source import TimedVenueQuote
+from veridex.venues.polymarket import decimal_to_native
+from veridex.venues.price_history import VenuePriceHistoryFrame
+from veridex.venues.venue_price_source import (
+    TimedVenueQuote,
+    build_backfilled_venue_source,
+)
 
 _RUNG_LABELS = {rung.value for rung in EvidenceRung}
 
@@ -468,6 +473,106 @@ def test_vvv_producer_collects_decision_quote_coverage_with_staleness(tmp_path: 
     assert cov.quote_matched_count == sum(1 for d in decisions if d.quote_matched)
     # 6b flow: matched staleness (120s → <=2m) is bucketed, summing exactly to quote_matched_count.
     assert sum(cov.freshness_bucket_counts_for_used_quotes.values()) == cov.quote_matched_count
+
+
+# ── Units regression (Run-002-VvV): decision-coverage collection queries a SECONDS-keyed source ──
+# with a TxLINE MarketState.ts in unix MILLISECONDS. Both evaluation.py call sites — the fired-pick
+# lookup and the WAIT-tick ``_first_matched_quote`` — must convert ms→s or matched staleness ≈ 1e12 ≫
+# the 900s bound → every decision unmatched → quote_matched_count=0 over the whole run (Run-002). The
+# ``_fires_src`` stub above ignores ``ts``, so only a REAL ts-sensitive source exercises the contract.
+_FRAME_TS_EARLY_S = 1_782_641_900  # unix SECONDS (10-digit), Polymarket-canonical frame ts
+_FRAME_TS_LATE_S = 1_782_642_000
+_QUERY_TS_MS = 1_782_642_003_000  # TxLINE decision ts in unix MILLISECONDS (13-digit) == 1_782_642_003 s
+_EXPECTED_STALENESS_S = 3  # 1_782_642_003 - 1_782_642_000, well inside the 900s bound
+
+
+def _seconds_frame_source():
+    """A REAL ts-sensitive source over 1X2|home frames at SECONDS-scale ts (900s freshness bound)."""
+    frames = [
+        VenuePriceHistoryFrame(
+            ts=ts,
+            fixture_id=5,
+            market_ref="1X2|home|full",
+            condition_id="0xcond",
+            token_id="tok-home",
+            native_price=decimal_to_native(2.0),
+            venue_decimal_price=2.0,
+            price_kind="clob-prices-history",
+            fidelity_s=60,
+        )
+        for ts in (_FRAME_TS_EARLY_S, _FRAME_TS_LATE_S)
+    ]
+    src, _sid = build_backfilled_venue_source(
+        frames,
+        price_history_artifact_hashes=["ph#1"],
+        coverage_artifact_hash="cov#1",
+        freshness_s=900,
+        haircut_ladder_bps=[0, 100, 200, 300],
+    )
+    return src
+
+
+def _ms_query_state() -> MarketState:
+    """A 1X2|home tick whose ``ts`` is unix MILLISECONDS (13-digit) — the real decision-query scale."""
+    return MarketState(
+        fixture_id=5,
+        tick_seq=0,
+        ts=_QUERY_TS_MS,
+        phase=0,
+        markets={
+            "1X2|home|full": {
+                "stable_prob_bps": {"home": 6000},
+                "stable_price": {"home": 2.0},
+                "suspended": False,
+            }
+        },
+        scores={},
+    )
+
+
+def test_collect_venue_behavior_converts_ms_tick_to_seconds_for_lookup() -> None:
+    """Units regression (Run-002-VvV): both evaluation.py venue-source call sites convert ms→s.
+
+    Drives ``_collect_vvv_venue_behavior`` with a synthetic sealed run whose ONE tick carries a TxLINE
+    ms-scale ``ts`` against a real seconds-keyed source: the fired-pick decision (direct source call)
+    AND the WAIT-tick decision (via ``_first_matched_quote``) must both MATCH, carrying a staleness in a
+    sane SECONDS range (0–900), never ≈ 1e12. On the pre-fix code the raw ms ts overran the 900s bound →
+    ``None`` → ``quote_matched=False`` for every decision (the Run-002 0%-coverage artifact).
+    """
+    from types import SimpleNamespace
+
+    from veridex.backtest.evaluation import _collect_vvv_venue_behavior
+
+    state = _ms_query_state()
+    fired_row = {
+        "tick_seq": 0,
+        "raw_prescore": {
+            "raw_action": {
+                "type": "FOLLOW_MOMENTUM",
+                "params": {"market_key": "1X2|home|full", "side": "home"},
+            }
+        },
+    }
+    wait_row = {"tick_seq": 0, "raw_prescore": {"raw_action": {"type": "WAIT", "params": {}}}}
+    result = SimpleNamespace(score_rows=[fired_row, wait_row])
+
+    rows, decisions = _collect_vvv_venue_behavior(
+        result,  # type: ignore[arg-type]
+        {0: state},
+        venue_price_source=_seconds_frame_source(),
+        close_ts=_QUERY_TS_MS // 1000,
+        coverage_class="ok",
+    )
+
+    matched = [d for d in decisions if d.quote_matched]
+    assert len(matched) == 2, "both the fired-pick and WAIT-tick lookups must match after ms→s conversion"
+    assert {d.fired for d in matched} == {True, False}, "one fired decision and one WAIT decision matched"
+    for d in matched:
+        assert d.staleness_s is not None
+        assert 0 <= d.staleness_s <= 900, f"staleness must be seconds-scale, got {d.staleness_s}"
+        assert d.staleness_s == _EXPECTED_STALENESS_S
+    # The fired pick also yields a behavior row whose staleness is the same seconds-scale value.
+    assert rows and all(0 <= r.staleness_s <= 900 for r in rows)
 
 
 def test_vvv_producer_records_unmatched_decisions_when_source_is_none(tmp_path: Path) -> None:
