@@ -1,0 +1,1019 @@
+{
+ "tool": "cp1_probe/1",
+ "min_pre_kickoff": 5,
+ "fixtures": [
+  {
+   "coverage": {
+    "fixture_id": 18179763,
+    "sides": [
+     {
+      "side": "home",
+      "token_resolved": true,
+      "quote_count": 663,
+      "pre_kickoff_quote_count": 648,
+      "freshness_bucket_counts": {
+       "<=2m": 0,
+       "<=5m": 0,
+       "<=15m": 1
+      },
+      "first_quote_ts": 1782642003,
+      "last_quote_ts": 1783032604,
+      "covered": true,
+      "partial_side_missing": null
+     },
+     {
+      "side": "away",
+      "token_resolved": true,
+      "quote_count": 663,
+      "pre_kickoff_quote_count": 648,
+      "freshness_bucket_counts": {
+       "<=2m": 0,
+       "<=5m": 0,
+       "<=15m": 1
+      },
+      "first_quote_ts": 1782642003,
+      "last_quote_ts": 1783032604,
+      "covered": true,
+      "partial_side_missing": null
+     },
+     {
+      "side": "draw",
+      "token_resolved": true,
+      "quote_count": 663,
+      "pre_kickoff_quote_count": 648,
+      "freshness_bucket_counts": {
+       "<=2m": 0,
+       "<=5m": 0,
+       "<=15m": 1
+      },
+      "first_quote_ts": 1782642004,
+      "last_quote_ts": 1783032605,
+      "covered": true,
+      "partial_side_missing": null
+     }
+    ],
+    "headline_eligible": true,
+    "reason": null
+   },
+   "coverage_content_hash": "4e83a8340a0b29ce2b5b1dd7b6522930be87730a54677bd7d7d260d3241e2fa6"
+  },
+  {
+   "coverage": {
+    "fixture_id": 18179551,
+    "sides": [
+     {
+      "side": "home",
+      "token_resolved": true,
+      "quote_count": 640,
+      "pre_kickoff_quote_count": 625,
+      "freshness_bucket_counts": {
+       "<=2m": 0,
+       "<=5m": 0,
+       "<=15m": 1
+      },
+      "first_quote_ts": 1782642003,
+      "last_quote_ts": 1783018805,
+      "covered": true,
+      "partial_side_missing": null
+     },
+     {
+      "side": "away",
+      "token_resolved": true,
+      "quote_count": 639,
+      "pre_kickoff_quote_count": 624,
+      "freshness_bucket_counts": {
+       "<=2m": 0,
+       "<=5m": 0,
+       "<=15m": 1
+      },
+      "first_quote_ts": 1782642004,
+      "last_quote_ts": 1783018205,
+      "covered": true,
+      "partial_side_missing": null
+     },
+     {
+      "side": "draw",
+      "token_resolved": true,
+      "quote_count": 639,
+      "pre_kickoff_quote_count": 625,
+      "freshness_bucket_counts": {
+       "<=2m": 0,
+       "<=5m": 0,
+       "<=15m": 1
+      },
+      "first_quote_ts": 1782642003,
+      "last_quote_ts": 1783018805,
+      "covered": true,
+      "partial_side_missing": null
+     }
+    ],
+    "headline_eligible": true,
+    "reason": null
+   },
+   "coverage_content_hash": "29031cfdc28c1583ac3b1c43415f25062752df863e284a882c708bdbc49c0d12"
+  },
+  {
+   "coverage": {
+    "fixture_id": 18176123,
+    "sides": [
+     {
+      "side": "home",
+      "token_resolved": true,
+      "quote_count": 926,
+      "pre_kickoff_quote_count": 906,
+      "freshness_bucket_counts": {
+       "<=2m": 0,
+       "<=5m": 0,
+       "<=15m": 1
+      },
+      "first_quote_ts": 1782555604,
+      "last_quote_ts": 1783101004,
+      "covered": true,
+      "partial_side_missing": null
+     },
+     {
+      "side": "away",
+      "token_resolved": true,
+      "quote_count": 925,
+      "pre_kickoff_quote_count": 906,
+      "freshness_bucket_counts": {
+       "<=2m": 0,
+       "<=5m": 0,
+       "<=15m": 1
+      },
+      "first_quote_ts": 1782555604,
+      "last_quote_ts": 1783101003,
+      "covered": true,
+      "partial_side_missing": null
+     },
+     {
+      "side": "draw",
+      "token_resolved": true,
+      "quote_count": 926,
+      "pre_kickoff_quote_count": 906,
+      "freshness_bucket_counts": {
+       "<=2m": 0,
+       "<=5m": 0,
+       "<=15m": 1
+      },
+      "first_quote_ts": 1782555604,
+      "last_quote_ts": 1783101004,
+      "covered": true,
+      "partial_side_missing": null
+     }
+    ],
+    "headline_eligible": true,
+    "reason": null
+   },
+   "coverage_content_hash": "92f9298360713bb25da61a4cdacd9159a38a41b3b7b608a66c362e5b62fb0a09"
+  },
+  {
+   "coverage": {
+    "fixture_id": 17588229,
+    "sides": [
+     {
+      "side": "home",
+      "token_resolved": true,
+      "quote_count": 3084,
+      "pre_kickoff_quote_count": 3070,
+      "freshness_bucket_counts": {
+       "<=2m": 0,
+       "<=5m": 0,
+       "<=15m": 1
+      },
+      "first_quote_ts": 1780590607,
+      "last_quote_ts": 1782438604,
+      "covered": true,
+      "partial_side_missing": null
+     },
+     {
+      "side": "away",
+      "token_resolved": true,
+      "quote_count": 3084,
+      "pre_kickoff_quote_count": 3070,
+      "freshness_bucket_counts": {
+       "<=2m": 0,
+       "<=5m": 0,
+       "<=15m": 1
+      },
+      "first_quote_ts": 1780590607,
+      "last_quote_ts": 1782438604,
+      "covered": true,
+      "partial_side_missing": null
+     },
+     {
+      "side": "draw",
+      "token_resolved": true,
+      "quote_count": 3084,
+      "pre_kickoff_quote_count": 3070,
+      "freshness_bucket_counts": {
+       "<=2m": 0,
+       "<=5m": 0,
+       "<=15m": 1
+      },
+      "first_quote_ts": 1780590607,
+      "last_quote_ts": 1782438604,
+      "covered": true,
+      "partial_side_missing": null
+     }
+    ],
+    "headline_eligible": true,
+    "reason": null
+   },
+   "coverage_content_hash": "ed92fd2a4ec97f6d571d25d3dceee7a6fba89a74050271d1e8de6c48c2f7efd8"
+  },
+  {
+   "coverage": {
+    "fixture_id": 17588234,
+    "sides": [
+     {
+      "side": "home",
+      "token_resolved": true,
+      "quote_count": 3186,
+      "pre_kickoff_quote_count": 3173,
+      "freshness_bucket_counts": {
+       "<=2m": 1,
+       "<=5m": 0,
+       "<=15m": 1
+      },
+      "first_quote_ts": 1780590606,
+      "last_quote_ts": 1782500405,
+      "covered": true,
+      "partial_side_missing": null
+     },
+     {
+      "side": "away",
+      "token_resolved": true,
+      "quote_count": 3186,
+      "pre_kickoff_quote_count": 3173,
+      "freshness_bucket_counts": {
+       "<=2m": 1,
+       "<=5m": 0,
+       "<=15m": 1
+      },
+      "first_quote_ts": 1780590607,
+      "last_quote_ts": 1782500406,
+      "covered": true,
+      "partial_side_missing": null
+     },
+     {
+      "side": "draw",
+      "token_resolved": true,
+      "quote_count": 3186,
+      "pre_kickoff_quote_count": 3173,
+      "freshness_bucket_counts": {
+       "<=2m": 1,
+       "<=5m": 0,
+       "<=15m": 1
+      },
+      "first_quote_ts": 1780590607,
+      "last_quote_ts": 1782500406,
+      "covered": true,
+      "partial_side_missing": null
+     }
+    ],
+    "headline_eligible": true,
+    "reason": null
+   },
+   "coverage_content_hash": "8380f312d235d7c4c5609226ff651ccb7b3f5cad418bb7dc4fe4307a12d37580"
+  },
+  {
+   "coverage": {
+    "fixture_id": 17926593,
+    "sides": [
+     {
+      "side": "home",
+      "token_resolved": true,
+      "quote_count": 3085,
+      "pre_kickoff_quote_count": 3070,
+      "freshness_bucket_counts": {
+       "<=2m": 0,
+       "<=5m": 0,
+       "<=15m": 1
+      },
+      "first_quote_ts": 1780590607,
+      "last_quote_ts": 1782438604,
+      "covered": true,
+      "partial_side_missing": null
+     },
+     {
+      "side": "away",
+      "token_resolved": true,
+      "quote_count": 3084,
+      "pre_kickoff_quote_count": 3070,
+      "freshness_bucket_counts": {
+       "<=2m": 0,
+       "<=5m": 0,
+       "<=15m": 1
+      },
+      "first_quote_ts": 1780590607,
+      "last_quote_ts": 1782438604,
+      "covered": true,
+      "partial_side_missing": null
+     },
+     {
+      "side": "draw",
+      "token_resolved": true,
+      "quote_count": 3084,
+      "pre_kickoff_quote_count": 3070,
+      "freshness_bucket_counts": {
+       "<=2m": 0,
+       "<=5m": 0,
+       "<=15m": 1
+      },
+      "first_quote_ts": 1780590607,
+      "last_quote_ts": 1782438604,
+      "covered": true,
+      "partial_side_missing": null
+     }
+    ],
+    "headline_eligible": true,
+    "reason": null
+   },
+   "coverage_content_hash": "73c1a53be342d5ae7788156f53ed6382b67a6541f7fcc8e7c47ed4c954d8a105"
+  },
+  {
+   "coverage": {
+    "fixture_id": 17588245,
+    "sides": [
+     {
+      "side": "home",
+      "token_resolved": true,
+      "quote_count": 3343,
+      "pre_kickoff_quote_count": 3328,
+      "freshness_bucket_counts": {
+       "<=2m": 0,
+       "<=5m": 0,
+       "<=15m": 1
+      },
+      "first_quote_ts": 1780590606,
+      "last_quote_ts": 1782593404,
+      "covered": true,
+      "partial_side_missing": null
+     },
+     {
+      "side": "away",
+      "token_resolved": true,
+      "quote_count": 3342,
+      "pre_kickoff_quote_count": 3328,
+      "freshness_bucket_counts": {
+       "<=2m": 0,
+       "<=5m": 0,
+       "<=15m": 1
+      },
+      "first_quote_ts": 1780590606,
+      "last_quote_ts": 1782593404,
+      "covered": true,
+      "partial_side_missing": null
+     },
+     {
+      "side": "draw",
+      "token_resolved": true,
+      "quote_count": 3342,
+      "pre_kickoff_quote_count": 3328,
+      "freshness_bucket_counts": {
+       "<=2m": 0,
+       "<=5m": 0,
+       "<=15m": 1
+      },
+      "first_quote_ts": 1780590607,
+      "last_quote_ts": 1782593404,
+      "covered": true,
+      "partial_side_missing": null
+     }
+    ],
+    "headline_eligible": true,
+    "reason": null
+   },
+   "coverage_content_hash": "274749b0ac350951d023f916df350fff9ba6e0fd491af0230f1d04f6a6e2244a"
+  },
+  {
+   "coverage": {
+    "fixture_id": 17588391,
+    "sides": [
+     {
+      "side": "home",
+      "token_resolved": true,
+      "quote_count": 3357,
+      "pre_kickoff_quote_count": 3343,
+      "freshness_bucket_counts": {
+       "<=2m": 0,
+       "<=5m": 0,
+       "<=15m": 1
+      },
+      "first_quote_ts": 1780590607,
+      "last_quote_ts": 1782602405,
+      "covered": true,
+      "partial_side_missing": null
+     },
+     {
+      "side": "away",
+      "token_resolved": true,
+      "quote_count": 3357,
+      "pre_kickoff_quote_count": 3343,
+      "freshness_bucket_counts": {
+       "<=2m": 0,
+       "<=5m": 0,
+       "<=15m": 1
+      },
+      "first_quote_ts": 1780590607,
+      "last_quote_ts": 1782602405,
+      "covered": true,
+      "partial_side_missing": null
+     },
+     {
+      "side": "draw",
+      "token_resolved": true,
+      "quote_count": 3357,
+      "pre_kickoff_quote_count": 3343,
+      "freshness_bucket_counts": {
+       "<=2m": 0,
+       "<=5m": 0,
+       "<=15m": 1
+      },
+      "first_quote_ts": 1780590607,
+      "last_quote_ts": 1782602405,
+      "covered": true,
+      "partial_side_missing": null
+     }
+    ],
+    "headline_eligible": true,
+    "reason": null
+   },
+   "coverage_content_hash": "a22558af27892503441fa9001a3ca139c745772f05200ecc2448587b05c55cc6"
+  },
+  {
+   "coverage": {
+    "fixture_id": 17588404,
+    "sides": [
+     {
+      "side": "home",
+      "token_resolved": true,
+      "quote_count": 3216,
+      "pre_kickoff_quote_count": 3202,
+      "freshness_bucket_counts": {
+       "<=2m": 0,
+       "<=5m": 0,
+       "<=15m": 1
+      },
+      "first_quote_ts": 1780590607,
+      "last_quote_ts": 1782517804,
+      "covered": true,
+      "partial_side_missing": null
+     },
+     {
+      "side": "away",
+      "token_resolved": true,
+      "quote_count": 3217,
+      "pre_kickoff_quote_count": 3202,
+      "freshness_bucket_counts": {
+       "<=2m": 0,
+       "<=5m": 0,
+       "<=15m": 1
+      },
+      "first_quote_ts": 1780590606,
+      "last_quote_ts": 1782517803,
+      "covered": true,
+      "partial_side_missing": null
+     },
+     {
+      "side": "draw",
+      "token_resolved": true,
+      "quote_count": 3216,
+      "pre_kickoff_quote_count": 3202,
+      "freshness_bucket_counts": {
+       "<=2m": 0,
+       "<=5m": 0,
+       "<=15m": 1
+      },
+      "first_quote_ts": 1780590606,
+      "last_quote_ts": 1782517803,
+      "covered": true,
+      "partial_side_missing": null
+     }
+    ],
+    "headline_eligible": true,
+    "reason": null
+   },
+   "coverage_content_hash": "817a68c97ecc825e34803a1a406ef281b1311cf709ac9a6cb08218275313eac1"
+  },
+  {
+   "coverage": {
+    "fixture_id": 17588325,
+    "sides": [
+     {
+      "side": "home",
+      "token_resolved": true,
+      "quote_count": 3372,
+      "pre_kickoff_quote_count": 3358,
+      "freshness_bucket_counts": {
+       "<=2m": 0,
+       "<=5m": 0,
+       "<=15m": 1
+      },
+      "first_quote_ts": 1780590607,
+      "last_quote_ts": 1782611404,
+      "covered": true,
+      "partial_side_missing": null
+     },
+     {
+      "side": "away",
+      "token_resolved": true,
+      "quote_count": 3372,
+      "pre_kickoff_quote_count": 3358,
+      "freshness_bucket_counts": {
+       "<=2m": 0,
+       "<=5m": 0,
+       "<=15m": 1
+      },
+      "first_quote_ts": 1780590607,
+      "last_quote_ts": 1782611403,
+      "covered": true,
+      "partial_side_missing": null
+     },
+     {
+      "side": "draw",
+      "token_resolved": true,
+      "quote_count": 3372,
+      "pre_kickoff_quote_count": 3358,
+      "freshness_bucket_counts": {
+       "<=2m": 0,
+       "<=5m": 0,
+       "<=15m": 1
+      },
+      "first_quote_ts": 1780590606,
+      "last_quote_ts": 1782611403,
+      "covered": true,
+      "partial_side_missing": null
+     }
+    ],
+    "headline_eligible": true,
+    "reason": null
+   },
+   "coverage_content_hash": "a4ccdc22ed92ace072a3896e5b7742c599c2d1d4cc5e34128cf1d85a0b61a766"
+  },
+  {
+   "coverage": {
+    "fixture_id": 18167317,
+    "sides": [
+     {
+      "side": "home",
+      "token_resolved": true,
+      "quote_count": 500,
+      "pre_kickoff_quote_count": 485,
+      "freshness_bucket_counts": {
+       "<=2m": 0,
+       "<=5m": 1,
+       "<=15m": 1
+      },
+      "first_quote_ts": 1782382204,
+      "last_quote_ts": 1782672605,
+      "covered": true,
+      "partial_side_missing": null
+     },
+     {
+      "side": "away",
+      "token_resolved": true,
+      "quote_count": 500,
+      "pre_kickoff_quote_count": 485,
+      "freshness_bucket_counts": {
+       "<=2m": 0,
+       "<=5m": 0,
+       "<=15m": 1
+      },
+      "first_quote_ts": 1782382203,
+      "last_quote_ts": 1782672604,
+      "covered": true,
+      "partial_side_missing": null
+     },
+     {
+      "side": "draw",
+      "token_resolved": true,
+      "quote_count": 500,
+      "pre_kickoff_quote_count": 485,
+      "freshness_bucket_counts": {
+       "<=2m": 0,
+       "<=5m": 1,
+       "<=15m": 0
+      },
+      "first_quote_ts": 1782382204,
+      "last_quote_ts": 1782672605,
+      "covered": true,
+      "partial_side_missing": null
+     }
+    ],
+    "headline_eligible": true,
+    "reason": null
+   },
+   "coverage_content_hash": "4e596dce1e309792a27b4648db314e763c084e53e8fb66afecfa552c1ce7f90c"
+  },
+  {
+   "coverage": {
+    "fixture_id": 18172469,
+    "sides": [
+     {
+      "side": "home",
+      "token_resolved": true,
+      "quote_count": 483,
+      "pre_kickoff_quote_count": 468,
+      "freshness_bucket_counts": {
+       "<=2m": 0,
+       "<=5m": 0,
+       "<=15m": 1
+      },
+      "first_quote_ts": 1782471605,
+      "last_quote_ts": 1782751806,
+      "covered": true,
+      "partial_side_missing": null
+     },
+     {
+      "side": "away",
+      "token_resolved": true,
+      "quote_count": 482,
+      "pre_kickoff_quote_count": 468,
+      "freshness_bucket_counts": {
+       "<=2m": 0,
+       "<=5m": 0,
+       "<=15m": 1
+      },
+      "first_quote_ts": 1782471604,
+      "last_quote_ts": 1782751805,
+      "covered": true,
+      "partial_side_missing": null
+     },
+     {
+      "side": "draw",
+      "token_resolved": true,
+      "quote_count": 482,
+      "pre_kickoff_quote_count": 468,
+      "freshness_bucket_counts": {
+       "<=2m": 0,
+       "<=5m": 0,
+       "<=15m": 1
+      },
+      "first_quote_ts": 1782471604,
+      "last_quote_ts": 1782751805,
+      "covered": true,
+      "partial_side_missing": null
+     }
+    ],
+    "headline_eligible": true,
+    "reason": null
+   },
+   "coverage_content_hash": "f6366a60ca5b445273a06f61a64d8173d6d6a75b7f1449351a4a67f5e5d565f9"
+  },
+  {
+   "coverage": {
+    "fixture_id": 18175983,
+    "sides": [
+     {
+      "side": "home",
+      "token_resolved": true,
+      "quote_count": 370,
+      "pre_kickoff_quote_count": 350,
+      "freshness_bucket_counts": {
+       "<=2m": 0,
+       "<=5m": 0,
+       "<=15m": 1
+      },
+      "first_quote_ts": 1782555004,
+      "last_quote_ts": 1782764405,
+      "covered": true,
+      "partial_side_missing": null
+     },
+     {
+      "side": "away",
+      "token_resolved": true,
+      "quote_count": 370,
+      "pre_kickoff_quote_count": 350,
+      "freshness_bucket_counts": {
+       "<=2m": 0,
+       "<=5m": 0,
+       "<=15m": 1
+      },
+      "first_quote_ts": 1782555004,
+      "last_quote_ts": 1782764404,
+      "covered": true,
+      "partial_side_missing": null
+     },
+     {
+      "side": "draw",
+      "token_resolved": true,
+      "quote_count": 370,
+      "pre_kickoff_quote_count": 350,
+      "freshness_bucket_counts": {
+       "<=2m": 0,
+       "<=5m": 0,
+       "<=15m": 1
+      },
+      "first_quote_ts": 1782555005,
+      "last_quote_ts": 1782764405,
+      "covered": true,
+      "partial_side_missing": null
+     }
+    ],
+    "headline_eligible": true,
+    "reason": null
+   },
+   "coverage_content_hash": "fb4d170deb15e91c1b3fef0e79752d93d6bc57bc83e6eb06b66b46afe6d28d88"
+  },
+  {
+   "coverage": {
+    "fixture_id": 18172280,
+    "sides": [
+     {
+      "side": "home",
+      "token_resolved": true,
+      "quote_count": 535,
+      "pre_kickoff_quote_count": 516,
+      "freshness_bucket_counts": {
+       "<=2m": 0,
+       "<=5m": 0,
+       "<=15m": 1
+      },
+      "first_quote_ts": 1782471604,
+      "last_quote_ts": 1782780603,
+      "covered": true,
+      "partial_side_missing": null
+     },
+     {
+      "side": "away",
+      "token_resolved": true,
+      "quote_count": 535,
+      "pre_kickoff_quote_count": 516,
+      "freshness_bucket_counts": {
+       "<=2m": 0,
+       "<=5m": 0,
+       "<=15m": 1
+      },
+      "first_quote_ts": 1782471604,
+      "last_quote_ts": 1782780603,
+      "covered": true,
+      "partial_side_missing": null
+     },
+     {
+      "side": "draw",
+      "token_resolved": true,
+      "quote_count": 536,
+      "pre_kickoff_quote_count": 516,
+      "freshness_bucket_counts": {
+       "<=2m": 0,
+       "<=5m": 0,
+       "<=15m": 1
+      },
+      "first_quote_ts": 1782471604,
+      "last_quote_ts": 1782780603,
+      "covered": true,
+      "partial_side_missing": null
+     }
+    ],
+    "headline_eligible": true,
+    "reason": null
+   },
+   "coverage_content_hash": "abd07d433784477e05a4af5a4758cb35d5c66f714879d62d5653ad8696a6d0ec"
+  },
+  {
+   "coverage": {
+    "fixture_id": 18175981,
+    "sides": [
+     {
+      "side": "home",
+      "token_resolved": true,
+      "quote_count": 511,
+      "pre_kickoff_quote_count": 497,
+      "freshness_bucket_counts": {
+       "<=2m": 0,
+       "<=5m": 0,
+       "<=15m": 1
+      },
+      "first_quote_ts": 1782555004,
+      "last_quote_ts": 1782852603,
+      "covered": true,
+      "partial_side_missing": null
+     },
+     {
+      "side": "away",
+      "token_resolved": true,
+      "quote_count": 510,
+      "pre_kickoff_quote_count": 497,
+      "freshness_bucket_counts": {
+       "<=2m": 0,
+       "<=5m": 0,
+       "<=15m": 1
+      },
+      "first_quote_ts": 1782555004,
+      "last_quote_ts": 1782852604,
+      "covered": true,
+      "partial_side_missing": null
+     },
+     {
+      "side": "draw",
+      "token_resolved": true,
+      "quote_count": 510,
+      "pre_kickoff_quote_count": 497,
+      "freshness_bucket_counts": {
+       "<=2m": 0,
+       "<=5m": 0,
+       "<=15m": 1
+      },
+      "first_quote_ts": 1782555004,
+      "last_quote_ts": 1782852604,
+      "covered": true,
+      "partial_side_missing": null
+     }
+    ],
+    "headline_eligible": true,
+    "reason": null
+   },
+   "coverage_content_hash": "22d33fc1107de4bb2c0c5a7ae43a12f37d070dc6b9649b71570d920fc3a4a558"
+  },
+  {
+   "coverage": {
+    "fixture_id": 18179550,
+    "sides": [
+     {
+      "side": "home",
+      "token_resolved": true,
+      "quote_count": 505,
+      "pre_kickoff_quote_count": 486,
+      "freshness_bucket_counts": {
+       "<=2m": 0,
+       "<=5m": 1,
+       "<=15m": 0
+      },
+      "first_quote_ts": 1782642003,
+      "last_quote_ts": 1782935407,
+      "covered": true,
+      "partial_side_missing": null
+     },
+     {
+      "side": "away",
+      "token_resolved": true,
+      "quote_count": 505,
+      "pre_kickoff_quote_count": 486,
+      "freshness_bucket_counts": {
+       "<=2m": 0,
+       "<=5m": 1,
+       "<=15m": 0
+      },
+      "first_quote_ts": 1782642003,
+      "last_quote_ts": 1782935407,
+      "covered": true,
+      "partial_side_missing": null
+     },
+     {
+      "side": "draw",
+      "token_resolved": true,
+      "quote_count": 506,
+      "pre_kickoff_quote_count": 486,
+      "freshness_bucket_counts": {
+       "<=2m": 0,
+       "<=5m": 1,
+       "<=15m": 0
+      },
+      "first_quote_ts": 1782642003,
+      "last_quote_ts": 1782935407,
+      "covered": true,
+      "partial_side_missing": null
+     }
+    ],
+    "headline_eligible": true,
+    "reason": null
+   },
+   "coverage_content_hash": "05b07515910f95017c9777e1cfd2d3378afa38ad9a574c4df471d3d7d3fc6634"
+  },
+  {
+   "coverage": {
+    "fixture_id": 18179759,
+    "sides": [
+     {
+      "side": "home",
+      "token_resolved": true,
+      "quote_count": 416,
+      "pre_kickoff_quote_count": 377,
+      "freshness_bucket_counts": {
+       "<=2m": 0,
+       "<=5m": 0,
+       "<=15m": 1
+      },
+      "first_quote_ts": 1782641404,
+      "last_quote_ts": 1782867005,
+      "covered": true,
+      "partial_side_missing": null
+     },
+     {
+      "side": "away",
+      "token_resolved": true,
+      "quote_count": 396,
+      "pre_kickoff_quote_count": 377,
+      "freshness_bucket_counts": {
+       "<=2m": 0,
+       "<=5m": 0,
+       "<=15m": 1
+      },
+      "first_quote_ts": 1782641404,
+      "last_quote_ts": 1782867005,
+      "covered": true,
+      "partial_side_missing": null
+     },
+     {
+      "side": "draw",
+      "token_resolved": true,
+      "quote_count": 396,
+      "pre_kickoff_quote_count": 377,
+      "freshness_bucket_counts": {
+       "<=2m": 0,
+       "<=5m": 0,
+       "<=15m": 1
+      },
+      "first_quote_ts": 1782641404,
+      "last_quote_ts": 1782867005,
+      "covered": true,
+      "partial_side_missing": null
+     }
+    ],
+    "headline_eligible": true,
+    "reason": null
+   },
+   "coverage_content_hash": "02810d3ccda79f6e3ef1af8bce711aa2513d1b3715b59136f0a7de796ce0b7a3"
+  },
+  {
+   "coverage": {
+    "fixture_id": 18175918,
+    "sides": [
+     {
+      "side": "home",
+      "token_resolved": true,
+      "quote_count": 948,
+      "pre_kickoff_quote_count": 930,
+      "freshness_bucket_counts": {
+       "<=2m": 0,
+       "<=5m": 0,
+       "<=15m": 1
+      },
+      "first_quote_ts": 1782555605,
+      "last_quote_ts": 1783115404,
+      "covered": true,
+      "partial_side_missing": null
+     },
+     {
+      "side": "away",
+      "token_resolved": true,
+      "quote_count": 948,
+      "pre_kickoff_quote_count": 930,
+      "freshness_bucket_counts": {
+       "<=2m": 0,
+       "<=5m": 0,
+       "<=15m": 1
+      },
+      "first_quote_ts": 1782555604,
+      "last_quote_ts": 1783115404,
+      "covered": true,
+      "partial_side_missing": null
+     },
+     {
+      "side": "draw",
+      "token_resolved": true,
+      "quote_count": 949,
+      "pre_kickoff_quote_count": 930,
+      "freshness_bucket_counts": {
+       "<=2m": 0,
+       "<=5m": 0,
+       "<=15m": 1
+      },
+      "first_quote_ts": 1782555604,
+      "last_quote_ts": 1783115404,
+      "covered": true,
+      "partial_side_missing": null
+     }
+    ],
+    "headline_eligible": true,
+    "reason": null
+   },
+   "coverage_content_hash": "4656ed79ce4b3ad44754cc12408d352d932d8d9a23b2b7f74c6a34ef8979d34b"
+  }
+ ],
+ "headline_eligible_fixture_ids": [
+  18179763,
+  18179551,
+  18176123,
+  17588229,
+  17588234,
+  17926593,
+  17588245,
+  17588391,
+  17588404,
+  17588325,
+  18167317,
+  18172469,
+  18175983,
+  18172280,
+  18175981,
+  18179550,
+  18179759,
+  18175918
+ ],
+ "headline_eligible_count": 18,
+ "viable": true,
+ "artifact_content_hash": "f88bd42ed70299abdaa6ae4f99cfa010671a6eb0f77871040e760251640b4077"
+}

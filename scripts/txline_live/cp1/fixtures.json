@@ -1,0 +1,128 @@
+[
+ {
+  "fixture_id": 18179763,
+  "event_slug": "fifwc-prt-hrv-2026-07-02",
+  "home_team": "Portugal",
+  "away_team": "Croatia",
+  "kickoff_ts": 1783032980
+ },
+ {
+  "fixture_id": 18179551,
+  "event_slug": "fifwc-esp-aut-2026-07-02",
+  "home_team": "Spain",
+  "away_team": "Austria",
+  "kickoff_ts": 1783018805
+ },
+ {
+  "fixture_id": 18176123,
+  "event_slug": "fifwc-aus-egy-2026-07-03",
+  "home_team": "Australia",
+  "away_team": "Egypt",
+  "kickoff_ts": 1783101319
+ },
+ {
+  "fixture_id": 17588229,
+  "event_slug": "fifwc-par-aus-2026-06-25",
+  "home_team": "Paraguay",
+  "away_team": "Australia",
+  "kickoff_ts": 1782439010
+ },
+ {
+  "fixture_id": 17588234,
+  "event_slug": "fifwc-nor-fra-2026-06-26",
+  "home_team": "Norway",
+  "away_team": "France",
+  "kickoff_ts": 1782500409
+ },
+ {
+  "fixture_id": 17926593,
+  "event_slug": "fifwc-tur-usa-2026-06-25",
+  "home_team": "Turkey",
+  "away_team": "USA",
+  "kickoff_ts": 1782438929
+ },
+ {
+  "fixture_id": 17588245,
+  "event_slug": "fifwc-hrv-gha-2026-06-27",
+  "home_team": "Croatia",
+  "away_team": "Ghana",
+  "kickoff_ts": 1782593807
+ },
+ {
+  "fixture_id": 17588391,
+  "event_slug": "fifwc-col-prt-2026-06-27",
+  "home_team": "Colombia",
+  "away_team": "Portugal",
+  "kickoff_ts": 1782602715
+ },
+ {
+  "fixture_id": 17588404,
+  "event_slug": "fifwc-ury-esp-2026-06-26",
+  "home_team": "Uruguay",
+  "away_team": "Spain",
+  "kickoff_ts": 1782518218
+ },
+ {
+  "fixture_id": 17588325,
+  "event_slug": "fifwc-jor-arg-2026-06-27",
+  "home_team": "Jordan",
+  "away_team": "Argentina",
+  "kickoff_ts": 1782611759
+ },
+ {
+  "fixture_id": 18167317,
+  "event_slug": "fifwc-rsa-can-2026-06-28",
+  "home_team": "South Africa",
+  "away_team": "Canada",
+  "kickoff_ts": 1782672905
+ },
+ {
+  "fixture_id": 18172469,
+  "event_slug": "fifwc-bra-jpn-2026-06-29",
+  "home_team": "Brazil",
+  "away_team": "Japan",
+  "kickoff_ts": 1782752117
+ },
+ {
+  "fixture_id": 18175983,
+  "event_slug": "fifwc-ger-par-2026-06-29",
+  "home_team": "Germany",
+  "away_team": "Paraguay",
+  "kickoff_ts": 1782764727
+ },
+ {
+  "fixture_id": 18172280,
+  "event_slug": "fifwc-nld-mar-2026-06-29",
+  "home_team": "Netherlands",
+  "away_team": "Morocco",
+  "kickoff_ts": 1782781078
+ },
+ {
+  "fixture_id": 18175981,
+  "event_slug": "fifwc-fra-swe-2026-06-30",
+  "home_team": "France",
+  "away_team": "Sweden",
+  "kickoff_ts": 1782853001
+ },
+ {
+  "fixture_id": 18179550,
+  "event_slug": "fifwc-bel-sen-2026-07-01",
+  "home_team": "Belgium",
+  "away_team": "Senegal",
+  "kickoff_ts": 1782935707
+ },
+ {
+  "fixture_id": 18179759,
+  "event_slug": "fifwc-mex-ecu-2026-06-30",
+  "home_team": "Mexico",
+  "away_team": "Ecuador",
+  "kickoff_ts": 1782867364
+ },
+ {
+  "fixture_id": 18175918,
+  "event_slug": "fifwc-arg-cvi-2026-07-03",
+  "home_team": "Argentina",
+  "away_team": "Cape Verde",
+  "kickoff_ts": 1783115725
+ }
+]
