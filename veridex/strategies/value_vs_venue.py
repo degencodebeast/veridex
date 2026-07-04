@@ -32,7 +32,11 @@ from veridex.law.edge import executable_edge_bps
 from veridex.runtime.agent import AGENT_ACTION_SCHEMA_VERSION, agent_config_hash
 from veridex.runtime.orchestrator import PROOF_MODE_REPRODUCIBLE, Agent
 from veridex.runtime.schemas import AgentAction, SportsActionType
-from veridex.venues.venue_price_source import VenuePriceSource, txline_ts_to_venue_seconds
+from veridex.venues.venue_price_source import (
+    VenuePriceSource,
+    txline_market_to_venue_ref,
+    txline_ts_to_venue_seconds,
+)
 
 #: STATIC, number-free rationale — carries NO venue-derived value into the sealed evidence (INV 4).
 _VVV_REASON = "value vs venue: estimated executable edge cleared the minimum"
@@ -136,11 +140,17 @@ def value_vs_venue_agent(
                     fair_prob_bps = int(prob_bps[side])
                 except (TypeError, ValueError):
                     continue
+                # Bridge the TxLINE (market_key, side) to the C-3 frame ``market_ref`` the source is keyed
+                # by. ``None`` ⇒ out of venue scope (no frame for this market — AH / OU / 1X2-half): skip
+                # the lookup (this side cannot be priced against the venue → no edge → does not fire).
+                venue_ref = txline_market_to_venue_ref(market_key, side)
+                if venue_ref is None:
+                    continue
                 # Venue price comes ONLY from the injected time-aligned source (per fixture/market/side/ts)
                 # — never from market_state. No quote (None) ⇒ no edge ⇒ this side does not fire (WAIT).
                 # The source is keyed by unix SECONDS; MarketState.ts is unix MILLISECONDS → convert.
                 quote = venue_price_source(
-                    market_state.fixture_id, market_key, side, txline_ts_to_venue_seconds(market_state.ts)
+                    market_state.fixture_id, venue_ref, side, txline_ts_to_venue_seconds(market_state.ts)
                 )
                 venue_decimal_price = quote.venue_decimal_price if quote is not None else None
                 signal = vvv_signal(fair_prob_bps, venue_decimal_price, min_edge_bps=min_edge_bps)

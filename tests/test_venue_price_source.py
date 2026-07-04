@@ -19,6 +19,7 @@ from veridex.venues.venue_price_source import (
     TimedVenueQuote,
     VenuePriceSource,
     build_backfilled_venue_source,
+    txline_market_to_venue_ref,
 )
 
 
@@ -195,6 +196,36 @@ def test_haircut_ladder_is_report_only_does_not_change_quote() -> None:
     # Same RAW price + staleness: the ladder is identity/reporting only, never applied to the quote.
     assert qa.venue_decimal_price == qb.venue_decimal_price == 1.72
     assert qa.staleness_s == qb.staleness_s == 300
+
+
+# ── keying bridge: the TxLINE (market_key, side) → C-3 frame ``market_ref`` mapper ──────────────
+#
+# The REAL TxLINE marketstate keys the 1X2 FULL-match market as ``"1X2_PARTICIPANT_RESULT||"`` with a
+# SEPARATE per-participant side dimension (``part1`` / ``draw`` / ``part2``, verified against the real
+# pack + numerically: part1 ≈ venue home, part2 ≈ venue away). The C-3 frames instead bake the side
+# INTO the ref (``"1X2|home|full"``). Without a bridge the agent queries the source with the TxLINE key
+# — which is not a frame ref — so every 1X2-full lookup misses (the Run-002-VvV 0%-coverage artifact).
+# Non-1X2-full keys (half-match, Asian-handicap, over/under) have NO C/P1 frames, so they map to None
+# and their decisions skip the venue lookup entirely (out of venue scope, not "priced and missed").
+
+
+def test_txline_market_to_venue_ref_bridges_real_1x2_full_and_side() -> None:
+    """The real TxLINE 1X2-FULL key + each real side token maps to the matching C-3 frame ``market_ref``."""
+    assert txline_market_to_venue_ref("1X2_PARTICIPANT_RESULT||", "part1") == "1X2|home|full"
+    assert txline_market_to_venue_ref("1X2_PARTICIPANT_RESULT||", "part2") == "1X2|away|full"
+    assert txline_market_to_venue_ref("1X2_PARTICIPANT_RESULT||", "draw") == "1X2|draw|full"
+
+
+def test_txline_market_to_venue_ref_returns_none_for_out_of_scope_markets() -> None:
+    """Non-1X2-full keys (half-match / Asian-handicap / over-under) and unknown sides have NO frame → None."""
+    # 1X2 HALF-match (MarketPeriod=half=1) has no C/P1 frames → out of venue scope.
+    assert txline_market_to_venue_ref("1X2_PARTICIPANT_RESULT|half=1|", "part1") is None
+    # Other families never had frames in C/P1 (1X2-full only).
+    assert txline_market_to_venue_ref("OVERUNDER_PARTICIPANT_GOALS||line=2.5", "over") is None
+    assert txline_market_to_venue_ref("ASIANHANDICAP_PARTICIPANT_GOALS||line=-0.5", "part1") is None
+    # An unrecognized side token on the covered market is still unmappable → None (never a wrong ref).
+    assert txline_market_to_venue_ref("1X2_PARTICIPANT_RESULT||", "home") is None
+    assert txline_market_to_venue_ref("1X2_PARTICIPANT_RESULT||", "part3") is None
 
 
 def test_missing_market_and_fixture_return_none() -> None:

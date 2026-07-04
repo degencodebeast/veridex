@@ -15,9 +15,8 @@ from types import SimpleNamespace
 import pytest
 
 from tests.test_drift_agent import _ms
-from tests.test_replay_pack import _write_session
+from tests.test_value_vs_venue import _write_1x2_session
 from veridex.ingest.marketstate import MarketState
-from veridex.ingest.replay_pack import pack_from_session
 from veridex.runtime.window import RunWindow
 from veridex.venues.polymarket import decimal_to_native
 from veridex.venues.price_history import VenuePriceHistoryFrame
@@ -53,15 +52,18 @@ def test_estimated_edge_seam_calls_the_4arg_timed_source_and_rejects_market_key_
     from veridex.backtest.vvv_report import _estimated_edge_over_fired_picks
     from veridex.strategies.value_vs_venue import vvv_signal
 
-    # A synthetic sealed run with ONE FOLLOW_MOMENTUM pick on 1X2|home / home @ 6000 bps at tick 0.
+    # A synthetic sealed run with ONE FOLLOW_MOMENTUM pick on the REAL 1X2-full key / part1 @ 6000 bps.
     row = {
         "raw_prescore": {
-            "raw_action": {"type": "FOLLOW_MOMENTUM", "params": {"market_key": "1X2|home", "side": "home"}}
+            "raw_action": {
+                "type": "FOLLOW_MOMENTUM",
+                "params": {"market_key": "1X2_PARTICIPANT_RESULT||", "side": "part1"},
+            }
         },
         "tick_seq": 0,
     }
     result = SimpleNamespace(score_rows=[row])
-    states_by_tick = {0: _ms(6000)}
+    states_by_tick = {0: _ms(6000, mk="1X2_PARTICIPANT_RESULT||", side="part1")}
 
     edge = _estimated_edge_over_fired_picks(
         result,  # type: ignore[arg-type]
@@ -126,9 +128,9 @@ def test_estimated_edge_prices_ms_tick_against_seconds_frames() -> None:
         ts=query_ts_ms,
         phase=0,
         markets={
-            "1X2|home|full": {
-                "stable_prob_bps": {"home": 6000},
-                "stable_price": {"home": 2.0},
+            "1X2_PARTICIPANT_RESULT||": {
+                "stable_prob_bps": {"part1": 6000},
+                "stable_price": {"part1": 2.0},
                 "suspended": False,
             }
         },
@@ -138,7 +140,7 @@ def test_estimated_edge_prices_ms_tick_against_seconds_frames() -> None:
         "raw_prescore": {
             "raw_action": {
                 "type": "FOLLOW_MOMENTUM",
-                "params": {"market_key": "1X2|home|full", "side": "home"},
+                "params": {"market_key": "1X2_PARTICIPANT_RESULT||", "side": "part1"},
             }
         },
         "tick_seq": 0,
@@ -165,9 +167,8 @@ async def test_vvv_report_uses_4arg_timed_source(tmp_path: Path) -> None:
     """
     from veridex.backtest.vvv_report import vvv_report_with_estimated_edge
 
-    session_dir = _write_session(tmp_path)
-    pack_dir = tmp_path / "pack"
-    pack_from_session(session_dir, pack_dir)
+    # REAL-FORMAT 1X2-full pack so the agent's market-identity bridge resolves each side to its frame ref.
+    pack_dir = _write_1x2_session(tmp_path, [40.0, 25.0, 35.0])
 
     result, report = await vvv_report_with_estimated_edge(
         pack_dir,
@@ -182,7 +183,3 @@ async def test_vvv_report_uses_4arg_timed_source(tmp_path: Path) -> None:
     assert report.estimated_executable_edge_bps is not None  # fired + attached post-build
     assert report.real_executable_edge_bps is None  # paper venue — no live fill (CON-003)
     assert report.run_id == result.run_id
-
-
-# ``_ms`` builds a real one-side MarketState (fixture_id=5, mk="1X2|home", side="home"); reuse it here.
-from tests.test_drift_agent import _ms  # noqa: E402  (after module docstring/imports by intent)

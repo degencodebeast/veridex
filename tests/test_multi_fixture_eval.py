@@ -19,6 +19,7 @@ from pathlib import Path
 import pytest
 
 from tests.test_replay_pack import _write_session
+from tests.test_value_vs_venue import _write_1x2_session
 from veridex.backtest.evaluation import (
     EvalProtocol,
     produce_results_by_fixture,
@@ -129,11 +130,27 @@ def test_nulls_and_abstentions_are_counted_honestly() -> None:
 
 
 def _real_pack(tmp_path: Path) -> Path:
-    """A real, hashed 1X2 pack (fixture 5) built through the same normalizer the live loop uses."""
+    """A real, hashed 1X2 pack (fixture 5) built through the same normalizer the live loop uses.
+
+    NOTE: this pack uses a fabricated 1X2 SuperOddsType/side shape (``1X2||`` + Home/Draw/Away) — fine
+    for the venue-BLIND drift/baseline legs (which never touch the market-identity bridge), but NOT for
+    VvV firing. VvV tests that must fire a venue-priced pick use :func:`_real_1x2_full_pack` instead.
+    """
     session_dir = _write_session(tmp_path)
     pack_dir = tmp_path / "pack"
     pack_from_session(session_dir, pack_dir)
     return pack_dir
+
+
+def _real_1x2_full_pack(tmp_path: Path) -> Path:
+    """A real, hashed pack (fixture 5) in the REAL TxLINE 1X2-FULL shape the market-identity bridge needs.
+
+    ``1X2_PARTICIPANT_RESULT||`` + sides ``part1``/``draw``/``part2`` (part1=home, part2=away) — the exact
+    key/side format the real pack + Run-002 feed, so the VvV agent's ``txline_market_to_venue_ref`` bridge
+    resolves each side to its C-3 frame ref and prices against the injected source. Sub-50% fair probs so a
+    generous venue decimal (5.0) fires and a break-even one (2.0) does not.
+    """
+    return _write_1x2_session(tmp_path, [40.0, 25.0, 35.0])
 
 
 def test_producer_generates_results_then_feeds_the_evaluation(tmp_path: Path) -> None:
@@ -178,7 +195,7 @@ def test_producer_runs_all_named_baselines(tmp_path: Path) -> None:
 
 def test_producer_runs_value_vs_venue_only_with_a_source(tmp_path: Path) -> None:
     """VvV runs (and its estimated-edge metric appears at the venue rung) ONLY when a source is given (DRIFT-2)."""
-    pack_dir = _real_pack(tmp_path)
+    pack_dir = _real_1x2_full_pack(tmp_path)
     proto = _proto(fixture_ids=[5], strategy_configs=["value-vs-venue"], baselines=[])
 
     # venue decimal 5.0 makes every fixture-5 side's edge positive, so the agent FIRES.
@@ -411,7 +428,7 @@ def test_post_build_estimated_edge_does_not_mutate_sealed_hash(tmp_path: Path) -
     producer path must seal the IDENTICAL ``evidence_hash`` — the estimated edge is attached to the
     report via ``model_copy`` AFTER the venue-free build, so the sealed run never learns it exists.
     """
-    pack_dir = _real_pack(tmp_path)
+    pack_dir = _real_1x2_full_pack(tmp_path)
     window = RunWindow(
         window_id="w_vvv", fixture_id=5, market_allowlist=["1X2"], end_rule="pre_match", min_clv_horizon_s=0
     )
@@ -437,7 +454,7 @@ def test_post_build_estimated_edge_does_not_mutate_sealed_hash(tmp_path: Path) -
 def test_vvv_producer_collects_decision_quote_coverage_with_staleness(tmp_path: Path) -> None:
     """The producer records a VvV decision per tick; matched decisions carry staleness (6b) and flow
     into ``decision_quote_coverage`` computed over ALL decisions (CON-012), not just fired picks."""
-    pack_dir = _real_pack(tmp_path)
+    pack_dir = _real_1x2_full_pack(tmp_path)
     proto = _proto(fixture_ids=[5], strategy_configs=["value-vs-venue"], baselines=[])
 
     decision_sink: dict[int, list[VenueDecision]] = {}
@@ -473,6 +490,78 @@ def test_vvv_producer_collects_decision_quote_coverage_with_staleness(tmp_path: 
     assert cov.quote_matched_count == sum(1 for d in decisions if d.quote_matched)
     # 6b flow: matched staleness (120s → <=2m) is bucketed, summing exactly to quote_matched_count.
     assert sum(cov.freshness_bucket_counts_for_used_quotes.values()) == cov.quote_matched_count
+
+
+# ── keying bridge: out-of-venue-scope decisions must not dilute the quote-coverage denominator ───
+#
+# ``quote_matched_pct`` answers "of the decisions the venue COULD price (1X2-full, which has frames),
+# how many matched a quote under the freshness bound?". A non-1X2-full decision (AH / OU / 1X2-half)
+# has NO C/P1 frame — it is OUT OF VENUE SCOPE, categorically distinct from "in scope but no quote
+# near this tick". Counting it as an unmatched in-scope decision would silently understate the true
+# coverage. So it is excluded from ``decision_count`` and tracked separately in ``out_of_venue_scope_count``.
+
+
+def test_out_of_venue_scope_decisions_excluded_from_coverage_denominator() -> None:
+    """A None-mapped (out-of-scope) decision is NOT an in-scope unmatched decision — it is excluded."""
+    decisions = [
+        VenueDecision(fired=False, quote_matched=True, staleness_s=30, in_venue_scope=True),   # in scope, matched
+        VenueDecision(fired=False, quote_matched=False, in_venue_scope=True),                   # in scope, no quote
+        VenueDecision(fired=False, quote_matched=False, in_venue_scope=False),                  # OUT of venue scope
+        VenueDecision(fired=False, quote_matched=False, in_venue_scope=False),                  # OUT of venue scope
+    ]
+
+    report = build_venue_behavior_report(
+        [],
+        decisions,
+        haircut_ladder_bps=[0],
+        prob_bands=[(0, 100)],
+        ttc_buckets=["<1h", ">24h"],
+        freshness_buckets=["<=2m", "<=5m"],
+    )
+    cov = report.decision_quote_coverage
+
+    # Denominator is the IN-SCOPE (1X2-full) decisions only — the two out-of-scope decisions are excluded.
+    assert cov.decision_count == 2
+    assert cov.out_of_venue_scope_count == 2
+    assert cov.quote_matched_count == 1
+    assert cov.quote_none_count == 1  # the ONE in-scope no-quote decision — NOT the out-of-scope ones
+    assert cov.quote_matched_pct == 50.0  # 1 matched / 2 in-scope, not 1/4
+
+
+def test_collect_marks_non_1x2_market_out_of_venue_scope() -> None:
+    """A WAIT tick whose only market is non-1X2 (no frame) is recorded OUT of venue scope, not unmatched."""
+    from types import SimpleNamespace
+
+    from veridex.backtest.evaluation import _collect_vvv_venue_behavior
+
+    ou_only = MarketState(
+        fixture_id=5,
+        tick_seq=0,
+        ts=_QUERY_TS_MS,
+        phase=0,
+        markets={
+            "OVERUNDER_PARTICIPANT_GOALS||line=2.5": {
+                "stable_prob_bps": {"over": 5000, "under": 5000},
+                "stable_price": {"over": 2.0, "under": 2.0},
+                "suspended": False,
+            }
+        },
+        scores={},
+    )
+    wait_row = {"tick_seq": 0, "raw_prescore": {"raw_action": {"type": "WAIT", "params": {}}}}
+    result = SimpleNamespace(score_rows=[wait_row])
+
+    _rows, decisions = _collect_vvv_venue_behavior(
+        result,  # type: ignore[arg-type]
+        {0: ou_only},
+        venue_price_source=_fires_src(),  # would match if it were ever CALLED — it must not be for OU
+        close_ts=_QUERY_TS_MS // 1000,
+        coverage_class="ok",
+    )
+
+    assert len(decisions) == 1
+    assert decisions[0].in_venue_scope is False, "an over/under-only tick is out of venue scope (no frame)"
+    assert decisions[0].quote_matched is False, "out of scope ⇒ never a fabricated match"
 
 
 # ── Units regression (Run-002-VvV): decision-coverage collection queries a SECONDS-keyed source ──
@@ -513,16 +602,20 @@ def _seconds_frame_source():
 
 
 def _ms_query_state() -> MarketState:
-    """A 1X2|home tick whose ``ts`` is unix MILLISECONDS (13-digit) — the real decision-query scale."""
+    """A REAL-FORMAT 1X2-full tick (``1X2_PARTICIPANT_RESULT||`` + ``part1``) with ``ts`` in unix MS.
+
+    The market-identity bridge maps ``part1`` on the 1X2-full key to the frame ref ``1X2|home|full`` the
+    seconds source is keyed by, so the ms→s conversion is what determines match vs None.
+    """
     return MarketState(
         fixture_id=5,
         tick_seq=0,
         ts=_QUERY_TS_MS,
         phase=0,
         markets={
-            "1X2|home|full": {
-                "stable_prob_bps": {"home": 6000},
-                "stable_price": {"home": 2.0},
+            "1X2_PARTICIPANT_RESULT||": {
+                "stable_prob_bps": {"part1": 6000},
+                "stable_price": {"part1": 2.0},
                 "suspended": False,
             }
         },
@@ -549,7 +642,7 @@ def test_collect_venue_behavior_converts_ms_tick_to_seconds_for_lookup() -> None
         "raw_prescore": {
             "raw_action": {
                 "type": "FOLLOW_MOMENTUM",
-                "params": {"market_key": "1X2|home|full", "side": "home"},
+                "params": {"market_key": "1X2_PARTICIPANT_RESULT||", "side": "part1"},
             }
         },
     }
@@ -578,7 +671,7 @@ def test_collect_venue_behavior_converts_ms_tick_to_seconds_for_lookup() -> None
 def test_vvv_producer_records_unmatched_decisions_when_source_is_none(tmp_path: Path) -> None:
     """A source that never has a quote yields all-WAIT, all-unmatched decisions — the honest
     "could not price under the bound" coverage signal, never a fabricated match (CON-012)."""
-    pack_dir = _real_pack(tmp_path)
+    pack_dir = _real_1x2_full_pack(tmp_path)
     proto = _proto(fixture_ids=[5], strategy_configs=["value-vs-venue"], baselines=[])
 
     decision_sink: dict[int, list[VenueDecision]] = {}

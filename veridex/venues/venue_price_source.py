@@ -84,6 +84,51 @@ def txline_ts_to_venue_seconds(ts_ms: int) -> int:
     return ts_ms // 1000
 
 
+#: The REAL TxLINE market_key for the 1X2 FULL-match market: ``{SuperOddsType}|{MarketPeriod}|{MarketParameters}``
+#: with an EMPTY period/params (full match) collapses to ``"1X2_PARTICIPANT_RESULT||"``. The 1X2 HALF-match
+#: market is ``"1X2_PARTICIPANT_RESULT|half=1|"`` (a different key) and has NO C/P1 frames.
+_TXLINE_1X2_FULL_MARKET_KEY = "1X2_PARTICIPANT_RESULT||"
+
+#: The REAL TxLINE 1X2 side tokens (``PriceNames`` in the raw feed, ``stable_prob_bps`` keys after
+#: normalization) → the C-3 frame ``market_ref``'s side token. ``part1`` is the HOME participant and
+#: ``part2`` the AWAY participant (listed first/second in TxLINE), verified against ``packs/18179763``
+#: both structurally and numerically (part1 ≈ venue home implied prob, part2 ≈ venue away). ``draw``
+#: is the draw. Any other token (e.g. a raw ``home``/``away``) is unmappable → no frame → ``None``.
+_TXLINE_1X2_SIDE_TO_VENUE_SIDE = {"part1": "home", "part2": "away", "draw": "draw"}
+
+
+def txline_market_to_venue_ref(market_key: str, side: str) -> str | None:
+    """Bridge a TxLINE ``(market_key, side)`` decision coordinate to a C-3 frame ``market_ref``, or ``None``.
+
+    The C-3 :class:`~veridex.venues.price_history.VenuePriceHistoryFrame`s are keyed by a Polymarket-side
+    ``market_ref`` that BAKES the side into the ref (``"1X2|home|full"``). The REAL TxLINE marketstate
+    instead keys the 1X2 FULL-match market as ``"1X2_PARTICIPANT_RESULT||"`` with the side as a SEPARATE
+    dimension (``part1`` / ``draw`` / ``part2`` in ``stable_prob_bps``). This function is the identity
+    bridge between those two namespaces: given the TxLINE key + side the agent is deciding on, it returns
+    the frame ``market_ref`` to look the quote up under — the string the source's index is keyed by.
+
+    Only the 1X2 FULL-match market is in venue scope for C/P1: Polymarket frames exist for that market
+    and all three sides ONLY. Every other TxLINE market — 1X2 HALF-match (``"...|half=1|"``),
+    Asian-handicap, over/under — has NO frame and returns ``None`` so its decisions SKIP the venue lookup
+    (out of venue scope, distinct from "in scope but no quote near this tick"). An unrecognized side token
+    on the covered market also returns ``None`` (never guess a wrong ref).
+
+    Args:
+        market_key: The TxLINE ``MarketState.markets`` key (e.g. ``"1X2_PARTICIPANT_RESULT||"``).
+        side: The TxLINE side token (a ``stable_prob_bps`` key, e.g. ``"part1"``).
+
+    Returns:
+        The C-3 frame ``market_ref`` (e.g. ``"1X2|home|full"``) to query the source with, or ``None``
+        when the coordinate is out of the C/P1 venue scope (no backfilled frame exists for it).
+    """
+    if market_key != _TXLINE_1X2_FULL_MARKET_KEY:
+        return None
+    venue_side = _TXLINE_1X2_SIDE_TO_VENUE_SIDE.get(side)
+    if venue_side is None:
+        return None
+    return f"1X2|{venue_side}|full"
+
+
 def _compute_venue_source_id(
     *,
     price_history_artifact_hashes: Sequence[str],

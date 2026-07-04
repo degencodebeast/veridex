@@ -16,7 +16,6 @@ from pathlib import Path
 import pytest
 
 from tests.test_drift_agent import _ms
-from tests.test_replay_pack import _write_session
 from veridex.ingest.marketstate import MarketState
 from veridex.ingest.replay_pack import pack_from_session
 from veridex.runtime.window import RunWindow
@@ -74,16 +73,21 @@ def _seconds_frame_source() -> VenuePriceSource:
 
 
 def _ms_query_state() -> MarketState:
-    """A TxLINE tick whose ``ts`` is unix MILLISECONDS (13-digit) — the real decision-query scale."""
+    """A REAL-FORMAT TxLINE tick: ``ts`` in unix MILLISECONDS (13-digit) AND the real 1X2-full key/side.
+
+    The market_key is ``1X2_PARTICIPANT_RESULT||`` (side NOT embedded) and the side dimension lives in
+    ``stable_prob_bps`` as ``part1`` (home) — exactly what the real pack + Run-002 feed. Priced against
+    the seconds frames keyed ``1X2|home|full`` via the market-identity bridge (``part1`` → home).
+    """
     return MarketState(
         fixture_id=_FIXTURE_ID,
         tick_seq=0,
         ts=_QUERY_TS_MS,
         phase=0,
         markets={
-            "1X2|home|full": {
-                "stable_prob_bps": {"home": 6000},
-                "stable_price": {"home": 2.0},
+            "1X2_PARTICIPANT_RESULT||": {
+                "stable_prob_bps": {"part1": 6000},
+                "stable_price": {"part1": 2.0},
                 "suspended": False,
             }
         },
@@ -207,7 +211,7 @@ def test_vvv_action_params_do_not_smuggle_venue_data_into_evidence() -> None:
     from veridex.strategies.value_vs_venue import value_vs_venue_agent
 
     agent = value_vs_venue_agent(venue_price_source=_src(2.0), venue_source_id="test-venue-src")
-    action = asyncio.run(agent.decide(_ms(6000)))
+    action = asyncio.run(agent.decide(_ms(6000, mk="1X2_PARTICIPANT_RESULT||", side="part1")))
 
     assert action.type != "WAIT", "fair 6000 @ decimal 2.0 clears a 0 min-edge and must fire"
     # params are a SUBSET of the TxLINE-derived allowlist — nothing else may ride into the seal.
@@ -233,7 +237,7 @@ def test_venue_numbers_never_in_action_params() -> None:
     agent = value_vs_venue_agent(
         agent_id="vvv", venue_price_source=_src(1.90, staleness_s=120), venue_source_id="src#1", min_edge_bps=0
     )
-    action = asyncio.run(agent.decide(_ms(5500)))
+    action = asyncio.run(agent.decide(_ms(5500, mk="1X2_PARTICIPANT_RESULT||", side="part1")))
 
     assert action.type != "WAIT", "fair 0.55 @ decimal 1.90 clears a 0 min-edge and must fire"
     for forbidden in ("venue_decimal_price", "gap_bps", "estimated_executable_edge_bps", "staleness", "staleness_s"):
@@ -263,8 +267,33 @@ def test_agent_prices_ms_decision_ts_against_seconds_frames_and_fires() -> None:
         "a ms decision ts vs seconds frames must convert to seconds and MATCH (staleness 3s ≤ 900), "
         "not overrun the freshness bound → None → WAIT"
     )
-    assert action.params.get("market_key") == "1X2|home|full"
-    assert action.params.get("side") == "home"
+    assert action.params.get("market_key") == "1X2_PARTICIPANT_RESULT||"
+    assert action.params.get("side") == "part1"
+
+
+def test_agent_matches_real_txline_1x2_key_via_venue_ref_bridge() -> None:
+    """REAL-KEY regression (the keying-bridge bug): the agent prices the REAL TxLINE 1X2-full key.
+
+    The venue source is keyed by the C-3 frame ref ``1X2|home|full``; the REAL TxLINE marketstate keys
+    the 1X2-full market as ``1X2_PARTICIPANT_RESULT||`` with side ``part1``. Without the market-identity
+    bridge the agent queries ``source(fixture_id, "1X2_PARTICIPANT_RESULT||", "part1", ts)`` — a key the
+    seconds-frame index (``1X2|home|full``) does not contain → ``None`` → WAIT on every tick (Run-002-VvV
+    0% coverage). With the bridge ``part1`` on the 1X2-full key resolves to ``1X2|home|full`` and the
+    quote MATCHES → the agent FIRES (fair 0.60 @ decimal 2.0 → +0.20 edge). The sealed action still
+    carries ONLY the TxLINE-derived key/side (never the venue ref) — INVARIANT 4 untouched.
+    """
+    from veridex.strategies.value_vs_venue import value_vs_venue_agent
+
+    agent = value_vs_venue_agent(venue_price_source=_seconds_frame_source(), venue_source_id="src-seconds")
+    action = asyncio.run(agent.decide(_ms_query_state()))
+
+    assert action.type != "WAIT", (
+        "the REAL TxLINE 1X2-full key (1X2_PARTICIPANT_RESULT|| + part1) must bridge to the frame ref "
+        "1X2|home|full and MATCH the seconds source — not miss the index → None → WAIT (the 0%-coverage bug)"
+    )
+    # The sealed params carry the RAW TxLINE coordinate, NOT the venue ref (the bridge is query-only).
+    assert action.params.get("market_key") == "1X2_PARTICIPANT_RESULT||"
+    assert action.params.get("side") == "part1"
 
 
 def test_agent_waits_when_source_returns_none() -> None:
@@ -272,7 +301,7 @@ def test_agent_waits_when_source_returns_none() -> None:
     from veridex.strategies.value_vs_venue import value_vs_venue_agent
 
     agent = value_vs_venue_agent(agent_id="vvv", venue_price_source=_src(None), venue_source_id="src#1")
-    action = asyncio.run(agent.decide(_ms(5500)))
+    action = asyncio.run(agent.decide(_ms(5500, mk="1X2_PARTICIPANT_RESULT||", side="part1")))
 
     assert action.type == "WAIT"  # AgentAction.type, not .action
 
@@ -292,8 +321,8 @@ def test_same_quote_different_venue_source_id_changes_raw_prescore_config_not_ev
     a = value_vs_venue_agent(agent_id="vvv", venue_price_source=src, venue_source_id="src#A")
     b = value_vs_venue_agent(agent_id="vvv", venue_price_source=src, venue_source_id="src#B")
 
-    res_a = asyncio.run(run_competition([_ms(5500)], [a], source_mode="replay"))
-    res_b = asyncio.run(run_competition([_ms(5500)], [b], source_mode="replay"))
+    res_a = asyncio.run(run_competition([_ms(5500, mk="1X2_PARTICIPANT_RESULT||", side="part1")], [a], source_mode="replay"))
+    res_b = asyncio.run(run_competition([_ms(5500, mk="1X2_PARTICIPANT_RESULT||", side="part1")], [b], source_mode="replay"))
 
     def _fired_prescore(res: object) -> dict:
         fired = [
@@ -343,9 +372,9 @@ async def test_vvv_produces_report_with_estimated_edge_but_scored_path_stays_ven
     """The producer attaches an estimated edge POST-build; the scored/ranked path stays venue-blind."""
     from veridex.backtest.vvv_report import vvv_report_with_estimated_edge
 
-    session_dir = _write_session(tmp_path)
-    pack_dir = tmp_path / "pack"
-    pack_from_session(session_dir, pack_dir)
+    # A REAL-FORMAT 1X2-full pack (1X2_PARTICIPANT_RESULT|| + part1/draw/part2) so the agent's
+    # market-identity bridge resolves each side to its frame ref and prices against the source.
+    pack_dir = _write_1x2_session(tmp_path, [40.0, 25.0, 35.0])
 
     assumptions = {"no_interpolation": True, "slippage_bps": 0, "costs_bps": 0}
     # venue decimal 5.0 makes every fixture-5 side's edge strongly positive, so the agent FIRES —
@@ -374,10 +403,12 @@ async def test_vvv_produces_report_with_estimated_edge_but_scored_path_stays_ven
 
 
 def _write_1x2_session(tmp_path: Path, pct: list[float]) -> Path:
-    """A real, hashed 1X2 pack (fixture 5) whose de-vigged fair probs come from ``pct`` (percent).
+    """A real, hashed 1X2 pack (fixture 5) in the REAL TxLINE 1X2-full format, fair probs from ``pct``.
 
-    Two identical ticks so the pre_match window splits the last as the reconstructed close and the
-    agent decides on exactly one tick.
+    ``SuperOddsType="1X2_PARTICIPANT_RESULT"`` + ``PriceNames=["part1","draw","part2"]`` reproduce the
+    exact key/side shape of the real pack (market_key ``1X2_PARTICIPANT_RESULT||``, sides part1/draw/part2
+    — part1=home, part2=away). ``pct`` stays column-ordered ``[home, draw, away]``. Two identical ticks so
+    the pre_match window splits the last as the reconstructed close and the agent decides on exactly one tick.
     """
     from veridex.ingest.recorder import SessionMeta, envelope_line
 
@@ -386,10 +417,10 @@ def _write_1x2_session(tmp_path: Path, pct: list[float]) -> Path:
             "FixtureId": _FIXTURE_ID,
             "Ts": ts,
             "InRunning": False,
-            "SuperOddsType": "1X2",
+            "SuperOddsType": "1X2_PARTICIPANT_RESULT",
             "MarketPeriod": None,
             "MarketParameters": None,
-            "PriceNames": ["Home", "Draw", "Away"],
+            "PriceNames": ["part1", "draw", "part2"],
             "Prices": [2500, 3200, 2800],
             "Pct": pct,
         }
@@ -425,9 +456,9 @@ async def test_estimated_edge_is_none_when_the_strategy_fires_no_picks(tmp_path:
     """
     from veridex.backtest.vvv_report import vvv_report_with_estimated_edge
 
-    session_dir = _write_session(tmp_path)
-    pack_dir = tmp_path / "pack"
-    pack_from_session(session_dir, pack_dir)
+    # REAL-FORMAT 1X2-full pack; every side < 5000 bps so at decimal 2.0 every edge is NEGATIVE (fair*2-1
+    # < 0) and the agent WAITs on every in-scope tick — the honest "took nothing" case (F2).
+    pack_dir = _write_1x2_session(tmp_path, [40.0, 25.0, 35.0])
 
     result, report = await vvv_report_with_estimated_edge(
         pack_dir,
@@ -446,14 +477,14 @@ async def test_estimated_edge_is_none_when_the_strategy_fires_no_picks(tmp_path:
 async def test_estimated_edge_reflects_the_fired_pick_not_a_larger_unfired_opportunity(tmp_path: Path) -> None:
     """F2: the reported edge is the STRATEGY'S taken pick's edge, not the best market opportunity.
 
-    Pct makes Home (4000 bps) the max-fair side, but ``Away`` (3500 bps) sorts first, so the agent
-    FIRES on Away and never takes Home. The old global-max aggregate reported Home's (larger) edge —
-    an opportunity the strategy declined; the honest answer is Away's edge (the position it took).
+    Pct makes ``part1`` (home, 4000 bps) the max-fair side, but ``draw`` (2500 bps) sorts first, so the
+    agent FIRES on draw and never takes part1. The old global-max aggregate reported part1's (larger)
+    edge — an opportunity the strategy declined; the honest answer is draw's edge (the position it took).
     """
     from veridex.backtest.vvv_report import vvv_report_with_estimated_edge
     from veridex.strategies.value_vs_venue import vvv_signal
 
-    pack_dir = _write_1x2_session(tmp_path, [40.0, 25.0, 35.0])  # Home 4000 > Away 3500 > Draw 2500
+    pack_dir = _write_1x2_session(tmp_path, [40.0, 25.0, 35.0])  # part1 4000 > part2 3500 > draw 2500
 
     result, report = await vvv_report_with_estimated_edge(
         pack_dir,
@@ -461,15 +492,15 @@ async def test_estimated_edge_reflects_the_fired_pick_not_a_larger_unfired_oppor
         venue_price_source=_src(3.0),
         venue_source_id="test-venue-src",
         window=_window(),
-        min_edge_bps=-(10**9),  # everything clears → agent fires the first-sorted side (Away)
+        min_edge_bps=-(10**9),  # everything clears → agent fires the first-sorted side (draw)
         assumptions={"no_interpolation": True},
     )
 
     picks = _fired_picks(result)
-    assert picks and picks[0]["side"] == "Away"  # the strategy actually took Away, not Home
+    assert picks and picks[0]["side"] == "draw"  # the strategy took the sorted-first side, NOT max-fair part1
 
-    away_edge = vvv_signal(3500, 3.0)["estimated_executable_edge_bps"]  # the FIRED pick's edge
-    home_edge = vvv_signal(4000, 3.0)["estimated_executable_edge_bps"]  # the larger UNFIRED edge
-    assert away_edge < home_edge  # the discrimination is real (Away < Home)
-    assert report.estimated_executable_edge_bps == away_edge  # reflects the FIRED pick...
+    draw_edge = vvv_signal(2500, 3.0)["estimated_executable_edge_bps"]  # the FIRED pick's edge
+    home_edge = vvv_signal(4000, 3.0)["estimated_executable_edge_bps"]  # the larger UNFIRED edge (part1/home)
+    assert draw_edge < home_edge  # the discrimination is real (draw < part1)
+    assert report.estimated_executable_edge_bps == draw_edge  # reflects the FIRED pick...
     assert report.estimated_executable_edge_bps != home_edge  # ...NOT the larger unfired opportunity

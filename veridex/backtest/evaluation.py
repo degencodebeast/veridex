@@ -58,6 +58,7 @@ from veridex.strategies.value_vs_venue import vvv_signal
 from veridex.venues.venue_price_source import (
     TimedVenueQuote,
     VenuePriceSource,
+    txline_market_to_venue_ref,
     txline_ts_to_venue_seconds,
 )
 
@@ -271,15 +272,23 @@ def _pre_match_close_ts(marketstates: list[MarketState], window: RunWindow) -> i
 
 def _first_matched_quote(
     state: MarketState, venue_price_source: VenuePriceSource
-) -> TimedVenueQuote | None:
+) -> tuple[TimedVenueQuote | None, bool]:
     """The first time-aligned quote over the VvV agent's OWN market/side iteration on this tick.
 
     Mirrors :func:`~veridex.strategies.value_vs_venue.value_vs_venue_agent`'s decide loop (sorted
-    markets, skip suspended / non-dict prob maps, sorted sides) so "could this tick be priced?" is
-    answered over exactly the coordinates the agent evaluated — the honest ``quote_matched`` signal for
-    a WAIT tick (CON-012). Returns ``None`` when no side had a quote under the source's freshness bound.
+    markets, skip suspended / non-dict prob maps, sorted sides, and — like the agent — bridging each
+    ``(market_key, side)`` to the C-3 frame ``market_ref``, skipping out-of-venue-scope coordinates) so
+    "could this tick be priced?" is answered over exactly the coordinates the agent evaluated — the
+    honest ``quote_matched`` signal for a WAIT tick (CON-012).
+
+    Returns ``(quote, in_venue_scope)``: ``quote`` is the first matched quote (or ``None`` when no
+    in-scope side had a quote under the freshness bound), and ``in_venue_scope`` is ``True`` iff the tick
+    had at least one coordinate the venue could price (a 1X2-full side with a frame). A tick with NO
+    in-scope coordinate (only AH / OU / 1X2-half) is out of venue scope — distinct from "in scope but no
+    quote" — and is excluded from the quote-coverage denominator.
     """
     markets: dict[str, dict[str, Any]] = getattr(state, "markets", {}) or {}
+    in_venue_scope = False
     for market_key in sorted(markets):
         market = markets[market_key]
         if market.get("suspended"):
@@ -288,13 +297,18 @@ def _first_matched_quote(
         if not isinstance(prob_bps, dict):
             continue
         for side in sorted(prob_bps):
+            # Bridge to the frame ``market_ref``; ``None`` ⇒ out of venue scope (no frame) → skip.
+            venue_ref = txline_market_to_venue_ref(market_key, side)
+            if venue_ref is None:
+                continue
+            in_venue_scope = True
             # Source is keyed by unix SECONDS; state.ts is unix MILLISECONDS → convert at the seam.
             quote = venue_price_source(
-                state.fixture_id, market_key, side, txline_ts_to_venue_seconds(state.ts)
+                state.fixture_id, venue_ref, side, txline_ts_to_venue_seconds(state.ts)
             )
             if quote is not None:
-                return quote
-    return None
+                return quote, True
+    return None, in_venue_scope
 
 
 def _collect_vvv_venue_behavior(
@@ -327,26 +341,35 @@ def _collect_vvv_venue_behavior(
         action_type = raw_action.get("type")
         fired = getattr(action_type, "value", action_type) == SportsActionType.FOLLOW_MOMENTUM.value
         if not fired:
-            quote = _first_matched_quote(state, venue_price_source)
+            quote, in_venue_scope = _first_matched_quote(state, venue_price_source)
             decisions.append(
                 VenueDecision(
                     fired=False,
                     quote_matched=quote is not None,
                     staleness_s=quote.staleness_s if quote is not None else None,
+                    in_venue_scope=in_venue_scope,
                 )
             )
             continue
 
-        # A fired pick prices against its OWN sealed (market_key, side) at the SAME tick it fired on.
+        # A fired pick prices against its OWN sealed (market_key, side) at the SAME tick it fired on,
+        # bridged to the C-3 frame ``market_ref``. ``None`` ⇒ out of venue scope (no frame) → the venue
+        # lookup is skipped and the decision is excluded from the quote-coverage denominator.
         params = raw_action.get("params", {})
         market_key = params.get("market_key")
         side = params.get("side")
+        venue_ref = (
+            txline_market_to_venue_ref(market_key, side)
+            if market_key is not None and side is not None
+            else None
+        )
+        in_venue_scope = venue_ref is not None
         # Source is keyed by unix SECONDS; state.ts is unix MILLISECONDS → convert at the seam.
         quote = (
             venue_price_source(
-                state.fixture_id, market_key, side, txline_ts_to_venue_seconds(state.ts)
+                state.fixture_id, venue_ref, side, txline_ts_to_venue_seconds(state.ts)
             )
-            if market_key is not None and side is not None
+            if venue_ref is not None
             else None
         )
         decisions.append(
@@ -354,6 +377,7 @@ def _collect_vvv_venue_behavior(
                 fired=True,
                 quote_matched=quote is not None,
                 staleness_s=quote.staleness_s if quote is not None else None,
+                in_venue_scope=in_venue_scope,
             )
         )
         if quote is None:

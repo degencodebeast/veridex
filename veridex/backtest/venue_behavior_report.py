@@ -75,6 +75,11 @@ class VenueDecision(BaseModel):
     fired: bool
     quote_matched: bool
     staleness_s: int | None = None
+    #: Whether this decision was on a market the venue COULD price (a 1X2-full coordinate with a C-3
+    #: frame). ``False`` marks an OUT-OF-VENUE-SCOPE decision — an AH / OU / 1X2-half market that has no
+    #: backfilled frame — which is excluded from the quote-coverage denominator (never a "priced and
+    #: missed" in-scope decision). Defaults ``True`` so existing in-scope constructions are unaffected.
+    in_venue_scope: bool = True
 
     @model_validator(mode="after")
     def _matched_quote_carries_an_age(self) -> VenueDecision:
@@ -116,6 +121,10 @@ class DecisionQuoteCoverage(BaseModel):
     fired_pick_quote_matched_count: int
     fired_pick_quote_none_count: int
     freshness_bucket_counts_for_used_quotes: dict[str, int]
+    #: Decisions that were OUT of venue scope (no C-3 frame for the market — AH / OU / 1X2-half), so the
+    #: venue lookup was skipped. Excluded from ``decision_count`` and NOT counted in ``quote_none_count``:
+    #: they are "not priceable by this venue at all", not "priceable but unmatched near this tick".
+    out_of_venue_scope_count: int = 0
 
 
 class VenueBehaviorReport(BaseModel):
@@ -293,14 +302,22 @@ def build_venue_behavior_report(
 def _decision_quote_coverage(
     decisions: Sequence[VenueDecision], freshness_buckets: Sequence[str]
 ) -> DecisionQuoteCoverage:
-    """Coverage over ALL decision opportunities (CON-012), plus a separate fired-pick split."""
-    decision_count = len(decisions)
-    matched = [d for d in decisions if d.quote_matched]
+    """Coverage over the IN-SCOPE decision opportunities (CON-012), plus a separate fired-pick split.
+
+    The denominator is the decisions the venue COULD price (``in_venue_scope`` — the 1X2-full family that
+    has C-3 frames), NOT every decision: an AH / OU / 1X2-half decision has no frame, so counting it as an
+    unmatched in-scope decision would silently understate the true quote coverage. Out-of-scope decisions
+    are excluded from ``decision_count`` and tracked separately in ``out_of_venue_scope_count``.
+    """
+    in_scope = [d for d in decisions if d.in_venue_scope]
+    out_of_venue_scope_count = len(decisions) - len(in_scope)
+    decision_count = len(in_scope)
+    matched = [d for d in in_scope if d.quote_matched]
     quote_matched_count = len(matched)
     quote_none_count = decision_count - quote_matched_count
     quote_matched_pct = round(quote_matched_count / decision_count * 100.0, 4) if decision_count else 0.0
 
-    fired = [d for d in decisions if d.fired]
+    fired = [d for d in in_scope if d.fired]
     fired_pick_count = len(fired)
     fired_pick_quote_matched_count = sum(1 for d in fired if d.quote_matched)
 
@@ -319,6 +336,7 @@ def _decision_quote_coverage(
         fired_pick_quote_matched_count=fired_pick_quote_matched_count,
         fired_pick_quote_none_count=fired_pick_count - fired_pick_quote_matched_count,
         freshness_bucket_counts_for_used_quotes=bucket_counts,
+        out_of_venue_scope_count=out_of_venue_scope_count,
     )
 
 
