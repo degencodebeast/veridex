@@ -26,6 +26,8 @@ import pytest
 
 from veridex.ingest.txline_client import (
     fetch_odds_updates,
+    fixtures_snapshot_url,
+    odds_snapshot_url,
     odds_stream_url,
     odds_updates_url,
     odds_validation_url,
@@ -54,6 +56,18 @@ def test_scores_and_stream_urls() -> None:
 
 def test_validation_url_keys_on_message_id() -> None:
     assert odds_validation_url(_BASE, "m-7") == "https://txline-dev.txodds.com/api/odds/validation?messageId=m-7"
+
+
+def test_fixtures_snapshot_url_is_documented_discovery_path() -> None:
+    # The DOCUMENTED discovery path (the bare `/api/fixtures` 404s).
+    url = fixtures_snapshot_url(_BASE, 72, 20213)
+    assert url == "https://txline-dev.txodds.com/api/fixtures/snapshot?competitionId=72&startEpochDay=20213"
+
+
+def test_odds_snapshot_url_requires_as_of() -> None:
+    # The bare snapshot is empty pre-match — asOf pins a point-in-time (CON-040).
+    url = odds_snapshot_url(_BASE, 123, 1782518400)
+    assert url == "https://txline-dev.txodds.com/api/odds/snapshot/123?asOf=1782518400"
 
 
 def test_validation_labels_are_honest() -> None:

@@ -30,6 +30,24 @@ def odds_updates_url(base: str, fid: int) -> str:
     return f"{base}/odds/updates/{fid}"
 
 
+def odds_snapshot_url(base: str, fid: int, as_of: int) -> str:
+    """``/odds/snapshot/{fid}?asOf=`` — point-in-time snapshot.
+
+    The BARE ``/odds/snapshot/{fid}`` is empty pre-match (CON-040); ``asOf`` (epoch seconds)
+    pins the snapshot to a specific instant so it can carry pre-match data.
+    """
+    return f"{base}/odds/snapshot/{fid}?asOf={as_of}"
+
+
+def fixtures_snapshot_url(base: str, competition_id: int, start_epoch_day: int) -> str:
+    """``/fixtures/snapshot?competitionId=&startEpochDay=`` — the DOCUMENTED discovery path.
+
+    Discovers fixtures for a competition from ``start_epoch_day`` onward. The bare ``/fixtures``
+    path 404s; this parameterized snapshot is the documented way to enumerate fixtures.
+    """
+    return f"{base}/fixtures/snapshot?competitionId={competition_id}&startEpochDay={start_epoch_day}"
+
+
 def odds_stream_url(base: str) -> str:
     """``/odds/stream`` — live SSE odds movement."""
     return f"{base}/odds/stream"
