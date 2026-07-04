@@ -194,6 +194,15 @@ class BacktestReport(BaseModel):
     #: the replay law actually verifies. Distinct from the (policy-envelope) ``policy_pass_fail_rate``.
     law_valid_rate: float
 
+    # --- close provenance / honest degrade marker (D2) ----------------------
+    #: NON-sealed, human-readable provenance for the pre_match close (the report analog of the live
+    #: runner's ``ops`` markers). ``None`` for a clean full-match ``pre_match`` (verified kickoff +
+    #: complete per-market CON-040 close). Non-None either (a) NOTES a pre-match-only pack (no verified
+    #: kickoff — still true CLV) or (b) NAMES a fail-closed DEGRADE (all-in-running / incomplete close),
+    #: in which case no row carries true ``clv_bps`` (the run finalized on window CLV) and ``avg_clv`` is
+    #: ``None``. Never part of the sealed evidence — a derived, explanatory marker only.
+    closing_note: str | None = None
+
     # --- explicit assumptions + the untouched score stack -------------------
     assumptions: BacktestAssumptions
     leaderboard: list[dict[str, Any]]
