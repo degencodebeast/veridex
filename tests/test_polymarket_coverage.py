@@ -114,6 +114,18 @@ def test_probe_shell_imports_network_free() -> None:
     assert callable(probe.render_summary)
 
 
+def test_prices_history_params_include_interval_and_pinned_fidelity() -> None:
+    # Root cause of the CLOB 400: no time component. The client MUST send a range (interval=max),
+    # and the fidelity is a PINNED constant (finest 1-min resolution), not an ad-hoc literal.
+    from scripts.txline_live.cp1_probe import CLOB_FIDELITY_MINUTES, _prices_history_params
+
+    params = _prices_history_params("TOKEN123")
+    assert params["market"] == "TOKEN123"
+    assert params["interval"] == "max"  # the mandatory time component (fixes HTTP 400)
+    assert params["fidelity"] == CLOB_FIDELITY_MINUTES
+    assert CLOB_FIDELITY_MINUTES == 1  # finest resolution pinned; matches minute-scale freshness buckets
+
+
 def test_probe_refuses_to_write_an_empty_artifact() -> None:
     import pytest
 

@@ -50,6 +50,18 @@ DEFAULT_OUT_DIR = Path(__file__).parent / "cp1"
 DEFAULT_FIXTURES_CONFIG = DEFAULT_OUT_DIR / "fixtures.json"
 CLOB_BASE_URL = "https://clob.polymarket.com"
 
+# CLOB /prices-history REQUIRES a time component — a bare ?market=<tok> 400s with
+# "the time component is mandatory, please use 'startTs' and 'endTs' or 'interval'". We pass
+# interval=max to pull the full available price path, then filter to pre-kickoff downstream.
+CLOB_INTERVAL = "max"
+# Fidelity is the point spacing in MINUTES (empirically: fidelity=60 -> ~1 point/hour,
+# fidelity=1 -> ~1 point/minute). Pinned to 1 = the FINEST resolution: it yields the most
+# complete pre-kickoff price path and matches the minute-scale freshness buckets
+# ("<=2m"/"<=5m"/"<=15m"). NOT tuned to the >=5 gate — both 1 and 60 clear it by 20-600x on
+# real WC markets, so the covered verdict is invariant to this choice; we pick the most faithful
+# resolution, never the count-maximizing one.
+CLOB_FIDELITY_MINUTES = 1
+
 # The probe's single source of truth for the covered threshold (CON-001 default). Threaded into
 # BOTH evaluate_venue_coverage (which produces the covered flags) and the recorded artifact, so
 # the artifact's min_pre_kickoff can never silently disagree with the covered flags it ships.
@@ -181,14 +193,23 @@ async def _probe_one(
     )
 
 
+def _prices_history_params(token_id: str) -> dict[str, Any]:
+    """Build the CLOB ``/prices-history`` query params (pure, so the range/fidelity is testable).
+
+    Includes the mandatory time component (``interval``) — the missing piece that made bare
+    ``?market=<tok>`` 400 — plus the pinned :data:`CLOB_FIDELITY_MINUTES` resolution.
+    """
+    return {"market": token_id, "interval": CLOB_INTERVAL, "fidelity": CLOB_FIDELITY_MINUTES}
+
+
 class _DefaultPricesHistoryClient:
     """Live Polymarket CLOB ``/prices-history`` client (httpx imported lazily; offline-safe import)."""
 
     async def get_prices_history(self, token_id: str) -> list[dict[str, Any]]:
         import httpx
 
-        async with httpx.AsyncClient(base_url=CLOB_BASE_URL, timeout=15.0) as http:
-            response = await http.get("/prices-history", params={"market": token_id, "fidelity": 1})
+        async with httpx.AsyncClient(base_url=CLOB_BASE_URL, timeout=20.0) as http:
+            response = await http.get("/prices-history", params=_prices_history_params(token_id))
             response.raise_for_status()
             data = response.json()
         history = data.get("history", data) if isinstance(data, dict) else data
