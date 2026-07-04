@@ -301,6 +301,15 @@ async def produce_results_by_fixture(
         (``{"fixture_id", "kind", "market", "action", "clv_bps"}``) — the exact input
         :func:`run_multi_fixture_evaluation` consumes.
     """
+    # FU-2 fail-loud (review Finding A): the manifest is the "no filter claim without it" artifact, so
+    # filtering with nowhere to retain the eligible/excluded universe (incl. a named zero-eligible skip)
+    # is a footgun — refuse it rather than silently drop the record.
+    if market_quality_config is not None and manifest_sink is None:
+        raise ValueError(
+            "market_quality_config was provided without a manifest_sink: the eligible-market manifest is "
+            "the required FU-2 artifact (no filter claim without it) — pass a manifest_sink dict to retain it."
+        )
+
     results: dict[int, list[dict[str, Any]]] = {}
     for fixture_id in protocol.fixture_ids:
         pack_dir = packs[fixture_id]

@@ -25,6 +25,10 @@ import pytest
 
 from tests.test_multi_fixture_eval import _patch_all_loaders, _proto
 from veridex.backtest.evaluation import produce_results_by_fixture
+from veridex.backtest.market_filter import (
+    build_eligible_market_manifest,
+    filter_marketstates_to_allowlist,
+)
 from veridex.ingest.marketstate import MarketState
 from veridex.strategies.market_quality import DEFAULT_MARKET_QUALITY_CONFIG
 
@@ -210,3 +214,140 @@ def test_filter_config_hash_is_present_and_stable(monkeypatch: pytest.MonkeyPatc
 
     assert sinks[0] == sinks[1] == DEFAULT_MARKET_QUALITY_CONFIG.filter_config_hash()
     assert len(sinks[0]) == 64
+
+
+# ==========================================================================================
+# Review Finding B (SHIP-BLOCKER) — ``phase`` is NOT monotonic: a halftime/goal/VAR suspension
+# re-reports InRunning=false → phase==0 AGAIN, deep IN-PLAY. So the LAST phase==0 tick is often a
+# post-kickoff in-play re-quote. Eligibility MUST be judged off the PRE-KICKOFF decision slice (the
+# same slice D2 scores), never the trailing in-play line — else a market HEALTHY at kickoff is judged
+# degenerate off an in-play re-quote and wrongly excluded (can zero out the whole fixture).
+# ==========================================================================================
+
+
+def _healthy_pre_then_trailing_inplay(fixture_id: int) -> list[MarketState]:
+    """31 healthy pre-kickoff ticks @0.55, the kickoff (``phase==1``) tick, then a TRAILING degenerate
+    ``phase==0`` in-play re-quote @0.98 (a halftime/VAR suspension re-report — phase back to 0 mid-match)."""
+    states: list[MarketState] = []
+    for i in range(31):
+        states.append(_tick(fixture_id, tick_seq=i, ts=i * 25, phase=0, markets={_HEALTHY_KEY: _ou_market(5_500)}))
+    states.append(_tick(fixture_id, tick_seq=31, ts=800, phase=1, markets={_HEALTHY_KEY: _ou_market(5_500)}))
+    states.append(_tick(fixture_id, tick_seq=32, ts=850, phase=0, markets={_HEALTHY_KEY: _ou_market(9_800)}))
+    return states
+
+
+def test_manifest_judges_eligibility_off_pre_kickoff_slice_not_trailing_in_play() -> None:
+    """RED on the all-phase==0 bug: the trailing @0.98 in-play re-quote is read as the close → the
+    healthy market is wrongly excluded (near_certain) → ``eligible == []``. GREEN after the fix: the
+    market is judged off its LAST PRE-KICKOFF line (@0.55) and stays ELIGIBLE."""
+    manifest = build_eligible_market_manifest(60, _healthy_pre_then_trailing_inplay(60), DEFAULT_MARKET_QUALITY_CONFIG)
+    assert manifest.eligible == [_HEALTHY_KEY], "healthy-at-kickoff market must not be excluded off an in-play re-quote"
+    assert manifest.excluded == []
+    assert manifest.zero_eligible is False
+
+
+def test_market_seen_only_after_kickoff_is_not_counted() -> None:
+    """A market that first appears in a TRAILING in-play ``phase==0`` re-quote (never pre-kickoff) is
+    outside the decision universe — it must be neither eligible nor excluded (not counted at all)."""
+    fixture_id = 61
+    states = [
+        _tick(fixture_id, tick_seq=0, ts=0, phase=0, markets={_HEALTHY_KEY: _ou_market(5_500)}),
+        _tick(fixture_id, tick_seq=1, ts=700, phase=0, markets={_HEALTHY_KEY: _ou_market(5_500)}),
+        _tick(fixture_id, tick_seq=2, ts=800, phase=1, markets={_HEALTHY_KEY: _ou_market(5_500)}),  # kickoff
+        # a NEW market appears only in a post-kickoff in-play re-quote:
+        _tick(fixture_id, tick_seq=3, ts=850, phase=0, markets={_DEGEN_KEY: _ou_market(9_800)}),
+    ]
+    manifest = build_eligible_market_manifest(fixture_id, states, DEFAULT_MARKET_QUALITY_CONFIG)
+    all_keys = set(manifest.eligible) | {ex.market_key for ex in manifest.excluded}
+    assert _DEGEN_KEY not in all_keys, "a market seen only after kickoff must not be counted"
+
+
+# ------------------------------------------------------------------------------------------
+# Review Finding 3 — excluded markets carry the NUMERIC evidence (implied_prob/tick_count/horizon_s),
+# so a Run-001 skeptic sees "near_certain at 0.97", not just the label.
+# ------------------------------------------------------------------------------------------
+
+
+def test_excluded_market_carries_numeric_evidence() -> None:
+    fixture_id = 62
+    states = _states(fixture_id)  # _DEGEN_KEY @0.97 near-certain, _HEALTHY_KEY @0.55
+    manifest = build_eligible_market_manifest(fixture_id, states, DEFAULT_MARKET_QUALITY_CONFIG)
+    degen = next(ex for ex in manifest.excluded if ex.market_key == _DEGEN_KEY)
+    assert "near_certain" in degen.reasons
+    assert degen.implied_prob == pytest.approx(0.97, abs=1e-6)  # the MAX side prob at the pre-kickoff close
+    assert degen.tick_count == 32
+    assert degen.horizon_s == 31 * 25
+
+
+# ------------------------------------------------------------------------------------------
+# Review Finding 4 — direct unit tests: the 0.5-neutral-unmapped branch, a mapped-but-suspended close,
+# a >1-eligible multi-market pack, and filter_marketstates_to_allowlist key-stripping.
+# ------------------------------------------------------------------------------------------
+
+
+def test_unmapped_suspended_close_is_excluded_honestly_not_near_certain() -> None:
+    """An unmapped (empty prob map) + suspended close is excluded by ``unmapped``/``close_suspended``,
+    NOT mislabeled ``near_certain`` (implied_prob is a mid-band neutral 0.5 when there is no prob)."""
+    fixture_id = 63
+    unmapped = {"stable_prob_bps": {}, "stable_price": {}, "suspended": True}
+    states = [
+        _tick(fixture_id, tick_seq=0, ts=0, phase=0, markets={_HEALTHY_KEY: unmapped}),
+        _tick(fixture_id, tick_seq=1, ts=700, phase=0, markets={_HEALTHY_KEY: unmapped}),
+        _tick(fixture_id, tick_seq=2, ts=800, phase=1, markets={_HEALTHY_KEY: unmapped}),
+    ]
+    manifest = build_eligible_market_manifest(fixture_id, states, DEFAULT_MARKET_QUALITY_CONFIG)
+    ex = next(e for e in manifest.excluded if e.market_key == _HEALTHY_KEY)
+    assert "near_certain" not in ex.reasons
+    assert "unmapped" in ex.reasons and "close_suspended" in ex.reasons
+    assert ex.implied_prob == pytest.approx(0.5)
+
+
+def test_multi_market_pack_yields_more_than_one_eligible() -> None:
+    """A 3-market pre-kickoff pack: two healthy lines eligible, one degenerate excluded (sorted, >1 eligible)."""
+    fixture_id = 64
+    k1, k2, k3 = "1X2_PARTICIPANT_RESULT||", _HEALTHY_KEY, _DEGEN_KEY
+    states: list[MarketState] = []
+    for i in range(31):
+        states.append(
+            _tick(fixture_id, tick_seq=i, ts=i * 25, phase=0, markets={
+                k1: {"stable_prob_bps": {"home": 4_800, "draw": 2_600, "away": 2_600},
+                     "stable_price": {"home": 2.08, "draw": 3.85, "away": 3.85}, "suspended": False},
+                k2: _ou_market(5_500),
+                k3: _ou_market(9_700),
+            })
+        )
+    states.append(_tick(fixture_id, tick_seq=31, ts=800, phase=1, markets={}))
+    manifest = build_eligible_market_manifest(fixture_id, states, DEFAULT_MARKET_QUALITY_CONFIG)
+    assert manifest.eligible == sorted([k1, k2])  # deterministic ordering, >1 eligible
+    assert manifest.eligible_count == 2 and manifest.excluded_count == 1
+    assert [ex.market_key for ex in manifest.excluded] == [k3]
+
+
+def test_filter_marketstates_to_allowlist_preserves_ticks_strips_keys() -> None:
+    fixture_id = 65
+    states = [
+        _tick(fixture_id, tick_seq=0, ts=0, phase=0, markets={_HEALTHY_KEY: _ou_market(5_500), _DEGEN_KEY: _ou_market(9_700)}),
+        _tick(fixture_id, tick_seq=1, ts=800, phase=1, markets={_HEALTHY_KEY: _ou_market(5_500)}),
+    ]
+    out = filter_marketstates_to_allowlist(states, {_HEALTHY_KEY})
+    assert len(out) == len(states), "every tick is preserved (phase structure intact)"
+    assert all(set(s.markets) <= {_HEALTHY_KEY} for s in out), "non-allowlisted keys stripped from every tick"
+    assert _HEALTHY_KEY in out[0].markets and _DEGEN_KEY not in out[0].markets
+
+
+# ------------------------------------------------------------------------------------------
+# Review Finding A — filtering with nowhere to retain the named-skip manifest is a footgun: a config
+# WITHOUT a sink must FAIL LOUD (the manifest is the "no filter claim without it" artifact).
+# ------------------------------------------------------------------------------------------
+
+
+def test_filtering_without_a_manifest_sink_raises(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    fixture_id = 66
+    _patch_all_loaders(monkeypatch, _states(fixture_id))
+    proto = _proto(fixture_ids=[fixture_id], strategy_configs=[], baselines=_BASELINES)
+    with pytest.raises(ValueError, match="manifest_sink"):
+        asyncio.run(
+            produce_results_by_fixture(
+                proto, packs={fixture_id: tmp_path}, market_quality_config=DEFAULT_MARKET_QUALITY_CONFIG
+            )
+        )

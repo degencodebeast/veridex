@@ -21,19 +21,29 @@ Filter inputs are derived from the PRE-KICKOFF (``phase == 0``) ticks — the de
 
 from __future__ import annotations
 
-from collections.abc import Collection, Iterable
+from collections.abc import Collection
+from typing import Any
 
 from pydantic import BaseModel
 
+from veridex.backtest.pre_match import first_inrunning_index
 from veridex.ingest.marketstate import MarketState
 from veridex.strategies.market_quality import MarketQualityConfig, evaluate_market_quality
 
 
 class ExcludedMarket(BaseModel):
-    """One excluded market and every named rule that failed (never a single generic 'ineligible')."""
+    """One excluded market, every named rule that failed, and the NUMERIC evidence behind them.
+
+    The evidence (``implied_prob`` / ``tick_count`` / ``horizon_s``) is what the filter already computed
+    to reach the verdict — carrying it (not just the reason label) lets a Run-001 skeptic pinning the
+    market universe see "near_certain AT 0.97 over 32 ticks", never a bare "ineligible".
+    """
 
     market_key: str
     reasons: list[str]
+    implied_prob: float
+    tick_count: int
+    horizon_s: int
 
 
 class EligibleMarketManifest(BaseModel):
@@ -58,9 +68,19 @@ class EligibleMarketManifest(BaseModel):
     zero_eligible: bool
 
 
-def _pre_kickoff_states(marketstates: Iterable[MarketState]) -> list[MarketState]:
-    """The pre-kickoff (``phase == 0``) ticks — the decision universe a ``pre_match`` backtest scores."""
-    return [state for state in marketstates if state.phase == 0]
+def _pre_kickoff_states(marketstates: list[MarketState]) -> list[MarketState]:
+    """The PRE-KICKOFF ticks — the exact decision universe a ``pre_match`` backtest scores (D2).
+
+    ``phase`` is NOT monotonic: a halftime/goal/VAR suspension re-reports InRunning=false, flipping
+    ``phase`` back to 0 DEEP in-play. So "every ``phase == 0`` tick" wrongly sweeps in post-kickoff
+    in-play re-quotes, and a market's LAST such tick can be an in-play line — judging a market HEALTHY
+    at kickoff degenerate off it. We converge on the SAME cutoff D2 uses: everything strictly BEFORE the
+    first in-running tick (:func:`~veridex.backtest.pre_match.first_inrunning_index`), then the pre-kickoff
+    ``phase == 0`` lines within it (a defensive ``phase == 0`` filter for any pre-kickoff suspension).
+    """
+    first_ir = first_inrunning_index(marketstates)
+    pre = marketstates if first_ir is None else marketstates[:first_ir]
+    return [state for state in pre if state.phase == 0]
 
 
 def build_eligible_market_manifest(
@@ -88,7 +108,7 @@ def build_eligible_market_manifest(
     tick_count: dict[str, int] = {}
     first_ts: dict[str, int] = {}
     last_ts: dict[str, int] = {}
-    last_market: dict[str, dict] = {}
+    last_market: dict[str, dict[str, Any]] = {}
     for state in phase0:  # ordered: later ticks overwrite last_ts/last_market
         for market_key, market in state.markets.items():
             tick_count[market_key] = tick_count.get(market_key, 0) + 1
@@ -122,7 +142,16 @@ def build_eligible_market_manifest(
         if result.eligible:
             eligible.append(market_key)
         else:
-            excluded.append(ExcludedMarket(market_key=market_key, reasons=result.reasons))
+            # Carry the numeric evidence the verdict was reached on (not just the reason labels).
+            excluded.append(
+                ExcludedMarket(
+                    market_key=market_key,
+                    reasons=result.reasons,
+                    implied_prob=implied_prob,
+                    tick_count=result.tick_count,
+                    horizon_s=result.horizon_s,
+                )
+            )
 
     return EligibleMarketManifest(
         fixture_id=fixture_id,
