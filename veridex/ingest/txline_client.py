@@ -122,6 +122,35 @@ async def fetch_odds_updates(
             await client.aclose()
 
 
+async def fetch_scores_updates(
+    fid: int, *, base_url: str | None = None, creds: tuple[str, str] | None = None, client: Any = None
+) -> list[dict[str, Any]]:
+    """GET ``/scores/updates/{fid}`` with TxLINE auth; returns the list of native score updates.
+
+    Mirrors :func:`fetch_odds_updates` exactly — same auth headers, lazy ``httpx``, and
+    list-or-``{"updates": [...]}`` payload handling — for the backfill scores leg.
+    """
+    from veridex.config import get_settings, require_txline
+
+    settings = get_settings()
+    jwt, token = creds if creds is not None else require_txline(settings)
+    base = base_url or settings.txline_base_url
+    headers = build_auth_headers(jwt, token)
+    own = client is None
+    if own:
+        import httpx  # noqa: PLC0415
+
+        client = httpx.AsyncClient()
+    try:
+        resp = await client.get(scores_updates_url(base, fid), headers=headers)
+        resp.raise_for_status()
+        data = resp.json()
+        return list(data) if isinstance(data, list) else list(data.get("updates", []))
+    finally:
+        if own:
+            await client.aclose()
+
+
 async def validate_odds(
     message_id: str, *, base_url: str | None = None, creds: tuple[str, str] | None = None, client: Any = None
 ) -> dict[str, Any]:

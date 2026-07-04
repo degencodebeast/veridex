@@ -26,6 +26,7 @@ import pytest
 
 from veridex.ingest.txline_client import (
     fetch_odds_updates,
+    fetch_scores_updates,
     fixtures_snapshot_url,
     odds_snapshot_url,
     odds_stream_url,
@@ -143,6 +144,22 @@ async def test_fetch_odds_updates_dict_wrapped_payload() -> None:
     client = _FakeClient({"updates": [{"MessageId": "x"}]})
     updates = await fetch_odds_updates(1, base_url=_BASE, creds=_CREDS, client=client)
     assert [u["MessageId"] for u in updates] == ["x"]
+
+
+async def test_fetch_scores_updates_list_payload() -> None:
+    client = _FakeClient([{"Ts": 1}, {"Ts": 2}])
+    updates = await fetch_scores_updates(456, base_url=_BASE, creds=_CREDS, client=client)
+    assert [u["Ts"] for u in updates] == [1, 2]
+    assert client.calls == ["https://txline-dev.txodds.com/api/scores/updates/456"]
+    # TxLINE auth headers threaded through, mirroring fetch_odds_updates (CON-041).
+    assert client.headers[0]["Authorization"] == "Bearer jwt-1"
+    assert client.headers[0]["X-Api-Token"] == "api-token-1"
+
+
+async def test_fetch_scores_updates_dict_wrapped_payload() -> None:
+    client = _FakeClient({"updates": [{"Ts": 9}]})
+    updates = await fetch_scores_updates(1, base_url=_BASE, creds=_CREDS, client=client)
+    assert [u["Ts"] for u in updates] == [9]
 
 
 async def test_validate_odds_keys_on_message_id() -> None:
