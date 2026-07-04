@@ -23,10 +23,16 @@ SOURCE's job (C-4); this module only fixes the shape of the seam both consumers 
 
 from __future__ import annotations
 
-from collections.abc import Callable
+import bisect
+import hashlib
+import json
+from collections import defaultdict
+from collections.abc import Callable, Sequence
 from typing import TypeAlias
 
 from pydantic import BaseModel
+
+from veridex.venues.price_history import VenuePriceHistoryFrame
 
 
 class TimedVenueQuote(BaseModel):
@@ -51,3 +57,103 @@ class TimedVenueQuote(BaseModel):
 #: WAITs on. The venue's identity (which artifact it prices against) is pinned SEPARATELY via the
 #: agent's ``venue_source_id`` (config-hash identity), never smuggled through the returned numbers.
 VenuePriceSource: TypeAlias = Callable[[int, str, str, int], TimedVenueQuote | None]
+
+
+def _compute_venue_source_id(
+    *,
+    price_history_artifact_hashes: Sequence[str],
+    coverage_artifact_hash: str,
+    freshness_s: int,
+    haircut_ladder_bps: Sequence[int],
+    source_config_version: str,
+) -> str:
+    """sha256 over the five reproducibility inputs, canonically serialized so it's deterministic.
+
+    The price-history artifact hashes are SORTED (order of the backfill packs is immaterial to the
+    source's identity), but the haircut ladder is kept ORDERED — ``[0, 100, 200, 300]`` and
+    ``[0, 200]`` are genuinely different report configurations and MUST hash differently. Any of the
+    five inputs changing ⇒ a different id, so the agent's ``config_hash`` provably pins exactly which
+    artifact(s)/coverage/bound/ladder/config it priced against (spec §venue_source_id, CON-005).
+    """
+    payload = {
+        "price_history_artifact_hashes": sorted(price_history_artifact_hashes),
+        "coverage_artifact_hash": coverage_artifact_hash,
+        "freshness_s": freshness_s,
+        "haircut_ladder_bps": list(haircut_ladder_bps),
+        "source_config_version": source_config_version,
+    }
+    serialized = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+
+
+def build_backfilled_venue_source(
+    frames: Sequence[VenuePriceHistoryFrame],
+    *,
+    price_history_artifact_hashes: Sequence[str],
+    coverage_artifact_hash: str,
+    freshness_s: int,
+    haircut_ladder_bps: Sequence[int],
+    source_config_version: str = "cp1-v1",
+) -> tuple[VenuePriceSource, str]:
+    """Build a bounded-staleness, time-indexed :data:`VenuePriceSource` over backfilled frames (C-4).
+
+    This is the time-alignment C-2's seam only fixed the SHAPE of: on a decision coordinate the source
+    returns the LATEST frame at/before ``ts`` whose age ``ts - frame.ts <= freshness_s``, carrying the
+    real ``staleness_s`` of that alignment. It NEVER interpolates, NEVER looks ahead (a frame at
+    ``ts' > ts`` is invisible), and a missing/too-stale quote is ``None`` — the fail-safe the agent
+    WAITs on (CON-006). The returned price is the RAW ``venue_decimal_price``; the ``haircut_ladder_bps``
+    is carried for identity/reporting ONLY (C-5) and never alters the quote (CON-007, REQ-005).
+
+    Args:
+        frames: Backfilled price-history frames (already decimal via AC-014; ``native_to_decimal`` is
+            NOT re-applied at this seam). Frames are indexed by ``(fixture_id, market_ref)``.
+        price_history_artifact_hashes: The C-3 ``VenuePriceHistoryPack.artifact_content_hash``es the
+            frames came from (a frame carries no hash of its own). Order-independent in the identity.
+        coverage_artifact_hash: The C-1 coverage-artifact hash.
+        freshness_s: The staleness bound in seconds; a quote strictly older than this is ``None``.
+        haircut_ladder_bps: Round-trip haircut ladder (bps) — report-only; pinned in the identity but
+            NEVER applied to the returned quote.
+        source_config_version: Source config version tag, part of the identity.
+
+    Returns:
+        A ``(source, venue_source_id)`` pair. ``venue_source_id`` is the sha256 reproducibility hash
+        over the five identity inputs; the ``source`` is keyed by ``(fixture_id, market_key, side, ts)``.
+    """
+    # Index frames by (fixture_id, market_ref) → sorted [(ts, decimal_price), ...]. The WC 1X2
+    # market_ref ("1X2|home|full", per polymarket_resolver) already embeds the side, and the VvV
+    # agent passes that SAME string as market_key — so the lookup keys on market_key directly and the
+    # side arg is a redundant confirmation of what the ref already names.
+    index: dict[tuple[int, str], list[tuple[int, float]]] = defaultdict(list)
+    for frame in frames:
+        index[(frame.fixture_id, frame.market_ref)].append((frame.ts, frame.venue_decimal_price))
+    for pairs in index.values():
+        pairs.sort(key=lambda pair: pair[0])
+    # Parallel ts-only lists for a bisect over the "most recent at or before ts" boundary.
+    ts_index: dict[tuple[int, str], list[int]] = {
+        key: [ts for ts, _ in pairs] for key, pairs in index.items()
+    }
+
+    def source(fixture_id: int, market_key: str, side: str, ts: int) -> TimedVenueQuote | None:
+        key = (fixture_id, market_key)
+        pairs = index.get(key)
+        if not pairs:
+            return None  # no frames for this (fixture, market) — fail-safe None
+        # bisect_right gives the first index whose ts is STRICTLY greater than the decision ts, so
+        # pos-1 is the most recent frame AT OR BEFORE ts — a later frame (ts' > ts) is never seen.
+        pos = bisect.bisect_right(ts_index[key], ts)
+        if pos == 0:
+            return None  # no quote at/before ts — no look-ahead to a future frame
+        frame_ts, decimal_price = pairs[pos - 1]
+        staleness_s = ts - frame_ts
+        if staleness_s > freshness_s:
+            return None  # too stale — never interpolate to fill the gap
+        return TimedVenueQuote(venue_decimal_price=decimal_price, staleness_s=staleness_s)
+
+    venue_source_id = _compute_venue_source_id(
+        price_history_artifact_hashes=price_history_artifact_hashes,
+        coverage_artifact_hash=coverage_artifact_hash,
+        freshness_s=freshness_s,
+        haircut_ladder_bps=haircut_ladder_bps,
+        source_config_version=source_config_version,
+    )
+    return source, venue_source_id
