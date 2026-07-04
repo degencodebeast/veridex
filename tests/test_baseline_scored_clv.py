@@ -213,3 +213,90 @@ def test_drift_rows_unchanged_by_baselines(monkeypatch: pytest.MonkeyPatch, tmp_
                   if r["kind"] == "cumulative-drift"]
 
     assert drift_solo == drift_with, "adding baselines must not change drift's scored rows"
+
+
+# ------------------------------------------------------------------------------------------
+# 6) END-TO-END multi-fixture aggregate: baseline_comparison averages CLV ACROSS fixtures.
+#    Single-fixture tests never exercise the cross-fixture division — this pins it exactly.
+# ------------------------------------------------------------------------------------------
+
+
+def _patch_packs(monkeypatch: pytest.MonkeyPatch, states_by_fixture: dict[int, list[MarketState]]) -> None:
+    """Per-fixture synthetic tape for BOTH loaders + a per-pack content hash (multi-fixture runs)."""
+
+    def loader(pack_dir, fid, **kw):  # type: ignore[no-untyped-def]
+        return states_by_fixture[fid]
+
+    monkeypatch.setattr("veridex.backtest.evaluation.load_pack_marketstates", loader)
+    monkeypatch.setattr("veridex.backtest.runner.load_pack_marketstates", loader)
+    monkeypatch.setattr("veridex.backtest.runner._pack_content_hash", lambda pack_dir: f"hash{Path(pack_dir).name}")
+
+
+def _full_match(fixture_id: int, home_seq: list[int]) -> list[MarketState]:
+    """Pre-kickoff ticks with the given Home-prob path, then a degenerate in-running kickoff tick."""
+    states = [
+        _tick(fixture_id, tick_seq=i, ts=100 + 10 * i, phase=0, home_bps=h) for i, h in enumerate(home_seq)
+    ]
+    states.append(
+        MarketState(fixture_id=fixture_id, tick_seq=len(home_seq), ts=100 + 10 * len(home_seq) + 80, phase=1, markets={}, scores={})
+    )
+    return states
+
+
+def test_multi_fixture_baseline_comparison_aggregate(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """favorite scores +1000 on fixture 10 and −2000 on fixture 20 → cross-fixture avg == −500.0.
+
+    Exact-value pin of the averaging/division path: the comparison bucket must average a baseline's
+    scored CLV ACROSS fixtures (2 scored picks over 6 total rows, 4 pending) — a wrong aggregate
+    (per-fixture, summed, or mis-divided) fails this.
+    """
+    states_by_fixture = {
+        10: _full_match(10, [6_000, 6_500, 7_000]),  # favorite Home 6000→close 7000 → +1000
+        20: _full_match(20, [6_000, 5_000, 4_000]),  # favorite Home 6000→close 4000 → −2000
+    }
+    _patch_packs(monkeypatch, states_by_fixture)
+    proto = _proto(fixture_ids=[10, 20], strategy_configs=["cumulative-drift"], baselines=["favorite"])
+
+    results = asyncio.run(produce_results_by_fixture(proto, packs={10: tmp_path / "p10", 20: tmp_path / "p20"}))
+    out = run_multi_fixture_evaluation(proto, results_by_fixture=results, cadence_ok=True)
+
+    fav = out["calibration"].baseline_comparison["favorite"]
+    assert fav.avg_clv_bps == -500.0  # (+1000 + −2000) / 2 scored picks, averaged across BOTH fixtures
+    assert fav.n == 6  # 3 favorite rows per fixture × 2 fixtures
+    assert fav.pending == 4  # 4 WAIT/pending rows; scored = n − pending = 2
+    assert fav.n - fav.pending == 2
+
+
+# ------------------------------------------------------------------------------------------
+# 7) Fail-loud dispatch guard: a name registered in BASELINES but unhandled by _dispatch must RAISE
+#    (never silently become an all-WAIT phantom no-op competitor).
+# ------------------------------------------------------------------------------------------
+
+
+def test_every_registered_baseline_is_dispatchable() -> None:
+    """Every name in BASELINES is handled by the agent dispatch — no silent-degradation gap."""
+    from veridex.backtest.baseline_agents import baseline_agent
+    from veridex.backtest.baselines import BASELINES
+
+    usable = _tick(1, tick_seq=0, ts=100, phase=0, home_bps=6_000)
+    for name in BASELINES:
+        agent = baseline_agent(name, seed=1)
+        action = asyncio.run(agent.decide(usable))  # must not raise for any registered baseline
+        assert action.type in {SportsActionType.WAIT, SportsActionType.FOLLOW_MOMENTUM}
+
+
+def test_registered_baseline_without_dispatch_handler_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A BASELINES entry the dispatch doesn't handle FAILS LOUD — never a silent all-WAIT no-op.
+
+    RED against ``return None``: the phantom baseline currently decides WAIT forever (a scored-CLV
+    competitor silently degraded to a no-op). It must raise instead so a future 5th baseline that
+    forgets a dispatch arm cannot slip through as a phantom.
+    """
+    from veridex.backtest.baseline_agents import baseline_agent
+    from veridex.backtest.baselines import BASELINES
+
+    monkeypatch.setitem(BASELINES, "phantom_unhandled", lambda *a, **k: None)
+    agent = baseline_agent("phantom_unhandled", seed=1)
+    usable = _tick(1, tick_seq=0, ts=100, phase=0, home_bps=6_000)
+    with pytest.raises(ValueError, match="phantom_unhandled"):
+        asyncio.run(agent.decide(usable))

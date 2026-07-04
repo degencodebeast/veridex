@@ -138,6 +138,9 @@ def run_multi_fixture_evaluation(
     # FU-3: the drift-vs-baseline comparison surface — drift's scored-CLV distribution alongside each
     # named baseline's. StaleLine is excluded (it is not produced here — cadence-gated separately); any
     # named kind that produced no rows is dropped by the builder, so no fabricated empty bucket appears.
+    # HONESTY (entry asymmetry): favorite/threshold_move enter at the EARLIEST usable tick (full
+    # pre-kickoff CLV runway), while drift enters gated-late (min_tick_count/min_horizon), so the
+    # head-to-head structurally FAVORS the baseline — the bias runs ADVERSE to drift, never flattering it.
     comparison_kinds = [
         config for config in protocol.strategy_configs if config != STALE_LINE_CONFIG
     ] + list(protocol.baselines)

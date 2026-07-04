@@ -36,11 +36,17 @@ from veridex.runtime.orchestrator import PROOF_MODE_REPRODUCIBLE, Agent
 from veridex.runtime.schemas import AgentAction, SportsActionType
 
 
-def _dispatch(name: str, fn: Callable, *, prices: list[float], fair_probs: dict[str, float], horizon_s: int, seed: int) -> AgentAction | None:
-    """Call ONE baseline with ITS OWN signature (DRIFT-1); ``None`` for an unknown baseline shape.
+def _dispatch(name: str, fn: Callable, *, prices: list[float], fair_probs: dict[str, float], horizon_s: int, seed: int) -> AgentAction:
+    """Call ONE baseline with ITS OWN signature (DRIFT-1).
 
     Mirrors the retired ``evaluation._baseline_action`` dispatch so each baseline's decision rule is used
     verbatim — the adapter only supplies the per-tick inputs, never a reinvented rule.
+
+    FAIL LOUD: this dispatch is a second registry parallel to :data:`~veridex.backtest.baselines.BASELINES`,
+    and :func:`baseline_agent` only ever calls it with a name already validated against ``BASELINES``. A
+    name that IS registered but has no arm here is a wiring bug (e.g. a future 5th baseline) — it must
+    RAISE, never return a WAIT-forever phantom that would silently ride the leaderboard as a scored-CLV
+    competitor that never scores. ``test_every_registered_baseline_is_dispatchable`` guards the coverage.
     """
     if name == "no_trade":
         return fn(prices, horizon_s)
@@ -50,7 +56,10 @@ def _dispatch(name: str, fn: Callable, *, prices: list[float], fair_probs: dict[
         return fn(prices, horizon_s)
     if name == "seeded_random":
         return fn(prices, horizon_s, seed)
-    return None  # a baseline whose signature the adapter doesn't know — never guess
+    raise ValueError(
+        f"baseline {name!r} is registered in BASELINES but has no _dispatch arm — refusing to silently "
+        "degrade it to an all-WAIT phantom competitor; add its per-tick dispatch arm in baseline_agents.py"
+    )
 
 
 class BaselineAgentStrategy:
@@ -119,7 +128,7 @@ class BaselineAgentStrategy:
         action = _dispatch(
             self._name, self._fn, prices=self._prices, fair_probs=fair_probs, horizon_s=horizon_s, seed=self._seed
         )
-        if action is None or action.type == SportsActionType.WAIT:
+        if action.type == SportsActionType.WAIT:
             return AgentAction(type=SportsActionType.WAIT, params={})
 
         # Enrich the fired pick with the market_key + side the law scores on. favorite names its own side
