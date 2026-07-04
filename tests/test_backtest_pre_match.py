@@ -236,19 +236,45 @@ def test_pre_match_reconstructed_close_never_leaves_a_gap() -> None:
 # ---------------------------------------------------------------------------
 
 
-def _ou_record(ts_ms: int, under_pct: float, *, in_running: bool) -> dict[str, Any]:
-    """One raw native TxLINE OU record; ``in_running`` drives the normalized ``phase``."""
+def _ou_record(ts_ms: int, under_pct: float, *, in_running: bool, line: float = 2.5) -> dict[str, Any]:
+    """One raw native TxLINE OU record; ``in_running`` drives ``phase``, ``line`` the ``market_key``.
+
+    Two distinct ``line`` values (e.g. 2.5 and 3.5) yield two OU ``market_key``s (``OU||line=2.5`` /
+    ``OU||line=3.5``), BOTH matching the ``["OU"]`` allowlist prefix.
+    """
     return {
         "FixtureId": _PACK_FIXTURE_ID,
         "Ts": ts_ms,
         "InRunning": in_running,
         "SuperOddsType": "OU",
         "MarketPeriod": None,
-        "MarketParameters": "line=2.5",
+        "MarketParameters": f"line={line}",
         "PriceNames": ["Over", "Under"],
         "Prices": [1900, 1900],
         "Pct": [round(100.0 - under_pct, 1), round(under_pct, 1)],
     }
+
+
+def _build_pack_from_specs(tmp_path: Path, specs: list[tuple[float, bool, float]]) -> Path:
+    """Build a hashed ReplayPack, ONE tick per ``(under_pct, in_running, line)`` spec, in order."""
+    session_dir = tmp_path / "session"
+    session_dir.mkdir()
+    lines = [
+        envelope_line(_ou_record(100_000 + i * 10_000, under, in_running=ir, line=ln), 100 + i * 10)
+        for i, (under, ir, ln) in enumerate(specs)
+    ]
+    (session_dir / "records.jsonl").write_text("\n".join(lines) + "\n")
+    (session_dir / "meta.json").write_text(
+        SessionMeta(started_ts=99, endpoints=["/odds/stream"], tool_version="t").model_dump_json()
+    )
+    out_dir = tmp_path / "pack"
+    pack_from_session(session_dir, out_dir)
+    return out_dir
+
+
+def _row_market_key(row: dict[str, Any]) -> str | None:
+    """The ``market_key`` a score row's decision was taken on (from the sealed pre-score action)."""
+    return row["raw_prescore"]["raw_action"]["params"].get("market_key")
 
 
 def _build_full_match_pack(tmp_path: Path, phases: list[bool]) -> Path:
@@ -300,3 +326,48 @@ async def test_run_backtest_all_inrunning_degrades_with_named_reason(tmp_path: P
     assert "pre-kickoff" in report.closing_note.lower()  # the named degrade reason (asserted, not a silent 0)
     assert report.avg_clv is None  # no true pre-match CLV was fabricated
     assert report.clv_distribution.count == 0
+
+
+async def test_run_backtest_pre_match_close_is_per_market_complete_end_to_end(tmp_path: Path) -> None:
+    """Two OU markets through the REAL scoring pass: each scores against ITS OWN last pre-kickoff close.
+
+    Guards the silent-CLV-0 bug the single-market ``..._stops_at_kickoff`` test cannot: market A
+    (line=2.5) STOPS updating early while market B (line=3.5) keeps moving, so the last pre-kickoff tick
+    carries only B. The per-market fold must still close A against A's OWN last pre-kickoff line (6300,
+    entered at 6000 → CLV 300), NOT the full-time in-running line (9000 → 3000) and NOT B's line. If the
+    fold ever regressed to a single global last-tick close, A would be uncovered → the completeness gate
+    would DEGRADE the run to window CLV and A's ``clv_bps`` would become ``None`` — failing the asserts
+    below (verified offline: a base-only close makes every ``clv_bps`` None). A silent-CLV-0 fall-back
+    (A scored against its own entry) would make A's CLV 0 — also caught.
+    """
+    # (under_pct, in_running, line): A last-updates at tick 1 (EARLIER than B's tick 3); kickoff at tick 4.
+    specs = [
+        (60.0, False, 2.5),  # t0  A entry              → Under 6000
+        (63.0, False, 2.5),  # t1  A LAST pre-kickoff   → Under 6300  (A stops updating here)
+        (55.0, False, 3.5),  # t2  B entry              → Under 5500
+        (59.0, False, 3.5),  # t3  B LAST pre-kickoff   → Under 5900  (a LATER tick than A's last)
+        (90.0, True, 2.5),   # t4  in-running A (kickoff cutoff) — a VERY different line, must NOT be the close
+        (90.0, True, 3.5),   # t5  in-running B
+    ]
+    pack_dir = _build_pack_from_specs(tmp_path, specs)
+
+    result, report = await run_backtest(pack_dir, _PACK_FIXTURE_ID, [deterministic_agent("baseline")], window=_window())
+
+    scored = [row for row in result.score_rows if is_scored(row)]
+    # (1) real true CLV was produced (not a degrade).
+    assert report.avg_clv is not None
+    # (2) BOTH markets' picks are scored — not just one (the completeness the fold guarantees).
+    assert {_row_market_key(row) for row in scored} == {"OU||line=2.5", "OU||line=3.5"}
+    assert report.clv_distribution.count == len(scored)
+
+    a_entry = next(r for r in scored if _row_market_key(r) == "OU||line=2.5" and r["tick_seq"] == 0)
+    b_entry = next(r for r in scored if _row_market_key(r) == "OU||line=3.5" and r["tick_seq"] == 2)
+    # (3) CRITICAL: market A's entry scores against A's OWN last pre-kickoff line (6300-6000), a NON-ZERO
+    # value — never 0 (silent fall-back to its entry) and never 3000 (the in-running/full-time line).
+    assert a_entry["clv_bps"] == 300
+    # (4) market B likewise scores against B's OWN last pre-kickoff line (5900-5500) — its own close, not A's.
+    assert b_entry["clv_bps"] == 400
+    # (5) no decision was scored on an in-running tick (kickoff cutoff at tick_seq 4), and the in-running
+    # line (9000) was never used as the close.
+    assert max(row["tick_seq"] for row in result.score_rows) < 4
+    assert report.closing_note is None  # clean full-match: verified kickoff + complete per-market close
