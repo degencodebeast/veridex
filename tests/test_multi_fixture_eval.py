@@ -537,7 +537,7 @@ def test_collect_marks_non_1x2_market_out_of_venue_scope() -> None:
     ou_only = MarketState(
         fixture_id=5,
         tick_seq=0,
-        ts=_QUERY_TS_MS,
+        ts=_QUERY_TS_S,
         phase=0,
         markets={
             "OVERUNDER_PARTICIPANT_GOALS||line=2.5": {
@@ -555,7 +555,7 @@ def test_collect_marks_non_1x2_market_out_of_venue_scope() -> None:
         result,  # type: ignore[arg-type]
         {0: ou_only},
         venue_price_source=_fires_src(),  # would match if it were ever CALLED — it must not be for OU
-        close_ts=_QUERY_TS_MS // 1000,
+        close_ts=_QUERY_TS_S,
         coverage_class="ok",
     )
 
@@ -565,13 +565,14 @@ def test_collect_marks_non_1x2_market_out_of_venue_scope() -> None:
 
 
 # ── Units regression (Run-002-VvV): decision-coverage collection queries a SECONDS-keyed source ──
-# with a TxLINE MarketState.ts in unix MILLISECONDS. Both evaluation.py call sites — the fired-pick
-# lookup and the WAIT-tick ``_first_matched_quote`` — must convert ms→s or matched staleness ≈ 1e12 ≫
-# the 900s bound → every decision unmatched → quote_matched_count=0 over the whole run (Run-002). The
+# with a TxLINE MarketState.ts that is ALREADY unix seconds (the normalizer floors ms→s). Both
+# evaluation.py call sites — the fired-pick lookup and the WAIT-tick ``_first_matched_quote`` — pass the
+# seconds ts through DIRECTLY; re-dividing it by 1000 (the reverted e4e5608 bug) made matched staleness
+# ≈ 1.78M ≫ the 900s bound → every decision unmatched → quote_matched_count=0 (Run-002). The
 # ``_fires_src`` stub above ignores ``ts``, so only a REAL ts-sensitive source exercises the contract.
 _FRAME_TS_EARLY_S = 1_782_641_900  # unix SECONDS (10-digit), Polymarket-canonical frame ts
 _FRAME_TS_LATE_S = 1_782_642_000
-_QUERY_TS_MS = 1_782_642_003_000  # TxLINE decision ts in unix MILLISECONDS (13-digit) == 1_782_642_003 s
+_QUERY_TS_S = 1_782_642_003  # decision ts in unix SECONDS (10-digit) — the real MarketState.ts scale
 _EXPECTED_STALENESS_S = 3  # 1_782_642_003 - 1_782_642_000, well inside the 900s bound
 
 
@@ -602,15 +603,15 @@ def _seconds_frame_source():
 
 
 def _ms_query_state() -> MarketState:
-    """A REAL-FORMAT 1X2-full tick (``1X2_PARTICIPANT_RESULT||`` + ``part1``) with ``ts`` in unix MS.
+    """A REAL-FORMAT 1X2-full tick (``1X2_PARTICIPANT_RESULT||`` + ``part1``) with ``ts`` in unix SECONDS.
 
     The market-identity bridge maps ``part1`` on the 1X2-full key to the frame ref ``1X2|home|full`` the
-    seconds source is keyed by, so the ms→s conversion is what determines match vs None.
+    seconds source is keyed by; the seconds ts is passed to the source directly (no conversion).
     """
     return MarketState(
         fixture_id=5,
         tick_seq=0,
-        ts=_QUERY_TS_MS,
+        ts=_QUERY_TS_S,
         phase=0,
         markets={
             "1X2_PARTICIPANT_RESULT||": {
@@ -623,14 +624,14 @@ def _ms_query_state() -> MarketState:
     )
 
 
-def test_collect_venue_behavior_converts_ms_tick_to_seconds_for_lookup() -> None:
-    """Units regression (Run-002-VvV): both evaluation.py venue-source call sites convert ms→s.
+def test_collect_venue_behavior_prices_seconds_tick_for_lookup() -> None:
+    """Units regression (Run-002-VvV): both evaluation.py venue-source call sites pass the seconds ts through.
 
-    Drives ``_collect_vvv_venue_behavior`` with a synthetic sealed run whose ONE tick carries a TxLINE
-    ms-scale ``ts`` against a real seconds-keyed source: the fired-pick decision (direct source call)
-    AND the WAIT-tick decision (via ``_first_matched_quote``) must both MATCH, carrying a staleness in a
-    sane SECONDS range (0–900), never ≈ 1e12. On the pre-fix code the raw ms ts overran the 900s bound →
-    ``None`` → ``quote_matched=False`` for every decision (the Run-002 0%-coverage artifact).
+    Drives ``_collect_vvv_venue_behavior`` with a synthetic sealed run whose ONE tick carries a
+    seconds-scale ``MarketState.ts`` against a real seconds-keyed source: the fired-pick decision (direct
+    source call) AND the WAIT-tick decision (via ``_first_matched_quote``) must both MATCH, carrying a
+    staleness in a sane SECONDS range (0–900). Re-dividing the already-seconds ts by 1000 (the reverted
+    e4e5608 bug) overran the 900s bound → ``None`` → ``quote_matched=False`` for every decision (Run-002).
     """
     from types import SimpleNamespace
 
@@ -653,12 +654,12 @@ def test_collect_venue_behavior_converts_ms_tick_to_seconds_for_lookup() -> None
         result,  # type: ignore[arg-type]
         {0: state},
         venue_price_source=_seconds_frame_source(),
-        close_ts=_QUERY_TS_MS // 1000,
+        close_ts=_QUERY_TS_S,
         coverage_class="ok",
     )
 
     matched = [d for d in decisions if d.quote_matched]
-    assert len(matched) == 2, "both the fired-pick and WAIT-tick lookups must match after ms→s conversion"
+    assert len(matched) == 2, "both the fired-pick and WAIT-tick lookups must match on the seconds ts"
     assert {d.fired for d in matched} == {True, False}, "one fired decision and one WAIT decision matched"
     for d in matched:
         assert d.staleness_s is not None

@@ -58,30 +58,14 @@ class TimedVenueQuote(BaseModel):
 #: agent's ``venue_source_id`` (config-hash identity), never smuggled through the returned numbers.
 #:
 #: TIME UNIT CONTRACT (load-bearing): ``ts`` is unix **SECONDS** — the Polymarket-canonical scale the
-#: backfilled :class:`~veridex.venues.price_history.VenuePriceHistoryFrame` timestamps live in. TxLINE
-#: ``MarketState.ts`` is unix **MILLISECONDS**, so every call site that prices a TxLINE tick MUST convert
-#: via :func:`txline_ts_to_venue_seconds` first. Feeding a raw ms ``ts`` to a seconds-indexed source makes
-#: ``staleness_s = ts - frame.ts ≈ 1e12`` — always past any sane ``freshness_s`` bound — so EVERY lookup
-#: fails to ``None`` (the Run-002-VvV 0%-coverage artifact). The contract is explicit here, NOT sniffed
-#: from the magnitude of ``ts`` inside the source.
+#: backfilled :class:`~veridex.venues.price_history.VenuePriceHistoryFrame` timestamps live in. A TxLINE
+#: ``MarketState.ts`` is ALREADY unix seconds: the production normalizer
+#: :func:`~veridex.ingest.txline_normalize.marketstate_from_txline_odds` does ``latest_ts = max(Ts) // 1000``
+#: on the raw 13-digit-ms record ``Ts``, so every loaded/live MarketState carries a 10-digit seconds ts.
+#: Call sites therefore pass ``market_state.ts`` to this source DIRECTLY — no conversion. (An earlier fix
+#: wrongly re-divided the already-seconds ts by 1000, making ``ts ≈ 1.78e6 ≪`` every frame ts → ``None`` →
+#: the Run-002-VvV 0%-coverage artifact; that conversion was reverted.)
 VenuePriceSource: TypeAlias = Callable[[int, str, str, int], TimedVenueQuote | None]
-
-
-def txline_ts_to_venue_seconds(ts_ms: int) -> int:
-    """Convert a TxLINE tick timestamp (unix MILLISECONDS) to the venue source's unix-SECONDS contract.
-
-    ``MarketState.ts`` is unix milliseconds; a :data:`VenuePriceSource` is keyed by unix seconds
-    (matching the Polymarket-canonical backfilled frames). Call this at EVERY site that prices a TxLINE
-    tick against the source, so the resulting :attr:`TimedVenueQuote.staleness_s` comes out in seconds
-    (comparable to ``freshness_s``) rather than the ≈1e12 a raw ms/seconds subtraction would produce.
-
-    Args:
-        ts_ms: A TxLINE ``MarketState.ts`` in unix milliseconds.
-
-    Returns:
-        The same instant floored to whole unix seconds (``ts_ms // 1000``).
-    """
-    return ts_ms // 1000
 
 
 #: The REAL TxLINE market_key for the 1X2 FULL-match market: ``{SuperOddsType}|{MarketPeriod}|{MarketParameters}``
@@ -204,8 +188,9 @@ def build_backfilled_venue_source(
     }
 
     def source(fixture_id: int, market_key: str, side: str, ts: int) -> TimedVenueQuote | None:
-        # ``ts`` is unix SECONDS (the frame scale) — callers convert TxLINE ms ts via
-        # ``txline_ts_to_venue_seconds`` so ``staleness_s`` below is a seconds gap, not ≈1e12.
+        # ``ts`` is unix SECONDS (the frame scale) — a ``MarketState.ts`` is already seconds (the
+        # normalizer floors ms→s), so callers pass it through directly and ``staleness_s`` below is a
+        # seconds gap, not ≈1e12.
         key = (fixture_id, market_key)
         pairs = index.get(key)
         if not pairs:

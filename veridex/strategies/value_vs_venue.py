@@ -32,11 +32,7 @@ from veridex.law.edge import executable_edge_bps
 from veridex.runtime.agent import AGENT_ACTION_SCHEMA_VERSION, agent_config_hash
 from veridex.runtime.orchestrator import PROOF_MODE_REPRODUCIBLE, Agent
 from veridex.runtime.schemas import AgentAction, SportsActionType
-from veridex.venues.venue_price_source import (
-    VenuePriceSource,
-    txline_market_to_venue_ref,
-    txline_ts_to_venue_seconds,
-)
+from veridex.venues.venue_price_source import VenuePriceSource, txline_market_to_venue_ref
 
 #: STATIC, number-free rationale — carries NO venue-derived value into the sealed evidence (INV 4).
 _VVV_REASON = "value vs venue: estimated executable edge cleared the minimum"
@@ -148,9 +144,10 @@ def value_vs_venue_agent(
                     continue
                 # Venue price comes ONLY from the injected time-aligned source (per fixture/market/side/ts)
                 # — never from market_state. No quote (None) ⇒ no edge ⇒ this side does not fire (WAIT).
-                # The source is keyed by unix SECONDS; MarketState.ts is unix MILLISECONDS → convert.
+                # The source is keyed by unix SECONDS; MarketState.ts is ALREADY unix seconds (the
+                # normalizer emits seconds), so it is passed through directly — no conversion.
                 quote = venue_price_source(
-                    market_state.fixture_id, venue_ref, side, txline_ts_to_venue_seconds(market_state.ts)
+                    market_state.fixture_id, venue_ref, side, market_state.ts
                 )
                 venue_decimal_price = quote.venue_decimal_price if quote is not None else None
                 signal = vvv_signal(fair_prob_bps, venue_decimal_price, min_edge_bps=min_edge_bps)

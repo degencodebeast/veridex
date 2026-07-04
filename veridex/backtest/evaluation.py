@@ -59,7 +59,6 @@ from veridex.venues.venue_price_source import (
     TimedVenueQuote,
     VenuePriceSource,
     txline_market_to_venue_ref,
-    txline_ts_to_venue_seconds,
 )
 
 #: The strategy-config id that names the (cadence-gated) StaleLine decision strategy (M8).
@@ -302,9 +301,9 @@ def _first_matched_quote(
             if venue_ref is None:
                 continue
             in_venue_scope = True
-            # Source is keyed by unix SECONDS; state.ts is unix MILLISECONDS → convert at the seam.
+            # Source is keyed by unix SECONDS; state.ts is ALREADY unix seconds (normalizer) → pass through.
             quote = venue_price_source(
-                state.fixture_id, venue_ref, side, txline_ts_to_venue_seconds(state.ts)
+                state.fixture_id, venue_ref, side, state.ts
             )
             if quote is not None:
                 return quote, True
@@ -364,10 +363,10 @@ def _collect_vvv_venue_behavior(
             else None
         )
         in_venue_scope = venue_ref is not None
-        # Source is keyed by unix SECONDS; state.ts is unix MILLISECONDS → convert at the seam.
+        # Source is keyed by unix SECONDS; state.ts is ALREADY unix seconds (normalizer) → pass through.
         quote = (
             venue_price_source(
-                state.fixture_id, venue_ref, side, txline_ts_to_venue_seconds(state.ts)
+                state.fixture_id, venue_ref, side, state.ts
             )
             if venue_ref is not None
             else None
