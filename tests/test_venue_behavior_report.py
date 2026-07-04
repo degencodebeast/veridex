@@ -16,6 +16,9 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+from pydantic import ValidationError
+
 from veridex.backtest.venue_behavior_report import (
     DecisionQuoteCoverage,
     VenueBehaviorReport,
@@ -82,11 +85,15 @@ def test_report_slices_and_named_survival_warnings() -> None:
 
 
 def test_decision_quote_coverage_is_computed_over_all_decisions_not_just_fired() -> None:
+    # DISCRIMINATING fixture: the all-decisions ratio (3/5=60%) DIVERGES from the fired-pick ratio
+    # (1/2=50%), so a regression that computed quote_matched_pct over fired picks would read 50.0 and
+    # FAIL this assertion. A degenerate 2/4-and-1/2 fixture (both 50%) could not catch that bug.
     decisions = [
-        _dec(fired=True, quote_matched=True, staleness=120),
-        _dec(fired=True, quote_matched=False),
-        _dec(fired=False, quote_matched=False),
-        _dec(fired=False, quote_matched=True, staleness=600),
+        _dec(fired=True, quote_matched=True, staleness=120),  # fired + matched
+        _dec(fired=True, quote_matched=False),  # fired + no quote
+        _dec(fired=False, quote_matched=False),  # unfired + no quote
+        _dec(fired=False, quote_matched=True, staleness=600),  # unfired + matched
+        _dec(fired=False, quote_matched=True, staleness=200),  # unfired + matched (breaks the symmetry)
     ]
     rep = build_venue_behavior_report(
         [],
@@ -98,8 +105,9 @@ def test_decision_quote_coverage_is_computed_over_all_decisions_not_just_fired()
     )
     c = rep.decision_quote_coverage
     assert isinstance(c, DecisionQuoteCoverage)
-    assert c.decision_count == 4 and c.quote_matched_count == 2 and c.quote_none_count == 2
-    assert c.quote_matched_pct == 50.0  # 2/4 — NOT "18/18 fixtures covered"
+    assert c.decision_count == 5 and c.quote_matched_count == 3 and c.quote_none_count == 2
+    assert c.quote_matched_pct == 60.0  # 3/5 over ALL decisions — NOT 50.0 (1/2 over fired picks)
+    # fired-pick split is reported INDEPENDENTLY and stays 1/2 — proving the two denominators differ:
     assert c.fired_pick_count == 2 and c.fired_pick_quote_matched_count == 1 and c.fired_pick_quote_none_count == 1
     assert sum(c.freshness_bucket_counts_for_used_quotes.values()) == c.quote_matched_count  # only matched bucketed
 
@@ -192,3 +200,45 @@ def test_run_writes_one_hypothesis_ledger_entry(tmp_path: Path) -> None:
     assert ledger_path.exists()
     lines = [ln for ln in ledger_path.read_text().splitlines() if ln.strip()]
     assert len(lines) == 1  # exactly one hypothesis-ledger entry per run
+
+
+def _ttc_of(rep: VenueBehaviorReport) -> set[str]:
+    return {s.dimensions["time_to_close"] for s in rep.slices}
+
+
+def test_custom_ttc_buckets_change_bucketing() -> None:
+    """``ttc_buckets`` is a FUNCTIONAL param: a custom partition relabels a row's time-to-close slice."""
+    row = _row(side="home", prob=0.55, edge=450, staleness=120, ttc_s=3600, coverage="headline")
+    common = {
+        "haircut_ladder_bps": [0],
+        "prob_bands": [(0, 20), (20, 40), (40, 60), (60, 80), (80, 100)],
+        "freshness_buckets": ["<=2m", "<=5m", "<=15m"],
+    }
+    default = build_venue_behavior_report([row], [], ttc_buckets=[">24h", "6-24h", "1-6h", "<1h"], **common)
+    custom = build_venue_behavior_report([row], [], ttc_buckets=["<2h", "2-24h", ">24h"], **common)
+    # 3600s (1h): the default partition calls it "1-6h"; the custom partition calls it "<2h".
+    assert _ttc_of(default) == {"1-6h"}
+    assert _ttc_of(custom) == {"<2h"}
+
+
+def test_matched_decision_without_staleness_raises() -> None:
+    """Producer contract (self-defense for the honesty instrument): a matched quote MUST carry an age.
+
+    Otherwise it would be silently dropped from ``freshness_bucket_counts_for_used_quotes`` and the
+    bucket sum would undercount matched quotes. Fail LOUD at construction, never silent-undercount.
+    """
+    with pytest.raises(ValidationError):
+        VenueDecision(fired=True, quote_matched=True)  # matched but no staleness_s
+
+
+def test_empty_freshness_buckets_yields_no_artifact_warning() -> None:
+    """Degenerate empty freshness partition must not crash; there is no stalest bucket ⇒ warning False."""
+    rep = build_venue_behavior_report(
+        [],
+        [],
+        haircut_ladder_bps=[0, 100],
+        prob_bands=[(0, 100)],
+        ttc_buckets=["<1h", "1-6h"],
+        freshness_buckets=[],
+    )
+    assert rep.freshness_artifact_warning is False

@@ -36,7 +36,7 @@ from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
-from pydantic import BaseModel
+from pydantic import BaseModel, model_validator
 
 #: The canonical coverage classes. Headline metrics are computed over ``"headline"`` rows ONLY;
 #: ``"diagnostic-partial"`` rows are disclosed as their own slices but never promoted (CON-001).
@@ -75,6 +75,18 @@ class VenueDecision(BaseModel):
     fired: bool
     quote_matched: bool
     staleness_s: int | None = None
+
+    @model_validator(mode="after")
+    def _matched_quote_carries_an_age(self) -> VenueDecision:
+        """A matched quote MUST have a ``staleness_s`` (its used-mid age).
+
+        Producer contract that protects the honesty instrument: a matched decision with no age would
+        be silently dropped from ``freshness_bucket_counts_for_used_quotes``, making its values
+        undercount ``quote_matched_count``. Fail LOUD here, never silent-undercount downstream.
+        """
+        if self.quote_matched and self.staleness_s is None:
+            raise ValueError("a matched quote (quote_matched=True) must carry staleness_s (its age)")
+        return self
 
 
 class VenueBehaviorSlice(BaseModel):
@@ -154,15 +166,42 @@ def _prob_band(fair_prob: float, prob_bands: Sequence[tuple[int, int]]) -> str:
     return f"{prob_bands[-1][0]}-{prob_bands[-1][1]}"
 
 
-def _ttc_bucket(ttc_s: int) -> str:
-    """Map seconds-to-close to a canonical time-to-close bucket label (spec §4 pinned boundaries)."""
-    if ttc_s >= 24 * 3600:
-        return ">24h"
-    if ttc_s >= 6 * 3600:
-        return "6-24h"
-    if ttc_s >= 3600:
-        return "1-6h"
-    return "<1h"
+#: Time-to-close unit suffixes → seconds. Bucket labels combine these ("6-24h", "<1h", "30m").
+_TTC_UNIT_SECONDS = {"h": 3600, "m": 60, "s": 1}
+
+
+def _parse_ttc_token(token: str, default_unit: str) -> int:
+    """Parse a single ``"24h"`` / ``"30m"`` / ``"6"`` token to seconds (``default_unit`` if unitless)."""
+    token = token.strip()
+    if token and token[-1] in _TTC_UNIT_SECONDS:
+        return int(token[:-1]) * _TTC_UNIT_SECONDS[token[-1]]
+    return int(token) * _TTC_UNIT_SECONDS[default_unit]
+
+
+def _parse_ttc_range(label: str) -> tuple[float, float]:
+    """Parse a time-to-close bucket label into a ``[lo, hi)`` seconds range.
+
+    Recognizes ``">24h"`` → ``[24h, inf)``, ``"<1h"`` → ``[0, 1h)``, and ``"1-6h"`` → ``[1h, 6h)``
+    (a unitless low bound inherits the high bound's unit, e.g. ``"1"`` in ``"1-6h"`` is hours).
+    """
+    label = label.strip()
+    if label.startswith(">"):
+        return (float(_parse_ttc_token(label[1:], "h")), float("inf"))
+    if label.startswith("<"):
+        return (0.0, float(_parse_ttc_token(label[1:], "h")))
+    lo_str, hi_str = label.split("-", 1)
+    hi_unit = hi_str.strip()[-1] if hi_str.strip() and hi_str.strip()[-1] in _TTC_UNIT_SECONDS else "h"
+    return (float(_parse_ttc_token(lo_str, hi_unit)), float(_parse_ttc_token(hi_str, hi_unit)))
+
+
+def _ttc_bucket(ttc_s: int, ttc_buckets: Sequence[str]) -> str:
+    """Assign seconds-to-close to the caller's ``ttc_buckets`` partition (a FUNCTIONAL param)."""
+    for label in ttc_buckets:
+        lo, hi = _parse_ttc_range(label)
+        if lo <= ttc_s < hi:
+            return label
+    # beyond every provided bucket → the widest one (largest upper bound) as a defensive fallback.
+    return max(ttc_buckets, key=lambda b: _parse_ttc_range(b)[1])
 
 
 def _mean(values: Sequence[float]) -> float | None:
@@ -192,7 +231,7 @@ def build_venue_behavior_report(
         key = (
             row.side,
             _prob_band(row.fair_prob, prob_bands),
-            _ttc_bucket(row.time_to_close_s),
+            _ttc_bucket(row.time_to_close_s, ttc_buckets),
             _freshness_bucket(row.staleness_s, freshness_buckets),
             row.coverage_class,
         )
@@ -226,15 +265,20 @@ def build_venue_behavior_report(
         cost_survival[haircut] = headline_mean is not None and headline_mean > 0
 
     # --- freshness_artifact_warning: positive HEADLINE edge ONLY in the stalest freshness bucket ----
-    stalest = sorted(freshness_buckets, key=_parse_seconds)[-1]
-    bucket_edges: dict[str, list[float]] = defaultdict(list)
-    for row in rows:
-        if row.coverage_class == HEADLINE:
-            bucket_edges[_freshness_bucket(row.staleness_s, freshness_buckets)].append(
-                float(row.estimated_edge_bps)
-            )
-    positive_buckets = {b for b, edges in bucket_edges.items() if (_mean(edges) or 0.0) > 0}
-    freshness_artifact_warning = positive_buckets == {stalest}
+    # No freshness partition ⇒ no stalest bucket ⇒ the artifact question is undefined ⇒ False (no crash).
+    ordered_freshness = sorted(freshness_buckets, key=_parse_seconds)
+    if ordered_freshness:
+        stalest = ordered_freshness[-1]
+        bucket_edges: dict[str, list[float]] = defaultdict(list)
+        for row in rows:
+            if row.coverage_class == HEADLINE:
+                bucket_edges[_freshness_bucket(row.staleness_s, freshness_buckets)].append(
+                    float(row.estimated_edge_bps)
+                )
+        positive_buckets = {b for b, edges in bucket_edges.items() if (_mean(edges) or 0.0) > 0}
+        freshness_artifact_warning = positive_buckets == {stalest}
+    else:
+        freshness_artifact_warning = False
 
     decision_coverage = _decision_quote_coverage(decisions, freshness_buckets)
 
