@@ -16,12 +16,15 @@ from __future__ import annotations
 import asyncio
 from pathlib import Path
 
+import pytest
+
 from tests.test_replay_pack import _write_session
 from veridex.backtest.evaluation import (
     EvalProtocol,
     produce_results_by_fixture,
     run_multi_fixture_evaluation,
 )
+from veridex.ingest.marketstate import MarketState
 from veridex.ingest.replay_pack import pack_from_session
 from veridex.provenance import EvidenceRung
 
@@ -227,3 +230,106 @@ def test_producer_requires_explicit_venue_source_identity_for_vvv(tmp_path: Path
         )
     )
     assert [row for row in res2.get(5, []) if row["kind"] == "value-vs-venue"]
+
+
+# ==========================================================================================
+# FU-1 — baselines must EMIT rows on FULL-MATCH packs (Pilot-0 zero-rows gap).
+#
+# The producer derives baseline inputs from the fixture's ticks. The latent bug: it keyed off
+# ``marketstates[-1]`` — on a full-match pack that final tick is FULL-TIME (in-running), often with
+# no usable market/prob map. ``_baseline_inputs`` then returned ``None`` and the producer's
+# ``baseline_inputs is None`` guard SILENTLY skipped every baseline (Pilot-0: baseline_rows == 0).
+# The fix derives inputs from the PRE-KICKOFF decision states (D2 windowing), the same universe drift
+# decides over, so the four baselines emit their rows — still with ``clv_bps is None`` (FU-3 territory).
+# ==========================================================================================
+
+_BASELINE_NAMES = ["no_trade", "favorite", "threshold_move", "seeded_random"]
+
+
+def _1x2_tick(fixture_id: int, *, tick_seq: int, ts: int, phase: int, home_bps: int) -> MarketState:
+    """A usable 1X2 pre-kickoff tick (Home prob in bps; Away is the complement)."""
+    return MarketState(
+        fixture_id=fixture_id,
+        tick_seq=tick_seq,
+        ts=ts,
+        phase=phase,
+        markets={
+            "1X2||": {
+                "stable_prob_bps": {"Home": home_bps, "Away": 10_000 - home_bps},
+                "stable_price": {"Home": 2.0, "Away": 2.0},
+                "suspended": False,
+            }
+        },
+        scores={},
+    )
+
+
+def _full_match_states(fixture_id: int) -> list[MarketState]:
+    """Pre-kickoff ticks with a usable 1X2 map, then a DEGENERATE full-time in-running final tick.
+
+    The final (``phase == 1``) tick carries NO usable market map — exactly the Pilot-0 shape where
+    ``_baseline_inputs``, keyed off ``marketstates[-1]``, returned ``None`` and skipped every baseline.
+    """
+    return [
+        _1x2_tick(fixture_id, tick_seq=0, ts=100, phase=0, home_bps=5_000),
+        _1x2_tick(fixture_id, tick_seq=1, ts=110, phase=0, home_bps=5_200),
+        _1x2_tick(fixture_id, tick_seq=2, ts=120, phase=0, home_bps=6_000),
+        # full-time in-running final tick: empty/degenerate market map (no usable prob map).
+        MarketState(fixture_id=fixture_id, tick_seq=3, ts=200, phase=1, markets={}, scores={}),
+    ]
+
+
+def _pre_match_only_states(fixture_id: int) -> list[MarketState]:
+    """A pre-match-only pack (never goes in-running) — the legacy path that already worked."""
+    return [
+        _1x2_tick(fixture_id, tick_seq=0, ts=100, phase=0, home_bps=5_000),
+        _1x2_tick(fixture_id, tick_seq=1, ts=110, phase=0, home_bps=5_400),
+        _1x2_tick(fixture_id, tick_seq=2, ts=120, phase=0, home_bps=6_000),
+    ]
+
+
+def test_baselines_emit_rows_on_full_match_pack(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """On a full-match pack whose FINAL tick is a degenerate full-time tick, all four baselines emit
+    rows (with ``clv_bps is None``) and the calibration report's ``by_kind`` includes the baseline kinds.
+
+    RED against the ``marketstates[-1]`` path: the empty final tick makes ``_baseline_inputs`` return
+    ``None`` → the producer skips every baseline → ``baseline_rows == 0`` and ``by_kind`` has no baselines.
+    """
+    fixture_id = 42
+    states = _full_match_states(fixture_id)
+    monkeypatch.setattr(
+        "veridex.backtest.evaluation.load_pack_marketstates",
+        lambda pack_dir, fid, **kw: states,
+    )
+    proto = _proto(fixture_ids=[fixture_id], strategy_configs=[], baselines=_BASELINE_NAMES)
+
+    results = asyncio.run(produce_results_by_fixture(proto, packs={fixture_id: tmp_path}))
+
+    baseline_rows = [row for row in results[fixture_id] if row["kind"] in _BASELINE_NAMES]
+    assert baseline_rows, "the baselines must EMIT rows on a full-match pack (Pilot-0 gap: was 0)"
+    kinds = {row["kind"] for row in baseline_rows}
+    assert set(_BASELINE_NAMES) <= kinds, f"all four baselines must emit; got {kinds}"
+    for row in baseline_rows:
+        assert row["action"] in {"WAIT", "FOLLOW_MOMENTUM"}
+        assert row["clv_bps"] is None  # still null/abstention references (scored CLV is FU-3)
+
+    out = run_multi_fixture_evaluation(proto, results_by_fixture=results, cadence_ok=True)
+    assert set(_BASELINE_NAMES) <= set(out["calibration"].by_kind), "by_kind must include baseline kinds"
+
+
+def test_baselines_still_emit_on_pre_match_only_pack(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Regression: a pre-match-only pack (never in-running) STILL emits all four baseline rows."""
+    fixture_id = 43
+    states = _pre_match_only_states(fixture_id)
+    monkeypatch.setattr(
+        "veridex.backtest.evaluation.load_pack_marketstates",
+        lambda pack_dir, fid, **kw: states,
+    )
+    proto = _proto(fixture_ids=[fixture_id], strategy_configs=[], baselines=_BASELINE_NAMES)
+
+    results = asyncio.run(produce_results_by_fixture(proto, packs={fixture_id: tmp_path}))
+
+    kinds = {row["kind"] for row in results[fixture_id]}
+    assert set(_BASELINE_NAMES) <= kinds, f"pre-match-only regression: all baselines must emit; got {kinds}"
+    for row in results[fixture_id]:
+        assert row["clv_bps"] is None

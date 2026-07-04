@@ -33,6 +33,7 @@ from pydantic import BaseModel
 
 from veridex.backtest.baselines import BASELINES
 from veridex.backtest.calibration import CalibrationReport, build_calibration_report
+from veridex.backtest.pre_match import plan_pre_match_backtest
 from veridex.backtest.runner import run_backtest
 from veridex.backtest.vvv_report import vvv_report_with_estimated_edge
 from veridex.ingest.marketstate import MarketState
@@ -224,23 +225,45 @@ def _baseline_inputs(marketstates: list[MarketState]) -> dict[str, Any] | None:
     """Extract the inputs the heterogeneous baselines need from a fixture's ticks, or ``None``.
 
     DRIFT-1: the baselines take DIFFERENT inputs — a ``prices`` series (``no_trade`` / ``threshold_move``
-    / ``seeded_random``), a ``fair_probs`` dict (``favorite``), and a horizon. All are derived from the
-    first market (sorted) in the LAST tick. Returns ``None`` when no market is present (honest skip).
+    / ``seeded_random``), a ``fair_probs`` dict (``favorite``), and a horizon.
+
+    FU-1 (same bug class as D2): these are derived from the PRE-KICKOFF decision states — the same
+    universe drift decides over, via :func:`~veridex.backtest.pre_match.plan_pre_match_backtest` — NOT
+    from ``marketstates[-1]``. On a full-match pack that final tick is FULL-TIME (in-running), often with
+    no usable market/prob map; keying off it made this return ``None`` and the producer SILENTLY skip
+    every baseline (Pilot-0: baseline_rows == 0). The inputs are keyed off the first market (sorted) in
+    the LAST pre-kickoff tick. Returns ``None`` when no pre-kickoff market is present (honest skip): an
+    all-in-running pack has no pre-kickoff evidence, so no baseline input can be derived.
     """
     if not marketstates:
         return None
-    last_markets = getattr(marketstates[-1], "markets", {}) or {}
-    if not last_markets:
+    plan = plan_pre_match_backtest(marketstates)
+    decision_states = plan.decision_states
+    if not decision_states:
         return None
-    market_key = sorted(last_markets)[0]
-    prob_map: dict[str, Any] = last_markets[market_key].get("stable_prob_bps") or {}
-    sides = sorted(prob_map)
-    if not sides:
+    # The folded per-market pre-kickoff close (every market at its LAST pre-kickoff value) is the honest
+    # "final" reference within the pre-kickoff universe — it carries markets last priced on EARLIER ticks
+    # that the single last decision tick may not (on a full-match pack that tick can be a lone suspended
+    # line). Fall back to the last decision tick when no fold exists.
+    close = plan.closing_state or decision_states[-1]
+    close_markets = getattr(close, "markets", {}) or {}
+    # Seed the baselines off the first market (sorted, deterministic) with a USABLE (non-empty) prob map:
+    # a suspended/degenerate line carries an empty ``stable_prob_bps`` and can't seed favorite's fair_probs
+    # or a fair-prob-derived price, so it is skipped here (data-usability guard, NOT a quality filter).
+    market_key: str | None = None
+    prob_map: dict[str, Any] = {}
+    for candidate_key in sorted(close_markets):
+        candidate_probs = (close_markets[candidate_key].get("stable_prob_bps") or {})
+        if candidate_probs:
+            market_key = candidate_key
+            prob_map = candidate_probs
+            break
+    if market_key is None:
         return None
-    side0 = sides[0]
+    side0 = sorted(prob_map)[0]
 
     prices: list[float] = []
-    for state in marketstates:
+    for state in decision_states:
         market = (getattr(state, "markets", {}) or {}).get(market_key, {})
         price_map = market.get("stable_price") or {}
         tick_probs = market.get("stable_prob_bps") or {}
@@ -250,7 +273,7 @@ def _baseline_inputs(marketstates: list[MarketState]) -> dict[str, Any] | None:
             prices.append(10000.0 / float(tick_probs[side0]))  # decimal price from the fair prob
 
     fair_probs = {side: float(bps) / 10000.0 for side, bps in prob_map.items()}
-    horizon_s = int(getattr(marketstates[-1], "ts", 0)) - int(getattr(marketstates[0], "ts", 0))
+    horizon_s = int(getattr(decision_states[-1], "ts", 0)) - int(getattr(decision_states[0], "ts", 0))
     return {"market": market_key, "prices": prices, "fair_probs": fair_probs, "horizon_s": horizon_s}
 
 
