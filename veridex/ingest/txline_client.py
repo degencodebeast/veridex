@@ -12,6 +12,7 @@ credentials come from typed config only (CON-041), never repo/logs/events.
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 from veridex.ingest.live_client import build_auth_headers
@@ -97,38 +98,49 @@ def reconstruct_closing(updates: list[dict[str, Any]]) -> dict[str, Any] | None:
     return closing
 
 
-async def fetch_odds_updates(
-    fid: int, *, base_url: str | None = None, creds: tuple[str, str] | None = None, client: Any = None
+async def _get_updates_with_cache_retry(
+    client: Any, url: str, headers: dict[str, str], *, retries: int, retry_delay: float
 ) -> list[dict[str, Any]]:
-    """GET ``/odds/updates/{fid}`` with TxLINE auth; returns the list of native odds updates."""
-    from veridex.config import get_settings, require_txline
+    """GET ``url``, retrying through a cache-cold EMPTY 200 (5-minute TxLINE update cache).
 
-    settings = get_settings()
-    jwt, token = creds if creds is not None else require_txline(settings)
-    base = base_url or settings.txline_base_url
-    headers = build_auth_headers(jwt, token)
-    own = client is None
-    if own:
-        import httpx  # noqa: PLC0415
-
-        client = httpx.AsyncClient()
-    try:
-        resp = await client.get(odds_updates_url(base, fid), headers=headers)
+    A cold cache returns a quick empty body while it warms; ``.json()`` on that body raises
+    ``JSONDecodeError`` — a cryptic symptom of the real cause. Retry a few times before raising
+    a descriptive error; never let the bare ``JSONDecodeError`` escape.
+    """
+    resp = None
+    for attempt in range(1, retries + 1):
+        resp = await client.get(url, headers=headers)
         resp.raise_for_status()
-        data = resp.json()
-        return list(data) if isinstance(data, list) else list(data.get("updates", []))
-    finally:
-        if own:
-            await client.aclose()
+        try:
+            data = resp.json()
+        except ValueError:
+            data = None
+        if data is not None:
+            return list(data) if isinstance(data, list) else list(data.get("updates", []))
+        if attempt < retries:
+            await asyncio.sleep(retry_delay)
+    content = resp.content if resp is not None else b""
+    content_type = resp.headers.get("content-type", "") if resp is not None else ""
+    status = resp.status_code if resp is not None else "?"
+    raise RuntimeError(
+        f"{url}: HTTP {status} {content_type} returned {len(content)} bytes but no parseable "
+        f"JSON after {retries} attempts (cache cold? outside retention?)"
+    )
 
 
-async def fetch_scores_updates(
-    fid: int, *, base_url: str | None = None, creds: tuple[str, str] | None = None, client: Any = None
+async def fetch_odds_updates(
+    fid: int,
+    *,
+    base_url: str | None = None,
+    creds: tuple[str, str] | None = None,
+    client: Any = None,
+    retries: int = 3,
+    retry_delay: float = 2.0,
 ) -> list[dict[str, Any]]:
-    """GET ``/scores/updates/{fid}`` with TxLINE auth; returns the list of native score updates.
+    """GET ``/odds/updates/{fid}`` with TxLINE auth; returns the list of native odds updates.
 
-    Mirrors :func:`fetch_odds_updates` exactly — same auth headers, lazy ``httpx``, and
-    list-or-``{"updates": [...]}`` payload handling — for the backfill scores leg.
+    Retries through a cache-cold empty 200 (see :func:`_get_updates_with_cache_retry`); the
+    own-client path uses a generous timeout since a warm payload can be tens of MB.
     """
     from veridex.config import get_settings, require_txline
 
@@ -140,12 +152,43 @@ async def fetch_scores_updates(
     if own:
         import httpx  # noqa: PLC0415
 
-        client = httpx.AsyncClient()
+        client = httpx.AsyncClient(timeout=httpx.Timeout(120.0))
     try:
-        resp = await client.get(scores_updates_url(base, fid), headers=headers)
-        resp.raise_for_status()
-        data = resp.json()
-        return list(data) if isinstance(data, list) else list(data.get("updates", []))
+        url = odds_updates_url(base, fid)
+        return await _get_updates_with_cache_retry(client, url, headers, retries=retries, retry_delay=retry_delay)
+    finally:
+        if own:
+            await client.aclose()
+
+
+async def fetch_scores_updates(
+    fid: int,
+    *,
+    base_url: str | None = None,
+    creds: tuple[str, str] | None = None,
+    client: Any = None,
+    retries: int = 3,
+    retry_delay: float = 2.0,
+) -> list[dict[str, Any]]:
+    """GET ``/scores/updates/{fid}`` with TxLINE auth; returns the list of native score updates.
+
+    Mirrors :func:`fetch_odds_updates` exactly — same auth headers, lazy ``httpx``, generous
+    own-client timeout, and cache-cold-empty retry — for the backfill scores leg.
+    """
+    from veridex.config import get_settings, require_txline
+
+    settings = get_settings()
+    jwt, token = creds if creds is not None else require_txline(settings)
+    base = base_url or settings.txline_base_url
+    headers = build_auth_headers(jwt, token)
+    own = client is None
+    if own:
+        import httpx  # noqa: PLC0415
+
+        client = httpx.AsyncClient(timeout=httpx.Timeout(120.0))
+    try:
+        url = scores_updates_url(base, fid)
+        return await _get_updates_with_cache_retry(client, url, headers, retries=retries, retry_delay=retry_delay)
     finally:
         if own:
             await client.aclose()

@@ -19,6 +19,7 @@ Behaviors under test
 from __future__ import annotations
 
 import ast
+import json
 from pathlib import Path
 from typing import Any
 
@@ -105,26 +106,38 @@ def test_reconstruct_closing_none_on_empty() -> None:
 
 
 class _FakeResp:
+    """``payload=None`` simulates a cache-cold EMPTY 200 (body-less JSON body)."""
+
     def __init__(self, payload: Any) -> None:
         self._p = payload
+        self.status_code = 200
+        self.headers = {"content-type": "application/json"}
+        body = b"" if payload is None else json.dumps(payload).encode()
+        self.content = body
+        self.text = body.decode()
 
     def raise_for_status(self) -> None:
         return None
 
     def json(self) -> Any:
+        if self._p is None:
+            return json.loads("")  # raises JSONDecodeError, matching a real empty-body 200
         return self._p
 
 
 class _FakeClient:
-    def __init__(self, payload: Any) -> None:
-        self._p = payload
+    """``sequence`` returns a different payload per successive ``.get`` call (last one sticks)."""
+
+    def __init__(self, payload: Any = None, *, sequence: list[Any] | None = None) -> None:
+        self._sequence = sequence if sequence is not None else [payload]
         self.calls: list[str] = []
         self.headers: list[dict[str, str]] = []
 
     async def get(self, url: str, headers: dict[str, str] | None = None, **kw: Any) -> _FakeResp:
         self.calls.append(url)
         self.headers.append(headers or {})
-        return _FakeResp(self._p)
+        idx = min(len(self.calls) - 1, len(self._sequence) - 1)
+        return _FakeResp(self._sequence[idx])
 
     async def aclose(self) -> None:
         return None
@@ -160,6 +173,36 @@ async def test_fetch_scores_updates_dict_wrapped_payload() -> None:
     client = _FakeClient({"updates": [{"Ts": 9}]})
     updates = await fetch_scores_updates(1, base_url=_BASE, creds=_CREDS, client=client)
     assert [u["Ts"] for u in updates] == [9]
+
+
+# ---------------------------------------------------------------------------
+# Cache-cold empty-body retry: the endpoint has a 5-minute cache; a cold cache
+# returns a quick EMPTY 200 while it warms. Must retry, never leak a bare
+# JSONDecodeError.
+# ---------------------------------------------------------------------------
+
+
+async def test_fetch_odds_updates_retries_through_cache_cold_empty() -> None:
+    client = _FakeClient(sequence=[None, [{"MessageId": "a"}, {"MessageId": "b"}]])
+    updates = await fetch_odds_updates(123, base_url=_BASE, creds=_CREDS, client=client, retry_delay=0.0)
+    assert [u["MessageId"] for u in updates] == ["a", "b"]
+    assert len(client.calls) == 2  # first call cache-cold empty, second call warm
+
+
+async def test_fetch_odds_updates_raises_descriptive_on_persistent_empty() -> None:
+    client = _FakeClient(None)  # always empty — cache never warms within retry budget
+    with pytest.raises(RuntimeError) as exc_info:
+        await fetch_odds_updates(999, base_url=_BASE, creds=_CREDS, client=client, retry_delay=0.0)
+    message = str(exc_info.value)
+    assert "999" in message
+    assert "bytes" in message
+
+
+async def test_fetch_scores_updates_retries_through_cache_cold_empty() -> None:
+    client = _FakeClient(sequence=[None, [{"Ts": 1}, {"Ts": 2}]])
+    updates = await fetch_scores_updates(456, base_url=_BASE, creds=_CREDS, client=client, retry_delay=0.0)
+    assert [u["Ts"] for u in updates] == [1, 2]
+    assert len(client.calls) == 2
 
 
 async def test_validate_odds_keys_on_message_id() -> None:
