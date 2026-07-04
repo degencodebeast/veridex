@@ -95,6 +95,7 @@ _TEAM_ALIASES: dict[str, str] = {
     "cote d ivoire": "cote divoire",
     "czech republic": "czechia",
     "cape verde": "cabo verde",
+    "turkey": "turkiye",
 }
 
 # "Will <TEAM> win…"  — capture the team name up to " win".
@@ -511,6 +512,13 @@ def _parse_gamma_market(
 class _DefaultGammaClient:
     """Live Gamma client used when :func:`resolve_market` is called without an injected client.
 
+    Fetches the ``/events`` endpoint by slug and returns the event's ``markets`` FLATTENED —
+    the same flat ``list[market]`` shape the injected test client returns. This is the live
+    ground truth (verified 2026-07-02): a fixture slug names an EVENT whose ``markets`` list
+    holds the 3 binary 1X2 Yes/No markets. The per-market ``slug`` carries a ``-<team>``/
+    ``-draw`` suffix, so ``/markets?slug=<event-slug>`` returns ``[]`` and never surfaces the
+    1X2 markets — the event must be fetched and its ``markets`` unwrapped instead.
+
     ``httpx`` is imported lazily inside :meth:`get_markets` (not at module scope) so
     importing ``veridex.venues.polymarket_resolver`` stays offline-safe.
     """
@@ -519,7 +527,15 @@ class _DefaultGammaClient:
         import httpx
 
         async with httpx.AsyncClient(base_url=GAMMA_BASE_URL, timeout=10.0) as http:
-            response = await http.get("/markets", params=params)
+            response = await http.get("/events", params=params)
             response.raise_for_status()
             data = response.json()
-        return data if isinstance(data, list) else [data]
+        events = data if isinstance(data, list) else [data]
+        markets: list[dict[str, Any]] = []
+        for event in events:
+            if not isinstance(event, dict):
+                continue
+            event_markets = event.get("markets")
+            if isinstance(event_markets, list):
+                markets.extend(m for m in event_markets if isinstance(m, dict))
+        return markets
