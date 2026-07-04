@@ -34,6 +34,10 @@ from pydantic import BaseModel
 from veridex.backtest.baseline_agents import baseline_agent
 from veridex.backtest.baselines import BASELINES
 from veridex.backtest.calibration import CalibrationReport, build_calibration_report
+from veridex.backtest.market_filter import (
+    EligibleMarketManifest,
+    build_eligible_market_manifest,
+)
 from veridex.backtest.runner import run_backtest
 from veridex.backtest.vvv_report import vvv_report_with_estimated_edge
 from veridex.ingest.marketstate import MarketState
@@ -43,6 +47,7 @@ from veridex.runtime.orchestrator import RunResult
 from veridex.runtime.window import RunWindow
 from veridex.scoring import is_scored
 from veridex.strategies.drift import cumulative_drift_agent
+from veridex.strategies.market_quality import MarketQualityConfig
 
 #: The strategy-config id that names the (cadence-gated) StaleLine decision strategy (M8).
 STALE_LINE_CONFIG = "stale-line"
@@ -242,6 +247,8 @@ async def produce_results_by_fixture(
     packs: dict[int, Path],
     venue_price_source: Callable[[str], float | None] | None = None,
     venue_source_id: str | None = None,
+    market_quality_config: MarketQualityConfig | None = None,
+    manifest_sink: dict[int, EligibleMarketManifest] | None = None,
 ) -> dict[int, list[dict[str, Any]]]:
     """Run the committed roster over each fixture's REAL pack into the ``results_by_fixture`` dict.
 
@@ -274,6 +281,20 @@ async def produce_results_by_fixture(
             content_hash of the quote / price-history artifact), bound into the VvV ``config_hash``
             for reproducibility. Required for VvV: a missing/empty value skips VvV (fail closed). The
             producer never derives it from ``venue_price_source``.
+        market_quality_config: FU-2 OPT-IN eligibility gate. ``None`` (default) ⇒ UNFILTERED — every
+            market enters the scored universe, byte-identical to the pre-FU-2 behavior (no manifest is
+            emitted). When provided, the M1 filter (:func:`~veridex.strategies.market_quality.evaluate_market_quality`)
+            builds a per-fixture ELIGIBLE allowlist over the pinned config BEFORE scoring, and that
+            SAME allowlist is applied to drift AND baselines (identical eligible universe). It changes
+            WHICH markets are scored, never HOW CLV is computed. A fixture with ZERO eligible markets is
+            a NAMED skip (empty rows) recorded in its manifest — never a silent empty. (The venue-rung
+            ValueVsVenue path is intentionally NOT gated here: it is a separate strategy priced off
+            backfilled venue data, outside the drift-vs-baseline apples-to-apples comparison.)
+        manifest_sink: Optional ``{fixture_id: EligibleMarketManifest}`` collector. When
+            ``market_quality_config`` is provided, the producer populates it with the eligible-market
+            manifest for each fixture (``filter_config_hash`` + eligible/excluded market_keys + reasons
+            + counts + the ``zero_eligible`` named-skip flag), so a Run-001 protocol can pin the exact
+            scored market universe. Untouched on the unfiltered (``None``-config) path.
 
     Returns:
         ``{fixture_id: [row, ...]}`` where each row is calibration-shaped
@@ -285,11 +306,30 @@ async def produce_results_by_fixture(
         pack_dir = packs[fixture_id]
         marketstates = load_pack_marketstates(pack_dir, fixture_id)
         window = _build_window(protocol, fixture_id, marketstates)
+
+        # FU-2 eligibility gate (opt-in): build the ELIGIBLE-MARKET allowlist + manifest BEFORE scoring,
+        # then feed the SAME allowlist to drift AND baselines so the comparison stays apples-to-apples.
+        # None-config leaves ``market_key_allowlist`` as ``None`` — run_backtest filters nothing (unchanged).
+        market_key_allowlist: list[str] | None = None
+        if market_quality_config is not None:
+            manifest = build_eligible_market_manifest(fixture_id, marketstates, market_quality_config)
+            if manifest_sink is not None:
+                manifest_sink[fixture_id] = manifest
+            market_key_allowlist = manifest.eligible
+            if manifest.zero_eligible:
+                # No silent zero: ZERO eligible markets is a NAMED skip in the manifest (recorded above),
+                # surfaced here as an explicit empty result — the fixture is not scored on a degenerate universe.
+                results[fixture_id] = []
+                continue
+
         rows: list[dict[str, Any]] = []
 
         for config in protocol.strategy_configs:
             if config == CUMULATIVE_DRIFT_CONFIG:
-                result, _ = await run_backtest(pack_dir, fixture_id, [cumulative_drift_agent()], window=window)
+                result, _ = await run_backtest(
+                    pack_dir, fixture_id, [cumulative_drift_agent()], window=window,
+                    market_key_allowlist=market_key_allowlist,
+                )
                 rows.extend(_rows_from_run(result, fixture_id=fixture_id, kind=config))
             elif config == VALUE_VS_VENUE_CONFIG:
                 # DRIFT-2 / Codex M7 — FAIL CLOSED: run VvV only when a venue source AND a DISTINCT
@@ -325,6 +365,7 @@ async def produce_results_by_fixture(
                 fixture_id,
                 [baseline_agent(name, seed=fixture_id) for name in baseline_names],
                 window=window,
+                market_key_allowlist=market_key_allowlist,
             )
             for name in baseline_names:
                 rows.extend(_rows_from_run(baseline_run, fixture_id=fixture_id, kind=name, agent_id=name))

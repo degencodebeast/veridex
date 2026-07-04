@@ -14,8 +14,10 @@ from __future__ import annotations
 import asyncio
 import json
 import time
+from collections.abc import Collection
 from pathlib import Path
 
+from veridex.backtest.market_filter import filter_marketstates_to_allowlist
 from veridex.backtest.pre_match import plan_pre_match_backtest
 from veridex.backtest.report import (
     BACKTEST_EXECUTION_MODE,
@@ -44,6 +46,7 @@ async def run_backtest(
     window: RunWindow,
     policy_envelope: PolicyEnvelope | None = None,
     replay_speed: float = 0.0,
+    market_key_allowlist: Collection[str] | None = None,
 ) -> tuple[RunResult, BacktestReport]:
     """Replay one fixture of a ReplayPack through ``CompetitionRun`` and score it into a report.
 
@@ -66,11 +69,18 @@ async def run_backtest(
         policy_envelope: Optional operator envelope, folded into the report's ``config_hash``.
         replay_speed: Pacing hint in seconds between fed ticks (``0.0`` = as fast as possible).
             Pacing NEVER enters the sealed result — it only affects wall-clock cadence.
+        market_key_allowlist: FU-2 eligibility gate. When provided, each loaded tick is narrowed to
+            these EXACT full market_keys BEFORE the D2 plan/feed, so only eligible markets enter the
+            scored universe (the SAME allowlist is passed for drift and baselines, keeping the
+            comparison apples-to-apples). ``None`` (default) filters NOTHING — byte-identical to the
+            pre-FU-2 path. This changes WHICH markets are fed/scored, never HOW CLV is computed.
 
     Returns:
         ``(run_result, backtest_report)`` — the sealed run and its honest, derived-only report.
     """
     marketstates = load_pack_marketstates(pack_dir, fixture_id, verify=True)
+    if market_key_allowlist is not None:
+        marketstates = filter_marketstates_to_allowlist(marketstates, market_key_allowlist)
     content_hash = _pack_content_hash(pack_dir)
 
     # Deterministic run id: same pack + same window → same sealed run (AC-2D-301).

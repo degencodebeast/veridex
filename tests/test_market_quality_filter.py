@@ -1,0 +1,212 @@
+"""FU-2 — the market-quality filter wired into the S6 producer + the eligible-market manifest.
+
+Codex requirement: ``produce_results_by_fixture`` scores drift + baselines over ALL markets, so
+degenerate near-certain lines (e.g. O/U 0.5 at ~0.97) enter the official evaluation and can distort
+CLV. FU-2 makes the M1 filter (:func:`veridex.strategies.market_quality.evaluate_market_quality`) an
+OPT-IN eligibility gate: a pinned ``MarketQualityConfig`` builds the ELIGIBLE market allowlist BEFORE
+scoring, that allowlist is applied CONSISTENTLY to drift AND baselines (identical eligible universe),
+and an ELIGIBLE-MARKET MANIFEST is emitted (``filter_config_hash`` + eligible/excluded + reasons +
+counts). Codex's hard rule: no filter claim without that manifest.
+
+Trust invariants under test:
+  * the filter is an ELIGIBILITY gate, NEVER a CLV-computation change (it only changes WHICH markets
+    are scored, never HOW CLV is computed);
+  * default / ``None`` config ⇒ current UNFILTERED behavior, byte-identical (regression);
+  * the eligible set is IDENTICAL for drift and baselines (apples-to-apples preserved);
+  * a fixture left with ZERO eligible markets is a NAMED skip in the manifest, never a silent empty.
+"""
+
+from __future__ import annotations
+
+import asyncio
+from pathlib import Path
+
+import pytest
+
+from tests.test_multi_fixture_eval import _patch_all_loaders, _proto
+from veridex.backtest.evaluation import produce_results_by_fixture
+from veridex.ingest.marketstate import MarketState
+from veridex.strategies.market_quality import DEFAULT_MARKET_QUALITY_CONFIG
+
+# Two OVERUNDER lines that share a prefix (so a prefix-level allowlist could NOT separate them — the
+# filter MUST work at full-key granularity). The degenerate 0.5 line sorts BEFORE the healthy 2.5 line,
+# so the baseline agent (which latches the first sorted usable market) would decide over the degenerate
+# line UNLESS it is filtered out of the feed — making the filter load-bearing for baselines too.
+_DEGEN_KEY = "OVERUNDER_PARTICIPANT_GOALS||line=0.5"
+_HEALTHY_KEY = "OVERUNDER_PARTICIPANT_GOALS||line=2.5"
+
+_BASELINES = ["no_trade", "favorite"]
+
+
+def _ou_market(over_bps: int, *, suspended: bool = False) -> dict:
+    return {
+        "stable_prob_bps": {"over": over_bps, "under": 10_000 - over_bps},
+        "stable_price": {"over": 10_000 / over_bps, "under": 10_000 / (10_000 - over_bps)},
+        "suspended": suspended,
+    }
+
+
+def _tick(fixture_id: int, *, tick_seq: int, ts: int, phase: int, markets: dict[str, dict]) -> MarketState:
+    return MarketState(fixture_id=fixture_id, tick_seq=tick_seq, ts=ts, phase=phase, markets=markets, scores={})
+
+
+def _states(fixture_id: int, *, degen_over_bps: int = 9_700, healthy_over_bps: int = 5_500) -> list[MarketState]:
+    """32 pre-kickoff ticks (>= min_tick_count, >= min_horizon_s) carrying a degenerate + a healthy line,
+    then a degenerate full-time in-running tick (the D2 kickoff cutoff)."""
+    states: list[MarketState] = []
+    for i in range(32):
+        states.append(
+            _tick(
+                fixture_id,
+                tick_seq=i,
+                ts=i * 25,  # horizon spans 31*25 = 775s >= 600
+                phase=0,
+                markets={
+                    _DEGEN_KEY: _ou_market(degen_over_bps),
+                    _HEALTHY_KEY: _ou_market(healthy_over_bps + (i % 5) * 20),  # gentle drift, stays < 0.95
+                },
+            )
+        )
+    states.append(_tick(fixture_id, tick_seq=32, ts=1_000, phase=1, markets={}))  # full-time cutoff
+    return states
+
+
+def _markets_referenced(rows: list[dict]) -> set[str]:
+    """Full market_keys a fired row references (WAIT/no-position rows carry ``"n/a"`` — excluded)."""
+    return {row["market"] for row in rows if row["market"] != "n/a"}
+
+
+# ------------------------------------------------------------------------------------------
+# RED: a degenerate near-certain line is EXCLUDED from scoring and the manifest is emitted.
+# ------------------------------------------------------------------------------------------
+
+
+def test_market_quality_filter_excludes_degenerate_and_emits_manifest(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    fixture_id = 71
+    _patch_all_loaders(monkeypatch, _states(fixture_id))
+    proto = _proto(fixture_ids=[fixture_id], strategy_configs=["cumulative-drift"], baselines=_BASELINES)
+    manifest_sink: dict = {}
+
+    results = asyncio.run(
+        produce_results_by_fixture(
+            proto,
+            packs={fixture_id: tmp_path},
+            market_quality_config=DEFAULT_MARKET_QUALITY_CONFIG,
+            manifest_sink=manifest_sink,
+        )
+    )
+
+    # The manifest is the required artifact — no filter claim without it.
+    assert fixture_id in manifest_sink
+    manifest = manifest_sink[fixture_id]
+    assert manifest.filter_config_hash == DEFAULT_MARKET_QUALITY_CONFIG.filter_config_hash()
+    assert manifest.eligible == [_HEALTHY_KEY]
+    assert manifest.eligible_count == 1 and manifest.excluded_count == 1
+    excluded = {ex.market_key: ex.reasons for ex in manifest.excluded}
+    assert _DEGEN_KEY in excluded and "near_certain" in excluded[_DEGEN_KEY]
+
+    # The degenerate line is NEVER scored (filtered from the feed); real rows still exist for the healthy line.
+    assert results[fixture_id], "the healthy line must still be scored"
+    assert _DEGEN_KEY not in _markets_referenced(results[fixture_id])
+
+
+def test_filter_applies_to_drift_and_baselines_identically(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The SAME eligible universe governs drift AND baseline rows — no market scored for one, filtered for
+    the other (apples-to-apples preserved)."""
+    fixture_id = 72
+    _patch_all_loaders(monkeypatch, _states(fixture_id))
+    proto = _proto(fixture_ids=[fixture_id], strategy_configs=["cumulative-drift"], baselines=_BASELINES)
+    manifest_sink: dict = {}
+
+    results = asyncio.run(
+        produce_results_by_fixture(
+            proto,
+            packs={fixture_id: tmp_path},
+            market_quality_config=DEFAULT_MARKET_QUALITY_CONFIG,
+            manifest_sink=manifest_sink,
+        )
+    )
+    eligible = set(manifest_sink[fixture_id].eligible)
+
+    drift_rows = [r for r in results[fixture_id] if r["kind"] == "cumulative-drift"]
+    baseline_rows = [r for r in results[fixture_id] if r["kind"] in _BASELINES]
+    # Every fired market — in drift rows AND in baseline rows — is inside the eligible set; the degenerate
+    # line appears in NEITHER (it was filtered from the feed both strategies decide over).
+    assert _markets_referenced(drift_rows) <= eligible
+    assert _markets_referenced(baseline_rows) <= eligible
+    assert _DEGEN_KEY not in _markets_referenced(results[fixture_id])
+
+
+def test_unfiltered_default_unchanged(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """``market_quality_config=None`` (and omitting it entirely) ⇒ existing behavior, byte-identical."""
+    fixture_id = 73
+    _patch_all_loaders(monkeypatch, _states(fixture_id))
+    proto = _proto(fixture_ids=[fixture_id], strategy_configs=["cumulative-drift"], baselines=_BASELINES)
+
+    baseline_no_param = asyncio.run(produce_results_by_fixture(proto, packs={fixture_id: tmp_path}))
+
+    manifest_sink: dict = {}
+    explicit_none = asyncio.run(
+        produce_results_by_fixture(
+            proto, packs={fixture_id: tmp_path}, market_quality_config=None, manifest_sink=manifest_sink
+        )
+    )
+
+    # None path is byte-identical to the pre-FU-2 call, and emits NO manifest (unfiltered ⇒ no filter claim).
+    assert explicit_none == baseline_no_param
+    assert manifest_sink == {}
+    # And unfiltered, the degenerate line IS in the scored universe (proving the filter is what removes it).
+    assert _DEGEN_KEY in _markets_referenced(baseline_no_param[fixture_id])
+
+
+def test_zero_eligible_is_named_skip(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """A fixture whose every market is degenerate ⇒ a NAMED skip in the manifest, never a silent empty."""
+    fixture_id = 74
+    # Both lines near-certain (over 9700) → every market excluded.
+    _patch_all_loaders(monkeypatch, _states(fixture_id, degen_over_bps=9_700, healthy_over_bps=9_700))
+    proto = _proto(fixture_ids=[fixture_id], strategy_configs=["cumulative-drift"], baselines=_BASELINES)
+    manifest_sink: dict = {}
+
+    results = asyncio.run(
+        produce_results_by_fixture(
+            proto,
+            packs={fixture_id: tmp_path},
+            market_quality_config=DEFAULT_MARKET_QUALITY_CONFIG,
+            manifest_sink=manifest_sink,
+        )
+    )
+
+    assert results[fixture_id] == []  # empty, but NOT silent...
+    manifest = manifest_sink[fixture_id]
+    assert manifest.zero_eligible is True  # ...it is a named skip.
+    assert manifest.eligible == [] and manifest.eligible_count == 0
+    assert manifest.excluded_count == 2
+    for ex in manifest.excluded:
+        assert "near_certain" in ex.reasons
+
+
+def test_filter_config_hash_is_present_and_stable(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """The manifest pins a stable, config-only ``filter_config_hash`` (config identity fixed before results)."""
+    fixture_id = 75
+    _patch_all_loaders(monkeypatch, _states(fixture_id))
+    proto = _proto(fixture_ids=[fixture_id], strategy_configs=[], baselines=_BASELINES)
+
+    sinks = []
+    for _ in range(2):
+        sink: dict = {}
+        asyncio.run(
+            produce_results_by_fixture(
+                proto,
+                packs={fixture_id: tmp_path},
+                market_quality_config=DEFAULT_MARKET_QUALITY_CONFIG,
+                manifest_sink=sink,
+            )
+        )
+        sinks.append(sink[fixture_id].filter_config_hash)
+
+    assert sinks[0] == sinks[1] == DEFAULT_MARKET_QUALITY_CONFIG.filter_config_hash()
+    assert len(sinks[0]) == 64
