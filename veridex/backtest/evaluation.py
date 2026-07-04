@@ -31,16 +31,15 @@ from typing import Any, Literal
 
 from pydantic import BaseModel
 
+from veridex.backtest.baseline_agents import baseline_agent
 from veridex.backtest.baselines import BASELINES
 from veridex.backtest.calibration import CalibrationReport, build_calibration_report
-from veridex.backtest.pre_match import plan_pre_match_backtest
 from veridex.backtest.runner import run_backtest
 from veridex.backtest.vvv_report import vvv_report_with_estimated_edge
 from veridex.ingest.marketstate import MarketState
 from veridex.ingest.replay_pack import load_pack_marketstates
 from veridex.provenance import EvidenceRung
 from veridex.runtime.orchestrator import RunResult
-from veridex.runtime.schemas import AgentAction
 from veridex.runtime.window import RunWindow
 from veridex.scoring import is_scored
 from veridex.strategies.drift import cumulative_drift_agent
@@ -136,8 +135,14 @@ def run_multi_fixture_evaluation(
     # AC-009: a predeclared StaleLine strategy is admitted ONLY when cadence actually backs it.
     stale_line_included = (STALE_LINE_CONFIG in protocol.strategy_configs) and cadence_ok
 
+    # FU-3: the drift-vs-baseline comparison surface — drift's scored-CLV distribution alongside each
+    # named baseline's. StaleLine is excluded (it is not produced here — cadence-gated separately); any
+    # named kind that produced no rows is dropped by the builder, so no fabricated empty bucket appears.
+    comparison_kinds = [
+        config for config in protocol.strategy_configs if config != STALE_LINE_CONFIG
+    ] + list(protocol.baselines)
     calibration: CalibrationReport = build_calibration_report(
-        rows, provenance=EvidenceRung.TXLINE_ONLY.value
+        rows, provenance=EvidenceRung.TXLINE_ONLY.value, comparison_kinds=comparison_kinds
     )
 
     return {
@@ -200,16 +205,23 @@ def _build_window(protocol: EvalProtocol, fixture_id: int, marketstates: list[Ma
     )
 
 
-def _rows_from_run(result: RunResult, *, fixture_id: int, kind: str) -> list[dict[str, Any]]:
+def _rows_from_run(
+    result: RunResult, *, fixture_id: int, kind: str, agent_id: str | None = None
+) -> list[dict[str, Any]]:
     """Project a sealed run's ``score_rows`` into calibration-shaped rows (one per decision).
 
     Reuses the SINGLE-SOURCE-OF-TRUTH :func:`~veridex.scoring.is_scored` predicate: a row carries a
     real ``clv_bps`` only when it is scored, otherwise ``None`` (a WAIT/pending abstention — never a
     fabricated 0). ``action`` normalizes the sealed action type (enum-or-string), and ``market`` is
     the fired pick's ``market_key`` (``"n/a"`` for a no-position row).
+
+    ``agent_id`` (FU-3) filters a multi-agent run's rows to one participant — the baselines share ONE
+    ``run_backtest`` (head-to-head on identical ticks), so each is projected back to its own ``kind``.
     """
     rows: list[dict[str, Any]] = []
     for row in result.score_rows:
+        if agent_id is not None and row.get("agent_id") != agent_id:
+            continue
         raw_action = row.get("raw_prescore", {}).get("raw_action", {})
         action_type = raw_action.get("type")
         action = getattr(action_type, "value", action_type)
@@ -219,77 +231,6 @@ def _rows_from_run(result: RunResult, *, fixture_id: int, kind: str) -> list[dic
             {"fixture_id": fixture_id, "kind": kind, "market": str(market), "action": action, "clv_bps": clv_bps}
         )
     return rows
-
-
-def _baseline_inputs(marketstates: list[MarketState]) -> dict[str, Any] | None:
-    """Extract the inputs the heterogeneous baselines need from a fixture's ticks, or ``None``.
-
-    DRIFT-1: the baselines take DIFFERENT inputs — a ``prices`` series (``no_trade`` / ``threshold_move``
-    / ``seeded_random``), a ``fair_probs`` dict (``favorite``), and a horizon.
-
-    FU-1 (same bug class as D2): these are derived from the PRE-KICKOFF decision states — the same
-    universe drift decides over, via :func:`~veridex.backtest.pre_match.plan_pre_match_backtest` — NOT
-    from ``marketstates[-1]``. On a full-match pack that final tick is FULL-TIME (in-running), often with
-    no usable market/prob map; keying off it made this return ``None`` and the producer SILENTLY skip
-    every baseline (Pilot-0: baseline_rows == 0). The inputs are keyed off the first market (sorted) in
-    the LAST pre-kickoff tick. Returns ``None`` when no pre-kickoff market is present (honest skip): an
-    all-in-running pack has no pre-kickoff evidence, so no baseline input can be derived.
-    """
-    if not marketstates:
-        return None
-    plan = plan_pre_match_backtest(marketstates)
-    decision_states = plan.decision_states
-    if not decision_states:
-        return None
-    # The folded per-market pre-kickoff close (every market at its LAST pre-kickoff value) is the honest
-    # "final" reference within the pre-kickoff universe — it carries markets last priced on EARLIER ticks
-    # that the single last decision tick may not (on a full-match pack that tick can be a lone suspended
-    # line). Fall back to the last decision tick when no fold exists.
-    close = plan.closing_state or decision_states[-1]
-    close_markets = getattr(close, "markets", {}) or {}
-    # Seed the baselines off the first market (sorted, deterministic) with a USABLE (non-empty) prob map:
-    # a suspended/degenerate line carries an empty ``stable_prob_bps`` and can't seed favorite's fair_probs
-    # or a fair-prob-derived price, so it is skipped here (data-usability guard, NOT a quality filter).
-    market_key: str | None = None
-    prob_map: dict[str, Any] = {}
-    for candidate_key in sorted(close_markets):
-        candidate_probs = (close_markets[candidate_key].get("stable_prob_bps") or {})
-        if candidate_probs:
-            market_key = candidate_key
-            prob_map = candidate_probs
-            break
-    if market_key is None:
-        return None
-    side0 = sorted(prob_map)[0]
-
-    prices: list[float] = []
-    for state in decision_states:
-        market = (getattr(state, "markets", {}) or {}).get(market_key, {})
-        price_map = market.get("stable_price") or {}
-        tick_probs = market.get("stable_prob_bps") or {}
-        if side0 in price_map:
-            prices.append(float(price_map[side0]))
-        elif side0 in tick_probs and tick_probs[side0]:
-            prices.append(10000.0 / float(tick_probs[side0]))  # decimal price from the fair prob
-
-    fair_probs = {side: float(bps) / 10000.0 for side, bps in prob_map.items()}
-    horizon_s = int(getattr(decision_states[-1], "ts", 0)) - int(getattr(decision_states[0], "ts", 0))
-    return {"market": market_key, "prices": prices, "fair_probs": fair_probs, "horizon_s": horizon_s}
-
-
-def _baseline_action(name: str, fn: Callable, inputs: dict[str, Any], *, seed: int) -> AgentAction | None:
-    """Call one baseline with ITS OWN signature (DRIFT-1); ``None`` for an unknown baseline shape."""
-    prices = inputs["prices"]
-    horizon_s = inputs["horizon_s"]
-    if name == "no_trade":
-        return fn(prices, horizon_s)
-    if name == "favorite":
-        return fn(inputs["fair_probs"], horizon_s)
-    if name == "threshold_move":
-        return fn(prices, horizon_s)
-    if name == "seeded_random":
-        return fn(prices, horizon_s, seed)
-    return None  # a baseline whose signature the producer doesn't know — skip honestly, never guess
 
 
 async def produce_results_by_fixture(
@@ -311,11 +252,15 @@ async def produce_results_by_fixture(
         ``venue_source_id`` FAILS CLOSED: the strategy is HONESTLY SKIPPED (no row, no faked price).
       * ``"stale-line"`` → NOT run here — it is cadence-gated inside
         :func:`run_multi_fixture_evaluation` (AC-009).
-      * each named baseline → dispatched DIRECTLY with its own heterogeneous signature (DRIFT-1),
-        one row per fixture; a baseline whose inputs can't be derived is skipped, never faked.
+      * each named baseline → wrapped as an Agent (:func:`~veridex.backtest.baseline_agents.baseline_agent`)
+        and run through :func:`~veridex.backtest.runner.run_backtest` — the SAME scored path drift uses, so
+        a fired baseline pick is SCORED by the law against the per-market CON-040 kickoff close (FU-3), not
+        a hardcoded null. The baselines share ONE run (head-to-head on identical ticks) and their rows are
+        split back to per-baseline ``kind``; ``no_trade`` always WAITs (stays null) and a pick with no
+        valid close FAILS CLOSED (degrades to WINDOW CLV → unscored), never a fabricated CLV.
 
-    No scoring logic is duplicated: the strategy rows come from the SAME sealed
-    ``RunResult.score_rows`` those real paths produce.
+    No scoring logic is duplicated: EVERY strategy AND baseline row comes from the SAME sealed
+    ``RunResult.score_rows`` ``run_backtest`` produces — the law owns CLV.
 
     Args:
         protocol: The committed evaluation contract (its fixtures/roster/baselines drive the run).
@@ -363,23 +308,23 @@ async def produce_results_by_fixture(
                 rows.extend(_rows_from_run(result, fixture_id=fixture_id, kind=config))
             # STALE_LINE_CONFIG (cadence-gated in the evaluation) and any unknown config: skip here.
 
-        baseline_inputs = _baseline_inputs(marketstates)
-        for name in protocol.baselines:
-            fn = BASELINES.get(name)
-            if fn is None or baseline_inputs is None:
-                continue  # unknown baseline / no derivable inputs — honest skip (never a faked row)
-            action = _baseline_action(name, fn, baseline_inputs, seed=fixture_id)
-            if action is None:
-                continue
-            rows.append(
-                {
-                    "fixture_id": fixture_id,
-                    "kind": name,
-                    "market": str(baseline_inputs["market"]),
-                    "action": action.type.value,
-                    "clv_bps": None,  # baselines are called directly — no law-scored CLV to report
-                }
+        # FU-3: each acting baseline is now SCORED through the SAME path drift uses — wrapped as an Agent
+        # (baseline_agent) and run through run_backtest, so its fired pick gets a real clv_bps recomputed
+        # by the law against the per-market CON-040 kickoff close (D2), never a hardcoded None. All named
+        # baselines share ONE run (head-to-head on identical ticks, the CompetitionRun contract); their
+        # rows are split back to per-baseline ``kind`` by agent_id. no_trade always WAITs → its rows stay
+        # unscored/null; a fired pick with no valid close FAILS CLOSED inside run_backtest (degrades to
+        # WINDOW CLV → is_scored False → clv_bps None), never a fabricated CLV.
+        baseline_names = [name for name in protocol.baselines if name in BASELINES]
+        if baseline_names:
+            baseline_run, _ = await run_backtest(
+                pack_dir,
+                fixture_id,
+                [baseline_agent(name, seed=fixture_id) for name in baseline_names],
+                window=window,
             )
+            for name in baseline_names:
+                rows.extend(_rows_from_run(baseline_run, fixture_id=fixture_id, kind=name, agent_id=name))
 
         results[fixture_id] = rows
     return results

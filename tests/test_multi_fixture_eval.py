@@ -146,7 +146,7 @@ def test_producer_generates_results_then_feeds_the_evaluation(tmp_path: Path) ->
 
 
 def test_producer_runs_all_named_baselines(tmp_path: Path) -> None:
-    """Every named baseline is dispatched with ITS OWN signature and yields a row (DRIFT-1)."""
+    """Every named baseline is run as an Agent through the SAME scored path drift uses (FU-3, DRIFT-1)."""
     pack_dir = _real_pack(tmp_path)
     names = ["no_trade", "favorite", "threshold_move", "seeded_random"]
     proto = _proto(fixture_ids=[5], strategy_configs=[], baselines=names)
@@ -155,10 +155,14 @@ def test_producer_runs_all_named_baselines(tmp_path: Path) -> None:
 
     kinds = {row["kind"] for row in results[5]}
     assert set(names) <= kinds, f"every baseline must produce a row; got {kinds}"
-    # Each baseline row is a real, valid decision (WAIT or a fired pick) — never a fabricated CLV.
+    # FU-3: each row is a real, valid decision — a WAIT abstention (null CLV) or a fired pick SCORED by
+    # the law against the CON-040 close. clv_bps is null IFF the row is a WAIT (never a fabricated CLV,
+    # never a null for a fired-and-closed pick). no_trade only ever WAITs → it stays null.
     for row in results[5]:
         assert row["action"] in {"WAIT", "FOLLOW_MOMENTUM"}
-        assert row["clv_bps"] is None  # baselines are called directly (no law-scored CLV)
+        assert (row["clv_bps"] is None) == (row["action"] == "WAIT")
+    for row in (r for r in results[5] if r["kind"] == "no_trade"):
+        assert row["clv_bps"] is None
 
 
 def test_producer_runs_value_vs_venue_only_with_a_source(tmp_path: Path) -> None:
@@ -240,10 +244,27 @@ def test_producer_requires_explicit_venue_source_identity_for_vvv(tmp_path: Path
 # no usable market/prob map. ``_baseline_inputs`` then returned ``None`` and the producer's
 # ``baseline_inputs is None`` guard SILENTLY skipped every baseline (Pilot-0: baseline_rows == 0).
 # The fix derives inputs from the PRE-KICKOFF decision states (D2 windowing), the same universe drift
-# decides over, so the four baselines emit their rows — still with ``clv_bps is None`` (FU-3 territory).
+# decides over, so the four baselines emit their rows. FU-3 then made those acting baselines SCORED
+# (run as Agents through run_backtest), so a fired pick now carries a real clv_bps and no_trade stays null.
 # ==========================================================================================
 
 _BASELINE_NAMES = ["no_trade", "favorite", "threshold_move", "seeded_random"]
+
+
+def _patch_all_loaders(monkeypatch: pytest.MonkeyPatch, states: list[MarketState]) -> None:
+    """Drive the whole path off synthetic ``states`` without a real on-disk pack.
+
+    FU-3: the acting baselines are now scored via ``run_backtest``, which independently loads the pack
+    (``runner.load_pack_marketstates``) and reads its content hash (``runner._pack_content_hash``) — so
+    both, plus the producer's own ``evaluation.load_pack_marketstates``, are patched to the same tape.
+    """
+    monkeypatch.setattr(
+        "veridex.backtest.evaluation.load_pack_marketstates", lambda pack_dir, fid, **kw: states
+    )
+    monkeypatch.setattr(
+        "veridex.backtest.runner.load_pack_marketstates", lambda pack_dir, fid, **kw: states
+    )
+    monkeypatch.setattr("veridex.backtest.runner._pack_content_hash", lambda pack_dir: "deadbeefcafe0000")
 
 
 def _1x2_tick(fixture_id: int, *, tick_seq: int, ts: int, phase: int, home_bps: int) -> MarketState:
@@ -297,10 +318,7 @@ def test_baselines_emit_rows_on_full_match_pack(monkeypatch: pytest.MonkeyPatch,
     """
     fixture_id = 42
     states = _full_match_states(fixture_id)
-    monkeypatch.setattr(
-        "veridex.backtest.evaluation.load_pack_marketstates",
-        lambda pack_dir, fid, **kw: states,
-    )
+    _patch_all_loaders(monkeypatch, states)
     proto = _proto(fixture_ids=[fixture_id], strategy_configs=[], baselines=_BASELINE_NAMES)
 
     results = asyncio.run(produce_results_by_fixture(proto, packs={fixture_id: tmp_path}))
@@ -311,7 +329,8 @@ def test_baselines_emit_rows_on_full_match_pack(monkeypatch: pytest.MonkeyPatch,
     assert set(_BASELINE_NAMES) <= kinds, f"all four baselines must emit; got {kinds}"
     for row in baseline_rows:
         assert row["action"] in {"WAIT", "FOLLOW_MOMENTUM"}
-        assert row["clv_bps"] is None  # still null/abstention references (scored CLV is FU-3)
+        # FU-3: null IFF a WAIT abstention; a fired pick is SCORED vs the CON-040 close (never a fake CLV).
+        assert (row["clv_bps"] is None) == (row["action"] == "WAIT")
 
     out = run_multi_fixture_evaluation(proto, results_by_fixture=results, cadence_ok=True)
     assert set(_BASELINE_NAMES) <= set(out["calibration"].by_kind), "by_kind must include baseline kinds"
@@ -321,15 +340,13 @@ def test_baselines_still_emit_on_pre_match_only_pack(monkeypatch: pytest.MonkeyP
     """Regression: a pre-match-only pack (never in-running) STILL emits all four baseline rows."""
     fixture_id = 43
     states = _pre_match_only_states(fixture_id)
-    monkeypatch.setattr(
-        "veridex.backtest.evaluation.load_pack_marketstates",
-        lambda pack_dir, fid, **kw: states,
-    )
+    _patch_all_loaders(monkeypatch, states)
     proto = _proto(fixture_ids=[fixture_id], strategy_configs=[], baselines=_BASELINE_NAMES)
 
     results = asyncio.run(produce_results_by_fixture(proto, packs={fixture_id: tmp_path}))
 
     kinds = {row["kind"] for row in results[fixture_id]}
     assert set(_BASELINE_NAMES) <= kinds, f"pre-match-only regression: all baselines must emit; got {kinds}"
+    # FU-3: null IFF a WAIT abstention; a fired pick is scored vs the held-out per-market close (no lookahead).
     for row in results[fixture_id]:
-        assert row["clv_bps"] is None
+        assert (row["clv_bps"] is None) == (row["action"] == "WAIT")

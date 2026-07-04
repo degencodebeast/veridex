@@ -126,18 +126,34 @@ def _breadth(settled: list[dict[str, Any]]) -> CalibrationBreadth:
     )
 
 
-def build_calibration_report(settled: list[dict[str, Any]], *, provenance: str) -> CalibrationReport:
+def build_calibration_report(
+    settled: list[dict[str, Any]],
+    *,
+    provenance: str,
+    comparison_kinds: list[str] | None = None,
+) -> CalibrationReport:
     """Aggregate settled picks into a `CalibrationReport` (REPORT-ONLY, SEC-002 — module docstring).
 
     Each row of ``settled`` is ``{"fixture_id": int, "kind": str, "market": str, "action": str,
     "clv_bps": int | None}`` — already-scored picks; this function invents no scored number, it
     only aggregates what's given.
+
+    ``comparison_kinds`` (FU-3) names the strategies to surface in ``baseline_comparison`` — the honest
+    drift-vs-baseline comparison. Each named kind that actually produced rows gets its own bucket (the
+    SAME ``CalibrationBucket`` — avg CLV + scored count — used everywhere else), so a reader can compare
+    the drift agent's scored-CLV distribution against each zero-edge baseline's. A kind that produced no
+    rows is omitted (never a fabricated empty bucket); ``None``/empty leaves the comparison ``{}``.
     """
     overall = _bucket(settled)
     by_kind = {key: _bucket(rows) for key, rows in _group_by(settled, "kind").items()}
     by_market = {key: _bucket(rows) for key, rows in _group_by(settled, "market").items()}
     by_action = {key: _bucket(rows) for key, rows in _group_by(settled, "action").items()}
     breadth = _breadth(settled)
+    # baseline_comparison reuses the ALREADY-computed by_kind buckets (no re-aggregation, no invented
+    # number) filtered to the requested strategies that are actually present — drift vs each baseline.
+    baseline_comparison = (
+        {kind: by_kind[kind] for kind in comparison_kinds if kind in by_kind} if comparison_kinds else {}
+    )
     headline = f"{overall.hit_rate:.1%} hit rate over {overall.n} settled picks ({provenance})"
     return CalibrationReport(
         overall=overall,
@@ -145,7 +161,7 @@ def build_calibration_report(settled: list[dict[str, Any]], *, provenance: str) 
         by_market=by_market,
         by_action=by_action,
         breadth=breadth,
-        baseline_comparison={},
+        baseline_comparison=baseline_comparison,
         provenance=provenance,
         headline=headline,
     )
