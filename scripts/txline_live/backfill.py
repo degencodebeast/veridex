@@ -26,6 +26,7 @@ import asyncio
 import os
 import sys
 from pathlib import Path
+from typing import Any
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
@@ -33,13 +34,32 @@ sys.path.insert(0, str(ROOT))
 DEFAULT_PACKS_DIR = Path(__file__).parent / "packs"
 
 
-async def _backfill_one(fid: int, base_url: str, creds: tuple[str, str], packs_dir: Path) -> None:
+async def _fetch_scores_or_empty(
+    fid: int, base_url: str, creds: tuple[str, str], *, client: Any = None
+) -> list[dict[str, Any]]:
+    """Fetch the score history for ``fid``; NON-fatal.
+
+    Scores are a recorded, non-evidence sibling (never sealed pack evidence) — an unavailable or
+    erroring scores leg must not block the odds-backed pack from being built at all.
+    """
+    from veridex.ingest.txline_client import fetch_scores_updates
+
+    try:
+        return await fetch_scores_updates(fid, base_url=base_url, creds=creds, client=client)
+    except Exception as e:  # noqa: BLE001 — scores unavailable must not abort the odds-backed pack
+        print(f"fixture {fid}: scores unavailable ({type(e).__name__}: {e}) — building pack from odds only")
+        return []
+
+
+async def _backfill_one(
+    fid: int, base_url: str, creds: tuple[str, str], packs_dir: Path, *, client: Any = None
+) -> None:
     # Imports kept local (CON-010): keeps module import network-free; httpx is lazy under fetch_*.
     from veridex.ingest.backfill import build_pack_from_fixture
-    from veridex.ingest.txline_client import fetch_odds_updates, fetch_scores_updates
+    from veridex.ingest.txline_client import fetch_odds_updates
 
-    odds = await fetch_odds_updates(fid, base_url=base_url, creds=creds)
-    scores = await fetch_scores_updates(fid, base_url=base_url, creds=creds)
+    odds = await fetch_odds_updates(fid, base_url=base_url, creds=creds, client=client)
+    scores = await _fetch_scores_or_empty(fid, base_url, creds, client=client)
     print(f"fixture {fid}: fetched {len(odds)} odds updates, {len(scores)} score updates")
 
     out_dir = packs_dir / str(fid)

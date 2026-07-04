@@ -16,6 +16,7 @@ import asyncio
 from typing import Any
 
 from veridex.ingest.live_client import build_auth_headers
+from veridex.ingest.marketstate import parse_sse_line
 
 _VALIDATION_METHODS: dict[str, str] = {
     "odds": "validateOdds",
@@ -103,20 +104,37 @@ async def _get_updates_with_cache_retry(
 ) -> list[dict[str, Any]]:
     """GET ``url``, retrying through a cache-cold EMPTY 200 (5-minute TxLINE update cache).
 
-    A cold cache returns a quick empty body while it warms; ``.json()`` on that body raises
-    ``JSONDecodeError`` — a cryptic symptom of the real cause. Retry a few times before raising
-    a descriptive error; never let the bare ``JSONDecodeError`` escape.
+    Content-type decides how the body is parsed: ``/odds/updates`` returns JSON, but
+    ``/scores/updates`` returns ``text/event-stream`` (SSE) — parsed line-by-line through the
+    SAME :func:`~veridex.ingest.marketstate.parse_sse_line` normalizer live capture uses, never a
+    second hand-rolled SSE parser.
+
+    A cold cache returns a quick empty body while it warms: an empty JSON body makes ``.json()``
+    raise ``JSONDecodeError`` (a cryptic symptom of the real cause), and an empty/heartbeat-only
+    SSE body parses to zero records. Either empty outcome retries a few times before raising a
+    descriptive error; never let a bare ``JSONDecodeError`` escape.
     """
     resp = None
     for attempt in range(1, retries + 1):
         resp = await client.get(url, headers=headers)
         resp.raise_for_status()
-        try:
-            data = resp.json()
-        except ValueError:
-            data = None
-        if data is not None:
-            return list(data) if isinstance(data, list) else list(data.get("updates", []))
+        content_type = resp.headers.get("content-type", "")
+        data: list[dict[str, Any]]
+        if "event-stream" in content_type:
+            data = [rec for line in resp.text.splitlines() if (rec := parse_sse_line(line)) is not None]
+        else:
+            try:
+                parsed: Any = resp.json()
+            except ValueError:
+                parsed = None
+            if parsed is None:
+                data = []
+            elif isinstance(parsed, list):
+                data = list(parsed)
+            else:
+                data = list(parsed.get("updates", []))
+        if data:
+            return data
         if attempt < retries:
             await asyncio.sleep(retry_delay)
     content = resp.content if resp is not None else b""

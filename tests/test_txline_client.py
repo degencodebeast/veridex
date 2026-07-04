@@ -205,6 +205,68 @@ async def test_fetch_scores_updates_retries_through_cache_cold_empty() -> None:
     assert len(client.calls) == 2
 
 
+# ---------------------------------------------------------------------------
+# ``/scores/updates/{fid}`` returns ``text/event-stream`` (SSE), NOT JSON — the same
+# ``parse_sse_line`` normalizer live capture uses must parse this body too.
+# ---------------------------------------------------------------------------
+
+
+class _FakeSSEResp:
+    """A ``text/event-stream`` 200 whose body is raw SSE text, not JSON."""
+
+    def __init__(self, body: str) -> None:
+        self.status_code = 200
+        self.headers = {"content-type": "text/event-stream"}
+        self.content = body.encode()
+        self.text = body
+
+    def raise_for_status(self) -> None:
+        return None
+
+    def json(self) -> Any:
+        raise ValueError("not JSON: text/event-stream")  # mirrors a real SSE body
+
+
+class _FakeSSEClient:
+    def __init__(self, bodies: list[str]) -> None:
+        self._bodies = bodies
+        self.calls: list[str] = []
+        self.headers: list[dict[str, str]] = []
+
+    async def get(self, url: str, headers: dict[str, str] | None = None, **kw: Any) -> _FakeSSEResp:
+        self.calls.append(url)
+        self.headers.append(headers or {})
+        idx = min(len(self.calls) - 1, len(self._bodies) - 1)
+        return _FakeSSEResp(self._bodies[idx])
+
+    async def aclose(self) -> None:
+        return None
+
+
+async def test_fetch_scores_updates_parses_event_stream() -> None:
+    # Real `parse_sse_line` line shape (marketstate.py / capture.py): "data: {json}" per event,
+    # blank/comment/event: lines are non-data and skipped.
+    sse_body = (
+        'data: {"FixtureId": 456, "Ts": 1, "phase": 1, "scores": {"home": 0}}\n'
+        "\n"
+        ": heartbeat\n"
+        'data: {"FixtureId": 456, "Ts": 2, "phase": 1, "scores": {"home": 1}}\n'
+        "\n"
+    )
+    client = _FakeSSEClient([sse_body])
+    updates = await fetch_scores_updates(456, base_url=_BASE, creds=_CREDS, client=client, retry_delay=0.0)
+    assert len(updates) == 2
+    assert [u["Ts"] for u in updates] == [1, 2]
+    assert client.calls == ["https://txline-dev.txodds.com/api/scores/updates/456"]
+
+
+async def test_fetch_odds_updates_json_path_unchanged_when_content_type_is_json() -> None:
+    # Sibling odds leg stays on the `.json()` path — content-type-aware parsing must not regress it.
+    client = _FakeClient([{"MessageId": "a"}])
+    updates = await fetch_odds_updates(123, base_url=_BASE, creds=_CREDS, client=client)
+    assert [u["MessageId"] for u in updates] == ["a"]
+
+
 async def test_validate_odds_keys_on_message_id() -> None:
     payload = {"odds": {}, "summary": {}, "subTreeProof": [], "mainTreeProof": []}
     client = _FakeClient(payload)
