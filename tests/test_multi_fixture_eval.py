@@ -27,6 +27,7 @@ from veridex.backtest.evaluation import (
 from veridex.ingest.marketstate import MarketState
 from veridex.ingest.replay_pack import pack_from_session
 from veridex.provenance import EvidenceRung
+from veridex.venues.venue_price_source import TimedVenueQuote
 
 _RUNG_LABELS = {rung.value for rung in EvidenceRung}
 
@@ -175,7 +176,7 @@ def test_producer_runs_value_vs_venue_only_with_a_source(tmp_path: Path) -> None
         produce_results_by_fixture(
             proto,
             packs={5: pack_dir},
-            venue_price_source=lambda mk: 5.0,
+            venue_price_source=lambda fid, mk, side, ts: TimedVenueQuote(venue_decimal_price=5.0, staleness_s=0),
             venue_source_id="quote-artifact-hash-abc",
         )
     )
@@ -212,14 +213,14 @@ def test_producer_requires_explicit_venue_source_identity_for_vvv(tmp_path: Path
 
     # Source present but NO explicit identity -> VvV is SKIPPED (fail closed), never run with "<lambda>".
     res = asyncio.run(
-        produce_results_by_fixture(proto, packs={5: pack_dir}, venue_price_source=lambda mk: 2.0)
+        produce_results_by_fixture(proto, packs={5: pack_dir}, venue_price_source=lambda fid, mk, side, ts: TimedVenueQuote(venue_decimal_price=2.0, staleness_s=0))
     )
     assert [row for row in res.get(5, []) if row["kind"] == "value-vs-venue"] == []
 
     # An empty identity is no identity — still skipped.
     res_empty = asyncio.run(
         produce_results_by_fixture(
-            proto, packs={5: pack_dir}, venue_price_source=lambda mk: 2.0, venue_source_id=""
+            proto, packs={5: pack_dir}, venue_price_source=lambda fid, mk, side, ts: TimedVenueQuote(venue_decimal_price=2.0, staleness_s=0), venue_source_id=""
         )
     )
     assert [row for row in res_empty.get(5, []) if row["kind"] == "value-vs-venue"] == []
@@ -229,7 +230,7 @@ def test_producer_requires_explicit_venue_source_identity_for_vvv(tmp_path: Path
         produce_results_by_fixture(
             proto,
             packs={5: pack_dir},
-            venue_price_source=lambda mk: 2.0,
+            venue_price_source=lambda fid, mk, side, ts: TimedVenueQuote(venue_decimal_price=2.0, staleness_s=0),
             venue_source_id="quote-artifact-hash-abc",
         )
     )

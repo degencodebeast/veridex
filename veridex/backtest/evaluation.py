@@ -25,7 +25,6 @@ Both are counted honestly (never dropped, never scored as 0), and the rows feed 
 
 from __future__ import annotations
 
-from collections.abc import Callable
 from pathlib import Path
 from typing import Any, Literal
 
@@ -48,6 +47,7 @@ from veridex.runtime.window import RunWindow
 from veridex.scoring import is_scored
 from veridex.strategies.drift import cumulative_drift_agent
 from veridex.strategies.market_quality import MarketQualityConfig
+from veridex.venues.venue_price_source import VenuePriceSource
 
 #: The strategy-config id that names the (cadence-gated) StaleLine decision strategy (M8).
 STALE_LINE_CONFIG = "stale-line"
@@ -245,7 +245,7 @@ async def produce_results_by_fixture(
     protocol: EvalProtocol,
     *,
     packs: dict[int, Path],
-    venue_price_source: Callable[[str], float | None] | None = None,
+    venue_price_source: VenuePriceSource | None = None,
     venue_source_id: str | None = None,
     market_quality_config: MarketQualityConfig | None = None,
     manifest_sink: dict[int, EligibleMarketManifest] | None = None,

@@ -13,7 +13,6 @@ build while the report still surfaces an honest, explicitly-assumed, machine-run
 
 from __future__ import annotations
 
-from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -25,13 +24,14 @@ from veridex.runtime.orchestrator import RunResult
 from veridex.runtime.schemas import SportsActionType
 from veridex.runtime.window import RunWindow
 from veridex.strategies.value_vs_venue import value_vs_venue_agent, vvv_signal
+from veridex.venues.venue_price_source import VenuePriceSource
 
 
 def _estimated_edge_over_fired_picks(
     result: RunResult,
     states_by_tick: dict[int, Any],
     *,
-    venue_price_source: Callable[[str], float | None],
+    venue_price_source: VenuePriceSource,
     min_edge_bps: int,
 ) -> int | None:
     """Estimated executable edge (bps) over the STRATEGY'S ACTUAL FIRED PICKS — never a declined one.
@@ -39,7 +39,9 @@ def _estimated_edge_over_fired_picks(
     Reads the agent's real, SEALED decisions from ``result.score_rows`` (the ``FOLLOW_MOMENTUM``
     picks, whose ``raw_prescore.raw_action.params`` carry only the TxLINE-derived ``market_key`` +
     ``side``), re-prices each pick's fair prob — looked up from the SAME tick it fired on
-    (``states_by_tick[tick_seq]``) — against the injected venue quote via ``vvv_signal``, and
+    (``states_by_tick[tick_seq]``) — against the TIME-ALIGNED venue quote from
+    ``venue_price_source(fixture_id, market_key, side, ts)`` (that SAME tick's ``fixture_id``/``ts``)
+    via ``vvv_signal``, and
     aggregates the computable (quote-backed) edges as their MAX. A pick whose venue price is ``None``
     (no quote) is skipped. Returns ``None`` when the strategy fired NO picks — the honest answer for a
     strategy that took zero positions, NOT the best market opportunity it declined (F2).
@@ -66,8 +68,11 @@ def _estimated_edge_over_fired_picks(
             fair_prob_bps = int(prob_bps[side])
         except (TypeError, ValueError):
             continue
+        # Time-aligned venue quote for THIS fired pick's coordinate (same tick's fixture_id + ts).
+        quote = venue_price_source(state.fixture_id, market_key, side, state.ts)
+        venue_decimal_price = quote.venue_decimal_price if quote is not None else None
         estimated = vvv_signal(
-            fair_prob_bps, venue_price_source(market_key), min_edge_bps=min_edge_bps
+            fair_prob_bps, venue_decimal_price, min_edge_bps=min_edge_bps
         )["estimated_executable_edge_bps"]
         if estimated is not None:
             edges.append(estimated)
@@ -78,7 +83,7 @@ async def vvv_report_with_estimated_edge(
     pack_dir: Path,
     fixture_id: int,
     *,
-    venue_price_source: Callable[[str], float | None],
+    venue_price_source: VenuePriceSource,
     venue_source_id: str,
     window: RunWindow,
     min_edge_bps: int = 0,
@@ -101,8 +106,11 @@ async def vvv_report_with_estimated_edge(
     Args:
         pack_dir: Directory of the self-describing ReplayPack.
         fixture_id: The fixture within the pack to replay.
-        venue_price_source: Injected ``Callable[[str], float | None]`` returning the venue DECIMAL
-            price for a market_key (the ONLY venue input; never read from sealed evidence).
+        venue_price_source: Injected time-aligned
+            :data:`~veridex.venues.venue_price_source.VenuePriceSource` — called with
+            ``(fixture_id, market_key, side, ts)`` and returning a
+            :class:`~veridex.venues.venue_price_source.TimedVenueQuote` (or ``None``); the ONLY venue
+            input, never read from sealed evidence.
         venue_source_id: Stable identity of the venue price source (e.g. the quote/price-history
             artifact hash). Bound into the VvV agent's ``config_hash`` for reproducibility — ties the
             report's reproducible config to the venue source it priced against. Must be non-empty.
