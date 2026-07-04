@@ -50,6 +50,11 @@ DEFAULT_OUT_DIR = Path(__file__).parent / "cp1"
 DEFAULT_FIXTURES_CONFIG = DEFAULT_OUT_DIR / "fixtures.json"
 CLOB_BASE_URL = "https://clob.polymarket.com"
 
+# The probe's single source of truth for the covered threshold (CON-001 default). Threaded into
+# BOTH evaluate_venue_coverage (which produces the covered flags) and the recorded artifact, so
+# the artifact's min_pre_kickoff can never silently disagree with the covered flags it ships.
+MIN_PRE_KICKOFF = 5
+
 # Freshness bands (seconds) reported per side, exclusive so their counts partition the
 # within-15m pre-kickoff quotes (matches the spec §4 "<=2m"/"<=5m"/"<=15m" buckets).
 FRESHNESS_BANDS: tuple[tuple[str, int], ...] = (
@@ -59,13 +64,19 @@ FRESHNESS_BANDS: tuple[tuple[str, int], ...] = (
 )
 
 
-def build_coverage_artifact(coverages: list[VenueCoverage], *, tool: str = "cp1_probe/1") -> dict[str, Any]:
+def build_coverage_artifact(
+    coverages: list[VenueCoverage], *, min_pre_kickoff: int = MIN_PRE_KICKOFF, tool: str = "cp1_probe/1"
+) -> dict[str, Any]:
     """Shape the probed per-fixture coverages into the content-hashed coverage artifact.
 
     Refuses an EMPTY input (nothing probed is a misconfiguration, not a result). Zero
     headline-eligible fixtures IS a legitimate result — the artifact still writes with
     ``viable=False`` (CON-001 fail-closed). Each fixture carries its own
     :func:`coverage_content_hash`, and the whole artifact is hashed for pinning.
+
+    ``min_pre_kickoff`` is the threshold that PRODUCED the covered flags — the caller threads the
+    same value it passed to :func:`evaluate_venue_coverage` so the recorded threshold can never
+    silently disagree with the shipped covered flags.
     """
     from veridex.venues.polymarket_coverage import coverage_content_hash
 
@@ -82,7 +93,7 @@ def build_coverage_artifact(coverages: list[VenueCoverage], *, tool: str = "cp1_
     headline_ids = [cov.fixture_id for cov in coverages if cov.headline_eligible]
     artifact: dict[str, Any] = {
         "tool": tool,
-        "min_pre_kickoff": 5,
+        "min_pre_kickoff": min_pre_kickoff,
         "fixtures": fixtures,
         "headline_eligible_fixture_ids": headline_ids,
         "headline_eligible_count": len(headline_ids),
@@ -126,7 +137,9 @@ def _bucket_pre_kickoff(quote_tss: list[int], kickoff_ts: int) -> tuple[int, dic
     return len(pre), buckets, first, last
 
 
-async def _probe_one(fixture: dict[str, Any], *, client: Any, gamma_client: Any) -> VenueCoverage:
+async def _probe_one(
+    fixture: dict[str, Any], *, client: Any, gamma_client: Any, min_pre_kickoff: int
+) -> VenueCoverage:
     """Resolve the three 1X2 tokens for a fixture and count Polymarket pre-kickoff quotes per side."""
     from veridex.venues.polymarket_coverage import SideInput, evaluate_venue_coverage
     from veridex.venues.polymarket_resolver import MarketUnavailable, resolve_market, side_to_token
@@ -163,7 +176,9 @@ async def _probe_one(fixture: dict[str, Any], *, client: Any, gamma_client: Any)
             print(f"fixture {fixture_id} side {side}: token unresolved ({exc}) — recorded uncovered")
             side_inputs[side] = SideInput(pre_kickoff_quote_count=0, token_resolved=False)
 
-    return evaluate_venue_coverage(fixture_id, side_inputs, kickoff_ts=kickoff_ts, min_pre_kickoff=5)
+    return evaluate_venue_coverage(
+        fixture_id, side_inputs, kickoff_ts=kickoff_ts, min_pre_kickoff=min_pre_kickoff
+    )
 
 
 class _DefaultPricesHistoryClient:
@@ -193,20 +208,21 @@ def _load_fixtures_config(path: Path) -> list[dict[str, Any]]:
     return fixtures
 
 
-async def run(fixtures_config: Path, out_dir: Path) -> dict[str, Any]:
+async def run(fixtures_config: Path, out_dir: Path, *, min_pre_kickoff: int = MIN_PRE_KICKOFF) -> dict[str, Any]:
     fixtures = _load_fixtures_config(fixtures_config)
-    print(f"probing Polymarket coverage for {len(fixtures)} fixture(s)")
+    print(f"probing Polymarket coverage for {len(fixtures)} fixture(s) (min_pre_kickoff={min_pre_kickoff})")
 
     client = _DefaultPricesHistoryClient()
     coverages: list[VenueCoverage] = []
     for fixture in fixtures:
         try:
-            cov = await _probe_one(fixture, client=client, gamma_client=None)
+            cov = await _probe_one(fixture, client=client, gamma_client=None, min_pre_kickoff=min_pre_kickoff)
             coverages.append(cov)
         except Exception as exc:  # noqa: BLE001 — one bad fixture must not abort the probe
             print(f"fixture {fixture.get('fixture_id')}: FAILED {type(exc).__name__}: {exc}")
 
-    artifact = build_coverage_artifact(coverages)
+    # Same threshold into both legs: the covered flags AND the recorded min_pre_kickoff.
+    artifact = build_coverage_artifact(coverages, min_pre_kickoff=min_pre_kickoff)
     out_dir.mkdir(parents=True, exist_ok=True)
     out_path = out_dir / "cp1-coverage.json"
     out_path.write_text(json.dumps(artifact, indent=1))

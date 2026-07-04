@@ -139,6 +139,19 @@ def test_zero_headline_eligible_still_produces_a_fail_closed_artifact() -> None:
     assert any("NOT VIABLE" in line for line in render_summary(artifact))
 
 
+def test_artifact_records_the_threshold_actually_used() -> None:
+    # the recorded min_pre_kickoff must be the SAME threshold that produced the covered flags,
+    # not a hardcoded constant that could silently disagree.
+    from scripts.txline_live.cp1_probe import build_coverage_artifact
+
+    cov = evaluate_venue_coverage(
+        300, {"home": 8, "away": 6, "draw": 5}, kickoff_ts=1000, min_pre_kickoff=7
+    )
+    assert cov.headline_eligible is False  # away(6) and draw(5) are below 7
+    artifact = build_coverage_artifact([cov], min_pre_kickoff=7)
+    assert artifact["min_pre_kickoff"] == 7
+
+
 def test_headline_eligible_artifact_is_viable() -> None:
     from scripts.txline_live.cp1_probe import build_coverage_artifact, render_summary
 

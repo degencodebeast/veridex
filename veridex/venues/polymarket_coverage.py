@@ -105,9 +105,12 @@ def evaluate_venue_coverage(
             either a bare pre-kickoff quote count (int) or a rich :class:`SideInput` (count +
             freshness buckets + first/last ts + token-resolved flag). A side absent from the map
             is treated as an unresolved, uncovered side (fail closed, never assumed covered).
-        kickoff_ts: The pre-kickoff boundary the caller used to derive ``pre_kickoff_quote_count``
-            (pinned in the coverage artifact so the counted universe is reproducible; the pure
-            gate itself operates on the already-counted inputs).
+        kickoff_ts: The pre-kickoff boundary the caller (the probe shell) used UPSTREAM to derive
+            ``pre_kickoff_quote_count`` and the freshness buckets. Accepted for signature stability
+            and documentation only — the pure gate operates on the already-counted ``SideInput``s,
+            so ``kickoff_ts`` is NOT referenced in the body and NOT persisted into
+            :class:`VenueCoverage` or its content hash. (Persist it here only if a future run needs
+            it pinned; today it is not.)
         min_pre_kickoff: The covered threshold (CON-001 default 5).
 
     Returns:
