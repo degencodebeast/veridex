@@ -207,13 +207,14 @@ def build_sealed_result(
 ) -> dict[str, Any]:
     """Serialize the sealed result artifact (§4) -- in memory only, writes NO file.
 
-    Carries the pinned ``config`` + ``config_hash`` (the seal), the ``overall_verdict``
-    (mirrored as the top-level ``verdict``) with global stats and per-slice verdicts
-    (E4), the full per-event ``event_records[]`` audit trail (GUD-001 / AC-008), the
-    §4 top-level counts (``fixtures`` / ``total_goal_events`` / ``eligible_events`` /
-    ``raw_delta_*_median``), the CON-014 defaults note, and both tally maps -- with
-    the per-fixture extraction excludes merged into ``excluded_by_reason``. Writing
-    this dict to disk is the operator-gated E6 ``--seal`` step; no I/O here.
+    Carries the pinned ``config`` + ``config_hash`` (the seal), the top-level
+    ``verdict`` plus the ``global`` block (directional stats, ``raw_delta_*_median``,
+    and a nested ``verdict``) and per-slice verdicts (E4), the full per-event
+    ``event_records[]`` audit trail (GUD-001 / AC-008), the §4 top-level counts
+    (``fixtures`` / ``total_goal_events`` / ``eligible_events``), the CON-014 defaults
+    note, and both tally maps -- with the per-fixture extraction excludes merged into
+    ``excluded_by_reason``. Writing this dict to disk is the operator-gated E6
+    ``--seal`` step; no I/O here.
     """
     # Eligible == directional set: R is set ONLY for LAG/OVERSHOOT/REVERSAL events
     # (every NO-SIGNAL / excluded record carries R=None), so ``R is not None`` is the
@@ -230,7 +231,9 @@ def build_sealed_result(
         "fixtures": list(fixtures),
         "total_goal_events": total_goal_events,
         "eligible_events": result.global_n,
-        "overall_verdict": result.overall_verdict,
+        # §4 nests the directional stats, raw-delta medians, and verdict INSIDE the
+        # `global` block; a single top-level `verdict` mirrors it (no redundant
+        # top-level `overall_verdict`, which §4 does not carry).
         "verdict": result.overall_verdict,
         "predeclared_defaults_note": PREDECLARED_DEFAULTS_NOTE,
         "global": {
@@ -238,11 +241,14 @@ def build_sealed_result(
             "median_R": result.global_median_R,
             "ci_low": result.global_ci_low,
             "ci_high": result.global_ci_high,
+            "raw_delta_imm_median": (
+                statistics.median(raw_delta_imm) if raw_delta_imm else None
+            ),
+            "raw_delta_settle_median": (
+                statistics.median(raw_delta_settle) if raw_delta_settle else None
+            ),
+            "verdict": result.overall_verdict,
         },
-        "raw_delta_imm_median": statistics.median(raw_delta_imm) if raw_delta_imm else None,
-        "raw_delta_settle_median": (
-            statistics.median(raw_delta_settle) if raw_delta_settle else None
-        ),
         "per_slice": [
             {
                 "slice": sv.slice,

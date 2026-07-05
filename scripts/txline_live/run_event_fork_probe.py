@@ -148,7 +148,7 @@ def main() -> None:
     Codex milestone review; DO NOT run in CI.
     """
     sealed = run_probe(seal=True)
-    print(f"overall_verdict={sealed['overall_verdict']} "
+    print(f"verdict={sealed['verdict']} "
           f"global_n={sealed['global']['n']} "
           f"config_hash={sealed['config_hash'][:12]}")
 

@@ -220,7 +220,9 @@ def test_sealed_result_schema_has_event_records(monkeypatch) -> None:
     # Top-level seal fields.
     assert sealed["config_hash"] == cfg.config_hash()
     assert sealed["config"] == cfg.model_dump()
-    assert sealed["overall_verdict"] == "INCONCLUSIVE"
+    assert sealed["verdict"] == "INCONCLUSIVE"
+    assert sealed["global"]["verdict"] == "INCONCLUSIVE"
+    assert "overall_verdict" not in sealed  # §4 carries no top-level overall_verdict
     assert sealed["class_counts"] == {"LAG": 1, "NO-SIGNAL": 1}
     assert sealed["excluded_by_reason"]["below_epsilon"] == 1
     assert sealed["global"]["median_R"] == 0.45
@@ -282,14 +284,19 @@ def test_sealed_result_has_section4_toplevel_fields() -> None:
     assert sealed["fixtures"] == [111, 222]
     assert sealed["total_goal_events"] == 7
     assert sealed["eligible_events"] == 1  # directional-set size == result.global_n
-    # Top-level verdict alias mirrors overall_verdict (§4 schema top-level field).
+    # §4: a single top-level verdict; the nested global.verdict mirrors it; NO
+    # redundant top-level overall_verdict.
     assert sealed["verdict"] == "FADE"
-    assert sealed["overall_verdict"] == "FADE"
+    assert sealed["global"]["verdict"] == "FADE"
+    assert "overall_verdict" not in sealed
     # CON-014 note: values are v1 predeclared defaults, not optimized.
     assert "CON-014" in sealed["predeclared_defaults_note"]
-    # Raw-delta medians over the eligible (R-not-None) events (GUD-001).
-    assert sealed["raw_delta_imm_median"] == 0.29
-    assert sealed["raw_delta_settle_median"] == 0.65
+    # §4: raw-delta medians are NESTED in the global block (not top-level), over
+    # the eligible (R-not-None) events (GUD-001).
+    assert "raw_delta_imm_median" not in sealed
+    assert "raw_delta_settle_median" not in sealed
+    assert sealed["global"]["raw_delta_imm_median"] == 0.29
+    assert sealed["global"]["raw_delta_settle_median"] == 0.65
     # Extraction reasons merged alongside the compute reason.
     assert sealed["excluded_by_reason"]["below_epsilon"] == 1
     assert sealed["excluded_by_reason"]["decreasing_score"] == 2
@@ -317,5 +324,5 @@ def test_sealed_result_raw_delta_medians_none_when_no_eligible() -> None:
     )
     sealed = build_sealed_result(cfg, result, records, fixtures=[1], total_goal_events=1)
     assert sealed["eligible_events"] == 0
-    assert sealed["raw_delta_imm_median"] is None
-    assert sealed["raw_delta_settle_median"] is None
+    assert sealed["global"]["raw_delta_imm_median"] is None
+    assert sealed["global"]["raw_delta_settle_median"] is None

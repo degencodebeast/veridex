@@ -127,7 +127,8 @@ def test_end_to_end_returns_sealed_dict_no_write(
 
     assert isinstance(result, dict)
     assert result["config_hash"] == runner.EXPECTED_CONFIG_HASH
-    assert "overall_verdict" in result
+    assert "verdict" in result
+    assert "overall_verdict" not in result  # §4: no top-level overall_verdict
     assert isinstance(result["event_records"], list)
     assert "class_counts" in result
     assert "excluded_by_reason" in result
@@ -145,11 +146,15 @@ def test_end_to_end_returns_sealed_dict_no_write(
     # §4 top-level conformance fields are present.
     assert result["fixtures"] == list(runner.PINNED_FIXTURES)
     assert result["total_goal_events"] == len(result["event_records"])
-    assert result["eligible_events"] == result["global"]["n"]
-    assert result["verdict"] == result["overall_verdict"]
+    # Floor-passers (eligible) are a superset of the directional set (global n).
+    assert result["eligible_events"] >= result["global"]["n"]
+    # §4: the single top-level verdict mirrors the nested global.verdict.
+    assert result["verdict"] == result["global"]["verdict"]
     assert "CON-014" in result["predeclared_defaults_note"]
-    assert "raw_delta_imm_median" in result
-    assert "raw_delta_settle_median" in result
+    # §4: raw-delta medians are nested inside the global block, not top-level.
+    assert "raw_delta_imm_median" in result["global"]
+    assert "raw_delta_settle_median" in result["global"]
+    assert "raw_delta_imm_median" not in result
     # Extraction excludes are merged into excluded_by_reason (keys always present,
     # even at zero -- extract_goal_events initializes all three reasons).
     for reason in ("decreasing_score", "ambiguous_delta", "unparseable"):
