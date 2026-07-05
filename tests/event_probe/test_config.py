@@ -47,6 +47,11 @@ def test_config_defaults_match_spec() -> None:
     assert cfg.robustness_horizons_s == (30, 60, 600)
     assert cfg.epsilon == 0.05
     assert cfg.min_odds_states == 3  # CON-008 per-event observability floor
+    # slice thresholds (CON-007 v1 predeclared defaults): the favorite/underdog
+    # p_pre cutoff and the early/late match-minute boundary -- pinned BEFORE any
+    # run (CON-014), so a post-hoc change to either VOIDs via config_hash.
+    assert cfg.favorite_prob_cutoff == 0.50
+    assert cfg.late_match_minute == 60
     # aggregation (CON-009/010)
     assert cfg.n_min_global == 30
     assert cfg.n_min_slice == 15
@@ -79,6 +84,10 @@ def test_config_hash_is_threshold_sensitive() -> None:
     assert ProbeConfig(robustness_horizons_s=(30, 60, 601)).config_hash() != base
     # CON-008: the min-odds-states floor is SEALED -- a post-hoc 3->2 change VOIDs.
     assert ProbeConfig(min_odds_states=2).config_hash() != base
+    # CON-007: the two predeclared slice thresholds are SEALED too -- tuning the
+    # favorite cutoff or the late-match boundary after a run diverges the hash.
+    assert ProbeConfig(favorite_prob_cutoff=0.55).config_hash() != base
+    assert ProbeConfig(late_match_minute=55).config_hash() != base
 
 
 def test_config_rejects_unknown_field() -> None:

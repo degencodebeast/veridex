@@ -81,6 +81,11 @@ class ProbeConfig(BaseModel):
     robustness_horizons_s: tuple[int, ...] = (30, 60, 600)
     epsilon: float = 0.05
     min_odds_states: int = 3  # CON-008 per-event observability floor (sealed)
+    # slice thresholds (CON-007): the ONLY two numeric knobs the slice tagger reads.
+    # Both are v1 PREDECLARED defaults (CON-014), sealed here so a post-hoc change to
+    # either moves config_hash() and VOIDs the run rather than silently re-bucketing.
+    favorite_prob_cutoff: float = 0.50  # p_pre >= cutoff -> favorite_scorer
+    late_match_minute: int = 60  # match_minute >= this -> late (else early)
     # aggregation (CON-009/010)
     n_min_global: int = 30
     n_min_slice: int = 15
