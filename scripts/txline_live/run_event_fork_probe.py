@@ -118,7 +118,7 @@ def run_probe(cfg: ProbeConfig | None = None, *, seal: bool = False) -> dict[str
         for reason, count in extraction.excluded.items():
             extraction_excluded[reason] = extraction_excluded.get(reason, 0) + count
         for event in extraction.events:
-            series = build_tracked_series(states, event.participant)
+            series = build_tracked_series(states, event.participant, cfg)
             record = compute_event_record(series, event, window_cfg)
             # Derive ALL FIVE CON-007 slice dimensions (the tracked series is
             # participant-keyed and knows no home/away, favorite status, score
