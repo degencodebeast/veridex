@@ -168,6 +168,19 @@ class BacktestReport(BaseModel):
     sim_pnl: int | None
     #: Real venue-executable edge — ALWAYS None on the paper/replay path (fake venue, Codex M2).
     real_executable_edge_bps: int | None
+    #: ESTIMATED venue-executable edge (bps) — a VENUE-DERIVED, EXPLANATORY quantity. DISTINCT from
+    #: ``real_executable_edge_bps`` (which needs a live fill and stays None): this is what the
+    #: de-margined fair probability WOULD have earned at a recorded/backfilled venue price. It is
+    #: attached ONLY AFTER the pure venue-free build (via ``model_copy``); ``build_backtest_report``
+    #: NEVER sets it, so the builder stays venue-blind. NEVER a ranked axis (CLV alone ranks — SEC-005).
+    estimated_executable_edge_bps: int | None = None
+    #: Machine-readable evidence rung the estimated edge was priced from (e.g.
+    #: ``"backfilled-price-history"`` / ``"recorded-live-quote"`` — a ``veridex.provenance.EvidenceRung``
+    #: value). ``None`` until a producer attaches an estimated edge.
+    estimated_edge_rung: str | None = None
+    #: The EXPLICIT assumptions the estimated edge was computed under (e.g. ``no_interpolation``).
+    #: ``None`` until a producer attaches an estimated edge.
+    estimated_edge_assumptions: dict[str, Any] | None = None
 
     # --- sensitivity + operational rates ------------------------------------
     threshold_sensitivity: list[ThresholdSensitivityPoint]
@@ -180,6 +193,15 @@ class BacktestReport(BaseModel):
     #: LAW-acceptance pass fraction (valid decisions / total decisions) — the honest name for what
     #: the replay law actually verifies. Distinct from the (policy-envelope) ``policy_pass_fail_rate``.
     law_valid_rate: float
+
+    # --- close provenance / honest degrade marker (D2) ----------------------
+    #: NON-sealed, human-readable provenance for the pre_match close (the report analog of the live
+    #: runner's ``ops`` markers). ``None`` for a clean full-match ``pre_match`` (verified kickoff +
+    #: complete per-market CON-040 close). Non-None either (a) NOTES a pre-match-only pack (no verified
+    #: kickoff — still true CLV) or (b) NAMES a fail-closed DEGRADE (all-in-running / incomplete close),
+    #: in which case no row carries true ``clv_bps`` (the run finalized on window CLV) and ``avg_clv`` is
+    #: ``None``. Never part of the sealed evidence — a derived, explanatory marker only.
+    closing_note: str | None = None
 
     # --- explicit assumptions + the untouched score stack -------------------
     assumptions: BacktestAssumptions

@@ -19,6 +19,7 @@ Behaviors under test
 from __future__ import annotations
 
 import ast
+import json
 from pathlib import Path
 from typing import Any
 
@@ -26,6 +27,9 @@ import pytest
 
 from veridex.ingest.txline_client import (
     fetch_odds_updates,
+    fetch_scores_updates,
+    fixtures_snapshot_url,
+    odds_snapshot_url,
     odds_stream_url,
     odds_updates_url,
     odds_validation_url,
@@ -54,6 +58,18 @@ def test_scores_and_stream_urls() -> None:
 
 def test_validation_url_keys_on_message_id() -> None:
     assert odds_validation_url(_BASE, "m-7") == "https://txline-dev.txodds.com/api/odds/validation?messageId=m-7"
+
+
+def test_fixtures_snapshot_url_is_documented_discovery_path() -> None:
+    # The DOCUMENTED discovery path (the bare `/api/fixtures` 404s).
+    url = fixtures_snapshot_url(_BASE, 72, 20213)
+    assert url == "https://txline-dev.txodds.com/api/fixtures/snapshot?competitionId=72&startEpochDay=20213"
+
+
+def test_odds_snapshot_url_requires_as_of() -> None:
+    # The bare snapshot is empty pre-match — asOf pins a point-in-time (CON-040).
+    url = odds_snapshot_url(_BASE, 123, 1782518400)
+    assert url == "https://txline-dev.txodds.com/api/odds/snapshot/123?asOf=1782518400"
 
 
 def test_validation_labels_are_honest() -> None:
@@ -90,26 +106,38 @@ def test_reconstruct_closing_none_on_empty() -> None:
 
 
 class _FakeResp:
+    """``payload=None`` simulates a cache-cold EMPTY 200 (body-less JSON body)."""
+
     def __init__(self, payload: Any) -> None:
         self._p = payload
+        self.status_code = 200
+        self.headers = {"content-type": "application/json"}
+        body = b"" if payload is None else json.dumps(payload).encode()
+        self.content = body
+        self.text = body.decode()
 
     def raise_for_status(self) -> None:
         return None
 
     def json(self) -> Any:
+        if self._p is None:
+            return json.loads("")  # raises JSONDecodeError, matching a real empty-body 200
         return self._p
 
 
 class _FakeClient:
-    def __init__(self, payload: Any) -> None:
-        self._p = payload
+    """``sequence`` returns a different payload per successive ``.get`` call (last one sticks)."""
+
+    def __init__(self, payload: Any = None, *, sequence: list[Any] | None = None) -> None:
+        self._sequence = sequence if sequence is not None else [payload]
         self.calls: list[str] = []
         self.headers: list[dict[str, str]] = []
 
     async def get(self, url: str, headers: dict[str, str] | None = None, **kw: Any) -> _FakeResp:
         self.calls.append(url)
         self.headers.append(headers or {})
-        return _FakeResp(self._p)
+        idx = min(len(self.calls) - 1, len(self._sequence) - 1)
+        return _FakeResp(self._sequence[idx])
 
     async def aclose(self) -> None:
         return None
@@ -129,6 +157,114 @@ async def test_fetch_odds_updates_dict_wrapped_payload() -> None:
     client = _FakeClient({"updates": [{"MessageId": "x"}]})
     updates = await fetch_odds_updates(1, base_url=_BASE, creds=_CREDS, client=client)
     assert [u["MessageId"] for u in updates] == ["x"]
+
+
+async def test_fetch_scores_updates_list_payload() -> None:
+    client = _FakeClient([{"Ts": 1}, {"Ts": 2}])
+    updates = await fetch_scores_updates(456, base_url=_BASE, creds=_CREDS, client=client)
+    assert [u["Ts"] for u in updates] == [1, 2]
+    assert client.calls == ["https://txline-dev.txodds.com/api/scores/updates/456"]
+    # TxLINE auth headers threaded through, mirroring fetch_odds_updates (CON-041).
+    assert client.headers[0]["Authorization"] == "Bearer jwt-1"
+    assert client.headers[0]["X-Api-Token"] == "api-token-1"
+
+
+async def test_fetch_scores_updates_dict_wrapped_payload() -> None:
+    client = _FakeClient({"updates": [{"Ts": 9}]})
+    updates = await fetch_scores_updates(1, base_url=_BASE, creds=_CREDS, client=client)
+    assert [u["Ts"] for u in updates] == [9]
+
+
+# ---------------------------------------------------------------------------
+# Cache-cold empty-body retry: the endpoint has a 5-minute cache; a cold cache
+# returns a quick EMPTY 200 while it warms. Must retry, never leak a bare
+# JSONDecodeError.
+# ---------------------------------------------------------------------------
+
+
+async def test_fetch_odds_updates_retries_through_cache_cold_empty() -> None:
+    client = _FakeClient(sequence=[None, [{"MessageId": "a"}, {"MessageId": "b"}]])
+    updates = await fetch_odds_updates(123, base_url=_BASE, creds=_CREDS, client=client, retry_delay=0.0)
+    assert [u["MessageId"] for u in updates] == ["a", "b"]
+    assert len(client.calls) == 2  # first call cache-cold empty, second call warm
+
+
+async def test_fetch_odds_updates_raises_descriptive_on_persistent_empty() -> None:
+    client = _FakeClient(None)  # always empty — cache never warms within retry budget
+    with pytest.raises(RuntimeError) as exc_info:
+        await fetch_odds_updates(999, base_url=_BASE, creds=_CREDS, client=client, retry_delay=0.0)
+    message = str(exc_info.value)
+    assert "999" in message
+    assert "bytes" in message
+
+
+async def test_fetch_scores_updates_retries_through_cache_cold_empty() -> None:
+    client = _FakeClient(sequence=[None, [{"Ts": 1}, {"Ts": 2}]])
+    updates = await fetch_scores_updates(456, base_url=_BASE, creds=_CREDS, client=client, retry_delay=0.0)
+    assert [u["Ts"] for u in updates] == [1, 2]
+    assert len(client.calls) == 2
+
+
+# ---------------------------------------------------------------------------
+# ``/scores/updates/{fid}`` returns ``text/event-stream`` (SSE), NOT JSON — the same
+# ``parse_sse_line`` normalizer live capture uses must parse this body too.
+# ---------------------------------------------------------------------------
+
+
+class _FakeSSEResp:
+    """A ``text/event-stream`` 200 whose body is raw SSE text, not JSON."""
+
+    def __init__(self, body: str) -> None:
+        self.status_code = 200
+        self.headers = {"content-type": "text/event-stream"}
+        self.content = body.encode()
+        self.text = body
+
+    def raise_for_status(self) -> None:
+        return None
+
+    def json(self) -> Any:
+        raise ValueError("not JSON: text/event-stream")  # mirrors a real SSE body
+
+
+class _FakeSSEClient:
+    def __init__(self, bodies: list[str]) -> None:
+        self._bodies = bodies
+        self.calls: list[str] = []
+        self.headers: list[dict[str, str]] = []
+
+    async def get(self, url: str, headers: dict[str, str] | None = None, **kw: Any) -> _FakeSSEResp:
+        self.calls.append(url)
+        self.headers.append(headers or {})
+        idx = min(len(self.calls) - 1, len(self._bodies) - 1)
+        return _FakeSSEResp(self._bodies[idx])
+
+    async def aclose(self) -> None:
+        return None
+
+
+async def test_fetch_scores_updates_parses_event_stream() -> None:
+    # Real `parse_sse_line` line shape (marketstate.py / capture.py): "data: {json}" per event,
+    # blank/comment/event: lines are non-data and skipped.
+    sse_body = (
+        'data: {"FixtureId": 456, "Ts": 1, "phase": 1, "scores": {"home": 0}}\n'
+        "\n"
+        ": heartbeat\n"
+        'data: {"FixtureId": 456, "Ts": 2, "phase": 1, "scores": {"home": 1}}\n'
+        "\n"
+    )
+    client = _FakeSSEClient([sse_body])
+    updates = await fetch_scores_updates(456, base_url=_BASE, creds=_CREDS, client=client, retry_delay=0.0)
+    assert len(updates) == 2
+    assert [u["Ts"] for u in updates] == [1, 2]
+    assert client.calls == ["https://txline-dev.txodds.com/api/scores/updates/456"]
+
+
+async def test_fetch_odds_updates_json_path_unchanged_when_content_type_is_json() -> None:
+    # Sibling odds leg stays on the `.json()` path — content-type-aware parsing must not regress it.
+    client = _FakeClient([{"MessageId": "a"}])
+    updates = await fetch_odds_updates(123, base_url=_BASE, creds=_CREDS, client=client)
+    assert [u["MessageId"] for u in updates] == ["a"]
 
 
 async def test_validate_odds_keys_on_message_id() -> None:

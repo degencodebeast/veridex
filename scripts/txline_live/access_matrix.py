@@ -35,6 +35,8 @@ from pathlib import Path
 from typing import Literal, TypedDict
 
 from veridex.ingest.txline_client import (
+    fixtures_snapshot_url,
+    odds_snapshot_url,
     odds_stream_url,
     odds_updates_url,
     odds_validation_url,
@@ -63,6 +65,13 @@ class ProbeResult(ProbeTarget):
 
 _UNKNOWN = "UNKNOWN"
 _SKIPPED_NO_FIXTURE_NOTE = "no fixture_id supplied (set TXLINE_PROBE_FIXTURE_ID)"
+_SKIPPED_NO_COMPETITION_NOTE = (
+    "no competition supplied (set TXLINE_PROBE_COMPETITION_ID + TXLINE_PROBE_START_EPOCH_DAY)"
+)
+# A PLACEHOLDER messageId 404 is NOT an access signal — validation proofs exist only for SEALED
+# records, so this target can only be exercised with a real messageId lifted from a live odds
+# update. Its 404 must never be counted as an endpoint failure.
+_VALIDATION_PLACEHOLDER_NOTE = "needs a real messageId from a live odds update (placeholder 404 is not an access signal)"
 _FIXTURE_SCOPED_NAMES = frozenset({"odds_updates", "odds_snapshot", "scores_updates"})
 
 _MATRIX_HEADERS = (
@@ -78,35 +87,49 @@ _MATRIX_HEADERS = (
 )
 
 
-def probe_targets(base: str, fixture_id: int | None) -> list[ProbeTarget]:
+def probe_targets(
+    base: str,
+    fixture_id: int | None,
+    *,
+    competition_id: int | None = None,
+    start_epoch_day: int | None = None,
+    as_of: int = 0,
+) -> list[ProbeTarget]:
     """Build the full set of §3.1 probe targets against ``base``.
 
-    Every spec capability appears by NAME regardless of ``fixture_id`` —
-    when a fixture id is unknown, the fixture-scoped targets (``odds_updates``,
-    ``odds_snapshot``, ``scores_updates``) still appear so the matrix
-    documents them, using a placeholder fixture id in their URL.
+    Every spec capability appears by NAME regardless of the optional
+    parameters — when an id/param is unknown a placeholder is used in the
+    built URL and :func:`main` records an honest ``SKIPPED`` status (via
+    :func:`skip_note_for` + :func:`build_skipped_result`) rather than firing a
+    misleading placeholder probe.
 
     Args:
         base: TxLINE API base URL (e.g. ``https://txline-dev.txodds.com/api``).
         fixture_id: A known fixture id to scope fixture-level probes to, or
-            ``None`` to use a placeholder fid in the built URL. When
-            ``None``, :func:`main` does NOT actually probe these three
-            targets with the placeholder (a fid=0 GET/404 an operator could
-            misread as "endpoint down") — it records an honest ``SKIPPED``
-            status via :func:`build_skipped_result` instead. The targets
-            still appear here, by name, so the matrix documents them either
-            way.
+            ``None`` for a placeholder fid.
+        competition_id: Competition to scope the documented
+            ``/fixtures/snapshot`` discovery probe to, or ``None`` for a
+            placeholder (the probe is then SKIPPED by :func:`main`).
+        start_epoch_day: Epoch-day floor for the discovery snapshot, paired
+            with ``competition_id``.
+        as_of: Point-in-time (epoch seconds) for the ``odds_snapshot`` probe —
+            the bare snapshot is empty pre-match, so ``asOf`` is required
+            (CON-040).
 
     Returns:
         Probe targets covering odds/scores streams, fixture-scoped odds
-        updates + snapshot + scores updates, odds validation, and all three
-        undocumented discovery candidate paths (fixtures/sports/competitions).
+        updates + point-in-time snapshot + scores updates, odds validation,
+        and the ONE documented ``/fixtures/snapshot`` discovery path (the bare
+        ``/fixtures`` / ``/sports`` / ``/competitions`` paths all 404 and are
+        no longer probed).
     """
     fid = fixture_id if fixture_id is not None else 0
+    cid = competition_id if competition_id is not None else 0
+    sed = start_epoch_day if start_epoch_day is not None else 0
     return [
         {"name": "odds_stream", "url": odds_stream_url(base), "kind": "sse_head"},
         {"name": "odds_updates", "url": odds_updates_url(base, fid), "kind": "get"},
-        {"name": "odds_snapshot", "url": f"{base}/odds/snapshot/{fid}", "kind": "get"},
+        {"name": "odds_snapshot", "url": odds_snapshot_url(base, fid, as_of), "kind": "get"},
         {"name": "scores_stream", "url": scores_stream_url(base), "kind": "sse_head"},
         {"name": "scores_updates", "url": scores_updates_url(base, fid), "kind": "get"},
         {
@@ -114,31 +137,57 @@ def probe_targets(base: str, fixture_id: int | None) -> list[ProbeTarget]:
             "url": odds_validation_url(base, "PLACEHOLDER"),
             "kind": "get",
         },
-        {"name": "fixtures_discovery", "url": f"{base}/fixtures", "kind": "get"},
-        {"name": "sports_discovery", "url": f"{base}/sports", "kind": "get"},
-        {"name": "competitions_discovery", "url": f"{base}/competitions", "kind": "get"},
+        {"name": "fixtures_discovery", "url": fixtures_snapshot_url(base, cid, sed), "kind": "get"},
     ]
 
 
-def build_skipped_result(target: ProbeTarget) -> ProbeResult:
-    """Turn a fixture-scoped :class:`ProbeTarget` into an honest ``SKIPPED`` result.
+def skip_note_for(
+    target: ProbeTarget,
+    *,
+    fixture_id: int | None,
+    competition_id: int | None,
+    start_epoch_day: int | None,
+) -> str | None:
+    """Decide whether a target must be SKIPPED rather than live-probed (pure — no I/O).
 
-    Used by :func:`main` in place of actually GETing a ``fid=0`` placeholder
-    URL when no real fixture id is available — a fid=0 probe would return a
-    404 an operator could misread as "endpoint down" rather than "we never
-    asked with a real fixture." Pure — no I/O.
+    Returns an explanatory note when the target cannot be probed honestly, or ``None`` when it
+    should be probed for real. The three skip reasons:
+
+    - ``odds_validation``: ALWAYS skipped — its ``messageId=PLACEHOLDER`` 404 is not an access
+      signal (proofs exist only for SEALED records; a real messageId must come from a live update).
+    - fixture-scoped targets (``odds_updates``/``odds_snapshot``/``scores_updates``) with no
+      ``fixture_id``: a ``fid=0`` 404 would be misread as "endpoint down".
+    - ``fixtures_discovery`` with no ``competition_id``/``start_epoch_day``: the documented
+      discovery snapshot needs both to return anything meaningful.
+    """
+    name = target["name"]
+    if name == "odds_validation":
+        return _VALIDATION_PLACEHOLDER_NOTE
+    if name in _FIXTURE_SCOPED_NAMES and fixture_id is None:
+        return _SKIPPED_NO_FIXTURE_NOTE
+    if name == "fixtures_discovery" and (competition_id is None or start_epoch_day is None):
+        return _SKIPPED_NO_COMPETITION_NOTE
+    return None
+
+
+def build_skipped_result(target: ProbeTarget, note: str | None = None) -> ProbeResult:
+    """Turn a :class:`ProbeTarget` into an honest ``SKIPPED`` result.
+
+    Used by :func:`main` in place of firing a misleading placeholder probe (a ``fid=0`` /
+    ``messageId=PLACEHOLDER`` 404 an operator could misread as "endpoint down"). Pure — no I/O.
 
     Args:
-        target: The fixture-scoped :class:`ProbeTarget` being skipped.
+        target: The :class:`ProbeTarget` being skipped.
+        note: The explanatory ``payload_note`` (typically from :func:`skip_note_for`). Defaults to
+            the no-fixture-id note for backward compatibility.
 
     Returns:
-        A :class:`ProbeResult` with ``status="SKIPPED"`` and an explanatory
-        ``payload_note`` pointing at the env var that would supply a real id.
+        A :class:`ProbeResult` with ``status="SKIPPED"`` and the explanatory ``payload_note``.
     """
     return {
         **target,
         "status": "SKIPPED",
-        "payload_note": _SKIPPED_NO_FIXTURE_NOTE,
+        "payload_note": note if note is not None else _SKIPPED_NO_FIXTURE_NOTE,
         "coverage_note": "",
     }
 
@@ -192,6 +241,8 @@ async def main() -> None:
     the workspace root (i.e. one level above the repo root). Never writes
     secrets (JWT/token) into the output.
     """
+    import time  # noqa: PLC0415
+
     import httpx  # noqa: PLC0415
 
     from veridex.config import get_settings, require_txline
@@ -205,13 +256,32 @@ async def main() -> None:
     fixture_id_env = os.environ.get("TXLINE_PROBE_FIXTURE_ID")
     fixture_id = int(fixture_id_env) if fixture_id_env else None
 
-    targets = probe_targets(base, fixture_id)
+    competition_env = os.environ.get("TXLINE_PROBE_COMPETITION_ID", "72")  # documented default competition
+    competition_id = int(competition_env) if competition_env else None
+    start_epoch_env = os.environ.get("TXLINE_PROBE_START_EPOCH_DAY")
+    start_epoch_day = int(start_epoch_env) if start_epoch_env else None
+    as_of_env = os.environ.get("TXLINE_PROBE_ASOF")
+    as_of = int(as_of_env) if as_of_env else int(time.time())
+
+    targets = probe_targets(
+        base,
+        fixture_id,
+        competition_id=competition_id,
+        start_epoch_day=start_epoch_day,
+        as_of=as_of,
+    )
     results: list[ProbeResult] = []
 
     async with httpx.AsyncClient() as client:
         for target in targets:
-            if fixture_id is None and target["name"] in _FIXTURE_SCOPED_NAMES:
-                results.append(build_skipped_result(target))
+            skip_note = skip_note_for(
+                target,
+                fixture_id=fixture_id,
+                competition_id=competition_id,
+                start_epoch_day=start_epoch_day,
+            )
+            if skip_note is not None:
+                results.append(build_skipped_result(target, skip_note))
                 continue
             result: ProbeResult = {**target, "status": _UNKNOWN, "payload_note": "", "coverage_note": ""}
             try:
