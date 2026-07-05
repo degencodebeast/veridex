@@ -21,6 +21,9 @@ import builtins
 import contextlib
 import json
 
+import pytest
+from pydantic import ValidationError
+
 from veridex.backtest.event_probe.aggregate import AggConfig, ProbeResult, SliceVerdict
 from veridex.backtest.event_probe.compute import EventRecord, WindowConfig
 from veridex.backtest.event_probe.config import (
@@ -76,6 +79,14 @@ def test_config_hash_is_threshold_sensitive() -> None:
     assert ProbeConfig(robustness_horizons_s=(30, 60, 601)).config_hash() != base
     # CON-008: the min-odds-states floor is SEALED -- a post-hoc 3->2 change VOIDs.
     assert ProbeConfig(min_odds_states=2).config_hash() != base
+
+
+def test_config_rejects_unknown_field() -> None:
+    # A construction-time typo (e.g. ``n_min_globl``) must RAISE, not silently keep
+    # the default and produce an identical hash -- that would be exactly the drift
+    # the seal exists to prevent (frozen=True stops post-hoc mutation, not typos).
+    with pytest.raises(ValidationError):
+        ProbeConfig(nonexistent_threshold=1)
 
 
 def test_band_seal_matches_consumed_source() -> None:

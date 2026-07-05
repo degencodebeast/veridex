@@ -25,6 +25,7 @@ The seal follows the Run-001/Run-002 predeclared pattern (PAT-001):
 from __future__ import annotations
 
 import hashlib
+from typing import Any
 
 from pydantic import BaseModel, ConfigDict
 
@@ -54,7 +55,10 @@ class ProbeConfig(BaseModel):
     cannot silently mutate a threshold after the hash is computed.
     """
 
-    model_config = ConfigDict(frozen=True)
+    # frozen -> no post-construction mutation; extra="forbid" -> a construction-time
+    # typo (e.g. ``n_min_globl=25``) RAISES instead of silently keeping the default and
+    # yielding an identical config_hash (the exact drift the seal exists to prevent).
+    model_config = ConfigDict(frozen=True, extra="forbid")
 
     # window / classifier (CON-002..006)
     pre_window_s: int = 120
@@ -124,7 +128,7 @@ def verify_pinned(cfg: ProbeConfig, expected_hash: str) -> None:
         )
 
 
-def _serialize_event_record(record: EventRecord) -> dict:
+def _serialize_event_record(record: EventRecord) -> dict[str, Any]:
     """Serialize one ``EventRecord`` to the §4 per-event audit schema (JSON-safe).
 
     Grid keys are stringified so the artifact is directly JSON-serializable (int
@@ -150,7 +154,7 @@ def _serialize_event_record(record: EventRecord) -> dict:
 
 def build_sealed_result(
     cfg: ProbeConfig, result: ProbeResult, records: list[EventRecord]
-) -> dict:
+) -> dict[str, Any]:
     """Serialize the sealed result artifact (§4) -- in memory only, writes NO file.
 
     Carries the pinned ``config`` + ``config_hash`` (the seal), the ``overall_verdict``
