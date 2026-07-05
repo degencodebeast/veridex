@@ -27,6 +27,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import statistics
+from collections.abc import Sequence
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict
@@ -50,6 +52,13 @@ def _canonical_dump(payload: Any) -> str:
 #: Sealed protocol identity (spec §4). Bound alongside the config hash so a result
 #: cannot be relabelled under a different protocol without a new stamp (CON-014).
 PROTOCOL_ID = "event-fork-probe-v1"
+
+#: The §4 CON-014 defaults note carried on every sealed artifact -- states plainly
+#: that the pinned thresholds are v1 predeclared, NOT optimized, and that post-hoc
+#: tuning is a protocol violation.
+PREDECLARED_DEFAULTS_NOTE = (
+    "v1 defaults, not optimized; post-hoc threshold changes forbidden (CON-014)."
+)
 
 
 class ProbeVoidError(Exception):
@@ -171,28 +180,69 @@ def _serialize_event_record(record: EventRecord) -> dict[str, Any]:
     }
 
 
+def _merge_excluded(
+    compute_excluded: dict[str, int], extraction_excluded: dict[str, int] | None
+) -> dict[str, int]:
+    """Merge extraction excludes (E1) into the compute excludes (E3) by reason.
+
+    §4 requires ONE ``excluded_by_reason`` map spanning both stages, so the
+    extraction rejects (``decreasing_score`` / ``ambiguous_delta`` / ``unparseable``)
+    appear alongside the compute reasons (``no_pre_tick`` ...) rather than being
+    dropped on the floor before aggregation ever sees them.
+    """
+    merged = dict(compute_excluded)
+    for reason, count in (extraction_excluded or {}).items():
+        merged[reason] = merged.get(reason, 0) + count
+    return merged
+
+
 def build_sealed_result(
-    cfg: ProbeConfig, result: ProbeResult, records: list[EventRecord]
+    cfg: ProbeConfig,
+    result: ProbeResult,
+    records: list[EventRecord],
+    *,
+    fixtures: Sequence[int] = (),
+    total_goal_events: int = 0,
+    extraction_excluded: dict[str, int] | None = None,
 ) -> dict[str, Any]:
     """Serialize the sealed result artifact (§4) -- in memory only, writes NO file.
 
     Carries the pinned ``config`` + ``config_hash`` (the seal), the ``overall_verdict``
-    with global stats and per-slice verdicts (E4), the full per-event
-    ``event_records[]`` audit trail (GUD-001 / AC-008), and both tally maps
-    (``class_counts`` / ``excluded_by_reason``). Writing this dict to disk is the
-    operator-gated E6 ``--seal`` step; this function never performs I/O.
+    (mirrored as the top-level ``verdict``) with global stats and per-slice verdicts
+    (E4), the full per-event ``event_records[]`` audit trail (GUD-001 / AC-008), the
+    §4 top-level counts (``fixtures`` / ``total_goal_events`` / ``eligible_events`` /
+    ``raw_delta_*_median``), the CON-014 defaults note, and both tally maps -- with
+    the per-fixture extraction excludes merged into ``excluded_by_reason``. Writing
+    this dict to disk is the operator-gated E6 ``--seal`` step; no I/O here.
     """
+    # Eligible == directional set: R is set ONLY for LAG/OVERSHOOT/REVERSAL events
+    # (every NO-SIGNAL / excluded record carries R=None), so ``R is not None`` is the
+    # class gate. Raw-delta medians are reported over exactly this set (GUD-001), so
+    # a below-epsilon ratio artifact can never leak into the headline move sizes.
+    eligible = [rec for rec in records if rec.R is not None]
+    raw_delta_imm = [rec.delta_imm for rec in eligible if rec.delta_imm is not None]
+    raw_delta_settle = [rec.delta_settle for rec in eligible if rec.delta_settle is not None]
+
     return {
         "protocol_id": PROTOCOL_ID,
         "config": cfg.model_dump(),
         "config_hash": cfg.config_hash(),
+        "fixtures": list(fixtures),
+        "total_goal_events": total_goal_events,
+        "eligible_events": result.global_n,
         "overall_verdict": result.overall_verdict,
+        "verdict": result.overall_verdict,
+        "predeclared_defaults_note": PREDECLARED_DEFAULTS_NOTE,
         "global": {
             "n": result.global_n,
             "median_R": result.global_median_R,
             "ci_low": result.global_ci_low,
             "ci_high": result.global_ci_high,
         },
+        "raw_delta_imm_median": statistics.median(raw_delta_imm) if raw_delta_imm else None,
+        "raw_delta_settle_median": (
+            statistics.median(raw_delta_settle) if raw_delta_settle else None
+        ),
         "per_slice": [
             {
                 "slice": sv.slice,
@@ -206,5 +256,7 @@ def build_sealed_result(
         ],
         "event_records": [_serialize_event_record(record) for record in records],
         "class_counts": dict(result.class_counts),
-        "excluded_by_reason": dict(result.excluded_by_reason),
+        "excluded_by_reason": _merge_excluded(
+            result.excluded_by_reason, extraction_excluded
+        ),
     }

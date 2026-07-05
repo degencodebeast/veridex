@@ -246,3 +246,76 @@ def test_sealed_result_schema_has_event_records(monkeypatch) -> None:
 
     # The whole sealed artifact is JSON-serializable (no tuples/ints-as-keys leak).
     json.dumps(sealed)
+
+
+def test_sealed_result_has_section4_toplevel_fields() -> None:
+    # §4 conformance: the sealed dict must carry the top-level fields the schema
+    # names -- fixtures, total_goal_events, eligible_events, a top-level verdict
+    # alias, the CON-014 defaults note, and the raw-delta medians -- AND merge the
+    # per-fixture extraction excludes into excluded_by_reason (so decreasing_score
+    # / ambiguous_delta / unparseable appear alongside the compute reasons).
+    cfg = ProbeConfig()
+    records = [
+        _event_record(),  # eligible LAG: delta_imm 0.29, delta_settle 0.65, R 0.45
+        _event_record(event_class="NO-SIGNAL", exclusion_reason="below_epsilon", R=None),
+    ]
+    result = ProbeResult(
+        overall_verdict="FADE",
+        global_n=1,
+        global_median_R=0.45,
+        global_ci_low=1.1,
+        global_ci_high=1.4,
+        per_slice=[],
+        class_counts={"LAG": 1, "NO-SIGNAL": 1},
+        excluded_by_reason={"below_epsilon": 1},
+    )
+
+    sealed = build_sealed_result(
+        cfg,
+        result,
+        records,
+        fixtures=[111, 222],
+        total_goal_events=7,
+        extraction_excluded={"decreasing_score": 2, "ambiguous_delta": 0, "unparseable": 1},
+    )
+
+    assert sealed["fixtures"] == [111, 222]
+    assert sealed["total_goal_events"] == 7
+    assert sealed["eligible_events"] == 1  # directional-set size == result.global_n
+    # Top-level verdict alias mirrors overall_verdict (§4 schema top-level field).
+    assert sealed["verdict"] == "FADE"
+    assert sealed["overall_verdict"] == "FADE"
+    # CON-014 note: values are v1 predeclared defaults, not optimized.
+    assert "CON-014" in sealed["predeclared_defaults_note"]
+    # Raw-delta medians over the eligible (R-not-None) events (GUD-001).
+    assert sealed["raw_delta_imm_median"] == 0.29
+    assert sealed["raw_delta_settle_median"] == 0.65
+    # Extraction reasons merged alongside the compute reason.
+    assert sealed["excluded_by_reason"]["below_epsilon"] == 1
+    assert sealed["excluded_by_reason"]["decreasing_score"] == 2
+    assert sealed["excluded_by_reason"]["ambiguous_delta"] == 0
+    assert sealed["excluded_by_reason"]["unparseable"] == 1
+    json.dumps(sealed)
+
+
+def test_sealed_result_raw_delta_medians_none_when_no_eligible() -> None:
+    # With no eligible (R-not-None) event, the raw-delta medians are None -- an
+    # empty directional set never fabricates a zero move.
+    cfg = ProbeConfig()
+    records = [
+        _event_record(event_class="NO-SIGNAL", exclusion_reason="no_pre_tick", R=None),
+    ]
+    result = ProbeResult(
+        overall_verdict="INCONCLUSIVE",
+        global_n=0,
+        global_median_R=None,
+        global_ci_low=None,
+        global_ci_high=None,
+        per_slice=[],
+        class_counts={"NO-SIGNAL": 1},
+        excluded_by_reason={"no_pre_tick": 1},
+    )
+    sealed = build_sealed_result(cfg, result, records, fixtures=[1], total_goal_events=1)
+    assert sealed["eligible_events"] == 0
+    assert sealed["raw_delta_imm_median"] is None
+    assert sealed["raw_delta_settle_median"] is None

@@ -133,8 +133,27 @@ def test_end_to_end_returns_sealed_dict_no_write(
     assert "excluded_by_reason" in result
     # The pinned universe carries real goal events -> a populated audit trail.
     assert len(result["event_records"]) > 0
-    # The runner carries each event's home/away label into slice_tags (AC-008).
-    assert all("scoring_side" in row["slice_tags"] for row in result["event_records"])
+    # The runner carries ALL FIVE CON-007 slice dimensions per event (AC-008),
+    # each a named non-empty bucket -- not just scoring_side.
+    _slice_keys = {
+        "scoring_side", "favorite_status", "score_context", "half", "match_timing",
+    }
+    for row in result["event_records"]:
+        assert set(row["slice_tags"]) == _slice_keys
+        assert all(isinstance(v, str) and v for v in row["slice_tags"].values())
+
+    # §4 top-level conformance fields are present.
+    assert result["fixtures"] == list(runner.PINNED_FIXTURES)
+    assert result["total_goal_events"] == len(result["event_records"])
+    assert result["eligible_events"] == result["global"]["n"]
+    assert result["verdict"] == result["overall_verdict"]
+    assert "CON-014" in result["predeclared_defaults_note"]
+    assert "raw_delta_imm_median" in result
+    assert "raw_delta_settle_median" in result
+    # Extraction excludes are merged into excluded_by_reason (keys always present,
+    # even at zero -- extract_goal_events initializes all three reasons).
+    for reason in ("decreasing_score", "ambiguous_delta", "unparseable"):
+        assert reason in result["excluded_by_reason"]
 
     # seal=False writes nothing: the operator-gated result JSON is not created.
     assert runner.RESULT_PATH.exists() == existed_before

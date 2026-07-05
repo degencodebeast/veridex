@@ -43,13 +43,16 @@ from veridex.backtest.event_probe.config import (  # noqa: E402
 )
 from veridex.backtest.event_probe.extraction import extract_goal_events  # noqa: E402
 from veridex.backtest.event_probe.series import build_tracked_series  # noqa: E402
+from veridex.backtest.event_probe.slices import derive_slice_tags  # noqa: E402
 from veridex.ingest.replay_pack import load_pack_marketstates  # noqa: E402
 
 #: The pinned ProbeConfig identity (``ProbeConfig().config_hash()``), hard-coded so a
 #: post-hoc threshold change diverges the live hash and VOIDs the run (CON-014).
+#: Re-pinned when the two CON-007 slice thresholds (favorite_prob_cutoff /
+#: late_match_minute) were sealed into ProbeConfig.
 #: Recompute: ``.venv/bin/python -c "from veridex.backtest.event_probe.config import
 #: ProbeConfig; print(ProbeConfig().config_hash())"``.
-EXPECTED_CONFIG_HASH = "34a82845e9a0059612c90b5a6a634ee88b4085e075b828f499ddf1cf08c78569"
+EXPECTED_CONFIG_HASH = "10d6986f7fe57d90f5256dd998ae3fc3598b15853a73f6dec37b32762048e259"
 
 #: The predeclared fixture universe -- the 18 headline-eligible World Cup ReplayPacks
 #: (the ``run002_vvv`` roster), each with a ``pack.json`` + ``scores_<fid>.json``
@@ -99,21 +102,38 @@ def run_probe(cfg: ProbeConfig | None = None, *, seal: bool = False) -> dict[str
 
     window_cfg = cfg.to_window_config()
     records = []
+    total_goal_events = 0
+    extraction_excluded: dict[str, int] = {}
     for fixture_id in PINNED_FIXTURES:
         pack_dir = PACKS_DIR / str(fixture_id)
         states = load_pack_marketstates(pack_dir, fixture_id, verify=True)
         scores = json.loads((pack_dir / f"scores_{fixture_id}.json").read_text())
         extraction = extract_goal_events(scores)
+        total_goal_events += len(extraction.events)
+        # Thread each fixture's extraction rejects through so §4's excluded_by_reason
+        # spans extraction (decreasing_score / ambiguous_delta / unparseable) as well
+        # as the compute reasons -- no reject is dropped before aggregation.
+        for reason, count in extraction.excluded.items():
+            extraction_excluded[reason] = extraction_excluded.get(reason, 0) + count
         for event in extraction.events:
             series = build_tracked_series(states, event.participant)
             record = compute_event_record(series, event, window_cfg)
-            # Carry the scores-derived home/away label into slice_tags (AC-008):
-            # the tracked series is participant-keyed and knows no home/away.
-            record = replace(record, slice_tags={"scoring_side": event.scoring_side})
+            # Derive ALL FIVE CON-007 slice dimensions (the tracked series is
+            # participant-keyed and knows no home/away, favorite status, score
+            # context, or timing -- those come from the event + its window record).
+            slice_tags = derive_slice_tags(event, record, cfg)
+            record = replace(record, slice_tags=slice_tags)
             records.append(record)
 
     result = aggregate_verdict(records, cfg.to_agg_config())
-    sealed = build_sealed_result(cfg, result, records)
+    sealed = build_sealed_result(
+        cfg,
+        result,
+        records,
+        fixtures=list(PINNED_FIXTURES),
+        total_goal_events=total_goal_events,
+        extraction_excluded=extraction_excluded,
+    )
 
     if seal:
         RESULT_PATH.parent.mkdir(parents=True, exist_ok=True)
