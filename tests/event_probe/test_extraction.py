@@ -136,6 +136,31 @@ def test_stats_only_change_is_not_a_goal():
     assert result.events == []
 
 
+def test_total_without_goals_key_is_carry_forward_not_unparseable():
+    """E1-t6b: a Total with NO Goals key is a carry-forward, not unparseable.
+
+    `Total` is a sparse stat-map; a corners-only update omits `Goals` entirely
+    (distinct from t6, where `Goals` is present as 0). Such a record must produce
+    no event, must NOT be counted as `unparseable` or `ambiguous_delta`, and must
+    not disturb the carried count -- so a later `Goals: 1` still yields one event.
+    """
+    records = [
+        {"Seq": 1, "Ts": 1782500800000, "Action": "kickoff", "Participant1IsHome": True,
+         "Score": {"Participant2": {"Total": {"Goals": 0}}}},
+        # Corners-only update: Total present, but no `Goals` key at all.
+        {"Seq": 2, "Ts": 1782500850000, "Action": "corner", "Participant1IsHome": True,
+         "Score": {"Participant2": {"Total": {"Corners": 1}}}},
+        {"Seq": 3, "Ts": 1782500900000, "Action": "goal", "Participant1IsHome": True,
+         "Score": {"Participant2": {"Total": {"Goals": 1}}}},
+    ]
+    result = extract_goal_events(records)
+    assert len(result.events) == 1
+    assert result.events[0].participant == 2
+    assert result.events[0].t_e == 1782500900       # the later Goals:1 record
+    assert result.excluded["unparseable"] == 0
+    assert result.excluded["ambiguous_delta"] == 0
+
+
 def test_decreasing_total_goals_rejected():
     """E1-t7: a VAR overturn (Goals decreases) is rejected and counted."""
     records = [
