@@ -48,6 +48,10 @@ class WindowConfig:
 
     E5's ``ProbeConfig`` is the sealed superset / single source of truth; all
     thresholds are read from this object -- no literals inlined in the logic.
+
+    Precondition: ``epsilon`` must be ``> 0``. The pinned default ``0.05`` (CON-006)
+    satisfies this; ``epsilon == 0`` would disable the NO-SIGNAL band (the strict
+    ``|delta_settle| < epsilon`` guard could never fire) and is out of spec.
     """
 
     pre_window_s: int = 120
@@ -78,7 +82,13 @@ class EventRecord:
 
 
 def to_logit(p: float) -> float:
-    """Return ``ln(p / (1 - p))`` -- the logit transform (CON-002)."""
+    """Return ``ln(p / (1 - p))`` -- the logit transform (CON-002).
+
+    Precondition: ``p`` must be in the open interval ``(0, 1)``. This is
+    guaranteed upstream by E2's near-certain band guard -- ``build_tracked_series``
+    only emits ticks with ``prob`` inside ``[band_lo, band_hi] = [0.05, 0.95]`` --
+    so ``0`` / ``1`` never reach here and no explicit guard is added.
+    """
     return math.log(p / (1 - p))
 
 

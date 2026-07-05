@@ -134,3 +134,78 @@ def test_compute_record_reports_raw_deltas() -> None:
     # The robustness grid is populated and the primary horizon resolves.
     assert record.grid[300] is not None
     assert set(record.grid) == {30, 60, 300, 600}
+
+
+def test_below_epsilon_eligible_reports_raw_deltas() -> None:
+    # A fully-resolved event (pre/imm/settle present, >=3 states) whose settled
+    # move is under epsilon: 0.55 -> 0.56 gives |delta_settle| ~ 0.040 < 0.05.
+    # It is excluded as below_epsilon, but GUD-001 still requires the raw deltas
+    # (only R is nulled). Discriminating: fails if the below-eps branch nulled
+    # delta_imm / delta_settle instead of preserving them.
+    series = [
+        TrackedTick(ts=950, prob=0.55),   # pre
+        TrackedTick(ts=1030, prob=0.60),  # imm
+        TrackedTick(ts=1150, prob=0.57),  # extra in-window state
+        TrackedTick(ts=1300, prob=0.56),  # settle -> tiny settled move
+    ]
+    record = compute_event_record(series, _event(), WindowConfig())
+
+    assert record.event_class == "NO-SIGNAL"
+    assert record.exclusion_reason == "below_epsilon"
+    assert record.delta_imm is not None
+    assert record.delta_settle is not None
+    assert abs(record.delta_settle) < WindowConfig().epsilon  # confirms the branch
+    assert record.R is None
+
+
+def test_exactly_epsilon_is_signal_not_no_signal() -> None:
+    # abs(delta_settle) EXACTLY == epsilon must be treated as a SIGNAL (the guard
+    # is strict `<`, not `<=`). We pin epsilon to the fixture's exact settled move
+    # so the equality is float-exact, then assert it classifies via the ratio
+    # (LAG here), NOT below_epsilon. Discriminating: fails on a `<=` slip, which
+    # would fold the boundary into NO-SIGNAL.
+    series = [
+        TrackedTick(ts=950, prob=0.55),   # pre
+        TrackedTick(ts=1030, prob=0.62),  # imm
+        TrackedTick(ts=1150, prob=0.66),  # extra in-window state
+        TrackedTick(ts=1300, prob=0.70),  # settle
+    ]
+    delta_settle = to_logit(0.70) - to_logit(0.55)
+    cfg = WindowConfig(epsilon=delta_settle)  # epsilon == |delta_settle| exactly
+    record = compute_event_record(series, _event(), cfg)
+
+    assert record.exclusion_reason is None
+    assert record.event_class != "NO-SIGNAL"
+    assert record.event_class == "LAG"  # R in (0, 1)
+    assert record.R is not None
+
+
+def test_compute_record_end_to_end_overshoot_and_reversal() -> None:
+    # End-to-end (full compute_event_record, not just classify_reaction) coverage
+    # for OVERSHOOT and REVERSAL -- previously only LAG had an e2e path.
+    # OVERSHOOT: immediate move (0.55->0.78) exceeds the settled move (->0.70),
+    # same sign -> R > 1.
+    overshoot_series = [
+        TrackedTick(ts=950, prob=0.55),
+        TrackedTick(ts=1030, prob=0.78),
+        TrackedTick(ts=1150, prob=0.74),
+        TrackedTick(ts=1300, prob=0.70),
+    ]
+    overshoot = compute_event_record(overshoot_series, _event(), WindowConfig())
+    assert overshoot.exclusion_reason is None
+    assert overshoot.event_class == "OVERSHOOT"
+    assert overshoot.R is not None and overshoot.R > 1
+
+    # REVERSAL: immediate move (0.55->0.50) is opposite in sign to the settled
+    # move (->0.70) -> R < 0, and must stay DISTINCT from OVERSHOOT.
+    reversal_series = [
+        TrackedTick(ts=950, prob=0.55),
+        TrackedTick(ts=1030, prob=0.50),
+        TrackedTick(ts=1150, prob=0.60),
+        TrackedTick(ts=1300, prob=0.70),
+    ]
+    reversal = compute_event_record(reversal_series, _event(), WindowConfig())
+    assert reversal.exclusion_reason is None
+    assert reversal.event_class == "REVERSAL"
+    assert reversal.event_class != "OVERSHOOT"
+    assert reversal.R is not None and reversal.R < 0
