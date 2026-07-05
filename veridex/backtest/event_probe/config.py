@@ -9,9 +9,10 @@ second copy of a default to drift out of sync.
 The seal follows the Run-001/Run-002 predeclared pattern (PAT-001):
 
 * ``config_hash()`` -- sha256 over the canonical (sorted-key, compact) JSON dump of
-  every field, mirroring ``MarketQualityConfig.filter_config_hash`` exactly (same
-  ``serialize_payload`` helper). Changing ANY threshold after results are observed
-  changes this hash -- the CON-014 anti-drift guarantee.
+  every field, mirroring ``MarketQualityConfig.filter_config_hash`` exactly (a local
+  :func:`_canonical_dump` byte-identical to ``serialize_payload``, inlined so this
+  rung-1 package imports nothing from the trust core). Changing ANY threshold after
+  results are observed changes this hash -- the CON-014 anti-drift guarantee.
 * ``verify_pinned(cfg, expected_hash)`` -- raises ``ProbeVoidError`` when the live
   hash diverges from the committed stamp, and is a pure comparison (no I/O), so the
   E6 runner can VOID BEFORE touching any pack/scores file (PAT-001 / AC-007).
@@ -25,14 +26,26 @@ The seal follows the Run-001/Run-002 predeclared pattern (PAT-001):
 from __future__ import annotations
 
 import hashlib
+import json
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict
 
 from veridex.backtest.event_probe.aggregate import AggConfig, ProbeResult
 from veridex.backtest.event_probe.compute import EventRecord, WindowConfig
-from veridex.runtime.evidence import serialize_payload
 from veridex.strategies.market_quality import DEFAULT_MARKET_QUALITY_CONFIG
+
+
+def _canonical_dump(payload: Any) -> str:
+    """Canonical JSON: sorted keys, compact separators.
+
+    BYTE-IDENTICAL to ``veridex.runtime.evidence.serialize_payload`` -- inlined
+    HERE, not imported, so the rung-1 ``event_probe`` package imports NOTHING from
+    the trust core (``veridex.runtime.evidence``; CON-012 trust boundary). Because
+    it reproduces the exact same dump, ``config_hash()`` is unchanged and stays
+    canonicalization-parity with ``MarketQualityConfig.filter_config_hash``.
+    """
+    return json.dumps(payload, sort_keys=True, separators=(",", ":"))
 
 #: Sealed protocol identity (spec §4). Bound alongside the config hash so a result
 #: cannot be relabelled under a different protocol without a new stamp (CON-014).
@@ -106,11 +119,12 @@ class ProbeConfig(BaseModel):
         """SHA-256 over the canonically-serialized config (stable, order-independent).
 
         Mirrors ``MarketQualityConfig.filter_config_hash`` exactly: the same
-        ``serialize_payload`` (``json.dumps(sort_keys=True, separators=(",", ":"))``)
-        over ``model_dump()``. The ``robustness_horizons_s`` tuple serializes as a
-        JSON array, identically to a list, so the dump is deterministic.
+        canonical dump (``json.dumps(sort_keys=True, separators=(",", ":"))``,
+        inlined as :func:`_canonical_dump` to stay off the trust boundary) over
+        ``model_dump()``. The ``robustness_horizons_s`` tuple serializes as a JSON
+        array, identically to a list, so the dump is deterministic.
         """
-        return hashlib.sha256(serialize_payload(self.model_dump()).encode()).hexdigest()
+        return hashlib.sha256(_canonical_dump(self.model_dump()).encode()).hexdigest()
 
 
 def verify_pinned(cfg: ProbeConfig, expected_hash: str) -> None:
