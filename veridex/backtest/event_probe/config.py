@@ -51,7 +51,7 @@ def _canonical_dump(payload: Any) -> str:
 
 #: Sealed protocol identity (spec §4). Bound alongside the config hash so a result
 #: cannot be relabelled under a different protocol without a new stamp (CON-014).
-PROTOCOL_ID = "event-fork-probe-v1"
+PROTOCOL_ID = "event-fork-probe-v2"
 
 #: The CON-008 observability-floor FAILURE reasons: an event carrying one of these
 #: never resolved its windows / had too few states, so it did NOT pass the floor.

@@ -323,6 +323,26 @@ def test_sealed_result_has_section4_toplevel_fields() -> None:
     json.dumps(sealed)
 
 
+def test_sealed_result_carries_v2_protocol_id() -> None:
+    # The sealed artifact's protocol identity is bumped to v2 for the re-stamp: v1
+    # measured the first-half 1X2 market (dead at halftime); v2 measures the
+    # full-match market. The result carries BOTH protocol_id and config_hash, so a
+    # result cannot be relabelled under a different protocol without a new stamp.
+    cfg = ProbeConfig()
+    result = ProbeResult(
+        overall_verdict="INCONCLUSIVE",
+        global_n=0,
+        global_median_R=None,
+        global_ci_low=None,
+        global_ci_high=None,
+        per_slice=[],
+        class_counts={},
+        excluded_by_reason={},
+    )
+    sealed = build_sealed_result(cfg, result, [])
+    assert sealed["protocol_id"] == "event-fork-probe-v2"
+
+
 def test_sealed_result_raw_delta_medians_none_when_no_eligible() -> None:
     # With no eligible (R-not-None) event, the raw-delta medians are None -- an
     # empty directional set never fabricates a zero move.
