@@ -259,8 +259,16 @@ def aggregate_verdict(records: list[EventRecord], cfg: AggConfig) -> ProbeResult
             _directional_verdict(directional, cfg)
         )
 
-    # SPLIT overrides the global only when slices decisively disagree (CON-010).
-    overall_verdict = "SPLIT-BY-SLICE" if _is_split(per_slice) else global_verdict
+    # SPLIT overrides the global only when the global itself clears its floor AND
+    # slices decisively disagree (CON-010). Slice dimensions overlap, so two
+    # cross-dimension slices can each reach 15 while the DISTINCT global n < 30 --
+    # an underpowered global must fail closed to INCONCLUSIVE (GUD-002 / AC-005),
+    # never be rescued into a decisive SPLIT.
+    overall_verdict = (
+        "SPLIT-BY-SLICE"
+        if global_n >= cfg.n_min_global and _is_split(per_slice)
+        else global_verdict
+    )
 
     return ProbeResult(
         overall_verdict=overall_verdict,

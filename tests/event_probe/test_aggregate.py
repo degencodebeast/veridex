@@ -174,3 +174,40 @@ def test_no_signal_excluded_from_directional() -> None:
     assert result.class_counts["LAG"] == 30
     assert result.class_counts["NO-SIGNAL"] == 3
     assert result.excluded_by_reason["below_epsilon"] == 3
+
+
+def test_split_requires_global_floor() -> None:
+    # Slice dimensions OVERLAP: each event carries multiple tags, so two
+    # DIFFERENT-dimension slices can each reach the slice floor (15) while the
+    # DISTINCT global directional n stays below the global floor (30). SPLIT must
+    # NOT override an underpowered global -- an N<30 sample fails closed to
+    # INCONCLUSIVE and is never rescued into a decisive direction (CON-010
+    # bullet-3, AC-005). Here: 14 venue=home (FOLLOW) + 14 half=first_half (FADE)
+    # + 1 record carrying BOTH tags lifts each slice to 15 but keeps distinct
+    # directional n at 29.
+    records = [
+        _rec(0.5, event_class="LAG", slice_tags={"venue": "home"}) for _ in range(14)
+    ]
+    records += [
+        _rec(1.5, event_class="OVERSHOOT", slice_tags={"half": "first_half"})
+        for _ in range(14)
+    ]
+    records.append(
+        _rec(
+            0.5,
+            event_class="LAG",
+            slice_tags={"venue": "home", "half": "first_half"},
+        )
+    )
+
+    result = aggregate_verdict(records, AggConfig())
+
+    # Both slices are individually decisive and opposite...
+    venue = next(s for s in result.per_slice if s.slice == "home")
+    half = next(s for s in result.per_slice if s.slice == "first_half")
+    assert venue.n == 15 and venue.verdict == "FOLLOW"
+    assert half.n == 15 and half.verdict == "FADE"
+    # ...but the distinct global directional sample is sub-floor, so the overall
+    # verdict fails closed to INCONCLUSIVE, NOT SPLIT-BY-SLICE.
+    assert result.global_n == 29
+    assert result.overall_verdict == "INCONCLUSIVE"
