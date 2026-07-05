@@ -67,8 +67,15 @@ class AggConfig:
 
 @dataclass(frozen=True)
 class SliceVerdict:
-    """One context-slice's directional verdict (or DESCRIPTIVE_ONLY below floor)."""
+    """One context-slice's directional verdict (or DESCRIPTIVE_ONLY below floor).
 
+    ``dimension`` names the CON-007 partition (e.g. ``half``, ``match_timing``) and
+    ``slice`` is the bucket value within it (e.g. ``unknown``). Both are carried so
+    the summary is self-describing and two dimensions sharing a bucket value (both
+    ``unknown``) never collide into one indistinguishable row.
+    """
+
+    dimension: str
     slice: str
     n: int
     median_R: float | None
@@ -176,8 +183,9 @@ def _slice_verdicts(records: list[EventRecord], cfg: AggConfig) -> list[SliceVer
     Groups the directional records by every ``(slice_tag_key, tag_value)`` pair;
     a group at/above the slice floor gets its own CI verdict, one below is
     ``DESCRIPTIVE_ONLY`` (reported, never directional). Output is sorted by
-    ``(key, value)`` for determinism; each ``SliceVerdict.slice`` is the tag value
-    (matching the sealed artifact schema, Section 4).
+    ``(dimension, value)`` for determinism; each ``SliceVerdict`` carries both the
+    ``dimension`` (tag key) and ``slice`` (tag value) so rows are self-describing
+    and never collide when two dimensions share a bucket value (Section 4).
     """
     groups: dict[tuple[str, str], list[float]] = {}
     for rec in records:
@@ -187,11 +195,12 @@ def _slice_verdicts(records: list[EventRecord], cfg: AggConfig) -> list[SliceVer
             groups.setdefault((key, value), []).append(rec.R)
 
     verdicts: list[SliceVerdict] = []
-    for (_key, value), values in sorted(groups.items()):
+    for (dimension, value), values in sorted(groups.items()):
         n = len(values)
         if n < cfg.n_min_slice:
             verdicts.append(
                 SliceVerdict(
+                    dimension=dimension,
                     slice=value,
                     n=n,
                     median_R=statistics.median(values),
@@ -204,6 +213,7 @@ def _slice_verdicts(records: list[EventRecord], cfg: AggConfig) -> list[SliceVer
         median_r, ci_low, ci_high, verdict = _directional_verdict(values, cfg)
         verdicts.append(
             SliceVerdict(
+                dimension=dimension,
                 slice=value,
                 n=n,
                 median_R=median_r,

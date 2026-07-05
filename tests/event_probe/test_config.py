@@ -203,6 +203,7 @@ def test_sealed_result_schema_has_event_records(monkeypatch) -> None:
         global_ci_high=0.9,
         per_slice=[
             SliceVerdict(
+                dimension="favorite_status",
                 slice="favorite",
                 n=1,
                 median_R=0.45,
@@ -227,6 +228,9 @@ def test_sealed_result_schema_has_event_records(monkeypatch) -> None:
     assert sealed["excluded_by_reason"]["below_epsilon"] == 1
     assert sealed["global"]["median_R"] == 0.45
     assert sealed["per_slice"][0]["verdict"] == "DESCRIPTIVE_ONLY"
+    # per_slice rows are self-describing: dimension + bucket value (§4 polish).
+    assert sealed["per_slice"][0]["dimension"] == "favorite_status"
+    assert sealed["per_slice"][0]["slice"] == "favorite"
 
     # event_records[] carries every §4 audit field for every record.
     assert len(sealed["event_records"]) == 2

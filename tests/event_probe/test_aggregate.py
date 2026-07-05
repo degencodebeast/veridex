@@ -211,3 +211,38 @@ def test_split_requires_global_floor() -> None:
     # verdict fails closed to INCONCLUSIVE, NOT SPLIT-BY-SLICE.
     assert result.global_n == 29
     assert result.overall_verdict == "INCONCLUSIVE"
+
+
+def test_per_slice_rows_carry_dimension() -> None:
+    # Each per_slice row names the DIMENSION it partitions, not just the bucket
+    # value -- so the summary is self-describing and rows never collide when two
+    # dimensions share a bucket value.
+    result = aggregate_verdict(
+        [_rec(0.5, event_class="LAG", slice_tags={"half": "first_half"})],
+        AggConfig(),
+    )
+    row = result.per_slice[0]
+    assert row.dimension == "half"
+    assert row.slice == "first_half"
+
+
+def test_same_bucket_value_across_dimensions_is_disambiguated() -> None:
+    # `half` and `match_timing` can BOTH yield the bucket value "unknown" (no
+    # StatusId / no clock). Without a dimension key the two summary rows collide;
+    # with it they stay distinguishable.
+    records = [
+        _rec(
+            0.5,
+            event_class="LAG",
+            slice_tags={"half": "unknown", "match_timing": "unknown"},
+        )
+        for _ in range(3)
+    ]
+    result = aggregate_verdict(records, AggConfig())
+
+    unknown_rows = [s for s in result.per_slice if s.slice == "unknown"]
+    assert len(unknown_rows) == 2  # one per dimension, not one collapsed row
+    assert {s.dimension for s in unknown_rows} == {"half", "match_timing"}
+    # Every (dimension, slice) pair is unique -> no silent collision.
+    pairs = [(s.dimension, s.slice) for s in result.per_slice]
+    assert len(pairs) == len(set(pairs))

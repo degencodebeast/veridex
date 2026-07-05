@@ -267,6 +267,7 @@ def build_sealed_result(
         },
         "per_slice": [
             {
+                "dimension": sv.dimension,
                 "slice": sv.slice,
                 "n": sv.n,
                 "median_R": sv.median_R,
