@@ -30,6 +30,7 @@ def _event(
     scorer_goals_before: int = 0,
     conceded_goals_before: int = 0,
     match_minute: int | None = 20,
+    status_id: int | None = None,
 ) -> GoalEvent:
     return GoalEvent(
         t_e=1000,
@@ -38,6 +39,7 @@ def _event(
         scorer_goals_before=scorer_goals_before,
         conceded_goals_before=conceded_goals_before,
         match_minute=match_minute,
+        status_id=status_id,
     )
 
 
@@ -145,13 +147,57 @@ def test_half_first_second_and_unknown() -> None:
 
 
 def test_half_boundary_at_45() -> None:
+    # With no StatusId marker, half falls back to the match clock at the 45' split.
     cfg = ProbeConfig()
     assert derive_slice_tags(
-        _event(match_minute=44), _record(), cfg
+        _event(match_minute=44, status_id=None), _record(), cfg
     )["half"] == "first_half"
     assert derive_slice_tags(
-        _event(match_minute=45), _record(), cfg
+        _event(match_minute=45, status_id=None), _record(), cfg
     )["half"] == "second_half"
+
+
+def test_half_status_id_is_authoritative_over_clock() -> None:
+    # StatusId is the authoritative period marker: a first-half STOPPAGE goal reads
+    # minute 47 on the continuous clock but StatusId=2 -> first_half (the old
+    # clock-only logic would misclassify it as second_half).
+    cfg = ProbeConfig()
+    assert derive_slice_tags(
+        _event(match_minute=47, status_id=2), _record(), cfg
+    )["half"] == "first_half"
+    # StatusId wins even when the clock is missing.
+    assert derive_slice_tags(
+        _event(match_minute=None, status_id=4), _record(), cfg
+    )["half"] == "second_half"
+
+
+def test_half_extra_time_is_its_own_bucket() -> None:
+    # Extra-time statuses (7 = ET first period, 9 = ET second period) map to a NEW
+    # named bucket, never folded into second_half.
+    cfg = ProbeConfig()
+    assert derive_slice_tags(
+        _event(match_minute=95, status_id=7), _record(), cfg
+    )["half"] == "extra_time"
+    assert derive_slice_tags(
+        _event(match_minute=118, status_id=9), _record(), cfg
+    )["half"] == "extra_time"
+
+
+def test_half_unrecognized_status_is_unknown() -> None:
+    # A StatusId that is present but not a recognized play period (e.g. 5 = full
+    # time) is not trusted for the half -> unknown (named + counted, never guessed
+    # from a frozen/zero clock under a non-play phase).
+    cfg = ProbeConfig()
+    assert derive_slice_tags(
+        _event(match_minute=90, status_id=5), _record(), cfg
+    )["half"] == "unknown"
+
+
+def test_half_status_absent_no_clock_is_unknown() -> None:
+    cfg = ProbeConfig()
+    assert derive_slice_tags(
+        _event(match_minute=None, status_id=None), _record(), cfg
+    )["half"] == "unknown"
 
 
 def test_match_timing_early_late_unknown() -> None:

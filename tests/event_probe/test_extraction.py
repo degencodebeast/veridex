@@ -293,6 +293,31 @@ def test_leader_extends_carries_ahead_before_score():
     assert (second.scorer_goals_before, second.conceded_goals_before) == (1, 0)
 
 
+def test_status_id_exposed_on_goal_event():
+    """E1b-t4: each goal carries the record's StatusId period marker (or None).
+
+    StatusId is the authoritative period marker (2=first half, 4=second half,
+    7/9=extra time -- verified across the 18-fixture universe); the slice tagger
+    prefers it over the match clock. A record with no StatusId yields ``None``.
+    """
+    with_status = [
+        {"Seq": 1, "Ts": 1782500800000, "Action": "kickoff", "Participant1IsHome": True,
+         "Score": {"Participant2": {"Total": {"Goals": 0}}}},
+        {"Seq": 2, "Ts": 1782500866000, "Action": "goal", "Participant1IsHome": True,
+         "StatusId": 4, "Clock": {"Running": True, "Seconds": 3000},
+         "Score": {"Participant2": {"Total": {"Goals": 1}}}},
+    ]
+    (event,) = extract_goal_events(with_status).events
+    assert event.status_id == 4
+
+    no_status = [
+        {"Seq": 1, "Ts": 1782500800000, "Action": "goal", "Participant1IsHome": True,
+         "Score": {"Participant2": {"Total": {"Goals": 1}}}},
+    ]
+    (event,) = extract_goal_events(no_status).events
+    assert event.status_id is None
+
+
 def test_match_minute_from_clock_seconds():
     """E1b-t3: match_minute is the goal record's Clock.Seconds floored to minutes.
 

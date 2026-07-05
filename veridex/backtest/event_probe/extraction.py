@@ -37,6 +37,11 @@ class GoalEvent:
       match-elapsed clock verified in the real fixtures), or ``None`` when the
       record carries no readable clock -- never fabricated, tagged `unknown`
       downstream. Defaults keep the dataclass additive for direct constructions.
+    * ``status_id`` -- the goal record's ``StatusId`` period marker (2=first half,
+      4=second half, 7/9=extra time -- verified across the 18-fixture universe), or
+      ``None`` when absent. It is the AUTHORITATIVE half source; the slice tagger
+      prefers it over ``match_minute`` (which mislabels first-half stoppage goals
+      and cannot see extra time).
     """
 
     t_e: int
@@ -45,6 +50,7 @@ class GoalEvent:
     scorer_goals_before: int = 0
     conceded_goals_before: int = 0
     match_minute: int | None = None
+    status_id: int | None = None
 
 
 @dataclass(frozen=True)
@@ -82,6 +88,19 @@ def _match_minute(record: dict) -> int | None:
     if not isinstance(seconds, int) or isinstance(seconds, bool):
         return None
     return seconds // 60
+
+
+def _status_id(record: dict) -> int | None:
+    """Return the record's ``StatusId`` period marker as an int, else ``None``.
+
+    ``StatusId`` is the feed's authoritative match-phase code (2=first half,
+    4=second half, 7/9=extra time -- verified across the fixture universe). A
+    missing or non-integer value yields ``None`` (no trusted period marker).
+    """
+    status = record.get("StatusId")
+    if not isinstance(status, int) or isinstance(status, bool):
+        return None
+    return status
 
 
 def _scoring_side(participant: int, participant1_is_home: bool) -> str:
@@ -167,6 +186,7 @@ def extract_goal_events(records: list[dict]) -> ExtractionResult:
                     scorer_goals_before=carried[participant],
                     conceded_goals_before=carried[opponent],
                     match_minute=_match_minute(record),
+                    status_id=_status_id(record),
                 )
             )
             carried[participant] = new_value

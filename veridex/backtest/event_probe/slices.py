@@ -24,7 +24,16 @@ from veridex.backtest.event_probe.extraction import GoalEvent
 #: The structural halftime boundary in match minutes: minute < 45 is the first
 #: half, >= 45 the second. Not a tunable threshold (unlike the CON-007 knobs) --
 #: it is the definition of "half" itself, so it is a constant, not a config field.
+#: Only used as the FALLBACK when no StatusId period marker is present.
 _HALFTIME_MINUTE: int = 45
+
+#: The authoritative ``StatusId`` period codes (verified across the 18-fixture
+#: universe): 2=first half, 4=second half, 7/9=extra time (first/second ET period).
+#: All other codes are non-play phases (pre-match, halftime, full time, penalties)
+#: that never legitimately host a goal.
+_STATUS_FIRST_HALF: int = 2
+_STATUS_SECOND_HALF: int = 4
+_STATUS_EXTRA_TIME: frozenset[int] = frozenset({7, 9})
 
 
 def _favorite_status(p_pre: float | None, cutoff: float) -> str:
@@ -64,11 +73,29 @@ def _score_context(scorer_before: int, conceded_before: int) -> str:
     return "other"  # pragma: no cover - unreachable for integer scores
 
 
-def _half(match_minute: int | None) -> str:
-    """first_half / second_half / unknown from the goal's match minute."""
-    if match_minute is None:
-        return "unknown"
-    return "first_half" if match_minute < _HALFTIME_MINUTE else "second_half"
+def _half(status_id: int | None, match_minute: int | None) -> str:
+    """first_half / second_half / extra_time / unknown for the goal.
+
+    The pinned rule is "half from the period marker IF PRESENT, else match-minute":
+
+    * ``StatusId`` 2 / 4 -> first_half / second_half (authoritative; correctly
+      keeps first-half stoppage goals in the first half, which a clock-only split
+      cannot).
+    * ``StatusId`` 7 / 9 -> ``extra_time`` -- its own named bucket, never folded
+      into second_half.
+    * ``StatusId`` absent -> fall back to the match clock at the 45' split.
+    * anything left -- a present but non-play StatusId, or an absent marker with no
+      clock either -> ``unknown`` (named + counted, never guessed).
+    """
+    if status_id == _STATUS_FIRST_HALF:
+        return "first_half"
+    if status_id == _STATUS_SECOND_HALF:
+        return "second_half"
+    if status_id in _STATUS_EXTRA_TIME:
+        return "extra_time"
+    if status_id is None and match_minute is not None:
+        return "first_half" if match_minute < _HALFTIME_MINUTE else "second_half"
+    return "unknown"
 
 
 def _match_timing(match_minute: int | None, late_minute: int) -> str:
@@ -93,6 +120,6 @@ def derive_slice_tags(
         "score_context": _score_context(
             event.scorer_goals_before, event.conceded_goals_before
         ),
-        "half": _half(event.match_minute),
+        "half": _half(event.status_id, event.match_minute),
         "match_timing": _match_timing(event.match_minute, cfg.late_match_minute),
     }
