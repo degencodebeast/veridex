@@ -709,3 +709,194 @@ def test_side_to_token_no_aliases(resolved_market: ResolvedMarket, side: str) ->
 def test_side_to_token_unknown_side_raises_value_error(resolved_market: ResolvedMarket) -> None:
     with pytest.raises(ValueError):
         side_to_token(resolved_market, "draw")
+
+
+# ---------------------------------------------------------------------------
+# Default live Gamma client: fetch the EVENT (/events?slug=...) and FLATTEN its
+# `markets` list.  Captured live 2026-07-02 against gamma-api.polymarket.com: a
+# fixture slug names ONE event whose `markets` is a list of 3 binary Yes/No
+# markets (per-team win + draw), each with JSON-ENCODED-STRING outcomes/
+# clobTokenIds and closed=True.  The 1X2 market SLUGS carry -prt/-draw/-hrv
+# suffixes, so /markets?slug=<EVENT-slug> returns [] — the C-1 probe's real
+# failure.  The injected-test contract (a FLAT list of market dicts) is
+# unchanged; only the DEFAULT client must produce that flat list from /events.
+# ---------------------------------------------------------------------------
+
+# One event, closed=True, markets = 3 binary Yes/No markets — the exact shape
+# `GET /events?slug=fifwc-prt-hrv-2026-07-02` returns live (token ids captured live).
+_LIVE_EVENTS_PAYLOAD: list[dict] = [
+    {
+        "slug": "fifwc-prt-hrv-2026-07-02",
+        "closed": True,
+        "markets": [
+            {
+                "conditionId": "0x43bde2aa4a2067139451beb84649e5acaff989a3a0817fb1c592046c993d4168",
+                "slug": "fifwc-prt-hrv-2026-07-02-prt",
+                "question": "Will Portugal win on 2026-07-02?",
+                "outcomes": '["Yes", "No"]',
+                "clobTokenIds": (
+                    '["105300101902444670024314531766229236783176275346588264475245645697082520508325",'
+                    ' "36793987766888699593820647443469563387793929831492612627107713011601013977487"]'
+                ),
+                "orderPriceMinTickSize": "0.0025",
+                "closed": True,
+            },
+            {
+                "conditionId": "0x0ea55d012e501a500011f42067b140ee5dcb4c678c94401459962b3a841ac568",
+                "slug": "fifwc-prt-hrv-2026-07-02-draw",
+                "question": "Will Portugal vs. Croatia end in a draw?",
+                "outcomes": '["Yes", "No"]',
+                "clobTokenIds": (
+                    '["51119174525701806371550479635410149688193271356842779075353445408012707878262",'
+                    ' "7216924252254397393172583178610701050362566901628641624989721309958035485866"]'
+                ),
+                "orderPriceMinTickSize": "0.0025",
+                "closed": True,
+            },
+            {
+                "conditionId": "0xd23b4810d916942c2c7b71d9f0f5e3248adc0e4017d8ffa5dd0b1fe721beb0f2",
+                "slug": "fifwc-prt-hrv-2026-07-02-hrv",
+                "question": "Will Croatia win on 2026-07-02?",
+                "outcomes": '["Yes", "No"]',
+                "clobTokenIds": (
+                    '["87174293490112529998913581015460784091668285134964562963484251070427507993480",'
+                    ' "36533706584300857667029617554986527551244192111758453592898850406162026529582"]'
+                ),
+                "orderPriceMinTickSize": "0.0025",
+                "closed": True,
+            },
+        ],
+    }
+]
+
+_PRT_YES = "105300101902444670024314531766229236783176275346588264475245645697082520508325"
+_HRV_YES = "87174293490112529998913581015460784091668285134964562963484251070427507993480"
+_DRAW_YES = "51119174525701806371550479635410149688193271356842779075353445408012707878262"
+
+
+class _FakeHTTPResponse:
+    def __init__(self, data: object) -> None:
+        self._data = data
+
+    def raise_for_status(self) -> None:
+        return None
+
+    def json(self) -> object:
+        return self._data
+
+
+class _RecordingAsyncClient:
+    """Fake httpx.AsyncClient recording the requested path; returns the live /events payload."""
+
+    calls: list[tuple[str, dict | None]] = []
+
+    def __init__(self, **kwargs: object) -> None:
+        self._kwargs = kwargs
+
+    async def __aenter__(self) -> "_RecordingAsyncClient":
+        return self
+
+    async def __aexit__(self, *exc: object) -> bool:
+        return False
+
+    async def get(self, path: str, params: dict | None = None) -> _FakeHTTPResponse:
+        type(self).calls.append((path, params))
+        return _FakeHTTPResponse(_LIVE_EVENTS_PAYLOAD)
+
+
+@pytest.fixture
+def patched_httpx(monkeypatch: pytest.MonkeyPatch) -> type[_RecordingAsyncClient]:
+    import httpx
+
+    _RecordingAsyncClient.calls = []
+    monkeypatch.setattr(httpx, "AsyncClient", _RecordingAsyncClient)
+    return _RecordingAsyncClient
+
+
+async def test_default_gamma_client_fetches_events_and_flattens_markets(
+    patched_httpx: type[_RecordingAsyncClient],
+) -> None:
+    """The default client hits /events?slug=... and returns the event's markets flattened."""
+    client = polymarket_resolver._DefaultGammaClient()
+
+    markets = await client.get_markets(slug="fifwc-prt-hrv-2026-07-02")
+
+    # It must query the EVENT endpoint, not /markets (which returns [] for an event slug).
+    assert patched_httpx.calls == [("/events", {"slug": "fifwc-prt-hrv-2026-07-02"})]
+    # And it must return the event's 3 markets flattened (not the wrapping event object).
+    assert [m["slug"] for m in markets] == [
+        "fifwc-prt-hrv-2026-07-02-prt",
+        "fifwc-prt-hrv-2026-07-02-draw",
+        "fifwc-prt-hrv-2026-07-02-hrv",
+    ]
+
+
+@pytest.mark.parametrize(
+    "market_ref,side,expected_yes",
+    [
+        ("1X2|home|full", "home", _PRT_YES),
+        ("1X2|away|full", "away", _HRV_YES),
+        ("1X2|draw|full", "draw", _DRAW_YES),
+    ],
+)
+async def test_resolve_1x2_end_to_end_against_live_events_shape(
+    patched_httpx: type[_RecordingAsyncClient],
+    market_ref: str,
+    side: str,
+    expected_yes: str,
+) -> None:
+    """resolve_market(client=None) resolves each 1X2 side against the live /events structure.
+
+    Reproduces the C-1 probe path exactly (default client, real closed-market event shape) and
+    asserts the right per-side YES token — the failure the probe hit on all 18 fixtures.
+    """
+    resolved = await resolve_market(
+        market_ref,
+        "fifwc-prt-hrv-2026-07-02",
+        home_team="Portugal",
+        away_team="Croatia",
+        client=None,
+    )
+
+    assert side_to_token(resolved, side) == expected_yes
+
+
+async def test_team_name_alias_matches_turkey_to_turkiye() -> None:
+    """Operator 'Turkey' matches Gamma 'Türkiye' for 1X2|home (live WC naming diff, C-1 fixture).
+
+    Verified live 2026-06-25: event ``fifwc-tur-usa-2026-06-25`` carries ``"Will Türkiye win…"``
+    (Gamma uses the endonym) while the operator fixture supplies ``"Turkey"``. Without the alias
+    the home side fails closed; with it the home bet maps to the Türkiye-win market's YES token.
+    """
+    turkiye_yes = "90000000000000000000000000000000000000000000000000000000000001"
+
+    class _FlatClient:
+        async def get_markets(self, **params: object) -> list[dict]:
+            return [
+                {
+                    "conditionId": "0xtur",
+                    "slug": "fifwc-tur-usa-2026-06-25-tur",
+                    "question": "Will Türkiye win on 2026-06-25?",
+                    "outcomes": '["Yes", "No"]',
+                    "clobTokenIds": f'["{turkiye_yes}", "90000000000000000000000000000000000000000000000000000000000002"]',
+                    "orderPriceMinTickSize": "0.01",
+                },
+                {
+                    "conditionId": "0xusa",
+                    "slug": "fifwc-tur-usa-2026-06-25-usa",
+                    "question": "Will United States win on 2026-06-25?",
+                    "outcomes": '["Yes", "No"]',
+                    "clobTokenIds": '["90000000000000000000000000000000000000000000000000000000000003", "90000000000000000000000000000000000000000000000000000000000004"]',
+                    "orderPriceMinTickSize": "0.01",
+                },
+            ]
+
+    resolved = await resolve_market(
+        "1X2|home|full",
+        "fifwc-tur-usa-2026-06-25",
+        home_team="Turkey",
+        away_team="USA",
+        client=_FlatClient(),
+    )
+
+    assert side_to_token(resolved, "home") == turkiye_yes

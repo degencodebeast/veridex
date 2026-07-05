@@ -1,0 +1,475 @@
+{
+ "tool": "cp1_backfill/1",
+ "coverage_artifact_hash": "f88bd42ed70299abdaa6ae4f99cfa010671a6eb0f77871040e760251640b4077",
+ "fidelity_s": 60,
+ "fixtures": [
+  {
+   "fixture_id": 18179763,
+   "sides": [
+    {
+     "side": "home",
+     "ok": true,
+     "frames": 663,
+     "artifact_content_hash": "e8ac7fc5d7bf08234d1a9912dbbb740a3cf69f09e340696eb413243ab7227dba",
+     "frames_file": "scripts/txline_live/cp1/frames/18179763/home.jsonl"
+    },
+    {
+     "side": "away",
+     "ok": true,
+     "frames": 663,
+     "artifact_content_hash": "e1ad84d03d7eae0cf77304f472cbdaec308c6c78462166342f1c1942fa83dd5d",
+     "frames_file": "scripts/txline_live/cp1/frames/18179763/away.jsonl"
+    },
+    {
+     "side": "draw",
+     "ok": true,
+     "frames": 663,
+     "artifact_content_hash": "4a00e24ca02d4048a1b659ae37c52d5730e2c7cd98f99018cff4a7aad195108b",
+     "frames_file": "scripts/txline_live/cp1/frames/18179763/draw.jsonl"
+    }
+   ]
+  },
+  {
+   "fixture_id": 18179551,
+   "sides": [
+    {
+     "side": "home",
+     "ok": true,
+     "frames": 640,
+     "artifact_content_hash": "4489b6cde00accf6a7561edf2c209beb764e3e1578854c5eb595a50344926eb2",
+     "frames_file": "scripts/txline_live/cp1/frames/18179551/home.jsonl"
+    },
+    {
+     "side": "away",
+     "ok": true,
+     "frames": 639,
+     "artifact_content_hash": "b31d2ea24b1a41d90a872087cb3ba1eb9c60b6e8b47d664bdf6c17ca8b60d1be",
+     "frames_file": "scripts/txline_live/cp1/frames/18179551/away.jsonl"
+    },
+    {
+     "side": "draw",
+     "ok": true,
+     "frames": 639,
+     "artifact_content_hash": "cc45de5b7f54e7e2f6bc0b91d24d8da7ceb0a28834b268cec0cd04fded1178a5",
+     "frames_file": "scripts/txline_live/cp1/frames/18179551/draw.jsonl"
+    }
+   ]
+  },
+  {
+   "fixture_id": 18176123,
+   "sides": [
+    {
+     "side": "home",
+     "ok": true,
+     "frames": 926,
+     "artifact_content_hash": "a33516ea01550fdba3f7b9f62277c2a4dc7a4edbf94e2fbc49ce9bd5fc7f6031",
+     "frames_file": "scripts/txline_live/cp1/frames/18176123/home.jsonl"
+    },
+    {
+     "side": "away",
+     "ok": true,
+     "frames": 925,
+     "artifact_content_hash": "acefa7556da120cb0d350f9a5a2a1609f5d5557740a2c90b93e164162e5d3905",
+     "frames_file": "scripts/txline_live/cp1/frames/18176123/away.jsonl"
+    },
+    {
+     "side": "draw",
+     "ok": true,
+     "frames": 926,
+     "artifact_content_hash": "23d5b16193efa1f3d645433b56e28afc443a095b1c9088b62c17f7747952c901",
+     "frames_file": "scripts/txline_live/cp1/frames/18176123/draw.jsonl"
+    }
+   ]
+  },
+  {
+   "fixture_id": 17588229,
+   "sides": [
+    {
+     "side": "home",
+     "ok": true,
+     "frames": 3075,
+     "artifact_content_hash": "34e9f373a5d9fa9326ffd5f77c9b93bdfaebe4569017439c0e9993368b4d89be",
+     "frames_file": "scripts/txline_live/cp1/frames/17588229/home.jsonl"
+    },
+    {
+     "side": "away",
+     "ok": true,
+     "frames": 3075,
+     "artifact_content_hash": "1d49028c87d286ecf2a329e052f4c3c8f2402c33eb4a93b1f0ef6b512dc06df7",
+     "frames_file": "scripts/txline_live/cp1/frames/17588229/away.jsonl"
+    },
+    {
+     "side": "draw",
+     "ok": true,
+     "frames": 3075,
+     "artifact_content_hash": "ea1c74630115cb624aa71fb208b3e60f6776ff1a38d6d8d466b763032ab0e253",
+     "frames_file": "scripts/txline_live/cp1/frames/17588229/draw.jsonl"
+    }
+   ]
+  },
+  {
+   "fixture_id": 17588234,
+   "sides": [
+    {
+     "side": "home",
+     "ok": true,
+     "frames": 3177,
+     "artifact_content_hash": "60031e6bc3970f84543251c96a33fdeffc1120fe6e5ccc6322b085d7498aff9c",
+     "frames_file": "scripts/txline_live/cp1/frames/17588234/home.jsonl"
+    },
+    {
+     "side": "away",
+     "ok": true,
+     "frames": 3177,
+     "artifact_content_hash": "3d37c772e0ea5f37abeb4d80b26d0028070e169bef39f411702a6df9b1ccb7bf",
+     "frames_file": "scripts/txline_live/cp1/frames/17588234/away.jsonl"
+    },
+    {
+     "side": "draw",
+     "ok": true,
+     "frames": 3177,
+     "artifact_content_hash": "4063da46a2daafe716af35cdf7c9815279e21f55dab8eeb325f12f95c8b32257",
+     "frames_file": "scripts/txline_live/cp1/frames/17588234/draw.jsonl"
+    }
+   ]
+  },
+  {
+   "fixture_id": 17926593,
+   "sides": [
+    {
+     "side": "home",
+     "ok": true,
+     "frames": 3076,
+     "artifact_content_hash": "ce8f35b0d9e501e1951ed5902e68710ae42739b4b3b98ef3d4b38bd111b692de",
+     "frames_file": "scripts/txline_live/cp1/frames/17926593/home.jsonl"
+    },
+    {
+     "side": "away",
+     "ok": true,
+     "frames": 3075,
+     "artifact_content_hash": "7e53ba9e2f61491408537ad2c2c6bcf14c94a02e7faed180a04ac4561aa8488b",
+     "frames_file": "scripts/txline_live/cp1/frames/17926593/away.jsonl"
+    },
+    {
+     "side": "draw",
+     "ok": true,
+     "frames": 3075,
+     "artifact_content_hash": "5d12fd68e4e41c44a34182a0d64af0f00f53651db2ae33f042cb5b395df2b251",
+     "frames_file": "scripts/txline_live/cp1/frames/17926593/draw.jsonl"
+    }
+   ]
+  },
+  {
+   "fixture_id": 17588245,
+   "sides": [
+    {
+     "side": "home",
+     "ok": true,
+     "frames": 3334,
+     "artifact_content_hash": "63bebbdbce241eac721776355bdb92e2b17dff180808105de73633a913a6cd40",
+     "frames_file": "scripts/txline_live/cp1/frames/17588245/home.jsonl"
+    },
+    {
+     "side": "away",
+     "ok": true,
+     "frames": 3333,
+     "artifact_content_hash": "79798cc0924f3dfb683267a667fbf0a4592032e10efa6eef69f79f9c1a72ff89",
+     "frames_file": "scripts/txline_live/cp1/frames/17588245/away.jsonl"
+    },
+    {
+     "side": "draw",
+     "ok": true,
+     "frames": 3333,
+     "artifact_content_hash": "a353f2466564772b856e9f07dc44e81697457d1c33c30c4fa616b3d47d1e81ea",
+     "frames_file": "scripts/txline_live/cp1/frames/17588245/draw.jsonl"
+    }
+   ]
+  },
+  {
+   "fixture_id": 17588391,
+   "sides": [
+    {
+     "side": "home",
+     "ok": true,
+     "frames": 3348,
+     "artifact_content_hash": "2e049cf73498f65e96b6b5d01449c2a9cd87aa359eb6b592d375aba39818b0f4",
+     "frames_file": "scripts/txline_live/cp1/frames/17588391/home.jsonl"
+    },
+    {
+     "side": "away",
+     "ok": true,
+     "frames": 3348,
+     "artifact_content_hash": "12b7e6db7328d3d18331d4543914ca47013348bb37eed5109841373c6afa9b0b",
+     "frames_file": "scripts/txline_live/cp1/frames/17588391/away.jsonl"
+    },
+    {
+     "side": "draw",
+     "ok": true,
+     "frames": 3348,
+     "artifact_content_hash": "377dd56164b46d1940d35d05784a2ebc0bdb37b40bb430ea7f9c2c4ff34d0f58",
+     "frames_file": "scripts/txline_live/cp1/frames/17588391/draw.jsonl"
+    }
+   ]
+  },
+  {
+   "fixture_id": 17588404,
+   "sides": [
+    {
+     "side": "home",
+     "ok": true,
+     "frames": 3207,
+     "artifact_content_hash": "32cff906f7e5e226580e44a04a31da34c2721ce6ac60c4f2055a41abaf4ec938",
+     "frames_file": "scripts/txline_live/cp1/frames/17588404/home.jsonl"
+    },
+    {
+     "side": "away",
+     "ok": true,
+     "frames": 3208,
+     "artifact_content_hash": "540e2f1ad3d5fcf91445c4bb95e86f8d0ccb24db16b3284955bc16a2b893efdf",
+     "frames_file": "scripts/txline_live/cp1/frames/17588404/away.jsonl"
+    },
+    {
+     "side": "draw",
+     "ok": true,
+     "frames": 3207,
+     "artifact_content_hash": "4ce16932d954a16c5cd2076dd5f826a651247d2ab9db0d134ae90ffffef877cc",
+     "frames_file": "scripts/txline_live/cp1/frames/17588404/draw.jsonl"
+    }
+   ]
+  },
+  {
+   "fixture_id": 17588325,
+   "sides": [
+    {
+     "side": "home",
+     "ok": true,
+     "frames": 3363,
+     "artifact_content_hash": "5dfcafe61ee1fe762889338c1040b001ebaaa8c6adb7d39786243fe5e048e483",
+     "frames_file": "scripts/txline_live/cp1/frames/17588325/home.jsonl"
+    },
+    {
+     "side": "away",
+     "ok": true,
+     "frames": 3363,
+     "artifact_content_hash": "cd58b090d86f8cb1fa0b57568c94061dff0bb8f6eafb2abded56c8b0682a0f96",
+     "frames_file": "scripts/txline_live/cp1/frames/17588325/away.jsonl"
+    },
+    {
+     "side": "draw",
+     "ok": true,
+     "frames": 3363,
+     "artifact_content_hash": "9261874be1424374a66915781eef922b195d9cf47d558dd4bcaa0cd922cfbb6d",
+     "frames_file": "scripts/txline_live/cp1/frames/17588325/draw.jsonl"
+    }
+   ]
+  },
+  {
+   "fixture_id": 18167317,
+   "sides": [
+    {
+     "side": "home",
+     "ok": true,
+     "frames": 500,
+     "artifact_content_hash": "b2a1751864d218a55658f72f2246bb60f848a3de994fd5cc68f6ca67e7287c3e",
+     "frames_file": "scripts/txline_live/cp1/frames/18167317/home.jsonl"
+    },
+    {
+     "side": "away",
+     "ok": true,
+     "frames": 500,
+     "artifact_content_hash": "90b3edc3e7ecfc991bc036e91490d34d8348865272813fb797f7555d616e9204",
+     "frames_file": "scripts/txline_live/cp1/frames/18167317/away.jsonl"
+    },
+    {
+     "side": "draw",
+     "ok": true,
+     "frames": 500,
+     "artifact_content_hash": "b21108ebb3973ac78425e3dfe5d10cb4cc14389fc34b8e0907de34459f2a5ec0",
+     "frames_file": "scripts/txline_live/cp1/frames/18167317/draw.jsonl"
+    }
+   ]
+  },
+  {
+   "fixture_id": 18172469,
+   "sides": [
+    {
+     "side": "home",
+     "ok": true,
+     "frames": 483,
+     "artifact_content_hash": "d9c72df0aede116adaae8a2551a45667cc61fb73da01749337a216e388cfd14c",
+     "frames_file": "scripts/txline_live/cp1/frames/18172469/home.jsonl"
+    },
+    {
+     "side": "away",
+     "ok": true,
+     "frames": 482,
+     "artifact_content_hash": "d0993211c96994c6862d1163cffb68723981a5b5cb050db3863bdbd86d9419c8",
+     "frames_file": "scripts/txline_live/cp1/frames/18172469/away.jsonl"
+    },
+    {
+     "side": "draw",
+     "ok": true,
+     "frames": 482,
+     "artifact_content_hash": "f9c1d649fa9cf616ec02c670f260dfb0e0108c029141d168d527de9c1b2d5872",
+     "frames_file": "scripts/txline_live/cp1/frames/18172469/draw.jsonl"
+    }
+   ]
+  },
+  {
+   "fixture_id": 18175983,
+   "sides": [
+    {
+     "side": "home",
+     "ok": true,
+     "frames": 370,
+     "artifact_content_hash": "ac783aa50d0ee95b4b33986e37c1d7dcd8d6dd3a6fcbb845fa66287a565f3e3b",
+     "frames_file": "scripts/txline_live/cp1/frames/18175983/home.jsonl"
+    },
+    {
+     "side": "away",
+     "ok": true,
+     "frames": 370,
+     "artifact_content_hash": "7499cfa228f36f462cd677714f4b33a35996bd8b26a601aaa3d541b8b094884d",
+     "frames_file": "scripts/txline_live/cp1/frames/18175983/away.jsonl"
+    },
+    {
+     "side": "draw",
+     "ok": true,
+     "frames": 370,
+     "artifact_content_hash": "717b9f93f2796a661dcdde7bbbff309a690fa9c1dc786fff7187ddee587fa8e1",
+     "frames_file": "scripts/txline_live/cp1/frames/18175983/draw.jsonl"
+    }
+   ]
+  },
+  {
+   "fixture_id": 18172280,
+   "sides": [
+    {
+     "side": "home",
+     "ok": true,
+     "frames": 535,
+     "artifact_content_hash": "d627d87ad6639af0a080deb9f1774b54e72752100dfa6c2776a43f62427c2dc6",
+     "frames_file": "scripts/txline_live/cp1/frames/18172280/home.jsonl"
+    },
+    {
+     "side": "away",
+     "ok": true,
+     "frames": 535,
+     "artifact_content_hash": "d1383cc46758a8552eb79434f00215487771ad92ea4e8187c95308486af7513f",
+     "frames_file": "scripts/txline_live/cp1/frames/18172280/away.jsonl"
+    },
+    {
+     "side": "draw",
+     "ok": true,
+     "frames": 536,
+     "artifact_content_hash": "0c255f35c091a06661610e22d8a031a02c34a13afb9bf0d510de9add2a6a58e1",
+     "frames_file": "scripts/txline_live/cp1/frames/18172280/draw.jsonl"
+    }
+   ]
+  },
+  {
+   "fixture_id": 18175981,
+   "sides": [
+    {
+     "side": "home",
+     "ok": true,
+     "frames": 511,
+     "artifact_content_hash": "950db633c43eea5f9a9fe85cc7b4f04f8f3fa02110a637341cc44a985619045b",
+     "frames_file": "scripts/txline_live/cp1/frames/18175981/home.jsonl"
+    },
+    {
+     "side": "away",
+     "ok": true,
+     "frames": 510,
+     "artifact_content_hash": "ff0a4e3e54c11373d15aa59552f2cd6a420a98dec3f1d9a6e2e5b99bd93ac5d7",
+     "frames_file": "scripts/txline_live/cp1/frames/18175981/away.jsonl"
+    },
+    {
+     "side": "draw",
+     "ok": true,
+     "frames": 510,
+     "artifact_content_hash": "4023c4f20a9f42314a0a832b5c7fc505dcab42197e14b39d5692229b82a159aa",
+     "frames_file": "scripts/txline_live/cp1/frames/18175981/draw.jsonl"
+    }
+   ]
+  },
+  {
+   "fixture_id": 18179550,
+   "sides": [
+    {
+     "side": "home",
+     "ok": true,
+     "frames": 505,
+     "artifact_content_hash": "c71a56f36b195a30192c2d22ee59bd60f2274517611fcf58fbb9e9c974c9ea65",
+     "frames_file": "scripts/txline_live/cp1/frames/18179550/home.jsonl"
+    },
+    {
+     "side": "away",
+     "ok": true,
+     "frames": 505,
+     "artifact_content_hash": "7f1c304d128dbd9a4818876b059771f3dede777dc37d5d54268c79e909c98281",
+     "frames_file": "scripts/txline_live/cp1/frames/18179550/away.jsonl"
+    },
+    {
+     "side": "draw",
+     "ok": true,
+     "frames": 506,
+     "artifact_content_hash": "4a042199adcd19c2539995c00da81ba876404d6ee9286f09c60ab0985b4b99a4",
+     "frames_file": "scripts/txline_live/cp1/frames/18179550/draw.jsonl"
+    }
+   ]
+  },
+  {
+   "fixture_id": 18179759,
+   "sides": [
+    {
+     "side": "home",
+     "ok": true,
+     "frames": 416,
+     "artifact_content_hash": "814c33eaee928ad726b5a7b4cd44b87fd79336e1bb78a5b210c2b18579d89abb",
+     "frames_file": "scripts/txline_live/cp1/frames/18179759/home.jsonl"
+    },
+    {
+     "side": "away",
+     "ok": true,
+     "frames": 396,
+     "artifact_content_hash": "4012b50b700fed7510757aeba680414cb45a61afff9c66f5b1f5bde03b9fa299",
+     "frames_file": "scripts/txline_live/cp1/frames/18179759/away.jsonl"
+    },
+    {
+     "side": "draw",
+     "ok": true,
+     "frames": 396,
+     "artifact_content_hash": "309eb8be625f12c45a16c9bd4129b7cde258e78df7b52c5ec10de280cdfe10f0",
+     "frames_file": "scripts/txline_live/cp1/frames/18179759/draw.jsonl"
+    }
+   ]
+  },
+  {
+   "fixture_id": 18175918,
+   "sides": [
+    {
+     "side": "home",
+     "ok": true,
+     "frames": 948,
+     "artifact_content_hash": "3e4bf6831869fdf3c946b3845a3701f356b6fa69ac09a5efcaa6565e24c771c9",
+     "frames_file": "scripts/txline_live/cp1/frames/18175918/home.jsonl"
+    },
+    {
+     "side": "away",
+     "ok": true,
+     "frames": 948,
+     "artifact_content_hash": "ffbf3bdfb9785fedd6bc6ea2a0b1cc6cd8026e309add6525f0844f6e41e09e1e",
+     "frames_file": "scripts/txline_live/cp1/frames/18175918/away.jsonl"
+    },
+    {
+     "side": "draw",
+     "ok": true,
+     "frames": 949,
+     "artifact_content_hash": "0dd3f800e74e0c173be56015ab120584246e86c672a0cb639bbf23583da865dc",
+     "frames_file": "scripts/txline_live/cp1/frames/18175918/draw.jsonl"
+    }
+   ]
+  }
+ ]
+}

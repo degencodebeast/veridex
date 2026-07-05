@@ -19,14 +19,26 @@ from pathlib import Path
 import pytest
 
 from tests.test_replay_pack import _write_session
+from tests.test_value_vs_venue import _write_1x2_session
 from veridex.backtest.evaluation import (
     EvalProtocol,
     produce_results_by_fixture,
     run_multi_fixture_evaluation,
 )
+from veridex.backtest.runner import run_backtest
+from veridex.backtest.venue_behavior_report import VenueDecision, build_venue_behavior_report
+from veridex.backtest.vvv_report import vvv_report_with_estimated_edge
 from veridex.ingest.marketstate import MarketState
 from veridex.ingest.replay_pack import pack_from_session
 from veridex.provenance import EvidenceRung
+from veridex.runtime.window import RunWindow
+from veridex.strategies.value_vs_venue import value_vs_venue_agent
+from veridex.venues.polymarket import decimal_to_native
+from veridex.venues.price_history import VenuePriceHistoryFrame
+from veridex.venues.venue_price_source import (
+    TimedVenueQuote,
+    build_backfilled_venue_source,
+)
 
 _RUNG_LABELS = {rung.value for rung in EvidenceRung}
 
@@ -118,11 +130,27 @@ def test_nulls_and_abstentions_are_counted_honestly() -> None:
 
 
 def _real_pack(tmp_path: Path) -> Path:
-    """A real, hashed 1X2 pack (fixture 5) built through the same normalizer the live loop uses."""
+    """A real, hashed 1X2 pack (fixture 5) built through the same normalizer the live loop uses.
+
+    NOTE: this pack uses a fabricated 1X2 SuperOddsType/side shape (``1X2||`` + Home/Draw/Away) — fine
+    for the venue-BLIND drift/baseline legs (which never touch the market-identity bridge), but NOT for
+    VvV firing. VvV tests that must fire a venue-priced pick use :func:`_real_1x2_full_pack` instead.
+    """
     session_dir = _write_session(tmp_path)
     pack_dir = tmp_path / "pack"
     pack_from_session(session_dir, pack_dir)
     return pack_dir
+
+
+def _real_1x2_full_pack(tmp_path: Path) -> Path:
+    """A real, hashed pack (fixture 5) in the REAL TxLINE 1X2-FULL shape the market-identity bridge needs.
+
+    ``1X2_PARTICIPANT_RESULT||`` + sides ``part1``/``draw``/``part2`` (part1=home, part2=away) — the exact
+    key/side format the real pack + Run-002 feed, so the VvV agent's ``txline_market_to_venue_ref`` bridge
+    resolves each side to its C-3 frame ref and prices against the injected source. Sub-50% fair probs so a
+    generous venue decimal (5.0) fires and a break-even one (2.0) does not.
+    """
+    return _write_1x2_session(tmp_path, [40.0, 25.0, 35.0])
 
 
 def test_producer_generates_results_then_feeds_the_evaluation(tmp_path: Path) -> None:
@@ -167,7 +195,7 @@ def test_producer_runs_all_named_baselines(tmp_path: Path) -> None:
 
 def test_producer_runs_value_vs_venue_only_with_a_source(tmp_path: Path) -> None:
     """VvV runs (and its estimated-edge metric appears at the venue rung) ONLY when a source is given (DRIFT-2)."""
-    pack_dir = _real_pack(tmp_path)
+    pack_dir = _real_1x2_full_pack(tmp_path)
     proto = _proto(fixture_ids=[5], strategy_configs=["value-vs-venue"], baselines=[])
 
     # venue decimal 5.0 makes every fixture-5 side's edge positive, so the agent FIRES.
@@ -175,7 +203,7 @@ def test_producer_runs_value_vs_venue_only_with_a_source(tmp_path: Path) -> None
         produce_results_by_fixture(
             proto,
             packs={5: pack_dir},
-            venue_price_source=lambda mk: 5.0,
+            venue_price_source=lambda fid, mk, side, ts: TimedVenueQuote(venue_decimal_price=5.0, staleness_s=0),
             venue_source_id="quote-artifact-hash-abc",
         )
     )
@@ -212,14 +240,14 @@ def test_producer_requires_explicit_venue_source_identity_for_vvv(tmp_path: Path
 
     # Source present but NO explicit identity -> VvV is SKIPPED (fail closed), never run with "<lambda>".
     res = asyncio.run(
-        produce_results_by_fixture(proto, packs={5: pack_dir}, venue_price_source=lambda mk: 2.0)
+        produce_results_by_fixture(proto, packs={5: pack_dir}, venue_price_source=lambda fid, mk, side, ts: TimedVenueQuote(venue_decimal_price=2.0, staleness_s=0))
     )
     assert [row for row in res.get(5, []) if row["kind"] == "value-vs-venue"] == []
 
     # An empty identity is no identity — still skipped.
     res_empty = asyncio.run(
         produce_results_by_fixture(
-            proto, packs={5: pack_dir}, venue_price_source=lambda mk: 2.0, venue_source_id=""
+            proto, packs={5: pack_dir}, venue_price_source=lambda fid, mk, side, ts: TimedVenueQuote(venue_decimal_price=2.0, staleness_s=0), venue_source_id=""
         )
     )
     assert [row for row in res_empty.get(5, []) if row["kind"] == "value-vs-venue"] == []
@@ -229,7 +257,7 @@ def test_producer_requires_explicit_venue_source_identity_for_vvv(tmp_path: Path
         produce_results_by_fixture(
             proto,
             packs={5: pack_dir},
-            venue_price_source=lambda mk: 2.0,
+            venue_price_source=lambda fid, mk, side, ts: TimedVenueQuote(venue_decimal_price=2.0, staleness_s=0),
             venue_source_id="quote-artifact-hash-abc",
         )
     )
@@ -350,3 +378,315 @@ def test_baselines_still_emit_on_pre_match_only_pack(monkeypatch: pytest.MonkeyP
     # FU-3: null IFF a WAIT abstention; a fired pick is scored vs the held-out per-market close (no lookahead).
     for row in results[fixture_id]:
         assert (row["clv_bps"] is None) == (row["action"] == "WAIT")
+
+
+# ==========================================================================================
+# C-6 — Run-002-VvV producer wiring: the venue leg never disturbs rung-1 drift, the estimated-edge
+# attach never touches the sealed evidence hash, and the producer COLLECTS the VvV decision
+# opportunities (decision_quote_coverage) with matched decisions carrying their staleness (6b).
+# ==========================================================================================
+
+#: A fixed 15m freshness bound is far wider than the synthetic packs' second-scale ts gaps, so a
+#: constant-price source always matches — enough to exercise the collection paths deterministically.
+def _fires_src(price: float = 5.0, staleness_s: int = 120):
+    return lambda fid, mk, side, ts: TimedVenueQuote(venue_decimal_price=price, staleness_s=staleness_s)
+
+
+def _never_src():
+    return lambda fid, mk, side, ts: None
+
+
+def test_rung1_drift_unchanged_by_venue_leg(tmp_path: Path) -> None:
+    """GUD-003: adding the value-vs-venue leg leaves the drift rows BYTE-identical.
+
+    The venue leg runs its OWN sealed ``run_backtest`` (via ``vvv_report_with_estimated_edge``), so it
+    can legitimately add VvV rows but must NEVER perturb the drift run's rows/evidence.
+    """
+    pack_dir = _real_pack(tmp_path)
+    base_proto = _proto(fixture_ids=[5], strategy_configs=["cumulative-drift"], baselines=[])
+    venue_proto = _proto(
+        fixture_ids=[5], strategy_configs=["cumulative-drift", "value-vs-venue"], baselines=[]
+    )
+
+    base = asyncio.run(produce_results_by_fixture(base_proto, packs={5: pack_dir}))
+    withv = asyncio.run(
+        produce_results_by_fixture(
+            venue_proto, packs={5: pack_dir}, venue_price_source=_fires_src(), venue_source_id="src#1"
+        )
+    )
+
+    drift_base = [row for row in base[5] if row["kind"] == "cumulative-drift"]
+    drift_withv = [row for row in withv[5] if row["kind"] == "cumulative-drift"]
+    assert drift_base, "the drift leg must produce rows (guard is meaningless on an empty set)"
+    assert drift_base == drift_withv, "the venue leg must leave rung-1 drift rows byte-unchanged"
+
+
+def test_post_build_estimated_edge_does_not_mutate_sealed_hash(tmp_path: Path) -> None:
+    """CON-004 + evidence-precision note: the POST-build estimated-edge attach never touches the seal.
+
+    A bare venue-free ``run_backtest`` of the SAME VvV agent and the ``vvv_report_with_estimated_edge``
+    producer path must seal the IDENTICAL ``evidence_hash`` — the estimated edge is attached to the
+    report via ``model_copy`` AFTER the venue-free build, so the sealed run never learns it exists.
+    """
+    pack_dir = _real_1x2_full_pack(tmp_path)
+    window = RunWindow(
+        window_id="w_vvv", fixture_id=5, market_allowlist=["1X2"], end_rule="pre_match", min_clv_horizon_s=0
+    )
+    src = _fires_src(staleness_s=0)
+
+    agent = value_vs_venue_agent(venue_price_source=src, venue_source_id="src#1")
+    result_plain, report_plain = asyncio.run(run_backtest(pack_dir, 5, [agent], window=window))
+    result_vvv, report_vvv = asyncio.run(
+        vvv_report_with_estimated_edge(
+            pack_dir, 5, venue_price_source=src, venue_source_id="src#1", window=window,
+            assumptions={"source": "c6-test"},
+        )
+    )
+
+    # The venue-free seal is byte-identical across the plain build and the estimated-edge producer path.
+    assert result_vvv.evidence_hash == result_plain.evidence_hash
+    assert report_vvv.evidence_hash == report_plain.evidence_hash
+    # ...yet the estimate IS attached, and the executable (live-fill) edge stays null (CON-003).
+    assert report_vvv.estimated_executable_edge_bps is not None
+    assert report_vvv.real_executable_edge_bps is None
+
+
+def test_vvv_producer_collects_decision_quote_coverage_with_staleness(tmp_path: Path) -> None:
+    """The producer records a VvV decision per tick; matched decisions carry staleness (6b) and flow
+    into ``decision_quote_coverage`` computed over ALL decisions (CON-012), not just fired picks."""
+    pack_dir = _real_1x2_full_pack(tmp_path)
+    proto = _proto(fixture_ids=[5], strategy_configs=["value-vs-venue"], baselines=[])
+
+    decision_sink: dict[int, list[VenueDecision]] = {}
+    row_sink: dict[int, list] = {}
+    asyncio.run(
+        produce_results_by_fixture(
+            proto,
+            packs={5: pack_dir},
+            venue_price_source=_fires_src(staleness_s=120),
+            venue_source_id="src#1",
+            venue_decision_sink=decision_sink,
+            venue_behavior_row_sink=row_sink,
+        )
+    )
+
+    decisions = decision_sink[5]
+    assert decisions and all(isinstance(d, VenueDecision) for d in decisions)
+    fired_matched = [d for d in decisions if d.fired and d.quote_matched]
+    assert fired_matched, "venue 5.0 must fire+match at least one decision"
+    # 6b: every matched decision carries a non-None staleness (else the C-5 model would have raised).
+    assert all(d.staleness_s is not None for d in decisions if d.quote_matched)
+
+    report = build_venue_behavior_report(
+        row_sink[5],
+        decisions,
+        haircut_ladder_bps=[0, 100, 200, 300],
+        prob_bands=[(0, 100)],
+        ttc_buckets=["<1h", "1-6h", "6-24h", ">24h"],
+        freshness_buckets=["<=2m", "<=5m", "<=15m"],
+    )
+    cov = report.decision_quote_coverage
+    assert cov.decision_count == len(decisions)
+    assert cov.quote_matched_count == sum(1 for d in decisions if d.quote_matched)
+    # 6b flow: matched staleness (120s → <=2m) is bucketed, summing exactly to quote_matched_count.
+    assert sum(cov.freshness_bucket_counts_for_used_quotes.values()) == cov.quote_matched_count
+
+
+# ── keying bridge: out-of-venue-scope decisions must not dilute the quote-coverage denominator ───
+#
+# ``quote_matched_pct`` answers "of the decisions the venue COULD price (1X2-full, which has frames),
+# how many matched a quote under the freshness bound?". A non-1X2-full decision (AH / OU / 1X2-half)
+# has NO C/P1 frame — it is OUT OF VENUE SCOPE, categorically distinct from "in scope but no quote
+# near this tick". Counting it as an unmatched in-scope decision would silently understate the true
+# coverage. So it is excluded from ``decision_count`` and tracked separately in ``out_of_venue_scope_count``.
+
+
+def test_out_of_venue_scope_decisions_excluded_from_coverage_denominator() -> None:
+    """A None-mapped (out-of-scope) decision is NOT an in-scope unmatched decision — it is excluded."""
+    decisions = [
+        VenueDecision(fired=False, quote_matched=True, staleness_s=30, in_venue_scope=True),   # in scope, matched
+        VenueDecision(fired=False, quote_matched=False, in_venue_scope=True),                   # in scope, no quote
+        VenueDecision(fired=False, quote_matched=False, in_venue_scope=False),                  # OUT of venue scope
+        VenueDecision(fired=False, quote_matched=False, in_venue_scope=False),                  # OUT of venue scope
+    ]
+
+    report = build_venue_behavior_report(
+        [],
+        decisions,
+        haircut_ladder_bps=[0],
+        prob_bands=[(0, 100)],
+        ttc_buckets=["<1h", ">24h"],
+        freshness_buckets=["<=2m", "<=5m"],
+    )
+    cov = report.decision_quote_coverage
+
+    # Denominator is the IN-SCOPE (1X2-full) decisions only — the two out-of-scope decisions are excluded.
+    assert cov.decision_count == 2
+    assert cov.out_of_venue_scope_count == 2
+    assert cov.quote_matched_count == 1
+    assert cov.quote_none_count == 1  # the ONE in-scope no-quote decision — NOT the out-of-scope ones
+    assert cov.quote_matched_pct == 50.0  # 1 matched / 2 in-scope, not 1/4
+
+
+def test_collect_marks_non_1x2_market_out_of_venue_scope() -> None:
+    """A WAIT tick whose only market is non-1X2 (no frame) is recorded OUT of venue scope, not unmatched."""
+    from types import SimpleNamespace
+
+    from veridex.backtest.evaluation import _collect_vvv_venue_behavior
+
+    ou_only = MarketState(
+        fixture_id=5,
+        tick_seq=0,
+        ts=_QUERY_TS_S,
+        phase=0,
+        markets={
+            "OVERUNDER_PARTICIPANT_GOALS||line=2.5": {
+                "stable_prob_bps": {"over": 5000, "under": 5000},
+                "stable_price": {"over": 2.0, "under": 2.0},
+                "suspended": False,
+            }
+        },
+        scores={},
+    )
+    wait_row = {"tick_seq": 0, "raw_prescore": {"raw_action": {"type": "WAIT", "params": {}}}}
+    result = SimpleNamespace(score_rows=[wait_row])
+
+    _rows, decisions = _collect_vvv_venue_behavior(
+        result,  # type: ignore[arg-type]
+        {0: ou_only},
+        venue_price_source=_fires_src(),  # would match if it were ever CALLED — it must not be for OU
+        close_ts=_QUERY_TS_S,
+        coverage_class="ok",
+    )
+
+    assert len(decisions) == 1
+    assert decisions[0].in_venue_scope is False, "an over/under-only tick is out of venue scope (no frame)"
+    assert decisions[0].quote_matched is False, "out of scope ⇒ never a fabricated match"
+
+
+# ── Units regression (Run-002-VvV): decision-coverage collection queries a SECONDS-keyed source ──
+# with a TxLINE MarketState.ts that is ALREADY unix seconds (the normalizer floors ms→s). Both
+# evaluation.py call sites — the fired-pick lookup and the WAIT-tick ``_first_matched_quote`` — pass the
+# seconds ts through DIRECTLY; re-dividing it by 1000 (the reverted e4e5608 bug) made matched staleness
+# ≈ 1.78M ≫ the 900s bound → every decision unmatched → quote_matched_count=0 (Run-002). The
+# ``_fires_src`` stub above ignores ``ts``, so only a REAL ts-sensitive source exercises the contract.
+_FRAME_TS_EARLY_S = 1_782_641_900  # unix SECONDS (10-digit), Polymarket-canonical frame ts
+_FRAME_TS_LATE_S = 1_782_642_000
+_QUERY_TS_S = 1_782_642_003  # decision ts in unix SECONDS (10-digit) — the real MarketState.ts scale
+_EXPECTED_STALENESS_S = 3  # 1_782_642_003 - 1_782_642_000, well inside the 900s bound
+
+
+def _seconds_frame_source():
+    """A REAL ts-sensitive source over 1X2|home frames at SECONDS-scale ts (900s freshness bound)."""
+    frames = [
+        VenuePriceHistoryFrame(
+            ts=ts,
+            fixture_id=5,
+            market_ref="1X2|home|full",
+            condition_id="0xcond",
+            token_id="tok-home",
+            native_price=decimal_to_native(2.0),
+            venue_decimal_price=2.0,
+            price_kind="clob-prices-history",
+            fidelity_s=60,
+        )
+        for ts in (_FRAME_TS_EARLY_S, _FRAME_TS_LATE_S)
+    ]
+    src, _sid = build_backfilled_venue_source(
+        frames,
+        price_history_artifact_hashes=["ph#1"],
+        coverage_artifact_hash="cov#1",
+        freshness_s=900,
+        haircut_ladder_bps=[0, 100, 200, 300],
+    )
+    return src
+
+
+def _ms_query_state() -> MarketState:
+    """A REAL-FORMAT 1X2-full tick (``1X2_PARTICIPANT_RESULT||`` + ``part1``) with ``ts`` in unix SECONDS.
+
+    The market-identity bridge maps ``part1`` on the 1X2-full key to the frame ref ``1X2|home|full`` the
+    seconds source is keyed by; the seconds ts is passed to the source directly (no conversion).
+    """
+    return MarketState(
+        fixture_id=5,
+        tick_seq=0,
+        ts=_QUERY_TS_S,
+        phase=0,
+        markets={
+            "1X2_PARTICIPANT_RESULT||": {
+                "stable_prob_bps": {"part1": 6000},
+                "stable_price": {"part1": 2.0},
+                "suspended": False,
+            }
+        },
+        scores={},
+    )
+
+
+def test_collect_venue_behavior_prices_seconds_tick_for_lookup() -> None:
+    """Units regression (Run-002-VvV): both evaluation.py venue-source call sites pass the seconds ts through.
+
+    Drives ``_collect_vvv_venue_behavior`` with a synthetic sealed run whose ONE tick carries a
+    seconds-scale ``MarketState.ts`` against a real seconds-keyed source: the fired-pick decision (direct
+    source call) AND the WAIT-tick decision (via ``_first_matched_quote``) must both MATCH, carrying a
+    staleness in a sane SECONDS range (0–900). Re-dividing the already-seconds ts by 1000 (the reverted
+    e4e5608 bug) overran the 900s bound → ``None`` → ``quote_matched=False`` for every decision (Run-002).
+    """
+    from types import SimpleNamespace
+
+    from veridex.backtest.evaluation import _collect_vvv_venue_behavior
+
+    state = _ms_query_state()
+    fired_row = {
+        "tick_seq": 0,
+        "raw_prescore": {
+            "raw_action": {
+                "type": "FOLLOW_MOMENTUM",
+                "params": {"market_key": "1X2_PARTICIPANT_RESULT||", "side": "part1"},
+            }
+        },
+    }
+    wait_row = {"tick_seq": 0, "raw_prescore": {"raw_action": {"type": "WAIT", "params": {}}}}
+    result = SimpleNamespace(score_rows=[fired_row, wait_row])
+
+    rows, decisions = _collect_vvv_venue_behavior(
+        result,  # type: ignore[arg-type]
+        {0: state},
+        venue_price_source=_seconds_frame_source(),
+        close_ts=_QUERY_TS_S,
+        coverage_class="ok",
+    )
+
+    matched = [d for d in decisions if d.quote_matched]
+    assert len(matched) == 2, "both the fired-pick and WAIT-tick lookups must match on the seconds ts"
+    assert {d.fired for d in matched} == {True, False}, "one fired decision and one WAIT decision matched"
+    for d in matched:
+        assert d.staleness_s is not None
+        assert 0 <= d.staleness_s <= 900, f"staleness must be seconds-scale, got {d.staleness_s}"
+        assert d.staleness_s == _EXPECTED_STALENESS_S
+    # The fired pick also yields a behavior row whose staleness is the same seconds-scale value.
+    assert rows and all(0 <= r.staleness_s <= 900 for r in rows)
+
+
+def test_vvv_producer_records_unmatched_decisions_when_source_is_none(tmp_path: Path) -> None:
+    """A source that never has a quote yields all-WAIT, all-unmatched decisions — the honest
+    "could not price under the bound" coverage signal, never a fabricated match (CON-012)."""
+    pack_dir = _real_1x2_full_pack(tmp_path)
+    proto = _proto(fixture_ids=[5], strategy_configs=["value-vs-venue"], baselines=[])
+
+    decision_sink: dict[int, list[VenueDecision]] = {}
+    asyncio.run(
+        produce_results_by_fixture(
+            proto,
+            packs={5: pack_dir},
+            venue_price_source=_never_src(),
+            venue_source_id="src#1",
+            venue_decision_sink=decision_sink,
+        )
+    )
+
+    decisions = decision_sink[5]
+    assert decisions, "decision opportunities are recorded even when nothing could be priced"
+    assert all(not d.quote_matched for d in decisions)
+    assert all(not d.fired for d in decisions), "no quote ⇒ no edge ⇒ every tick WAITs"
