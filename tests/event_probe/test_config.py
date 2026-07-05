@@ -61,6 +61,11 @@ def test_config_defaults_match_spec() -> None:
     # near-certain band (CON-016)
     assert cfg.band_lo == 0.05
     assert cfg.band_hi == 0.95
+    # series selection surface (v2): the FULL-MATCH 1X2 market key and the
+    # in-running phase are SEALED here so series.py reads them from the config,
+    # not from module constants outside config_hash (the v2 seal-coverage fix).
+    assert cfg.market_1x2_key == "1X2_PARTICIPANT_RESULT||"
+    assert cfg.in_running_phase == 1
 
 
 def test_config_hash_stable_and_deterministic() -> None:
@@ -88,6 +93,11 @@ def test_config_hash_is_threshold_sensitive() -> None:
     # favorite cutoff or the late-match boundary after a run diverges the hash.
     assert ProbeConfig(favorite_prob_cutoff=0.55).config_hash() != base
     assert ProbeConfig(late_match_minute=55).config_hash() != base
+    # v2: the series-selection surface is SEALED too -- swapping the 1X2 market key
+    # or the in-running phase (which change WHAT is measured) must diverge the hash,
+    # closing the "sealed-but-not-in-hash module constant" gap.
+    assert ProbeConfig(market_1x2_key="1X2_PARTICIPANT_RESULT|half=1|").config_hash() != base
+    assert ProbeConfig(in_running_phase=0).config_hash() != base
 
 
 def test_config_rejects_unknown_field() -> None:

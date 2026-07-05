@@ -114,6 +114,16 @@ class ProbeConfig(BaseModel):
     # than leaving the sealed band a decorative literal. Pinned v1 values: 0.05 / 0.95.
     band_lo: float = DEFAULT_MARKET_QUALITY_CONFIG.band_lo
     band_hi: float = DEFAULT_MARKET_QUALITY_CONFIG.band_hi
+    # series selection surface (v2): the two constants that decide WHAT the tracked
+    # series measures -- the 1X2 market key and the in-running phase -- are SEALED
+    # here (not module constants in series.py) so a change moves config_hash() and
+    # VOIDs the run. v1 tracked "1X2_PARTICIPANT_RESULT|half=1|" (the FIRST-HALF
+    # market, dead at halftime -> 62% of goals unobservable); v2 tracks the
+    # FULL-MATCH "1X2_PARTICIPANT_RESULT||". build_tracked_series reads BOTH from
+    # this config (CON-016 band_lo/band_hi included), closing the v1 gap where the
+    # selection surface lived outside the hash.
+    market_1x2_key: str = "1X2_PARTICIPANT_RESULT||"
+    in_running_phase: int = 1
 
     def to_window_config(self) -> WindowConfig:
         """Rebuild E3's ``WindowConfig`` from the sealed fields (single source)."""

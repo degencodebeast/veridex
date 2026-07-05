@@ -48,11 +48,13 @@ from veridex.ingest.replay_pack import load_pack_marketstates  # noqa: E402
 
 #: The pinned ProbeConfig identity (``ProbeConfig().config_hash()``), hard-coded so a
 #: post-hoc threshold change diverges the live hash and VOIDs the run (CON-014).
-#: Re-pinned when the two CON-007 slice thresholds (favorite_prob_cutoff /
-#: late_match_minute) were sealed into ProbeConfig.
+#: Re-pinned for v2 when the series-selection surface (market_1x2_key /
+#: in_running_phase) was sealed into ProbeConfig -- the full-match ``||`` 1X2 market
+#: replaces the first-half ``|half=1|`` one. (v1 hash was
+#: 10d6986f7fe57d90f5256dd998ae3fc3598b15853a73f6dec37b32762048e259.)
 #: Recompute: ``.venv/bin/python -c "from veridex.backtest.event_probe.config import
 #: ProbeConfig; print(ProbeConfig().config_hash())"``.
-EXPECTED_CONFIG_HASH = "10d6986f7fe57d90f5256dd998ae3fc3598b15853a73f6dec37b32762048e259"
+EXPECTED_CONFIG_HASH = "2be65639490535092934713de1aefba237982c45141a3b5d8effd4f8115d2e76"
 
 #: The predeclared fixture universe -- the 18 headline-eligible World Cup ReplayPacks
 #: (the ``run002_vvv`` roster), each with a ``pack.json`` + ``scores_<fid>.json``
