@@ -53,6 +53,14 @@ def _canonical_dump(payload: Any) -> str:
 #: cannot be relabelled under a different protocol without a new stamp (CON-014).
 PROTOCOL_ID = "event-fork-probe-v1"
 
+#: The CON-008 observability-floor FAILURE reasons: an event carrying one of these
+#: never resolved its windows / had too few states, so it did NOT pass the floor.
+#: below_epsilon is NOT here -- a below-epsilon event IS floor-eligible (it resolved
+#: its windows; its settled move was merely too small to classify directionally).
+_FLOOR_FAIL_REASONS: frozenset[str] = frozenset(
+    {"no_pre_tick", "no_imm_tick_60s", "no_settle_tick", "insufficient_odds_states"}
+)
+
 #: The §4 CON-014 defaults note carried on every sealed artifact -- states plainly
 #: that the pinned thresholds are v1 predeclared, NOT optimized, and that post-hoc
 #: tuning is a protocol violation.
@@ -224,13 +232,21 @@ def build_sealed_result(
     raw_delta_imm = [rec.delta_imm for rec in eligible if rec.delta_imm is not None]
     raw_delta_settle = [rec.delta_settle for rec in eligible if rec.delta_settle is not None]
 
+    # eligible_events = events that PASSED the CON-008 observability floor =
+    # total_goal_events - (the four floor-FAIL reasons). This is a SUPERSET of the
+    # directional set (result.global_n): a below_epsilon event passed the floor but
+    # carries no R, so it counts here yet not in the directional CI.
+    eligible_events = sum(
+        1 for rec in records if rec.exclusion_reason not in _FLOOR_FAIL_REASONS
+    )
+
     return {
         "protocol_id": PROTOCOL_ID,
         "config": cfg.model_dump(),
         "config_hash": cfg.config_hash(),
         "fixtures": list(fixtures),
         "total_goal_events": total_goal_events,
-        "eligible_events": result.global_n,
+        "eligible_events": eligible_events,
         # §4 nests the directional stats, raw-delta medians, and verdict INSIDE the
         # `global` block; a single top-level `verdict` mirrors it (no redundant
         # top-level `overall_verdict`, which §4 does not carry).

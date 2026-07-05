@@ -283,7 +283,11 @@ def test_sealed_result_has_section4_toplevel_fields() -> None:
 
     assert sealed["fixtures"] == [111, 222]
     assert sealed["total_goal_events"] == 7
-    assert sealed["eligible_events"] == 1  # directional-set size == result.global_n
+    # Both records passed the CON-008 floor (the LAG is directional; the
+    # below_epsilon one is floor-eligible but not directional), so eligible_events
+    # counts 2 -- a superset of the directional global_n (1).
+    assert sealed["eligible_events"] == 2
+    assert sealed["global"]["n"] == 1
     # §4: a single top-level verdict; the nested global.verdict mirrors it; NO
     # redundant top-level overall_verdict.
     assert sealed["verdict"] == "FADE"
@@ -326,3 +330,33 @@ def test_sealed_result_raw_delta_medians_none_when_no_eligible() -> None:
     assert sealed["eligible_events"] == 0
     assert sealed["global"]["raw_delta_imm_median"] is None
     assert sealed["global"]["raw_delta_settle_median"] is None
+
+
+def test_eligible_events_counts_floor_passers_not_directional_set() -> None:
+    # eligible_events = events that PASSED the CON-008 observability floor, which is
+    # a SUPERSET of the directional (R-bearing) set: a below_epsilon event resolved
+    # its windows (floor-eligible) but carries no R, so it counts toward
+    # eligible_events yet NOT toward the directional global_n. Only the four
+    # floor-FAIL reasons subtract from eligible_events.
+    cfg = ProbeConfig()
+    records = [
+        # Floor-eligible but below epsilon -> not directional (R=None).
+        _event_record(event_class="NO-SIGNAL", exclusion_reason="below_epsilon", R=None),
+        # Floor FAILURE -> not eligible.
+        _event_record(event_class="NO-SIGNAL", exclusion_reason="no_pre_tick", R=None),
+    ]
+    result = ProbeResult(
+        overall_verdict="INCONCLUSIVE",
+        global_n=0,  # directional set is empty
+        global_median_R=None,
+        global_ci_low=None,
+        global_ci_high=None,
+        per_slice=[],
+        class_counts={"NO-SIGNAL": 2},
+        excluded_by_reason={"below_epsilon": 1, "no_pre_tick": 1},
+    )
+    sealed = build_sealed_result(cfg, result, records, fixtures=[1], total_goal_events=2)
+    # The below_epsilon event is floor-eligible; the no_pre_tick event is not.
+    assert sealed["eligible_events"] == 1
+    # ...and that is strictly greater than the empty directional set.
+    assert sealed["eligible_events"] > sealed["global"]["n"]
