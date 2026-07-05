@@ -250,6 +250,74 @@ def test_sorted_by_seq_fallback_ts():
     assert [e.t_e for e in result.events] == [1782500820, 1782500830]
 
 
+def test_carried_before_scores_exposed_go_ahead_and_equalizer():
+    """E1b-t1: each goal carries the scorer team's PRE-goal score (both sides).
+
+    ``scorer_goals_before`` / ``conceded_goals_before`` are the carried counts
+    *just before* the goal, the raw material CON-007's score_context slice needs.
+    A first goal at 0-0 is a GO-AHEAD (scorer==conceded before); the reply making
+    it 1-1 is an EQUALIZER (scorer == conceded - 1 before).
+    """
+    records = [
+        {"Seq": 1, "Ts": 1782500800000, "Action": "kickoff", "Participant1IsHome": True,
+         "Score": {"Participant1": {"Total": {"Goals": 0}},
+                   "Participant2": {"Total": {"Goals": 0}}}},
+        # P1 scores first: state before is 0-0 -> go-ahead for P1.
+        {"Seq": 2, "Ts": 1782500860000, "Action": "goal", "Participant1IsHome": True,
+         "Score": {"Participant1": {"Total": {"Goals": 1}}}},
+        # P2 replies: state before is P2=0, P1=1 -> P2 is down one -> equalizer.
+        {"Seq": 3, "Ts": 1782500920000, "Action": "goal", "Participant1IsHome": True,
+         "Score": {"Participant2": {"Total": {"Goals": 1}}}},
+    ]
+    result = extract_goal_events(records)
+    assert len(result.events) == 2
+
+    go_ahead, equalizer = result.events
+    assert (go_ahead.participant, go_ahead.scorer_goals_before,
+            go_ahead.conceded_goals_before) == (1, 0, 0)
+    assert (equalizer.participant, equalizer.scorer_goals_before,
+            equalizer.conceded_goals_before) == (2, 0, 1)
+
+
+def test_leader_extends_carries_ahead_before_score():
+    """E1b-t2: a leader extending carries scorer > conceded before the goal."""
+    records = [
+        {"Seq": 1, "Ts": 1782500800000, "Action": "goal", "Participant1IsHome": True,
+         "Score": {"Participant1": {"Total": {"Goals": 1}}}},
+        # P1 scores again from 1-0: before is P1=1, P2=0 -> leader_extends.
+        {"Seq": 2, "Ts": 1782500860000, "Action": "goal", "Participant1IsHome": True,
+         "Score": {"Participant1": {"Total": {"Goals": 2}}}},
+    ]
+    result = extract_goal_events(records)
+    second = result.events[1]
+    assert (second.scorer_goals_before, second.conceded_goals_before) == (1, 0)
+
+
+def test_match_minute_from_clock_seconds():
+    """E1b-t3: match_minute is the goal record's Clock.Seconds floored to minutes.
+
+    ``Clock.Seconds`` is the continuous match-elapsed clock (verified in the real
+    fixture); a goal at 370s is minute 6. A record with no ``Clock`` yields
+    ``match_minute is None`` (named `unknown` downstream, never fabricated).
+    """
+    with_clock = [
+        {"Seq": 1, "Ts": 1782500800000, "Action": "kickoff", "Participant1IsHome": True,
+         "Score": {"Participant2": {"Total": {"Goals": 0}}}},
+        {"Seq": 2, "Ts": 1782500866000, "Action": "goal", "Participant1IsHome": True,
+         "Clock": {"Running": True, "Seconds": 370},
+         "Score": {"Participant2": {"Total": {"Goals": 1}}}},
+    ]
+    (event,) = extract_goal_events(with_clock).events
+    assert event.match_minute == 6
+
+    no_clock = [
+        {"Seq": 1, "Ts": 1782500800000, "Action": "goal", "Participant1IsHome": True,
+         "Score": {"Participant2": {"Total": {"Goals": 1}}}},
+    ]
+    (event,) = extract_goal_events(no_clock).events
+    assert event.match_minute is None
+
+
 @pytest.mark.skipif(not _REAL_FIXTURE.exists(), reason="real score fixture not present")
 def test_real_fixture_extracts_expected_goals():
     """E1-real: the recorded WC fixture 17588234 finishes 1-4 (5 goals).

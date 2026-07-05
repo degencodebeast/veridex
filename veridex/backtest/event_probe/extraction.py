@@ -26,11 +26,25 @@ class GoalEvent:
     ``t_e`` is the event time in seconds (13-digit ms ``Ts`` floor-divided by
     1000), ``scoring_side`` is the home/away label, and ``participant`` is the
     1-based participant index that scored.
+
+    The remaining fields are the raw material the CON-007 slice tagger consumes:
+
+    * ``scorer_goals_before`` / ``conceded_goals_before`` -- the carried
+      ``Total.Goals`` of the scoring side and its opponent *just before* this goal
+      (the pre-goal score), from which score_context (equalizer / go_ahead /
+      leader_extends / deficit_reduced) is derived downstream.
+    * ``match_minute`` -- the goal record's ``Clock.Seconds // 60`` (the continuous
+      match-elapsed clock verified in the real fixtures), or ``None`` when the
+      record carries no readable clock -- never fabricated, tagged `unknown`
+      downstream. Defaults keep the dataclass additive for direct constructions.
     """
 
     t_e: int
     scoring_side: str
     participant: int
+    scorer_goals_before: int = 0
+    conceded_goals_before: int = 0
+    match_minute: int | None = None
 
 
 @dataclass(frozen=True)
@@ -50,6 +64,24 @@ def _sort_key(record: dict) -> tuple[int, int]:
     if seq is not None:
         return (0, seq)
     return (1, record.get("Ts", 0))
+
+
+def _match_minute(record: dict) -> int | None:
+    """Return the record's match minute from ``Clock.Seconds``, else ``None``.
+
+    ``Clock`` is ``{"Running": bool, "Seconds": int}`` -- a continuous
+    match-elapsed clock (first half 0..~2989s incl. stoppage, then 2700..~5700s in
+    the second half; it never resets), so ``Seconds // 60`` is the match minute.
+    Absent / malformed clock -> ``None`` (the goal's timing is `unknown`, never
+    invented).
+    """
+    clock = record.get("Clock")
+    if not isinstance(clock, dict):
+        return None
+    seconds = clock.get("Seconds")
+    if not isinstance(seconds, int) or isinstance(seconds, bool):
+        return None
+    return seconds // 60
 
 
 def _scoring_side(participant: int, participant1_is_home: bool) -> str:
@@ -124,11 +156,17 @@ def extract_goal_events(records: list[dict]) -> ExtractionResult:
         if increments:
             (participant, new_value), = increments.items()
             side = _scoring_side(participant, bool(record.get("Participant1IsHome")))
+            opponent = 2 if participant == 1 else 1
             events.append(
                 GoalEvent(
                     t_e=record["Ts"] // 1000,
                     scoring_side=side,
                     participant=participant,
+                    # Carried counts are still the PRE-goal state here (this
+                    # participant's carry is updated only after appending).
+                    scorer_goals_before=carried[participant],
+                    conceded_goals_before=carried[opponent],
+                    match_minute=_match_minute(record),
                 )
             )
             carried[participant] = new_value
