@@ -118,3 +118,48 @@ def test_series_participant_token_mapping() -> None:
 
     assert [t.prob for t in p1] == [0.6]
     assert [t.prob for t in p2] == [0.25]
+
+
+def test_series_skips_state_missing_1x2_key() -> None:
+    """E2-t6: an in-running state with NO 1X2 key yields [] (no crash).
+
+    This is the dominant real-data branch -- ~31,737 states in pack 17588234
+    carry no ``1X2_PARTICIPANT_RESULT|half=1|`` market -- so the missing-key path
+    must be skipped, never raise a KeyError.
+    """
+    state = MarketState(
+        fixture_id=17588234,
+        tick_seq=0,
+        ts=1000,
+        phase=_IN_RUNNING,
+        markets={
+            "OVERUNDER_PARTICIPANT_GOALS|half=1|line=2.5": {
+                "stable_prob_bps": {"over": 5000, "under": 5000},
+                "stable_price": {},
+                "suspended": False,
+            }
+        },
+        scores={},
+    )
+
+    assert build_tracked_series([state], 1) == []
+
+
+def test_series_band_boundary_strict() -> None:
+    """E2-t7: the near-certain band is STRICT -- exactly band_lo/band_hi are KEPT.
+
+    prob == 0.05 (500 bps) and prob == 0.95 (9500 bps) sit on the band edge and
+    are kept; 0.0499 (499 bps) and 0.9501 (9501 bps) fall just outside and are
+    excluded. Pins the ``<``/``>`` semantics that t4's 0.02/0.98 does not nail.
+    """
+    states = [
+        _state(phase=_IN_RUNNING, ts=100, part1_bps=500),   # exactly band_lo -> kept
+        _state(phase=_IN_RUNNING, ts=200, part1_bps=9500),  # exactly band_hi -> kept
+        _state(phase=_IN_RUNNING, ts=300, part1_bps=499),   # just below band_lo -> excluded
+        _state(phase=_IN_RUNNING, ts=400, part1_bps=9501),  # just above band_hi -> excluded
+    ]
+
+    series = build_tracked_series(states, participant=1)
+
+    assert [t.ts for t in series] == [100, 200]
+    assert [t.prob for t in series] == [0.05, 0.95]
