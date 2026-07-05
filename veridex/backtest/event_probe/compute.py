@@ -37,10 +37,6 @@ from dataclasses import dataclass, field
 from veridex.backtest.event_probe.extraction import GoalEvent
 from veridex.backtest.event_probe.series import TrackedTick
 
-# Per-event observability floor (CON-008): minimum valid odds states across the
-# pre-to-primary window for an event to be eligible.
-_MIN_ODDS_STATES: int = 3
-
 
 @dataclass(frozen=True)
 class WindowConfig:
@@ -60,6 +56,9 @@ class WindowConfig:
     settle_tol_s: int = 30
     epsilon: float = 0.05
     robustness_horizons_s: tuple[int, ...] = (30, 60, 600)
+    #: Per-event observability floor (CON-008): minimum valid odds states across
+    #: ``[t_e - pre_window_s, t_e + primary_horizon_s]`` for an event to be eligible.
+    min_odds_states: int = 3
 
 
 @dataclass(frozen=True)
@@ -203,7 +202,7 @@ def compute_event_record(
     lo = t_e - cfg.pre_window_s
     hi = t_e + cfg.primary_horizon_s
     n_states = sum(1 for tick in series if lo <= tick.ts <= hi)
-    if n_states < _MIN_ODDS_STATES:
+    if n_states < cfg.min_odds_states:
         return _record(
             delta_imm=None, delta_settle=None, R=None,
             event_class="NO-SIGNAL", exclusion_reason="insufficient_odds_states",

@@ -29,6 +29,7 @@ from veridex.backtest.event_probe.config import (
     build_sealed_result,
     verify_pinned,
 )
+from veridex.strategies.market_quality import DEFAULT_MARKET_QUALITY_CONFIG
 
 
 def test_config_defaults_match_spec() -> None:
@@ -42,6 +43,7 @@ def test_config_defaults_match_spec() -> None:
     assert cfg.settle_tol_s == 30
     assert cfg.robustness_horizons_s == (30, 60, 600)
     assert cfg.epsilon == 0.05
+    assert cfg.min_odds_states == 3  # CON-008 per-event observability floor
     # aggregation (CON-009/010)
     assert cfg.n_min_global == 30
     assert cfg.n_min_slice == 15
@@ -72,6 +74,21 @@ def test_config_hash_is_threshold_sensitive() -> None:
     assert ProbeConfig(n_min_global=31).config_hash() != base
     assert ProbeConfig(band_hi=0.94).config_hash() != base
     assert ProbeConfig(robustness_horizons_s=(30, 60, 601)).config_hash() != base
+    # CON-008: the min-odds-states floor is SEALED -- a post-hoc 3->2 change VOIDs.
+    assert ProbeConfig(min_odds_states=2).config_hash() != base
+
+
+def test_band_seal_matches_consumed_source() -> None:
+    # CON-016: the SEALED band must equal the band E2 (``series.py``) actually
+    # consumes (``DEFAULT_MARKET_QUALITY_CONFIG``). Deriving the seal from the same
+    # source means a market-quality band change moves ``config_hash()`` -> VOIDs,
+    # instead of the sealed band being a decorative literal that never tracks it.
+    cfg = ProbeConfig()
+    assert cfg.band_lo == DEFAULT_MARKET_QUALITY_CONFIG.band_lo
+    assert cfg.band_hi == DEFAULT_MARKET_QUALITY_CONFIG.band_hi
+    # The pinned v1 values remain 0.05 / 0.95.
+    assert cfg.band_lo == 0.05
+    assert cfg.band_hi == 0.95
 
 
 def test_to_window_and_agg_config_match_sealed() -> None:

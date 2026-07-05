@@ -31,6 +31,7 @@ from pydantic import BaseModel, ConfigDict
 from veridex.backtest.event_probe.aggregate import AggConfig, ProbeResult
 from veridex.backtest.event_probe.compute import EventRecord, WindowConfig
 from veridex.runtime.evidence import serialize_payload
+from veridex.strategies.market_quality import DEFAULT_MARKET_QUALITY_CONFIG
 
 #: Sealed protocol identity (spec §4). Bound alongside the config hash so a result
 #: cannot be relabelled under a different protocol without a new stamp (CON-014).
@@ -62,15 +63,18 @@ class ProbeConfig(BaseModel):
     settle_tol_s: int = 30
     robustness_horizons_s: tuple[int, ...] = (30, 60, 600)
     epsilon: float = 0.05
+    min_odds_states: int = 3  # CON-008 per-event observability floor (sealed)
     # aggregation (CON-009/010)
     n_min_global: int = 30
     n_min_slice: int = 15
     bootstrap_n: int = 10000
     ci_level: float = 0.90
     seed: int = 20260705
-    # near-certain band (CON-016)
-    band_lo: float = 0.05
-    band_hi: float = 0.95
+    # near-certain band (CON-016): DERIVED from the band E2 (``series.py``) actually
+    # consumes, so a market-quality band change moves ``config_hash()`` (VOIDs) rather
+    # than leaving the sealed band a decorative literal. Pinned v1 values: 0.05 / 0.95.
+    band_lo: float = DEFAULT_MARKET_QUALITY_CONFIG.band_lo
+    band_hi: float = DEFAULT_MARKET_QUALITY_CONFIG.band_hi
 
     def to_window_config(self) -> WindowConfig:
         """Rebuild E3's ``WindowConfig`` from the sealed fields (single source)."""
@@ -81,6 +85,7 @@ class ProbeConfig(BaseModel):
             settle_tol_s=self.settle_tol_s,
             epsilon=self.epsilon,
             robustness_horizons_s=self.robustness_horizons_s,
+            min_odds_states=self.min_odds_states,
         )
 
     def to_agg_config(self) -> AggConfig:
