@@ -56,13 +56,27 @@ from veridex.ingest.replay_pack import load_pack_marketstates  # noqa: E402
 #: ProbeConfig; print(ProbeConfig().config_hash())"``.
 EXPECTED_CONFIG_HASH = "2be65639490535092934713de1aefba237982c45141a3b5d8effd4f8115d2e76"
 
-#: The predeclared fixture universe -- the 18 headline-eligible World Cup ReplayPacks
-#: (the ``run002_vvv`` roster), each with a ``pack.json`` + ``scores_<fid>.json``
-#: sibling under ``scripts/txline_live/packs/`` (verified present at commit time).
+#: The predeclared fixture universe (v2 objective re-stamp). ALL finished competition-72
+#: (FIFA WC 2026) fixtures discoverable via the TxLINE backfill path as of
+#: 2026-07-06T00:50:44Z with both odds+scores legs (verify=True) and the full-match
+#: ``1X2_PARTICIPANT_RESULT||`` key present: **67 included, data-exhausted** (bounded by
+#: the TxLINE scores-feed retention horizon, NOT by discretion). 26 fixtures excluded with
+#: named reasons + 6 not-yet-finished; the full frozen manifest (IDs, pack content-hashes,
+#: named exclusions, discovery query) is at
+#: ``.omc/research/event-fork-probe-universe-manifest.md`` (Codex-blessed). Allowed
+#: conclusions: FOLLOW / FADE / SPLIT-BY-SLICE / INCONCLUSIVE-no-build. Frozen BEFORE any
+#: full-67 verdict was computed (out-of-sample for the 49 packs added post-original-18).
+#: Supersedes the original 18-fixture run002_vvv roster.
 PINNED_FIXTURES: tuple[int, ...] = (
-    18179763, 18179551, 18176123, 17588229, 17588234, 17926593, 17588245, 17588391,
-    17588404, 17588325, 18167317, 18172469, 18175983, 18172280, 18175981, 18179550,
-    18179759, 18175918,
+    17588223, 17588229, 17588231, 17588232, 17588234, 17588235, 17588236, 17588238,
+    17588240, 17588242, 17588244, 17588245, 17588302, 17588303, 17588309, 17588310,
+    17588313, 17588314, 17588317, 17588319, 17588320, 17588321, 17588323, 17588324,
+    17588325, 17588326, 17588388, 17588389, 17588390, 17588391, 17588395, 17588397,
+    17588398, 17588401, 17588402, 17588404, 17926593, 17926603, 17926615, 17926647,
+    17926686, 17926687, 17926688, 17926704, 17926740, 17926764, 17926765, 17926766,
+    18167317, 18172280, 18172379, 18172469, 18175397, 18175918, 18175981, 18175983,
+    18176123, 18179549, 18179550, 18179551, 18179552, 18179759, 18179763, 18179764,
+    18185036, 18187298, 18188721,
 )
 
 #: The ReplayPack universe root (each fixture is a ``packs/<fid>/`` directory).
