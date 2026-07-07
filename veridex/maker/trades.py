@@ -94,9 +94,19 @@ def load_trade_prints(path: str | Path) -> list[TradePrint]:
     Returns:
         The parsed trade prints in file order.
 
+    Malformed lines propagate their natural parse/validation errors (this loader
+    does not catch or wrap them): a non-JSON line raises
+    :class:`json.JSONDecodeError`, a row missing ``price`` raises ``KeyError`` (the
+    explicit ``row["price"]`` bounds-check), and a row missing any other required
+    field raises pydantic ``ValidationError`` at :class:`TradePrint` construction.
+
     Raises:
         MarkoutError: If any row's ``price`` is outside ``[0, 1]``.
         FileNotFoundError: If ``path`` does not exist.
+        json.JSONDecodeError: If any non-blank line is not valid JSON.
+        KeyError: If any row is missing the ``price`` key.
+        ValidationError: If any row is missing another required field (or has a
+            field of the wrong type).
     """
     trades: list[TradePrint] = []
     with Path(path).open() as f:

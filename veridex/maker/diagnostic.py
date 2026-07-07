@@ -13,10 +13,11 @@ so it can never masquerade as a fill-based cost.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from statistics import mean
-from typing import TYPE_CHECKING, Callable
+from typing import TYPE_CHECKING
 
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 
 from veridex.maker.trades import AggressorSide
 
@@ -42,14 +43,20 @@ class AdverseSelectionReport(BaseModel):
 
     All fields default so ``AdverseSelectionReport()`` constructs cleanly.
     Trade-derived metrics are ``_diagnostic``-suffixed; ``real_executable_edge_bps``
-    is typed literally ``None`` and can NEVER hold a value at R1.5.
+    is typed literally ``None`` and can NEVER hold a value at R1.5. The model is
+    ``frozen`` (post-construction mutation raises ``ValidationError``) and forbids
+    extra fields (a smuggled fill kwarg is rejected loudly), matching
+    :class:`~veridex.maker.trades.TradePrint`.
     """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
 
     trade_flow_preceding_fv_move_bps_diagnostic: int | None = None
     toxic_vs_benign_flow_ratio_diagnostic: float | None = None
     trades_near_quote_count: int = 0
-    # Typed literally ``None`` (NOT ``int | None``): structurally impossible to
-    # set to a value, enforcing AC-018's no-executable-edge boundary at R1.5.
+    # Typed literally ``None`` (NOT ``int | None``) AND frozen: structurally
+    # impossible to set to a value, enforcing AC-018's no-executable-edge
+    # boundary at R1.5.
     real_executable_edge_bps: None = None
 
 
@@ -99,11 +106,14 @@ def compute_trade_aware_diagnostic(
     flow_bps: int | None = round(mean(contributions)) if contributions else None
 
     ratio: float | None
-    if near_trades:
+    if contributions:
         toxic = sum(1 for c in contributions if c > 0)
         benign = sum(1 for c in contributions if c <= 0)
         ratio = toxic / max(1, benign)
     else:
+        # Abstain in lockstep with the flow diagnostic: when there are near
+        # trades but NONE have a resolvable fv-after, the ratio is ``None``
+        # (unknown) rather than ``0.0`` (falsely "all benign").
         ratio = None
 
     return AdverseSelectionReport(
