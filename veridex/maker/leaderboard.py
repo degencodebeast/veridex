@@ -16,7 +16,7 @@ __all__ = [
     "window_clv_analog",
 ]
 
-_R2_BRACKET_KEYS = frozenset({"bracket", "sensitivity", "r2"})
+_R2_BRACKET_KEYS = frozenset({"bracket", "sensitivity", "r2", "r2_bracket"})
 
 
 def assert_bracket_not_ranked(agent_metrics: list[dict[str, Any]]) -> None:
@@ -30,7 +30,8 @@ def assert_bracket_not_ranked(agent_metrics: list[dict[str, Any]]) -> None:
         agent_metrics: One metric-stack dict per maker agent, as passed to ``rank_makers``.
 
     Raises:
-        AssertionError: If any row contains a key in ``{"bracket", "sensitivity", "r2"}``.
+        AssertionError: If any row contains a key in
+            ``{"bracket", "sensitivity", "r2", "r2_bracket"}``.
     """
     for row in agent_metrics:
         offending = _R2_BRACKET_KEYS & row.keys()
