@@ -14,6 +14,7 @@ from __future__ import annotations
 from typing import Any
 
 from veridex.maker.contracts import Side, TargetQuote, TargetQuoteSet
+from veridex.maker.state_machine import GateContext, MakerState, classify_state
 
 _MARKET_KEY = "1X2|home|full"
 
@@ -89,24 +90,67 @@ class TxLineFairMarketMakerAgent:
         clock: int,
     ) -> TargetQuoteSet:
         fv = reference_fv.get("fv")
-        if fv is None or reference_fv.get("suspended"):
+        if fv is None:
             return TargetQuoteSet(
                 fixture_id=0, tick_seq=0, ts=clock, quotes=[], regime="NO_QUOTE"
             )
 
+        # Build the gate context from the injected snapshot. Reference-feed
+        # signals come from `reference_fv`; policy thresholds from `params`;
+        # inventory from `inventory.get("net", ...)` (never subscript, so the
+        # existing `inventory={}` cases still classify as MAKER_SAFE).
+        inventory_net = inventory.get("net", 0.0)
+        ctx = GateContext(
+            suspended=reference_fv.get("suspended", False),
+            staleness_s=reference_fv.get("staleness_s", 0),
+            freshness_s=params.get("freshness_s", 120),
+            event_cooldown_active=reference_fv.get("event_cooldown_active", False),
+            fair_vol_bps=reference_fv.get("fair_vol_bps", 0),
+            fair_vol_widen_bps=params.get("fair_vol_widen_bps", 300),
+            inventory=inventory_net,
+            inventory_extreme=params.get("inventory_extreme", 0.5),
+        )
+        state = classify_state(ctx)
+
+        # A gate (NO_QUOTE / ONE_SIDED_REDUCE) always wins over A-S shaping:
+        # `as_shaping` is applied ONLY inside MAKER_SAFE / WIDEN and can NEVER
+        # manufacture quotes when the state is a gate (CON-009 / AC-008).
+        if state is MakerState.NO_QUOTE:
+            return TargetQuoteSet(
+                fixture_id=0, tick_seq=0, ts=clock, quotes=[], regime=MakerState.NO_QUOTE.value
+            )
+
+        widen_multiplier = params.get("widen_multiplier", 1.0)
+        if state is MakerState.WIDEN:
+            half_spread = self.base_half_spread * widen_multiplier
+        else:
+            half_spread = self.base_half_spread
+
         bid = TargetQuote(
             side=Side.BID,
             market_key=_MARKET_KEY,
-            price=round(fv - self.base_half_spread, 4),
+            price=round(fv - half_spread, 4),
             size=1.0,
         )
         ask = TargetQuote(
             side=Side.ASK,
             market_key=_MARKET_KEY,
-            price=round(fv + self.base_half_spread, 4),
+            price=round(fv + half_spread, 4),
             size=1.0,
         )
-        return TargetQuoteSet(fixture_id=0, tick_seq=0, ts=clock, quotes=[bid, ask])
+
+        if state is MakerState.ONE_SIDED_REDUCE:
+            # Quote only the inventory-reducing side: long (net > 0) reduces by
+            # asking; short (net < 0) reduces by bidding.
+            quotes = [ask] if inventory_net > 0 else [bid]
+        else:
+            # MAKER_SAFE / WIDEN: two-sided. A-S shaping (if present) may adjust
+            # these quotes here, but never bypasses a gate.
+            quotes = [bid, ask]
+
+        return TargetQuoteSet(
+            fixture_id=0, tick_seq=0, ts=clock, quotes=quotes, regime=state.value
+        )
 
     def params_hash_inputs(self) -> str:
         return f"txline_fair:hs={self.base_half_spread}"
