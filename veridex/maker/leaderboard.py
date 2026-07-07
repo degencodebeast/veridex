@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from typing import Any
 
-__all__ = ["maker_rank_key", "rank_makers"]
+__all__ = ["maker_rank_key", "rank_makers", "window_clv_analog"]
 
 
 def maker_rank_key(metrics: dict[str, Any]) -> tuple[Any, ...]:
@@ -33,6 +33,29 @@ def maker_rank_key(metrics: dict[str, Any]) -> tuple[Any, ...]:
         -metrics.get("quote_count", 0),  # more quotes first
         metrics.get("agent_id", ""),  # deterministic final tiebreak
     )
+
+
+def window_clv_analog(avg_markout_bps: int | None, scored: int) -> dict[str, Any]:
+    """Build the maker's window-CLV analog: a report-only labeled aggregate.
+
+    Mirrors the shape of the directional ``avg_window_clv_bps`` supporting aggregate so the
+    maker proof card can connect to the same evidence grammar, but this is explicitly labeled
+    as NOT a rank axis. It must never be blended into ``maker_rank_key``/``rank_makers``.
+
+    Args:
+        avg_markout_bps: The maker's average markout vs future TxLINE FV, in bps (``None`` if
+            unscored).
+        scored: Count of scored actions contributing to the aggregate.
+
+    Returns:
+        A labeled aggregate dict: ``window_markout_bps``, ``window_action_count``, and a
+        ``note`` explaining it is not a CLV rank axis.
+    """
+    return {
+        "window_markout_bps": avg_markout_bps,
+        "window_action_count": scored,
+        "note": "maker markout vs future TxLINE FV; labeled aggregate, NOT a CLV rank axis",
+    }
 
 
 def rank_makers(agent_metrics: list[dict[str, Any]]) -> list[dict[str, Any]]:
