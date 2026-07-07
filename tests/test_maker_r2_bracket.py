@@ -15,6 +15,15 @@ def test_queue_modeled_true_is_rejected():
         FillAssumptionConfig(fill_model_id="m1", latency_ms=1, cross_rule="mid",
                              partial_fill_policy="none", queue_modeled=True)
 
+def test_bracket_single_markout_collapses_to_same_value():
+    b = render_sensitivity_bracket([42], _cfg())
+    assert b["bracket"]["pessimistic"] == 42 and b["bracket"]["neutral"] == 42 and b["bracket"]["optimistic"] == 42
+
+def test_bracket_empty_markouts_rejected():
+    import pytest
+    with pytest.raises(ValueError):
+        render_sensitivity_bracket([], _cfg())
+
 def test_fill_assumption_change_moves_config_hash():
     a = _cfg().config_hash()
     b = FillAssumptionConfig(fill_model_id="m2", latency_ms=250, cross_rule="mid",

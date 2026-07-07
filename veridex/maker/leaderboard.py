@@ -34,9 +34,10 @@ def assert_bracket_not_ranked(agent_metrics: list[dict[str, Any]]) -> None:
     """
     for row in agent_metrics:
         offending = _R2_BRACKET_KEYS & row.keys()
-        assert not offending, (
-            f"R2 bracket key(s) {sorted(offending)} must never enter the maker rank input"
-        )
+        if offending:
+            raise AssertionError(
+                f"R2 bracket key(s) {sorted(offending)} must never enter the maker rank input"
+            )
 
 
 def maker_rank_key(metrics: dict[str, Any]) -> tuple[Any, ...]:

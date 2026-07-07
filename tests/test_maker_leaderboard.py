@@ -14,6 +14,9 @@ def test_none_markout_sorts_last():
         {"agent_id": "b", "avg_markout_bps": 10, "abstained": 0, "quote_count": 5}])
     assert ranked[0]["agent_id"] == "b"
 
+def test_rank_makers_empty_list_returns_empty():
+    assert rank_makers([]) == []
+
 def test_maker_rank_key_has_no_clv_and_module_never_imports_directional_scorer():
     # scope the "no CLV" check to the RANK KEY (a later task adds a window_clv_analog labeled aggregate
     # to this same module, which legitimately contains "clv"); the module must never touch the

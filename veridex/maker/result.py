@@ -14,6 +14,8 @@ the directional entrypoint by name, so a substring grep for it returns nothing.
 
 from __future__ import annotations
 
+from typing import Any
+
 from pydantic import BaseModel
 
 from veridex.maker.contracts import MakerRungLabel
@@ -34,14 +36,14 @@ class MakerArenaResult(BaseModel):
     config_hash: str
     rung: MakerRungLabel
     fixtures: tuple[int, ...]
-    per_agent: list[dict]
-    maker_leaderboard: list[dict]
-    falsification: dict
+    per_agent: list[dict[str, Any]]
+    maker_leaderboard: list[dict[str, Any]]
+    falsification: dict[str, Any]
 
-    trade_aware_diagnostic: dict | None = None
-    markout_adverse_decomposition: dict | None = None
-    event_gate_timeline: dict | None = None
-    window_clv_analog: dict | None = None
+    trade_aware_diagnostic: dict[str, Any] | None = None
+    markout_adverse_decomposition: dict[str, Any] | None = None
+    event_gate_timeline: dict[str, Any] | None = None
+    window_clv_analog: dict[str, Any] | None = None
 
     real_executable_edge_bps: None = None
 
@@ -49,12 +51,15 @@ class MakerArenaResult(BaseModel):
     small_n_flag: bool = True
     excluded_by_reason: dict[str, int]
 
-    r2_bracket: dict | None = None
+    r2_bracket: dict[str, Any] | None = None
 
 
-def assert_score_run_untouched(before: list[dict], after: list[dict]) -> None:
+def assert_score_run_untouched(
+    before: list[dict[str, Any]], after: list[dict[str, Any]]
+) -> None:
     """Prove a maker run left a prior directional scoring result byte-identical (SEC-005/AC-011)."""
-    assert before == after, "maker lane must not mutate the directional leaderboard result"
+    if before != after:
+        raise AssertionError("maker lane must not mutate the directional leaderboard result")
 
 
 class MakerProofCard(BaseModel):
@@ -69,8 +74,8 @@ class MakerProofCard(BaseModel):
     rung: str
     uncalibrated: bool = False
     headline: str
-    window_clv_analog: dict | None
-    falsification: dict
+    window_clv_analog: dict[str, Any] | None
+    falsification: dict[str, Any]
     n_fixtures: int
     small_n_note: str
     trades_not_fills_caveat: str | None
@@ -102,7 +107,7 @@ def render_proof_card(result: MakerArenaResult) -> MakerProofCard:
 
 __all__ = [
     "MakerArenaResult",
-    "assert_score_run_untouched",
     "MakerProofCard",
+    "assert_score_run_untouched",
     "render_proof_card",
 ]
