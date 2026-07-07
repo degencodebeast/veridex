@@ -18,10 +18,6 @@ from pydantic import BaseModel
 
 from veridex.maker.contracts import MakerRungLabel
 
-# Public name of the non-mutation guard, assembled so the directional token
-# never appears as a contiguous substring in this module's source (SEC-005).
-_GUARD_NAME = "assert_" + "score" + "_run" + "_untouched"
-
 
 class MakerArenaResult(BaseModel):
     """Top-level result of a market-maker arena run.
@@ -54,30 +50,9 @@ class MakerArenaResult(BaseModel):
     excluded_by_reason: dict[str, int]
 
 
-def _assert_prior_directional_result_untouched(
-    before: list[dict], after: list[dict]
-) -> None:
-    """Assert a maker run left a prior directional result byte-identical.
-
-    Exported under the public name assembled in ``_GUARD_NAME``.
-
-    Args:
-        before: The directional leaderboard rows captured *before* the maker run.
-        after: The same rows captured *after* the maker run.
-
-    Raises:
-        AssertionError: If ``before != after``, indicating the maker lane
-            mutated the directional result (a SEC-005 / AC-011 violation).
-    """
-    if before != after:
-        raise AssertionError(
-            "maker lane mutated the directional result: "
-            f"before={before!r} != after={after!r}"
-        )
+def assert_score_run_untouched(before: list[dict], after: list[dict]) -> None:
+    """Prove a maker run left a prior directional scoring result byte-identical (SEC-005/AC-011)."""
+    assert before == after, "maker lane must not mutate the directional leaderboard result"
 
 
-# Bind the guard under its public name without embedding the directional token
-# as a contiguous substring anywhere in this source file.
-globals()[_GUARD_NAME] = _assert_prior_directional_result_untouched
-
-__all__ = ["MakerArenaResult", _GUARD_NAME]
+__all__ = ["MakerArenaResult", "assert_score_run_untouched"]
