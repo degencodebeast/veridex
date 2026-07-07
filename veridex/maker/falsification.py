@@ -20,10 +20,14 @@ from __future__ import annotations
 
 import random
 from statistics import mean
+from typing import Any, Callable, Protocol
 
 from pydantic import BaseModel
 
-__all__ = ["FalsificationResult", "falsify"]
+from veridex.maker.contracts import Side, TargetQuoteSet
+from veridex.maker.scorer import score_r1_markout
+
+__all__ = ["FalsificationResult", "falsify", "run_falsification_arena"]
 
 
 class FalsificationResult(BaseModel):
@@ -116,3 +120,105 @@ def falsify(
         ci_high_bps=round(ci_high),
         verdict=verdict,
     )
+
+
+class _MakerAgent(Protocol):
+    """Structural type for a proposal-only maker agent (see ``maker.agents``)."""
+
+    def propose(
+        self,
+        *,
+        reference_fv: dict[str, Any],
+        venue_view: dict[str, Any],
+        inventory: dict[str, Any],
+        params: dict[str, Any],
+        clock: int,
+    ) -> TargetQuoteSet: ...
+
+
+def _toxicity_quality(
+    agent: _MakerAgent,
+    tape: list[dict[str, Any]],
+    ref_at: Callable[[str, Side, int], float | None],
+    horizons_s: tuple[int, ...],
+) -> list[int]:
+    """Score one agent over the shared tape and return its per-quote quality list.
+
+    Each proposed quote is scored on forward markout, then converted to a
+    **toxicity-based** quality score ``-max(0, -markout_bps)`` (higher = better =
+    less toxic). Only the *picked-off* side is penalised: a favourable markout
+    contributes ``0`` rather than an oversized positive that could cancel a
+    picked-off side (the mean-signed-markout tie the toxicity basis fixes).
+
+    Args:
+        agent: A proposal-only maker agent.
+        tape: Shared tape rows carrying ``ts``, ``fv``, ``mid`` (and optional
+            ``suspended``).
+        ref_at: Reference lookup ``(market_key, side, ts) -> fair | None``.
+        horizons_s: Forward horizons in seconds.
+
+    Returns:
+        The agent's per-quote quality scores (toxicity, negated).
+    """
+    quote_sets = [
+        agent.propose(
+            reference_fv={"fv": row["fv"], "suspended": row.get("suspended", False)},
+            venue_view={"mid": row["mid"]},
+            inventory={},
+            params={},
+            clock=row["ts"],
+        )
+        for row in tape
+    ]
+    marks, _acc = score_r1_markout(quote_sets, ref_at, horizons_s)
+    return [-max(0, -m.markout_bps) for m in marks]
+
+
+def run_falsification_arena(
+    *,
+    tape: list[dict[str, Any]],
+    naive: _MakerAgent,
+    candidate: _MakerAgent,
+    ref_at: Callable[[str, Side, int], float | None],
+    horizons_s: tuple[int, ...],
+    has_trade_reference: bool,
+) -> dict[str, Any]:
+    """Run the naive-vs-candidate quote-quality falsification arena (R1).
+
+    Both agents quote the same shared ``tape``; each quote is scored on forward
+    markout and reduced to a **toxicity** quality score ``-max(0, -markout_bps)``
+    (never mean signed markout — that lets a symmetric naive maker's oversized
+    good side cancel its picked-off side into a spurious tie). A candidate that
+    is *less toxic* than the negative control yields ``delta > 0`` and can
+    ``SEPARATED``.
+
+    Headline (AC-017): a non-``SEPARATED`` R1 verdict is **never** a candidate
+    edge — it is always ``"INCONCLUSIVE"``. ``has_trade_reference`` is accepted
+    for a future R1.5 trade-print tautology-breaker path but does **not** rescue
+    a non-separated R1 verdict here.
+
+    Args:
+        tape: Shared tape rows (``ts``, ``fv``, ``mid``, optional ``suspended``).
+        naive: The naive negative-control maker.
+        candidate: The TxLINE-fair candidate maker.
+        ref_at: Reference lookup ``(market_key, side, ts) -> fair | None``.
+        horizons_s: Forward horizons in seconds.
+        has_trade_reference: Whether an independent trade reference exists
+            (reserved for R1.5; does not affect the R1 headline).
+
+    Returns:
+        ``{"falsification": FalsificationResult, "headline": str}`` where
+        ``headline`` is ``"SEPARATED_QUOTE_QUALITY"`` only when the verdict is
+        ``"SEPARATED"``, else ``"INCONCLUSIVE"``.
+    """
+    naive_quality = _toxicity_quality(naive, tape, ref_at, horizons_s)
+    candidate_quality = _toxicity_quality(candidate, tape, ref_at, horizons_s)
+
+    result = falsify(naive_quality, candidate_quality)
+
+    if result.verdict == "SEPARATED":
+        headline = "SEPARATED_QUOTE_QUALITY"
+    else:
+        headline = "INCONCLUSIVE"
+
+    return {"falsification": result, "headline": headline}
