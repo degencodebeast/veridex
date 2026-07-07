@@ -1,4 +1,15 @@
+import pytest
 from veridex.maker.basis import decompose_gap, reach_from_residual
+
+
+def test_decompose_gap_rejects_length_mismatch():
+    with pytest.raises(ValueError):
+        decompose_gap([0.6, 0.6], [0.5])
+
+
+def test_decompose_gap_rejects_empty():
+    with pytest.raises(ValueError):
+        decompose_gap([], [])
 
 
 def test_structural_offset_is_reported_as_basis_not_edge():

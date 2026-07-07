@@ -72,6 +72,10 @@ def decompose_gap(
     Raises:
         MarkoutError: If any operand is not a native probability in ``[0, 1]``.
     """
+    if len(txline_fv) != len(venue_native):
+        raise ValueError("decompose_gap requires equal-length series")
+    if not txline_fv:
+        raise ValueError("decompose_gap requires non-empty series")
     n = len(txline_fv)
     for x in txline_fv:
         assert_native_prob(x, "txline_fv")

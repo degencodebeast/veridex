@@ -16,6 +16,10 @@ def test_decimal_odds_operand_is_rejected_not_mis_scaled():
     with pytest.raises(MarkoutError):
         forward_markout_bps(side=Side.BID, quote_price=0.58, ref_now=0.60, ref_future=1.05)
 
+def test_ref_now_zero_raises_markout_error_not_zero_division():
+    with pytest.raises(MarkoutError):
+        forward_markout_bps(side=Side.BID, quote_price=0.0, ref_now=0.0, ref_future=0.5)
+
 def test_assert_native_prob_bounds():
     assert assert_native_prob(0.0, "x") == 0.0 and assert_native_prob(1.0, "x") == 1.0
     with pytest.raises(MarkoutError):

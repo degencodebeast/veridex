@@ -15,7 +15,7 @@ we do not fabricate a fair value we did not observe.
 
 from __future__ import annotations
 
-from typing import Callable
+from typing import Any, Callable
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -119,7 +119,7 @@ def score_r1_markout(
 
 def aggregate_agent_metrics(
     agent_id: str, marks: list[QuoteMarkout], acc: QuoteAccounting
-) -> dict:
+) -> dict[str, Any]:
     """Aggregate per-agent metrics recomputed purely from scored evidence.
 
     ``avg_markout_bps`` is derived only from ``marks`` (never from any

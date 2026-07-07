@@ -6,9 +6,15 @@ tape** of forward markouts and reports whether the two populations *separate*
 in quote-quality terms, with a deterministic bootstrap confidence interval.
 
 The comparison is framed strictly as **quote quality** (never "edge", "profit"
-or "pnl"): a higher mean markout is a better quote, and a candidate is only
-declared to have separated from the negative control when the entire bootstrap
-CI of the mean-markout delta sits above zero.
+or "pnl"): a candidate is only declared to have separated from the negative
+control when the entire bootstrap CI of the mean-value delta sits above zero.
+
+:func:`falsify` itself is a **generic two-sample bootstrap** over whatever
+per-quote values it is handed; it does not know about markouts. The arena
+(:func:`run_falsification_arena`) gets its teeth by feeding it **toxicity-reduced**
+values (``-max(0, -markout)`` via :func:`_toxicity_quality`), **not** raw mean
+signed markout — because mean signed markout lets a symmetric naive maker's
+oversized good side cancel its picked-off side into a spurious tie.
 
 Determinism is a hard requirement: a fixed ``seed`` yields a sealed,
 reproducible verdict. The bootstrap uses only the standard library
@@ -47,14 +53,17 @@ class FalsificationResult(BaseModel):
 
 
 def _percentile(sorted_values: list[float], pct: float) -> float:
-    """Return the ``pct`` percentile of an already-sorted list (nearest-rank).
+    """Return the ``pct`` percentile of an already-sorted list.
+
+    Uses a **floored interpolation index** ``int(pct * (len - 1))`` rather than
+    true nearest-rank rounding.
 
     Args:
         sorted_values: Non-empty list sorted in ascending order.
         pct: Percentile in ``[0.0, 1.0]`` (e.g. ``0.025`` for the 2.5th).
 
     Returns:
-        The value at the nearest-rank index for ``pct``.
+        The value at the floored interpolation index for ``pct``.
     """
     idx = int(pct * (len(sorted_values) - 1))
     return sorted_values[idx]
@@ -67,11 +76,16 @@ def falsify(
     n_boot: int = 1000,
     seed: int = 20260707,
 ) -> FalsificationResult:
-    """Falsify that a candidate maker separates from a naive negative control.
+    """Falsify that a candidate sample separates from a naive negative control.
 
-    Computes the mean-markout delta ``mean(candidate) - mean(naive)`` and a
-    deterministic bootstrap confidence interval for that delta, then renders a
-    sealed verdict:
+    This is a **generic two-sample bootstrap**: it operates on whatever per-quote
+    values it is handed and has no notion of markout semantics. The arena feeds it
+    toxicity-reduced quality values (see :func:`run_falsification_arena`), not raw
+    mean signed markout, so that a symmetric naive maker's good side cannot cancel
+    its picked-off side into a spurious tie.
+
+    Computes the mean delta ``mean(candidate) - mean(naive)`` and a deterministic
+    bootstrap confidence interval for that delta, then renders a sealed verdict:
 
     * ``"SEPARATED"`` when the whole CI is above zero (``ci_low > 0``): the
       candidate's quote quality reliably beats the negative control.
@@ -92,6 +106,9 @@ def falsify(
     Returns:
         A :class:`FalsificationResult` with the delta, CI bounds and verdict.
     """
+    if not naive_markouts or not candidate_markouts:
+        raise ValueError("falsify requires non-empty markout lists")
+
     delta = mean(candidate_markouts) - mean(naive_markouts)
 
     rng = random.Random(seed)

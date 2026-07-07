@@ -1,4 +1,10 @@
+import pytest
 from veridex.maker.falsification import falsify
+
+
+def test_falsify_rejects_empty_input():
+    with pytest.raises(ValueError):
+        falsify([], [5])
 
 
 def test_clear_candidate_advantage_is_separated():

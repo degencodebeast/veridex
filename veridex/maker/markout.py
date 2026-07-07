@@ -72,5 +72,8 @@ def forward_markout_bps(
     ref_now = assert_native_prob(ref_now, "ref_now")
     ref_future = assert_native_prob(ref_future, "ref_future")
 
+    if ref_now == 0.0:
+        raise MarkoutError("ref_now is zero; markout undefined")
+
     sign = 1 if side is Side.BID else -1
     return round(sign * (ref_future - quote_price) / ref_now * 1e4)
