@@ -21,11 +21,14 @@ from __future__ import annotations
 import hashlib
 import json
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
 from veridex.maker.mapping import DEFAULT_MAPPING_PATH, load_resolved_market_lookup
+
+if TYPE_CHECKING:
+    from veridex.maker.r2_bracket import FillAssumptionConfig
 
 
 def _canonical_dump(obj: Any) -> str:
@@ -83,6 +86,7 @@ def build_maker_run_config(
     mapping_path: str | Path = DEFAULT_MAPPING_PATH,
     markout_horizons_s: tuple[int, ...] = (30, 60, 300),
     agents: tuple[Any, ...] = (),
+    fill_assumption: FillAssumptionConfig | None = None,
 ) -> MakerRunConfig:
     """Build a :class:`MakerRunConfig` bound to the committed mapping content hash.
 
@@ -100,6 +104,10 @@ def build_maker_run_config(
             ``params_hash_inputs() -> str``). Each agent's behavior-param hash is
             bound into ``agent_config_hashes`` so any agent-param change moves
             ``config_hash()`` (SEC-006).
+        fill_assumption: Optional fill-assumption config. When provided, its
+            ``config_hash()`` is bound into ``fill_assumption_hash`` so any
+            fill-assumption change moves the run ``config_hash()`` (CON-003 / AC-012).
+            When ``None``, ``fill_assumption_hash`` stays ``None``.
 
     Returns:
         A frozen :class:`MakerRunConfig` with the recomputed mapping hash bound in.
@@ -115,6 +123,9 @@ def build_maker_run_config(
         mapping_content_hash=mapping_content_hash,
         markout_horizons_s=markout_horizons_s,
         agent_config_hashes=tuple(a.params_hash_inputs() for a in agents),
+        fill_assumption_hash=(
+            fill_assumption.config_hash() if fill_assumption is not None else None
+        ),
     )
 
 
