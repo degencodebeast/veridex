@@ -81,6 +81,7 @@ def build_maker_run_config(
     fixture_ids: tuple[int, ...],
     mapping_path: Any = DEFAULT_MAPPING_PATH,
     markout_horizons_s: tuple[int, ...] = (30, 60, 300),
+    agents: tuple[Any, ...] = (),
 ) -> MakerRunConfig:
     """Build a :class:`MakerRunConfig` bound to the committed mapping content hash.
 
@@ -94,6 +95,10 @@ def build_maker_run_config(
         fixture_ids: The cp1 fixture universe; MUST be exactly 18 fixtures.
         mapping_path: Path to the committed resolved-market mapping file.
         markout_horizons_s: Markout horizons (seconds) to pin into the config.
+        agents: Participating agents (duck-typed: any object exposing
+            ``params_hash_inputs() -> str``). Each agent's behavior-param hash is
+            bound into ``agent_config_hashes`` so any agent-param change moves
+            ``config_hash()`` (SEC-006).
 
     Returns:
         A frozen :class:`MakerRunConfig` with the recomputed mapping hash bound in.
@@ -108,6 +113,7 @@ def build_maker_run_config(
         fixture_ids=fixture_ids,
         mapping_content_hash=mapping_content_hash,
         markout_horizons_s=markout_horizons_s,
+        agent_config_hashes=tuple(a.params_hash_inputs() for a in agents),
     )
 
 
