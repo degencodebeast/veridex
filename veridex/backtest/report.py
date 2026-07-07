@@ -194,6 +194,16 @@ class BacktestReport(BaseModel):
     #: the replay law actually verifies. Distinct from the (policy-envelope) ``policy_pass_fail_rate``.
     law_valid_rate: float
 
+    #: REPORT-ONLY odds input-proof stamp ("verify-before-seal", input-proof axis): a summary of
+    #: whether TxLINE returned a valid two-tier Merkle inclusion proof for each odds message that fed
+    #: this run (see :mod:`veridex.ingest.odds_proof`). Attached POST-BUILD via ``model_copy``
+    #: (:func:`veridex.ingest.odds_proof.attach_odds_proof_status`); ``build_backtest_report`` NEVER
+    #: sets it and it is NOT bound into ``config_hash`` / ``evidence_hash`` — adding it CANNOT perturb
+    #: an existing sealed hash. HONEST claim only: "TxLINE returned valid inclusion proofs for N/M" —
+    #: NOT independently verified against the on-chain root (a future Tier-2 recompute). ``None`` until
+    #: a producer attaches it. NEVER a ranked axis (SEC-005).
+    odds_proof_status: dict[str, Any] | None = None
+
     # --- close provenance / honest degrade marker (D2) ----------------------
     #: NON-sealed, human-readable provenance for the pre_match close (the report analog of the live
     #: runner's ``ops`` markers). ``None`` for a clean full-match ``pre_match`` (verified kickoff +

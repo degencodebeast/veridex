@@ -56,8 +56,18 @@ def test_scores_and_stream_urls() -> None:
     assert scores_stream_url(_BASE) == "https://txline-dev.txodds.com/api/scores/stream"
 
 
-def test_validation_url_keys_on_message_id() -> None:
-    assert odds_validation_url(_BASE, "m-7") == "https://txline-dev.txodds.com/api/odds/validation?messageId=m-7"
+def test_validation_url_keys_on_message_id_and_ts() -> None:
+    # BOTH messageId AND ts are required by the TxLINE API (ts omitted -> HTTP 404); the
+    # message_id is URL-encoded because it contains ':' and '-'.
+    real_mid = "1830828776:00003:001421-10021-stab"
+    url = odds_validation_url(_BASE, real_mid, 1782518400)
+    assert url == (
+        "https://txline-dev.txodds.com/api/odds/validation"
+        "?messageId=1830828776%3A00003%3A001421-10021-stab&ts=1782518400"
+    )
+    assert "messageId=1830828776%3A00003%3A001421-10021-stab" in url  # urlencoded ':'
+    assert "&ts=1782518400" in url
+    assert ":00003" not in url  # raw colon must be escaped
 
 
 def test_fixtures_snapshot_url_is_documented_discovery_path() -> None:
@@ -267,12 +277,21 @@ async def test_fetch_odds_updates_json_path_unchanged_when_content_type_is_json(
     assert [u["MessageId"] for u in updates] == ["a"]
 
 
-async def test_validate_odds_keys_on_message_id() -> None:
+async def test_validate_odds_keys_on_message_id_and_passes_ts() -> None:
     payload = {"odds": {}, "summary": {}, "subTreeProof": [], "mainTreeProof": []}
     client = _FakeClient(payload)
-    result = await validate_odds("m-7", base_url=_BASE, creds=_CREDS, client=client)
+    result = await validate_odds(
+        "1830828776:00003:001421-10021-stab", 1782518400, base_url=_BASE, creds=_CREDS, client=client
+    )
     assert result == payload
-    assert client.calls == ["https://txline-dev.txodds.com/api/odds/validation?messageId=m-7"]
+    # ts is threaded through to the request URL (urlencoded messageId + required ts).
+    assert client.calls == [
+        "https://txline-dev.txodds.com/api/odds/validation"
+        "?messageId=1830828776%3A00003%3A001421-10021-stab&ts=1782518400"
+    ]
+    # TxLINE auth headers still intact (CON-041).
+    assert client.headers[0]["Authorization"] == "Bearer jwt-1"
+    assert client.headers[0]["X-Api-Token"] == "api-token-1"
 
 
 def test_import_does_not_pull_httpx() -> None:
