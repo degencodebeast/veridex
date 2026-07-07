@@ -22,7 +22,12 @@ from pydantic import BaseModel, ConfigDict, Field
 from veridex.maker.contracts import Side, TargetQuoteSet
 from veridex.maker.markout import forward_markout_bps
 
-__all__ = ["QuoteMarkout", "QuoteAccounting", "score_r1_markout"]
+__all__ = [
+    "QuoteMarkout",
+    "QuoteAccounting",
+    "score_r1_markout",
+    "aggregate_agent_metrics",
+]
 
 
 class QuoteMarkout(BaseModel):
@@ -110,3 +115,38 @@ def score_r1_markout(
                 scored += 1
 
     return marks, QuoteAccounting(scored=scored, abstained=abstained)
+
+
+def aggregate_agent_metrics(
+    agent_id: str, marks: list[QuoteMarkout], acc: QuoteAccounting
+) -> dict:
+    """Aggregate per-agent metrics recomputed purely from scored evidence.
+
+    ``avg_markout_bps`` is derived only from ``marks`` (never from any
+    agent-supplied value) and is ``None`` — not ``0`` — when there are no
+    scored quotes, mirroring ``scoring.avg_clv_bps``.
+
+    ``real_executable_edge_bps`` is a hardcoded literal ``None``: this scorer
+    measures quote quality only and never claims a fill/PnL/executable-edge
+    number (see module docstring).
+
+    Args:
+        agent_id: Identifier of the agent being scored.
+        marks: Scored ``QuoteMarkout`` evidence for this agent.
+        acc: Full accounting for this agent's scoring pass.
+
+    Returns:
+        A dict of recomputed metrics for the agent.
+    """
+    avg_markout_bps = (
+        round(sum(m.markout_bps for m in marks) / len(marks)) if marks else None
+    )
+    return {
+        "agent_id": agent_id,
+        "avg_markout_bps": avg_markout_bps,
+        "quote_count": len(marks),
+        "scored": acc.scored,
+        "abstained": acc.abstained,
+        "excluded": acc.excluded,
+        "real_executable_edge_bps": None,
+    }
