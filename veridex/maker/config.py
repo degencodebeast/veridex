@@ -24,6 +24,8 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from veridex.maker.mapping import DEFAULT_MAPPING_PATH, load_resolved_market_lookup
+
 
 def _canonical_dump(obj: Any) -> str:
     """Canonical JSON: sorted keys, compact separators.
@@ -72,6 +74,41 @@ class MakerRunConfig(BaseModel):
         Tuple fields serialize as JSON arrays, so the dump is deterministic.
         """
         return hashlib.sha256(_canonical_dump(self.model_dump()).encode()).hexdigest()
+
+
+def build_maker_run_config(
+    *,
+    fixture_ids: tuple[int, ...],
+    mapping_path: Any = DEFAULT_MAPPING_PATH,
+    markout_horizons_s: tuple[int, ...] = (30, 60, 300),
+) -> MakerRunConfig:
+    """Build a :class:`MakerRunConfig` bound to the committed mapping content hash.
+
+    Enforces the n=18 cp1 fixture universe (CON-015 / AC-020) and binds the
+    records-only mapping content hash recomputed from the committed mapping file
+    (via :func:`load_resolved_market_lookup`) into the config so any mapping drift
+    moves ``config_hash()``. Performs NO live Gamma/network I/O -- it only reads the
+    committed mapping.
+
+    Args:
+        fixture_ids: The cp1 fixture universe; MUST be exactly 18 fixtures.
+        mapping_path: Path to the committed resolved-market mapping file.
+        markout_horizons_s: Markout horizons (seconds) to pin into the config.
+
+    Returns:
+        A frozen :class:`MakerRunConfig` with the recomputed mapping hash bound in.
+
+    Raises:
+        ValueError: If ``fixture_ids`` is not exactly 18 fixtures.
+    """
+    if len(fixture_ids) != 18:
+        raise ValueError("maker universe must be n=18 cp1 fixtures (CON-015)")
+    _records, mapping_content_hash = load_resolved_market_lookup(mapping_path)
+    return MakerRunConfig(
+        fixture_ids=fixture_ids,
+        mapping_content_hash=mapping_content_hash,
+        markout_horizons_s=markout_horizons_s,
+    )
 
 
 def verify_pinned(cfg: MakerRunConfig, expected_hash: str) -> None:
