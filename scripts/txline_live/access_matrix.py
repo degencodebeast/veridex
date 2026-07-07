@@ -133,8 +133,12 @@ def probe_targets(
         {"name": "scores_stream", "url": scores_stream_url(base), "kind": "sse_head"},
         {"name": "scores_updates", "url": scores_updates_url(base, fid), "kind": "get"},
         {
+            # messageId AND ts are both placeholders here (0 mirrors the fid/cid/sed
+            # placeholder-int convention above) — this target is ALWAYS skip_note_for'd
+            # regardless of the value, since a real ts only exists paired with a real
+            # messageId lifted from a live odds update (see _VALIDATION_PLACEHOLDER_NOTE).
             "name": "odds_validation",
-            "url": odds_validation_url(base, "PLACEHOLDER"),
+            "url": odds_validation_url(base, "PLACEHOLDER", 0),
             "kind": "get",
         },
         {"name": "fixtures_discovery", "url": fixtures_snapshot_url(base, cid, sed), "kind": "get"},
