@@ -14,9 +14,12 @@ def test_none_markout_sorts_last():
         {"agent_id": "b", "avg_markout_bps": 10, "abstained": 0, "quote_count": 5}])
     assert ranked[0]["agent_id"] == "b"
 
-def test_maker_rank_key_has_no_clv_and_module_never_imports_score_run():
+def test_maker_rank_key_has_no_clv_and_module_never_imports_directional_scorer():
     # scope the "no CLV" check to the RANK KEY (a later task adds a window_clv_analog labeled aggregate
-    # to this same module, which legitimately contains "clv"); the module must never touch score_run.
-    assert "clv" not in inspect.getsource(maker_rank_key).lower()
+    # to this same module, which legitimately contains "clv"); the module must never touch the
+    # directional scorer.
+    assert "clv" not in inspect.getsource(maker_rank_key).lower()     # CLV never in the rank key
     mod_src = inspect.getsource(lb).lower()
-    assert "score_run" not in mod_src and "_rank_key" not in mod_src and "avg_clv" not in mod_src
+    assert "veridex.scoring" not in mod_src      # no import of the directional scorer
+    assert "score_run" not in mod_src            # no call to the directional score_run
+    assert "avg_clv" not in mod_src              # no directional CLV field

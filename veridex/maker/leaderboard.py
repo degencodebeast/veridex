@@ -9,18 +9,10 @@ from __future__ import annotations
 
 from typing import Any
 
-# NOTE (SEC-005 substring guard): the maker leaderboard tests assert that this module's source
-# never contains the directional scorer's private sort-key token. The public key function is
-# required to be importable under the name built below, whose spelling happens to contain that
-# token as a substring. We therefore define the real function under a non-colliding descriptive
-# name (`maker_markout_key`) and publish the required public alias via concatenation, so the
-# forbidden substring never appears literally in this file while the public API is unchanged.
-_PUBLIC_KEY_NAME = "maker_rank" + "_key"
-
-__all__ = [_PUBLIC_KEY_NAME, "rank_makers"]
+__all__ = ["maker_rank_key", "rank_makers"]
 
 
-def maker_markout_key(metrics: dict[str, Any]) -> tuple[Any, ...]:
+def maker_rank_key(metrics: dict[str, Any]) -> tuple[Any, ...]:
     """Ascending sort key encoding the maker rank order (best maker sorts first).
 
     Order: avg markout desc (``None`` last) -> abstained asc -> quote_count desc -> agent_id asc
@@ -43,10 +35,6 @@ def maker_markout_key(metrics: dict[str, Any]) -> tuple[Any, ...]:
     )
 
 
-# Publish the required public alias without embedding the guarded substring in source text.
-globals()[_PUBLIC_KEY_NAME] = maker_markout_key
-
-
 def rank_makers(agent_metrics: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Rank makers best-first, assigning a 1-based ``maker_rank`` to each row.
 
@@ -57,7 +45,7 @@ def rank_makers(agent_metrics: list[dict[str, Any]]) -> list[dict[str, Any]]:
         Copies of the input rows sorted by the maker key, each with ``maker_rank`` (1..N) added.
         Inputs are not mutated.
     """
-    ranked = sorted((dict(row) for row in agent_metrics), key=maker_markout_key)
+    ranked = sorted((dict(row) for row in agent_metrics), key=maker_rank_key)
     for position, row in enumerate(ranked, start=1):
         row["maker_rank"] = position
     return ranked
