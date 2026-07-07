@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 from typing import Any
+from urllib.parse import quote
 
 from veridex.ingest.live_client import build_auth_headers
 from veridex.ingest.marketstate import parse_sse_line
@@ -65,9 +66,14 @@ def scores_stream_url(base: str) -> str:
     return f"{base}/scores/stream"
 
 
-def odds_validation_url(base: str, message_id: str) -> str:
-    """``/odds/validation?messageId=`` — proof for one SEALED odds record (verify by messageId)."""
-    return f"{base}/odds/validation?messageId={message_id}"
+def odds_validation_url(base: str, message_id: str, ts: int) -> str:
+    """``/odds/validation?messageId=&ts=`` — proof for one SEALED odds record.
+
+    BOTH ``messageId`` and ``ts`` are REQUIRED by the TxLINE API (omitting ``ts`` → HTTP 404);
+    ``message_id`` is URL-encoded because it contains ``:`` and ``-`` (e.g.
+    ``1830828776:00003:001421-10021-stab``).
+    """
+    return f"{base}/odds/validation?messageId={quote(message_id)}&ts={ts}"
 
 
 def validation_method(evidence_kind: str) -> str:
@@ -213,12 +219,20 @@ async def fetch_scores_updates(
 
 
 async def validate_odds(
-    message_id: str, *, base_url: str | None = None, creds: tuple[str, str] | None = None, client: Any = None
+    message_id: str,
+    ts: int,
+    *,
+    base_url: str | None = None,
+    creds: tuple[str, str] | None = None,
+    client: Any = None,
 ) -> dict[str, Any]:
-    """GET ``/odds/validation?messageId=`` — the sealed-record proof to verify vs the txoracle root.
+    """GET ``/odds/validation?messageId=&ts=`` — the sealed-record proof to verify vs the txoracle root.
 
-    Returns the ``{snapshot/odds, summary, subTreeProof, mainTreeProof}`` payload. Proofs exist
-    only for SEALED per-batch records — callers verify by ``messageId``, never the freshest tick.
+    BOTH ``message_id`` and ``ts`` are REQUIRED (they are the ``MessageId``/``Ts`` fields from
+    ``/odds/updates`` responses); omitting ``ts`` yields HTTP 404.
+
+    Returns the ``{odds, summary, subTreeProof, mainTreeProof}`` payload. Proofs exist only for
+    SEALED per-batch records — callers verify by ``messageId``, never the freshest tick.
     """
     from veridex.config import get_settings, require_txline
 
@@ -232,7 +246,7 @@ async def validate_odds(
 
         client = httpx.AsyncClient()
     try:
-        resp = await client.get(odds_validation_url(base, message_id), headers=headers)
+        resp = await client.get(odds_validation_url(base, message_id, ts), headers=headers)
         resp.raise_for_status()
         return dict(resp.json())
     finally:
