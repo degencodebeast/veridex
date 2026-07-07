@@ -19,11 +19,22 @@ import json
 from enum import Enum
 from pathlib import Path
 
+from typing import TYPE_CHECKING
+
 from pydantic import BaseModel, ConfigDict, field_validator
 
 from veridex.maker.markout import assert_native_prob
 
-__all__ = ["AggressorSide", "TradePrint", "load_trade_prints"]
+if TYPE_CHECKING:
+    from veridex.maker.mapping import ResolvedMarketRecord
+
+__all__ = [
+    "AggressorSide",
+    "TradePrint",
+    "join_trades_to_fixture",
+    "join_trades_to_fixture_with_accounting",
+    "load_trade_prints",
+]
 
 
 class AggressorSide(str, Enum):
@@ -97,3 +108,67 @@ def load_trade_prints(path: str | Path) -> list[TradePrint]:
             assert_native_prob(row["price"], "price")
             trades.append(TradePrint(**row))
     return trades
+
+
+def join_trades_to_fixture_with_accounting(
+    trades: list[TradePrint],
+    records: list["ResolvedMarketRecord"],
+    fixture_id: int,
+) -> tuple[dict[str, list[TradePrint]], int]:
+    """Join trade prints to a fixture's markets via the pinned mapping records.
+
+    The join key ``(condition_id, token_id)`` is taken **only** from the committed
+    mapping records (never a live lookup), so a trade is grouped under a market
+    ``market_ref`` iff a record for this ``fixture_id`` pins that exact pair.
+
+    Every trade is fully accounted (HB-10, no silent drops): each trade is either
+    grouped into exactly one ``market_ref`` bucket **xor** counted as ``unmatched``.
+
+    Args:
+        trades: Venue trade prints to join.
+        records: The pinned mapping records (any fixtures); only those whose
+            ``fixture_id`` equals ``fixture_id`` contribute join keys.
+        fixture_id: The fixture whose markets we are joining against.
+
+    Returns:
+        A ``(joined, unmatched)`` tuple where ``joined`` maps each matched
+        ``market_ref`` to its list of trades (file order preserved) and
+        ``unmatched`` counts trades matching no record for this fixture.
+    """
+    index: dict[tuple[str, str], str] = {
+        (record.condition_id, record.token_id): record.market_ref
+        for record in records
+        if record.fixture_id == fixture_id
+    }
+
+    joined: dict[str, list[TradePrint]] = {}
+    unmatched = 0
+    for trade in trades:
+        market_ref = index.get((trade.condition_id, trade.token_id))
+        if market_ref is None:
+            unmatched += 1
+            continue
+        joined.setdefault(market_ref, []).append(trade)
+    return joined, unmatched
+
+
+def join_trades_to_fixture(
+    trades: list[TradePrint],
+    records: list["ResolvedMarketRecord"],
+    fixture_id: int,
+) -> dict[str, list[TradePrint]]:
+    """Join trade prints to a fixture's markets, returning only the grouped dict.
+
+    Thin wrapper over :func:`join_trades_to_fixture_with_accounting` that drops the
+    unmatched count. See that function for the join-key and accounting semantics.
+
+    Args:
+        trades: Venue trade prints to join.
+        records: The pinned mapping records providing the join keys.
+        fixture_id: The fixture whose markets we are joining against.
+
+    Returns:
+        A mapping of each matched ``market_ref`` to its list of trades.
+    """
+    joined, _ = join_trades_to_fixture_with_accounting(trades, records, fixture_id)
+    return joined
