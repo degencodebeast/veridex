@@ -31,4 +31,4 @@ def assign_rung(presence: DataPresence) -> MakerRungLabel | None:
     """
     if not presence.has_mids:
         return None
-    return MakerRungLabel("MM-R1.5") if presence.has_trades else MakerRungLabel("MM-R1")
+    return MakerRungLabel.R1_5 if presence.has_trades else MakerRungLabel.R1

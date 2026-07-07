@@ -11,5 +11,5 @@ def test_recomputed_hash_matches_pinned_and_is_records_only():
 
 def test_recompute_is_over_sorted_records_not_whole_file():
     records, _ = load_resolved_market_lookup(DEFAULT_MAPPING_PATH)
-    shuffled = [r.model_dump() for r in reversed(records)]
-    assert recompute_records_hash(shuffled) == PINNED_MAPPING_HASH
+    reversed_records = [r.model_dump() for r in reversed(records)]
+    assert recompute_records_hash(reversed_records) == PINNED_MAPPING_HASH

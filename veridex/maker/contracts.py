@@ -9,7 +9,7 @@ keeps the maker loop out of the directional decision path.
 from __future__ import annotations
 
 from enum import Enum
-from typing import Protocol
+from typing import Any, Protocol
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -58,6 +58,6 @@ class MarketMakerAgent(Protocol):
         reference_fv: dict[str, float],
         venue_view: dict[str, float],
         inventory: dict[str, float],
-        params: dict,
+        params: dict[str, Any],
         clock: int,
     ) -> TargetQuoteSet: ...

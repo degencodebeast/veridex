@@ -20,6 +20,7 @@ from __future__ import annotations
 import hashlib
 import json
 from pathlib import Path
+from typing import Any
 
 from pydantic import BaseModel, ConfigDict
 
@@ -56,7 +57,7 @@ class ResolvedMarketRecord(BaseModel):
     venue: str
 
 
-def recompute_records_hash(records: list[dict]) -> str:
+def recompute_records_hash(records: list[dict[str, Any]]) -> str:
     """Recompute the canonical records-only content hash.
 
     Args:
@@ -84,6 +85,6 @@ def load_resolved_market_lookup(
         hash. The hash is computed over the original raw record dicts.
     """
     raw = json.loads(Path(path).read_text())
-    raw_records: list[dict] = raw["records"]
+    raw_records: list[dict[str, Any]] = raw["records"]
     parsed = [ResolvedMarketRecord(**record) for record in raw_records]
     return parsed, recompute_records_hash(raw_records)

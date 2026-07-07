@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from pathlib import Path
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -79,7 +80,7 @@ class MakerRunConfig(BaseModel):
 def build_maker_run_config(
     *,
     fixture_ids: tuple[int, ...],
-    mapping_path: Any = DEFAULT_MAPPING_PATH,
+    mapping_path: str | Path = DEFAULT_MAPPING_PATH,
     markout_horizons_s: tuple[int, ...] = (30, 60, 300),
     agents: tuple[Any, ...] = (),
 ) -> MakerRunConfig:
