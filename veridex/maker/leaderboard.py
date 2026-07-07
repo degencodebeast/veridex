@@ -9,7 +9,34 @@ from __future__ import annotations
 
 from typing import Any
 
-__all__ = ["maker_rank_key", "rank_makers", "window_clv_analog"]
+__all__ = [
+    "assert_bracket_not_ranked",
+    "maker_rank_key",
+    "rank_makers",
+    "window_clv_analog",
+]
+
+_R2_BRACKET_KEYS = frozenset({"bracket", "sensitivity", "r2"})
+
+
+def assert_bracket_not_ranked(agent_metrics: list[dict[str, Any]]) -> None:
+    """Revert-proof guard: reject rank input carrying an R2 sensitivity bracket.
+
+    The R2 bracket is a declared model overlay, never a ranked measurement (HB-12). This guard
+    ensures a future refactor cannot silently smuggle a bracket/sensitivity/r2 key into the
+    maker rank axis.
+
+    Args:
+        agent_metrics: One metric-stack dict per maker agent, as passed to ``rank_makers``.
+
+    Raises:
+        AssertionError: If any row contains a key in ``{"bracket", "sensitivity", "r2"}``.
+    """
+    for row in agent_metrics:
+        offending = _R2_BRACKET_KEYS & row.keys()
+        assert not offending, (
+            f"R2 bracket key(s) {sorted(offending)} must never enter the maker rank input"
+        )
 
 
 def maker_rank_key(metrics: dict[str, Any]) -> tuple[Any, ...]:
@@ -68,6 +95,7 @@ def rank_makers(agent_metrics: list[dict[str, Any]]) -> list[dict[str, Any]]:
         Copies of the input rows sorted by the maker key, each with ``maker_rank`` (1..N) added.
         Inputs are not mutated.
     """
+    assert_bracket_not_ranked(agent_metrics)
     ranked = sorted((dict(row) for row in agent_metrics), key=maker_rank_key)
     for position, row in enumerate(ranked, start=1):
         row["maker_rank"] = position
