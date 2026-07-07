@@ -1,7 +1,9 @@
 # Deploy Your Own Veridex Agent (WD-3)
 
 Run ONE agent on TxLINE under the same law / policy / proof seal as the Veridex arena — but
-outside the competition container — producing an anchored, independently-verifiable proof.
+outside the competition container — producing an independently-verifiable proof (anchored on
+Solana when anchoring credentials are configured; the replay quickstart below honestly reports
+`anchor=not_anchored`).
 
 ## Quick start (replay)
 
@@ -24,6 +26,33 @@ The run config (`agent.toml`) holds strategy + policy knobs ONLY. **Credentials 
 TOML** (COM-001): the TxLINE JWT + `X-Api-Token`, the Solana keypair (`SOLANA_KEYPAIR_PATH`), and
 venue keys are read from `veridex/.env` via `veridex.config.Settings` at use time. See
 `veridex_agent/sample_agent.toml`.
+
+## Templates and config
+
+A Veridex deploy is a pinned strategy instance:
+
+```text
+AgentTemplate + AgentConfig + PolicyEnvelope = AgentInstance
+```
+
+- **AgentTemplate** is the strategy family, such as value-vs-venue, stale-line, sharp-momentum,
+  arb scanner, or market-maker/QuoteGuard.
+- **AgentConfig** is the concrete strategy instance: market universe, signal thresholds, warmup /
+  lookback windows, confirmation rules, quote freshness, liquidity/spread requirements, stake
+  sizing, risk caps, cooldowns, source mode, and execution mode.
+- **PolicyEnvelope** is the risk boundary: stake caps, order caps, allowlists, kill switch, quote
+  freshness, and approval requirements.
+
+Changing a strategy-affecting config value creates a new pinned config hash. That is intentional:
+two configs on the same template can produce different CLV, PnL, and drawdown, and Veridex should
+be able to replay which exact config caused which actions.
+
+Configs can change trading behavior and profitability. They cannot change Veridex's trust rules:
+no config may bypass law/recompute, policy, evidence integrity, Checks, receipt separation,
+runtime/proof separation, or scoring immutability.
+
+Before guarded live execution, run the config through replay/backtest, live-paper, and dry-run so
+the strategy has a visible performance and policy record before real venue submission.
 
 ## Extension seams
 

@@ -16,6 +16,24 @@ It can read TxLINE state, inspect allowed context, call approved tools, choose a
 
 The agent does not grade itself. It should not be the authority for CLV, executable edge, score rows, policy approval, proof checks, leaderboard rank, settlement, or payout.
 
+## How configurable are Veridex agents?
+
+Veridex agents should be configurable enough that the config can make or break the strategy.
+
+The model is:
+
+```text
+AgentTemplate + AgentConfig + PolicyEnvelope = AgentInstance
+```
+
+The template is the strategy family: value-vs-venue, stale-line, sharp momentum, arb scanner, market maker, or a future researcher/model-originator agent.
+
+The config is the deployed strategy instance: market universe, signal thresholds, warmup/lookback windows, confirmation rules, quote freshness, liquidity/spread requirements, minimum executable edge, stake sizing, risk caps, cooldown, source mode, and execution mode.
+
+So two users can deploy the same template with different configs and get different CLV, PnL, hit rate, and drawdown. That is the point of Agent Studio.
+
+But configs cannot change Veridex's trust rules. They cannot bypass law/recompute, policy, evidence integrity, Checks, receipt separation, runtime/proof separation, or scoring immutability. The agent can trade differently; it cannot grade itself differently.
+
 ## Why split the system into agent, recompute, policy, and proof layers?
 
 Because each layer catches a different failure mode:
@@ -181,6 +199,10 @@ Evidence integrity, manifest binding, receipt separation, and anchor status are 
 No. Dry-run receipts prove the execution lane would have fired under policy. They do not prove skill.
 
 Skill comes from the sealed decision, recomputed math, CLV, and proof checks. Execution receipts are non-scoring artifacts.
+
+## Couldn't Veridex just seal favorable odds and let the neutral law compute a nice number from them?
+
+No. The odds behind every sealed result are checkable against TxLINE's Merkle-anchored root — Veridex records a proof-status stamp for them, and in a live check 269/270 of our sampled World Cup odds returned valid TxLINE inclusion proofs. So the law recompute proves our math is faithful to the sealed inputs, and the Merkle check proves those inputs are authentic TxLINE data we didn't edit.
 
 ## What should the demo make obvious?
 
