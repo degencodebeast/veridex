@@ -46,6 +46,14 @@ class NaiveMarketMakerAgent:
         clock: int,
     ) -> TargetQuoteSet:
         mid = venue_view["mid"]
+        # Settlement-zone abstention: near resolution the anchor sits so close to
+        # 0 or 1 that a valid two-sided quote cannot fit inside (0, 1). Rather
+        # than emit an out-of-range price (which downstream markout scoring
+        # rejects), abstain with an empty NO_QUOTE set.
+        if mid - self.fixed_half_spread <= 0.0 or mid + self.fixed_half_spread >= 1.0:
+            return TargetQuoteSet(
+                fixture_id=0, tick_seq=0, ts=clock, quotes=[], regime="NO_QUOTE"
+            )
         bid = TargetQuote(
             side=Side.BID,
             market_key=_MARKET_KEY,
@@ -125,6 +133,17 @@ class TxLineFairMarketMakerAgent:
             half_spread = self.base_half_spread * widen_multiplier
         else:
             half_spread = self.base_half_spread
+
+        # Settlement-zone abstention: near resolution FV sits so close to 0 or 1
+        # that a valid two-sided quote cannot fit inside (0, 1). Rather than emit
+        # an out-of-range price (which downstream markout scoring rejects),
+        # abstain with an empty NO_QUOTE set. Uses the EFFECTIVE half-spread so a
+        # WIDEN state widens the abstention zone accordingly. This runs after the
+        # suspended/stale/`fv is None` gates and leaves interior anchors intact.
+        if fv - half_spread <= 0.0 or fv + half_spread >= 1.0:
+            return TargetQuoteSet(
+                fixture_id=0, tick_seq=0, ts=clock, quotes=[], regime=MakerState.NO_QUOTE.value
+            )
 
         bid = TargetQuote(
             side=Side.BID,
