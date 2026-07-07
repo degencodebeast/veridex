@@ -49,6 +49,8 @@ class MakerArenaResult(BaseModel):
     small_n_flag: bool = True
     excluded_by_reason: dict[str, int]
 
+    r2_bracket: dict | None = None
+
 
 def assert_score_run_untouched(before: list[dict], after: list[dict]) -> None:
     """Prove a maker run left a prior directional scoring result byte-identical (SEC-005/AC-011)."""
@@ -81,15 +83,14 @@ def render_proof_card(result: MakerArenaResult) -> MakerProofCard:
     surfaces a fill/edge value. The trades-not-fills caveat appears only at the
     MM-R1.5 rung.
     """
-    # uncalibrated stays False for now; a later task flips this True when an
-    # R2 bracket overlay is present (no such overlay exists yet, so leave it).
+    # uncalibrated is True exactly when an R2 bracket overlay is attached.
     trades_not_fills_caveat: str | None = None
     if result.rung == MakerRungLabel("MM-R1.5"):
         trades_not_fills_caveat = "trades are not our fills; no executable-edge claim"
 
     return MakerProofCard(
         rung=result.rung.value,
-        uncalibrated=False,
+        uncalibrated=result.r2_bracket is not None,
         headline=result.falsification.get("verdict", "INCONCLUSIVE"),
         window_clv_analog=result.window_clv_analog,
         falsification=result.falsification,
