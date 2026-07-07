@@ -51,8 +51,8 @@ Most agent demos ask you to trust the model's claim. Veridex makes the claim **a
 | Pillar | What it is | Why it exists |
 |---|---|---|
 | **Agent Studio** | Configure and deploy trading agents from strategy templates — typed, bounded configs; a preflight that fails closed with named reasons; one click to a running, pinned agent. | Users need to *build* strategies, not watch hardcoded bots. |
-| **Live Agent Arena** | A real-time room where agents **compete head-to-head on identical sealed inputs** — ingesting TxLINE data, producing actions, ranking on CLV, streaming their full decision trail (proposal → law → policy → receipt), with Head-to-Head Duel and a falsifiable leaderboard. | The track wants live autonomous agents competing, not static dashboards. |
-| **Verification / Proof layer** | Deterministic recompute, 7 structural checks, evidence hashes, Merkle root-forest, Solana anchors, proof cards, and verify-yourself endpoints. | Agents can trade, but they cannot grade themselves. **This is the moat.** |
+| **Live Agent Arena** | A real-time room where agents **compete head-to-head on identical sealed inputs** — ingesting TxLINE data, producing actions, ranking on CLV, streaming their full decision trail (proposal → law → policy → receipt), with Head-to-Head Duel and a falsifiable leaderboard. | A single strategy result is easy to overread. Running agents head-to-head on one sealed tape shows which ideas survive the same evidence, which abstain, and which fail — a fair, replayable contest, not isolated backtest claims. |
+| **Verification / Proof layer** | Deterministic recompute, 7 structural checks, evidence hashes, Merkle root-forest, Solana anchors, proof cards, and verify-yourself endpoints. | Agents can trade, but they can't grade themselves — so every result is recomputed from sealed evidence and independently checkable, letting the platform prove both wins and non-wins. |
 | **Execution + Risk layer** | Policy envelopes, two-phase gating, quote freshness, slippage and stake caps, a circuit breaker, honest mode labels, and a fail-closed operator-only path to real money. | Production trading isn't just finding edge — it's deciding when acting is *safe*. |
 
 ### Agents are configurable instances, not fixed bots
@@ -67,22 +67,18 @@ The **template** is the strategy family (`SharpMomentumAgent`, value-vs-venue, b
 
 ## We ran it on real World Cup data. Here's the truth.
 
-We pulled the full real TxLINE odds history for a finished World Cup fixture — **USA v Bosnia, 65,156 StablePrice updates spanning ~6 days** — built a content-hashed ReplayPack, and ran the flagship **Sharp Momentum v2** through the sealed pipeline. Once, no tuning, no fixture shopping. The result:
+We pulled real TxLINE odds history across **18 finished World Cup fixtures**, sealed each into a content-hashed ReplayPack, and ran two experiments end-to-end through the pipeline. Both are recorded; here is what they say.
 
-| What happened | The honest reading |
-|---|---|
-| **1X2:** the USA line moved **+907 bps** — but *smoothly*, across ~1,876 updates. Max robust-z = **1.13**, below the 2.5 shock gate. **Zero fires.** | Correct behavior for a *shock* detector — and an honest signal that a shock detector alone under-covers smooth pre-match drift. |
-| **Totals:** after we fixed a market-family bug the run itself exposed, v2 fired **twice** (z = 3.43, 2.51) — both on O/U 0.5, a near-certain line. | The detector works on real data. But firing only on a degenerate line is a market-selection lesson the strategy owns. |
-| **Scoring:** the O/U 0.5 closing line was **suspended** — no priced close exists. The law **refused to fabricate one** and scored both fires invalid (`closing_suspended`). | **avg CLV = None, 0 scored picks, confidence honestly "low."** The sealed run still verifies end-to-end. |
+**Run-001 — a candidate CLV signal (our strongest result).** The `CumulativeDriftAgent` — the drift template built for smooth multi-day repricing — averaged **+61.19 bps CLV** across the 18-fixture filtered universe, **beating all three acting deterministic baselines** on this sample (favorite +4.6, threshold-move −126.5, seeded-random −341.7 bps), net-positive on 10 of 18 fixtures. Crucially this is a **candidate rung-1 CLV signal, not proven executable alpha**: CLV is measured against the sharp TxLINE close with no venue leg, and the effective sample is ~18 fixtures, so it is *directional evidence, not a statistical proof*. But it is the honest kind of positive — the agent beat its baselines on identical sealed inputs, and every number was **recomputed by the law, never self-reported**.
 
-**That null result is the product.** It would have been trivial to impute a close, count WAITs as "high confidence," or lead this README with the synthetic demo's rosy number. Instead: the run surfaced two real bugs (a confidence metric that counted abstentions, a totals market-family the synthetic data had masked), we fixed both, re-ran once, and reported what the data said. The synthetic demo tape is **labeled synthetic on every machine-readable surface** — its numbers demonstrate the metric *pipeline*, never real-market performance.
+**Run-002 — the trust moat.** We then tested whether that candidate translated into **Polymarket venue edge** — and the platform stopped us from overclaiming. The rung-2 venue lane **works**: it priced **94.7% of drift's in-scope 1X2 decisions** against time-aligned Polymarket mids under a bounded-staleness bound, with a self-verified pinned coverage hash and `venue_source_id`. But the rung-2 *estimated mids* result was a near-perfect **monotonic longshot ramp** — **+607 bps** on 0–20% longshots decaying to **+33 bps** on 80–100% favorites — the fingerprint of a favorite-longshot / de-margin-scale divergence, **not** strategy-specific dislocation. So **Run-002 did NOT demonstrate executable venue edge.** These are estimated mids, not fills; `real_executable_edge_bps = None`; no profit and no fillability claim.
 
 > [!IMPORTANT]
-> **You cannot fake a win on Veridex — and we didn't fake ours.** A platform that manufactures edge is worthless; a platform that *proves* exactly what an agent did — including honest abstention and unscoreable closes — is the missing trust layer for autonomous trading. (The strategy roadmap that falls out of this run — a cumulative-drift template for smooth repricing, a market-quality filter for degenerate lines — is tracked, predeclared, and will be evaluated the same honest way.)
+> **That refusal is the product.** It would have been trivial to headline "+607 bps." Instead the law priced the decisions, the `VenueBehaviorReport` slices surfaced the ramp, and Veridex called it what it is — a structural divergence to *falsify*, not alpha to trade. Most agent demos ask you to trust the bot; a trustworthy **"no executable edge yet"** is exactly what a proof layer is for. (Full run-notes live in the research record: `.omc/research/run-001-run-note.md` and `run-002-run-note.md`.)
 
 ---
 
-## Why this wins (the leverage)
+## The trust moat
 
 Most "agent + crypto" projects ask you to **trust their leaderboard**. Veridex ships a leaderboard you can **falsify**:
 
@@ -90,13 +86,10 @@ Most "agent + crypto" projects ask you to **trust their leaderboard**. Veridex s
 - **Seven structural proof checks, none of which can be faked** — each recomputes from sealed evidence ([the 7 checks](#the-7-proof-checks)).
 - **A hard wall between "what the LLM says" and "what gets scored."** The trust path is **import-audited to contain zero LLM SDK code**. The model's claimed edge is untrusted metadata, fenced in the UI as `NOT AN INPUT TO SCORE`.
 - **CLV — the metric sharps respect** — recomputed from sealed entry vs. close; never self-reported P&L. Confidence keys off *scored picks*, so a thousand abstentions can never dress up as a "high-confidence" record.
-- **Fair competition by construction.** A competition runs its agents concurrently over *identical sealed inputs* — no agent sees a different feed, a later tick, or a friendlier close. Rank differences are strategy. That's what makes the leaderboard (and the Head-to-Head Duel) worth winning.
+- **Fair competition by construction.** A competition runs its agents concurrently over *identical sealed inputs* — no agent sees a different feed, a later tick, or a friendlier close. Rank differences are strategy. That's what makes the leaderboard (and the Head-to-Head Duel) a fair fight — and worth trusting.
 - **A real venue, really integrated.** Polymarket quotes/execution with honest price-unit discipline (the native price is audit-only; the platform speaks decimal odds), an event→market resolver that **fails closed rather than guess a token**, and a display gate that renders an edge number **only when a genuine venue quote backs it**.
 - **Deploy-your-own-agent, same proof.** The Studio deploy loop and the standalone SDK run *your* config through the same sealed law/policy/proof pipeline — same evidence discipline, pinned `config_hash`/`policy_hash`.
-- **Radical honesty as a feature.** Five explicit run modes, never conflated; unsupported fields don't render; a degraded run records *why* it degraded; synthetic data self-labels. You can trust the parts we claim *because* we're precise about the parts we don't.
-
-> [!TIP]
-> **Everyone else asks you to believe their numbers. Veridex hands you the tools to disprove ours — and you can't.**
+- **Radical honesty as a feature.** Five explicit run modes, never conflated; unsupported fields don't render; a degraded run records *why* it degraded; synthetic data self-labels. You can trust the parts we claim *because* we're precise about the parts we don't. Run-002 above is this feature in action: the platform refused to promote a longshot-ramp artifact into an edge claim.
 
 ---
 
@@ -224,7 +217,7 @@ Shipped through **six reviewed plans (~130 tasks)** — every task landed via a 
 | **Sharp Momentum v2** | The flagship detector — deterministic, no-lookahead-proven, 10 params config-hashed, literature-grounded, operating-curve tested. |
 | **Venue: Polymarket** | Read + write paths on the real CLOB (vendored, pinned client), an event→market resolver grounded in live-verified market structure (1X2 per-team, draw-binary, O/U multi-slug), price-unit discipline (native price audit-only), honest fill semantics, and a preflight with operator-verify tri-state — "couldn't check" never reads as "passed". |
 | **Execution safety** | The full fail-closed live_guarded surface: structural arm conjunction, two independent locks, `live_ready`, circuit breaker + live cap, quote-size coupling, earned `real_venue_quote`, honest degrade with recorded reasons. |
-| **Backtest + replay** | Content-hashed ReplayPacks from recorder sessions or real TxLINE history, a deterministic BacktestRunner with honest mode labels, and the real-fixture pipeline (the USA–Bosnia run above; raw vendor odds stay local — licensed data). |
+| **Backtest + replay** | Content-hashed ReplayPacks from recorder sessions or real TxLINE history, a deterministic BacktestRunner with honest mode labels, and the real-fixture pipeline behind the 18-fixture Run-001 / Run-002 results above (raw vendor odds stay local — licensed data). |
 | **Judge demo** | `python scripts/demo_phase2d.py` — offline, deterministic, produces *real sealed runs* + a manifest of verify URLs; synthetic data self-labels on every surface. |
 | **Frontend** | The full product surface: Live Cockpit, Decision Inspector (untrusted-LLM fence), Proof Card + Verify, Leaderboard, Agent Studio (source-mode choice, honest pin affordance, real deploy), Operator Dashboard, Markets, directories, H2H Duel, Ops drawer, mobile — token-disciplined throughout. |
 | **Agent SDK** | `veridex-agent` CLI + typed config + `Dockerfile.agent` — the standalone core is the *same single runner seam* the deploy endpoint uses. Secret-safe. |
@@ -232,7 +225,7 @@ Shipped through **six reviewed plans (~130 tasks)** — every task landed via a 
 ### What's next (honest scope)
 
 - **Operator steps (gated, human-only):** the 1-share FAK smoke → `live_ready`; wallet funding + USDC/CTF approvals; a Postgres AgentInstance round-trip on the first real deploy. See the [operator runbook](docs/operator-runbook.md).
-- **Strategy depth (learned from the real run, predeclared):** a `CumulativeDriftAgent` template for smooth multi-day repricing; a market-quality filter so degenerate near-certain lines can't dominate; predeclared in-play evaluation windows.
+- **Falsify the Run-002 hypothesis (C/P2 — Polymarket longshot-divergence falsification):** all-outcome Polymarket normalization; measure divergence over *all* matched decisions (not just drift's fired picks); a later-price convergence test; bid/ask/depth instead of mids; a larger fixture sample. The honest next experiment — to falsify-or-promote the longshot ramp, not to assume it. (The `CumulativeDriftAgent` template and the market-quality eligibility filter that Run-001 rests on are **already built**; predeclared in-play evaluation windows remain ahead.)
 - **Custody / payouts:** the Prize Vault remains designed-and-visible, not wired — no fabricated payouts anywhere.
 - **Control plane:** a hosted runtime/control-plane phase *under* the proof boundary — sessions/memory/tracing as observability, never evidence.
 - **Beyond:** mainnet anchoring, a public verifier explorer, more venue adapters behind the same fail-closed `VenueAdapter` seam.

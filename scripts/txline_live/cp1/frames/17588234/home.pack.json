@@ -1,0 +1,7 @@
+{
+ "pack_version": 1,
+ "fixture_id": 17588234,
+ "frames_file": "home.jsonl",
+ "artifact_content_hash": "60031e6bc3970f84543251c96a33fdeffc1120fe6e5ccc6322b085d7498aff9c",
+ "provenance": "backfilled-price-history"
+}

@@ -40,3 +40,4 @@ scripts/txline_live/*.tsbuildinfo
 apps/web/.env
 apps/web/.env.local
 apps/web/.env.*.local
+scripts/txline_live/packs/
