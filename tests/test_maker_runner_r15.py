@@ -8,6 +8,7 @@ default disk path): ``cfg.trade_artifact_hash`` is the identity, the path is onl
 source of bytes.
 """
 
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -15,6 +16,7 @@ import pytest
 
 import veridex.maker.runner as runner_mod
 from veridex.maker.config import MakerVoidError, build_maker_run_config
+from veridex.maker.diagnostic import FORBIDDEN_FILL_FIELDS
 from veridex.maker.trade_artifact import NormalizedTradeRow, recompute_artifact_hash
 from veridex.maker.trades import AggressorSide
 
@@ -170,3 +172,43 @@ def test_r15_claim_requires_both_pins(monkeypatch):
     assert "R1_5" in str(res.rung) and res.real_executable_edge_bps is None
     r1 = runner_mod.run_maker_arena(_pinned_cfg(), seal=False)  # no artifact -> MM-R1
     assert "R1" in str(r1.rung) and "R1_5" not in str(r1.rung)
+
+
+# --- E4-T4: real-artifact join -> trade-aware diagnostic, no-fill, full accounting ----
+def test_runner_r15_joins_real_artifact_and_stays_no_fill(monkeypatch):
+    class _Art:
+        artifact_hash = recompute_artifact_hash([_row()])  # pin == what the artifact recomputes to
+
+    cfg = build_maker_run_config(fixture_ids=CP1_18, trade_artifact=_Art())
+    monkeypatch.setattr(runner_mod, "load_trade_artifact", lambda *a, **k: _fake_artifact(rows=[_row()]))
+    monkeypatch.setattr(runner_mod, "build_cp1_maker_tape", lambda *a, **k: _fake_tape())
+    res = runner_mod.run_maker_arena(cfg, expected_config_hash=cfg.config_hash(),
+                                     trade_artifact_path=Path("pinned.json"), seal=False)
+
+    assert "R1_5" in str(res.rung)                 # verified trade artifact -> MM-R1.5
+    diagnostic = res.trade_aware_diagnostic
+    assert diagnostic is not None                  # the join produced a diagnostic container
+
+    # FULL ACCOUNTING: every trade grouped-or-unmatched, no silent drop.
+    assert diagnostic["rows_total"] == 1
+    assert diagnostic["rows_total"] == diagnostic["rows_matched"] + diagnostic["rows_unmatched"]
+    # both agents carry a report; convergence built on the residual (basis reported).
+    assert set(diagnostic["per_agent"]) == {"naive-mm", "txline-fair-mm"}
+
+    # HARD no-fill boundary: edge null everywhere; NO forbidden fill/PnL field in the
+    # serialized diagnostic; ``real_executable_edge_bps`` present only as the literal null.
+    assert res.real_executable_edge_bps is None
+    blob = json.dumps(diagnostic)
+    for forbidden in FORBIDDEN_FILL_FIELDS:
+        assert forbidden not in blob
+    for report in diagnostic["per_agent"].values():
+        assert report["real_executable_edge_bps"] is None
+
+
+def test_runner_r15_no_artifact_has_no_diagnostic_and_stays_r1(monkeypatch):
+    # No predeclared artifact -> no join, diagnostic stays None, rung MM-R1 (INSUFFICIENT
+    # trade data for an R1.5 claim).
+    monkeypatch.setattr(runner_mod, "build_cp1_maker_tape", lambda *a, **k: _fake_tape())
+    res = runner_mod.run_maker_arena(_pinned_cfg(), seal=False)
+    assert res.trade_aware_diagnostic is None
+    assert "R1" in str(res.rung) and "R1_5" not in str(res.rung)

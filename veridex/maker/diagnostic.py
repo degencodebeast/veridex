@@ -17,7 +17,7 @@ from collections.abc import Callable
 from statistics import mean
 from typing import TYPE_CHECKING
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from veridex.maker.basis import decompose_gap, reach_from_residual
 from veridex.maker.trades import AggressorSide
@@ -266,3 +266,42 @@ def build_convergence_reach(
         reach_horizon_s=reach_horizon_s,
         n=decomposition.n,
     )
+
+
+class TradeAwareDiagnostic(BaseModel):
+    """R1.5 real-artifact join + trade-aware diagnostic container (no-fill boundary).
+
+    Holds the pinned artifact identity, the FULL join accounting (every joined trade is
+    grouped-or-unmatched — ``rows_total == rows_matched + rows_unmatched``, no silent
+    drops), the per-agent :class:`AdverseSelectionReport`, and the basis-adjusted
+    :class:`ConvergenceReachReport`. It carries NO fill / fill-rate / spread-capture /
+    PnL / realized-PnL / executable-edge field: the trades are an independent diagnostic
+    reference, never Veridex fills.
+
+    ``data_state`` is ``"OK"`` when the join produced at least one usable observation and
+    ``"INSUFFICIENT_DATA"`` when the verified artifact yields nothing separable for this
+    fixture set (a real R1.5 outcome: the artifact earns the rung by data presence, but
+    the diagnostic still has nothing to say).
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    data_state: str
+    artifact_hash: str | None = None
+    rows_total: int = 0
+    rows_matched: int = 0
+    rows_unmatched: int = 0
+    per_agent: dict[str, AdverseSelectionReport] = Field(default_factory=dict)
+    convergence: ConvergenceReachReport | None = None
+    excluded_by_reason: dict[str, int] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def _accounting_reconciles(self) -> "TradeAwareDiagnostic":
+        """Every joined trade is grouped XOR unmatched — no silent drops (AC-102)."""
+        if self.rows_total != self.rows_matched + self.rows_unmatched:
+            raise ValueError(
+                "trade-join accounting failed: rows_total="
+                f"{self.rows_total} != rows_matched+rows_unmatched="
+                f"{self.rows_matched + self.rows_unmatched}"
+            )
+        return self

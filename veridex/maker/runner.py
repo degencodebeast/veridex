@@ -36,6 +36,11 @@ from veridex.maker.config import (
     verify_pinned,
 )
 from veridex.maker.contracts import MarketMakerAgent, Side
+from veridex.maker.diagnostic import (
+    TradeAwareDiagnostic,
+    build_convergence_reach,
+    compute_trade_aware_diagnostic,
+)
 from veridex.maker.falsification import FalsificationResult, falsify
 from veridex.maker.leaderboard import rank_makers, window_clv_analog
 from veridex.maker.mapping import (
@@ -57,6 +62,7 @@ from veridex.maker.trade_artifact import load_trade_artifact, recompute_artifact
 # pin VOIDs BEFORE any trade join. The join itself is wired in E4; here it must merely be
 # reachable/monkeypatchable and provably never called on a VOID.
 from veridex.maker.trades import (  # noqa: F401
+    TradePrint,
     join_trades_to_fixture_with_accounting,
 )
 
@@ -131,6 +137,134 @@ def _score_group(
         for row in rows
     ]
     return score_r1_markout(quote_sets, ref_at, horizons_s)
+
+
+def _row_to_trade_print(row: Any) -> TradePrint:
+    """Project a normalized trade row onto its ``TradePrint`` observation fields.
+
+    Only the market-observation fields cross over (``ts, price, size, aggressor_side,
+    condition_id, token_id``); the chain-event identity stays on the artifact row. NO
+    fill / edge / PnL field is ever introduced — a ``TradePrint`` is a venue trade, never
+    a Veridex fill.
+    """
+    return TradePrint(
+        ts=row.ts,
+        price=row.price,
+        size=row.size,
+        aggressor_side=row.aggressor_side,
+        condition_id=row.condition_id,
+        token_id=row.token_id,
+    )
+
+
+def _build_trade_aware_diagnostic(
+    *,
+    artifact: Any,
+    records: list[Any],
+    cfg: MakerRunConfig,
+    tape: list[dict[str, Any]],
+    agents: tuple[MarketMakerAgent, ...],
+    quality_by: dict[str, list[int]],
+    falsification: FalsificationResult,
+) -> TradeAwareDiagnostic:
+    """Join the verified artifact's trades to fixtures and build the R1.5 diagnostic.
+
+    FULL ACCOUNTING (AC-102): each trade is joined to exactly one fixture-market XOR
+    counted as unmatched, with NO silent drop — a trade matched under one fixture is
+    removed from the pool so it can never be re-counted as unmatched under another
+    (``rows_total == rows_matched + rows_unmatched``). The join key is the pinned mapping
+    ``(condition_id, token_id)`` only (never a live lookup).
+
+    The trades are an independent DIAGNOSTIC reference: no fill / fill-rate / spread-capture
+    / PnL / executable-edge value is produced, and ``real_executable_edge_bps`` stays
+    ``None`` on every per-agent report.
+    """
+    trade_prints = [_row_to_trade_print(row) for row in artifact.rows]
+
+    # Full-accounting join across all fixtures: matched trades are removed from the pool
+    # so a trade matched under fixture A is never re-counted as unmatched under fixture B.
+    remaining: list[TradePrint] = list(trade_prints)
+    matched_prints: list[TradePrint] = []
+    for fixture_id in cfg.fixture_ids:
+        joined, _unmatched = join_trades_to_fixture_with_accounting(
+            remaining, records, fixture_id
+        )
+        matched_here = [trade for group in joined.values() for trade in group]
+        matched_ids = {id(trade) for trade in matched_here}
+        matched_prints.extend(matched_here)
+        remaining = [trade for trade in remaining if id(trade) not in matched_ids]
+    rows_total = len(trade_prints)
+    rows_matched = len(matched_prints)
+    rows_unmatched = len(remaining)
+
+    # No-look-ahead fv lookup over the FULL observed TxLINE fv (fv exists at every tick).
+    all_sorted = sorted(tape, key=lambda row: row["ts"])
+    fv_ts = [row["ts"] for row in all_sorted]
+    fv_vals = [row["fv"] for row in all_sorted]
+
+    def fv_at(ts: int) -> float | None:
+        pos = bisect.bisect_right(fv_ts, ts)
+        if pos == 0:
+            return None
+        return fv_vals[pos - 1]
+
+    # The quote reference the venue trades are measured around: the median fresh venue mid
+    # (fall back to the median fv when no mid is fresh). Size is NEVER used.
+    mids = [row["mid"] for row in tape if row["mid"] is not None]
+    if mids:
+        quote_price = sorted(mids)[len(mids) // 2]
+    else:
+        quote_price = sorted(fv_vals)[len(fv_vals) // 2] if fv_vals else 0.5
+
+    # Per-agent toxicity loss (bps) as a non-negative magnitude derived from the pooled
+    # markout QUALITY (which is <= 0). This is a comparison anchor, NOT a PnL/fill.
+    horizons_s = cfg.markout_horizons_s
+    loss_by = {a.agent_id: -sum(quality_by.get(a.agent_id, [])) for a in agents}
+    agent_ids = [a.agent_id for a in agents]
+    candidate_loss = loss_by[agent_ids[-1]] if agent_ids else None
+    naive_loss = loss_by[agent_ids[0]] if agent_ids else None
+
+    per_agent: dict[str, Any] = {}
+    for agent in agents:
+        per_agent[agent.agent_id] = compute_trade_aware_diagnostic(
+            trades=matched_prints,
+            fv_at=fv_at,
+            quote_price=quote_price,
+            candidate_toxicity_loss_bps=candidate_loss,
+            naive_toxicity_loss_bps=naive_loss,
+            falsification_verdict=falsification.verdict,
+        )
+
+    # Basis-adjusted convergence over the mid-present rows (reach on the RESIDUAL only).
+    mid_rows = [row for row in all_sorted if row["mid"] is not None]
+    convergence = None
+    if mid_rows:
+        convergence = build_convergence_reach(
+            txline_fv=[row["fv"] for row in mid_rows],
+            venue_native=[row["mid"] for row in mid_rows],
+            reach_horizon_s=horizons_s[0] if horizons_s else 60,
+        )
+
+    usable = (
+        rows_matched > 0
+        or (convergence is not None and convergence.residual_reach_fraction is not None)
+        or any(
+            report.independent_reference_verdict != "INSUFFICIENT_DATA"
+            for report in per_agent.values()
+        )
+    )
+    data_state = "OK" if usable else "INSUFFICIENT_DATA"
+
+    return TradeAwareDiagnostic(
+        data_state=data_state,
+        artifact_hash=cfg.trade_artifact_hash,
+        rows_total=rows_total,
+        rows_matched=rows_matched,
+        rows_unmatched=rows_unmatched,
+        per_agent=per_agent,
+        convergence=convergence,
+        excluded_by_reason={},
+    )
 
 
 def run_maker_arena(
@@ -353,6 +487,22 @@ def run_maker_arena(
         )
     )
 
+    # 5b. R1.5 real-artifact join + trade-aware diagnostic. Only when the artifact-content
+    # pin verified (both pins passed): join the artifact's trades to fixtures under FULL
+    # accounting and build the per-agent no-fill diagnostic. Absent a verified artifact the
+    # diagnostic stays None and the run remains MM-R1 (no join, no fabricated value).
+    trade_aware_diagnostic: dict[str, Any] | None = None
+    if has_verified_trades:
+        trade_aware_diagnostic = _build_trade_aware_diagnostic(
+            artifact=artifact,
+            records=records,
+            cfg=cfg,
+            tape=tape,
+            agents=agents,
+            quality_by=quality_by,
+            falsification=falsification,
+        ).model_dump()
+
     # 6. Assemble the result. real_executable_edge_bps stays None (no edge claim).
     # For E2 the verified `trade_artifact_hash` is recorded transitively via the
     # `config_hash` binding (the pin is frozen INTO `cfg.config_hash()`), so the result
@@ -366,6 +516,7 @@ def run_maker_arena(
         per_agent=per_agent,
         maker_leaderboard=maker_leaderboard,
         falsification={**falsification.model_dump(), "headline": headline},
+        trade_aware_diagnostic=trade_aware_diagnostic,
         window_clv_analog=wca,
         fixture_universe_n=len({row["fixture_id"] for row in tape}),
         excluded_by_reason={},
