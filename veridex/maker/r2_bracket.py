@@ -16,6 +16,8 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 __all__ = [
+    "ALLOWED_EX_ANTE_FIELDS",
+    "ALLOWED_FILL_RULES",
     "FORBIDDEN_R2_TRIGGERS",
     "FillAssumptionConfig",
     "render_sensitivity_bracket",
@@ -28,6 +30,44 @@ _BRACKET_LABEL = "UNCALIBRATED / declared model overlay"
 # overlay into a post-hoc fill claim, which R2 must never make (CON-107).
 FORBIDDEN_R2_TRIGGERS = frozenset(
     {"trade_crossed", "price_touched", "mid_crossed", "fv_moved", "post_hoc_fill"}
+)
+
+# CON-106 (Gate-#3 Major 1): ex-ante honesty is proven POSITIVELY by an
+# ALLOWLIST, not by an open-ended denylist. A denylist only rejects the tokens
+# it happens to know; a rule/field that references a LATER observation while
+# avoiding those tokens (e.g. "uses_future_score_after_quote",
+# "future_score_after_quote", "realized_edge_next_bar") would slip through. The
+# allowlist inverts this: only the finite set of rules the render can actually
+# compute and the finite set of quote-time-only inputs are accepted; everything
+# else — including any novel future-referencing name — is rejected by default.
+
+# ALLOWED_FILL_RULES: the finite set of ``fill_probability_rule`` IDs that
+# ``render_r2_suite`` can actually COMPUTE. The render dispatches a SINGLE static
+# fill-probability mechanism (``_pinned_fill_probability`` -> ``rule_params["p"]``);
+# both supported IDs name that same static ex-ante rule. Derived from the render
+# logic in ``r2_suite.py`` + the passing R2 tests — no other rule ID is computed
+# anywhere in the maker lane.
+ALLOWED_FILL_RULES = frozenset({"static_fill_prob", "static_touch_prob"})
+
+# ALLOWED_EX_ANTE_FIELDS: the finite set of quote-time-only field names a rule may
+# reference. Spec §4.4 declares ``ex_ante_fields`` as "allowed at-quote-time
+# inputs" but does NOT enumerate them, so this set is DERIVED from the quote-time
+# quantities the render/rules legitimately use: every entry is knowable AT QUOTE
+# TIME and NONE references any later / realized / future observation (that is the
+# CON-106 ex-ante boundary). Seeded by the fields the passing R2 tests declare
+# (``quote_price``, ``quoted_half_spread``) plus the other quote-time primitives
+# (reference price, quoted spread/size, latency, near-band).
+ALLOWED_EX_ANTE_FIELDS = frozenset(
+    {
+        "quote_price",
+        "quote_size",
+        "quoted_half_spread",
+        "half_spread",
+        "ref_now",
+        "ref_price",
+        "latency_ms",
+        "near_band",
+    }
 )
 
 
@@ -73,15 +113,20 @@ class FillAssumptionConfig(BaseModel):
 
     @model_validator(mode="after")
     def _reject_tape_reactive_triggers(self) -> "FillAssumptionConfig":
-        """R2 fill rule is ex-ante only (CON-107, AC-116).
+        """R2 fill rule is ex-ante only (CON-106/CON-107, AC-116).
 
-        The fill rule and every declared ``ex_ante_fields`` entry must use only
-        information available AT QUOTE TIME. Naming any tape-reactive trigger
-        turns the overlay into a post-hoc fill claim, which is rejected here.
+        Ex-ante-ness is proven POSITIVELY by an ALLOWLIST: ``fill_probability_rule``
+        must be one the render can actually COMPUTE (``ALLOWED_FILL_RULES``) and
+        EVERY declared ``ex_ante_fields`` entry must be a quote-time-only input
+        (``ALLOWED_EX_ANTE_FIELDS``). A denylist alone cannot prove this — a name
+        that references a later observation while avoiding the known tokens (e.g.
+        ``uses_future_score_after_quote``) would slip through — so the allowlist is
+        the primary guard. The ``FORBIDDEN_R2_TRIGGERS`` denylist is kept as
+        defense-in-depth, giving a clear, specific error for known-bad triggers.
         """
-        # Case-insensitive SUBSTRING matching so neither a cased spelling
-        # (``TRADE_CROSSED``) nor a decorated field (``trade_crossed_signal``)
-        # can slip a forbidden trigger past the guard (CON-107, AC-116).
+        # Defense-in-depth: case-insensitive SUBSTRING matching gives a specific
+        # error for a known tape-reactive trigger, whether cased (``TRADE_CROSSED``)
+        # or decorated (``trade_crossed_signal``) (CON-107, AC-116).
         rule = self.fill_probability_rule.lower()
         if any(trigger in rule for trigger in FORBIDDEN_R2_TRIGGERS):
             raise ValueError(
@@ -96,6 +141,21 @@ class FillAssumptionConfig(BaseModel):
                     f"ex_ante_fields entry {field!r} embeds a tape-reactive "
                     f"trigger; R2 may only declare fields available at quote "
                     f"time. Forbidden: {sorted(FORBIDDEN_R2_TRIGGERS)}."
+                )
+
+        # Primary ex-ante proof: positive allowlist membership (CON-106).
+        if self.fill_probability_rule not in ALLOWED_FILL_RULES:
+            raise ValueError(
+                f"fill_probability_rule {self.fill_probability_rule!r} is not an "
+                f"allowlisted ex-ante rule the render can compute; R2 proves "
+                f"ex-ante-ness positively. Allowed: {sorted(ALLOWED_FILL_RULES)}."
+            )
+        for field in self.ex_ante_fields:
+            if field not in ALLOWED_EX_ANTE_FIELDS:
+                raise ValueError(
+                    f"ex_ante_fields entry {field!r} is not an allowlisted "
+                    f"quote-time input; R2 may only declare fields available AT "
+                    f"QUOTE TIME. Allowed: {sorted(ALLOWED_EX_ANTE_FIELDS)}."
                 )
         return self
 

@@ -126,3 +126,28 @@ def test_draw_mode_rejects_unknown_value():
     # m1: a typo'd draw_mode must be rejected, not silently treated deterministic.
     with pytest.raises(ValidationError):
         _cfg(draw_mode="SEEDED")
+
+
+def test_non_allowlisted_fill_rule_rejected():
+    # CON-106 (Gate-#3 Major 1): ex-ante honesty is proven by an ALLOWLIST, not a
+    # denylist. A rule that references a later observation but avoids the 5
+    # forbidden tokens (e.g. "uses_future_score_after_quote") slips the denylist,
+    # so the allowlist must reject any fill rule it cannot actually compute.
+    with pytest.raises(ValidationError):
+        _cfg(fill_probability_rule="uses_future_score_after_quote")
+
+
+def test_non_allowlisted_ex_ante_field_rejected():
+    # CON-106 (Gate-#3 Major 1): a declared ex-ante field that names a later
+    # observation ("future_score_after_quote") avoids the 5 forbidden tokens but
+    # is NOT a quote-time input -> the allowlist must reject it.
+    with pytest.raises(ValidationError):
+        _cfg(ex_ante_fields=["future_score_after_quote"])
+
+
+def test_split_or_renamed_realized_trigger_rejected():
+    # CON-106 (Gate-#3 Major 1): a future-/realized-referencing name that avoids
+    # every forbidden token ("realized_edge_next_bar") must still be rejected —
+    # positive ex-ante proof (allowlist), not open-ended denylist.
+    with pytest.raises(ValidationError):
+        _cfg(ex_ante_fields=["realized_edge_next_bar"])
