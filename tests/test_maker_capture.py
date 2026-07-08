@@ -15,7 +15,11 @@ from pathlib import Path
 import pytest
 
 import veridex.maker.capture as capture_module
-from veridex.maker.capture import build_trade_artifact, decode_order_filled
+from veridex.maker.capture import (
+    build_trade_artifact,
+    capture_order_filled_artifact,
+    decode_order_filled,
+)
 from veridex.maker.mapping import PINNED_MAPPING_HASH
 from veridex.maker.markout import MarkoutError
 
@@ -143,4 +147,49 @@ def test_build_trade_artifact_reconciles_and_has_no_token():
         + artifact.rows_duplicate_dropped
     )
     assert artifact.mapping_content_hash == PINNED_MAPPING_HASH
+    assert "HYPERSYNC" not in json.dumps(artifact.model_dump())
+
+
+def test_capture_entrypoint_fails_closed_without_token(monkeypatch, tmp_path):
+    monkeypatch.delenv("HYPERSYNC_API", raising=False)
+    out_path = tmp_path / "artifact.json"
+    with pytest.raises(RuntimeError):
+        capture_order_filled_artifact(from_block=1, to_block=2, out_path=out_path)
+    # fail-closed BEFORE any I/O: no artifact written.
+    assert not out_path.exists()
+
+
+class _FakeClient:
+    """An injected, network-free log source returning canned decoded logs."""
+
+    def __init__(self, logs):
+        self._logs = logs
+
+    def fetch_order_filled_logs(self, *, from_block, to_block):
+        return list(self._logs)
+
+
+def test_capture_entrypoint_with_injected_client_writes_tokenless_artifact(
+    monkeypatch, tmp_path
+):
+    import json
+
+    monkeypatch.delenv("HYPERSYNC_API", raising=False)
+    logs = [_order_filled_log(takerAssetId="42", log_index=7)]
+    out_path = tmp_path / "artifact.json"
+
+    artifact = capture_order_filled_artifact(
+        from_block=1,
+        to_block=2,
+        out_path=out_path,
+        client=_FakeClient(logs),
+        records=[{"token_id": "42"}],
+        manifest_meta=dict(_MANIFEST_META),
+    )
+
+    assert artifact.rows_matched_cp1 == 1
+    assert out_path.exists()
+    written = out_path.read_text()
+    # No operator token leaks into the persisted artifact.
+    assert "HYPERSYNC" not in written
     assert "HYPERSYNC" not in json.dumps(artifact.model_dump())

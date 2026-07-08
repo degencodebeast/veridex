@@ -26,7 +26,10 @@ module imports only the standard library and ``veridex.*``.
 
 from __future__ import annotations
 
-from typing import Any
+import json
+import os
+from pathlib import Path
+from typing import Any, Protocol
 
 from veridex.maker.mapping import PINNED_MAPPING_HASH
 from veridex.maker.markout import assert_native_prob
@@ -39,9 +42,28 @@ from veridex.maker.trade_artifact import (
 )
 
 __all__ = [
+    "OrderFilledLogSource",
     "build_trade_artifact",
+    "capture_order_filled_artifact",
     "decode_order_filled",
 ]
+
+
+class OrderFilledLogSource(Protocol):
+    """An injected, network-owning source of decoded ``OrderFilled`` logs.
+
+    The operator supplies the concrete implementation (e.g. a thin HyperSync
+    adapter that already holds the operator token). Keeping the network behind this
+    Protocol is what lets :mod:`veridex.maker.capture` import only stdlib +
+    ``veridex.*`` and lets tests inject a network-free fake.
+    """
+
+    def fetch_order_filled_logs(
+        self, *, from_block: int, to_block: int
+    ) -> list[dict[str, Any]]:
+        """Return decoded ``OrderFilled`` log dicts for the block range."""
+        ...
+
 
 #: The CTF Exchange V2 collateral (USDC) leg is emitted with assetId ``"0"``.
 _COLLATERAL_ASSET_ID = "0"
@@ -182,3 +204,113 @@ def build_trade_artifact(
         rows=tuple(unique_rows),
     )
     return TradeArtifact(**manifest)
+
+
+def capture_order_filled_artifact(
+    *,
+    from_block: int,
+    to_block: int,
+    out_path: str | Path,
+    client: OrderFilledLogSource | None = None,
+    records: list[dict[str, Any]] | None = None,
+    manifest_meta: dict[str, Any] | None = None,
+) -> TradeArtifact:
+    """Operator entrypoint: capture ``OrderFilled`` logs into a pinned artifact.
+
+    This is the ONLY place the ``HYPERSYNC_API`` operator secret is read, and it is
+    read purely to **gate** the run: the token is never passed into
+    :func:`build_trade_artifact`, never written into the artifact/manifest, and
+    never returned. The log source is an injected :class:`OrderFilledLogSource`, so
+    this function performs no network import itself and tests exercise it with a
+    network-free fake.
+
+    Fail-closed contract: with no injected ``client`` and no ``HYPERSYNC_API`` in the
+    environment, this raises before any network or file I/O.
+
+    Args:
+        from_block: First block (inclusive) of the capture range.
+        to_block: Last block (inclusive) of the capture range.
+        out_path: Destination path for the JSON artifact.
+        client: Injected log source. When ``None``, a token must be present AND a
+            client must still be provided (this module builds no network client).
+        records: Pinned cp1 mapping records; loaded from the pinned mapping artifact
+            when ``None``.
+        manifest_meta: Descriptive manifest fields; a default operator manifest is
+            built when ``None``.
+
+    Returns:
+        The validated, persisted :class:`TradeArtifact`.
+
+    Raises:
+        RuntimeError: If neither an injected client nor the ``HYPERSYNC_API`` token
+            is available (fail-closed), performing no network or file I/O.
+    """
+    token = os.environ.get("HYPERSYNC_API")
+    if client is None:
+        if not token:
+            raise RuntimeError(
+                "capture fails closed: the operator capture token is not set and no "
+                "log-source client was injected; no network call or file write was "
+                "performed (see docs/maker/r15-capture-runbook.md)"
+            )
+        raise RuntimeError(
+            "no OrderFilledLogSource injected: build a HyperSync-backed client from "
+            "the operator capture token in the operator harness and pass it as "
+            "client=...; veridex.maker.capture performs no network import of its own"
+        )
+
+    logs = client.fetch_order_filled_logs(from_block=from_block, to_block=to_block)
+    rows = [decode_order_filled(log) for log in logs]
+
+    if records is None:
+        records = _load_pinned_cp1_records()
+    if manifest_meta is None:
+        manifest_meta = _default_operator_manifest_meta(
+            from_block=from_block,
+            to_block=to_block,
+            token_supplied_externally=token is not None,
+        )
+
+    artifact = build_trade_artifact(rows, records=records, manifest_meta=manifest_meta)
+    Path(out_path).write_text(
+        json.dumps(artifact.model_dump(mode="json"), sort_keys=True, indent=2)
+    )
+    return artifact
+
+
+def _load_pinned_cp1_records() -> list[dict[str, Any]]:
+    """Load the pinned cp1 token set from committed mapping bytes (no network)."""
+    from veridex.maker.mapping import DEFAULT_MAPPING_PATH, load_resolved_market_lookup
+
+    parsed, _hash = load_resolved_market_lookup(DEFAULT_MAPPING_PATH)
+    return [{"token_id": record.token_id} for record in parsed]
+
+
+def _default_operator_manifest_meta(
+    *, from_block: int, to_block: int, token_supplied_externally: bool
+) -> dict[str, Any]:
+    """Build a default descriptive manifest (carries no operator secret)."""
+    return {
+        "raw_artifact_hash": None,
+        "schema_version": "v1",
+        "decoder_version": "orderfilled-cleanroom-v1",
+        "decoder_commit": None,
+        "source": "polymarket_ctf_exchange_v2_orderfilled",
+        "chain_id": 137,
+        "contract_address": "0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E",
+        "event_signature": (
+            "OrderFilled(bytes32,address,address,uint256,uint256,uint256,uint256,uint256)"
+        ),
+        "from_block": from_block,
+        "to_block": to_block,
+        "reorg_buffer_confs": 20,
+        "capture_ts": 0,
+        "capture_tool_id": "veridex-maker-capture",
+        "provider_id": "hypersync",
+        "token_supplied_externally": token_supplied_externally,
+        "fixture_count": 18,
+        "side_count": 54,
+        "cleanroom_attestation": (
+            "clean-room decode from CTF Exchange V2 OrderFilled ABI; no GPL code copied"
+        ),
+    }
