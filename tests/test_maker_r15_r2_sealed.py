@@ -55,9 +55,23 @@ def _fill_assumption(**kw) -> FillAssumptionConfig:
     return FillAssumptionConfig(**base)
 
 
+def _real_cp1_record(market_ref: str = "1X2|home|full"):
+    """A REAL pinned cp1 record for CP1_18[0] so a trade join yields rows_matched>0."""
+    from veridex.maker.mapping import DEFAULT_MAPPING_PATH, load_resolved_market_lookup
+
+    records, _hash = load_resolved_market_lookup(DEFAULT_MAPPING_PATH)
+    return next(
+        r for r in records if r.fixture_id == CP1_18[0] and r.market_ref == market_ref
+    )
+
+
 def _row(**kw):
+    # Default to a REAL cp1-matching (condition_id, token_id) so the join matches and the
+    # run earns MM-R1.5 (M1: a claimed MM-R1.5 requires at least one real matched trade).
+    rec = _real_cp1_record()
     base = dict(ts=1, price=0.5, size=2.0, aggressor_side=AggressorSide.BUY,
-                condition_id="0xc", token_id="42", block_number=100, tx_hash="0xabc", log_index=3)
+                condition_id=rec.condition_id, token_id=rec.token_id,
+                block_number=100, tx_hash="0xabc", log_index=3)
     base.update(kw)
     return NormalizedTradeRow(**base)
 
@@ -160,6 +174,27 @@ def test_r2_attached_is_report_only(monkeypatch):
     assert r2.real_executable_edge_bps is None
     assert r2.r2_bracket["real_executable_edge_bps"] is None
     assert r2.r2_bracket["realized_pnl"] is None
+
+
+# --- m2 (GUD-101): on an all-abstain tape with NO real markouts, the R2 overlay must be
+# SKIPPED (r2_bracket None), never rendered on a fabricated neutral [0] markout.
+def test_r2_overlay_skipped_when_no_real_markouts(monkeypatch):
+    def _abstain_tape():
+        # A single tick with NO fresh venue mid -> no quote is scored -> zero real markouts.
+        return [{"ts": 0, "fixture_id": CP1_18[0], "tick_seq": 0,
+                 "txline_market_key": "1X2_PARTICIPANT_RESULT||", "txline_side": "part1",
+                 "venue_market_ref": "1X2|home|full", "venue_side": "home",
+                 "fv": 0.60, "mid": None, "staleness_s": 0}]
+
+    monkeypatch.setattr(runner_mod, "build_cp1_maker_tape", lambda *a, **k: _abstain_tape())
+
+    fa = _fill_assumption()
+    cfg = build_maker_run_config(fixture_ids=CP1_18, fill_assumption=fa)
+    res = runner_mod.run_maker_arena(
+        cfg, expected_config_hash=cfg.config_hash(), fill_assumption=fa, seal=False
+    )
+    # No real per-quote markout exists -> overlay skipped rather than imputing zero.
+    assert res.r2_bracket is None
 
 
 # --- E9-T2: three-path integration ------------------------------------------------

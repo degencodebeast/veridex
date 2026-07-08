@@ -342,10 +342,12 @@ class TradeAwareDiagnostic(BaseModel):
     PnL / realized-PnL / executable-edge field: the trades are an independent diagnostic
     reference, never Veridex fills.
 
-    ``data_state`` is ``"OK"`` when the join produced at least one usable observation and
-    ``"INSUFFICIENT_DATA"`` when the verified artifact yields nothing separable for this
-    fixture set (a real R1.5 outcome: the artifact earns the rung by data presence, but
-    the diagnostic still has nothing to say).
+    ``data_state`` is ``"REAL_TRADES"`` when a real cp1-matching trade informed the
+    diagnostic (``rows_matched > 0``) and ``"INSUFFICIENT_DATA"`` otherwise (spec §4.3 /
+    AC-103). It gates ONLY on trade-derived signal: convergence is computed from the fv/mid
+    tape (no trades) and is reported but NEVER vouches for trade-data adequacy. A verified
+    artifact whose rows match no cp1 fixture yields ``INSUFFICIENT_DATA`` and the lane stays
+    MM-R1 -- there is no ``"OK for convergence-only"`` state.
     """
 
     model_config = ConfigDict(frozen=True, extra="forbid")

@@ -53,6 +53,24 @@ def _fake_artifact(rows):
     return SimpleNamespace(rows=tuple(rows))
 
 
+def _real_cp1_record(market_ref: str = "1X2|home|full"):
+    """A REAL pinned cp1 mapping record for CP1_18[0] (so a trade join can MATCH it)."""
+    from veridex.maker.mapping import DEFAULT_MAPPING_PATH, load_resolved_market_lookup
+
+    records, _hash = load_resolved_market_lookup(DEFAULT_MAPPING_PATH)
+    return next(
+        r for r in records if r.fixture_id == CP1_18[0] and r.market_ref == market_ref
+    )
+
+
+def _matching_row(**kw):
+    """A ``_row`` whose (condition_id, token_id) matches a REAL cp1 record -> rows_matched>0."""
+    rec = _real_cp1_record()
+    base = dict(condition_id=rec.condition_id, token_id=rec.token_id)
+    base.update(kw)
+    return _row(**base)
+
+
 def _fake_tape():
     # Two markets of CP1_18[0] so a trade matched to EITHER market (home or away) has its
     # own per-market fv series to be marked out against (no cross-market fv borrowing).
@@ -243,11 +261,15 @@ def test_loader_receives_exact_supplied_path_after_config_pin(monkeypatch):
 
 # --- E2-T3: both pins matching -> claimable MM-R1.5; stamping-only insufficient ----
 def test_r15_claim_requires_both_pins(monkeypatch):
+    # A REAL cp1-matching row so the join yields rows_matched>0 -> a genuine MM-R1.5 claim
+    # (a hash-valid artifact with ZERO matched trades stays MM-R1; see M1 test below).
+    matched = [_matching_row()]
+
     class _Art:
-        artifact_hash = recompute_artifact_hash([_row()])  # pin == what the artifact recomputes to
+        artifact_hash = recompute_artifact_hash(matched)  # pin == what the artifact recomputes to
 
     cfg = build_maker_run_config(fixture_ids=CP1_18, trade_artifact=_Art())
-    monkeypatch.setattr(runner_mod, "load_trade_artifact", lambda *a, **k: _fake_artifact(rows=[_row()]))
+    monkeypatch.setattr(runner_mod, "load_trade_artifact", lambda *a, **k: _fake_artifact(rows=matched))
     monkeypatch.setattr(runner_mod, "build_cp1_maker_tape", lambda *a, **k: _fake_tape())  # keep fast
     res = runner_mod.run_maker_arena(cfg, expected_config_hash=cfg.config_hash(),
                                      trade_artifact_path=Path("pinned.json"), seal=False)
@@ -258,18 +280,24 @@ def test_r15_claim_requires_both_pins(monkeypatch):
 
 # --- E4-T4: real-artifact join -> trade-aware diagnostic, no-fill, full accounting ----
 def test_runner_r15_joins_real_artifact_and_stays_no_fill(monkeypatch):
+    # A REAL cp1-matching row so rows_matched>0 and the run earns MM-R1.5 (M1: a claimed
+    # MM-R1.5 must be backed by at least one real matched trade, not a mere pinned artifact).
+    matched = [_matching_row()]
+
     class _Art:
-        artifact_hash = recompute_artifact_hash([_row()])  # pin == what the artifact recomputes to
+        artifact_hash = recompute_artifact_hash(matched)  # pin == what the artifact recomputes to
 
     cfg = build_maker_run_config(fixture_ids=CP1_18, trade_artifact=_Art())
-    monkeypatch.setattr(runner_mod, "load_trade_artifact", lambda *a, **k: _fake_artifact(rows=[_row()]))
+    monkeypatch.setattr(runner_mod, "load_trade_artifact", lambda *a, **k: _fake_artifact(rows=matched))
     monkeypatch.setattr(runner_mod, "build_cp1_maker_tape", lambda *a, **k: _fake_tape())
     res = runner_mod.run_maker_arena(cfg, expected_config_hash=cfg.config_hash(),
                                      trade_artifact_path=Path("pinned.json"), seal=False)
 
-    assert "R1_5" in str(res.rung)                 # verified trade artifact -> MM-R1.5
+    assert "R1_5" in str(res.rung)                 # verified matched trade artifact -> MM-R1.5
     diagnostic = res.trade_aware_diagnostic
     assert diagnostic is not None                  # the join produced a diagnostic container
+    assert diagnostic["data_state"] == "REAL_TRADES"   # a real matched trade informed it
+    assert diagnostic["rows_matched"] == 1
 
     # FULL ACCOUNTING: every trade grouped-or-unmatched, no silent drop.
     assert diagnostic["rows_total"] == 1
@@ -298,12 +326,17 @@ def test_runner_r15_join_matches_real_mapping_row(monkeypatch):
     from veridex.maker.mapping import DEFAULT_MAPPING_PATH, load_resolved_market_lookup
 
     records, _hash = load_resolved_market_lookup(DEFAULT_MAPPING_PATH)
-    # A REAL pinned (condition_id, token_id) whose fixture is in the pinned cp1 set.
-    rec = next(r for r in records if r.fixture_id in CP1_18)
+    # A REAL pinned (condition_id, token_id) for CP1_18[0]'s HOME market (the market present in
+    # `_fake_tape`), so the enriched join matches AND the trade sits near that market's OWN
+    # median mid (0.58) under the per-market near-quote reference.
+    rec = next(
+        r for r in records if r.fixture_id == CP1_18[0] and r.market_ref == "1X2|home|full"
+    )
 
     # Decoder-shaped row: REAL token_id, but condition_id="" (as the ABI decode leaves it).
+    # Price 0.58 == the home market's median mid in `_fake_tape` -> near the per-market quote.
     raw_row = NormalizedTradeRow(
-        ts=1, price=0.5, size=2.0, aggressor_side=AggressorSide.BUY,
+        ts=1, price=0.58, size=2.0, aggressor_side=AggressorSide.BUY,
         condition_id="", token_id=rec.token_id,
         block_number=100, tx_hash="0xabc", log_index=3,
     )
@@ -417,6 +450,98 @@ def test_runner_r15_no_artifact_has_no_diagnostic_and_stays_r1(monkeypatch):
     res = runner_mod.run_maker_arena(_pinned_cfg(), seal=False)
     assert res.trade_aware_diagnostic is None
     assert "R1" in str(res.rung) and "R1_5" not in str(res.rung)
+
+
+# --- M1 (honesty, AC-103/§4.3): a pinned artifact with ZERO cp1-matching trades must
+# stay MM-R1 / INSUFFICIENT_DATA -- the tape-only convergence disjunct must NOT vouch for
+# trade-data adequacy, and the rung must NOT upgrade to R1.5 on an empty/synthetic join.
+def test_zero_matched_trades_is_insufficient_data_and_stays_r1(monkeypatch):
+    monkeypatch.setattr(runner_mod, "build_cp1_maker_tape", lambda *a, **k: _fake_tape())
+
+    # (i) A provenance-/hash-valid artifact whose row matches NO pinned cp1
+    # (condition_id, token_id) (the default _row() uses condition_id="0xc", token_id="42").
+    # Convergence over the fv/mid tape is non-None, but that is NOT a trade signal:
+    # rows_matched==0 -> data_state INSUFFICIENT_DATA, rung stays MM-R1.
+    nonmatching = [_row()]
+
+    class _ArtNoMatch:
+        artifact_hash = recompute_artifact_hash(nonmatching)
+
+    cfg = build_maker_run_config(fixture_ids=CP1_18, trade_artifact=_ArtNoMatch())
+    monkeypatch.setattr(runner_mod, "load_trade_artifact",
+                        lambda *a, **k: _fake_artifact(rows=nonmatching))
+    res = runner_mod.run_maker_arena(cfg, expected_config_hash=cfg.config_hash(),
+                                     trade_artifact_path=Path("pinned.json"), seal=False)
+    assert "R1" in str(res.rung) and "R1_5" not in str(res.rung)
+    assert res.trade_aware_diagnostic is not None
+    assert res.trade_aware_diagnostic["data_state"] == "INSUFFICIENT_DATA"
+    assert res.trade_aware_diagnostic["rows_matched"] == 0
+    assert res.real_executable_edge_bps is None
+
+    # (ii) An EMPTY-rows artifact: no trade at all -> same MM-R1 / INSUFFICIENT_DATA.
+    empty: list = []
+
+    class _ArtEmpty:
+        artifact_hash = recompute_artifact_hash(empty)
+
+    cfg2 = build_maker_run_config(fixture_ids=CP1_18, trade_artifact=_ArtEmpty())
+    monkeypatch.setattr(runner_mod, "load_trade_artifact",
+                        lambda *a, **k: _fake_artifact(rows=empty))
+    res2 = runner_mod.run_maker_arena(cfg2, expected_config_hash=cfg2.config_hash(),
+                                      trade_artifact_path=Path("pinned.json"), seal=False)
+    assert "R1" in str(res2.rung) and "R1_5" not in str(res2.rung)
+    assert res2.trade_aware_diagnostic["data_state"] == "INSUFFICIENT_DATA"
+    assert res2.trade_aware_diagnostic["rows_matched"] == 0
+    assert res2.real_executable_edge_bps is None
+
+
+# --- m1 (per-market near-quote reference): the "near the quote" band must be measured
+# against EACH market's OWN median mid, never a single tape-wide median pooled across
+# markets trading at different price levels.
+def test_near_quote_reference_is_per_market_not_global(monkeypatch):
+    home = _real_cp1_record("1X2|home|full")
+    away = _real_cp1_record("1X2|away|full")
+
+    # Home market trades ~0.85; away market trades ~0.15. A global pooled median would land
+    # at one level and wrongly exclude the other market's near-quote trade.
+    rows = [
+        _row(ts=1000, price=0.85, aggressor_side=AggressorSide.BUY,
+             condition_id=home.condition_id, token_id=home.token_id),
+        _row(ts=1000, price=0.15, aggressor_side=AggressorSide.BUY,
+             condition_id=away.condition_id, token_id=away.token_id),
+    ]
+
+    _common = {"fixture_id": CP1_18[0], "tick_seq": 0,
+               "txline_market_key": "1X2_PARTICIPANT_RESULT||", "staleness_s": 0}
+
+    def _tape():
+        return [
+            {**_common, "ts": 1000, "txline_side": "part1",
+             "venue_market_ref": "1X2|home|full", "venue_side": "home", "fv": 0.85, "mid": 0.85},
+            {**_common, "ts": 1100, "txline_side": "part1",
+             "venue_market_ref": "1X2|home|full", "venue_side": "home", "fv": 0.85, "mid": 0.85},
+            {**_common, "ts": 1000, "txline_side": "part2",
+             "venue_market_ref": "1X2|away|full", "venue_side": "away", "fv": 0.15, "mid": 0.15},
+            {**_common, "ts": 1100, "txline_side": "part2",
+             "venue_market_ref": "1X2|away|full", "venue_side": "away", "fv": 0.15, "mid": 0.15},
+        ]
+
+    class _Art:
+        artifact_hash = recompute_artifact_hash(rows)
+
+    cfg = build_maker_run_config(fixture_ids=CP1_18, trade_artifact=_Art())
+    monkeypatch.setattr(runner_mod, "load_trade_artifact", lambda *a, **k: _fake_artifact(rows=rows))
+    monkeypatch.setattr(runner_mod, "build_cp1_maker_tape", lambda *a, **k: _tape())
+    res = runner_mod.run_maker_arena(cfg, expected_config_hash=cfg.config_hash(),
+                                     trade_artifact_path=Path("pinned.json"), seal=False)
+
+    diagnostic = res.trade_aware_diagnostic
+    assert diagnostic is not None
+    assert diagnostic["rows_matched"] == 2
+    # Per-market: BOTH trades sit near their OWN market's median mid -> near-count 2. A single
+    # global median (~0.85) would exclude the away trade at 0.15 (wrongly counting only 1).
+    for report in diagnostic["per_agent"].values():
+        assert report["trades_near_quote_count"] == 2
 
 
 # --- Codex Gate-#2 Major: candidate/naive toxicity loss must be a MEAN, not a

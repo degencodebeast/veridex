@@ -245,15 +245,20 @@ def _build_trade_aware_diagnostic(
         )
 
     all_sorted = sorted(tape, key=lambda row: row["ts"])
-    fv_vals = [row["fv"] for row in all_sorted]
 
-    # The quote reference the venue trades are measured around: the median fresh venue mid
-    # (fall back to the median fv when no mid is fresh). Size is NEVER used.
-    mids = [row["mid"] for row in tape if row["mid"] is not None]
-    if mids:
-        quote_price = sorted(mids)[len(mids) // 2]
-    else:
-        quote_price = sorted(fv_vals)[len(fv_vals) // 2] if fv_vals else 0.5
+    # The quote reference each market's venue trades are measured around is THAT market's OWN
+    # median fresh venue mid -- per-market, mirroring the already-per-market `fv_at`. A single
+    # tape-wide median pooled across all 18 fixtures would misjudge "near the quote" for any
+    # market trading at a different price level (a home market near 0.85 vs an away market near
+    # 0.15). Fall back to the market's own median fv when it has no fresh mid, then 0.5 when it
+    # has neither. Size is NEVER used.
+    def _market_quote_price(key: tuple[int, str]) -> float:
+        market_rows = fv_rows_by_market.get(key, [])
+        market_mids = [row["mid"] for row in market_rows if row["mid"] is not None]
+        if market_mids:
+            return sorted(market_mids)[len(market_mids) // 2]
+        market_fvs = [row["fv"] for row in market_rows]
+        return sorted(market_fvs)[len(market_fvs) // 2] if market_fvs else 0.5
 
     # Per-agent toxicity loss (bps) as a non-negative MEAN magnitude derived from the
     # pooled markout QUALITY (which is <= 0). This is a comparison anchor, NOT a
@@ -287,7 +292,7 @@ def _build_trade_aware_diagnostic(
         ts_list, fv_list = fv_series_by_market.get(market_key, ([], []))
         market_fv_at = _group_fv_at(ts_list, fv_list)
         signs, contributions, near, total = gather_near_trade_signals(
-            market_trades, market_fv_at, quote_price
+            market_trades, market_fv_at, _market_quote_price(market_key)
         )
         pooled_signs.extend(signs)
         pooled_contributions.extend(contributions)
@@ -316,15 +321,12 @@ def _build_trade_aware_diagnostic(
             reach_horizon_s=horizons_s[0] if horizons_s else 60,
         )
 
-    usable = (
-        rows_matched > 0
-        or (convergence is not None and convergence.residual_reach_fraction is not None)
-        or any(
-            report.independent_reference_verdict != "INSUFFICIENT_DATA"
-            for report in per_agent.values()
-        )
-    )
-    data_state = "OK" if usable else "INSUFFICIENT_DATA"
+    # data_state gates ONLY on trade-derived signal (spec §4.3 / AC-103): REAL_TRADES iff a
+    # real cp1-matching trade informed the diagnostic (rows_matched > 0), else
+    # INSUFFICIENT_DATA. Convergence is computed from the fv/mid tape (NO trades), so it must
+    # NOT vouch for trade-data adequacy -- it is still REPORTED below (real fv/mid signal) but
+    # never drives data_state. There is no "OK for convergence-only" state.
+    data_state = "REAL_TRADES" if rows_matched > 0 else "INSUFFICIENT_DATA"
 
     return TradeAwareDiagnostic(
         data_state=data_state,
@@ -362,8 +364,9 @@ def run_maker_arena(
     4. Score per ``(fixture_id, venue_market_ref)`` market (each quote marked out only
        against its OWN market's future fv), pool toxicity quality across markets, and
        run the naive-vs-candidate falsification on the pooled quality.
-    5. Assign the data-feasibility rung (mids present; trades present + verified ->
-       MM-R1.5, else MM-R1).
+    5. Join the verified artifact's trades and assign the data-feasibility rung: mids
+       present + at least one REAL cp1-matching trade (rows_matched > 0) -> MM-R1.5;
+       a pinned artifact with ZERO matched trades stays MM-R1 / INSUFFICIENT_DATA.
     6. Assemble the :class:`MakerArenaResult`.
     7. Write the sealed artifact ONLY when ``seal=True``.
 
@@ -578,23 +581,15 @@ def run_maker_arena(
     top = maker_leaderboard[0]
     wca = window_clv_analog(top["avg_markout_bps"], top["scored"])
 
-    # 5. Rung from data presence alone (mids present; a verified trade artifact ->
-    # MM-R1.5 via the EXISTING gate, else MM-R1). No parallel rung path is invented.
-    rung = assign_rung(
-        DataPresence(
-            has_mids=True,
-            has_trades=has_verified_trades,
-            has_fill_assumption=False,
-        )
-    )
-
-    # 5b. R1.5 real-artifact join + trade-aware diagnostic. Only when the artifact-content
-    # pin verified (both pins passed): join the artifact's trades to fixtures under FULL
-    # accounting and build the per-agent no-fill diagnostic. Absent a verified artifact the
-    # diagnostic stays None and the run remains MM-R1 (no join, no fabricated value).
-    trade_aware_diagnostic: dict[str, Any] | None = None
+    # 5. R1.5 real-artifact join + trade-aware diagnostic -- computed BEFORE the rung so the
+    # join result (rows_matched) can gate the rung. Only when the artifact-content pin verified
+    # (both pins passed): join the artifact's trades to fixtures under FULL accounting and build
+    # the per-agent no-fill diagnostic. Absent a verified artifact the diagnostic stays None and
+    # the run remains MM-R1 (no join, no fabricated value).
+    trade_aware_report = None
+    rows_matched = 0
     if has_verified_trades:
-        trade_aware_diagnostic = _build_trade_aware_diagnostic(
+        trade_aware_report = _build_trade_aware_diagnostic(
             artifact=artifact,
             records=records,
             cfg=cfg,
@@ -602,7 +597,24 @@ def run_maker_arena(
             agents=agents,
             quality_by=quality_by,
             falsification=falsification,
-        ).model_dump()
+        )
+        rows_matched = trade_aware_report.rows_matched
+    trade_aware_diagnostic: dict[str, Any] | None = (
+        trade_aware_report.model_dump() if trade_aware_report is not None else None
+    )
+
+    # 5b. Rung from data presence (AC-103): MM-R1.5 requires a REAL matched trade
+    # (rows_matched > 0) to have informed the diagnostic -- NOT merely a pinned artifact. A
+    # hash-/provenance-valid (or EMPTY-rows) artifact whose rows match NO cp1 fixture stays
+    # MM-R1 with data_state=INSUFFICIENT_DATA, so no empty/synthetic R1.5 claim is ever sealed.
+    # The pins still VOID before any I/O (unchanged); only the rung is derived from the join.
+    rung = assign_rung(
+        DataPresence(
+            has_mids=True,
+            has_trades=rows_matched > 0,
+            has_fill_assumption=False,
+        )
+    )
 
     # 5c. R2 REPORT-ONLY OVERLAY (REQ-107/108). When a pinned ex-ante fill assumption was
     # supplied (and passed the 2d instance pin), attach a quadruple-labeled
@@ -610,14 +622,16 @@ def run_maker_arena(
     # inputs. It is a DECLARED MODEL OVERLAY: it does NOT touch the rung (computed above
     # from data presence alone) and produces NO executable edge / fill value. The markout
     # inputs are the observed per-quote markout_bps pooled across agents (a report-only
-    # input, never a fill); an empty degenerate tape falls back to a neutral [0] so the
-    # overlay renders without fabricating a value.
+    # input, never a fill). GUD-101: on an all-abstain/degenerate tape with NO real markouts,
+    # SKIP the overlay (leave r2_bracket=None) rather than imputing a neutral [0] markout -- a
+    # fabricated value. Only render when there is at least one real per-quote markout.
     r2_bracket: dict[str, Any] | None = None
     if fill_assumption is not None:
         r2_markouts = [
             mark.markout_bps for agent in agents for mark in marks_by[agent.agent_id]
-        ] or [0]
-        r2_bracket = render_r2_suite(r2_markouts, fill_assumption).model_dump()
+        ]
+        if r2_markouts:
+            r2_bracket = render_r2_suite(r2_markouts, fill_assumption).model_dump()
 
     # 6. Assemble the result. real_executable_edge_bps stays None (no edge claim).
     # For E2 the verified `trade_artifact_hash` is recorded transitively via the
