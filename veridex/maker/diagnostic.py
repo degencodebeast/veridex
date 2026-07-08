@@ -52,7 +52,6 @@ class AdverseSelectionReport(BaseModel):
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    trade_flow_preceding_fv_move_bps_diagnostic: int | None = None
     toxic_vs_benign_flow_ratio_diagnostic: float | None = None
     trades_near_quote_count: int = 0
     # E4-T1 extended report-only diagnostics (all ``_diagnostic``-suffixed, ``None`` on
@@ -74,50 +73,32 @@ class AdverseSelectionReport(BaseModel):
     real_executable_edge_bps: None = None
 
 
-def compute_trade_aware_diagnostic(
-    trades: list["TradePrint"],
+def gather_near_trade_signals(
+    trades: list[TradePrint],
     fv_at: Callable[[int], float | None],
     quote_price: float,
     *,
     window_s: int = 120,
     near_band: float = 0.10,
-    # Reserved (spec-mandated Item-9 signature): accepted but not yet consumed — no
-    # naive-quote computation is performed here.
-    naive_quote_price: float | None = None,
-    candidate_toxicity_loss_bps: int | None = None,
-    naive_toxicity_loss_bps: int | None = None,
-    falsification_verdict: str | None = None,
-) -> AdverseSelectionReport:
-    """Measure trade-aware adverse selection from venue trades near a quote.
+) -> tuple[list[float], list[float], int, int]:
+    """Resolve one market's near-quote trades into ``(signs, contributions)``.
 
-    Venue trades are trades between OTHER parties — NEVER Veridex fills. This
-    diagnostic asks: when trade flow (aggressor buys/sells) PRECEDES a TxLINE
-    fair-value move, did fair value move in the aggressor's favor? If so, the
-    aggressors were informed (toxic to a maker who took the other side). It is a
-    DIAGNOSTIC only: ``real_executable_edge_bps`` stays ``None`` and no
-    fill / edge / PnL is claimed — trades are an independent reference, never
-    evidence that our quote filled.
+    Split out from :func:`compute_trade_aware_diagnostic` so a caller with MULTIPLE
+    markets can gather each market's signals against THAT market's own ``fv_at`` and
+    pool the results — never marking a trade out against a different market's fair
+    value (the M8 cross-market-FV-leakage guard, applied to the trade-aware diagnostic).
 
-    Args:
-        trades: Venue trade prints (never our fills).
-        fv_at: TxLINE fair-value lookup by timestamp; returns ``None`` if the
-            fair value is unavailable at that timestamp.
-        quote_price: The maker quote price to measure trade flow around.
-        window_s: Forward horizon (seconds) over which the post-trade fair-value
-            move is measured.
-        near_band: Half-width (native prob units) of the "near the quote" band.
+    ``signs`` and ``contributions`` are aligned per RESOLVABLE near-trade (one whose
+    ``fv_now`` and ``fv_after`` both exist). ``.size`` is NEVER read: every metric below
+    is size-agnostic, so doubling every trade's observational size leaves the report
+    byte-identical (the size-independence invariant, AC-105).
 
     Returns:
-        An :class:`AdverseSelectionReport` carrying only ``_diagnostic``-suffixed
-        trade-derived metrics plus ``trades_near_quote_count``.
-        ``real_executable_edge_bps`` is never set (stays ``None``).
+        ``(signs, contributions, near_count, total)`` where ``near_count`` is the number
+        of near-quote trades and ``total`` is ``len(trades)`` (used for the near-quote
+        RATE, which needs no fv).
     """
     near_trades = [t for t in trades if abs(t.price - quote_price) <= near_band]
-
-    # ``signs`` and ``contributions`` are aligned per RESOLVABLE near-trade (one whose
-    # ``fv_now`` and ``fv_after`` both exist). ``.size`` is NEVER read: every metric below
-    # is size-agnostic, so doubling every trade's observational size leaves the report
-    # byte-identical (the size-independence invariant, AC-105).
     signs: list[float] = []
     contributions: list[float] = []
     for t in near_trades:
@@ -128,26 +109,50 @@ def compute_trade_aware_diagnostic(
         sign = 1.0 if t.aggressor_side is AggressorSide.BUY else -1.0
         signs.append(sign)
         contributions.append(sign * (fv_after - fv_now) * 1e4)
+    return signs, contributions, len(near_trades), len(trades)
 
-    flow_bps: int | None = round(mean(contributions)) if contributions else None
 
+def assemble_adverse_selection_report(
+    signs: list[float],
+    contributions: list[float],
+    near_count: int,
+    total: int,
+    *,
+    candidate_toxicity_loss_bps: int | None = None,
+    naive_toxicity_loss_bps: int | None = None,
+    falsification_verdict: str | None = None,
+) -> AdverseSelectionReport:
+    """Build the :class:`AdverseSelectionReport` from POOLED near-trade signals.
+
+    ``signs`` / ``contributions`` may be pooled across many markets (each gathered
+    against its own market's fv by :func:`gather_near_trade_signals`); this function
+    only aggregates them into the report, so no cross-market fv comparison ever occurs
+    here. ``real_executable_edge_bps`` is never set (stays ``None``).
+
+    The mean signed post-trade fv move is surfaced by exactly ONE field --
+    ``post_trade_fv_markout_bps_diagnostic`` (below). It is deliberately distinct from
+    ``signed_flow_pressure_bps_diagnostic`` (the aggressor-sign imbalance, which does NOT
+    weight by the fv move) so no two report fields silently carry the same value.
+    """
     ratio: float | None
     if contributions:
         toxic = sum(1 for c in contributions if c > 0)
         benign = sum(1 for c in contributions if c <= 0)
         ratio = toxic / max(1, benign)
     else:
-        # Abstain in lockstep with the flow diagnostic: when there are near
+        # Abstain in lockstep with the post-trade markout: when there are near
         # trades but NONE have a resolvable fv-after, the ratio is ``None``
         # (unknown) rather than ``0.0`` (falsely "all benign").
         ratio = None
 
-    # E4-T2 extended metrics. All abstain to ``None`` when there is no resolvable
-    # near-trade + fv (``contributions`` empty), never to ``0`` (which would falsely
-    # read as "measured, and neutral").
-    total = len(trades)
+    # E4-T2 extended metrics. The fv-DEPENDENT metrics (signed flow, post-trade markout,
+    # picked-off, candidate-vs-naive delta) abstain to ``None`` when there is no resolvable
+    # near-trade + fv (``contributions`` empty), never to ``0`` (which would falsely read as
+    # "measured, and neutral"). The near-quote-trade RATE is the exception: it needs NO fv
+    # (it is a pure near/total count ratio) and so is gated only on ``total > 0`` -- it can be
+    # a real value (e.g. ``1.0``) even when every near-trade has an unresolvable fv-after.
     near_quote_trade_rate: float | None = (
-        len(near_trades) / total if total > 0 else None
+        near_count / total if total > 0 else None
     )
     # Net aggressor imbalance in bps, size-agnostic: mean of the +1/-1 aggressor signs
     # only (never weighted by ``.size``). ``None`` when nothing resolves.
@@ -195,15 +200,72 @@ def compute_trade_aware_diagnostic(
             independent_reference_verdict = "INCONCLUSIVE"
 
     return AdverseSelectionReport(
-        trade_flow_preceding_fv_move_bps_diagnostic=flow_bps,
         toxic_vs_benign_flow_ratio_diagnostic=ratio,
-        trades_near_quote_count=len(near_trades),
+        trades_near_quote_count=near_count,
         near_quote_trade_rate_diagnostic=near_quote_trade_rate,
         signed_flow_pressure_bps_diagnostic=signed_flow_pressure_bps,
         post_trade_fv_markout_bps_diagnostic=post_trade_fv_markout_bps,
         picked_off_pressure_diagnostic=picked_off_pressure,
         candidate_vs_naive_toxicity_delta_bps_diagnostic=candidate_vs_naive_toxicity_delta_bps,
         independent_reference_verdict=independent_reference_verdict,
+    )
+
+
+def compute_trade_aware_diagnostic(
+    trades: list["TradePrint"],
+    fv_at: Callable[[int], float | None],
+    quote_price: float,
+    *,
+    window_s: int = 120,
+    near_band: float = 0.10,
+    # Reserved (spec-mandated Item-9 signature): accepted but not yet consumed — no
+    # naive-quote computation is performed here.
+    naive_quote_price: float | None = None,
+    candidate_toxicity_loss_bps: int | None = None,
+    naive_toxicity_loss_bps: int | None = None,
+    falsification_verdict: str | None = None,
+) -> AdverseSelectionReport:
+    """Measure trade-aware adverse selection from venue trades near a quote.
+
+    Venue trades are trades between OTHER parties — NEVER Veridex fills. This
+    diagnostic asks: when trade flow (aggressor buys/sells) PRECEDES a TxLINE
+    fair-value move, did fair value move in the aggressor's favor? If so, the
+    aggressors were informed (toxic to a maker who took the other side). It is a
+    DIAGNOSTIC only: ``real_executable_edge_bps`` stays ``None`` and no
+    fill / edge / PnL is claimed — trades are an independent reference, never
+    evidence that our quote filled.
+
+    This is the SINGLE-market convenience entrypoint: all ``trades`` are gathered and
+    marked out against the one ``fv_at`` series. A multi-market caller must instead
+    :func:`gather_near_trade_signals` per market (each against its OWN fv) and pool the
+    signals through :func:`assemble_adverse_selection_report`, so a trade is never marked
+    out against a different market's fair value.
+
+    Args:
+        trades: Venue trade prints (never our fills).
+        fv_at: TxLINE fair-value lookup by timestamp; returns ``None`` if the
+            fair value is unavailable at that timestamp.
+        quote_price: The maker quote price to measure trade flow around.
+        window_s: Forward horizon (seconds) over which the post-trade fair-value
+            move is measured.
+        near_band: Half-width (native prob units) of the "near the quote" band.
+
+    Returns:
+        An :class:`AdverseSelectionReport` carrying only ``_diagnostic``-suffixed
+        trade-derived metrics plus ``trades_near_quote_count``.
+        ``real_executable_edge_bps`` is never set (stays ``None``).
+    """
+    signs, contributions, near_count, total = gather_near_trade_signals(
+        trades, fv_at, quote_price, window_s=window_s, near_band=near_band
+    )
+    return assemble_adverse_selection_report(
+        signs,
+        contributions,
+        near_count,
+        total,
+        candidate_toxicity_loss_bps=candidate_toxicity_loss_bps,
+        naive_toxicity_loss_bps=naive_toxicity_loss_bps,
+        falsification_verdict=falsification_verdict,
     )
 
 

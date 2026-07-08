@@ -7,6 +7,7 @@ stays literal ``None`` — trades are diagnostics, never fills, and ``.size`` is
 """
 
 import pytest
+from pydantic import ValidationError
 
 from veridex.maker.diagnostic import (
     AdverseSelectionReport,
@@ -20,10 +21,30 @@ def test_extended_report_fields_none_by_default_and_no_edge():
     r = AdverseSelectionReport(trades_near_quote_count=0)
     assert r.signed_flow_pressure_bps_diagnostic is None and r.picked_off_pressure_diagnostic is None
     assert r.real_executable_edge_bps is None
-    with pytest.raises(Exception):
+    with pytest.raises(ValidationError):
         AdverseSelectionReport(real_executable_edge_bps=5)  # literal None
-    with pytest.raises(Exception):
+    with pytest.raises(ValidationError):
         AdverseSelectionReport(pnl=5)  # extra=forbid
+
+
+def test_no_aliased_flow_field_and_markout_distinct_from_signed_flow():
+    # FIX 3: the redundant ``trade_flow_preceding_fv_move_bps_diagnostic`` (an exact alias of
+    # ``post_trade_fv_markout_bps_diagnostic``) is REMOVED; no two report fields silently
+    # carry the same value.
+    assert "trade_flow_preceding_fv_move_bps_diagnostic" not in AdverseSelectionReport.model_fields
+
+    # The post-trade markout (mean signed fv MOVE, contribution-weighted) and the signed-flow
+    # pressure (mean aggressor SIGN, unweighted by the move) are genuinely distinct signals:
+    # a single BUY whose fv rises 0.05 gives markout +500 bps but signed-flow +10000 bps.
+    T = [_tp(0, 0.50, AggressorSide.BUY)]
+    F = lambda ts: {0: 0.50, 120: 0.55}.get(ts)
+    rep = compute_trade_aware_diagnostic(trades=T, fv_at=F, quote_price=0.50)
+    assert rep.post_trade_fv_markout_bps_diagnostic == 500
+    assert rep.signed_flow_pressure_bps_diagnostic == 10000
+    assert (
+        rep.post_trade_fv_markout_bps_diagnostic
+        != rep.signed_flow_pressure_bps_diagnostic
+    )
 
 
 # --- E4-T2 --------------------------------------------------------------------
