@@ -130,3 +130,18 @@ def test_loader_receives_exact_supplied_path_after_config_pin(monkeypatch):
                                trade_artifact_path=supplied, seal=False)
     assert recorded_paths == [supplied]              # loader got the EXACT supplied path
     assert order.index("verify") < order.index("load")  # loaded ONLY after config pin passed
+
+
+# --- E2-T3: both pins matching -> claimable MM-R1.5; stamping-only insufficient ----
+def test_r15_claim_requires_both_pins(monkeypatch):
+    class _Art:
+        artifact_hash = recompute_artifact_hash([_row()])  # pin == what the artifact recomputes to
+
+    cfg = build_maker_run_config(fixture_ids=CP1_18, trade_artifact=_Art())
+    monkeypatch.setattr(runner_mod, "load_trade_artifact", lambda *a, **k: _fake_artifact(rows=[_row()]))
+    monkeypatch.setattr(runner_mod, "build_cp1_maker_tape", lambda *a, **k: _fake_tape())  # keep fast
+    res = runner_mod.run_maker_arena(cfg, expected_config_hash=cfg.config_hash(),
+                                     trade_artifact_path=Path("pinned.json"), seal=False)
+    assert "R1_5" in str(res.rung) and res.real_executable_edge_bps is None
+    r1 = runner_mod.run_maker_arena(_pinned_cfg(), seal=False)  # no artifact -> MM-R1
+    assert "R1" in str(r1.rung) and "R1_5" not in str(r1.rung)
