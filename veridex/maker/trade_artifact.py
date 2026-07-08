@@ -210,7 +210,17 @@ class TradeArtifact(BaseModel):
     @model_validator(mode="before")
     @classmethod
     def _reject_secret_bearing_keys(cls, data: Any) -> Any:
-        """Reject any manifest key whose name references an operator secret."""
+        """Reject any manifest key whose name references an operator secret.
+
+        Scope: this enforces KEY-NAME hygiene (the precise denylist above) plus the
+        schema-lock (``extra="forbid"``) so no unlisted / secret-named field can ride
+        along. It deliberately does NOT scan VALUES: a value-level heuristic would
+        false-positive on the manifest's own legitimate hex hashes (``config_hash``,
+        ``mapping_content_hash``, ``artifact_hash``). VALUE-level "no operator token"
+        hygiene is enforced at CAPTURE time in E3-T2 ``build_trade_artifact``, which
+        reads ``HYPERSYNC_API`` from the environment and never writes it into the
+        artifact -- so the operator token never reaches these bytes to begin with.
+        """
         if isinstance(data, dict):
             for key in data:
                 lowered = str(key).lower()
