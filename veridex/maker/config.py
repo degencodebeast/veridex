@@ -29,6 +29,7 @@ from veridex.maker.mapping import DEFAULT_MAPPING_PATH, load_resolved_market_loo
 
 if TYPE_CHECKING:
     from veridex.maker.r2_bracket import FillAssumptionConfig
+    from veridex.maker.trade_artifact import TradeArtifact
 
 
 def _canonical_dump(obj: Any) -> str:
@@ -68,6 +69,7 @@ class MakerRunConfig(BaseModel):
     rung_gate_thresholds: dict[str, int] = Field(default_factory=dict)
     agent_config_hashes: tuple[str, ...] = ()
     fill_assumption_hash: str | None = None
+    trade_artifact_hash: str | None = None
 
     def config_hash(self) -> str:
         """SHA-256 over the canonically-serialized config (stable, order-independent).
@@ -87,6 +89,7 @@ def build_maker_run_config(
     markout_horizons_s: tuple[int, ...] = (30, 60, 300),
     agents: tuple[Any, ...] = (),
     fill_assumption: FillAssumptionConfig | None = None,
+    trade_artifact: TradeArtifact | None = None,
 ) -> MakerRunConfig:
     """Build a :class:`MakerRunConfig` bound to the committed mapping content hash.
 
@@ -108,6 +111,11 @@ def build_maker_run_config(
             ``config_hash()`` is bound into ``fill_assumption_hash`` so any
             fill-assumption change moves the run ``config_hash()`` (CON-003 / AC-012).
             When ``None``, ``fill_assumption_hash`` stays ``None``.
+        trade_artifact: Optional predeclared trade artifact. When provided, its
+            ``artifact_hash`` is bound into ``trade_artifact_hash`` so the R1.5 pin
+            is a real config field — any artifact change moves the run
+            ``config_hash()`` (CON-110). When ``None``, ``trade_artifact_hash``
+            stays ``None``.
 
     Returns:
         A frozen :class:`MakerRunConfig` with the recomputed mapping hash bound in.
@@ -125,6 +133,9 @@ def build_maker_run_config(
         agent_config_hashes=tuple(a.params_hash_inputs() for a in agents),
         fill_assumption_hash=(
             fill_assumption.config_hash() if fill_assumption is not None else None
+        ),
+        trade_artifact_hash=(
+            trade_artifact.artifact_hash if trade_artifact is not None else None
         ),
     )
 

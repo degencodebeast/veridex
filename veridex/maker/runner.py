@@ -69,7 +69,7 @@ CP1_18: tuple[int, ...] = (
 #: Pinned config-hash stamp: the ``config_hash()`` of the default cp1 maker config.
 #: A run whose live config recomputes to anything else VOIDs before any I/O.
 MAKER_EXPECTED_CONFIG_HASH: str = (
-    "f74a486cd0ab53d40e6f31b0eef47a88953c8cb3502ea7d326478904f9c1f784"
+    "f997d5a8fcb7d7c4cb02048a56bfb7bcdfabc06c6657ea97bf84be43beb16f33"
 )
 
 # maker -> veridex -> repo root; the committed pack + venue-frame trees hang off it.
