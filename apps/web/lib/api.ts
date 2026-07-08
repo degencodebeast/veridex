@@ -24,8 +24,8 @@ import { VERIFIER_VERSION, type StatusBarState } from '@/lib/status';
 import type * as W from '@/lib/wire';
 import type {
   AnchorInfo, AnchorStatus, CheckResult, CockpitState, ExecutionMode, FeedHealthState,
-  InspectorRecord, LeaderboardRow, MatchState, PerformanceMetrics, ProofArtifact, ProofMode,
-  SourceMode, VerifyResult,
+  InspectorRecord, LeaderboardRow, MakerArenaResultView, MakerLeaderboardRow, MatchState,
+  PerformanceMetrics, ProofArtifact, ProofMode, SourceMode, VerifyResult,
 } from '@/lib/contracts';
 
 export const API_BASE = process.env.NEXT_PUBLIC_API_BASE ?? '';
@@ -45,6 +45,8 @@ export const PATHS = {
   feedHealth: () => `/feed/health`,
   // C2 catalog: agent runtime-events (OPS telemetry; ImplD-served orphaned route).
   runtimeEvents: (agentId: string) => `/agents/${agentId}/runtime-events`,
+  // MAKER lane: the sealed maker_arena_result.v1 envelope (quote-quality, toxicity-ranked).
+  makerArenaResult: () => `/maker/arena-result`,
 } as const;
 
 export class ApiError extends Error {
@@ -208,6 +210,72 @@ export function adaptLeaderboard(w: W.LeaderboardResponse): LeaderboardRow[] {
   }));
 }
 
+// MAKER lane adapter (SEC-005): a SEPARATE path — it does NOT reuse adaptLeaderboard /
+// adaptProofArtifact and never touches any directional CLV type. The maker lane ranks on
+// `avg_toxicity_loss_bps` (asc — lower is better). `real_executable_edge_bps` is carried through as
+// the honest `null` (no fill/PnL claim), never coerced to 0.
+export function adaptMakerArenaResult(w: W.MakerArenaResultResponseWire): MakerArenaResultView {
+  const rows: MakerLeaderboardRow[] = w.result.maker_leaderboard.map((r) => ({
+    agent_id: r.agent_id,
+    maker_rank: r.maker_rank, // NOT `rank` — the maker-lane placement
+    avg_toxicity_loss_bps: r.avg_toxicity_loss_bps,
+    avg_markout_bps: r.avg_markout_bps,
+    quote_count: r.quote_count,
+    scored: r.scored,
+    abstained: r.abstained,
+    real_executable_edge_bps: null, // always null — no fill/PnL claim
+  }));
+  return {
+    schema_version: w.schema_version,
+    lane: w.lane,
+    source_mode: toSourceMode(w.source_mode),
+    rank_axis: w.rank_axis,
+    rank_axis_direction: w.rank_axis_direction,
+    rung: w.result.rung,
+    fixture_universe_n: w.result.fixture_universe_n,
+    small_n_flag: w.result.small_n_flag,
+    real_executable_edge_bps: null,
+    leaderboard: rows,
+    falsification: {
+      verdict: w.result.falsification.verdict,
+      headline: w.result.falsification.headline,
+      delta_bps: w.result.falsification.delta_bps,
+      ci_low_bps: w.result.falsification.ci_low_bps,
+      ci_high_bps: w.result.falsification.ci_high_bps,
+    },
+    window_clv_analog: {
+      window_markout_bps: w.result.window_clv_analog.window_markout_bps,
+      window_action_count: w.result.window_clv_analog.window_action_count,
+      note: w.result.window_clv_analog.note,
+    },
+    proof_card: {
+      rung: w.proof_card.rung,
+      uncalibrated: w.proof_card.uncalibrated,
+      headline: w.proof_card.headline,
+      n_fixtures: w.proof_card.n_fixtures,
+      small_n_note: w.proof_card.small_n_note,
+      trades_not_fills_caveat: w.proof_card.trades_not_fills_caveat,
+      window_clv_analog: {
+        window_markout_bps: w.proof_card.window_clv_analog.window_markout_bps,
+        window_action_count: w.proof_card.window_clv_analog.window_action_count,
+        note: w.proof_card.window_clv_analog.note,
+      },
+      falsification: {
+        verdict: w.proof_card.falsification.verdict,
+        headline: w.proof_card.falsification.headline,
+        delta_bps: w.proof_card.falsification.delta_bps,
+        ci_low_bps: w.proof_card.falsification.ci_low_bps,
+        ci_high_bps: w.proof_card.falsification.ci_high_bps,
+      },
+    },
+    diagnostics: {
+      avg_markout_bps_label: w.diagnostics.avg_markout_bps_label,
+      avg_toxicity_loss_bps_label: w.diagnostics.avg_toxicity_loss_bps_label,
+      real_executable_edge_bps_label: w.diagnostics.real_executable_edge_bps_label,
+    },
+  };
+}
+
 function emptyMatch(): MatchState {
   return { fixture: '', phase: 'NS', minute: null, goals: [0, 0], yellow: [0, 0], red: [0, 0], corners: [0, 0], status: 'scheduled' };
 }
@@ -332,6 +400,16 @@ export async function getLeaderboard(competitionId?: string): Promise<Leaderboar
     return adaptLeaderboard(MOCK_FIXTURES.leaderboard).map((r) => ({ ...r, source_mode: r.source_mode === 'live' ? 'replay' : r.source_mode }));
   }
   return adaptLeaderboard(await getJson<W.LeaderboardResponse>(PATHS.leaderboard(competitionId)));
+}
+
+// GET /maker/arena-result → maker view-model (SEC-005: never routed through the CLV leaderboard).
+// Mock ⇒ the canonical maker fixture (REPLAY, never LIVE), through the SAME adapter.
+export async function getMakerArenaResult(): Promise<MakerArenaResultView> {
+  if (isMockEnabled()) {
+    const m = adaptMakerArenaResult(MOCK_FIXTURES.makerArenaResult);
+    return { ...m, source_mode: demote(m.source_mode) };
+  }
+  return adaptMakerArenaResult(await getJson<W.MakerArenaResultResponseWire>(PATHS.makerArenaResult()));
 }
 
 export async function getCockpitState(competitionId: string): Promise<CockpitState> {

@@ -14,6 +14,7 @@ import leaderboard from '../../../contracts/fixtures/leaderboard.json';
 import competitionState from '../../../contracts/fixtures/competition_state.json';
 import inspectorRecord from '../../../contracts/fixtures/inspector_record.json';
 import feedHealth from '../../../contracts/fixtures/feed_health.json';
+import makerArenaResult from '../../../contracts/fixtures/maker_arena_result.json';
 
 /** True when the frontend mock flag is set: env (build/runtime) or the `?mock=1` per-tab dev param. */
 export function isMockEnabled(): boolean {
@@ -34,4 +35,5 @@ export const MOCK_FIXTURES = {
   competition: competitionState as unknown as W.CompetitionStateResponse,
   inspector: inspectorRecord as unknown as W.InspectorRecord,
   feedHealth: feedHealth as unknown as W.FeedHealth,
+  makerArenaResult: makerArenaResult as unknown as W.MakerArenaResultResponseWire,
 };
