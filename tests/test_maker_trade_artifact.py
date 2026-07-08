@@ -13,6 +13,7 @@ from veridex.maker.mapping import PINNED_MAPPING_HASH
 from veridex.maker.trade_artifact import (
     NormalizedTradeRow,
     TradeArtifact,
+    dedup_normalized_rows,
     recompute_artifact_hash,
 )
 from veridex.maker.trades import AggressorSide
@@ -101,3 +102,12 @@ def test_trade_artifact_reconciles_and_forbids_token():
         _artifact([_row()], hypersync_api="secret")  # secret-bearing key forbidden
     with pytest.raises(Exception):
         _artifact([_row()], api_key="AKIA...")  # secret-bearing key forbidden
+
+
+def test_dedup_by_event_key():
+    # two rows sharing (tx_hash, log_index) → one kept, dropped == 1
+    unique, dropped = dedup_normalized_rows([_row(), _row()])
+    assert len(unique) == 1 and dropped == 1
+    # different log_index → both kept, dropped == 0
+    unique2, dropped2 = dedup_normalized_rows([_row(log_index=3), _row(log_index=4)])
+    assert len(unique2) == 2 and dropped2 == 0

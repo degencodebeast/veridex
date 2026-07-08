@@ -36,6 +36,7 @@ from veridex.maker.trades import AggressorSide
 __all__ = [
     "NormalizedTradeRow",
     "TradeArtifact",
+    "dedup_normalized_rows",
     "load_trade_artifact",
     "recompute_artifact_hash",
 ]
@@ -124,6 +125,33 @@ def recompute_artifact_hash(rows: list[NormalizedTradeRow]) -> str:
     payload = [_canonical_dump(r.model_dump(mode="json")) for r in ordered]
     encoded = _canonical_dump(payload).encode()
     return hashlib.sha256(encoded).hexdigest()
+
+
+def dedup_normalized_rows(
+    rows: list[NormalizedTradeRow],
+) -> tuple[list[NormalizedTradeRow], int]:
+    """Drop rows sharing a chain-event identity ``(tx_hash, log_index)``.
+
+    The first row seen for each ``event_key`` is kept (file order preserved);
+    every later row with an already-seen key is dropped and counted.
+
+    Args:
+        rows: The normalized trade rows, possibly containing duplicates.
+
+    Returns:
+        A ``(unique_rows, dropped_count)`` tuple.
+    """
+    seen: set[tuple[str, int]] = set()
+    unique: list[NormalizedTradeRow] = []
+    dropped = 0
+    for row in rows:
+        key = row.event_key()
+        if key in seen:
+            dropped += 1
+            continue
+        seen.add(key)
+        unique.append(row)
+    return unique, dropped
 
 
 class TradeArtifact(BaseModel):
