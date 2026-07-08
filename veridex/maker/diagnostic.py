@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING
 
 from pydantic import BaseModel, ConfigDict
 
+from veridex.maker.basis import decompose_gap, reach_from_residual
 from veridex.maker.trades import AggressorSide
 
 if TYPE_CHECKING:
@@ -201,4 +202,67 @@ def compute_trade_aware_diagnostic(
         picked_off_pressure_diagnostic=picked_off_pressure,
         candidate_vs_naive_toxicity_delta_bps_diagnostic=candidate_vs_naive_toxicity_delta_bps,
         independent_reference_verdict=independent_reference_verdict,
+    )
+
+
+class ConvergenceReachReport(BaseModel):
+    """Basis-adjusted convergence ("Reach") report — residual-only, never raw gap.
+
+    The raw TxLINE-vs-venue gap still contains the structural ``basis`` (a pricing
+    convention, not alpha), so it can never itself be read as convergence toward fair
+    value. This report therefore surfaces the structural ``basis_bps`` SEPARATELY and
+    exposes the reach signal ONLY on the residual (the gap after the basis is removed),
+    via :func:`~veridex.maker.basis.reach_from_residual`.
+
+    Attributes:
+        basis_bps: The structural (median) offset in basis points — reported separately
+            and NEVER counted toward the reach signal.
+        residual_reach_fraction: Fraction of consecutive steps whose RESIDUAL magnitude
+            shrank; ``None`` when there are fewer than two observations.
+        reach_horizon_s: The reach horizon (seconds) this report was built for.
+        n: The number of paired observations.
+        note: A short honest caveat that reach is measured on the residual only.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    basis_bps: int
+    residual_reach_fraction: float | None
+    reach_horizon_s: int
+    n: int
+    note: str = "reach measured on the basis-adjusted residual only, never the raw gap"
+
+
+def build_convergence_reach(
+    txline_fv: list[float],
+    venue_native: list[float],
+    reach_horizon_s: int,
+) -> ConvergenceReachReport:
+    """Build a :class:`ConvergenceReachReport` from paired TxLINE / venue series.
+
+    Decomposes the gap into a structural ``basis_bps`` and a per-step residual via
+    :func:`~veridex.maker.basis.decompose_gap`, then reads the reach signal from the
+    RESIDUAL only via :func:`~veridex.maker.basis.reach_from_residual`. It deliberately
+    NEVER derives reach (or any "edge") from the raw gap — no raw-gap-to-edge helper
+    exists here or in :mod:`veridex.maker.basis`.
+
+    Args:
+        txline_fv: TxLINE fair-value native probabilities in ``[0, 1]``.
+        venue_native: Venue native-price probabilities in ``[0, 1]`` (same length).
+        reach_horizon_s: The reach horizon (seconds) recorded on the report.
+
+    Returns:
+        The basis-adjusted :class:`ConvergenceReachReport`.
+
+    Raises:
+        MarkoutError: If any operand is not a native probability in ``[0, 1]``.
+        ValueError: If the two series differ in length or are empty.
+    """
+    decomposition = decompose_gap(txline_fv, venue_native)
+    residual_reach_fraction = reach_from_residual(decomposition.residual_gap_bps)
+    return ConvergenceReachReport(
+        basis_bps=decomposition.basis_bps,
+        residual_reach_fraction=residual_reach_fraction,
+        reach_horizon_s=reach_horizon_s,
+        n=decomposition.n,
     )
