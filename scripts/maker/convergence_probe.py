@@ -1,5 +1,9 @@
 """OFFLINE convergence probe -- does the TxLINE fair value LEAD the venue native mid?
 
+SUPERSEDED for lead-lag by scripts/maker/leadlag_probe.py -- the frozen-reference
+residual-reach here is vacuous for lead detection (median-demean cancels the anchor); kept as
+a documented negative example.
+
 This is an ANALYSIS tool, NOT part of the sealed/gated maker lane. It touches no
 ``veridex/maker/*`` trust module beyond REUSING the audited, basis-adjusted reach
 machinery (``build_convergence_reach`` -> ``decompose_gap`` + ``reach_from_residual``):
