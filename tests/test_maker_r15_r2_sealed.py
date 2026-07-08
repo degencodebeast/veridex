@@ -160,3 +160,50 @@ def test_r2_attached_is_report_only(monkeypatch):
     assert r2.real_executable_edge_bps is None
     assert r2.r2_bracket["real_executable_edge_bps"] is None
     assert r2.r2_bracket["realized_pnl"] is None
+
+
+# --- E9-T2: three-path integration ------------------------------------------------
+def test_three_path_r1_r15_r2_integration(monkeypatch):
+    monkeypatch.setattr(runner_mod, "build_cp1_maker_tape", lambda *a, **k: _fake_tape())
+
+    # (a) no trade_artifact_hash -> MM-R1, trade_aware_diagnostic null, no R2 overlay.
+    res_r1 = runner_mod.run_maker_arena(_pinned_cfg(), seal=False)
+    assert "R1" in str(res_r1.rung) and "R1_5" not in str(res_r1.rung)
+    assert res_r1.trade_aware_diagnostic is None
+    assert res_r1.r2_bracket is None
+    assert res_r1.real_executable_edge_bps is None
+
+    # (b) pinned matching (synthetic-in-test) artifact -> MM-R1.5, diagnostic populated,
+    # edge null, still no R2 overlay.
+    class _Art:
+        artifact_hash = recompute_artifact_hash([_row()])
+
+    cfg_r15 = build_maker_run_config(fixture_ids=CP1_18, trade_artifact=_Art())
+    monkeypatch.setattr(runner_mod, "load_trade_artifact", lambda *a, **k: _fake_artifact(rows=[_row()]))
+    res_r15 = runner_mod.run_maker_arena(
+        cfg_r15, expected_config_hash=cfg_r15.config_hash(),
+        trade_artifact_path=Path("pinned.json"), seal=False,
+    )
+    assert "R1_5" in str(res_r15.rung)
+    assert res_r15.trade_aware_diagnostic is not None
+    assert res_r15.r2_bracket is None
+    assert res_r15.real_executable_edge_bps is None
+
+    # (c) + pinned matching FillAssumptionConfig -> r2_bracket populated + labeled,
+    # NEVER ranked, rung UNCHANGED by R2 (still MM-R1.5), edge still null.
+    fa = _fill_assumption()
+    cfg_r2 = build_maker_run_config(fixture_ids=CP1_18, trade_artifact=_Art(), fill_assumption=fa)
+    res_r2 = runner_mod.run_maker_arena(
+        cfg_r2, expected_config_hash=cfg_r2.config_hash(),
+        trade_artifact_path=Path("pinned.json"), fill_assumption=fa, seal=False,
+    )
+    assert res_r2.rung == res_r15.rung                       # R2 did NOT change the rung
+    assert res_r2.r2_bracket is not None
+    assert res_r2.r2_bracket["label"] == R2_OVERLAY_LABEL
+    assert res_r2.r2_bracket["ranked"] is False
+    assert res_r2.real_executable_edge_bps is None
+    assert render_proof_card(res_r2).r2_overlay_label == R2_OVERLAY_LABEL
+
+    # R2 value never leaks into the ranking surface.
+    blob = json.dumps(res_r2.maker_leaderboard)
+    assert "r2_bracket" not in blob and R2_OVERLAY_LABEL not in blob
