@@ -54,6 +54,19 @@ class AdverseSelectionReport(BaseModel):
     trade_flow_preceding_fv_move_bps_diagnostic: int | None = None
     toxic_vs_benign_flow_ratio_diagnostic: float | None = None
     trades_near_quote_count: int = 0
+    # E4-T1 extended report-only diagnostics (all ``_diagnostic``-suffixed, ``None`` on
+    # no resolvable near-trade + fv). None of these is a fill / fill-rate / spread-capture
+    # / PnL / executable-edge value; they are independent trade-reference metrics only.
+    near_quote_trade_rate_diagnostic: float | None = None
+    signed_flow_pressure_bps_diagnostic: int | None = None
+    post_trade_fv_markout_bps_diagnostic: int | None = None
+    picked_off_pressure_diagnostic: float | None = None
+    candidate_vs_naive_toxicity_delta_bps_diagnostic: int | None = None
+    # Tautology-breaker verdict: ``SEPARATED`` only when the real-trade reference AND the
+    # falsification agree; ``INCONCLUSIVE`` when they disagree; ``INSUFFICIENT_DATA`` when
+    # there is no resolvable near-trade + fv. Defaults to ``INSUFFICIENT_DATA`` so a
+    # bare ``AdverseSelectionReport()`` constructs cleanly.
+    independent_reference_verdict: str = "INSUFFICIENT_DATA"
     # Typed literally ``None`` (NOT ``int | None``) AND frozen: structurally
     # impossible to set to a value, enforcing AC-018's no-executable-edge
     # boundary at R1.5.
