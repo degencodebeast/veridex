@@ -79,6 +79,11 @@ class MakerProofCard(BaseModel):
     n_fixtures: int
     small_n_note: str
     trades_not_fills_caveat: str | None
+    #: Honest R1.5 diagnostic status. When the trade-aware diagnostic is ABSENT at
+    #: MM-R1.5 this carries an explicit ``INSUFFICIENT_DATA`` / "not run" note (never
+    #: a fabricated value); it is ``None`` otherwise. It never carries a PnL/edge/fill
+    #: value — the card makes no executable-edge or realized-PnL claim.
+    trade_aware_diagnostic_note: str | None = None
 
 
 def render_proof_card(result: MakerArenaResult) -> MakerProofCard:
@@ -90,8 +95,17 @@ def render_proof_card(result: MakerArenaResult) -> MakerProofCard:
     """
     # uncalibrated is True exactly when an R2 bracket overlay is attached.
     trades_not_fills_caveat: str | None = None
+    trade_aware_diagnostic_note: str | None = None
     if result.rung == MakerRungLabel("MM-R1.5"):
         trades_not_fills_caveat = "trades are not our fills; no executable-edge claim"
+        # Honest no-data surfacing: when the trade-aware diagnostic was not produced
+        # (no pinned trade artifact / no resolvable trades), say so explicitly rather
+        # than fabricating a value. Never emit a fill/edge/PnL literal here.
+        if result.trade_aware_diagnostic is None:
+            trade_aware_diagnostic_note = (
+                "INSUFFICIENT_DATA: trade-aware diagnostic not run "
+                "(no pinned trade artifact)"
+            )
 
     return MakerProofCard(
         rung=result.rung.value,
@@ -104,6 +118,7 @@ def render_proof_card(result: MakerArenaResult) -> MakerProofCard:
         n_fixtures=result.fixture_universe_n,
         small_n_note=f"n={result.fixture_universe_n} (Polymarket-resolved cp1), small sample",
         trades_not_fills_caveat=trades_not_fills_caveat,
+        trade_aware_diagnostic_note=trade_aware_diagnostic_note,
     )
 
 
