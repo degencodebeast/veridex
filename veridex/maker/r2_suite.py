@@ -307,8 +307,17 @@ def render_r2_suite(
         inventory_path = _deterministic_inventory_path(markouts, cfg)
 
     p = _pinned_fill_probability(cfg)
-    peak = max((abs(v) for v in inventory_path.get("mean_path")
-                or [inventory_path.get("expected_final", 0.0)]), default=0.0)
+    peak = max(
+        (
+            abs(v)
+            for v in (
+                inventory_path.get("mean_path")
+                or inventory_path.get("expected_path")
+                or [0.0]
+            )
+        ),
+        default=0.0,
+    )
 
     pessimistic = min(markouts)
     optimistic = max(markouts)

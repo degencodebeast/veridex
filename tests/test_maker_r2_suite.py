@@ -72,6 +72,19 @@ def test_r2_seeded_is_deterministic_and_distributional():
     assert other.simulated_expected_inventory_path["mean_path"] != path["mean_path"]
 
 
+def test_deterministic_peak_exposure_scans_full_path():
+    # M-1: "peak exposure" must scan the WHOLE expected_path, not just the
+    # final endpoint. markouts=[200, -100] with p=0.5 -> expected_path =
+    # [1.0, 0.5]; the true peak abs-exposure is 1.0 (hit after markout #1),
+    # not abs(expected_final) == 0.5.
+    cfg = _cfg(rule_params={"p": 0.5})
+    b = render_r2_suite([200, -100], cfg)
+    path = b.simulated_expected_inventory_path
+    assert path["expected_path"] == [1.0, 0.5]
+    assert path["expected_final"] == 0.5
+    assert b.simulated_expected_exposure["model_peak_exposure"] == 1.0
+
+
 def test_r2_deterministic_labels_inventory_as_expected_model():
     cfg = _cfg(draw_mode="DETERMINISTIC_EXPECTED")
     b = render_r2_suite([10, 20, 30], cfg)
