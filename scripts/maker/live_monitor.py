@@ -688,6 +688,13 @@ def build_parser() -> argparse.ArgumentParser:
         dest="every",
         help="(optional) also emit interim analysis every N polls (default: on-shutdown only)",
     )
+    parser.add_argument(
+        "--base-url",
+        type=str,
+        default=None,
+        dest="base_url",
+        help="override TxLINE base URL (e.g. https://txline.txodds.com/api for mainnet); default uses config",
+    )
     return parser
 
 
@@ -719,7 +726,7 @@ async def _run_cli(args: argparse.Namespace) -> AnalysisResult:
     try:
         result = await run_monitor(
             matched=matched,
-            fv_source=_DefaultFvSource(settings=settings),
+            fv_source=_DefaultFvSource(settings=settings, base_url=args.base_url),
             mid_source=_DefaultMidSource(),
             recorder=recorder,
             poll_interval_s=args.poll_interval_s,

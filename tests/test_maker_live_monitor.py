@@ -311,6 +311,32 @@ def test_fail_closed_when_creds_absent() -> None:
         mod._DefaultFvSource(settings=settings)
 
 
+def test_base_url_override_and_default_fallback() -> None:
+    """#6b ``--base-url`` plumbing: an explicit base_url overrides settings; omitting it falls back.
+
+    Purely offline — constructs :class:`_DefaultFvSource` (never streams) and asserts on its
+    stored ``_base_url``, matching the CLI wiring in ``_run_cli`` (``base_url=args.base_url``).
+    """
+    import scripts.maker.live_monitor as mod
+
+    settings = Settings(_env_file=None, JWT="jwt-x", TXLINE_X_API_TOKEN="tok-x")
+
+    overridden = mod._DefaultFvSource(settings=settings, base_url="https://txline.txodds.com/api")
+    assert overridden._base_url == "https://txline.txodds.com/api"
+
+    default = mod._DefaultFvSource(settings=settings)
+    assert default._base_url == settings.txline_base_url
+    assert default._base_url != "https://txline.txodds.com/api"
+
+
+def test_help_shows_base_url_flag() -> None:
+    """#6c ``--help`` documents ``--base-url`` (offline: ``build_parser`` constructs no live source)."""
+    import scripts.maker.live_monitor as mod
+
+    help_text = mod.build_parser().format_help()
+    assert "--base-url" in help_text
+
+
 def test_illiquid_book_recorded_as_none_and_excluded() -> None:
     """#7 An empty-book mid is ``(None, None)`` → recorded with ``mid=None`` and excluded from the series."""
     # _mid_from_book: an empty bid/ask side yields (None, None), never imputed.
