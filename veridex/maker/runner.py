@@ -38,8 +38,9 @@ from veridex.maker.config import (
 from veridex.maker.contracts import MarketMakerAgent, Side
 from veridex.maker.diagnostic import (
     TradeAwareDiagnostic,
+    assemble_adverse_selection_report,
     build_convergence_reach,
-    compute_trade_aware_diagnostic,
+    gather_near_trade_signals,
 )
 from veridex.maker.falsification import FalsificationResult, falsify
 from veridex.maker.leaderboard import rank_makers, window_clv_analog
@@ -119,6 +120,27 @@ def _group_ref_at(
     return ref_at
 
 
+def _group_fv_at(
+    ts_list: list[int], fv_list: list[float]
+) -> Callable[[int], float | None]:
+    """Build a no-look-ahead fv lookup over ONE market's ``(ts, fv)`` series.
+
+    The single-arg ``(ts)`` analog of :func:`_group_ref_at`, used by the trade-aware
+    diagnostic so a matched trade's post-trade markout is resolved against ONLY its own
+    market's future fv -- never a merged/other-market tape. Returns the most-recent fv at
+    or before ``ts`` (a later tick is invisible -- no look-ahead), or ``None`` when no fv
+    exists at/before ``ts`` (including an empty series -- never imputed, never borrowed).
+    """
+
+    def fv_at(ts: int) -> float | None:
+        pos = bisect.bisect_right(ts_list, ts)
+        if pos == 0:
+            return None
+        return fv_list[pos - 1]
+
+    return fv_at
+
+
 def _score_group(
     agent: MarketMakerAgent,
     rows: list[dict[str, Any]],
@@ -183,30 +205,43 @@ def _build_trade_aware_diagnostic(
 
     # Full-accounting join across all fixtures: matched trades are removed from the pool
     # so a trade matched under fixture A is never re-counted as unmatched under fixture B.
+    # Each matched trade is bucketed under its OWN (fixture_id, market_ref) so its markout
+    # can later be measured against that market's fair value alone (never a pooled tape).
     remaining: list[TradePrint] = list(trade_prints)
-    matched_prints: list[TradePrint] = []
+    matched_by_market: dict[tuple[int, str], list[TradePrint]] = {}
     for fixture_id in cfg.fixture_ids:
         joined, _unmatched = join_trades_to_fixture_with_accounting(
             remaining, records, fixture_id
         )
-        matched_here = [trade for group in joined.values() for trade in group]
+        matched_here: list[TradePrint] = []
+        for market_ref, group in joined.items():
+            matched_by_market.setdefault((fixture_id, market_ref), []).extend(group)
+            matched_here.extend(group)
         matched_ids = {id(trade) for trade in matched_here}
-        matched_prints.extend(matched_here)
         remaining = [trade for trade in remaining if id(trade) not in matched_ids]
     rows_total = len(trade_prints)
-    rows_matched = len(matched_prints)
+    rows_matched = sum(len(group) for group in matched_by_market.values())
     rows_unmatched = len(remaining)
 
-    # No-look-ahead fv lookup over the FULL observed TxLINE fv (fv exists at every tick).
-    all_sorted = sorted(tape, key=lambda row: row["ts"])
-    fv_ts = [row["ts"] for row in all_sorted]
-    fv_vals = [row["fv"] for row in all_sorted]
+    # No-look-ahead fv lookup PER (fixture_id, venue_market_ref) market. Building ONE fv_at
+    # over the merged tape would let a matched trade's post-trade markout resolve against a
+    # DIFFERENT market's fair value (the same cross-market FV-pooling class fixed in the R1
+    # scoring path via `_group_ref_at`). So each market owns its own sorted fv series and a
+    # matched trade is only ever marked out against its own market's future fv.
+    fv_rows_by_market: dict[tuple[int, str], list[dict[str, Any]]] = {}
+    for row in tape:
+        key = (row["fixture_id"], row["venue_market_ref"])
+        fv_rows_by_market.setdefault(key, []).append(row)
+    fv_series_by_market: dict[tuple[int, str], tuple[list[int], list[float]]] = {}
+    for key, market_rows in fv_rows_by_market.items():
+        market_rows.sort(key=lambda row: row["ts"])
+        fv_series_by_market[key] = (
+            [row["ts"] for row in market_rows],
+            [row["fv"] for row in market_rows],
+        )
 
-    def fv_at(ts: int) -> float | None:
-        pos = bisect.bisect_right(fv_ts, ts)
-        if pos == 0:
-            return None
-        return fv_vals[pos - 1]
+    all_sorted = sorted(tape, key=lambda row: row["ts"])
+    fv_vals = [row["fv"] for row in all_sorted]
 
     # The quote reference the venue trades are measured around: the median fresh venue mid
     # (fall back to the median fv when no mid is fresh). Size is NEVER used.
@@ -224,12 +259,34 @@ def _build_trade_aware_diagnostic(
     candidate_loss = loss_by[agent_ids[-1]] if agent_ids else None
     naive_loss = loss_by[agent_ids[0]] if agent_ids else None
 
+    # Gather each market's near-quote trade signals against THAT market's own fv series,
+    # then POOL them (mirrors the R1 scoring path: per-market first, pool after). A market
+    # whose trades matched but that has no fv series in the tape contributes nothing (its
+    # fv_at yields None) rather than borrowing another market's fv.
+    pooled_signs: list[float] = []
+    pooled_contributions: list[float] = []
+    pooled_near = 0
+    pooled_total = 0
+    for market_key, market_trades in matched_by_market.items():
+        # A matched market with no fv series in the tape gets an empty series -> its fv_at
+        # yields None for every trade (nothing resolves), never another market's fv.
+        ts_list, fv_list = fv_series_by_market.get(market_key, ([], []))
+        market_fv_at = _group_fv_at(ts_list, fv_list)
+        signs, contributions, near, total = gather_near_trade_signals(
+            market_trades, market_fv_at, quote_price
+        )
+        pooled_signs.extend(signs)
+        pooled_contributions.extend(contributions)
+        pooled_near += near
+        pooled_total += total
+
     per_agent: dict[str, Any] = {}
     for agent in agents:
-        per_agent[agent.agent_id] = compute_trade_aware_diagnostic(
-            trades=matched_prints,
-            fv_at=fv_at,
-            quote_price=quote_price,
+        per_agent[agent.agent_id] = assemble_adverse_selection_report(
+            pooled_signs,
+            pooled_contributions,
+            pooled_near,
+            pooled_total,
             candidate_toxicity_loss_bps=candidate_loss,
             naive_toxicity_loss_bps=naive_loss,
             falsification_verdict=falsification.verdict,

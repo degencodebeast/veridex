@@ -52,10 +52,16 @@ def _fake_artifact(rows):
 
 
 def _fake_tape():
+    # Two markets of CP1_18[0] so a trade matched to EITHER market (home or away) has its
+    # own per-market fv series to be marked out against (no cross-market fv borrowing).
     return [{"ts": 0, "fixture_id": CP1_18[0], "tick_seq": 0,
              "txline_market_key": "1X2_PARTICIPANT_RESULT||", "txline_side": "part1",
              "venue_market_ref": "1X2|home|full", "venue_side": "home",
-             "fv": 0.60, "mid": 0.58, "staleness_s": 0}]
+             "fv": 0.60, "mid": 0.58, "staleness_s": 0},
+            {"ts": 0, "fixture_id": CP1_18[0], "tick_seq": 0,
+             "txline_market_key": "1X2_PARTICIPANT_RESULT||", "txline_side": "part2",
+             "venue_market_ref": "1X2|away|full", "venue_side": "away",
+             "fv": 0.30, "mid": 0.28, "staleness_s": 0}]
 
 
 # --- E2-T2 test A: config pin (layer 1) VOIDs before ANY artifact load -----------
@@ -268,6 +274,69 @@ def test_runner_r15_join_matches_real_mapping_row(monkeypatch):
         assert report["independent_reference_verdict"] != "INSUFFICIENT_DATA"
 
     # STILL honest: no fill / no executable edge; every fill field absent.
+    assert res.real_executable_edge_bps is None
+    blob = json.dumps(diagnostic)
+    for forbidden in FORBIDDEN_FILL_FIELDS:
+        assert forbidden not in blob
+    for report in diagnostic["per_agent"].values():
+        assert report["real_executable_edge_bps"] is None
+
+
+def test_diagnostic_markout_is_per_market_not_cross_market(monkeypatch):
+    # M8-class cross-market FV leakage guard for the R1.5 trade-aware diagnostic: a matched
+    # trade in market A must have its post-trade FV markout measured against market A's OWN
+    # fv series -- NEVER the merged/other-market tape. Two markets of ONE fixture carry
+    # DIFFERENT fv trajectories; the only matched trade lives in market A (away).
+    from veridex.maker.mapping import DEFAULT_MAPPING_PATH, load_resolved_market_lookup
+
+    records, _hash = load_resolved_market_lookup(DEFAULT_MAPPING_PATH)
+    rec = next(
+        r for r in records if r.fixture_id == CP1_18[0] and r.market_ref == "1X2|away|full"
+    )
+
+    _common = {
+        "fixture_id": CP1_18[0], "tick_seq": 0,
+        "txline_market_key": "1X2_PARTICIPANT_RESULT||", "staleness_s": 0,
+    }
+
+    def _tape():
+        return [
+            # Market A (away, MATCHED): its OWN fv rises 0.50 -> 0.55 over the window.
+            {**_common, "ts": 1000, "txline_side": "part2",
+             "venue_market_ref": "1X2|away|full", "venue_side": "away", "fv": 0.50, "mid": 0.50},
+            {**_common, "ts": 1100, "txline_side": "part2",
+             "venue_market_ref": "1X2|away|full", "venue_side": "away", "fv": 0.55, "mid": 0.50},
+            # Market B (home, UNMATCHED): a DIFFERENT trajectory whose ts=1120 tick would
+            # corrupt a merged-tape fv_at at the trade's fv-after horizon (1000 + window 120).
+            {**_common, "ts": 1120, "txline_side": "part1",
+             "venue_market_ref": "1X2|home|full", "venue_side": "home", "fv": 0.90, "mid": 0.90},
+        ]
+
+    # BUY at ts=1000 near the quote (median mid 0.50), pinned to market A's real (cond, token).
+    row = _row(ts=1000, price=0.50, aggressor_side=AggressorSide.BUY,
+               condition_id=rec.condition_id, token_id=rec.token_id)
+
+    class _Art:
+        artifact_hash = recompute_artifact_hash([row])
+
+    cfg = build_maker_run_config(fixture_ids=CP1_18, trade_artifact=_Art())
+    monkeypatch.setattr(runner_mod, "load_trade_artifact", lambda *a, **k: _fake_artifact(rows=[row]))
+    monkeypatch.setattr(runner_mod, "build_cp1_maker_tape", lambda *a, **k: _tape())
+    res = runner_mod.run_maker_arena(
+        cfg, expected_config_hash=cfg.config_hash(),
+        trade_artifact_path=Path("pinned.json"), seal=False,
+    )
+
+    diagnostic = res.trade_aware_diagnostic
+    assert diagnostic is not None
+    assert diagnostic["rows_matched"] == 1
+
+    # PER-MARKET markout: market A's BUY, fv 0.50 -> 0.55 => +500 bps. The merged-tape fv_at
+    # would leak market B's ts=1120 fv (0.90) into the fv-after, giving the WRONG +4000 bps.
+    for report in diagnostic["per_agent"].values():
+        assert report["post_trade_fv_markout_bps_diagnostic"] == 500
+
+    # No-fill boundary preserved.
     assert res.real_executable_edge_bps is None
     blob = json.dumps(diagnostic)
     for forbidden in FORBIDDEN_FILL_FIELDS:
