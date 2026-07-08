@@ -214,6 +214,8 @@ export interface MakerProofCardWire {
   n_fixtures: number;
   small_n_note: string;
   trades_not_fills_caveat: string | null;
+  trade_aware_diagnostic_note: string | null;
+  r2_overlay_label: string | null;
 }
 
 export interface MakerDiagnosticsWire {

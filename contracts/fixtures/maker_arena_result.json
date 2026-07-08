@@ -114,7 +114,8 @@
     "n_fixtures": 18,
     "small_n_note": "n=18 (Polymarket-resolved cp1), small sample",
     "trades_not_fills_caveat": null,
-    "trade_aware_diagnostic_note": null
+    "trade_aware_diagnostic_note": null,
+    "r2_overlay_label": null
   },
   "diagnostics": {
     "avg_markout_bps_label": "diagnostic_not_rank_axis",
