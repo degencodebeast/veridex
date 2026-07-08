@@ -27,6 +27,7 @@ from veridex.maker.r2_bracket import FORBIDDEN_R2_TRIGGERS, FillAssumptionConfig
 
 __all__ = [
     "R2_QUADRUPLE_LABEL",
+    "FILL_RULE_SOURCE",
     "FORBIDDEN_TRIGGER_ASSERTION",
     "R2SensitivityScenario",
     "R2ScenarioResult",
@@ -40,6 +41,12 @@ __all__ = [
 R2_QUADRUPLE_LABEL = (
     "REPORT_ONLY / UNCALIBRATED / DECLARED_MODEL_OVERLAY / NOT_A_FILL_PROOF"
 )
+
+# The pinned provenance of an R2 bracket's fill rule: it always comes from the
+# pinned ``FillAssumptionConfig``, never a live orderbook or observed fills. Pinned
+# via a validator so a reconstructed bracket cannot re-declare a different source
+# (Gate-#3 Major 2).
+FILL_RULE_SOURCE = "pinned_config"
 
 # The pinned no-tape-reactive assertion every bracket declares.
 FORBIDDEN_TRIGGER_ASSERTION = (
@@ -143,7 +150,7 @@ class R2SensitivityBracket(BaseModel):
     uses_own_fills: bool = False
     queue_modeled: bool = False
     ranked: bool = False
-    fill_rule_source: str = "pinned_config"
+    fill_rule_source: str = FILL_RULE_SOURCE
     forbidden_trigger_assertion: str = FORBIDDEN_TRIGGER_ASSERTION
     label: str = R2_QUADRUPLE_LABEL
 
@@ -170,6 +177,37 @@ class R2SensitivityBracket(BaseModel):
         if value != R2_QUADRUPLE_LABEL:
             raise ValueError(
                 f"R2 bracket label must be {R2_QUADRUPLE_LABEL!r}, got {value!r}."
+            )
+        return value
+
+    @field_validator("fill_rule_source")
+    @classmethod
+    def _must_be_pinned_fill_rule_source(cls, value: str) -> str:
+        """Pin the fill-rule provenance (Gate-#3 Major 2).
+
+        The fill rule ALWAYS comes from the pinned config; a reconstructed bracket
+        must not be able to re-declare ``"live_orderbook"`` or any other source.
+        """
+        if value != FILL_RULE_SOURCE:
+            raise ValueError(
+                f"fill_rule_source must be {FILL_RULE_SOURCE!r} (an R2 fill rule "
+                f"comes only from the pinned config, never a live orderbook), "
+                f"got {value!r}."
+            )
+        return value
+
+    @field_validator("forbidden_trigger_assertion")
+    @classmethod
+    def _must_be_pinned_forbidden_trigger_assertion(cls, value: str) -> str:
+        """Pin the no-tape-reactive assertion string (Gate-#3 Major 2).
+
+        The assertion is a fixed provenance claim; a reconstructed bracket must not
+        be able to substitute an assertion that concedes tape-reactive fills.
+        """
+        if value != FORBIDDEN_TRIGGER_ASSERTION:
+            raise ValueError(
+                "forbidden_trigger_assertion must be the pinned assertion "
+                f"{FORBIDDEN_TRIGGER_ASSERTION!r}, got {value!r}."
             )
         return value
 

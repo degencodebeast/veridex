@@ -12,6 +12,7 @@ from pydantic import ValidationError
 
 from veridex.maker.r2_bracket import FillAssumptionConfig
 from veridex.maker.r2_suite import (
+    R2SensitivityBracket,
     R2SensitivityScenario,
     render_protection_ablation,
     render_r2_suite,
@@ -153,3 +154,26 @@ def test_r2_sensitivity_scenario_matches_spec_44():
     # an out-of-enum mode is rejected
     with pytest.raises(ValidationError):
         R2SensitivityScenario(scenario_id="s", mode="bogus", fill_assumption_hash="h")
+
+
+def test_bracket_rejects_alternate_fill_rule_source():
+    # Gate-#3 Major 2: fill_rule_source is a PINNED provenance string. A caller
+    # must not be able to reconstruct a rendered bracket claiming a different
+    # source (e.g. "live_orderbook") — the validator pins it to "pinned_config".
+    b = render_r2_suite([10, 20, 30], _cfg())
+    dump = b.model_dump()
+    dump["fill_rule_source"] = "live_orderbook"
+    with pytest.raises(ValidationError):
+        R2SensitivityBracket(**dump)
+
+
+def test_bracket_rejects_alternate_forbidden_trigger_assertion():
+    # Gate-#3 Major 2: forbidden_trigger_assertion is a PINNED provenance string.
+    # A caller must not be able to reconstruct a bracket asserting the opposite
+    # (e.g. "trade_crossed fills are modeled") — the validator pins the exact
+    # module constant.
+    b = render_r2_suite([10, 20, 30], _cfg())
+    dump = b.model_dump()
+    dump["forbidden_trigger_assertion"] = "trade_crossed fills are modeled"
+    with pytest.raises(ValidationError):
+        R2SensitivityBracket(**dump)
