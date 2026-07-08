@@ -33,6 +33,8 @@ FORBIDDEN_DEFS = {
     "queue_position",
     "fill_simulation",
     "simulate_queue",
+    "OrderLifecycleEvent",
+    "RealFillReconciliation",
 }
 
 
