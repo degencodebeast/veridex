@@ -294,7 +294,11 @@ class ConvergenceReachReport(BaseModel):
     residual_reach_fraction: float | None
     reach_horizon_s: int
     n: int
-    note: str = "reach measured on the basis-adjusted residual only, never the raw gap"
+    note: str = (
+        "reach measured on the basis-adjusted residual only, never the raw gap; "
+        "residual-reach is a WEAK lead-lag detector — a near-0.5 reading is uninformative, "
+        "NOT evidence of 'no lead'; use an event-aligned signed-response test to establish FV lead"
+    )
 
 
 def build_convergence_reach(

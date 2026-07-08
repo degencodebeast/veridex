@@ -2,7 +2,17 @@
 
 OFFLINE probe (committed ReplayPack + pinned venue frames; no network). Reach is read from the basis-adjusted RESIDUAL only via the audited `build_convergence_reach`. The lead signal is the ASYMMETRY = (FV->venue reach) - (venue->FV reach): a POSITIVE value beyond 0.05 on a well-resolved venue == FV leads; ~0 == co-movement. Per-market, never pooled; forward horizon, no look-ahead; no settled value used as FV.
 
-## VERDICT: INCONCLUSIVE
+---
+
+> ## ⟳ CORRECTED (2026-07-08) — THE "INCONCLUSIVE" VERDICT BELOW IS WRONG (3 independent reviews agree)
+> The frozen-reference `build_convergence_reach` construction is **vacuous** for lead-lag: `decompose_gap` median-demeans, so a frozen anchor cancels exactly (identical `0.41667` for every frozen ∈ {0.10…0.90}). It never compared FV to venue. An event-aligned **signed-response** test on the SAME tape shows **FV DOES lead the venue — real, non-circular, modest, latency-driven** (fable found it, opus + Codex independently reproduced it):
+> - **Honest headline (Codex-reconciled): hit ~0.63, pooled z≈+6.9 (fixture-level z≈+3.8), 16/18 fixtures.** This is the **NEXT-change** event definition (predict the *next* qualifying venue move from the prior residual sign). The **0.78 / z≈+15** figure is the **SAME-change** definition (scoring the residual against the very move being "predicted") — near-circular, NOT for sizing. State which event timing is the claim. Placebo (post-move residual) correctly anti-predictive (~0.28).
+> - **Non-circular:** FV = external de-margined sportsbook consensus (`TXLineStablePriceDemargined`, BookmakerId 10021), NOT Polymarket — repo-verified end-to-end by two reviewers (venue = disjoint `polymarket`/`clob-prices-history` frames). Residual: TxLINE proprietary upstream is unprovable from repo → **ask the feed provider** whether its consensus ingests any prediction-market prices.
+> - **Latency, not model alpha:** lead survives the venue's own-autocorrelation null; mechanism = data-freshness edge on a **BACKFILLED** 60s-fidelity series, venue-change spacing ~**20–40 min** (aggregation-dependent: 40.2min tape-mid / 29.9min raw-frame / 20.1min per-market-median; NOT uniquely 49min).
+> - **BLOCKER before sizing:** confirm the LIVE venue is as stale as this backfill implies — the multi-minute lag may be a `clob-prices-history` fidelity artifact that shrinks/erases the edge on real quotes. Size on **next-change 0.63 / fixture-z≈+3.8**, never same-change 0.78 / z+15.
+> - **⚠ NOT YET SEALED (Codex):** the corrected signed-response test lives in ephemeral scratch scripts; the committed `convergence_probe.py` still reruns to INCONCLUSIVE. Commit the signed-response probe (with its exact next-change event definition) before treating this as reproducible/sealed or bringing it to quants as a "result to attack."
+
+## VERDICT: INCONCLUSIVE  *(← SUPERSEDED — see correction above)*
 
 > The venue mid is too coarsely sampled to answer the lead question. Within any hour-scale window the venue makes only a handful of distinct moves (median `venue_moves` below), while the TxLINE FV moves continuously. Freezing FV and watching the near-flat venue forces the FV->venue reach toward 0, which reads as a spurious 'venue leads' -- a SAMPLING-CADENCE ARTIFACT, not price leadership. We therefore refuse a directional verdict: **no FV lead is established, and the apparent venue-leads asymmetry is an artifact, not a finding.**
 
