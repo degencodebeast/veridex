@@ -6,6 +6,7 @@ at construction. Every new pin field must flow into ``config_hash()``.
 """
 
 import pytest
+from pydantic import ValidationError
 
 from veridex.maker.r2_bracket import FillAssumptionConfig
 
@@ -51,13 +52,13 @@ def test_fill_assumption_rule_params_move_config_hash():
 
 
 def test_queue_modeled_true_still_rejected():
-    with pytest.raises(Exception):
+    with pytest.raises(ValidationError):
         _cfg(queue_modeled=True)
 
 
 def test_forbidden_tape_reactive_trigger_rejected():
     # a forbidden trigger named as the fill rule is rejected
-    with pytest.raises(Exception):
+    with pytest.raises(ValidationError):
         FillAssumptionConfig(
             fill_model_id="m",
             latency_ms=1,
@@ -71,7 +72,7 @@ def test_forbidden_tape_reactive_trigger_rejected():
             ex_ante_fields=["quote_price"],
         )
     # a forbidden trigger named in ex_ante_fields is also rejected
-    with pytest.raises(Exception):
+    with pytest.raises(ValidationError):
         FillAssumptionConfig(
             fill_model_id="m",
             latency_ms=1,
@@ -86,34 +87,34 @@ def test_forbidden_tape_reactive_trigger_rejected():
         )
     # every forbidden trigger is rejected as a fill rule
     for trigger in ["trade_crossed", "price_touched", "mid_crossed", "fv_moved", "post_hoc_fill"]:
-        with pytest.raises(Exception):
+        with pytest.raises(ValidationError):
             _cfg(fill_probability_rule=trigger)
 
 
 def test_forbidden_trigger_rejected_case_insensitive():
     # M1/CON-107: an UPPER/mixed-case forbidden trigger must NOT slip through the
     # substring guard (case-insensitive matching).
-    with pytest.raises(Exception):
+    with pytest.raises(ValidationError):
         _cfg(fill_probability_rule="TRADE_CROSSED")
 
 
 def test_forbidden_trigger_rejected_in_decorated_ex_ante_field():
     # M1/CON-107: a decorated field embedding a forbidden trigger substring
     # (e.g. "trade_crossed_signal") must be rejected via substring matching.
-    with pytest.raises(Exception):
+    with pytest.raises(ValidationError):
         _cfg(ex_ante_fields=["trade_crossed_signal"])
 
 
 def test_seeded_stochastic_requires_seed_and_n_paths():
     # M2/CON-108: SEEDED_STOCHASTIC claims a pinned run -> seed and n_paths must
     # be pinned (seed not None, n_paths a positive int), else config_hash lies.
-    with pytest.raises(Exception):
+    with pytest.raises(ValidationError):
         _cfg(draw_mode="SEEDED_STOCHASTIC", seed=None, n_paths=100)
-    with pytest.raises(Exception):
+    with pytest.raises(ValidationError):
         _cfg(draw_mode="SEEDED_STOCHASTIC", seed=7, n_paths=None)
-    with pytest.raises(Exception):
+    with pytest.raises(ValidationError):
         _cfg(draw_mode="SEEDED_STOCHASTIC", seed=7, n_paths=0)
-    with pytest.raises(Exception):
+    with pytest.raises(ValidationError):
         _cfg(draw_mode="SEEDED_STOCHASTIC", seed=7, n_paths=-5)
     # a fully-pinned SEEDED_STOCHASTIC config is accepted
     _cfg(draw_mode="SEEDED_STOCHASTIC", seed=7, n_paths=100)
@@ -123,5 +124,5 @@ def test_seeded_stochastic_requires_seed_and_n_paths():
 
 def test_draw_mode_rejects_unknown_value():
     # m1: a typo'd draw_mode must be rejected, not silently treated deterministic.
-    with pytest.raises(Exception):
+    with pytest.raises(ValidationError):
         _cfg(draw_mode="SEEDED")

@@ -8,6 +8,7 @@ single path).
 """
 
 import pytest
+from pydantic import ValidationError
 
 from veridex.maker.r2_bracket import FillAssumptionConfig
 from veridex.maker.r2_suite import (
@@ -140,15 +141,15 @@ def test_r2_sensitivity_scenario_matches_spec_44():
     for mode in ("pessimistic", "neutral", "optimistic"):
         R2SensitivityScenario(scenario_id="s", mode=mode, fill_assumption_hash="h")
     # ranked=True is structurally rejected (never rankable)
-    with pytest.raises(Exception):
+    with pytest.raises(ValidationError):
         R2SensitivityScenario(
             scenario_id="s", mode="neutral", fill_assumption_hash="h", ranked=True
         )
     # queue_modeled=True is structurally rejected (no depth at R2)
-    with pytest.raises(Exception):
+    with pytest.raises(ValidationError):
         R2SensitivityScenario(
             scenario_id="s", mode="neutral", fill_assumption_hash="h", queue_modeled=True
         )
     # an out-of-enum mode is rejected
-    with pytest.raises(Exception):
+    with pytest.raises(ValidationError):
         R2SensitivityScenario(scenario_id="s", mode="bogus", fill_assumption_hash="h")

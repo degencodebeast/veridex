@@ -70,8 +70,9 @@ def assert_bracket_not_ranked(agent_metrics: list[dict[str, Any]]) -> None:
         agent_metrics: One metric-stack dict per maker agent, as passed to ``rank_makers``.
 
     Raises:
-        AssertionError: If any row contains a key in
-            ``{"bracket", "sensitivity", "r2", "r2_bracket"}``.
+        AssertionError: If any row contains a key in ``_R2_BRACKET_KEYS`` (the
+            full ``R2SensitivityBracket`` ∪ ``R2ProtectionAblation`` field set,
+            minus ``real_executable_edge_bps``).
     """
     for row in agent_metrics:
         offending = _R2_BRACKET_KEYS & row.keys()
