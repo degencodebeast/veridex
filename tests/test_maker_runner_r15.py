@@ -80,6 +80,26 @@ def test_artifact_content_mismatch_voids_before_join(monkeypatch):
     assert tape_calls == []   # VOID originated in the artifact-content branch, before any trade I/O
 
 
+# --- E2-T2 test C: a missing/unreadable artifact path fails CLOSED as MakerVoidError
+# The predeclared artifact identity is set, but the supplied path does not exist. The
+# real loader would raise FileNotFoundError; the runner must translate that into the
+# uniform MakerVoidError fail-closed surface and NEVER reach the tape/trade I/O.
+def test_missing_artifact_path_voids(monkeypatch):
+    tape_calls = []
+    monkeypatch.setattr(runner_mod, "build_cp1_maker_tape",
+                        lambda *a, **k: tape_calls.append("t") or _fake_tape())
+
+    class _Art:
+        artifact_hash = recompute_artifact_hash([_row()])
+
+    cfg = build_maker_run_config(fixture_ids=CP1_18, trade_artifact=_Art())
+    missing = Path("does-not-exist-trade-artifact-9f3c1e.json")
+    with pytest.raises(MakerVoidError):
+        runner_mod.run_maker_arena(cfg, expected_config_hash=cfg.config_hash(),
+                                   trade_artifact_path=missing, seal=False)
+    assert tape_calls == []   # VOID before any trade I/O
+
+
 # --- E2-T2 source-contract tests --------------------------------------------------
 def test_pinned_hash_but_no_path_is_insufficient_data(monkeypatch):
     # cfg.trade_artifact_hash set, but no trade_artifact_path -> the predeclared artifact

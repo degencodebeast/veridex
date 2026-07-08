@@ -223,12 +223,24 @@ def run_maker_arena(
                 "trade_artifact_path was supplied -- INSUFFICIENT_DATA: the pinned "
                 "artifact bytes cannot be verified. Do NOT report this result."
             )
-        artifact = load_trade_artifact(trade_artifact_path)
-        recomputed = recompute_artifact_hash(list(artifact.rows))
-        if recomputed != cfg.trade_artifact_hash:
+        try:
+            artifact = load_trade_artifact(trade_artifact_path)
+        except OSError as exc:
+            # Fail CLOSED, uniform VOID surface: a missing / unreadable artifact file
+            # must join the MakerVoidError VOID-everywhere boundary -- never leak a raw
+            # FileNotFoundError / OSError past the trust surface.
+            raise MakerVoidError(
+                "VOID: the predeclared trade artifact could not be read from "
+                f"{trade_artifact_path!r} ({type(exc).__name__}: {exc}) -- "
+                "INSUFFICIENT_DATA. Do NOT report this result."
+            ) from exc
+        # Named distinctly from the step-2 mapping `recomputed` above so the two trust
+        # hashes never shadow each other on the trust path.
+        recomputed_artifact_hash = recompute_artifact_hash(list(artifact.rows))
+        if recomputed_artifact_hash != cfg.trade_artifact_hash:
             raise MakerVoidError(
                 "VOID: loaded trade artifact recomputes to "
-                f"{recomputed}, which diverges from the predeclared "
+                f"{recomputed_artifact_hash}, which diverges from the predeclared "
                 f"cfg.trade_artifact_hash {cfg.trade_artifact_hash}. Do NOT report "
                 "this result."
             )
@@ -342,6 +354,10 @@ def run_maker_arena(
     )
 
     # 6. Assemble the result. real_executable_edge_bps stays None (no edge claim).
+    # For E2 the verified `trade_artifact_hash` is recorded transitively via the
+    # `config_hash` binding (the pin is frozen INTO `cfg.config_hash()`), so the result
+    # is already bound to the exact artifact identity; a dedicated result-level
+    # `trade_artifact_hash` field is surfaced later in E5-T2.
     result = MakerArenaResult(
         protocol_id=cfg.protocol_id,
         config_hash=cfg.config_hash(),
