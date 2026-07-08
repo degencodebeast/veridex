@@ -41,6 +41,10 @@ MAKER_DIAGNOSTICS: dict[str, str] = {
     "avg_markout_bps_label": "diagnostic_not_rank_axis",
     "avg_toxicity_loss_bps_label": "rank_axis_lower_is_better",
     "real_executable_edge_bps_label": "always_null_no_fill_or_pnl_claim",
+    # The MM-R1.5 trade-aware diagnostic is report-only: it carries adverse-selection /
+    # convergence observations, NEVER a fill / fill-rate / spread-capture-as-PnL /
+    # realized-PnL / executable-edge value. Null when the diagnostic was not run.
+    "trade_aware_diagnostic_label": "report_only_no_fill_or_edge_claim",
 }
 
 

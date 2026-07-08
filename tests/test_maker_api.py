@@ -105,6 +105,42 @@ def test_maker_proof_card_and_diagnostics_present() -> None:
     assert diag["real_executable_edge_bps_label"] == "always_null_no_fill_or_pnl_claim"
 
 
+def test_api_surfaces_r15_diagnostic_labels() -> None:
+    """E5-T2: the R1.5 trade-aware diagnostic is surfaced under an honesty label.
+
+    The label marks it report-only (no fill/edge/PnL claim), the diagnostic itself
+    is surfaced in the result envelope (null on the sealed MM-R1 seal — never a
+    fabricated value), and no fill/PnL/edge/CLV key leaks into its payload.
+    """
+    body = _client().get("/maker/arena-result").json()
+
+    # NEW: the trade-aware R1.5 diagnostic carries a report-only honesty label.
+    diag = body["diagnostics"]
+    assert diag["trade_aware_diagnostic_label"] == "report_only_no_fill_or_edge_claim"
+
+    # It is surfaced in the result envelope; null on the sealed MM-R1 seal (never fabricated).
+    result = body["result"]
+    assert "trade_aware_diagnostic" in result
+
+    # No fill/PnL/edge/CLV key may appear in the surfaced diagnostic payload.
+    banned = {
+        "real_executable_edge_bps",
+        "executable_edge_bps",
+        "fill_rate",
+        "fill_price",
+        "sim_pnl",
+        "pnl",
+        "realized_pnl",
+        "avg_clv_bps",
+        "clv_bps",
+    }
+    payload = result["trade_aware_diagnostic"]
+    if isinstance(payload, dict):
+        assert banned.isdisjoint(payload.keys()), (
+            f"fill/PnL/edge/CLV key leaked into R1.5 diagnostic: {payload.keys()}"
+        )
+
+
 def test_falsification_and_window_note_preserved() -> None:
     """falsification.verdict + window_clv_analog.note survive unchanged from the seal."""
     body = _client().get("/maker/arena-result").json()

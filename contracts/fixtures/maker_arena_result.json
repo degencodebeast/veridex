@@ -113,11 +113,13 @@
     },
     "n_fixtures": 18,
     "small_n_note": "n=18 (Polymarket-resolved cp1), small sample",
-    "trades_not_fills_caveat": null
+    "trades_not_fills_caveat": null,
+    "trade_aware_diagnostic_note": null
   },
   "diagnostics": {
     "avg_markout_bps_label": "diagnostic_not_rank_axis",
     "avg_toxicity_loss_bps_label": "rank_axis_lower_is_better",
-    "real_executable_edge_bps_label": "always_null_no_fill_or_pnl_claim"
+    "real_executable_edge_bps_label": "always_null_no_fill_or_pnl_claim",
+    "trade_aware_diagnostic_label": "report_only_no_fill_or_edge_claim"
   }
 }

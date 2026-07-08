@@ -64,6 +64,33 @@ describe('maker wire contract binding — maker_arena_result.json parses into Ma
     expect(m.diagnostics.avg_markout_bps_label).toBe('diagnostic_not_rank_axis');
   });
 
+  // E5-T2: the surfaced R1.5 trade-aware diagnostic never carries a fill / PnL / edge / CLV
+  // key. Null on the sealed MM-R1 seal (never a fabricated value); if ever populated, no
+  // forbidden key may appear in its payload.
+  it('R1.5 trade-aware diagnostic payload carries no fill/PnL/edge/CLV key', () => {
+    const m = load<MakerArenaResultResponseWire>('maker_arena_result.json');
+    const payload = m.result.trade_aware_diagnostic;
+    // sealed seal is MM-R1 → null (honest no-data, not a fabricated 0/value)
+    expect(payload === null || typeof payload === 'object').toBe(true);
+    const banned = [
+      'real_executable_edge_bps',
+      'executable_edge_bps',
+      'fill_rate',
+      'fill_price',
+      'sim_pnl',
+      'pnl',
+      'realized_pnl',
+      'avg_clv_bps',
+      'clv_bps',
+    ];
+    if (payload !== null) {
+      const keys = Object.keys(payload);
+      for (const forbidden of banned) {
+        expect(keys).not.toContain(forbidden);
+      }
+    }
+  });
+
   it('proof_card present with rung / n_fixtures / falsification', () => {
     const m = load<MakerArenaResultResponseWire>('maker_arena_result.json');
     expect(m.proof_card).toBeDefined();
