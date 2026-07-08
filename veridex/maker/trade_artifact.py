@@ -73,3 +73,36 @@ class NormalizedTradeRow(BaseModel):
     def event_key(self) -> tuple[str, int]:
         """Return the chain-event identity key ``(tx_hash, log_index)``."""
         return (self.tx_hash, self.log_index)
+
+
+def _canonical_dump(payload: object) -> str:
+    """Canonical, deterministic JSON encoding (inlined; no cross-module import).
+
+    Matches the mapping builder's ``sort_keys=True, separators=(",", ":")`` scheme
+    so the hash is byte-stable. Inlined here deliberately: the trade trust surface
+    must NOT depend on :mod:`veridex.runtime.evidence`.
+    """
+    return json.dumps(payload, sort_keys=True, separators=(",", ":"))
+
+
+def recompute_artifact_hash(rows: list[NormalizedTradeRow]) -> str:
+    """Recompute the trust-load-bearing artifact hash over normalized rows.
+
+    The hash covers BOTH the economic fields (``ts, price, size, aggressor_side,
+    condition_id, token_id``) AND the chain-event identity (``block_number,
+    tx_hash, log_index``) of every row, so any change to either — including a
+    differing ``log_index`` on otherwise-identical rows — produces a different
+    digest. Rows are sorted deterministically by ``(block_number, log_index)``
+    before hashing so file order does not affect the result.
+
+    Args:
+        rows: The normalized trade rows to hash.
+
+    Returns:
+        The lowercase hex sha256 digest over the canonical encoding of the
+        sorted rows.
+    """
+    ordered = sorted(rows, key=lambda r: (r.block_number, r.log_index))
+    payload = [_canonical_dump(r.model_dump(mode="json")) for r in ordered]
+    encoded = _canonical_dump(payload).encode()
+    return hashlib.sha256(encoded).hexdigest()
