@@ -16,7 +16,9 @@ import pytest
 
 import veridex.maker.runner as runner_mod
 from veridex.maker.config import MakerVoidError, build_maker_run_config
+from veridex.maker.contracts import Side
 from veridex.maker.diagnostic import FORBIDDEN_FILL_FIELDS
+from veridex.maker.scorer import QuoteAccounting, QuoteMarkout
 from veridex.maker.trade_artifact import NormalizedTradeRow, recompute_artifact_hash
 from veridex.maker.trades import AggressorSide
 
@@ -352,3 +354,97 @@ def test_runner_r15_no_artifact_has_no_diagnostic_and_stays_r1(monkeypatch):
     res = runner_mod.run_maker_arena(_pinned_cfg(), seal=False)
     assert res.trade_aware_diagnostic is None
     assert "R1" in str(res.rung) and "R1_5" not in str(res.rung)
+
+
+# --- Codex Gate-#2 Major: candidate/naive toxicity loss must be a MEAN, not a
+# cumulative SUM (E4 diagnostic honesty) ------------------------------------------
+def _fixed_mark(markout_bps: int, *, market_key: str = "1X2|home|full") -> QuoteMarkout:
+    """A ``QuoteMarkout`` with an explicit ``markout_bps``, everything else fixed."""
+    return QuoteMarkout(
+        fixture_id=0, tick_seq=0, side=Side.BID, market_key=market_key,
+        horizon_s=30, markout_bps=markout_bps,
+    )
+
+
+def test_candidate_vs_naive_delta_is_mean_not_cumulative(monkeypatch):
+    # `_build_trade_aware_diagnostic` derives `candidate_toxicity_loss_bps` /
+    # `naive_toxicity_loss_bps` from `quality_by` (built by `_score_group` in the R1
+    # scoring loop, one call per (market group, agent)). Monkeypatching `_score_group`
+    # gives full control over each agent's per-quote toxicity values -- UNEQUAL scored
+    # counts between naive (2 marks) and candidate (4 marks) so the cumulative-SUM delta
+    # and the MEAN delta diverge numerically (not just by a common scalar factor):
+    #   naive:     2 marks x toxicity 100  -> sum 200, mean 100
+    #   candidate: 4 marks x toxicity  40  -> sum 160, mean  40
+    #   sum-delta  = 160 - 200 = -40  (WRONG: scales with quote count)
+    #   mean-delta =  40 - 100 = -60  (RIGHT: matches scorer.avg_toxicity_loss_bps's axis)
+    def _fake_score_group(agent, rows, ref_at, horizons_s):
+        if agent.agent_id == "naive-mm":
+            marks = [_fixed_mark(-100)]                      # 1/group x 2 groups = 2 marks
+        else:
+            marks = [_fixed_mark(-40), _fixed_mark(-40)]      # 2/group x 2 groups = 4 marks
+        return marks, QuoteAccounting(scored=len(marks), abstained=0)
+
+    monkeypatch.setattr(runner_mod, "_score_group", _fake_score_group)
+
+    class _Art:
+        artifact_hash = recompute_artifact_hash([_row()])
+
+    cfg = build_maker_run_config(fixture_ids=CP1_18, trade_artifact=_Art())
+    monkeypatch.setattr(runner_mod, "load_trade_artifact", lambda *a, **k: _fake_artifact(rows=[_row()]))
+    monkeypatch.setattr(runner_mod, "build_cp1_maker_tape", lambda *a, **k: _fake_tape())
+    res = runner_mod.run_maker_arena(
+        cfg, expected_config_hash=cfg.config_hash(),
+        trade_artifact_path=Path("pinned.json"), seal=False,
+    )
+
+    diagnostic = res.trade_aware_diagnostic
+    assert diagnostic is not None
+
+    naive_toxicity = [100, 100]
+    candidate_toxicity = [40, 40, 40, 40]
+    expected_naive_mean = round(sum(naive_toxicity) / len(naive_toxicity))          # 100
+    expected_candidate_mean = round(sum(candidate_toxicity) / len(candidate_toxicity))  # 40
+    expected_mean_delta = expected_candidate_mean - expected_naive_mean              # -60
+    wrong_cumulative_delta = sum(candidate_toxicity) - sum(naive_toxicity)           # -40
+
+    for report in diagnostic["per_agent"].values():
+        delta = report["candidate_vs_naive_toxicity_delta_bps_diagnostic"]
+        assert delta == expected_mean_delta, (
+            f"expected MEAN-loss delta {expected_mean_delta}, got {delta} "
+            f"(a cumulative-sum delta would wrongly read {wrong_cumulative_delta})"
+        )
+        assert delta != wrong_cumulative_delta
+
+    # No-fill boundary preserved.
+    assert res.real_executable_edge_bps is None
+    blob = json.dumps(diagnostic)
+    for forbidden in FORBIDDEN_FILL_FIELDS:
+        assert forbidden not in blob
+
+
+def test_candidate_vs_naive_delta_none_when_one_side_has_no_scored_quotes(monkeypatch):
+    # If either agent has zero scored quotes, the mean is undefined for that side ->
+    # loss_by[agent] must be None, and the delta (a pure subtraction) must therefore
+    # also be None -- never a fabricated comparison from a missing operand.
+    def _fake_score_group(agent, rows, ref_at, horizons_s):
+        if agent.agent_id == "naive-mm":
+            return [], QuoteAccounting(scored=0, abstained=1)
+        return [_fixed_mark(-40)], QuoteAccounting(scored=1, abstained=0)
+
+    monkeypatch.setattr(runner_mod, "_score_group", _fake_score_group)
+
+    class _Art:
+        artifact_hash = recompute_artifact_hash([_row()])
+
+    cfg = build_maker_run_config(fixture_ids=CP1_18, trade_artifact=_Art())
+    monkeypatch.setattr(runner_mod, "load_trade_artifact", lambda *a, **k: _fake_artifact(rows=[_row()]))
+    monkeypatch.setattr(runner_mod, "build_cp1_maker_tape", lambda *a, **k: _fake_tape())
+    res = runner_mod.run_maker_arena(
+        cfg, expected_config_hash=cfg.config_hash(),
+        trade_artifact_path=Path("pinned.json"), seal=False,
+    )
+
+    diagnostic = res.trade_aware_diagnostic
+    assert diagnostic is not None
+    for report in diagnostic["per_agent"].values():
+        assert report["candidate_vs_naive_toxicity_delta_bps_diagnostic"] is None

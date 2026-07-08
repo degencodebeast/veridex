@@ -251,10 +251,20 @@ def _build_trade_aware_diagnostic(
     else:
         quote_price = sorted(fv_vals)[len(fv_vals) // 2] if fv_vals else 0.5
 
-    # Per-agent toxicity loss (bps) as a non-negative magnitude derived from the pooled
-    # markout QUALITY (which is <= 0). This is a comparison anchor, NOT a PnL/fill.
+    # Per-agent toxicity loss (bps) as a non-negative MEAN magnitude derived from the
+    # pooled markout QUALITY (which is <= 0). This is a comparison anchor, NOT a
+    # PnL/fill. It MUST be a mean (not a cumulative sum): the lane's gated toxicity
+    # axis is `scorer.avg_toxicity_loss_bps`, itself a mean of max(0, -markout) over
+    # scored marks, and `candidate_vs_naive_toxicity_delta_bps_diagnostic` (below) must
+    # stay on that same per-quote-scale axis rather than scaling with quote count.
+    # `None` when an agent has zero scored quotes (never fabricate a mean from nothing).
     horizons_s = cfg.markout_horizons_s
-    loss_by = {a.agent_id: -sum(quality_by.get(a.agent_id, [])) for a in agents}
+    loss_by: dict[str, int | None] = {
+        a.agent_id: (
+            round(sum(-q for q in qs) / len(qs)) if (qs := quality_by.get(a.agent_id, [])) else None
+        )
+        for a in agents
+    }
     agent_ids = [a.agent_id for a in agents]
     candidate_loss = loss_by[agent_ids[-1]] if agent_ids else None
     naive_loss = loss_by[agent_ids[0]] if agent_ids else None
