@@ -88,3 +88,18 @@ def test_forbidden_tape_reactive_trigger_rejected():
     for trigger in ["trade_crossed", "price_touched", "mid_crossed", "fv_moved", "post_hoc_fill"]:
         with pytest.raises(Exception):
             _cfg(fill_probability_rule=trigger)
+
+
+
+def test_forbidden_trigger_rejected_case_insensitive():
+    # M1/CON-107: an UPPER/mixed-case forbidden trigger must NOT slip through the
+    # substring guard (case-insensitive matching).
+    with pytest.raises(Exception):
+        _cfg(fill_probability_rule="TRADE_CROSSED")
+
+
+def test_forbidden_trigger_rejected_in_decorated_ex_ante_field():
+    # M1/CON-107: a decorated field embedding a forbidden trigger substring
+    # (e.g. "trade_crossed_signal") must be rejected via substring matching.
+    with pytest.raises(Exception):
+        _cfg(ex_ante_fields=["trade_crossed_signal"])

@@ -77,18 +77,23 @@ class FillAssumptionConfig(BaseModel):
         information available AT QUOTE TIME. Naming any tape-reactive trigger
         turns the overlay into a post-hoc fill claim, which is rejected here.
         """
-        rule = self.fill_probability_rule
+        # Case-insensitive SUBSTRING matching so neither a cased spelling
+        # (``TRADE_CROSSED``) nor a decorated field (``trade_crossed_signal``)
+        # can slip a forbidden trigger past the guard (CON-107, AC-116).
+        rule = self.fill_probability_rule.lower()
         if any(trigger in rule for trigger in FORBIDDEN_R2_TRIGGERS):
             raise ValueError(
-                f"fill_probability_rule {rule!r} names a tape-reactive trigger; "
-                f"R2 fill rules must be ex-ante only. Forbidden: "
-                f"{sorted(FORBIDDEN_R2_TRIGGERS)}."
+                f"fill_probability_rule {self.fill_probability_rule!r} names a "
+                f"tape-reactive trigger; R2 fill rules must be ex-ante only. "
+                f"Forbidden: {sorted(FORBIDDEN_R2_TRIGGERS)}."
             )
         for field in self.ex_ante_fields:
-            if field in FORBIDDEN_R2_TRIGGERS:
+            lowered = field.lower()
+            if any(trigger in lowered for trigger in FORBIDDEN_R2_TRIGGERS):
                 raise ValueError(
-                    f"ex_ante_fields entry {field!r} is a tape-reactive trigger; "
-                    f"R2 may only declare fields available at quote time."
+                    f"ex_ante_fields entry {field!r} embeds a tape-reactive "
+                    f"trigger; R2 may only declare fields available at quote "
+                    f"time. Forbidden: {sorted(FORBIDDEN_R2_TRIGGERS)}."
                 )
         return self
 
