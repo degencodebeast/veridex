@@ -8,6 +8,7 @@ and duplicate dedup keyed on event identity.
 from __future__ import annotations
 
 import pytest
+from pydantic import ValidationError
 
 from veridex.maker.mapping import PINNED_MAPPING_HASH
 from veridex.maker.trade_artifact import (
@@ -39,9 +40,12 @@ def test_normalized_row_carries_event_identity_and_no_fill_fields():
     r = _row()
     assert r.event_key() == ("0xabc", 3)
     assert r.block_number == 100 and r.tx_hash == "0xabc" and r.log_index == 3
-    with pytest.raises(Exception):
+    with pytest.raises(ValidationError):
         _row(fill_price=0.5)  # extra="forbid"
-    with pytest.raises(Exception):
+    # price=1.4 raises MarkoutError inside the field_validator, which pydantic wraps
+    # into a ValidationError at construction -- so the observable type here is
+    # ValidationError, not the raw MarkoutError.
+    with pytest.raises(ValidationError):
         _row(price=1.4)  # decimal rejected
 
 
@@ -101,16 +105,16 @@ def _artifact(rows, **kw):
 def test_trade_artifact_reconciles_and_forbids_token():
     a = _artifact([_row()])
     assert a.artifact_hash == recompute_artifact_hash([_row()])
-    with pytest.raises(Exception):
+    with pytest.raises(ValidationError):
         _artifact([_row()], artifact_hash="deadbeef")  # hash mismatch
-    with pytest.raises(Exception):
+    with pytest.raises(ValidationError):
         _artifact([_row()], rows_unmatched=5)  # reconciliation fails
-    with pytest.raises(Exception):
+    with pytest.raises(ValidationError):
         _artifact([_row()], mapping_content_hash="nope")  # mapping not pinned
     _artifact([_row()])  # token_supplied_externally=True is ALLOWED
-    with pytest.raises(Exception):
+    with pytest.raises(ValidationError):
         _artifact([_row()], hypersync_api="secret")  # secret-bearing key forbidden
-    with pytest.raises(Exception):
+    with pytest.raises(ValidationError):
         _artifact([_row()], api_key="AKIA...")  # secret-bearing key forbidden
 
 
