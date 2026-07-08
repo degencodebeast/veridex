@@ -188,7 +188,24 @@ def build_trade_artifact(
     rows_decoded = len(rows)
     unique_rows, duplicate_dropped = dedup_normalized_rows(rows)
 
+    # The clean-room decoder emits ``condition_id=""`` (the OrderFilled ABI carries no
+    # condition_id). Enrich each cp1-matched row's ``condition_id`` from the pinned mapping
+    # (indexed by the unique ``token_id``) so the artifact rows carry the real market
+    # identity and the runner's ``(condition_id, token_id)`` real-artifact join matches on
+    # real data (AC-102). Enrichment belongs in build (which holds the mapping), keeping the
+    # decoder pure; unmatched rows keep ``condition_id=""``. Rows are frozen -> model_copy.
     cp1_token_ids = {str(record["token_id"]) for record in records}
+    cp1_condition_by_token = {
+        str(record["token_id"]): str(record.get("condition_id", "") or "")
+        for record in records
+    }
+    unique_rows = [
+        row.model_copy(update={"condition_id": cp1_condition_by_token[row.token_id]})
+        if cp1_condition_by_token.get(row.token_id)
+        else row
+        for row in unique_rows
+    ]
+
     matched = [row for row in unique_rows if row.token_id in cp1_token_ids]
     unmatched = [row for row in unique_rows if row.token_id not in cp1_token_ids]
 
@@ -283,7 +300,12 @@ def _load_pinned_cp1_records() -> list[dict[str, Any]]:
     from veridex.maker.mapping import DEFAULT_MAPPING_PATH, load_resolved_market_lookup
 
     parsed, _hash = load_resolved_market_lookup(DEFAULT_MAPPING_PATH)
-    return [{"token_id": record.token_id} for record in parsed]
+    # ``condition_id`` rides along so ``build_trade_artifact`` can enrich matched rows'
+    # market identity (the decoder leaves ``condition_id=""``); it is public mapping data.
+    return [
+        {"token_id": record.token_id, "condition_id": record.condition_id}
+        for record in parsed
+    ]
 
 
 def _default_operator_manifest_meta(

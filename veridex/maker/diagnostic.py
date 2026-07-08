@@ -81,6 +81,8 @@ def compute_trade_aware_diagnostic(
     *,
     window_s: int = 120,
     near_band: float = 0.10,
+    # Reserved (spec-mandated Item-9 signature): accepted but not yet consumed — no
+    # naive-quote computation is performed here.
     naive_quote_price: float | None = None,
     candidate_toxicity_loss_bps: int | None = None,
     naive_toxicity_loss_bps: int | None = None,

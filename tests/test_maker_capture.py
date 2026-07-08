@@ -150,6 +150,26 @@ def test_build_trade_artifact_reconciles_and_has_no_token():
     assert "HYPERSYNC" not in json.dumps(artifact.model_dump())
 
 
+def test_build_trade_artifact_enriches_condition_id_from_mapping():
+    # The clean-room OrderFilled ABI has no condition_id, so a decoded row carries
+    # condition_id="". When its token_id is present in the pinned mapping, build MUST
+    # enrich the row's condition_id from that record so the runner's later
+    # (condition_id, token_id) join can match on real data (AC-102).
+    row = decode_order_filled(_order_filled_log(takerAssetId="42", log_index=7))
+    assert row.condition_id == ""  # decoder leaves it empty (no condition_id in the ABI)
+
+    records = [{"token_id": "42", "condition_id": "0xCONDMAPPED"}]
+    artifact = build_trade_artifact(
+        [row], records=records, manifest_meta=dict(_MANIFEST_META)
+    )
+
+    assert len(artifact.rows) == 1
+    assert artifact.rows[0].token_id == "42"
+    # Enriched from the mapping (was ""); the artifact_hash now deterministically
+    # covers the real condition_id.
+    assert artifact.rows[0].condition_id == "0xCONDMAPPED"
+
+
 def test_capture_entrypoint_fails_closed_without_token(monkeypatch, tmp_path):
     monkeypatch.delenv("HYPERSYNC_API", raising=False)
     out_path = tmp_path / "artifact.json"

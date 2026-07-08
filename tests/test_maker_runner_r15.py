@@ -23,6 +23,17 @@ from veridex.maker.trades import AggressorSide
 CP1_18 = (17588229, 17588234, 17588245, 17588325, 17588391, 17588404, 17926593, 18167317,
           18172280, 18172469, 18175918, 18175981, 18175983, 18176123, 18179550, 18179551, 18179759, 18179763)
 
+# Descriptive manifest for build_trade_artifact (carries no operator secret); the
+# count / hash / mapping-pin / rows fields are computed by the builder.
+_MANIFEST_META = dict(
+    raw_artifact_hash=None, schema_version="v1", decoder_version="d1", decoder_commit=None,
+    source="polymarket_ctf_exchange_v2_orderfilled", chain_id=137, contract_address="0xe11...",
+    event_signature="OrderFilled(bytes32,address,address,uint256,uint256,uint256,uint256,uint256)",
+    from_block=1, to_block=2, reorg_buffer_confs=20, capture_ts=1, capture_tool_id="t1",
+    provider_id="hs-prod", token_supplied_externally=True, fixture_count=18, side_count=54,
+    cleanroom_attestation="clean-room; no GPL copied",
+)
+
 
 def _pinned_cfg():
     return build_maker_run_config(fixture_ids=CP1_18)
@@ -197,6 +208,66 @@ def test_runner_r15_joins_real_artifact_and_stays_no_fill(monkeypatch):
 
     # HARD no-fill boundary: edge null everywhere; NO forbidden fill/PnL field in the
     # serialized diagnostic; ``real_executable_edge_bps`` present only as the literal null.
+    assert res.real_executable_edge_bps is None
+    blob = json.dumps(diagnostic)
+    for forbidden in FORBIDDEN_FILL_FIELDS:
+        assert forbidden not in blob
+    for report in diagnostic["per_agent"].values():
+        assert report["real_executable_edge_bps"] is None
+
+
+def test_runner_r15_join_matches_real_mapping_row(monkeypatch):
+    # M1 spec-closure (AC-102): the E4-T4 headline (real-artifact join -> diagnostic) must
+    # be LIVE on real captures. The decoder emits condition_id="" (the OrderFilled ABI has
+    # no condition_id), so an un-enriched artifact's ("", token_id) can NEVER match the
+    # pinned mapping's non-empty (condition_id, token_id) -> rows_matched==0, every per-agent
+    # report collapses to INSUFFICIENT_DATA. build_trade_artifact enriches condition_id from
+    # the mapping, so the join now matches on real data. RED before enrichment.
+    from veridex.maker.capture import build_trade_artifact
+    from veridex.maker.mapping import DEFAULT_MAPPING_PATH, load_resolved_market_lookup
+
+    records, _hash = load_resolved_market_lookup(DEFAULT_MAPPING_PATH)
+    # A REAL pinned (condition_id, token_id) whose fixture is in the pinned cp1 set.
+    rec = next(r for r in records if r.fixture_id in CP1_18)
+
+    # Decoder-shaped row: REAL token_id, but condition_id="" (as the ABI decode leaves it).
+    raw_row = NormalizedTradeRow(
+        ts=1, price=0.5, size=2.0, aggressor_side=AggressorSide.BUY,
+        condition_id="", token_id=rec.token_id,
+        block_number=100, tx_hash="0xabc", log_index=3,
+    )
+    artifact = build_trade_artifact(
+        [raw_row],
+        records=[{"token_id": rec.token_id, "condition_id": rec.condition_id}],
+        manifest_meta=dict(_MANIFEST_META),
+    )
+    # Enrichment lifted the real condition_id onto the artifact row.
+    assert artifact.rows[0].condition_id == rec.condition_id
+
+    class _Art:
+        artifact_hash = artifact.artifact_hash  # pin == what the enriched artifact recomputes to
+
+    cfg = build_maker_run_config(fixture_ids=CP1_18, trade_artifact=_Art())
+    monkeypatch.setattr(runner_mod, "load_trade_artifact", lambda *a, **k: artifact)
+    monkeypatch.setattr(runner_mod, "build_cp1_maker_tape", lambda *a, **k: _fake_tape())  # keep fast
+    res = runner_mod.run_maker_arena(
+        cfg, expected_config_hash=cfg.config_hash(),
+        trade_artifact_path=Path("pinned.json"), seal=False,
+    )
+
+    assert "R1_5" in str(res.rung)
+    diagnostic = res.trade_aware_diagnostic
+    assert diagnostic is not None
+
+    # The join MATCHES on real data now (was 0 before enrichment).
+    assert diagnostic["rows_matched"] > 0
+    assert diagnostic["rows_total"] == diagnostic["rows_matched"] + diagnostic["rows_unmatched"]
+
+    # Per-agent report POPULATED, not INSUFFICIENT_DATA (the M1 closure).
+    for report in diagnostic["per_agent"].values():
+        assert report["independent_reference_verdict"] != "INSUFFICIENT_DATA"
+
+    # STILL honest: no fill / no executable edge; every fill field absent.
     assert res.real_executable_edge_bps is None
     blob = json.dumps(diagnostic)
     for forbidden in FORBIDDEN_FILL_FIELDS:
