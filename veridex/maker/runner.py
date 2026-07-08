@@ -51,6 +51,14 @@ from veridex.maker.scorer import (
     score_r1_markout,
 )
 from veridex.maker.tape import build_cp1_maker_tape
+from veridex.maker.trade_artifact import load_trade_artifact, recompute_artifact_hash
+
+# Imported as a module-level, spyable name so tests can assert the R1.5 artifact-content
+# pin VOIDs BEFORE any trade join. The join itself is wired in E4; here it must merely be
+# reachable/monkeypatchable and provably never called on a VOID.
+from veridex.maker.trades import (  # noqa: F401
+    join_trades_to_fixture_with_accounting,
+)
 
 __all__ = [
     "CP1_18",
@@ -125,23 +133,43 @@ def _score_group(
     return score_r1_markout(quote_sets, ref_at, horizons_s)
 
 
-def run_maker_arena(cfg: MakerRunConfig, *, seal: bool = False) -> MakerArenaResult:
-    """Run the sealed MM-R1 maker arena over the real cp1 tape (fail-closed).
+def run_maker_arena(
+    cfg: MakerRunConfig,
+    *,
+    expected_config_hash: str = MAKER_EXPECTED_CONFIG_HASH,
+    trade_artifact_path: Path | None = None,
+    seal: bool = False,
+) -> MakerArenaResult:
+    """Run the sealed maker arena over the real cp1 tape (fail-closed).
 
     Strict ordering (each step gated by the previous):
 
     1. :func:`verify_pinned` -- pure, NO I/O; VOIDs on config drift BEFORE any load.
+       (R1 uses the default :data:`MAKER_EXPECTED_CONFIG_HASH`; R1.5 passes its
+       operator-predeclared per-run hash via ``expected_config_hash``.)
     2. Load the pinned mapping and re-check its recomputed content hash.
+    2b. Cross-check the config's fixture universe against the mapping's fixtures.
+    2c. TWO-LAYER R1.5 pin: when ``cfg.trade_artifact_hash`` is predeclared, load the
+        artifact from the EXPLICIT ``trade_artifact_path`` and VOID unless the loaded
+        rows recompute to that hash -- BEFORE any trade join / diagnostic / scoring.
     3. Build the real cp1 maker tape (consumes real ReplayPack bytes, ``verify=True``).
     4. Score per ``(fixture_id, venue_market_ref)`` market (each quote marked out only
        against its OWN market's future fv), pool toxicity quality across markets, and
        run the naive-vs-candidate falsification on the pooled quality.
-    5. Assign the data-feasibility rung (mids present, no trades -> MM-R1).
+    5. Assign the data-feasibility rung (mids present; trades present + verified ->
+       MM-R1.5, else MM-R1).
     6. Assemble the :class:`MakerArenaResult`.
     7. Write the sealed artifact ONLY when ``seal=True``.
 
     Args:
         cfg: The caller-supplied frozen run config (REQUIRED -- no default).
+        expected_config_hash: The predeclared config-hash the run is pinned to. For
+            the R1 lane this defaults to :data:`MAKER_EXPECTED_CONFIG_HASH`; the R1.5
+            lane supplies its operator-predeclared per-run hash. Layer-1 pin.
+        trade_artifact_path: The EXPLICIT source of the trade-artifact bytes -- never a
+            mutable default disk path / "latest artifact". ``cfg.trade_artifact_hash``
+            is the artifact IDENTITY; this arg is only the SOURCE of bytes. Required
+            (and verified) only when ``cfg.trade_artifact_hash`` is set.
         seal: When ``True``, write the result to :data:`RESULT_PATH`; otherwise
             write nothing and return the result.
 
@@ -149,11 +177,13 @@ def run_maker_arena(cfg: MakerRunConfig, *, seal: bool = False) -> MakerArenaRes
         The assembled :class:`MakerArenaResult`.
 
     Raises:
-        MakerVoidError: If the config hash drifted from the pinned stamp, or the
-            recomputed mapping content hash diverged from the config's bound value.
+        MakerVoidError: If the config hash drifted from the pinned stamp; the
+            recomputed mapping content hash diverged from the config's bound value;
+            a predeclared ``trade_artifact_hash`` has no supplied path; or the loaded
+            artifact's rows do not recompute to the predeclared hash.
     """
     # 1. VERIFY FIRST -- pure, no I/O. A drifted config VOIDs before any byte is read.
-    verify_pinned(cfg, MAKER_EXPECTED_CONFIG_HASH)
+    verify_pinned(cfg, expected_config_hash)
 
     # 2. Load the pinned mapping and re-check its recomputed content hash.
     records, recomputed = load_resolved_market_lookup(DEFAULT_MAPPING_PATH)
@@ -177,6 +207,35 @@ def run_maker_arena(cfg: MakerRunConfig, *, seal: bool = False) -> MakerArenaRes
             f"(cfg has {len(cfg.fixture_ids)}, mapping has {len(mapping_fixtures)}; "
             f"symmetric difference {symmetric_difference})"
         )
+
+    # 2c. TWO-LAYER R1.5 PIN, layer 2 (artifact-content). The layer-1 config pin
+    # (step 1) already froze `cfg.trade_artifact_hash` as the artifact IDENTITY; here
+    # we verify the loaded BYTES recompute to that identity BEFORE any trade join /
+    # diagnostic / scoring can consume them (CON-111, AC-118). The artifact SOURCE is
+    # the EXPLICIT `trade_artifact_path` arg -- never a mutable default disk path.
+    has_verified_trades = False
+    if cfg.trade_artifact_hash is not None:
+        if trade_artifact_path is None:
+            # Predeclared artifact identity but no supplied bytes -> INSUFFICIENT_DATA:
+            # the pinned artifact cannot be verified, so no loader call, no join.
+            raise MakerVoidError(
+                "VOID: cfg.trade_artifact_hash is predeclared but no "
+                "trade_artifact_path was supplied -- INSUFFICIENT_DATA: the pinned "
+                "artifact bytes cannot be verified. Do NOT report this result."
+            )
+        artifact = load_trade_artifact(trade_artifact_path)
+        recomputed = recompute_artifact_hash(list(artifact.rows))
+        if recomputed != cfg.trade_artifact_hash:
+            raise MakerVoidError(
+                "VOID: loaded trade artifact recomputes to "
+                f"{recomputed}, which diverges from the predeclared "
+                f"cfg.trade_artifact_hash {cfg.trade_artifact_hash}. Do NOT report "
+                "this result."
+            )
+        has_verified_trades = True
+    # A `trade_artifact_path` supplied while `cfg.trade_artifact_hash is None` is an
+    # UNPINNED artifact: it cannot back an R1.5 claim, so it is never loaded and the
+    # run stays MM-R1 (no join, no diagnostic).
 
     # 3. Consume the REAL cp1 ReplayPack bytes (every pack loaded with verify=True).
     tape = build_cp1_maker_tape(
@@ -272,9 +331,14 @@ def run_maker_arena(cfg: MakerRunConfig, *, seal: bool = False) -> MakerArenaRes
     top = maker_leaderboard[0]
     wca = window_clv_analog(top["avg_markout_bps"], top["scored"])
 
-    # 5. Rung from data presence alone (mids present, no trades -> MM-R1).
+    # 5. Rung from data presence alone (mids present; a verified trade artifact ->
+    # MM-R1.5 via the EXISTING gate, else MM-R1). No parallel rung path is invented.
     rung = assign_rung(
-        DataPresence(has_mids=True, has_trades=False, has_fill_assumption=False)
+        DataPresence(
+            has_mids=True,
+            has_trades=has_verified_trades,
+            has_fill_assumption=False,
+        )
     )
 
     # 6. Assemble the result. real_executable_edge_bps stays None (no edge claim).
