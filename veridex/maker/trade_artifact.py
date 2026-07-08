@@ -34,12 +34,57 @@ from veridex.maker.markout import assert_native_prob
 from veridex.maker.trades import AggressorSide
 
 __all__ = [
+    "PINNED_CHAIN_ID",
+    "PINNED_CLEANROOM_ATTESTATION",
+    "PINNED_CONTRACT_ADDRESS",
+    "PINNED_EVENT_SIGNATURE",
+    "PINNED_FIXTURE_COUNT",
+    "PINNED_SIDE_COUNT",
+    "PINNED_SOURCE",
     "NormalizedTradeRow",
     "TradeArtifact",
     "dedup_normalized_rows",
     "load_trade_artifact",
     "recompute_artifact_hash",
 ]
+
+#: Claim-bearing provenance manifest pins (spec §4.3/§4.4). A hash pin proves the
+#: bytes did not DRIFT; these pin what the bytes must BE. A `TradeArtifact` that is
+#: fully hash-valid / reconciling / mapping-pinned but whose provenance manifest does
+#: not match these values describes a hand-authored synthetic capture, NOT a real
+#: Polymarket CTF Exchange V2 `OrderFilled` capture, and cannot gate an R1.5 claim.
+#: These are the SINGLE SOURCE OF TRUTH: `veridex.maker.capture` stamps the SAME
+#: constants into every artifact it builds, so a real capture is always admissible
+#: against its own validator (capture ↔ artifact consistency).
+
+#: The literal `source` a real OrderFilled capture declares.
+PINNED_SOURCE = "polymarket_ctf_exchange_v2_orderfilled"
+
+#: Polygon mainnet — the chain the CTF Exchange V2 emits `OrderFilled` on.
+PINNED_CHAIN_ID = 137
+
+#: Polymarket CTF Exchange V2 contract (the `OrderFilled` emitter).
+PINNED_CONTRACT_ADDRESS = "0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E"
+
+#: The `OrderFilled(...)` event signature the clean-room decoder reads.
+PINNED_EVENT_SIGNATURE = (
+    "OrderFilled(bytes32,address,address,uint256,uint256,uint256,uint256,uint256)"
+)
+
+#: The pinned cp1 universe accounting: 18 fixtures × 3 sides = 54 records.
+PINNED_FIXTURE_COUNT = 18
+PINNED_SIDE_COUNT = 54
+
+#: The canonical clean-room / no-GPL attestation a real capture stamps. The validator
+#: does not require this EXACT string (test + operator wordings differ), but it requires
+#: the attestation to CONTAIN every mandatory clean-room token below, so an empty /
+#: "not cleanroom" statement cannot ride along on otherwise-valid bytes.
+PINNED_CLEANROOM_ATTESTATION = (
+    "clean-room decode from CTF Exchange V2 OrderFilled ABI; no GPL code copied"
+)
+
+#: Mandatory substrings (case-insensitive) every `cleanroom_attestation` must contain.
+_REQUIRED_CLEANROOM_TOKENS: tuple[str, ...] = ("clean-room", "no gpl")
 
 #: Manifest key substrings that would carry (or reference) an operator secret.
 #: A key matching any of these is rejected outright. This is a *precise* denylist:
@@ -168,6 +213,12 @@ class TradeArtifact(BaseModel):
     range, decoder, provider, row-count accounting) and the ``rows`` carry the
     decoded trades. Trust is enforced by these validators:
 
+    * the claim-bearing provenance manifest is pinned to a REAL Polymarket CTF
+      Exchange V2 ``OrderFilled`` capture (``source == PINNED_SOURCE``, ``chain_id ==
+      137``, ``contract_address``/``event_signature`` pinned, ``token_supplied_externally
+      is True``, ``fixture_count == 18``, ``side_count == 54``, and a clean-room
+      attestation carrying the required no-GPL statement) — so a fully hash-valid but
+      hand-authored synthetic artifact cannot claim R1.5;
     * every row must carry a UNIQUE chain-event key ``(tx_hash, log_index)`` — a
       single on-chain log maps to exactly one row (two rows for it would risk
       double-counting one trade downstream);
@@ -235,7 +286,58 @@ class TradeArtifact(BaseModel):
 
     @model_validator(mode="after")
     def _validate_provenance(self) -> "TradeArtifact":
-        """Enforce event-key uniqueness, hash coverage, reconciliation, mapping."""
+        """Enforce claim-bearing provenance pins + integrity validators.
+
+        The manifest pins (source / chain / contract / event-sig / operator-token
+        statement / cp1 counts / clean-room attestation) distinguish a REAL Polymarket
+        `OrderFilled` capture from a hand-authored synthetic artifact. They are checked
+        FIRST because they are the point of this layer: hash-validity, event-key
+        uniqueness, reconciliation and the mapping pin are all necessary but NOT
+        sufficient — none of them prove the bytes are the required data source.
+        """
+        if self.source != PINNED_SOURCE:
+            raise ValueError(
+                f"source not pinned: {self.source!r} != {PINNED_SOURCE!r} — a claimable "
+                "artifact must declare the real Polymarket OrderFilled source"
+            )
+        if self.chain_id != PINNED_CHAIN_ID:
+            raise ValueError(
+                f"chain_id not pinned: {self.chain_id} != {PINNED_CHAIN_ID} (Polygon)"
+            )
+        if self.contract_address != PINNED_CONTRACT_ADDRESS:
+            raise ValueError(
+                f"contract_address not pinned: {self.contract_address!r} != "
+                f"{PINNED_CONTRACT_ADDRESS!r} (CTF Exchange V2)"
+            )
+        if self.event_signature != PINNED_EVENT_SIGNATURE:
+            raise ValueError(
+                f"event_signature not pinned: {self.event_signature!r} != "
+                f"{PINNED_EVENT_SIGNATURE!r}"
+            )
+        if self.token_supplied_externally is not True:
+            raise ValueError(
+                "token_supplied_externally must be True: a real capture is gated by an "
+                "externally supplied operator token (never committed)"
+            )
+        if self.fixture_count != PINNED_FIXTURE_COUNT:
+            raise ValueError(
+                f"fixture_count not pinned: {self.fixture_count} != {PINNED_FIXTURE_COUNT}"
+            )
+        if self.side_count != PINNED_SIDE_COUNT:
+            raise ValueError(
+                f"side_count not pinned: {self.side_count} != {PINNED_SIDE_COUNT}"
+            )
+        lowered_attestation = self.cleanroom_attestation.lower()
+        missing = [
+            token
+            for token in _REQUIRED_CLEANROOM_TOKENS
+            if token not in lowered_attestation
+        ]
+        if missing:
+            raise ValueError(
+                "cleanroom_attestation missing required clean-room statement token(s) "
+                f"{missing}: got {self.cleanroom_attestation!r}"
+            )
         event_keys = [row.event_key() for row in self.rows]
         if len(set(event_keys)) != len(event_keys):
             raise ValueError(

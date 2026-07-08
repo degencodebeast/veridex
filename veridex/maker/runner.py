@@ -29,6 +29,8 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
+from pydantic import ValidationError
+
 from veridex.maker.agents import NaiveMarketMakerAgent, TxLineFairMarketMakerAgent
 from veridex.maker.config import (
     MakerRunConfig,
@@ -435,12 +437,16 @@ def run_maker_arena(
             )
         try:
             artifact = load_trade_artifact(trade_artifact_path)
-        except OSError as exc:
+        except (OSError, ValidationError) as exc:
             # Fail CLOSED, uniform VOID surface: a missing / unreadable artifact file
-            # must join the MakerVoidError VOID-everywhere boundary -- never leak a raw
-            # FileNotFoundError / OSError past the trust surface.
+            # (OSError) OR an artifact whose bytes FAIL the TradeArtifact trust validators
+            # (ValidationError -- e.g. a hand-authored SYNTHETIC provenance manifest, a
+            # tampered hash, a broken reconciliation) must join the MakerVoidError
+            # VOID-everywhere boundary -- never leak a raw error past the trust surface,
+            # and never load into the R1.5 join. A synthetic artifact therefore VOIDs here,
+            # BEFORE any trade I/O, so the run can never reach MM-R1.5 on it.
             raise MakerVoidError(
-                "VOID: the predeclared trade artifact could not be read from "
+                "VOID: the predeclared trade artifact could not be loaded/validated from "
                 f"{trade_artifact_path!r} ({type(exc).__name__}: {exc}) -- "
                 "INSUFFICIENT_DATA. Do NOT report this result."
             ) from exc

@@ -121,6 +121,69 @@ def test_missing_artifact_path_voids(monkeypatch):
     assert tape_calls == []   # VOID before any trade I/O
 
 
+# --- E1 provenance boundary: a SYNTHETIC artifact cannot reach MM-R1.5 ------------
+# Codex's exact defect: a fully hash-valid / reconciling / pinned-mapping artifact whose
+# provenance manifest is HAND-AUTHORED (source="synthetic...", chain_id=999,
+# contract="0xFAKE", cleanroom="not cleanroom", token_supplied_externally=False,
+# fixture_count/side_count=999) wrapping REAL rows was ACCEPTED, loaded, and upgraded to
+# MM-R1.5 with data_state="OK". With the provenance pin the artifact FAILS to load
+# (ValidationError -> uniform MakerVoidError), so the run VOIDs BEFORE any trade I/O and
+# can NEVER reach MM-R1.5 -- even though the artifact-content hash + config hash match.
+def test_runner_cannot_reach_r15_with_fake_provenance(monkeypatch, tmp_path):
+    import json as _json
+
+    from veridex.maker.mapping import PINNED_MAPPING_HASH
+
+    tape_calls = []
+    monkeypatch.setattr(runner_mod, "build_cp1_maker_tape",
+                        lambda *a, **k: tape_calls.append("t") or _fake_tape())
+
+    rows = [_row()]
+    h = recompute_artifact_hash(rows)  # a VALID content hash over REAL rows
+    fake = dict(
+        artifact_hash=h,
+        raw_artifact_hash=None,
+        schema_version="v1",
+        decoder_version="d1",
+        decoder_commit=None,
+        # HAND-AUTHORED synthetic provenance (Codex's exact fake) -- not a real capture.
+        source="synthetic_test_fixture_not_chain",
+        chain_id=999,
+        contract_address="0xFAKE",
+        event_signature="Synthetic(uint256)",
+        from_block=1,
+        to_block=2,
+        reorg_buffer_confs=20,
+        capture_ts=1,
+        capture_tool_id="t1",
+        provider_id="hs-prod",
+        token_supplied_externally=False,
+        rows_decoded=len(rows),
+        rows_matched_cp1=len(rows),
+        rows_unmatched=0,
+        rows_malformed=0,
+        rows_duplicate_dropped=0,
+        mapping_content_hash=PINNED_MAPPING_HASH,
+        fixture_count=999,
+        side_count=999,
+        cleanroom_attestation="not cleanroom",
+        rows=[r.model_dump(mode="json") for r in rows],
+    )
+    path = tmp_path / "synthetic-artifact.json"
+    path.write_text(_json.dumps(fake))
+
+    class _Art:  # the predeclared artifact IDENTITY = the (valid) content hash
+        artifact_hash = h
+
+    cfg = build_maker_run_config(fixture_ids=CP1_18, trade_artifact=_Art())
+    # config-hash pin PASSES and artifact-content hash MATCHES -- the ONLY thing that can
+    # stop the run reaching MM-R1.5 is the provenance pin at load.
+    with pytest.raises(MakerVoidError):
+        runner_mod.run_maker_arena(cfg, expected_config_hash=cfg.config_hash(),
+                                   trade_artifact_path=path, seal=False)
+    assert tape_calls == []   # VOID at load, BEFORE any trade I/O -> never reaches MM-R1.5
+
+
 # --- E2-T2 source-contract tests --------------------------------------------------
 def test_pinned_hash_but_no_path_is_insufficient_data(monkeypatch):
     # cfg.trade_artifact_hash set, but no trade_artifact_path -> the predeclared artifact

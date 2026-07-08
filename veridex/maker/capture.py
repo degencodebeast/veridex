@@ -35,6 +35,13 @@ from veridex.maker.mapping import PINNED_MAPPING_HASH
 from veridex.maker.markout import assert_native_prob
 from veridex.maker.trades import AggressorSide
 from veridex.maker.trade_artifact import (
+    PINNED_CHAIN_ID,
+    PINNED_CLEANROOM_ATTESTATION,
+    PINNED_CONTRACT_ADDRESS,
+    PINNED_EVENT_SIGNATURE,
+    PINNED_FIXTURE_COUNT,
+    PINNED_SIDE_COUNT,
+    PINNED_SOURCE,
     NormalizedTradeRow,
     TradeArtifact,
     dedup_normalized_rows,
@@ -211,6 +218,20 @@ def build_trade_artifact(
 
     manifest = dict(manifest_meta)
     manifest.update(
+        # Stamp the claim-bearing provenance from the SINGLE SOURCE OF TRUTH constants the
+        # TradeArtifact validator pins to (capture ↔ artifact consistency): a real capture
+        # ALWAYS produces an admissible artifact, and the offline assembler cannot be
+        # tricked into emitting synthetic provenance (source/chain/contract/event-sig/
+        # counts/clean-room) around real rows. `token_supplied_externally=True` because a
+        # real capture is operator-gated by an externally supplied token (never committed).
+        source=PINNED_SOURCE,
+        chain_id=PINNED_CHAIN_ID,
+        contract_address=PINNED_CONTRACT_ADDRESS,
+        event_signature=PINNED_EVENT_SIGNATURE,
+        token_supplied_externally=True,
+        fixture_count=PINNED_FIXTURE_COUNT,
+        side_count=PINNED_SIDE_COUNT,
+        cleanroom_attestation=PINNED_CLEANROOM_ATTESTATION,
         artifact_hash=recompute_artifact_hash(list(unique_rows)),
         rows_decoded=rows_decoded,
         rows_matched_cp1=len(matched),
@@ -317,12 +338,14 @@ def _default_operator_manifest_meta(
         "schema_version": "v1",
         "decoder_version": "orderfilled-cleanroom-v1",
         "decoder_commit": None,
-        "source": "polymarket_ctf_exchange_v2_orderfilled",
-        "chain_id": 137,
-        "contract_address": "0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E",
-        "event_signature": (
-            "OrderFilled(bytes32,address,address,uint256,uint256,uint256,uint256,uint256)"
-        ),
+        # Provenance sourced from the pinned constants the validator enforces; the same
+        # values are re-stamped in build_trade_artifact, so capture and validator can never
+        # disagree. (`token_supplied_externally` is recorded here for the descriptive
+        # manifest; build_trade_artifact force-stamps it True on the admissible artifact.)
+        "source": PINNED_SOURCE,
+        "chain_id": PINNED_CHAIN_ID,
+        "contract_address": PINNED_CONTRACT_ADDRESS,
+        "event_signature": PINNED_EVENT_SIGNATURE,
         "from_block": from_block,
         "to_block": to_block,
         "reorg_buffer_confs": 20,
@@ -330,9 +353,7 @@ def _default_operator_manifest_meta(
         "capture_tool_id": "veridex-maker-capture",
         "provider_id": "hypersync",
         "token_supplied_externally": token_supplied_externally,
-        "fixture_count": 18,
-        "side_count": 54,
-        "cleanroom_attestation": (
-            "clean-room decode from CTF Exchange V2 OrderFilled ABI; no GPL code copied"
-        ),
+        "fixture_count": PINNED_FIXTURE_COUNT,
+        "side_count": PINNED_SIDE_COUNT,
+        "cleanroom_attestation": PINNED_CLEANROOM_ATTESTATION,
     }

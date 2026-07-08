@@ -12,6 +12,13 @@ from pydantic import ValidationError
 
 from veridex.maker.mapping import PINNED_MAPPING_HASH
 from veridex.maker.trade_artifact import (
+    PINNED_CHAIN_ID,
+    PINNED_CLEANROOM_ATTESTATION,
+    PINNED_CONTRACT_ADDRESS,
+    PINNED_EVENT_SIGNATURE,
+    PINNED_FIXTURE_COUNT,
+    PINNED_SIDE_COUNT,
+    PINNED_SOURCE,
     NormalizedTradeRow,
     TradeArtifact,
     dedup_normalized_rows,
@@ -86,10 +93,10 @@ def _artifact(rows, **kw):
         schema_version="v1",
         decoder_version="d1",
         decoder_commit=None,
-        source="polymarket_ctf_exchange_v2_orderfilled",
-        chain_id=137,
-        contract_address="0xe11...",
-        event_signature="OrderFilled(...)",
+        source=PINNED_SOURCE,
+        chain_id=PINNED_CHAIN_ID,
+        contract_address=PINNED_CONTRACT_ADDRESS,
+        event_signature=PINNED_EVENT_SIGNATURE,
         from_block=1,
         to_block=2,
         reorg_buffer_confs=20,
@@ -103,9 +110,9 @@ def _artifact(rows, **kw):
         rows_malformed=0,
         rows_duplicate_dropped=0,
         mapping_content_hash=PINNED_MAPPING_HASH,
-        fixture_count=18,
-        side_count=54,
-        cleanroom_attestation="clean-room; no GPL copied",
+        fixture_count=PINNED_FIXTURE_COUNT,
+        side_count=PINNED_SIDE_COUNT,
+        cleanroom_attestation=PINNED_CLEANROOM_ATTESTATION,
         rows=tuple(rows),
     )
     base.update(kw)
@@ -126,6 +133,47 @@ def test_trade_artifact_reconciles_and_forbids_token():
         _artifact([_row()], hypersync_api="secret")  # secret-bearing key forbidden
     with pytest.raises(ValidationError):
         _artifact([_row()], api_key="AKIA...")  # secret-bearing key forbidden
+
+
+def test_trade_artifact_rejects_fake_provenance():
+    # Codex's exact synthetic artifact: REAL, hash-valid, reconciling, pinned-mapping
+    # rows wrapped in a HAND-AUTHORED provenance manifest that does NOT describe a real
+    # Polymarket OrderFilled capture. A hash pin proves the bytes did not drift; it does
+    # NOT prove the bytes are the required data source. The provenance pin must reject it.
+    with pytest.raises(ValidationError):
+        _artifact(
+            [_row()],
+            source="synthetic_test_fixture_not_chain",
+            chain_id=999,
+            contract_address="0xFAKE",
+            event_signature="Synthetic(uint256)",
+            cleanroom_attestation="not cleanroom",
+            token_supplied_externally=False,
+            fixture_count=999,
+            side_count=999,
+        )
+
+
+@pytest.mark.parametrize(
+    "fake_field",
+    [
+        {"source": "synthetic_test_fixture_not_chain"},
+        {"chain_id": 999},
+        {"contract_address": "0xFAKE"},
+        {"event_signature": "Synthetic(uint256)"},
+        {"token_supplied_externally": False},
+        {"fixture_count": 999},
+        {"side_count": 54 + 1},
+        {"fixture_count": 17},
+        {"cleanroom_attestation": "not cleanroom"},
+    ],
+)
+def test_trade_artifact_rejects_each_single_fake_provenance_field(fake_field):
+    # Each claim-bearing provenance field is individually pinned: flipping ANY one of
+    # them (leaving the rest genuine + the hash/reconciliation/mapping valid) must
+    # reject. A hash-valid artifact is necessary but NOT sufficient to claim R1.5.
+    with pytest.raises(ValidationError):
+        _artifact([_row()], **fake_field)
 
 
 def test_trade_artifact_rejects_duplicate_event_keys():
