@@ -70,3 +70,51 @@ exists **and is independently verified**, `assign_rung` caps at MM-R1.5 and
 
 This document is the checklist that a future operator-gated recorder step must
 satisfy before any MM-R3 or MM-R4 claim can be made.
+
+## R1.5 → R3/R4 handoff: what the `OrderFilled` tape already provides, and what stays future-only
+
+R1.5's normalized `TradeArtifact` (built from the Polymarket `OrderFilled` prints
+between *other* participants — see `veridex/maker/trade_artifact.py` and
+`veridex/maker/capture.py`) is a real, sealed, on-chain trade record. It is a
+genuine step toward R3/R4, but only for the **trade portion** of what each rung
+needs — it does not, and cannot, close the rest of the gap.
+
+**What it PROVIDES toward R3 (trade/print side only):**
+- Real venue prints with chain-event identity (`block_number`, `tx_hash`,
+  `log_index`) and native-probability `price`/`size`/`aggressor_side` —
+  i.e. exactly the "trade / print stream" bullet in the MM-R3 checklist above.
+- A predeclared, hash-pinned provenance chain (`TradeArtifact.artifact_hash`
+  bound to `MakerRunConfig.trade_artifact_hash`, verified before any I/O) —
+  so *when* a future depth recorder exists, the trade side of the R3 join
+  already has an auditable, non-fabricated source to join against.
+
+**What remains FUTURE-ONLY for R3 (still missing, unaffected by R1.5/R2):**
+- **Historical L2 `BookSnapshot` / incremental `BookDelta`** — full depth at
+  each price level, reconstructable tick-by-tick. R1.5/R2 touch none of this;
+  the venue is still mids-only. Without it, queue position ahead of a resting
+  order cannot be modeled — a simulated fill would remain fiction.
+- **Cancel stream** — arrivals/cancels ahead of us in the queue. Not captured
+  by `OrderFilled` prints (which only ever record *executed* trades), and not
+  added by R1.5/R2.
+- Both are **irrecoverable** for any block range that was not recorded live
+  with depth+cancels at the time — they cannot be backfilled from prints alone.
+
+**What remains FUTURE-ONLY for R4 (untouched by R1.5/R2):**
+- **Our own order lifecycle** (`place`/`amend`/`cancel`/`partial-fill`/`fill`
+  tied to our own order ids) — R1.5's `TradePrint`/`NormalizedTradeRow` are
+  deliberately anonymous market prints between *other* participants; they
+  carry no `fill_price`/`pnl`/`real_executable_edge_bps` field and cannot be
+  attributed to "our" order by construction (`veridex/maker/trades.py`).
+- **Real own-fill reconciliation** — matching our own submissions against the
+  venue's settlement. This requires us to have actually quoted on-venue,
+  which R1.5/R2 (report-only diagnostics and ex-ante sensitivity brackets over
+  *others'* prints) do not do and are not intended to do.
+- Until both exist and are independently verified, `real_executable_edge_bps`
+  stays the pinned literal `None`, and `assign_rung` continues to cap at
+  MM-R1.5 regardless of any `has_l2_depth`/`has_cancels`/`has_own_fills`
+  presence flag (see `tests/test_no_r3_r4_code.py`).
+
+In short: R1.5/R2 close the **trade-identity** gap for R3 and add nothing toward
+R4 (by design — R4 requires *our own* fills, which this extension never
+produces). Depth+cancels for R3 and own-order lifecycle for R4 remain the two
+irreducible, recorder-gated prerequisites named above.
