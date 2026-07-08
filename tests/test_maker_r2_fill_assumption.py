@@ -90,7 +90,6 @@ def test_forbidden_tape_reactive_trigger_rejected():
             _cfg(fill_probability_rule=trigger)
 
 
-
 def test_forbidden_trigger_rejected_case_insensitive():
     # M1/CON-107: an UPPER/mixed-case forbidden trigger must NOT slip through the
     # substring guard (case-insensitive matching).
@@ -103,3 +102,26 @@ def test_forbidden_trigger_rejected_in_decorated_ex_ante_field():
     # (e.g. "trade_crossed_signal") must be rejected via substring matching.
     with pytest.raises(Exception):
         _cfg(ex_ante_fields=["trade_crossed_signal"])
+
+
+def test_seeded_stochastic_requires_seed_and_n_paths():
+    # M2/CON-108: SEEDED_STOCHASTIC claims a pinned run -> seed and n_paths must
+    # be pinned (seed not None, n_paths a positive int), else config_hash lies.
+    with pytest.raises(Exception):
+        _cfg(draw_mode="SEEDED_STOCHASTIC", seed=None, n_paths=100)
+    with pytest.raises(Exception):
+        _cfg(draw_mode="SEEDED_STOCHASTIC", seed=7, n_paths=None)
+    with pytest.raises(Exception):
+        _cfg(draw_mode="SEEDED_STOCHASTIC", seed=7, n_paths=0)
+    with pytest.raises(Exception):
+        _cfg(draw_mode="SEEDED_STOCHASTIC", seed=7, n_paths=-5)
+    # a fully-pinned SEEDED_STOCHASTIC config is accepted
+    _cfg(draw_mode="SEEDED_STOCHASTIC", seed=7, n_paths=100)
+    # DETERMINISTIC_EXPECTED is unaffected by the seed/n_paths requirement
+    _cfg(draw_mode="DETERMINISTIC_EXPECTED", seed=None, n_paths=None)
+
+
+def test_draw_mode_rejects_unknown_value():
+    # m1: a typo'd draw_mode must be rejected, not silently treated deterministic.
+    with pytest.raises(Exception):
+        _cfg(draw_mode="SEEDED")

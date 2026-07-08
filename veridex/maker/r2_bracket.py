@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -53,7 +53,9 @@ class FillAssumptionConfig(BaseModel):
     # --- E6: pinned ex-ante fill rule (all flow into config_hash) ---
     fill_probability_rule: str = "static_fill_prob"
     rule_params: dict[str, float] = Field(default_factory=dict)
-    draw_mode: str = "DETERMINISTIC_EXPECTED"
+    draw_mode: Literal["SEEDED_STOCHASTIC", "DETERMINISTIC_EXPECTED"] = (
+        "DETERMINISTIC_EXPECTED"
+    )
     seed: int | None = None
     n_paths: int | None = None
     ex_ante_fields: list[str] = Field(default_factory=list)
@@ -94,6 +96,30 @@ class FillAssumptionConfig(BaseModel):
                     f"ex_ante_fields entry {field!r} embeds a tape-reactive "
                     f"trigger; R2 may only declare fields available at quote "
                     f"time. Forbidden: {sorted(FORBIDDEN_R2_TRIGGERS)}."
+                )
+        return self
+
+    @model_validator(mode="after")
+    def _require_pinned_seed_and_paths(self) -> "FillAssumptionConfig":
+        """SEEDED_STOCHASTIC must pin ``seed`` and ``n_paths`` (CON-108).
+
+        ``config_hash`` claims the run is pinned/deterministic; a ``seed=None``
+        draws from OS entropy (different percentiles each run) and a missing /
+        non-positive ``n_paths`` yields a degenerate all-zeros distribution.
+        ``DETERMINISTIC_EXPECTED`` is unaffected.
+        """
+        if self.draw_mode == "SEEDED_STOCHASTIC":
+            if self.seed is None:
+                raise ValueError(
+                    "SEEDED_STOCHASTIC requires a pinned 'seed' (got None): an "
+                    "unseeded draw is non-deterministic yet config_hash claims a "
+                    "pinned run."
+                )
+            if not (isinstance(self.n_paths, int) and self.n_paths > 0):
+                raise ValueError(
+                    f"SEEDED_STOCHASTIC requires a positive int 'n_paths', got "
+                    f"{self.n_paths!r}: a missing/non-positive n_paths yields a "
+                    f"degenerate empty distribution."
                 )
         return self
 
