@@ -17,7 +17,46 @@ __all__ = [
     "window_clv_analog",
 ]
 
-_R2_BRACKET_KEYS = frozenset({"bracket", "sensitivity", "r2", "r2_bracket"})
+# Static rank-denylist (SEC-005): EVERY R2-specific field name of
+# ``R2SensitivityBracket`` ∪ ``R2ProtectionAblation`` (authored by hand so
+# ``leaderboard.py`` imports NO R2 model -- module hygiene), plus the
+# result-attach overlay key and the legacy aliases. ``real_executable_edge_bps``
+# is DELIBERATELY EXCLUDED: it is a legitimate maker-row field emitted as
+# ``None`` by ``aggregate_agent_metrics`` -- denylisting it would reject every
+# normal maker row and break ``rank_makers``. The derivation test in
+# ``test_maker_r2_not_ranked.py`` asserts this set covers every R2 field.
+_R2_BRACKET_KEYS = frozenset(
+    {
+        # --- legacy aliases ---
+        "bracket",
+        "sensitivity",
+        "r2",
+        "r2_bracket",
+        # --- R2SensitivityBracket declared-overlay data ---
+        "simulated_expected_inventory_path",
+        "simulated_expected_exposure",
+        "simulated_spread_capture_range",
+        "simulated_adverse_selection_haircut",
+        "assumption_sensitivity",
+        # --- R2SensitivityBracket honesty tombstones / guards ---
+        "realized_pnl",
+        "fill_proof",
+        "uses_real_orderbook",
+        "uses_own_fills",
+        "queue_modeled",
+        "ranked",
+        "fill_rule_source",
+        "forbidden_trigger_assertion",
+        "label",
+        # --- R2ProtectionAblation ---
+        "protection_on",
+        "protection_off",
+        "event_gate_cost",
+        "delta_note",
+        # --- result-attach overlay key ---
+        "protection_on_off_ablation",
+    }
+)
 
 
 def assert_bracket_not_ranked(agent_metrics: list[dict[str, Any]]) -> None:
