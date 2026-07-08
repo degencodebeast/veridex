@@ -25,6 +25,8 @@ docs/strategy/
 # --- within the allowed trees, still exclude secrets + build artifacts ---
 veridex/.env
 veridex/.env.local
+veridex/.env.mainnet
+veridex/.env.*
 **/.omc/
 **/__pycache__/
 **/*.pyc
