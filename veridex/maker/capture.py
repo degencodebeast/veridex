@@ -26,15 +26,20 @@ module imports only the standard library and ``veridex.*``.
 
 from __future__ import annotations
 
-import json
-from pathlib import Path
 from typing import Any
 
+from veridex.maker.mapping import PINNED_MAPPING_HASH
 from veridex.maker.markout import assert_native_prob
 from veridex.maker.trades import AggressorSide
-from veridex.maker.trade_artifact import NormalizedTradeRow
+from veridex.maker.trade_artifact import (
+    NormalizedTradeRow,
+    TradeArtifact,
+    dedup_normalized_rows,
+    recompute_artifact_hash,
+)
 
 __all__ = [
+    "build_trade_artifact",
     "decode_order_filled",
 ]
 
@@ -110,3 +115,70 @@ def decode_order_filled(log: dict[str, Any]) -> NormalizedTradeRow:
         tx_hash=str(log["transaction_hash"]),
         log_index=int(log["log_index"]),
     )
+
+
+def build_trade_artifact(
+    rows: list[NormalizedTradeRow],
+    *,
+    records: list[dict[str, Any]],
+    manifest_meta: dict[str, Any],
+) -> TradeArtifact:
+    """Assemble a validated :class:`TradeArtifact` offline from decoded rows.
+
+    The build is fully offline and receives **no** operator token: dedup collapses
+    rows sharing a chain-event key, the remaining rows are reconciled against the
+    pinned cp1 records (matched vs. unmatched by ``token_id``), the artifact hash is
+    recomputed over the surviving rows, and the pinned mapping hash is stamped. The
+    counts satisfy the ``TradeArtifact`` reconciliation invariant
+    (``rows_decoded == matched + unmatched + malformed + duplicate_dropped``).
+
+    Args:
+        rows: Decoded normalized rows (may contain duplicate event keys).
+        records: The pinned cp1 mapping records; a row is ``matched_cp1`` when its
+            ``token_id`` appears in these records.
+        manifest_meta: The descriptive manifest fields (schema/decoder/source/block
+            range/provider/attestation, etc.). Must carry **no** operator secret;
+            the count / hash / mapping-pin / rows fields are computed here and must
+            not be supplied.
+
+    Returns:
+        The validated :class:`TradeArtifact`.
+
+    Raises:
+        ValueError: If ``manifest_meta`` supplies a field computed here.
+    """
+    computed_keys = {
+        "artifact_hash",
+        "rows_decoded",
+        "rows_matched_cp1",
+        "rows_unmatched",
+        "rows_malformed",
+        "rows_duplicate_dropped",
+        "mapping_content_hash",
+        "rows",
+    }
+    supplied_conflicts = computed_keys & manifest_meta.keys()
+    if supplied_conflicts:
+        raise ValueError(
+            f"manifest_meta must not supply computed fields: {sorted(supplied_conflicts)}"
+        )
+
+    rows_decoded = len(rows)
+    unique_rows, duplicate_dropped = dedup_normalized_rows(rows)
+
+    cp1_token_ids = {str(record["token_id"]) for record in records}
+    matched = [row for row in unique_rows if row.token_id in cp1_token_ids]
+    unmatched = [row for row in unique_rows if row.token_id not in cp1_token_ids]
+
+    manifest = dict(manifest_meta)
+    manifest.update(
+        artifact_hash=recompute_artifact_hash(list(unique_rows)),
+        rows_decoded=rows_decoded,
+        rows_matched_cp1=len(matched),
+        rows_unmatched=len(unmatched),
+        rows_malformed=0,
+        rows_duplicate_dropped=duplicate_dropped,
+        mapping_content_hash=PINNED_MAPPING_HASH,
+        rows=tuple(unique_rows),
+    )
+    return TradeArtifact(**manifest)

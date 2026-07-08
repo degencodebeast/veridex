@@ -15,8 +15,30 @@ from pathlib import Path
 import pytest
 
 import veridex.maker.capture as capture_module
-from veridex.maker.capture import decode_order_filled
+from veridex.maker.capture import build_trade_artifact, decode_order_filled
+from veridex.maker.mapping import PINNED_MAPPING_HASH
 from veridex.maker.markout import MarkoutError
+
+_MANIFEST_META = dict(
+    raw_artifact_hash=None,
+    schema_version="v1",
+    decoder_version="d1",
+    decoder_commit=None,
+    source="polymarket_ctf_exchange_v2_orderfilled",
+    chain_id=137,
+    contract_address="0xe11...",
+    event_signature="OrderFilled(bytes32,address,address,uint256,uint256,uint256,uint256,uint256)",
+    from_block=1,
+    to_block=2,
+    reorg_buffer_confs=20,
+    capture_ts=1,
+    capture_tool_id="t1",
+    provider_id="hs-prod",
+    token_supplied_externally=True,
+    fixture_count=18,
+    side_count=54,
+    cleanroom_attestation="clean-room; no GPL copied",
+)
 
 
 def _order_filled_log(**kw):
@@ -91,3 +113,34 @@ def test_capture_module_imports_only_stdlib_and_veridex():
                 imported_roots.add(node.module.split(".")[0])
     forbidden = imported_roots - allowed_roots
     assert not forbidden, f"capture.py imports non-stdlib/non-veridex modules: {forbidden}"
+
+
+def test_build_trade_artifact_reconciles_and_has_no_token():
+    import json
+
+    matched = decode_order_filled(_order_filled_log(takerAssetId="42", log_index=3))
+    duplicate = decode_order_filled(
+        _order_filled_log(takerAssetId="42", log_index=3, takerAmountFilled="2000000")
+    )  # same event key as `matched` → dropped as duplicate
+    non_cp1 = decode_order_filled(_order_filled_log(takerAssetId="99", log_index=4))
+
+    records = [{"token_id": "42"}]  # cp1 token set
+
+    artifact = build_trade_artifact(
+        [matched, duplicate, non_cp1],
+        records=records,
+        manifest_meta=dict(_MANIFEST_META),
+    )
+
+    assert artifact.rows_duplicate_dropped == 1
+    assert artifact.rows_unmatched == 1
+    assert artifact.rows_matched_cp1 == 1
+    assert artifact.rows_malformed == 0
+    assert artifact.rows_decoded == (
+        artifact.rows_matched_cp1
+        + artifact.rows_unmatched
+        + artifact.rows_malformed
+        + artifact.rows_duplicate_dropped
+    )
+    assert artifact.mapping_content_hash == PINNED_MAPPING_HASH
+    assert "HYPERSYNC" not in json.dumps(artifact.model_dump())
