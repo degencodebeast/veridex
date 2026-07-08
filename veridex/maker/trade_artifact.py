@@ -166,8 +166,11 @@ class TradeArtifact(BaseModel):
 
     The manifest fields describe the offline capture (source contract, block
     range, decoder, provider, row-count accounting) and the ``rows`` carry the
-    decoded trades. Trust is enforced by four validators:
+    decoded trades. Trust is enforced by these validators:
 
+    * every row must carry a UNIQUE chain-event key ``(tx_hash, log_index)`` — a
+      single on-chain log maps to exactly one row (two rows for it would risk
+      double-counting one trade downstream);
     * ``artifact_hash`` must equal :func:`recompute_artifact_hash` over ``rows``
       (covers economic + chain-event identity);
     * the row counts must reconcile exactly
@@ -232,7 +235,14 @@ class TradeArtifact(BaseModel):
 
     @model_validator(mode="after")
     def _validate_provenance(self) -> "TradeArtifact":
-        """Enforce hash coverage, row-count reconciliation, and pinned mapping."""
+        """Enforce event-key uniqueness, hash coverage, reconciliation, mapping."""
+        event_keys = [row.event_key() for row in self.rows]
+        if len(set(event_keys)) != len(event_keys):
+            raise ValueError(
+                "duplicate chain-event key in rows: each (tx_hash, log_index) "
+                "identifies exactly one on-chain log; two rows sharing one is an "
+                "integrity violation (risks double-counting a single trade)"
+            )
         expected_hash = recompute_artifact_hash(list(self.rows))
         if self.artifact_hash != expected_hash:
             raise ValueError(

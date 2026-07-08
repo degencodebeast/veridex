@@ -128,6 +128,17 @@ def test_trade_artifact_reconciles_and_forbids_token():
         _artifact([_row()], api_key="AKIA...")  # secret-bearing key forbidden
 
 
+def test_trade_artifact_rejects_duplicate_event_keys():
+    # A single (tx_hash, log_index) identifies exactly one on-chain log; two rows
+    # for it (differing economics) is an integrity violation and risks E4
+    # double-counting one on-chain trade. rows_decoded reconciles (2 matched) so
+    # only the uniqueness validator can reject it.
+    r1 = _row(tx_hash="0xabc", log_index=3, price=0.4, size=1.0)
+    r2 = _row(tx_hash="0xabc", log_index=3, price=0.7, size=9.0)
+    with pytest.raises(ValidationError):
+        _artifact([r1, r2])
+
+
 def test_dedup_by_event_key():
     # two rows sharing (tx_hash, log_index) → one kept, dropped == 1
     unique, dropped = dedup_normalized_rows([_row(), _row()])
