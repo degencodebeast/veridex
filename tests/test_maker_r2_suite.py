@@ -43,3 +43,34 @@ def test_r2_suite_labels_and_no_edge():
     # every data field is simulated_/model_/assumption_-prefixed provenance
     assert b.simulated_expected_inventory_path is not None
     assert b.simulated_spread_capture_range is not None
+
+
+def test_r2_seeded_is_deterministic_and_distributional():
+    cfg = _cfg(draw_mode="SEEDED_STOCHASTIC", seed=1234, n_paths=200, rule_params={"p": 0.5})
+    a = render_r2_suite([10, 20, 30, 40], cfg)
+    b = render_r2_suite([10, 20, 30, 40], cfg)
+    # same seed -> byte-identical output (never a cherry-picked single path)
+    assert a == b
+    assert a.model_dump() == b.model_dump()
+    # the seeded output is a DISTRIBUTION: mean + percentiles, not a lone path
+    path = a.simulated_expected_inventory_path
+    assert path["draw_mode"] == "SEEDED_STOCHASTIC"
+    assert path["seed"] == 1234 and path["n_paths"] == 200
+    for key in ("mean_path", "mean_final", "p10_final", "p50_final", "p90_final"):
+        assert key in path
+    assert path["p10_final"] <= path["p50_final"] <= path["p90_final"]
+    assert isinstance(path["mean_path"], list) and len(path["mean_path"]) == 4
+    # a different seed changes the drawn distribution
+    other = render_r2_suite([10, 20, 30, 40], _cfg(
+        draw_mode="SEEDED_STOCHASTIC", seed=9999, n_paths=200, rule_params={"p": 0.5}))
+    assert other.simulated_expected_inventory_path["mean_path"] != path["mean_path"]
+
+
+def test_r2_deterministic_labels_inventory_as_expected_model():
+    cfg = _cfg(draw_mode="DETERMINISTIC_EXPECTED")
+    b = render_r2_suite([10, 20, 30], cfg)
+    path = b.simulated_expected_inventory_path
+    assert path["draw_mode"] == "DETERMINISTIC_EXPECTED"
+    assert "expected_path" in path and "expected_final" in path
+    # expected/model, not shares held
+    assert "expected" in path["note"] and "shares held" in path["note"]
