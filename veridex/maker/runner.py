@@ -48,6 +48,8 @@ from veridex.maker.mapping import (
     DEFAULT_MAPPING_PATH,
     load_resolved_market_lookup,
 )
+from veridex.maker.r2_bracket import FillAssumptionConfig
+from veridex.maker.r2_suite import render_r2_suite
 from veridex.maker.result import MakerArenaResult
 from veridex.maker.rung_gate import DataPresence, assign_rung
 from veridex.maker.scorer import (
@@ -339,6 +341,7 @@ def run_maker_arena(
     *,
     expected_config_hash: str = MAKER_EXPECTED_CONFIG_HASH,
     trade_artifact_path: Path | None = None,
+    fill_assumption: FillAssumptionConfig | None = None,
     seal: bool = False,
 ) -> MakerArenaResult:
     """Run the sealed maker arena over the real cp1 tape (fail-closed).
@@ -371,6 +374,12 @@ def run_maker_arena(
             mutable default disk path / "latest artifact". ``cfg.trade_artifact_hash``
             is the artifact IDENTITY; this arg is only the SOURCE of bytes. Required
             (and verified) only when ``cfg.trade_artifact_hash`` is set.
+        fill_assumption: Optional pinned ex-ante fill-assumption instance. When
+            supplied, its ``config_hash()`` MUST equal ``cfg.fill_assumption_hash``
+            (the R2 analog of the artifact-content pin, REQ-107) or the run VOIDs
+            BEFORE any overlay is rendered; on a match a report-only
+            :func:`render_r2_suite` overlay is attached to ``r2_bracket``. The
+            overlay NEVER changes the rung and NEVER produces an executable edge.
         seal: When ``True``, write the result to :data:`RESULT_PATH`; otherwise
             write nothing and return the result.
 
@@ -449,6 +458,25 @@ def run_maker_arena(
     # A `trade_artifact_path` supplied while `cfg.trade_artifact_hash is None` is an
     # UNPINNED artifact: it cannot back an R1.5 claim, so it is never loaded and the
     # run stays MM-R1 (no join, no diagnostic).
+
+    # 2d. R2 ASSUMPTION-INSTANCE PIN (REQ-107) -- the R2 analog of the layer-2
+    # artifact-content pin. `cfg.fill_assumption_hash` binds only the HASH of the pinned
+    # ex-ante assumption into `config_hash`; the runner still receives the assumption
+    # INSTANCE separately, so an overlay rendered under an instance DIFFERENT from the one
+    # bound into the hash is exactly the drift REQ-107 forbids. Re-verify the instance here
+    # -- BEFORE any `render_r2_suite` -- and VOID on mismatch. (Deleting this compare lets a
+    # drifted assumption render an overlay, which `test_r2_assumption_instance_mismatch_voids`
+    # catches.)
+    if fill_assumption is not None:
+        recomputed_fill_assumption_hash = fill_assumption.config_hash()
+        if recomputed_fill_assumption_hash != cfg.fill_assumption_hash:
+            raise MakerVoidError(
+                "VOID: supplied fill_assumption recomputes to "
+                f"{recomputed_fill_assumption_hash}, which diverges from the "
+                f"predeclared cfg.fill_assumption_hash {cfg.fill_assumption_hash}. An R2 "
+                "overlay rendered under a DIFFERENT assumption than the one bound into "
+                "config_hash is forbidden drift. Do NOT report this result."
+            )
 
     # 3. Consume the REAL cp1 ReplayPack bytes (every pack loaded with verify=True).
     tape = build_cp1_maker_tape(
@@ -570,6 +598,21 @@ def run_maker_arena(
             falsification=falsification,
         ).model_dump()
 
+    # 5c. R2 REPORT-ONLY OVERLAY (REQ-107/108). When a pinned ex-ante fill assumption was
+    # supplied (and passed the 2d instance pin), attach a quadruple-labeled
+    # `render_r2_suite` overlay driven ONLY by the pinned assumption + report-only markout
+    # inputs. It is a DECLARED MODEL OVERLAY: it does NOT touch the rung (computed above
+    # from data presence alone) and produces NO executable edge / fill value. The markout
+    # inputs are the observed per-quote markout_bps pooled across agents (a report-only
+    # input, never a fill); an empty degenerate tape falls back to a neutral [0] so the
+    # overlay renders without fabricating a value.
+    r2_bracket: dict[str, Any] | None = None
+    if fill_assumption is not None:
+        r2_markouts = [
+            mark.markout_bps for agent in agents for mark in marks_by[agent.agent_id]
+        ] or [0]
+        r2_bracket = render_r2_suite(r2_markouts, fill_assumption).model_dump()
+
     # 6. Assemble the result. real_executable_edge_bps stays None (no edge claim).
     # For E2 the verified `trade_artifact_hash` is recorded transitively via the
     # `config_hash` binding (the pin is frozen INTO `cfg.config_hash()`), so the result
@@ -587,6 +630,7 @@ def run_maker_arena(
         window_clv_analog=wca,
         fixture_universe_n=len({row["fixture_id"] for row in tape}),
         excluded_by_reason={},
+        r2_bracket=r2_bracket,
     )
 
     # 7. Seal path writes ONLY when seal=True.

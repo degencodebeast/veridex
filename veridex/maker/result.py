@@ -20,6 +20,12 @@ from pydantic import BaseModel
 
 from veridex.maker.contracts import MakerRungLabel
 
+#: The quadruple R2 honesty label surfaced on the proof card when an R2 overlay is
+#: attached. Kept byte-identical to ``r2_suite.R2_QUADRUPLE_LABEL`` (duplicated here
+#: rather than imported so this result contract stays free of the R2 render module);
+#: the sealed tests assert the exact string on both sides.
+_R2_OVERLAY_LABEL = "REPORT_ONLY / UNCALIBRATED / DECLARED_MODEL_OVERLAY / NOT_A_FILL_PROOF"
+
 
 class MakerArenaResult(BaseModel):
     """Top-level result of a market-maker arena run.
@@ -84,6 +90,11 @@ class MakerProofCard(BaseModel):
     #: a fabricated value); it is ``None`` otherwise. It never carries a PnL/edge/fill
     #: value — the card makes no executable-edge or realized-PnL claim.
     trade_aware_diagnostic_note: str | None = None
+    #: R2 overlay honesty label (REQ-108/AC-110). Carries the quadruple label
+    #: :data:`_R2_OVERLAY_LABEL` exactly when an R2 bracket overlay is attached
+    #: (``result.r2_bracket is not None``); ``None`` for a plain R1/R1.5 result. It
+    #: is a REPORT-ONLY honesty marker, never a fill/edge claim.
+    r2_overlay_label: str | None = None
 
 
 def render_proof_card(result: MakerArenaResult) -> MakerProofCard:
@@ -119,6 +130,9 @@ def render_proof_card(result: MakerArenaResult) -> MakerProofCard:
         small_n_note=f"n={result.fixture_universe_n} (Polymarket-resolved cp1), small sample",
         trades_not_fills_caveat=trades_not_fills_caveat,
         trade_aware_diagnostic_note=trade_aware_diagnostic_note,
+        # REQ-108/AC-110: the quadruple honesty label is surfaced exactly when an R2
+        # overlay is attached, mirroring `uncalibrated`; None for a plain R1/R1.5 card.
+        r2_overlay_label=_R2_OVERLAY_LABEL if result.r2_bracket is not None else None,
     )
 
 
