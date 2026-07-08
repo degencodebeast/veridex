@@ -80,6 +80,10 @@ def compute_trade_aware_diagnostic(
     *,
     window_s: int = 120,
     near_band: float = 0.10,
+    naive_quote_price: float | None = None,
+    candidate_toxicity_loss_bps: int | None = None,
+    naive_toxicity_loss_bps: int | None = None,
+    falsification_verdict: str | None = None,
 ) -> AdverseSelectionReport:
     """Measure trade-aware adverse selection from venue trades near a quote.
 
@@ -107,6 +111,11 @@ def compute_trade_aware_diagnostic(
     """
     near_trades = [t for t in trades if abs(t.price - quote_price) <= near_band]
 
+    # ``signs`` and ``contributions`` are aligned per RESOLVABLE near-trade (one whose
+    # ``fv_now`` and ``fv_after`` both exist). ``.size`` is NEVER read: every metric below
+    # is size-agnostic, so doubling every trade's observational size leaves the report
+    # byte-identical (the size-independence invariant, AC-105).
+    signs: list[float] = []
     contributions: list[float] = []
     for t in near_trades:
         fv_now = fv_at(t.ts)
@@ -114,6 +123,7 @@ def compute_trade_aware_diagnostic(
         if fv_now is None or fv_after is None:
             continue
         sign = 1.0 if t.aggressor_side is AggressorSide.BUY else -1.0
+        signs.append(sign)
         contributions.append(sign * (fv_after - fv_now) * 1e4)
 
     flow_bps: int | None = round(mean(contributions)) if contributions else None
@@ -129,8 +139,66 @@ def compute_trade_aware_diagnostic(
         # (unknown) rather than ``0.0`` (falsely "all benign").
         ratio = None
 
+    # E4-T2 extended metrics. All abstain to ``None`` when there is no resolvable
+    # near-trade + fv (``contributions`` empty), never to ``0`` (which would falsely
+    # read as "measured, and neutral").
+    total = len(trades)
+    near_quote_trade_rate: float | None = (
+        len(near_trades) / total if total > 0 else None
+    )
+    # Net aggressor imbalance in bps, size-agnostic: mean of the +1/-1 aggressor signs
+    # only (never weighted by ``.size``). ``None`` when nothing resolves.
+    signed_flow_pressure_bps: int | None = (
+        round(mean(signs) * 1e4) if signs else None
+    )
+    # Average post-trade fair-value markout FROM THE MAKER'S PERSPECTIVE: how far fv moved
+    # in the aggressor's favour after the trade (positive => informed flow => adverse
+    # selection against a maker who took the other side). It is a DIAGNOSTIC, never a fill.
+    post_trade_fv_markout_bps: int | None = (
+        round(mean(contributions)) if contributions else None
+    )
+    # Fraction of resolvable near-trades where the aggressor was subsequently right
+    # (fv moved their way) — the maker got "picked off". A rate in [0, 1], ``None`` when
+    # nothing resolves.
+    picked_off_pressure: float | None = (
+        sum(1 for c in contributions if c > 0) / len(contributions)
+        if contributions
+        else None
+    )
+    # Candidate-vs-naive toxicity delta is a pure subtraction; ``None`` if EITHER operand
+    # is absent (cannot fabricate a comparison from a missing side).
+    candidate_vs_naive_toxicity_delta_bps: int | None
+    if candidate_toxicity_loss_bps is not None and naive_toxicity_loss_bps is not None:
+        candidate_vs_naive_toxicity_delta_bps = (
+            candidate_toxicity_loss_bps - naive_toxicity_loss_bps
+        )
+    else:
+        candidate_vs_naive_toxicity_delta_bps = None
+
+    # Tautology-breaker verdict. INSUFFICIENT_DATA when nothing resolves. Otherwise the
+    # real-trade reference "separates the candidate" iff the post-trade markout is strictly
+    # positive (there IS informed-flow adverse selection a fair-value maker would avoid);
+    # SEPARATED only when that independent reference AND the falsification agree, else
+    # INCONCLUSIVE (the two references disagree — never claim separation from one alone).
+    if not contributions:
+        independent_reference_verdict = "INSUFFICIENT_DATA"
+    else:
+        markout_separates = (
+            post_trade_fv_markout_bps is not None and post_trade_fv_markout_bps > 0
+        )
+        if markout_separates and falsification_verdict == "SEPARATED":
+            independent_reference_verdict = "SEPARATED"
+        else:
+            independent_reference_verdict = "INCONCLUSIVE"
+
     return AdverseSelectionReport(
         trade_flow_preceding_fv_move_bps_diagnostic=flow_bps,
         toxic_vs_benign_flow_ratio_diagnostic=ratio,
         trades_near_quote_count=len(near_trades),
+        near_quote_trade_rate_diagnostic=near_quote_trade_rate,
+        signed_flow_pressure_bps_diagnostic=signed_flow_pressure_bps,
+        post_trade_fv_markout_bps_diagnostic=post_trade_fv_markout_bps,
+        picked_off_pressure_diagnostic=picked_off_pressure,
+        candidate_vs_naive_toxicity_delta_bps_diagnostic=candidate_vs_naive_toxicity_delta_bps,
+        independent_reference_verdict=independent_reference_verdict,
     )

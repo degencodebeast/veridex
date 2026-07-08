@@ -57,7 +57,7 @@ def test_diagnostic_verdict_separated():
     T = [_tp(0, 0.51, AggressorSide.BUY), _tp(30, 0.51, AggressorSide.BUY)]
     F = lambda ts: {0: 0.50, 30: 0.52, 60: 0.60, 90: 0.62}.get(ts)
     rep = compute_trade_aware_diagnostic(
-        trades=T, fv_at=F, quote_price=0.50, falsification_verdict="SEPARATED"
+        trades=T, fv_at=F, quote_price=0.50, window_s=30, falsification_verdict="SEPARATED"
     )
     assert rep.post_trade_fv_markout_bps_diagnostic is not None
     assert rep.post_trade_fv_markout_bps_diagnostic > 0  # real-trade markout separates the candidate
@@ -70,7 +70,7 @@ def test_diagnostic_verdict_inconclusive():
     T = [_tp(0, 0.51, AggressorSide.BUY), _tp(30, 0.51, AggressorSide.BUY)]
     F = lambda ts: {0: 0.50, 30: 0.52, 60: 0.60, 90: 0.62}.get(ts)
     rep = compute_trade_aware_diagnostic(
-        trades=T, fv_at=F, quote_price=0.50, falsification_verdict="INCONCLUSIVE"
+        trades=T, fv_at=F, quote_price=0.50, window_s=30, falsification_verdict="INCONCLUSIVE"
     )
     assert rep.post_trade_fv_markout_bps_diagnostic > 0  # markout DOES separate
     assert rep.independent_reference_verdict == "INCONCLUSIVE"  # but references disagree
