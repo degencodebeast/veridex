@@ -9,7 +9,12 @@ from __future__ import annotations
 
 import pytest
 
-from veridex.maker.trade_artifact import NormalizedTradeRow, recompute_artifact_hash
+from veridex.maker.mapping import PINNED_MAPPING_HASH
+from veridex.maker.trade_artifact import (
+    NormalizedTradeRow,
+    TradeArtifact,
+    recompute_artifact_hash,
+)
 from veridex.maker.trades import AggressorSide
 
 
@@ -46,3 +51,53 @@ def test_artifact_hash_covers_event_identity():
     assert a != b
     c = recompute_artifact_hash([_row(price=0.6)])
     assert c != a  # economic field also covered
+
+
+def _artifact(rows, **kw):
+    h = recompute_artifact_hash(rows)
+    base = dict(
+        artifact_hash=h,
+        raw_artifact_hash=None,
+        schema_version="v1",
+        decoder_version="d1",
+        decoder_commit=None,
+        source="polymarket_ctf_exchange_v2_orderfilled",
+        chain_id=137,
+        contract_address="0xe11...",
+        event_signature="OrderFilled(...)",
+        from_block=1,
+        to_block=2,
+        reorg_buffer_confs=20,
+        capture_ts=1,
+        capture_tool_id="t1",
+        provider_id="hs-prod",
+        token_supplied_externally=True,
+        rows_decoded=len(rows),
+        rows_matched_cp1=len(rows),
+        rows_unmatched=0,
+        rows_malformed=0,
+        rows_duplicate_dropped=0,
+        mapping_content_hash=PINNED_MAPPING_HASH,
+        fixture_count=18,
+        side_count=54,
+        cleanroom_attestation="clean-room; no GPL copied",
+        rows=tuple(rows),
+    )
+    base.update(kw)
+    return TradeArtifact(**base)
+
+
+def test_trade_artifact_reconciles_and_forbids_token():
+    a = _artifact([_row()])
+    assert a.artifact_hash == recompute_artifact_hash([_row()])
+    with pytest.raises(Exception):
+        _artifact([_row()], artifact_hash="deadbeef")  # hash mismatch
+    with pytest.raises(Exception):
+        _artifact([_row()], rows_unmatched=5)  # reconciliation fails
+    with pytest.raises(Exception):
+        _artifact([_row()], mapping_content_hash="nope")  # mapping not pinned
+    _artifact([_row()])  # token_supplied_externally=True is ALLOWED
+    with pytest.raises(Exception):
+        _artifact([_row()], hypersync_api="secret")  # secret-bearing key forbidden
+    with pytest.raises(Exception):
+        _artifact([_row()], api_key="AKIA...")  # secret-bearing key forbidden
