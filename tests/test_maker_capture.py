@@ -87,6 +87,42 @@ def test_decode_order_filled_yields_native_price_and_identity():
     )
 
 
+def test_aggressor_derived_from_legs_not_external_side():
+    # M2 (sign integrity): the aggressor must be derived from the COLLATERAL LEG the decoder
+    # already computes (maker supplied collateral 'assetId 0' => maker BUYS shares => aggressor
+    # SELLS), NEVER from an ABI-external ``side`` key (the pinned OrderFilled has no side param;
+    # an operator adapter that maps the taker's side there would silently flip every sign).
+    from veridex.maker.trades import AggressorSide
+
+    # (a) NO ``side`` key at all: the leg derivation alone yields the aggressor. maker is the
+    # collateral leg (makerAssetId="0") => maker buys => aggressor SELLS.
+    log_no_side = _order_filled_log(makerAssetId="0", takerAssetId="42")
+    del log_no_side["side"]
+    row = decode_order_filled(log_no_side)
+    assert row.aggressor_side is AggressorSide.SELL   # leg-derived, no ``side`` needed
+
+    # (b) a ``side`` key that DISAGREES with the legs (maker=collateral but side=1 claims the
+    # maker SOLD) must raise -- defense-in-depth, refusing to trust the external key.
+    log_bad_side = _order_filled_log(makerAssetId="0", takerAssetId="42", side=1)
+    with pytest.raises(ValueError):
+        decode_order_filled(log_bad_side)
+
+
+def test_default_operator_manifest_stamps_real_capture_ts():
+    # m3: the OPERATOR capture path must stamp a real wall-clock capture_ts (not a dead 0).
+    import time
+
+    from veridex.maker.capture import _default_operator_manifest_meta
+
+    before = int(time.time())
+    meta = _default_operator_manifest_meta(
+        from_block=1, to_block=2, token_supplied_externally=True
+    )
+    after = int(time.time())
+    assert meta["capture_ts"] > 0
+    assert before <= meta["capture_ts"] <= after
+
+
 def test_decode_order_filled_rejects_decimal_out_of_range_price():
     # usdc_leg > share_leg → price > 1 (decimal-odds) → rejected, never reaches math.
     log = _order_filled_log(makerAmountFilled="1400000", takerAmountFilled="1000000")

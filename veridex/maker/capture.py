@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -87,21 +88,24 @@ def decode_order_filled(log: dict[str, Any]) -> NormalizedTradeRow:
     outcome-token (share) leg. Exactly one of ``makerAssetId`` / ``takerAssetId`` is
     the collateral asset (id ``"0"``); the other is the traded outcome token. The
     native price is ``usdc_leg / share_leg`` (both 6-decimal, so the scale cancels),
-    ``size`` is the share leg in human units, and the aggressor is the taker — the
-    negation of the maker's ``side``.
+    ``size`` is the share leg in human units, and the aggressor (taker) side is derived
+    from the collateral leg: a maker who supplied collateral BOUGHT shares, so the
+    aggressor SOLD. The aggressor is NEVER derived from an ABI-external ``side`` key.
 
     Args:
         log: A decoded ``OrderFilled`` log with keys ``block_number,
             transaction_hash, log_index, block_timestamp, maker, taker,
-            makerAssetId, takerAssetId, makerAmountFilled, takerAmountFilled,
-            side``.
+            makerAssetId, takerAssetId, makerAmountFilled, takerAmountFilled``. An
+            optional ``side`` key is NOT trusted for the aggressor sign; when present
+            it is only cross-checked against the leg derivation.
 
     Returns:
         The decoded :class:`NormalizedTradeRow` (never a Veridex fill).
 
     Raises:
-        ValueError: If neither / both legs are the collateral asset, or the share
-            leg is zero.
+        ValueError: If neither / both legs are the collateral asset, the share leg is
+            zero, or a present ``side`` key disagrees with the collateral-leg-derived
+            maker side.
         MarkoutError: If the derived ``price`` is outside ``[0, 1]``.
     """
     maker_asset_id = str(log["makerAssetId"])
@@ -129,8 +133,24 @@ def decode_order_filled(log: dict[str, Any]) -> NormalizedTradeRow:
     assert_native_prob(price, "price")
     size = share_amount / _AMOUNT_SCALE
 
-    # ``side`` is the maker's side (BUY=0, SELL=1); the aggressor is the taker.
-    maker_buys = int(log["side"]) == 0
+    # Derive the maker's side from the COLLATERAL LEG the decoder already computed, NOT from
+    # any ABI-external ``side`` key: the pinned OrderFilled(bytes32,address,address,uint256,
+    # uint256,uint256,uint256,uint256) has NO ``side`` param, so an operator adapter that
+    # synthesizes one and maps the taker's side there would silently flip every aggressor sign
+    # (negating signed_flow / post_trade_fv_markout / picked_off / toxic-vs-benign). A maker who
+    # SUPPLIED collateral (assetId "0") BOUGHT shares, so the aggressor (taker) SOLD.
+    maker_buys = maker_is_collateral
+    # Defense-in-depth: if a ``side`` key IS present, it must AGREE with the leg derivation
+    # (maker BUY=0 / SELL=1); disagreement means the external key is untrustworthy -> raise.
+    if "side" in log:
+        side_says_maker_buys = int(log["side"]) == 0
+        if side_says_maker_buys != maker_buys:
+            raise ValueError(
+                "OrderFilled 'side' disagrees with the collateral-leg-derived maker side "
+                f"(side={log['side']!r} => maker_buys={side_says_maker_buys}, but "
+                f"maker_is_collateral={maker_is_collateral} => maker_buys={maker_buys}); "
+                "refusing to trust the ABI-external 'side' key"
+            )
     aggressor_side = AggressorSide.SELL if maker_buys else AggressorSide.BUY
 
     return NormalizedTradeRow(
@@ -349,7 +369,11 @@ def _default_operator_manifest_meta(
         "from_block": from_block,
         "to_block": to_block,
         "reorg_buffer_confs": 20,
-        "capture_ts": 0,
+        # Real wall-clock capture time on the live operator path. This is manifest metadata
+        # only -- it does NOT feed ``artifact_hash`` (that is recomputed over the trade ROWS
+        # alone in build_trade_artifact), so hashed artifact bytes stay deterministic. Tests
+        # pass an explicit ``capture_ts`` for determinism instead of calling this default.
+        "capture_ts": int(time.time()),
         "capture_tool_id": "veridex-maker-capture",
         "provider_id": "hypersync",
         "token_supplied_externally": token_supplied_externally,
