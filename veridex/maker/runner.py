@@ -197,15 +197,23 @@ def run_maker_arena(cfg: MakerRunConfig, *, seal: bool = False) -> MakerArenaRes
 
     for rows in groups.values():
         # Only ticks carrying a fresh venue mid can be quoted by the venue-anchored
-        # naive control; a stale (None) mid is not imputed. The reference fv series
-        # is built from THIS group's own (ts, fv) pairs -- no cross-market leakage.
+        # naive control; a stale (None) mid is not imputed -- so QUOTE GENERATION runs
+        # over the mid-present ("live") rows only.
         live = sorted(
             (row for row in rows if row["mid"] is not None), key=lambda row: row["ts"]
         )
         if not live:
             continue
+        # The markout REFERENCE fv series, however, is the FULL observed TxLINE fv for
+        # THIS market -- fv is observed at EVERY tick, independent of venue-mid freshness.
+        # Building ref_at from `live` alone would drop the real future fv of any tick whose
+        # venue mid is stale (mid=None), silently falling ref_at(ts+h) back to an OLDER fv
+        # and corrupting the forward markout (Codex M8). So ref_at spans ALL group rows.
+        # This stays a single (fixture_id, venue_market_ref) group's own series -- no
+        # cross-market leakage; the grouping key is unchanged.
+        all_sorted = sorted(rows, key=lambda row: row["ts"])
         ref_at = _group_ref_at(
-            [row["ts"] for row in live], [row["fv"] for row in live]
+            [row["ts"] for row in all_sorted], [row["fv"] for row in all_sorted]
         )
         for agent in agents:
             marks, acc = _score_group(agent, live, ref_at, horizons_s)

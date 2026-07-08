@@ -2,6 +2,7 @@ import inspect, pytest
 import veridex.maker.runner as runner_mod
 from veridex.maker.runner import run_maker_arena
 from veridex.maker.config import build_maker_run_config, MakerVoidError
+from veridex.maker.contracts import Side
 
 CP1_18 = (17588229,17588234,17588245,17588325,17588391,17588404,17926593,18167317,
           18172280,18172469,18175918,18175981,18175983,18176123,18179550,18179551,18179759,18179763)
@@ -85,6 +86,56 @@ def test_scoring_is_per_market_not_cross_fixture(monkeypatch):
     assert res.fixture_universe_n == 2          # both fixtures represented
     assert res.real_executable_edge_bps is None
     # the run must not raise despite the same venue_market_ref appearing in two fixtures
+
+
+def test_markout_ref_uses_full_fv_series_even_when_future_mid_is_stale(monkeypatch):
+    # DEFECT (Codex M8): the markout REFERENCE fv series must be the FULL observed
+    # TxLINE fv for the market (fv exists at every tick), independent of whether the
+    # venue mid is fresh. The buggy code built ref_at from only the mid-present ("live")
+    # rows, so a FUTURE tick whose venue mid is stale (mid=None) had its real future fv
+    # dropped -- ref_at(ts+h) then silently fell back to an OLDER fv, corrupting the markout.
+    #
+    # Build ONE (fixture, venue_market_ref) group with a live row at ts=0 (fv=0.50, mid=0.50)
+    # and a FUTURE row at ts=30 whose fv moved to 0.80 but whose venue mid is STALE (None).
+    fid = CP1_18[0]
+    base = {"fixture_id": fid, "txline_market_key": "1X2_PARTICIPANT_RESULT||",
+            "txline_side": "part1", "venue_market_ref": "1X2|home|full", "venue_side": "home"}
+    def _tape_with_stale_future_mid(*a, **k):
+        return [
+            {**base, "tick_seq": 0, "ts": 0,  "fv": 0.50, "mid": 0.50, "staleness_s": 0},
+            {**base, "tick_seq": 1, "ts": 30, "fv": 0.80, "mid": None, "staleness_s": None},
+        ]
+    monkeypatch.setattr(runner_mod, "build_cp1_maker_tape", _tape_with_stale_future_mid)
+
+    # Spy on the scorer to observe the reference series the markout actually consumes.
+    # (The two-sided symmetric quote's AVERAGE markout is (ask-bid)/(2*ref_now), which
+    # cancels ref_future -- so avg_markout_bps alone cannot distinguish fixed from buggy;
+    # the +0.30 future move only shows up in the INDIVIDUAL bid/ask marks and in ref_at.)
+    seen: dict = {"bid30": []}
+    real_score = runner_mod.score_r1_markout
+    def _spy(quote_sets, ref_at, horizons_s):
+        marks, acc = real_score(quote_sets, ref_at, horizons_s)
+        # Future reference at the stale-mid tick: 0.80 (real future fv) once fixed, but
+        # the stale 0.50 fallback while buggy (the 0.80 was dropped with the mid=None row).
+        seen["ref_future_at_30"] = ref_at("1X2|home|full", Side.BID, 30)
+        seen["bid30"].extend(
+            m.markout_bps for m in marks if m.side is Side.BID and m.horizon_s == 30
+        )
+        return marks, acc
+    monkeypatch.setattr(runner_mod, "score_r1_markout", _spy)
+
+    res = run_maker_arena(_pinned_cfg(), seal=False)
+    cand = next(a for a in res.per_agent if a["agent_id"] == "txline-fair-mm")
+
+    # The markout reference at the future stale-mid tick MUST be the real future fv 0.80,
+    # not the 0.50 stale fallback -- proving the changed FV IS consumed by the markout.
+    assert seen["ref_future_at_30"] == 0.80
+    # Candidate bid @ 0.48 marked to future fv 0.80 over ref_now 0.50:
+    #   (0.80 - 0.48) / 0.50 * 1e4 = 6400 bps.
+    # With the bug (ref_future stalls at 0.50) this collapses to (0.50-0.48)/0.50*1e4 = 400.
+    assert 6400 in seen["bid30"]
+    assert 400 not in seen["bid30"]
+    assert cand["avg_markout_bps"] is not None
 
 
 def test_sealed_run_consumes_real_cp1_bytes(monkeypatch):
