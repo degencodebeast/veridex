@@ -8,7 +8,7 @@ single path).
 """
 
 from veridex.maker.r2_bracket import FillAssumptionConfig
-from veridex.maker.r2_suite import render_r2_suite
+from veridex.maker.r2_suite import render_protection_ablation, render_r2_suite
 
 QUAD_LABEL = "REPORT_ONLY / UNCALIBRATED / DECLARED_MODEL_OVERLAY / NOT_A_FILL_PROOF"
 
@@ -74,3 +74,23 @@ def test_r2_deterministic_labels_inventory_as_expected_model():
     assert "expected_path" in path and "expected_final" in path
     # expected/model, not shares held
     assert "expected" in path["note"] and "shares held" in path["note"]
+
+
+def test_protection_ablation_is_declared_overlay():
+    cfg_on = _cfg(fill_model_id="on", rule_params={"p": 0.3})
+    cfg_off = _cfg(fill_model_id="off", rule_params={"p": 0.6})
+    abl = render_protection_ablation([10, 20, 30], cfg_on, cfg_off)
+    # both sides carry the four labels + never ranked
+    for side in (abl.protection_on, abl.protection_off):
+        assert side.label == QUAD_LABEL
+        assert side.ranked is False and side.queue_modeled is False
+        assert side.fill_proof is False and side.uses_real_orderbook is False
+        assert side.uses_own_fills is False and side.real_executable_edge_bps is None
+    assert abl.label == QUAD_LABEL
+    # event_gate_cost is a model overlay, not a realized number
+    assert isinstance(abl.event_gate_cost, dict)
+    assert "model_inventory_delta" in abl.event_gate_cost
+    dump = abl.model_dump()
+    assert "realized_pnl" not in dump
+    # the ablation is never a rankable/executable claim
+    assert "declared model overlay" in abl.delta_note
