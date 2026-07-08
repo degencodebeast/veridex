@@ -7,8 +7,14 @@ seed-pinned deterministic (a distribution over n_paths, never a cherry-picked
 single path).
 """
 
+import pytest
+
 from veridex.maker.r2_bracket import FillAssumptionConfig
-from veridex.maker.r2_suite import render_protection_ablation, render_r2_suite
+from veridex.maker.r2_suite import (
+    R2SensitivityScenario,
+    render_protection_ablation,
+    render_r2_suite,
+)
 
 QUAD_LABEL = "REPORT_ONLY / UNCALIBRATED / DECLARED_MODEL_OVERLAY / NOT_A_FILL_PROOF"
 
@@ -94,3 +100,42 @@ def test_protection_ablation_is_declared_overlay():
     assert "realized_pnl" not in dump
     # the ablation is never a rankable/executable claim
     assert "declared model overlay" in abl.delta_note
+
+
+def test_r2_sensitivity_scenario_matches_spec_44():
+    # M3/§4.4: R2SensitivityScenario is the declared-overlay corner CONTRACT,
+    # exactly the six spec fields, guards pinned False, mode enumerated.
+    assert set(R2SensitivityScenario.model_fields) == {
+        "scenario_id",
+        "mode",
+        "fill_assumption_hash",
+        "label",
+        "ranked",
+        "queue_modeled",
+    }
+    cfg = _cfg()
+    s = R2SensitivityScenario(
+        scenario_id="s1",
+        mode="neutral",
+        fill_assumption_hash=cfg.config_hash(),
+    )
+    assert s.mode == "neutral"
+    assert s.ranked is False and s.queue_modeled is False
+    assert s.label == QUAD_LABEL
+    assert s.fill_assumption_hash == cfg.config_hash()
+    # all three modes construct
+    for mode in ("pessimistic", "neutral", "optimistic"):
+        R2SensitivityScenario(scenario_id="s", mode=mode, fill_assumption_hash="h")
+    # ranked=True is structurally rejected (never rankable)
+    with pytest.raises(Exception):
+        R2SensitivityScenario(
+            scenario_id="s", mode="neutral", fill_assumption_hash="h", ranked=True
+        )
+    # queue_modeled=True is structurally rejected (no depth at R2)
+    with pytest.raises(Exception):
+        R2SensitivityScenario(
+            scenario_id="s", mode="neutral", fill_assumption_hash="h", queue_modeled=True
+        )
+    # an out-of-enum mode is rejected
+    with pytest.raises(Exception):
+        R2SensitivityScenario(scenario_id="s", mode="bogus", fill_assumption_hash="h")

@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import math
 import random
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, field_validator
 
@@ -29,6 +29,7 @@ __all__ = [
     "R2_QUADRUPLE_LABEL",
     "FORBIDDEN_TRIGGER_ASSERTION",
     "R2SensitivityScenario",
+    "R2ScenarioResult",
     "R2SensitivityBracket",
     "R2ProtectionAblation",
     "render_r2_suite",
@@ -62,10 +63,50 @@ def _percentile(sorted_vals: list[float], q: float) -> float:
 
 
 class R2SensitivityScenario(BaseModel):
-    """One pinned-assumption corner of the report-only sensitivity bracket.
+    """Spec §4.4 declared-overlay scenario contract.
+
+    Exactly the six spec fields: ``{scenario_id, mode, fill_assumption_hash,
+    label, ranked=False, queue_modeled=False}``. ``mode`` is one of the three
+    corners; ``ranked`` / ``queue_modeled`` are structurally pinned to ``False``
+    (a scenario is never rankable and depth is unavailable at R2);
+    ``fill_assumption_hash`` binds the pinned ``FillAssumptionConfig``.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    scenario_id: str
+    mode: Literal["pessimistic", "neutral", "optimistic"]
+    fill_assumption_hash: str
+    label: str = R2_QUADRUPLE_LABEL
+    ranked: bool = False
+    queue_modeled: bool = False
+
+    @field_validator("ranked", "queue_modeled")
+    @classmethod
+    def _must_be_false(cls, value: bool) -> bool:
+        if value:
+            raise ValueError(
+                "R2 scenario guards must be False: a scenario is never ranked "
+                "and queue position can never be modeled at R2."
+            )
+        return value
+
+    @field_validator("label")
+    @classmethod
+    def _must_be_quad_label(cls, value: str) -> str:
+        if value != R2_QUADRUPLE_LABEL:
+            raise ValueError(
+                f"R2 scenario label must be {R2_QUADRUPLE_LABEL!r}, got {value!r}."
+            )
+        return value
+
+
+class R2ScenarioResult(BaseModel):
+    """One pinned-assumption corner VALUE of the report-only bracket.
 
     All quantities are ``simulated_``-prefixed model outputs of the pinned
-    ex-ante rule -- never observed fills, never realized PnL.
+    ex-ante rule -- never observed fills, never realized PnL. Nested only under
+    ``assumption_sensitivity`` (not a rank-visible top-level bracket field).
     """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
@@ -165,11 +206,11 @@ def _pinned_fill_probability(cfg: FillAssumptionConfig) -> float:
     return min(max(p, 0.0), 1.0)
 
 
-def _scenario(name: str, markout: float, cfg: FillAssumptionConfig) -> R2SensitivityScenario:
+def _scenario(name: str, markout: float, cfg: FillAssumptionConfig) -> R2ScenarioResult:
     """A single declared-overlay corner derived purely from cfg + a markout."""
     p = _pinned_fill_probability(cfg)
     inv = round(p * (markout / 100.0), 6)
-    return R2SensitivityScenario(
+    return R2ScenarioResult(
         name=name,
         simulated_expected_inventory=inv,
         simulated_expected_exposure=round(abs(inv), 6),
