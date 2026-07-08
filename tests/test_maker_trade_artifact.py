@@ -54,6 +54,16 @@ def test_artifact_hash_covers_event_identity():
     assert c != a  # economic field also covered
 
 
+def test_artifact_hash_is_order_independent():
+    # Two rows that TIE on (block_number, log_index) but differ in tx_hash (the rest
+    # of the identity) must not let input order change the digest: the sort key must
+    # be a TOTAL order matching identity (block_number, log_index, tx_hash), else a
+    # stable sort leaks file order into the trust-load-bearing hash.
+    r1 = _row(tx_hash="0xAAA", log_index=7, block_number=200, price=0.5)
+    r2 = _row(tx_hash="0xBBB", log_index=7, block_number=200, price=0.6)
+    assert recompute_artifact_hash([r1, r2]) == recompute_artifact_hash([r2, r1])
+
+
 def _artifact(rows, **kw):
     h = recompute_artifact_hash(rows)
     base = dict(
