@@ -24,6 +24,7 @@ from __future__ import annotations
 import bisect
 import json
 from pathlib import Path
+from typing import Any
 
 from veridex.ingest.replay_pack import load_pack_marketstates
 from veridex.maker.mapping import ResolvedMarketRecord, recompute_records_hash
@@ -94,7 +95,7 @@ def build_cp1_maker_tape(
     pack_root: Path,
     cp1_frames_root: Path,
     freshness_s: int = 120,
-) -> list[dict]:
+) -> list[dict[str, Any]]:
     """Build the cp1 maker tape from REAL ReplayPacks (TxLINE FV) + pinned venue frame bytes (venue mid).
 
     For each fixture in ``records`` (the canonical cp1 universe — 18 fixtures), replays the committed
@@ -127,7 +128,7 @@ def build_cp1_maker_tape(
 
     frame_index_cache: dict[Path, tuple[list[int], list[float]]] = {}
 
-    tape: list[dict] = []
+    tape: list[dict[str, Any]] = []
     for fixture_id in fixture_ids:
         states = load_pack_marketstates(pack_root / str(fixture_id), fixture_id, verify=True)
         for state in states:

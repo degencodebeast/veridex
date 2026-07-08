@@ -34,7 +34,7 @@ from veridex.maker.config import (
     MakerVoidError,
     verify_pinned,
 )
-from veridex.maker.falsification import run_falsification_arena
+from veridex.maker.falsification import FalsificationResult, falsify
 from veridex.maker.leaderboard import rank_makers, window_clv_analog
 from veridex.maker.mapping import (
     DEFAULT_MAPPING_PATH,
@@ -42,7 +42,12 @@ from veridex.maker.mapping import (
 )
 from veridex.maker.result import MakerArenaResult
 from veridex.maker.rung_gate import DataPresence, assign_rung
-from veridex.maker.scorer import aggregate_agent_metrics, score_r1_markout
+from veridex.maker.scorer import (
+    QuoteAccounting,
+    QuoteMarkout,
+    aggregate_agent_metrics,
+    score_r1_markout,
+)
 from veridex.maker.tape import build_cp1_maker_tape
 
 __all__ = [
@@ -74,28 +79,20 @@ _CP1_FRAMES_ROOT = _REPO_ROOT / "scripts" / "txline_live" / "cp1" / "frames"
 RESULT_PATH: Path = _REPO_ROOT / "scripts" / "txline_live" / "cp1" / "maker-arena-result.json"
 
 
-def _build_ref_at(tape: list[dict[str, Any]]):
-    """Build a no-look-ahead reference lookup ``(market_key, side, ts) -> fv | None``.
+def _group_ref_at(ts_list: list[int], fv_list: list[float]):
+    """Build a no-look-ahead reference lookup over ONE market's ``(ts, fv)`` series.
 
-    Indexes the tape's TxLINE fair value by ``(venue_market_ref, ts)`` and, at query
-    time, returns the most-recent fv at or before ``ts`` for that venue ref (a later
-    tick is invisible -- no look-ahead). ``side`` does not select the reference: the
-    fair value is a per-market series shared by both quote sides. Returns ``None``
-    when the market is unknown or no fv exists at/before ``ts`` (never imputed).
+    The closure is bound to a single ``(fixture_id, venue_market_ref)`` group's own
+    sorted fair-value series, so a quote generated from that market can only ever be
+    scored against that same market's future fv -- never another fixture's or another
+    venue side's (MM-R1). ``market_key``/``side`` are accepted for the
+    :func:`score_r1_markout` calling convention but do NOT select the series: the fair
+    value is the per-market series this closure already owns. Returns the most-recent
+    fv at or before ``ts`` (a later tick is invisible -- no look-ahead), or ``None``
+    when no fv exists at/before ``ts`` (never imputed).
     """
-    index: dict[str, tuple[list[int], list[float]]] = {}
-    by_ref: dict[str, list[tuple[int, float]]] = {}
-    for row in tape:
-        by_ref.setdefault(row["venue_market_ref"], []).append((row["ts"], row["fv"]))
-    for ref, pairs in by_ref.items():
-        pairs.sort(key=lambda pair: pair[0])
-        index[ref] = ([ts for ts, _ in pairs], [fv for _, fv in pairs])
 
-    def ref_at(market_key: str, side: Any, ts: int) -> float | None:
-        entry = index.get(market_key)
-        if entry is None:
-            return None
-        ts_list, fv_list = entry
+    def ref_at(market_key: str, side: object, ts: int) -> float | None:
         pos = bisect.bisect_right(ts_list, ts)
         if pos == 0:
             return None
@@ -104,20 +101,19 @@ def _build_ref_at(tape: list[dict[str, Any]]):
     return ref_at
 
 
-def _agent_metrics(agent: Any, adapted: list[dict[str, Any]], ref_at, horizons_s):
-    """Score one agent over the adapted tape and aggregate its markout metric stack."""
+def _score_group(agent: Any, rows: list[dict[str, Any]], ref_at, horizons_s):
+    """Score one agent over ONE market group's rows against that group's own fv."""
     quote_sets = [
         agent.propose(
-            reference_fv={"fv": row["fv"], "suspended": False},
+            reference_fv={"fv": row["fv"]},
             venue_view={"mid": row["mid"]},
             inventory={},
             params={},
             clock=row["ts"],
         )
-        for row in adapted
+        for row in rows
     ]
-    marks, acc = score_r1_markout(quote_sets, ref_at, horizons_s)
-    return aggregate_agent_metrics(agent.agent_id, marks, acc)
+    return score_r1_markout(quote_sets, ref_at, horizons_s)
 
 
 def run_maker_arena(cfg: MakerRunConfig, *, seal: bool = False) -> MakerArenaResult:
@@ -128,7 +124,9 @@ def run_maker_arena(cfg: MakerRunConfig, *, seal: bool = False) -> MakerArenaRes
     1. :func:`verify_pinned` -- pure, NO I/O; VOIDs on config drift BEFORE any load.
     2. Load the pinned mapping and re-check its recomputed content hash.
     3. Build the real cp1 maker tape (consumes real ReplayPack bytes, ``verify=True``).
-    4. Run the naive-vs-candidate falsification arena + per-agent markout metrics.
+    4. Score per ``(fixture_id, venue_market_ref)`` market (each quote marked out only
+       against its OWN market's future fv), pool toxicity quality across markets, and
+       run the naive-vs-candidate falsification on the pooled quality.
     5. Assign the data-feasibility rung (mids present, no trades -> MM-R1).
     6. Assemble the :class:`MakerArenaResult`.
     7. Write the sealed artifact ONLY when ``seal=True``.
@@ -164,9 +162,11 @@ def run_maker_arena(cfg: MakerRunConfig, *, seal: bool = False) -> MakerArenaRes
     # self-consistency, Codex M1 watch item).
     mapping_fixtures = {record.fixture_id for record in records}
     if set(cfg.fixture_ids) != mapping_fixtures:
+        symmetric_difference = sorted(set(cfg.fixture_ids) ^ mapping_fixtures)
         raise MakerVoidError(
             "cfg fixture universe disagrees with the pinned mapping's fixtures "
-            f"(cfg has {len(cfg.fixture_ids)}, mapping has {len(mapping_fixtures)})"
+            f"(cfg has {len(cfg.fixture_ids)}, mapping has {len(mapping_fixtures)}; "
+            f"symmetric difference {symmetric_difference})"
         )
 
     # 3. Consume the REAL cp1 ReplayPack bytes (every pack loaded with verify=True).
@@ -174,32 +174,82 @@ def run_maker_arena(cfg: MakerRunConfig, *, seal: bool = False) -> MakerArenaRes
         records, pack_root=_PACK_ROOT, cp1_frames_root=_CP1_FRAMES_ROOT
     )
 
-    # 4. Falsification arena + per-agent markout metrics over the shared tape.
-    ref_at = _build_ref_at(tape)
+    # 4. Per-market scoring (MM-R1): each quote is scored ONLY against its own
+    # (fixture_id, venue_market_ref) market's future TxLINE fv. The tape is grouped
+    # by that key so draw/away quotes are never marked out against the home fv, and
+    # so distinct fixtures that happen to share a venue_market_ref (e.g. every home
+    # market is "1X2|home|full") never pool into one ts-sorted series where
+    # ref_at(ts) could return a DIFFERENT match's fair value. Toxicity quality is
+    # pooled across markets only AFTER each quote has been scored in-market.
     horizons_s = cfg.markout_horizons_s
     naive = NaiveMarketMakerAgent()
     candidate = TxLineFairMarketMakerAgent()
+    agents = (naive, candidate)
 
-    # Only ticks carrying a fresh venue mid can be quoted by the venue-anchored naive
-    # control; a stale (None) mid is not imputed. Both agents share this same tape.
-    adapted = [
-        {"ts": row["ts"], "fv": row["fv"], "mid": row["mid"]}
-        for row in tape
-        if row["mid"] is not None
-    ]
+    groups: dict[tuple[int, str], list[dict[str, Any]]] = {}
+    for row in tape:
+        groups.setdefault((row["fixture_id"], row["venue_market_ref"]), []).append(row)
 
-    arena = run_falsification_arena(
-        tape=adapted,
-        naive=naive,
-        candidate=candidate,
-        ref_at=ref_at,
-        horizons_s=horizons_s,
-        has_trade_reference=False,
-    )
+    marks_by: dict[str, list[QuoteMarkout]] = {a.agent_id: [] for a in agents}
+    quality_by: dict[str, list[int]] = {a.agent_id: [] for a in agents}
+    scored_by: dict[str, int] = {a.agent_id: 0 for a in agents}
+    abstained_by: dict[str, int] = {a.agent_id: 0 for a in agents}
+
+    for rows in groups.values():
+        # Only ticks carrying a fresh venue mid can be quoted by the venue-anchored
+        # naive control; a stale (None) mid is not imputed. The reference fv series
+        # is built from THIS group's own (ts, fv) pairs -- no cross-market leakage.
+        live = sorted(
+            (row for row in rows if row["mid"] is not None), key=lambda row: row["ts"]
+        )
+        if not live:
+            continue
+        ref_at = _group_ref_at(
+            [row["ts"] for row in live], [row["fv"] for row in live]
+        )
+        for agent in agents:
+            marks, acc = _score_group(agent, live, ref_at, horizons_s)
+            marks_by[agent.agent_id].extend(marks)
+            quality_by[agent.agent_id].extend(-max(0, -m.markout_bps) for m in marks)
+            scored_by[agent.agent_id] += acc.scored
+            abstained_by[agent.agent_id] += acc.abstained
+
+    naive_quality = quality_by[naive.agent_id]
+    cand_quality = quality_by[candidate.agent_id]
+    if naive_quality and cand_quality:
+        falsification = falsify(naive_quality, cand_quality)
+        headline = (
+            "SEPARATED_QUOTE_QUALITY"
+            if falsification.verdict == "SEPARATED"
+            else "INCONCLUSIVE"
+        )
+    else:
+        # Degenerate/all-abstain tape: falsify would raise on an empty sample. Fail
+        # to an honest INCONCLUSIVE verdict rather than crash the sealed run.
+        falsification = FalsificationResult(
+            delta_bps=0, ci_low_bps=0, ci_high_bps=0, verdict="INCONCLUSIVE"
+        )
+        headline = "INCONCLUSIVE"
 
     per_agent = [
-        _agent_metrics(naive, adapted, ref_at, horizons_s),
-        _agent_metrics(candidate, adapted, ref_at, horizons_s),
+        aggregate_agent_metrics(
+            naive.agent_id,
+            marks_by[naive.agent_id],
+            QuoteAccounting(
+                scored=scored_by[naive.agent_id],
+                abstained=abstained_by[naive.agent_id],
+                excluded={},
+            ),
+        ),
+        aggregate_agent_metrics(
+            candidate.agent_id,
+            marks_by[candidate.agent_id],
+            QuoteAccounting(
+                scored=scored_by[candidate.agent_id],
+                abstained=abstained_by[candidate.agent_id],
+                excluded={},
+            ),
+        ),
     ]
     maker_leaderboard = rank_makers(per_agent)
     top = maker_leaderboard[0]
@@ -218,7 +268,7 @@ def run_maker_arena(cfg: MakerRunConfig, *, seal: bool = False) -> MakerArenaRes
         fixtures=cfg.fixture_ids,
         per_agent=per_agent,
         maker_leaderboard=maker_leaderboard,
-        falsification=arena,
+        falsification={**falsification.model_dump(), "headline": headline},
         window_clv_analog=wca,
         fixture_universe_n=len({row["fixture_id"] for row in tape}),
         excluded_by_reason={},

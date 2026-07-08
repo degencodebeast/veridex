@@ -19,6 +19,16 @@ from veridex.maker.state_machine import GateContext, MakerState, classify_state
 _MARKET_KEY = "1X2|home|full"
 
 
+def _settlement_abstains(anchor: float, half_spread: float) -> bool:
+    """Whether a two-sided quote around ``anchor`` would spill outside ``(0, 1)``.
+
+    Near resolution the anchor sits so close to 0 or 1 that a valid two-sided quote
+    cannot fit inside the open interval; either bound being violated means abstain
+    (rather than emit an out-of-range price that downstream markout scoring rejects).
+    """
+    return anchor - half_spread <= 0.0 or anchor + half_spread >= 1.0
+
+
 class NaiveMarketMakerAgent:
     """Quotes a fixed half-spread symmetrically around the venue's own mid.
 
@@ -50,9 +60,9 @@ class NaiveMarketMakerAgent:
         # 0 or 1 that a valid two-sided quote cannot fit inside (0, 1). Rather
         # than emit an out-of-range price (which downstream markout scoring
         # rejects), abstain with an empty NO_QUOTE set.
-        if mid - self.fixed_half_spread <= 0.0 or mid + self.fixed_half_spread >= 1.0:
+        if _settlement_abstains(mid, self.fixed_half_spread):
             return TargetQuoteSet(
-                fixture_id=0, tick_seq=0, ts=clock, quotes=[], regime="NO_QUOTE"
+                fixture_id=0, tick_seq=0, ts=clock, quotes=[], regime=MakerState.NO_QUOTE.value
             )
         bid = TargetQuote(
             side=Side.BID,
@@ -140,7 +150,7 @@ class TxLineFairMarketMakerAgent:
         # abstain with an empty NO_QUOTE set. Uses the EFFECTIVE half-spread so a
         # WIDEN state widens the abstention zone accordingly. This runs after the
         # suspended/stale/`fv is None` gates and leaves interior anchors intact.
-        if fv - half_spread <= 0.0 or fv + half_spread >= 1.0:
+        if _settlement_abstains(fv, half_spread):
             return TargetQuoteSet(
                 fixture_id=0, tick_seq=0, ts=clock, quotes=[], regime=MakerState.NO_QUOTE.value
             )

@@ -64,6 +64,29 @@ def test_tape_has_no_network_or_gamma_import():
     for banned in ("httpx", "requests", "gamma", "resolver", "aiohttp"):
         assert banned not in src.lower()
 
+def test_scoring_is_per_market_not_cross_fixture(monkeypatch):
+    # Two fixtures whose fv series would give opposite markouts if pooled. Each quote must be scored
+    # against its OWN fixture's future fv. We assert the run completes and reports both fixtures,
+    # and (indirectly) that no cross-fixture contamination crashes or collapses the universe.
+    def _two_fixture_tape(*a, **k):
+        rows = []
+        for fid, fv0, fv1 in ((111, 0.40, 0.60), (222, 0.60, 0.40)):
+            rows.append({"ts": 0, "fixture_id": fid, "tick_seq": 0,
+                         "txline_market_key": "1X2_PARTICIPANT_RESULT||", "txline_side": "part1",
+                         "venue_market_ref": "1X2|home|full", "venue_side": "home",
+                         "fv": fv0, "mid": 0.50, "staleness_s": 0})
+            rows.append({"ts": 60, "fixture_id": fid, "tick_seq": 1,
+                         "txline_market_key": "1X2_PARTICIPANT_RESULT||", "txline_side": "part1",
+                         "venue_market_ref": "1X2|home|full", "venue_side": "home",
+                         "fv": fv1, "mid": 0.50, "staleness_s": 0})
+        return rows
+    monkeypatch.setattr(runner_mod, "build_cp1_maker_tape", _two_fixture_tape)
+    res = run_maker_arena(_pinned_cfg(), seal=False)
+    assert res.fixture_universe_n == 2          # both fixtures represented
+    assert res.real_executable_edge_bps is None
+    # the run must not raise despite the same venue_market_ref appearing in two fixtures
+
+
 def test_sealed_run_consumes_real_cp1_bytes(monkeypatch):
     # REAL path: do NOT patch build_cp1_maker_tape. Spy the pack loader to prove real bytes + verify=True.
     import veridex.maker.tape as tape_mod
