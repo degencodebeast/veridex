@@ -162,14 +162,15 @@ def test_falsification_and_window_note_preserved() -> None:
 
 
 def test_committed_fixture_matches_generated_envelope() -> None:
-    """The committed fixture is a byte-for-byte copy of the generated envelope.
+    """The committed fixture's parsed value equals the generated envelope's.
 
     ``contracts/fixtures/maker_arena_result.json`` is never hand-authored (see
-    ``scripts/gen_maker_fixture.py``) — it must always equal what
-    ``build_maker_arena_result_response()`` produces from the sealed artifact right now.
-    This guards against schema drift (e.g. a new proof-card field added to
-    ``MakerProofCard``/``render_proof_card`` without re-running the generator) going
-    uncaught.
+    ``scripts/gen_maker_fixture.py``) — its parsed JSON value must always equal what
+    ``build_maker_arena_result_response()`` produces from the sealed artifact right now
+    (a parsed-dict comparison, not a byte-for-byte one, so it is insensitive to
+    incidental formatting like key order or whitespace). This guards against schema
+    drift (e.g. a new proof-card field added to ``MakerProofCard``/``render_proof_card``
+    without re-running the generator) going uncaught.
     """
     generated = build_maker_arena_result_response().model_dump(mode="json")
     committed = json.loads(_FIXTURE_PATH.read_text(encoding="utf-8"))

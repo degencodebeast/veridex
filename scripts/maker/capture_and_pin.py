@@ -80,11 +80,31 @@ def _operator_log_source() -> OrderFilledLogSource | None:
     return build_hypersync_source(token=token)
 
 
+def _scrub_token(text: str) -> str:
+    """Redact any live ``HYPERSYNC_API`` token value from ``text``.
+
+    The operator token is the one secret this CLI must never emit. Scrubbing the raw
+    token value (rather than trusting an exception's type or provenance) preserves the
+    no-leak guarantee even when the exception surfaces from OUTSIDE this module -- e.g.
+    a live network-SDK error whose message embeds the token in a request URL. When no
+    token is set (the fail-closed no-token case), this is a no-op: the existing clean
+    guard message passes through unchanged.
+    """
+    token = os.environ.get("HYPERSYNC_API")
+    if not token:
+        return text
+    return text.replace(token, "[REDACTED]")
+
+
 def _cmd_prepare(args: argparse.Namespace) -> int:
     """Capture the artifact and WRITE + PRINT the pin-manifest predeclaration.
 
-    Never seals. Fails closed (non-zero exit, no partial artifact) when the capture's
-    operator-token gate raises.
+    Never seals. Fails closed (non-zero exit, no partial artifact) on ANY capture
+    exception -- not just the ``RuntimeError`` fail-closed guard. On the operator LIVE
+    path (token present + real adapter), a network-SDK exception is typically NOT a
+    ``RuntimeError`` and could otherwise propagate as a raw traceback that embeds the
+    operator token (e.g. in a request URL). Every exception's text is scrubbed of the
+    live token value before it is ever printed.
     """
     out_path = Path(args.out)
     try:
@@ -94,11 +114,13 @@ def _cmd_prepare(args: argparse.Namespace) -> int:
             out_path=out_path,
             client=_operator_log_source(),
         )
-    except RuntimeError as exc:
-        # Fail-closed: the capture guard raised (no token / no injected client) BEFORE any
-        # network or file I/O, so no partial artifact exists. The guard message is
-        # token-free by construction.
-        print(f"capture failed closed: {exc}", file=sys.stderr)
+    except Exception as exc:
+        # Fail-closed on ANY exception. The no-token guard's RuntimeError is token-free
+        # by construction (static strings, no network I/O yet), so scrubbing is a no-op
+        # there and the existing clean message is preserved verbatim. Any other
+        # exception -- including a non-RuntimeError SDK error on the LIVE path -- has its
+        # text scrubbed of the live token value so it can never leak to stderr.
+        print(f"capture failed closed: {_scrub_token(str(exc))}", file=sys.stderr)
         raise SystemExit(2) from exc
 
     # Reload the persisted artifact and derive the predeclaration purely by composition.

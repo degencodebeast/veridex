@@ -209,3 +209,33 @@ def test_cli_never_emits_token(tmp_path, monkeypatch):
     assert "SECRET123" not in res.stderr
     assert "SECRET123" not in out.read_text()
     assert "SECRET123" not in out.with_suffix(".pin.json").read_text()
+
+
+# --- RED test 6: the LIVE capture path never leaks the token on ANY exception ---------
+@pytest.mark.parametrize("exc_type", [RuntimeError, ValueError])
+def test_cli_never_leaks_token_in_capture_error(tmp_path, monkeypatch, exc_type):
+    """A network-SDK error on the operator LIVE path must fail closed, token-free.
+
+    ``prepare`` previously only caught ``RuntimeError`` (the fail-closed guard). On the
+    operator LIVE path (token present + real adapter), a network-SDK exception is
+    typically NOT a ``RuntimeError`` and would propagate as a raw traceback -- and such
+    an SDK error can embed the token (e.g. in a request URL). This proves BOTH: (1) a
+    RuntimeError whose message happens to contain the token is still scrubbed, and (2) a
+    non-RuntimeError exception is now caught at all (the broadened catch).
+    """
+    monkeypatch.setenv("HYPERSYNC_API", "SECRET_TOKEN_XYZ")
+    out = tmp_path / "cp1-trades.json"
+
+    def _raise(**_kw):
+        raise exc_type(
+            "GET https://hypersync/query?api_key=SECRET_TOKEN_XYZ failed 500"
+        )
+
+    monkeypatch.setattr("scripts.maker.capture_and_pin.capture_order_filled_artifact", _raise)
+    res = run_cli(["prepare", "--from-block", "1", "--to-block", "2", "--out", str(out)])
+
+    assert res.exit_code != 0
+    assert "SECRET_TOKEN_XYZ" not in res.stdout
+    assert "SECRET_TOKEN_XYZ" not in res.stderr
+    assert not out.exists()
+    assert not out.with_suffix(".pin.json").exists()
