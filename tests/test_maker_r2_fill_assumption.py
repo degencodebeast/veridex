@@ -151,3 +151,49 @@ def test_split_or_renamed_realized_trigger_rejected():
     # positive ex-ante proof (allowlist), not open-ended denylist.
     with pytest.raises(ValidationError):
         _cfg(ex_ante_fields=["realized_edge_next_bar"])
+
+
+# --- Gate-#3 Round-2 Major (CON-106/CON-107): the ex-ante allowlist must cover
+# the ENTIRE fill-mechanism surface, not just fill_probability_rule +
+# ex_ante_fields. cross_rule / partial_fill_policy / rule_params / fill_model_id
+# also DECLARE fill mechanics and were previously unvalidated: each of the
+# configs below constructed + hashed as "pinned" while declaring non-ex-ante /
+# tape-reactive mechanics. They must now be rejected at construction. ---
+
+
+def test_rule_params_rejects_extra_key():
+    # rule_params keys are constrained to the supported parameter set for the
+    # selected rule; the render reads only rule_params["p"], so for the static
+    # rules the allowed key set is {"p"}. A future-looking extra key (also
+    # PUBLISHED into assumption_sensitivity["rule_params"]) must be rejected.
+    with pytest.raises(ValidationError):
+        _cfg(rule_params={"p": 0.5, "future_score_after_quote": 1.0})
+
+
+def test_rule_params_rejects_split_forbidden_token():
+    # A forbidden trigger split across keys ("trade" + "crossed") avoids every
+    # FORBIDDEN_R2_TRIGGERS substring, but both keys are outside the allowed
+    # {"p"} set -> the extra-key guard rejects it.
+    with pytest.raises(ValidationError):
+        _cfg(rule_params={"p": 0.5, "trade": 1.0, "crossed": 1.0})
+
+
+def test_cross_rule_rejects_forbidden_trigger():
+    # cross_rule declares HOW a quote crosses into a fill; "trade_crossed" is a
+    # tape-reactive (post-hoc) cross the R2 overlay must never claim.
+    with pytest.raises(ValidationError):
+        _cfg(cross_rule="trade_crossed")
+
+
+def test_partial_fill_policy_rejects_forbidden_trigger():
+    # partial_fill_policy declares fill mechanics; "post_hoc_fill" is a
+    # non-ex-ante, tape-reactive policy that must be rejected.
+    with pytest.raises(ValidationError):
+        _cfg(partial_fill_policy="post_hoc_fill")
+
+
+def test_fill_model_id_rejects_forbidden_trigger():
+    # fill_model_id is free-form, but must not NAME a forbidden tape-reactive
+    # trigger (denylist substring scan): "trade_crossed_model" embeds one.
+    with pytest.raises(ValidationError):
+        _cfg(fill_model_id="trade_crossed_model")
