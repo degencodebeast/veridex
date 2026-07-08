@@ -55,13 +55,18 @@ def test_config_drift_voids_before_artifact_load(monkeypatch):
     assert loads == []   # config VOID happened before ANY artifact load
 
 
-# --- E2-T2 test B: artifact-content pin (layer 2) VOIDs before ANY trade join -----
+# --- E2-T2 test B: artifact-content pin (layer 2) VOIDs before ANY trade I/O -------
 # CANNOT be false-green: the config gate PASSES (expected == cfg.config_hash()), so the
-# only possible VOID source is the artifact-content branch.
+# only possible VOID source is the artifact-content branch. The spy targets the REAL
+# trade-I/O entrypoint the happy R1.5 path reaches AFTER the pins -- `build_cp1_maker_tape`
+# (step 3, which consumes real ReplayPack bytes). Spying it (rather than the E4-only
+# `join_trades_to_fixture_with_accounting`, which the runner never calls yet) makes the
+# ordering assertion LOAD-BEARING: neutralize the artifact-content compare and the run
+# falls through to step 3, so the spy WOULD fire.
 def test_artifact_content_mismatch_voids_before_join(monkeypatch):
-    joins = []
-    monkeypatch.setattr(runner_mod, "join_trades_to_fixture_with_accounting",
-                        lambda *a, **k: joins.append("j") or ({}, 0))
+    tape_calls = []
+    monkeypatch.setattr(runner_mod, "build_cp1_maker_tape",
+                        lambda *a, **k: tape_calls.append("t") or _fake_tape())
 
     class _FakeArt:  # exposes .artifact_hash for the build binding
         artifact_hash = "H_PINNED_DIFFERENT"
@@ -72,7 +77,7 @@ def test_artifact_content_mismatch_voids_before_join(monkeypatch):
     with pytest.raises(MakerVoidError):
         runner_mod.run_maker_arena(cfg, expected_config_hash=cfg.config_hash(),
                                    trade_artifact_path=Path("pinned.json"), seal=False)
-    assert joins == []   # VOID originated in the artifact-content branch, before any trade join
+    assert tape_calls == []   # VOID originated in the artifact-content branch, before any trade I/O
 
 
 # --- E2-T2 source-contract tests --------------------------------------------------
