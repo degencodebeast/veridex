@@ -202,6 +202,18 @@ def run_falsification_arena(
 ) -> dict[str, Any]:
     """Run the naive-vs-candidate quote-quality falsification arena (R1).
 
+    WARNING -- SINGLE-MARKET ONLY: this helper operates on ONE market's tape and
+    performs NO per-market grouping. ``ref_at`` is a single flat lookup shared by
+    every row in ``tape``, so it must NEVER be given a multi-fixture / multi-market
+    tape -- doing so would pool fair value across markets, which is exactly the
+    defect the sealed runner's per-``(fixture_id, venue_market_ref)`` grouping
+    (see ``maker.runner.run_maker_arena``) exists to guard against (MM-R1). The
+    production path, :func:`~veridex.maker.runner.run_maker_arena`, does its own
+    per-market grouping (one ``ref_at`` closure per group via ``runner._group_ref_at``)
+    and does NOT call this helper -- it calls :func:`score_r1_markout` directly per
+    group instead. Use ``run_falsification_arena`` only for a single already-isolated
+    market's tape (e.g. tests, single-market experimentation).
+
     Both agents quote the same shared ``tape``; each quote is scored on forward
     markout and reduced to a **toxicity** quality score ``-max(0, -markout_bps)``
     (never mean signed markout — that lets a symmetric naive maker's oversized

@@ -96,7 +96,9 @@ def render_proof_card(result: MakerArenaResult) -> MakerProofCard:
     return MakerProofCard(
         rung=result.rung.value,
         uncalibrated=result.r2_bracket is not None,
-        headline=result.falsification.get("verdict", "INCONCLUSIVE"),
+        headline=result.falsification.get("headline") or result.falsification.get(
+            "verdict", "INCONCLUSIVE"
+        ),
         window_clv_analog=result.window_clv_analog,
         falsification=result.falsification,
         n_fixtures=result.fixture_universe_n,

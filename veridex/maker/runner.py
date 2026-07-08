@@ -25,6 +25,7 @@ module's namespace so a test can monkeypatch ``runner.load_resolved_market_looku
 from __future__ import annotations
 
 import bisect
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -34,6 +35,7 @@ from veridex.maker.config import (
     MakerVoidError,
     verify_pinned,
 )
+from veridex.maker.contracts import MarketMakerAgent, Side
 from veridex.maker.falsification import FalsificationResult, falsify
 from veridex.maker.leaderboard import rank_makers, window_clv_analog
 from veridex.maker.mapping import (
@@ -79,7 +81,9 @@ _CP1_FRAMES_ROOT = _REPO_ROOT / "scripts" / "txline_live" / "cp1" / "frames"
 RESULT_PATH: Path = _REPO_ROOT / "scripts" / "txline_live" / "cp1" / "maker-arena-result.json"
 
 
-def _group_ref_at(ts_list: list[int], fv_list: list[float]):
+def _group_ref_at(
+    ts_list: list[int], fv_list: list[float]
+) -> Callable[[str, Side, int], float | None]:
     """Build a no-look-ahead reference lookup over ONE market's ``(ts, fv)`` series.
 
     The closure is bound to a single ``(fixture_id, venue_market_ref)`` group's own
@@ -92,7 +96,7 @@ def _group_ref_at(ts_list: list[int], fv_list: list[float]):
     when no fv exists at/before ``ts`` (never imputed).
     """
 
-    def ref_at(market_key: str, side: object, ts: int) -> float | None:
+    def ref_at(market_key: str, side: Side, ts: int) -> float | None:
         pos = bisect.bisect_right(ts_list, ts)
         if pos == 0:
             return None
@@ -101,7 +105,12 @@ def _group_ref_at(ts_list: list[int], fv_list: list[float]):
     return ref_at
 
 
-def _score_group(agent: Any, rows: list[dict[str, Any]], ref_at, horizons_s):
+def _score_group(
+    agent: MarketMakerAgent,
+    rows: list[dict[str, Any]],
+    ref_at: Callable[[str, Side, int], float | None],
+    horizons_s: tuple[int, ...],
+) -> tuple[list[QuoteMarkout], QuoteAccounting]:
     """Score one agent over ONE market group's rows against that group's own fv."""
     quote_sets = [
         agent.propose(

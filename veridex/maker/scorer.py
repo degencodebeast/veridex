@@ -40,6 +40,15 @@ class QuoteMarkout(BaseModel):
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
+    # NOTE: fixture_id/tick_seq/market_key are AGENT-SUPPLIED PLACEHOLDERS under the
+    # runner-driven path (see `maker.runner.run_maker_arena`): agents currently hardcode
+    # fixture_id=0, tick_seq=0 and a fixed market_key on every TargetQuoteSet they
+    # propose. The runner groups + scores each quote by the TAPE ROW's real
+    # `(fixture_id, venue_market_ref)` -- NOT by these fields -- and
+    # `runner._group_ref_at`'s returned `ref_at` ignores its `market_key`/`side`
+    # arguments entirely (it already owns one market's fv series via closure). So these
+    # three fields are NOT authoritative provenance for a scored quote and must never be
+    # read as such; they are also never serialized into `MakerArenaResult`.
     fixture_id: int
     tick_seq: int
     side: Side
