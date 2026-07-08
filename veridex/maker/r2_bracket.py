@@ -13,11 +13,22 @@ import hashlib
 import json
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-__all__ = ["FillAssumptionConfig", "render_sensitivity_bracket"]
+__all__ = [
+    "FORBIDDEN_R2_TRIGGERS",
+    "FillAssumptionConfig",
+    "render_sensitivity_bracket",
+]
 
 _BRACKET_LABEL = "UNCALIBRATED / declared model overlay"
+
+# Tape-reactive triggers that peek at data NOT available at quote time. An R2
+# fill rule (or any declared ex-ante field) naming one of these would turn the
+# overlay into a post-hoc fill claim, which R2 must never make (CON-107).
+FORBIDDEN_R2_TRIGGERS = frozenset(
+    {"trade_crossed", "price_touched", "mid_crossed", "fv_moved", "post_hoc_fill"}
+)
 
 
 def _canonical_dump(obj: Any) -> str:
@@ -39,6 +50,13 @@ class FillAssumptionConfig(BaseModel):
     partial_fill_policy: str
     queue_modeled: bool = False
     notes: str = ""
+    # --- E6: pinned ex-ante fill rule (all flow into config_hash) ---
+    fill_probability_rule: str = "static_fill_prob"
+    rule_params: dict[str, float] = Field(default_factory=dict)
+    draw_mode: str = "DETERMINISTIC_EXPECTED"
+    seed: int | None = None
+    n_paths: int | None = None
+    ex_ante_fields: list[str] = Field(default_factory=list)
 
     @field_validator("queue_modeled")
     @classmethod
@@ -50,6 +68,29 @@ class FillAssumptionConfig(BaseModel):
                 "mids-only data, so queue position can never be modeled."
             )
         return value
+
+    @model_validator(mode="after")
+    def _reject_tape_reactive_triggers(self) -> "FillAssumptionConfig":
+        """R2 fill rule is ex-ante only (CON-107, AC-116).
+
+        The fill rule and every declared ``ex_ante_fields`` entry must use only
+        information available AT QUOTE TIME. Naming any tape-reactive trigger
+        turns the overlay into a post-hoc fill claim, which is rejected here.
+        """
+        rule = self.fill_probability_rule
+        if any(trigger in rule for trigger in FORBIDDEN_R2_TRIGGERS):
+            raise ValueError(
+                f"fill_probability_rule {rule!r} names a tape-reactive trigger; "
+                f"R2 fill rules must be ex-ante only. Forbidden: "
+                f"{sorted(FORBIDDEN_R2_TRIGGERS)}."
+            )
+        for field in self.ex_ante_fields:
+            if field in FORBIDDEN_R2_TRIGGERS:
+                raise ValueError(
+                    f"ex_ante_fields entry {field!r} is a tape-reactive trigger; "
+                    f"R2 may only declare fields available at quote time."
+                )
+        return self
 
     def config_hash(self) -> str:
         """Stable content hash of the pinned config."""
