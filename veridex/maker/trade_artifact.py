@@ -111,13 +111,15 @@ def recompute_artifact_hash(rows: list[NormalizedTradeRow]) -> str:
     condition_id, token_id``) AND the chain-event identity (``block_number,
     tx_hash, log_index``) of every row, so any change to either — including a
     differing ``log_index`` on otherwise-identical rows — produces a different
-    digest. Rows are sorted deterministically by
-    ``(block_number, log_index, tx_hash)`` before hashing so file order does not
-    affect the result. The sort key is a TOTAL order matching the row identity
-    ``(tx_hash, log_index)``: ``(block_number, log_index)`` alone is NOT total —
-    two rows with different ``tx_hash`` but equal ``(block_number, log_index)``
-    would tie, and Python's stable sort would then leak input order into the
-    trust-load-bearing digest.
+    digest. Rows are sorted deterministically by each row's FULL canonical
+    serialization before hashing so file order does not affect the result. The
+    sort key is the same per-row canonical JSON string that is hashed, which is a
+    TOTAL order over ANY distinct rows: any partial key (e.g.
+    ``(block_number, log_index, tx_hash)``) can tie two rows that differ only in
+    economics (``price``/``size``) — including two rows sharing an event key —
+    and Python's stable sort would then leak input order into the
+    trust-load-bearing digest. Ties under the full-content key occur only for
+    byte-identical rows, which serialize identically and so are order-independent.
 
     Args:
         rows: The normalized trade rows to hash.
@@ -126,8 +128,8 @@ def recompute_artifact_hash(rows: list[NormalizedTradeRow]) -> str:
         The lowercase hex sha256 digest over the canonical encoding of the
         sorted rows.
     """
-    ordered = sorted(rows, key=lambda r: (r.block_number, r.log_index, r.tx_hash))
-    payload = [_canonical_dump(r.model_dump(mode="json")) for r in ordered]
+    dumps = [_canonical_dump(r.model_dump(mode="json")) for r in rows]
+    payload = sorted(dumps)
     encoded = _canonical_dump(payload).encode()
     return hashlib.sha256(encoded).hexdigest()
 

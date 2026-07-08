@@ -68,6 +68,16 @@ def test_artifact_hash_is_order_independent():
     assert recompute_artifact_hash([r1, r2]) == recompute_artifact_hash([r2, r1])
 
 
+def test_artifact_hash_order_independent_same_event_key():
+    # Two rows sharing the FULL partial sort key (block_number, log_index, tx_hash)
+    # but differing in economics (price/size) tie under that partial key, so a stable
+    # sort leaks input order into the trust-load-bearing digest. The sort MUST key on
+    # each row's full canonical content, which is total over any distinct rows.
+    r1 = _row(tx_hash="0xabc", log_index=3, block_number=100, price=0.4, size=1.0)
+    r2 = _row(tx_hash="0xabc", log_index=3, block_number=100, price=0.7, size=9.0)
+    assert recompute_artifact_hash([r1, r2]) == recompute_artifact_hash([r2, r1])
+
+
 def _artifact(rows, **kw):
     h = recompute_artifact_hash(rows)
     base = dict(
