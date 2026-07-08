@@ -150,9 +150,17 @@ def aggregate_agent_metrics(
     avg_markout_bps = (
         round(sum(m.markout_bps for m in marks) / len(marks)) if marks else None
     )
+    # Adverse-selection toxicity loss: mean of max(0, -markout) over scored marks. A
+    # favorable mark (positive markout) contributes 0; a picked-off mark (negative
+    # markout) contributes its magnitude. Lower is better (0 = never picked off). This is
+    # the SAME axis the falsification bootstrap uses, re-expressed as a per-agent loss.
+    avg_toxicity_loss_bps = (
+        round(sum(max(0, -m.markout_bps) for m in marks) / len(marks)) if marks else None
+    )
     return {
         "agent_id": agent_id,
         "avg_markout_bps": avg_markout_bps,
+        "avg_toxicity_loss_bps": avg_toxicity_loss_bps,
         "quote_count": len(marks),
         "scored": acc.scored,
         "abstained": acc.abstained,

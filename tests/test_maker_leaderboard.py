@@ -2,16 +2,21 @@ import inspect
 from veridex.maker.leaderboard import maker_rank_key, rank_makers
 import veridex.maker.leaderboard as lb
 
-def test_ranks_by_markout_not_clv():
+def test_ranks_by_toxicity_loss_not_mean_markout():
+    # The real-seal scenario: the NAIVE control has a HIGHER mean markout (1060 vs 1050)
+    # -- because two-sided mean markout is dominated by half_spread/ref_now geometry, not
+    # quote quality -- but a WORSE (higher) adverse-selection toxicity loss (80 vs 40).
+    # Ranking must follow toxicity (the falsification axis): lower loss wins rank 1.
     ranked = rank_makers([
-        {"agent_id": "naive-mm", "avg_markout_bps": -20, "abstained": 0, "quote_count": 10},
-        {"agent_id": "txline-fair-mm", "avg_markout_bps": 60, "abstained": 0, "quote_count": 10}])
-    assert ranked[0]["agent_id"] == "txline-fair-mm" and ranked[0]["maker_rank"] == 1
+        {"agent_id": "naive", "avg_markout_bps": 1060, "avg_toxicity_loss_bps": 80, "abstained": 0, "quote_count": 100},
+        {"agent_id": "txline-fair", "avg_markout_bps": 1050, "avg_toxicity_loss_bps": 40, "abstained": 0, "quote_count": 100}])
+    assert ranked[0]["agent_id"] == "txline-fair" and ranked[0]["maker_rank"] == 1
+    assert ranked[1]["agent_id"] == "naive" and ranked[1]["maker_rank"] == 2
 
-def test_none_markout_sorts_last():
+def test_none_toxicity_sorts_last():
     ranked = rank_makers([
-        {"agent_id": "a", "avg_markout_bps": None, "abstained": 5, "quote_count": 5},
-        {"agent_id": "b", "avg_markout_bps": 10, "abstained": 0, "quote_count": 5}])
+        {"agent_id": "a", "avg_toxicity_loss_bps": None, "abstained": 5, "quote_count": 5},
+        {"agent_id": "b", "avg_toxicity_loss_bps": 10, "abstained": 0, "quote_count": 5}])
     assert ranked[0]["agent_id"] == "b"
 
 def test_rank_makers_empty_list_returns_empty():

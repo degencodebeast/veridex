@@ -1,8 +1,9 @@
 """Role-specific MAKER leaderboard (SEC-005 isolation).
 
-This lane ranks market-maker agents on quote **markout**, NOT on directional edge. It is
-structurally isolated from the directional scorer: this module MUST NOT import that scorer or
-blend any directional-edge metric into the maker rank axis. The rank axis here is markout only.
+This lane ranks market-maker agents on adverse-selection **toxicity** (the falsification
+axis), NOT on directional edge. It is structurally isolated from the directional scorer: this
+module MUST NOT import that scorer or blend any directional-edge metric into the maker rank
+axis. ``avg_markout_bps`` is kept only as a labeled diagnostic, never the rank axis.
 """
 
 from __future__ import annotations
@@ -44,9 +45,12 @@ def assert_bracket_not_ranked(agent_metrics: list[dict[str, Any]]) -> None:
 def maker_rank_key(metrics: dict[str, Any]) -> tuple[Any, ...]:
     """Ascending sort key encoding the maker rank order (best maker sorts first).
 
-    Order: avg markout desc (``None`` last) -> abstained asc -> quote_count desc -> agent_id asc
-    (deterministic final tiebreak). Markout is the maker's honesty/quality signal; the directional
-    price-view metric never enters this key.
+    Rank by adverse-selection toxicity (lower loss = better) -- the SAME axis the
+    falsification bootstrap uses. ``avg_markout_bps`` is a DIAGNOSTIC, not the rank axis
+    (raw two-sided mean is dominated by half_spread/ref_now geometry, not quote quality).
+
+    Order: toxicity loss asc (``None`` last) -> abstained asc -> quote_count desc -> agent_id asc
+    (deterministic final tiebreak). The directional price-view metric never enters this key.
 
     Args:
         metrics: One maker's metric-stack dict.
@@ -54,10 +58,10 @@ def maker_rank_key(metrics: dict[str, Any]) -> tuple[Any, ...]:
     Returns:
         A tuple suitable for ``list.sort``/``sorted`` (ascending, best maker first).
     """
-    avg = metrics.get("avg_markout_bps")
-    avg_key = (1, 0.0) if avg is None else (0, -avg)  # primary: avg markout desc, None last
+    loss = metrics.get("avg_toxicity_loss_bps")
+    loss_key = (1, 0.0) if loss is None else (0, loss)  # None last; lower loss first
     return (
-        avg_key,
+        loss_key,
         metrics.get("abstained", 0),  # fewer abstentions first
         -metrics.get("quote_count", 0),  # more quotes first
         metrics.get("agent_id", ""),  # deterministic final tiebreak
