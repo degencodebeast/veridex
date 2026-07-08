@@ -21,8 +21,12 @@ Design invariants (each load-bearing)
   ascending timestamps, but ``veridex.ingest.live_client.stream_marketstates`` yields records in
   ARRIVAL order, not ts order (a reconnect / delayed / duplicate SSE record is out of order). Left
   unsorted, ``bisect`` would select the wrong or a FUTURE FV — silently fabricating or erasing a
-  lead and breaking the central no-look-ahead guarantee. A record whose ts predates the last venue
-  sample for a market is recorded as an explicit ``gap`` (never back-filled into an analysed window).
+  lead and breaking the central no-look-ahead guarantee. A late/out-of-order FV record is instead
+  insorted into the ts-sorted history at its correct position (:func:`_insort_fv`), so it can only
+  ever affect the alignment of a FUTURE poll. The no-back-fill guarantee does NOT rest on any
+  ``gap`` marker (there is no "late FV" gap — the only ``gap`` this module emits is the per-market
+  poll-failure path); it holds because each recorded venue-sample row, once appended, is immutable
+  — a late FV can never rewrite or be back-filled into an already-recorded row.
 * **No look-ahead.** Alignment is ``_aligned_mid`` (most-recent-at-or-before), valid ONLY because
   the FV history is kept ascending per above.
 * **Token hygiene.** Creds are resolved only via :func:`veridex.config.require_txline` (fail-closed
@@ -256,6 +260,8 @@ async def run_monitor(
     now_fn: Callable[[], float] = time.time,
     sleep_fn: Callable[[float], Awaitable[None]] = asyncio.sleep,
     max_polls: int | None = None,
+    every: int | None = None,
+    fv_creds: tuple[str, str] | None = None,
 ) -> AnalysisResult:
     """Stream FV, poll venue mids, align with no look-ahead, record, then analyse on shutdown.
 
@@ -265,6 +271,12 @@ async def run_monitor(
     (most-recent-at-or-before — no look-ahead), and records the row. Shutdown is any of: SIGINT
     (an :class:`asyncio.Event`), the ``minutes`` deadline, or ``max_polls``. ``now_fn`` / ``sleep_fn``
     / ``max_polls`` are injected so tests are deterministic with NO real time and NO network.
+
+    If the FV consumer task dies from an unexpected exception (as opposed to a per-market poll
+    failure, which is already handled as an honest ``gap`` row), it is diagnosed via a SCRUBBED
+    print (never an unscrubbed token — see :func:`_scrub_token`) and the poll loop keeps running:
+    subsequent rows simply degrade to ``fv=None`` (excluded from analysis) rather than silently
+    losing the failure to the shutdown ``contextlib.suppress``.
 
     Args:
         matched: Markets to monitor (from :func:`match_markets`).
@@ -277,6 +289,11 @@ async def run_monitor(
         now_fn: Wall-clock source (injected in tests).
         sleep_fn: Async sleep (injected in tests).
         max_polls: Optional hard cap on poll rounds (deterministic test shutdown).
+        every: Optional poll cadence (in poll rounds) at which an interim cadence + lead-lag readout
+            is printed via :func:`analyze_samples` over the samples recorded so far. ``None``
+            (default) means on-shutdown analysis only.
+        fv_creds: Optional ``(jwt, api_token)`` pair used ONLY to scrub an FV-task diagnostic print
+            if the FV task dies unexpectedly; never logged itself.
 
     Returns:
         The :class:`AnalysisResult` (cadence + lead-lag) over the recorded session.
@@ -297,13 +314,21 @@ async def run_monitor(
         by_fixture[m.fixture_id].append(m)
 
     async def _consume_fv() -> None:
-        async for state in fv_source.stream():
-            for m in by_fixture.get(state.fixture_id, ()):
-                fv = _fv_from_state(state, m.txline_side)
-                if fv is None:
-                    continue
-                ts_list, val_list = fv_hist[(m.fixture_id, m.txline_side)]
-                _insort_fv(ts_list, val_list, int(state.ts), fv)
+        try:
+            async for state in fv_source.stream():
+                for m in by_fixture.get(state.fixture_id, ()):
+                    fv = _fv_from_state(state, m.txline_side)
+                    if fv is None:
+                        continue
+                    ts_list, val_list = fv_hist[(m.fixture_id, m.txline_side)]
+                    _insort_fv(ts_list, val_list, int(state.ts), fv)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 — diagnose then degrade honestly, never crash the monitor
+            print(
+                "  FV consumer task died — rows now degrade to fv=None (excluded from analysis): "
+                f"{_scrub_token(f'{type(exc).__name__}: {exc}', fv_creds)}"
+            )
 
     fv_task = asyncio.create_task(_consume_fv())
     # Give the FV task a scheduling slot before the first alignment read (drains buffered/canned FV).
@@ -360,6 +385,12 @@ async def run_monitor(
                 recorder.record(row)
 
             polls += 1
+            if every is not None and every > 0 and polls % every == 0:
+                interim = analyze_samples(samples)
+                print(
+                    f"[interim @ poll {polls}] pooled cadence median: {interim.pooled_cadence_median} s "
+                    f"(n={len(interim.pooled_cadence_deltas)}) | lead-lag verdict: {interim.probe.verdict}"
+                )
             await sleep_fn(poll_interval_s)
     finally:
         fv_task.cancel()
@@ -662,7 +693,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 async def _run_cli(args: argparse.Namespace) -> AnalysisResult:
     """Operator entrypoint: match markets (live Gamma), run the monitor, write artifacts + reports."""
-    from veridex.config import get_settings
+    from veridex.config import get_settings, require_txline
 
     settings = get_settings()
     fixtures = json.loads(Path(args.fixtures).read_text())
@@ -693,6 +724,8 @@ async def _run_cli(args: argparse.Namespace) -> AnalysisResult:
             recorder=recorder,
             poll_interval_s=args.poll_interval_s,
             minutes=args.minutes,
+            every=args.every,
+            fv_creds=require_txline(settings),  # scrub-only; already validated fail-closed above
         )
     finally:
         recorder.close()

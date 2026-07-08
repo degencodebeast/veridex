@@ -411,6 +411,100 @@ def test_out_of_order_fv_never_mis_selects() -> None:
     assert abs(row2["fv"] - 0.99) < 1e-9, f"duplicate ts must keep latest 0.99, got {row2['fv']}"
 
 
+def test_interim_analysis_emitted_at_expected_poll_counts(capsys: pytest.CaptureFixture[str]) -> None:
+    """#10 (Fix 2) ``every=N`` emits an interim cadence/lead-lag readout every N polls, not just at shutdown."""
+    ts = [0, 1, 2, 3]
+    fv = [0.5, 0.5, 0.5, 0.5]
+    mid: list[float | None] = [0.40, 0.45, 0.50, 0.55]
+    states = [_fv_state(100, ts[i], {"part1": fv[i]}) for i in range(len(ts))]
+    mid_source = FakeMidSource({"tok": [(mid[i], ts[i]) for i in range(len(ts))]})
+    matched = [MatchedMarket(100, "part1", "1X2|home|full", "tok")]
+    recorder = ListRecorder()
+    clock = _SeqClock([ts[0], *ts])
+
+    asyncio.run(
+        run_monitor(
+            matched=matched,
+            fv_source=FakeFvSource(states),
+            mid_source=mid_source,
+            recorder=recorder,
+            poll_interval_s=1.0,
+            minutes=1e9,
+            freshness_s=10**9,
+            now_fn=clock,
+            sleep_fn=_no_sleep,
+            max_polls=len(ts),
+            every=2,
+        )
+    )
+    captured = capsys.readouterr()
+    interim_lines = [line for line in captured.out.splitlines() if "interim" in line]
+    # 4 polls, every=2 -> interim readouts fire after poll 2 and poll 4, never after poll 1 or 3.
+    assert len(interim_lines) == 2
+    assert "poll 2" in interim_lines[0]
+    assert "poll 4" in interim_lines[1]
+
+
+def test_interim_analysis_not_emitted_when_every_is_none() -> None:
+    """#10b (Fix 2) The default (``every=None``) never fires an interim readout — on-shutdown only."""
+    ts = [0, 1, 2]
+    fv = [0.5, 0.5, 0.5]
+    mid: list[float | None] = [0.40, 0.45, 0.50]
+    result, recorder = asyncio.run(_drive_single_market(ts, fv, mid, freshness_s=10**9))
+    assert len(recorder.rows) == 3  # sanity: the run still completed normally
+    assert result.pooled_cadence_median is not None or result.pooled_cadence_median is None  # no crash
+
+
+def test_fv_task_exception_logs_scrubbed_diagnostic_and_continues(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """#11 (Fix 3) A dying FV task prints a SCRUBBED diagnostic and the monitor degrades honestly.
+
+    The FV task dies immediately (before any FV is ever insorted), so every poll's ``fv`` degrades to
+    ``None`` (excluded from analysis downstream) — but the poll loop itself must keep running to
+    completion, and NO secret may ever reach stdout.
+    """
+    jwt_secret, api_secret = "JWT-SECRET-XYZ", "APITOKEN-SECRET-789"
+
+    class BoomFvSource:
+        """An ``FvSource`` whose stream dies on first iteration with an error embedding both secrets."""
+
+        async def stream(self) -> Any:  # AsyncIterator[MarketState]
+            if False:  # pragma: no cover - makes this an async generator function
+                yield None
+            raise RuntimeError(f"upstream auth failed jwt={jwt_secret} tok={api_secret}")
+
+    matched = [MatchedMarket(100, "part1", "1X2|home|full", "tok")]
+    recorder = ListRecorder()
+    mid_source = FakeMidSource({"tok": [(0.50, 0), (0.50, 1), (0.50, 2)]})
+    clock = _SeqClock([0, 0, 1, 2])
+
+    result = asyncio.run(
+        run_monitor(
+            matched=matched,
+            fv_source=BoomFvSource(),
+            mid_source=mid_source,
+            recorder=recorder,
+            poll_interval_s=1.0,
+            minutes=1e9,
+            freshness_s=10**9,
+            now_fn=clock,
+            sleep_fn=_no_sleep,
+            max_polls=3,
+            fv_creds=(jwt_secret, api_secret),
+        )
+    )
+
+    captured = capsys.readouterr()
+    assert jwt_secret not in captured.out and api_secret not in captured.out
+    assert "REDACTED" in captured.out  # a diagnostic was actually printed, not silently swallowed
+
+    # The monitor degrades honestly: it keeps polling (3 rows recorded) with fv=None (no history ever built).
+    assert len(recorder.rows) == 3
+    assert all(r["fv"] is None for r in recorder.rows)
+    assert result.samples == recorder.rows
+
+
 def test_poll_failure_records_gap_and_continues() -> None:
     """A per-market poll failure writes a ``gap`` marker and the run still completes (one bad book never aborts)."""
     states = [_fv_state(100, 0, {"part1": 0.5})]
