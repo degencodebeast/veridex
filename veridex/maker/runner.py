@@ -157,6 +157,18 @@ def run_maker_arena(cfg: MakerRunConfig, *, seal: bool = False) -> MakerArenaRes
             "report this result."
         )
 
+    # 2b. Cross-check the config's fixture universe against the pinned mapping's
+    # fixtures. Even if someone re-pinned the config hash AND the mapping to
+    # mutually inconsistent 18-sets, this VOIDs rather than silently emitting a
+    # result whose `fixtures` disagree with the consumed tape (canonical-universe
+    # self-consistency, Codex M1 watch item).
+    mapping_fixtures = {record.fixture_id for record in records}
+    if set(cfg.fixture_ids) != mapping_fixtures:
+        raise MakerVoidError(
+            "cfg fixture universe disagrees with the pinned mapping's fixtures "
+            f"(cfg has {len(cfg.fixture_ids)}, mapping has {len(mapping_fixtures)})"
+        )
+
     # 3. Consume the REAL cp1 ReplayPack bytes (every pack loaded with verify=True).
     tape = build_cp1_maker_tape(
         records, pack_root=_PACK_ROOT, cp1_frames_root=_CP1_FRAMES_ROOT

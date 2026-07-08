@@ -44,6 +44,26 @@ def test_runner_has_no_network_or_gamma_import():
     for banned in ("httpx", "requests", "gamma", "resolver", "aiohttp"):
         assert banned not in src.lower()
 
+def test_runner_voids_when_cfg_fixtures_disagree_with_mapping(monkeypatch):
+    # cfg passes verify (CP1_18) and the mapping-hash check (monkeypatched to return the matching hash),
+    # but the mapping's records carry a NON-canonical fixture -> the cross-check must VOID.
+    from veridex.maker.mapping import ResolvedMarketRecord
+    cfg = _pinned_cfg()
+    bad_records = [ResolvedMarketRecord(condition_id="0xX", fixture_id=99999999, frame_rows=1,
+        market_ref="1X2|home|full", side="home", source_artifact_content_hash=None,
+        source_frames_file="f", token_id="1", venue="polymarket")]
+    monkeypatch.setattr(runner_mod, "load_resolved_market_lookup",
+                        lambda *a, **k: (bad_records, cfg.mapping_content_hash))
+    monkeypatch.setattr(runner_mod, "build_cp1_maker_tape", lambda *a, **k: _fake_tape())
+    with pytest.raises(MakerVoidError):
+        run_maker_arena(cfg, seal=False)
+
+def test_tape_has_no_network_or_gamma_import():
+    import inspect, veridex.maker.tape as tape_mod
+    src = inspect.getsource(tape_mod)
+    for banned in ("httpx", "requests", "gamma", "resolver", "aiohttp"):
+        assert banned not in src.lower()
+
 def test_sealed_run_consumes_real_cp1_bytes(monkeypatch):
     # REAL path: do NOT patch build_cp1_maker_tape. Spy the pack loader to prove real bytes + verify=True.
     import veridex.maker.tape as tape_mod
