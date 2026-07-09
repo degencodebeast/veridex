@@ -1,5 +1,5 @@
 """E2 — two-dimensional no-look-ahead alignment (recv_ts eligibility → source freshness)."""
-from veridex.live_recorder.alignment import eligible_fv, FvPoint
+from veridex.live_recorder.alignment import eligible_fv, replay_align, FvPoint
 
 
 def hist():
@@ -23,3 +23,11 @@ def test_sub_second_fv_is_ineligible():
          FvPoint(source_ts=108, recv_ts=107600, value=0.7, sequence_no=2)]
     got = eligible_fv(h, decision_recv_ts=107000)
     assert got.source_ts == 100          # the 107_600ms arrival is NOT visible at 107_000ms
+
+
+def test_duplicate_source_ts_correction_preserves_earlier_decision():
+    # FV source_ts=105 first arrives value=0.60 (recv 105000), later a CORRECTION source_ts=105 value=0.70 (recv 130000)
+    hist = [FvPoint(105, 105000, 0.60, 1), FvPoint(105, 130000, 0.70, 2)]
+    decisions = [("d-110", 110000)]   # decided at recv 110000, before the correction arrived
+    aligned = replay_align(decisions, hist)
+    assert aligned["d-110"].value == 0.60   # sees the pre-correction value, NOT the final 0.70

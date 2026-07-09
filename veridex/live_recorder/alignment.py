@@ -18,6 +18,7 @@ for replay because it would let a later correction rewrite an earlier decision.
 """
 from __future__ import annotations
 
+import bisect
 from typing import NamedTuple
 
 
@@ -58,3 +59,48 @@ def eligible_fv(fv_history: list[FvPoint], decision_recv_ts: int) -> FvPoint | N
         if best is None or (point.source_ts, point.sequence_no) > (best.source_ts, best.sequence_no):
             best = point
     return best
+
+
+def _insort_fv(history: list[FvPoint], point: FvPoint) -> None:
+    """Insert ``point`` keeping ``history`` ascending by ``source_ts`` and DEDUPED (latest value wins).
+
+    Mirrors ``scripts/maker/live_monitor.py::_insort_fv``: on a duplicate ``source_ts`` the latest
+    arrival replaces the prior point (a corrected/refreshed snapshot supersedes). This is the LIVE
+    forward-alignment shape — it deliberately DISCARDS superseded arrivals, so it must NOT be used to
+    pre-collapse history before :func:`replay_align` (that would erase the very pre-correction values
+    replay needs — see :func:`replay_align`).
+    """
+    keys = [p.source_ts for p in history]
+    pos = bisect.bisect_left(keys, point.source_ts)
+    if pos < len(history) and history[pos].source_ts == point.source_ts:
+        history[pos] = point  # duplicate source_ts → keep the latest arrival
+    else:
+        history.insert(pos, point)
+
+
+def replay_align(
+    decisions: list[tuple[str, int]], fv_history: list[FvPoint]
+) -> dict[str, FvPoint | None]:
+    """Reconstruct each decision's aligned FV from the state eligible AT THAT decision's ``recv_ts``.
+
+    Correctness contract (the whole point of E2): each decision is aligned against the RAW arrival
+    history under per-decision eligibility — NOT against a final deduped ``source_ts → latest value``
+    map. Collapsing duplicates to their latest value before eligibility would let a LATER correction
+    (which had not yet arrived) rewrite an EARLIER decision, silently re-manufacturing a latency edge.
+
+    Because eligibility (``recv_ts <= decision_recv_ts``) is applied per-decision over the full
+    history, a superseding correction that arrived after a decision is simply ineligible for it, and
+    the decision correctly sees the value that had arrived by its own ``recv_ts``.
+
+    Args:
+        decisions: ``(decision_id, decision_recv_ts)`` pairs; ``recv_ts`` is integer **milliseconds**.
+        fv_history: The RAW FV arrival history (all arrivals, corrections included — NOT pre-deduped).
+
+    Returns:
+        A ``decision_id → aligned FvPoint`` mapping; the value is ``None`` when the decision had no
+        eligible FV (abstain — never imputed).
+    """
+    return {
+        decision_id: eligible_fv(fv_history, decision_recv_ts)
+        for decision_id, decision_recv_ts in decisions
+    }
