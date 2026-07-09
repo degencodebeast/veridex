@@ -190,7 +190,11 @@ async def stream_marketstates(
     if client is None:
         import httpx  # noqa: PLC0415
 
-        _client = httpx.AsyncClient()
+        # SSE is a long-lived idle-tolerant stream: keep a connect/write timeout but
+        # DISABLE the read timeout (read=None), else httpx's default 5s read timeout
+        # fires on any gap >5s between odds ticks (guaranteed pre-match, and common in a
+        # live match's slow phases) → spurious disconnect/reconnect and lost FV data.
+        _client = httpx.AsyncClient(timeout=httpx.Timeout(30.0, read=None))
         _own_client = True
     else:
         _client = client
