@@ -171,6 +171,37 @@ def book_snapshot_from_json(
     )
 
 
+# --------------------------------------------------------------------------- credential fail-closed + secret hygiene
+def require_live_creds(env: Mapping[str, str]) -> tuple[str, str]:
+    """Return ``(jwt, api_token)`` from *env*, or FAIL CLOSED (raise) if either is absent.
+
+    Mirrors ``veridex.config.require_txline``: both credentials are REQUIRED and the guard raises
+    BEFORE any network I/O when one is missing. The secret VALUES are never logged.
+    """
+    missing = [key for key in _REQUIRED_CRED_KEYS if not env.get(key)]
+    if missing:
+        raise ValueError(f"live creds missing: set {' and '.join(_REQUIRED_CRED_KEYS)} (absent: {', '.join(missing)})")
+    return env[_REQUIRED_CRED_KEYS[0]], env[_REQUIRED_CRED_KEYS[1]]
+
+
+def configured(env: Mapping[str, str]) -> bool:
+    """Boolean-only telemetry: whether BOTH required creds are present (NEVER the secret values)."""
+    return all(bool(env.get(key)) for key in _REQUIRED_CRED_KEYS)
+
+
+def _scrub(text: str, *secrets: str) -> str:
+    """Redact each secret VALUE from *text* before it is printed/written.
+
+    Mirrors ``scripts/maker/live_monitor.py::_scrub_token`` / ``capture_and_pin.py::_scrub_token`` —
+    scrubs the raw values (not trusting an exception's provenance), so a credential embedded in an
+    error surfacing from OUTSIDE this module (e.g. a network-SDK URL/header) is still redacted.
+    """
+    for secret in secrets:
+        if secret:
+            text = text.replace(secret, "[REDACTED]")
+    return text
+
+
 # --------------------------------------------------------------------------- FV proof-reference sourcing
 def _fv_from_state(state: MarketState, side: str) -> float | None:
     """Native-prob FV for *side* from a state's 1X2 full-match market, or ``None``.

@@ -77,6 +77,7 @@ def test_sources_are_injectable_no_network() -> None:
     default (network) ``_DefaultBookDepthSource``.
     """
     import veridex.live_recorder.sources as mod
+    from veridex.live_recorder.contracts import BookLevel
     from veridex.live_recorder.sources import (
         BookDepthSource,
         BookSnapshot,
@@ -84,7 +85,6 @@ def test_sources_are_injectable_no_network() -> None:
         FakeFvSource,
         FvSource,
     )
-    from veridex.live_recorder.contracts import BookLevel
 
     # (a) MODULE-scope import audit — no network library imported at import time.
     source = Path(mod.__file__).read_text()
@@ -206,3 +206,45 @@ def test_marketstate_to_fair_value_rejects_missing_fv() -> None:
     state = _fv_state(100, 1710000000, {"part1": 0.62})
     with pytest.raises(Exception):
         marketstate_to_fair_value(state, "part2", "1X2|away|full", recv_ts=1, sequence_no=0)
+
+
+# --------------------------------------------------------------------------- E4-T4
+def test_missing_credential_fails_closed_and_no_secret_in_output(capsys, tmp_path):
+    """E4-T4: absent creds fail CLOSED (raise before I/O); scrubbing keeps the token out of any output."""
+    from veridex.live_recorder.sources import _scrub, configured, require_live_creds
+
+    # Fail closed on absent creds — raises before any I/O.
+    with pytest.raises(Exception):
+        require_live_creds(env={})
+
+    # A partial env still fails closed (both required creds must be present).
+    with pytest.raises(Exception):
+        require_live_creds(env={"JWT": "only-one"})
+
+    # Present creds resolve to the pair (never logged).
+    fake_jwt, fake_token = "FAKE-JWT-abc123", "FAKE-APITOKEN-xyz789"
+    creds = require_live_creds(env={"JWT": fake_jwt, "TXLINE_X_API_TOKEN": fake_token})
+    assert creds == (fake_jwt, fake_token)
+
+    # configured() is a boolean-only telemetry helper — never the secret value.
+    assert configured({"JWT": fake_jwt, "TXLINE_X_API_TOKEN": fake_token}) is True
+    assert configured({}) is False
+    assert configured({"JWT": fake_jwt}) is False
+
+    # _scrub strips the FAKE token value from any error/log text before printing.
+    leaky = f"boom auth failed jwt={fake_jwt} token={fake_token} in url"
+    scrubbed = _scrub(leaky, fake_jwt, fake_token)
+    assert fake_jwt not in scrubbed and fake_token not in scrubbed
+    assert "REDACTED" in scrubbed
+
+    # If any artifact is written, it + captured stdout/stderr must be ABSENT the token value.
+    print(scrubbed)  # exercise the print path
+    artifact = tmp_path / "telemetry.json"
+    import json as _json
+    artifact.write_text(_json.dumps({"configured": configured({"JWT": fake_jwt, "TXLINE_X_API_TOKEN": fake_token})}))
+    captured = capsys.readouterr()
+    blob = artifact.read_text()
+    assert fake_jwt not in blob and fake_token not in blob
+    assert fake_jwt not in captured.out and fake_token not in captured.out
+    assert fake_jwt not in captured.err and fake_token not in captured.err
+    assert "configured" in blob
