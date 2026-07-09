@@ -322,3 +322,39 @@ class VenueTradeEvent(_EventEnvelope):
         if value < 0.0:
             raise ValueError(f"size must be >= 0, got {value!r}")
         return value
+
+
+class NoQuoteIntentEvent(_EventEnvelope):
+    """A decision-time no-quote outcome. ``no_quote_reason`` is a CLOSED set — an
+    out-of-set reason is rejected, and no fabricated action field is stored."""
+
+    decision_id: str
+    no_quote_reason: Literal[
+        "stale",
+        "event_suspension",
+        "boundary",
+        "fee_negative",
+        "liquidity_missing",
+        "risk_cap",
+    ]
+
+
+class RiskGateEvent(_EventEnvelope):
+    """A risk-gate evaluation. ``decision_id`` may be ``None`` for session-level gates
+    that are not tied to a single decision."""
+
+    decision_id: str | None
+    gate: str
+    outcome: Literal["pass", "block"]
+    detail: str
+
+
+class LatencyEvent(_EventEnvelope):
+    """Latency breakdown for one decision. ``fv_recv_ts``/``decision_ts``/``book_obs_ts``
+    are integer milliseconds; ``chain_ms`` carries per-stage chain latencies in ms."""
+
+    decision_id: str
+    fv_recv_ts: int  # integer milliseconds
+    decision_ts: int  # integer milliseconds
+    book_obs_ts: int  # integer milliseconds
+    chain_ms: dict[str, int]

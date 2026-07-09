@@ -11,6 +11,7 @@ import pytest
 from veridex.live_recorder.contracts import (
     ExecutabilityMeasurement,
     FairValueEvent,
+    NoQuoteIntentEvent,
     QuoteIntentEvent,
     RecorderHeartbeatEvent,
     VenueBookSnapshotEvent,
@@ -100,3 +101,15 @@ def test_quote_intent_has_no_post_decision_fields():
     with pytest.raises(Exception): _qi(outbid_within_ms=200)      # post-decision field forbidden on the immutable intent
     with pytest.raises(Exception): _qi(stepped_ahead_count=3)     # post-decision field forbidden
     with pytest.raises(Exception): _qi(fill_price=0.6)            # no fill field
+
+
+def _nq(**kw):
+    base = dict(sequence_no=4, event_type="NoQuoteIntentEvent", source_ts=None, recv_ts=109000,
+                decision_id="d-109", no_quote_reason="stale"); base.update(kw); return NoQuoteIntentEvent(**base)
+
+
+def test_no_quote_reason_is_closed_set():
+    e = _nq(); assert e.no_quote_reason == "stale"
+    with pytest.raises(Exception): _nq(no_quote_reason="because_i_said_so")  # out-of-set reason rejected
+    with pytest.raises(Exception): _nq(action="cancel")                      # no fabricated action field
+    with pytest.raises(Exception): _nq(fill_price=0.6)                       # no fill field
