@@ -23,7 +23,6 @@ import {
   PublicKey,
   SystemProgram,
   Transaction,
-  sendAndConfirmTransaction,
 } from "@solana/web3.js";
 import {
   TOKEN_2022_PROGRAM_ID,
@@ -90,6 +89,31 @@ const idl = JSON.parse(
 async function main() {
   // ── Provider + program ─────────────────────────────────────────────────────
   const connection = new Connection(RPC_URL, "confirmed");
+
+  // Confirm via HTTP polling (getSignatureStatuses) instead of websocket
+  // `signatureSubscribe`, which Alchemy's Solana endpoint does not implement
+  // (returns JSON-RPC -32601 "method not found"). Works on any RPC.
+  async function sendTxPolled(conn: Connection, tx: Transaction, signers: Keypair[]): Promise<string> {
+    const { blockhash } = await conn.getLatestBlockhash("confirmed");
+    tx.recentBlockhash = blockhash;
+    tx.feePayer = signers[0].publicKey;
+    tx.sign(...signers);
+    const sig = await conn.sendRawTransaction(tx.serialize(), {
+      skipPreflight: false,
+      preflightCommitment: "confirmed",
+    });
+    console.log(`[INFO] sent ${sig} — polling for confirmation...`);
+    const deadline = Date.now() + 90_000;
+    while (Date.now() < deadline) {
+      const st = (await conn.getSignatureStatuses([sig], { searchTransactionHistory: true })).value[0];
+      if (st) {
+        if (st.err) throw new Error(`tx ${sig} failed on-chain: ${JSON.stringify(st.err)}`);
+        if (st.confirmationStatus === "confirmed" || st.confirmationStatus === "finalized") return sig;
+      }
+      await new Promise((r) => setTimeout(r, 2000));
+    }
+    throw new Error(`tx ${sig} not confirmed within 90s (HTTP poll)`);
+  }
   const wallet     = new Wallet(walletKeypair);
   const provider   = new AnchorProvider(connection, wallet, {
     commitment: "confirmed",
@@ -97,6 +121,10 @@ async function main() {
   });
   anchor.setProvider(provider);
 
+  // The committed txoracle.idl.json ships the DEVNET address (6pW6..), and modern Anchor
+  // reads the program id from idl.address — so force the mainnet program id here, else the
+  // subscribe tx targets the devnet program on mainnet ("Attempt to load a program that does not exist").
+  idl.address = PROGRAM_ID.toBase58();
   const program = new Program(idl, provider) as any;
 
   // ── CLI: optional --tx-sig=<sig> to skip on-chain step ───────────────────
@@ -110,8 +138,11 @@ async function main() {
   const sol = lamports / 1e9;
   console.log(`[INFO] Wallet: ${walletKeypair.publicKey.toBase58()}`);
   console.log(`[INFO] Balance: ${sol.toFixed(6)} SOL`);
-  if (sol < 0.1) {
-    throw new Error(`Insufficient balance: ${sol} SOL (need > 0.1)`);
+  // Real subscribe cost is ~0.005-0.01 SOL (network fee + Token-2022 ATA rent +
+  // subscription-record rent); 0.02 is a realistic floor (~2x actual) vs the
+  // devnet script's arbitrary 0.1. Free WC subscribe moves zero TxL.
+  if (sol < 0.02) {
+    throw new Error(`Insufficient balance: ${sol} SOL (need > 0.02)`);
   }
 
   // ── Derive PDAs ────────────────────────────────────────────────────────────
@@ -178,14 +209,14 @@ async function main() {
         ASSOCIATED_TOKEN_PROGRAM_ID
       );
       const ataTx = new Transaction().add(createAtaIx);
-      const ataSig = await sendAndConfirmTransaction(connection, ataTx, [walletKeypair]);
+      const ataSig = await sendTxPolled(connection, ataTx, [walletKeypair]);
       console.log(`[INFO] ATA created, sig: ${ataSig}`);
     }
 
     // ── Call subscribe(service_level_id=12, weeks=4) — real-time, WC free tier ──
     console.log("[INFO] Sending subscribe instruction...");
     try {
-      txSig = await program.methods
+      const subTx = await program.methods
         .subscribe(12, 4)
         .accounts({
           user:                   walletKeypair.publicKey,
@@ -198,7 +229,8 @@ async function main() {
           systemProgram:          SystemProgram.programId,
           associatedTokenProgram: ASSOCIATED_TOKEN_PROGRAM_ID,
         })
-        .rpc();
+        .transaction();
+      txSig = await sendTxPolled(connection, subTx, [walletKeypair]);
     } catch (e: any) {
       console.error("[ERROR] subscribe instruction failed:", e.message ?? e);
       if (e.logs && Array.isArray(e.logs)) {
