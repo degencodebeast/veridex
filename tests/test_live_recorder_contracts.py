@@ -9,6 +9,7 @@ post-decision fields may ever be stored on the immutable events.
 import pytest
 
 from veridex.live_recorder.contracts import (
+    DecisionEvent,
     ExecutabilityMeasurement,
     FairValueEvent,
     NoQuoteIntentEvent,
@@ -120,3 +121,21 @@ def test_no_quote_reason_is_closed_set():
     with pytest.raises(Exception): _nq(no_quote_reason="because_i_said_so")  # out-of-set reason rejected
     with pytest.raises(Exception): _nq(action="cancel")                      # no fabricated action field
     with pytest.raises(Exception): _nq(fill_price=0.6)                       # no fill field
+
+
+def _decision(**kw):
+    base = dict(sequence_no=5, event_type="DecisionEvent", source_ts=None, recv_ts=110000,
+                decision_id="d-110", fixture_id=18209181, market_ref="1X2|home|full", side="part1",
+                intent_kind="make", fv_event_id="fv-1", book_snapshot_id="bk-1", reason_code="ok",
+                config_hash="cfg-hash", policy_hash="pol-hash", model_inputs_hash="mi-hash"); base.update(kw)
+    return DecisionEvent(**base)
+
+
+def test_decision_event_requires_null_source_ts():
+    e = _decision(); assert e.source_ts is None  # locally generated: source_ts must be null (REQ-015)
+    with pytest.raises(Exception): _decision(source_ts=100)  # non-null source_ts on a DecisionEvent rejected
+
+
+def test_event_type_must_match_class_name():
+    e = _fv(); assert e.event_type == "FairValueEvent"
+    with pytest.raises(Exception): _fv(event_type="NoQuoteIntentEvent")  # discriminator mismatch rejected

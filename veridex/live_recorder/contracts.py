@@ -61,6 +61,16 @@ class _EventEnvelope(_FrozenModel):
     source_ts: int | None
     recv_ts: int  # integer milliseconds
 
+    @model_validator(mode="after")
+    def _event_type_matches_class_name(self) -> _EventEnvelope:
+        expected = type(self).__name__
+        if self.event_type != expected:
+            raise ValueError(
+                f"event_type must match the concrete class name {expected!r}, "
+                f"got {self.event_type!r}"
+            )
+        return self
+
 
 class RecorderHeartbeatEvent(_EventEnvelope):
     """Periodic liveness beat: what the poll loop saw this cycle."""
@@ -243,6 +253,17 @@ class DecisionEvent(_EventEnvelope):
     config_hash: str
     policy_hash: str
     model_inputs_hash: str
+
+    @field_validator("source_ts")
+    @classmethod
+    def _source_ts_must_be_null(cls, value: int | None) -> int | None:
+        if value is not None:
+            raise ValueError(
+                "DecisionEvent is locally generated and must have source_ts=None "
+                f"(REQ-015); the referenced FV's source_ts is reachable via "
+                f"fv_event_id (got {value!r})"
+            )
+        return value
 
 
 class QuoteIntentEvent(_EventEnvelope):
