@@ -165,3 +165,44 @@ def test_default_book_source_keeps_depth_not_mid() -> None:
     assert empty_snap is not None
     assert empty_snap.bids == ()
     assert len(empty_snap.asks) == 1 and empty_snap.asks[0].price == 0.60
+
+
+# --------------------------------------------------------------------------- E4-T3
+def test_marketstate_to_fair_value_labels_absent_message_id() -> None:
+    """E4-T3: ``MarketState`` → ``FairValueEvent`` with an HONEST (gap-labeled) proof reference.
+
+    A ``MarketState`` carries no ``messageId``, so the event MUST have ``message_id=None`` and
+    ``proof_status="unavailable_no_message_id"`` — never a fabricated status.
+    """
+    from veridex.live_recorder.contracts import FairValueEvent
+    from veridex.live_recorder.sources import marketstate_to_fair_value
+
+    state = _fv_state(100, 1710000000, {"part1": 0.62}, phase=2, suspended=False)
+
+    ev = marketstate_to_fair_value(
+        state,
+        "part1",
+        "1X2|home|full",
+        recv_ts=1710000000_500,
+        sequence_no=7,
+    )
+
+    assert isinstance(ev, FairValueEvent)
+    assert ev.message_id is None
+    assert ev.proof_status == "unavailable_no_message_id"
+    assert ev.proof_ts is None
+    # FV + context carried through honestly.
+    assert abs(ev.fv - 0.62) < 1e-9
+    assert ev.fixture_id == 100 and ev.side == "part1" and ev.market_ref == "1X2|home|full"
+    assert ev.phase == 2 and ev.suspended is False
+    assert ev.source_ts == 1710000000 and ev.recv_ts == 1710000000_500
+    assert ev.sequence_no == 7 and ev.event_type == "FairValueEvent"
+
+
+def test_marketstate_to_fair_value_rejects_missing_fv() -> None:
+    """E4-T3: a state with no FV for the side cannot fabricate an event — it raises (never invents a price)."""
+    from veridex.live_recorder.sources import marketstate_to_fair_value
+
+    state = _fv_state(100, 1710000000, {"part1": 0.62})
+    with pytest.raises(Exception):
+        marketstate_to_fair_value(state, "part2", "1X2|away|full", recv_ts=1, sequence_no=0)

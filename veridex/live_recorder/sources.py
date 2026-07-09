@@ -171,6 +171,98 @@ def book_snapshot_from_json(
     )
 
 
+# --------------------------------------------------------------------------- FV proof-reference sourcing
+def _fv_from_state(state: MarketState, side: str) -> float | None:
+    """Native-prob FV for *side* from a state's 1X2 full-match market, or ``None``.
+
+    Mirrors ``scripts/maker/live_monitor.py::_fv_from_state`` (``stable_prob_bps[side] / 1e4``).
+    """
+    market = state.markets.get(_TXLINE_1X2_FULL_MARKET_KEY)
+    if not market:
+        return None
+    stable_prob_bps = market.get("stable_prob_bps")
+    if not stable_prob_bps:
+        return None
+    bps = stable_prob_bps.get(side)
+    if bps is None:
+        return None
+    return float(bps) / _PROB_BPS_SCALE
+
+
+def _suspended_from_state(state: MarketState) -> bool:
+    """Whether the 1X2 full-match market is suspended (defaults to ``False`` when unstated)."""
+    market = state.markets.get(_TXLINE_1X2_FULL_MARKET_KEY) or {}
+    return bool(market.get("suspended", False))
+
+
+def marketstate_to_fair_value(
+    state: MarketState,
+    side: str,
+    market_ref: str,
+    *,
+    recv_ts: int,
+    sequence_no: int,
+    event_type: str = "FairValueEvent",
+) -> FairValueEvent:
+    """Map a streamed :class:`MarketState` to a :class:`FairValueEvent` with an HONEST proof reference.
+
+    ``MarketState`` carries NO ``messageId`` (see ``veridex.ingest.marketstate.MarketState``), so
+    the event is stamped ``message_id=None`` + ``proof_status="unavailable_no_message_id"`` — a proof
+    status is NEVER fabricated. ``source_ts`` is the state's integer-seconds venue clock; ``recv_ts``
+    is the recorder's integer-ms arrival clock.
+
+    Raises ``ValueError`` if *side* has no FV in the state (a price is never invented).
+    """
+    fv = _fv_from_state(state, side)
+    if fv is None:
+        raise ValueError(f"no fair value for side {side!r} in state (fixture {state.fixture_id}); FV is never fabricated")
+    return FairValueEvent(
+        sequence_no=sequence_no,
+        event_type=event_type,
+        source_ts=int(state.ts),
+        recv_ts=int(recv_ts),
+        fixture_id=int(state.fixture_id),
+        market_ref=market_ref,
+        side=side,
+        fv=fv,
+        phase=int(state.phase),
+        suspended=_suspended_from_state(state),
+        message_id=None,
+        proof_ts=None,
+        proof_status="unavailable_no_message_id",
+    )
+
+
+async def resolve_proofs_batch(
+    pairs: Iterable[tuple[str, int]],
+    *,
+    validate: Callable[..., Awaitable[dict[str, Any]]] | None = None,
+    base_url: str | None = None,
+    creds: tuple[str, str] | None = None,
+    client: Any = None,
+) -> dict[tuple[str, int], str]:
+    """OPTIONAL, REPORT-ONLY out-of-band proof resolver over collected ``(message_id, ts)`` pairs.
+
+    Reuses ``veridex.ingest.txline_client.validate_odds`` + ``veridex.ingest.odds_proof.classify_proof``
+    (both lazy-imported, so this module carries no import-time HTTP coupling) to classify each pair.
+    This is a SIDE report only — it MUST NOT be bound into any event ``content_hash`` (SEC-005), and it
+    runs only when the caller supplies pairs. ``validate`` is injectable so the report is testable offline.
+    """
+    from veridex.ingest.odds_proof import ERROR, classify_proof
+
+    if validate is None:
+        from veridex.ingest.txline_client import validate_odds as validate  # noqa: PLW2901 — lazy default
+
+    report: dict[tuple[str, int], str] = {}
+    for message_id, ts in pairs:
+        try:
+            resp = await validate(message_id, ts, base_url=base_url, creds=creds, client=client)
+            report[(message_id, ts)] = classify_proof(resp)
+        except Exception:  # noqa: BLE001 — report-only: an error is honest "unknown", never voids anything
+            report[(message_id, ts)] = ERROR
+    return report
+
+
 class _DefaultBookDepthSource:
     """Public Polymarket ``/book`` DEPTH source — lazy-``httpx`` GET (offline-safe to import).
 
