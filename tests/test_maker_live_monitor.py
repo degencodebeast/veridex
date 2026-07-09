@@ -464,7 +464,7 @@ def test_interim_analysis_emitted_at_expected_poll_counts(capsys: pytest.Capture
         )
     )
     captured = capsys.readouterr()
-    interim_lines = [line for line in captured.out.splitlines() if "interim" in line]
+    interim_lines = [line for line in captured.out.splitlines() if "interim @ poll" in line]
     # 4 polls, every=2 -> interim readouts fire after poll 2 and poll 4, never after poll 1 or 3.
     assert len(interim_lines) == 2
     assert "poll 2" in interim_lines[0]

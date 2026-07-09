@@ -334,6 +334,14 @@ async def run_monitor(
     # Give the FV task a scheduling slot before the first alignment read (drains buffered/canned FV).
     await asyncio.sleep(0)
 
+    print(
+        f"[monitor] {len(matched)} market(s) | poll {poll_interval_s:g}s | session {minutes:g}min"
+        f" | interim every {every if every else '-'} polls"
+    )
+    for m in matched:
+        print(f"  · fixture {m.fixture_id}  {m.venue_market_ref}  (txline {m.txline_side})")
+    print("[monitor] streaming FV + polling venue book; pre-match feeds may be quiet (NO DATA until odds move).")
+
     samples: list[dict[str, Any]] = []
     session_start = now_fn()
     deadline = session_start + minutes * 60.0
@@ -346,6 +354,8 @@ async def run_monitor(
             if now >= deadline:
                 break
             tick_ts = int(now)
+            mids_ok = 0
+            fv_ok = 0
 
             results = await asyncio.gather(
                 *(mid_source.fetch_mid(m.token_id) for m in matched),
@@ -354,6 +364,8 @@ async def run_monitor(
             for m, res in zip(matched, results, strict=True):
                 ts_list, val_list = fv_hist[(m.fixture_id, m.txline_side)]
                 fv, fv_staleness_s = _aligned_mid(ts_list, val_list, tick_ts, freshness_s)
+                if fv is not None:
+                    fv_ok += 1
                 if isinstance(res, BaseException):
                     # One bad book never aborts the round: record an honest gap and continue.
                     row = {
@@ -370,6 +382,8 @@ async def run_monitor(
                     }
                 else:
                     mid, book_ts = res
+                    if mid is not None:
+                        mids_ok += 1
                     row = {
                         "ts": tick_ts,
                         "fixture_id": m.fixture_id,
@@ -385,6 +399,11 @@ async def run_monitor(
                 recorder.record(row)
 
             polls += 1
+            fv_points = sum(len(tl) for tl, _ in fv_hist.values())
+            print(
+                f"[poll {polls}] venue mids: {mids_ok}/{len(matched)} | fv-aligned: {fv_ok}/{len(matched)}"
+                f" | fv points recv: {fv_points}"
+            )
             if every is not None and every > 0 and polls % every == 0:
                 interim = analyze_samples(samples)
                 print(
