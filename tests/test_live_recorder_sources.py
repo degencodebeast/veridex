@@ -44,6 +44,31 @@ async def _drain(agen: Any) -> list[Any]:
     return [item async for item in agen]
 
 
+class _FakeResponse:
+    """A canned httpx-like response: ``raise_for_status`` is a no-op, ``json`` returns the book."""
+
+    def __init__(self, payload: dict[str, Any]) -> None:
+        self._payload = payload
+
+    def raise_for_status(self) -> None:
+        return None
+
+    def json(self) -> dict[str, Any]:
+        return self._payload
+
+
+class _FakeHttpClient:
+    """An injected httpx-like client: records the GET and returns a canned ``/book`` response. No network."""
+
+    def __init__(self, payload: dict[str, Any]) -> None:
+        self._payload = payload
+        self.calls: list[tuple[str, dict[str, Any]]] = []
+
+    async def get(self, url: str, params: dict[str, Any] | None = None) -> _FakeResponse:
+        self.calls.append((url, dict(params or {})))
+        return _FakeResponse(self._payload)
+
+
 # --------------------------------------------------------------------------- E4-T1
 def test_sources_are_injectable_no_network() -> None:
     """E4-T1: fakes satisfy the source Protocols and NO live client / network lib is built.
@@ -106,3 +131,37 @@ def test_sources_are_injectable_no_network() -> None:
         mod._DefaultBookDepthSource = orig  # type: ignore[assignment]
     assert len(states) == 1 and states[0].ts == 100
     assert snap is not None and len(snap.bids) == 1 and len(snap.asks) == 1
+
+
+# --------------------------------------------------------------------------- E4-T2
+def test_default_book_source_keeps_depth_not_mid() -> None:
+    """E4-T2: the default ``/book`` adapter preserves full depth (levels, not a mid); empty side never imputed."""
+    from veridex.live_recorder.sources import _DefaultBookDepthSource
+
+    book = {
+        "bids": [{"price": "0.40", "size": "5"}, {"price": "0.39", "size": "7"}, {"price": "0.38", "size": "9"}],
+        "asks": [{"price": "0.60", "size": "4"}, {"price": "0.61", "size": "6"}],
+        "timestamp": "1710000000",
+    }
+    client = _FakeHttpClient(book)
+    source = _DefaultBookDepthSource(client=client, tick_size=0.01, min_price_increment=0.01)
+
+    snap = asyncio.run(source.fetch_book("tok-home"))
+
+    # Hit the PUBLIC book endpoint with only the token_id (no wallet/credential).
+    assert client.calls == [("/book", {"token_id": "tok-home"})]
+    # DEPTH, not mid: all levels preserved, not collapsed to a single number.
+    assert snap is not None
+    assert len(snap.bids) == 3 and len(snap.asks) == 2
+    assert [lvl.price for lvl in snap.bids] == [0.40, 0.39, 0.38]
+    assert [lvl.size for lvl in snap.asks] == [4.0, 6.0]
+    assert snap.book_ts == 1710000000
+    assert snap.token_id == "tok-home" and snap.is_snapshot is True
+
+    # An empty bids side → empty tuple; snapshot STILL returned; the other side is intact (never imputed).
+    empty_book = {"bids": [], "asks": [{"price": "0.60", "size": "4"}], "timestamp": "1710000001"}
+    empty_source = _DefaultBookDepthSource(client=_FakeHttpClient(empty_book))
+    empty_snap = asyncio.run(empty_source.fetch_book("tok-home"))
+    assert empty_snap is not None
+    assert empty_snap.bids == ()
+    assert len(empty_snap.asks) == 1 and empty_snap.asks[0].price == 0.60

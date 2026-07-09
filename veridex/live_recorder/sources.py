@@ -131,8 +131,88 @@ class FakeVenueTradeSource:
             yield trade
 
 
-class _DefaultBookDepthSource:
-    """Placeholder for the default public-``/book`` DEPTH adapter (implemented in E4-T2)."""
+def _levels_from_side(side: Any) -> tuple[BookLevel, ...]:
+    """Parse one book side (``[{"price":..,"size":..}, ...]``) into ordered ``BookLevel``s.
 
-    def __init__(self, *a: Any, **k: Any) -> None:
-        raise NotImplementedError("E4-T2")
+    An empty/missing side yields an empty tuple — a level is NEVER fabricated (illiquid side is honest).
+    """
+    return tuple(
+        BookLevel(price=float(level["price"]), size=float(level["size"]))
+        for level in (side or [])
+    )
+
+
+def book_snapshot_from_json(
+    book: Mapping[str, Any],
+    *,
+    token_id: str,
+    venue_market_ref: str,
+    tick_size: float,
+    min_price_increment: float,
+    is_snapshot: bool = True,
+) -> BookSnapshot:
+    """Map a public ``/book`` JSON payload to a full-depth :class:`BookSnapshot` (levels, never a mid).
+
+    ``book['bids']`` / ``book['asks']`` are lists of ``{'price','size'}`` level dicts and the
+    top-level timestamp is ``book['timestamp']`` (int-parsed) — mirrors
+    ``scripts/maker/live_monitor.py::_mid_from_book`` but KEEPS the depth instead of collapsing.
+    """
+    raw_ts = book.get("timestamp")
+    book_ts = int(raw_ts) if raw_ts is not None and raw_ts != "" else 0
+    return BookSnapshot(
+        token_id=token_id,
+        venue_market_ref=venue_market_ref,
+        book_ts=book_ts,
+        tick_size=tick_size,
+        min_price_increment=min_price_increment,
+        bids=_levels_from_side(book.get("bids")),
+        asks=_levels_from_side(book.get("asks")),
+        is_snapshot=is_snapshot,
+    )
+
+
+class _DefaultBookDepthSource:
+    """Public Polymarket ``/book`` DEPTH source — lazy-``httpx`` GET (offline-safe to import).
+
+    Mirrors ``scripts/maker/live_monitor.py::_DefaultMidSource``'s lazy-httpx pattern (hits the
+    PUBLIC book endpoint — no wallet, no credential) but KEEPS the full ``bids``/``asks`` depth
+    instead of collapsing to a mid. An empty side stays an empty tuple (never imputed). The
+    ``client`` seam is INJECTABLE so tests drive it with a fake and touch no network.
+    """
+
+    def __init__(
+        self,
+        *,
+        clob_url: str = _CLOB_URL,
+        timeout_s: float = 10.0,
+        tick_size: float = 0.01,
+        min_price_increment: float = 0.01,
+        venue_market_ref: str | None = None,
+        client: Any = None,
+    ) -> None:
+        self._clob_url = clob_url
+        self._timeout_s = timeout_s
+        self._tick_size = tick_size
+        self._min_price_increment = min_price_increment
+        self._venue_market_ref = venue_market_ref
+        self._client = client
+
+    async def fetch_book(self, token_id: str) -> BookSnapshot | None:
+        if self._client is not None:
+            response = await self._client.get("/book", params={"token_id": token_id})
+            response.raise_for_status()
+            book = response.json()
+        else:
+            import httpx
+
+            async with httpx.AsyncClient(base_url=self._clob_url, timeout=self._timeout_s) as http:
+                response = await http.get("/book", params={"token_id": token_id})
+                response.raise_for_status()
+                book = response.json()
+        return book_snapshot_from_json(
+            book,
+            token_id=token_id,
+            venue_market_ref=self._venue_market_ref or token_id,
+            tick_size=self._tick_size,
+            min_price_increment=self._min_price_increment,
+        )
