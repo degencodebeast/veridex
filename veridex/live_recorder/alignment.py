@@ -61,6 +61,30 @@ def eligible_fv(fv_history: list[FvPoint], decision_recv_ts: int) -> FvPoint | N
     return best
 
 
+def assert_append_order(history: list[FvPoint]) -> None:
+    """Assert ``sequence_no`` is a true append order: greater ``sequence_no`` never arrives earlier.
+
+    ``sequence_no`` is the monotonic arrival order and is the freshness tie-break on equal
+    ``source_ts`` (:func:`eligible_fv`). For that tie-break to mean "latest arrival wins", a later
+    ``sequence_no`` MUST carry a non-decreasing ``recv_ts``. This validates that invariant so a
+    malformed history cannot silently corrupt no-look-ahead alignment.
+
+    Args:
+        history: FV points to validate; checked in ``sequence_no`` order.
+
+    Raises:
+        ValueError: if a point with a greater ``sequence_no`` has a strictly earlier ``recv_ts``.
+    """
+    prev: FvPoint | None = None
+    for point in sorted(history, key=lambda p: p.sequence_no):
+        if prev is not None and point.recv_ts < prev.recv_ts:
+            raise ValueError(
+                f"append-order violation: sequence_no {point.sequence_no} has recv_ts "
+                f"{point.recv_ts} < sequence_no {prev.sequence_no} recv_ts {prev.recv_ts}"
+            )
+        prev = point
+
+
 def _insort_fv(history: list[FvPoint], point: FvPoint) -> None:
     """Insert ``point`` keeping ``history`` ascending by ``source_ts`` and DEDUPED (latest value wins).
 
