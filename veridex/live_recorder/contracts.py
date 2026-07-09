@@ -219,6 +219,61 @@ class FillAssumptionConfig(_FrozenModel):
         return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
+class DecisionEvent(_EventEnvelope):
+    """ONE logged decision line: the full decision-time context for an intent.
+
+    ``source_ts`` is ``None`` for a decision (it is recorder-internal, not sourced from a
+    venue clock); ``recv_ts`` is the decision-time recorder clock in integer ms.
+    """
+
+    source_ts: int | None = None
+    decision_id: str
+    fixture_id: int
+    market_ref: str
+    side: str
+    intent_kind: Literal["make", "take", "no_quote"]
+    fv_event_id: str
+    book_snapshot_id: str
+    reason_code: str
+    config_hash: str
+    policy_hash: str
+    model_inputs_hash: str
+
+
+class QuoteIntentEvent(_EventEnvelope):
+    """A decision-time quote intent. DECISION-TIME FIELDS ONLY: post-decision outcomes
+    (e.g. ``outbid_within_ms``, ``stepped_ahead_count``) are derived later and are NEVER
+    stored on this immutable intent — ``extra="forbid"`` rejects them at construction."""
+
+    decision_id: str
+    native_price: float
+    desired_size: float
+    side: str
+    ladder_rung: int
+    quote_intent_type: Literal["join", "improve_one_tick"]
+    queue_ahead_size: float | None
+
+    @field_validator("native_price")
+    @classmethod
+    def _native_price_in_unit_interval(cls, value: float) -> float:
+        return _reject_price_out_of_unit_interval(value)
+
+
+class TakeIntentEvent(_EventEnvelope):
+    """A decision-time take intent, carrying its COUNTERFACTUAL executability measurement."""
+
+    decision_id: str
+    native_price: float
+    desired_size: float
+    side: str
+    executability: ExecutabilityMeasurement
+
+    @field_validator("native_price")
+    @classmethod
+    def _native_price_in_unit_interval(cls, value: float) -> float:
+        return _reject_price_out_of_unit_interval(value)
+
+
 class VenueBookSnapshotEvent(_EventEnvelope):
     """Full-depth venue book snapshot — stores ``(price, size)`` levels, never a mid.
 

@@ -11,6 +11,7 @@ import pytest
 from veridex.live_recorder.contracts import (
     ExecutabilityMeasurement,
     FairValueEvent,
+    QuoteIntentEvent,
     RecorderHeartbeatEvent,
     VenueBookSnapshotEvent,
 )
@@ -86,3 +87,16 @@ def test_executability_label_is_counterfactual_only_and_no_fill():
     with pytest.raises(Exception): _ex(label="FILLED")                 # only COUNTERFACTUAL allowed
     with pytest.raises(Exception): _ex(fill_price=0.6)                 # no fill field
     with pytest.raises(Exception): _ex(real_executable_edge_bps=12)   # no executable edge
+
+
+def _qi(**kw):
+    base = dict(sequence_no=2, event_type="QuoteIntentEvent", source_ts=None, recv_ts=107000,
+                decision_id="d-107", native_price=0.60, desired_size=5.0, side="part1",
+                ladder_rung=0, quote_intent_type="join", queue_ahead_size=8.0); base.update(kw); return QuoteIntentEvent(**base)
+
+
+def test_quote_intent_has_no_post_decision_fields():
+    e = _qi(); assert e.queue_ahead_size == 8.0
+    with pytest.raises(Exception): _qi(outbid_within_ms=200)      # post-decision field forbidden on the immutable intent
+    with pytest.raises(Exception): _qi(stepped_ahead_count=3)     # post-decision field forbidden
+    with pytest.raises(Exception): _qi(fill_price=0.6)            # no fill field
