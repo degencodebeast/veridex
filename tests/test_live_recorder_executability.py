@@ -23,7 +23,9 @@ from veridex.live_recorder.contracts import (
 )
 from veridex.live_recorder.executability import (
     QueueJumpDecision,
+    bind_fee_config,
     derive_queue_jump,
+    fee_stress_grid,
     measure_take,
     queue_ahead_at,
 )
@@ -115,3 +117,44 @@ def test_queue_ahead_at_is_decision_time_size_never_imputed():
     assert queue_ahead_at(snap, side="part1", native_price=0.60) == 12.0
     # An empty book side is honest None (never imputed to 0).
     assert queue_ahead_at(_snap(bids=()), side="part1", native_price=0.60) is None
+
+
+# --------------------------------------------------------------------------- E5-T3
+def test_executability_binds_pinned_fee_config_no_queue_fill_prob():
+    cfg = FillAssumptionConfig(
+        taker_fee_bps=10, fee_stress_multiplier=1, spread_assumption=0.0, slippage_assumption=0.0
+    )
+    pinned_hash = cfg.config_hash()  # pinned BEFORE measurement
+    snap = _snap()
+
+    # Measurement asserts the passed config's hash equals the pinned hash before running.
+    ex = measure_take(
+        snapshot=snap, candidate_price=0.61, desired_size=5.0, fee_config=cfg,
+        pinned_config_hash=pinned_hash,
+    )
+    assert ex.label == "COUNTERFACTUAL"
+
+    # A config whose hash was NOT pinned is rejected (no post-hoc edits).
+    tampered = FillAssumptionConfig(
+        taker_fee_bps=10, fee_stress_multiplier=2, spread_assumption=0.0, slippage_assumption=0.0
+    )
+    with pytest.raises(Exception):
+        measure_take(
+            snapshot=snap, candidate_price=0.61, desired_size=5.0, fee_config=tampered,
+            pinned_config_hash=pinned_hash,
+        )
+    with pytest.raises(Exception):
+        bind_fee_config(tampered, pinned_hash)
+
+    # No queue-fill probability / queue simulation ANYWHERE in the measurement output.
+    for banned in ("fill_probability", "queue_fill", "queue_simulation", "fill_price", "filled_size"):
+        assert not hasattr(ex, banned)
+    dumped = ex.model_dump()
+    for banned in ("fill_probability", "queue_fill", "queue_simulation", "fill_price", "filled_size"):
+        assert banned not in dumped
+
+    # Rose 4x hashes DIFFERENTLY from the 1x config (the stress variant is fee_stress_multiplier=4).
+    grid = fee_stress_grid(taker_fee_bps=10)
+    hashes = {c.fee_stress_multiplier: c.config_hash() for c in grid}
+    assert 1.0 in hashes and 4.0 in hashes            # taker-fee-always + Rose 4x both pinned
+    assert hashes[1.0] != hashes[4.0]                 # distinct fee-stress dimensions
