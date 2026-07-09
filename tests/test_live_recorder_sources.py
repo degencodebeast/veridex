@@ -141,7 +141,7 @@ def test_default_book_source_keeps_depth_not_mid() -> None:
     book = {
         "bids": [{"price": "0.40", "size": "5"}, {"price": "0.39", "size": "7"}, {"price": "0.38", "size": "9"}],
         "asks": [{"price": "0.60", "size": "4"}, {"price": "0.61", "size": "6"}],
-        "timestamp": "1710000000",
+        "timestamp": "1710000000000",  # venue-native MILLISECONDS (client.py:529)
     }
     client = _FakeHttpClient(book)
     source = _DefaultBookDepthSource(client=client, tick_size=0.01, min_price_increment=0.01)
@@ -155,7 +155,7 @@ def test_default_book_source_keeps_depth_not_mid() -> None:
     assert len(snap.bids) == 3 and len(snap.asks) == 2
     assert [lvl.price for lvl in snap.bids] == [0.40, 0.39, 0.38]
     assert [lvl.size for lvl in snap.asks] == [4.0, 6.0]
-    assert snap.book_ts == 1710000000
+    assert snap.book_ts == 1710000000000
     assert snap.token_id == "tok-home" and snap.is_snapshot is True
 
     # An empty bids side → empty tuple; snapshot STILL returned; the other side is intact (never imputed).
@@ -165,6 +165,22 @@ def test_default_book_source_keeps_depth_not_mid() -> None:
     assert empty_snap is not None
     assert empty_snap.bids == ()
     assert len(empty_snap.asks) == 1 and empty_snap.asks[0].price == 0.60
+
+
+def test_book_snapshot_from_json_sorts_sides() -> None:
+    """Unsorted ``/book`` JSON is normalised: asks ascending, bids descending by price."""
+    from veridex.live_recorder.sources import book_snapshot_from_json
+
+    book = {
+        "bids": [{"price": "0.38", "size": "9"}, {"price": "0.40", "size": "5"}, {"price": "0.39", "size": "7"}],
+        "asks": [{"price": "0.62", "size": "4"}, {"price": "0.60", "size": "6"}, {"price": "0.61", "size": "2"}],
+        "timestamp": "1710000000000",
+    }
+    snap = book_snapshot_from_json(
+        book, token_id="tok", venue_market_ref="m", tick_size=0.01, min_price_increment=0.01
+    )
+    assert [lvl.price for lvl in snap.asks] == [0.60, 0.61, 0.62]  # ascending
+    assert [lvl.price for lvl in snap.bids] == [0.40, 0.39, 0.38]  # descending
 
 
 # --------------------------------------------------------------------------- E4-T3

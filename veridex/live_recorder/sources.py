@@ -156,17 +156,25 @@ def book_snapshot_from_json(
     ``book['bids']`` / ``book['asks']`` are lists of ``{'price','size'}`` level dicts and the
     top-level timestamp is ``book['timestamp']`` (int-parsed) — mirrors
     ``scripts/maker/live_monitor.py::_mid_from_book`` but KEEPS the depth instead of collapsing.
+    ``book_ts`` is venue-native MILLISECONDS (the ``/book`` timestamp is documented as ms in
+    ``veridex/venues/_vendor/polymarket_clob/client.py:529``).
+
+    Sides are normalised to CANONICAL ordering — ``asks`` ASCENDING and ``bids`` DESCENDING by
+    price (mirrors how the vendored ``LOB`` keeps sorted arrays) — so a downstream depth walk
+    can never under-count on a non-monotonic raw ``/book`` order.
     """
     raw_ts = book.get("timestamp")
     book_ts = int(raw_ts) if raw_ts is not None and raw_ts != "" else 0
+    asks = tuple(sorted(_levels_from_side(book.get("asks")), key=lambda level: level.price))
+    bids = tuple(sorted(_levels_from_side(book.get("bids")), key=lambda level: level.price, reverse=True))
     return BookSnapshot(
         token_id=token_id,
         venue_market_ref=venue_market_ref,
         book_ts=book_ts,
         tick_size=tick_size,
         min_price_increment=min_price_increment,
-        bids=_levels_from_side(book.get("bids")),
-        asks=_levels_from_side(book.get("asks")),
+        bids=bids,
+        asks=asks,
         is_snapshot=is_snapshot,
     )
 

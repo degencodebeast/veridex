@@ -29,6 +29,8 @@ or ``veridex.maker`` and touches no network.
 
 from __future__ import annotations
 
+from typing import Protocol, runtime_checkable
+
 from pydantic import BaseModel, ConfigDict
 
 from veridex.live_recorder.contracts import (
@@ -59,16 +61,37 @@ def measure_take(
     *,
     stale_window_s: int = 0,
     pinned_config_hash: str | None = None,
-) -> ExecutabilityMeasurement:
+) -> ExecutabilityMeasurement | None:
     """Walk observed ask depth into a COUNTERFACTUAL :class:`ExecutabilityMeasurement`.
 
     A take/buy walks the asks (mirrors ``LOB.get_cumulative_size(dir=1, price)``): every ask
     level with ``price <= candidate_price`` is resting size we could observably clear against.
-    We compute ``available_size_at_price`` (resting size at exactly ``candidate_price``),
-    ``cumulative_size_to_clear`` (cumulative resting size up to ``candidate_price``),
-    ``spread``/``half_spread``, a fee-stressed ``cost_clearing_threshold``, and ``clears``
-    (whether ``desired_size`` is observably clearable). ``label`` is ALWAYS
-    ``"COUNTERFACTUAL"`` — this is an OBSERVATION of the book, never an own fill.
+    The walk is ORDER-INDEPENDENT (it sums over all such levels, never relying on ascending
+    order) so an unsorted book side can never silently under-count. We compute
+    ``available_size_at_price`` (resting size at exactly ``candidate_price``),
+    ``cumulative_size_to_clear`` (resting size consumed to clear ``desired_size``, i.e. the
+    clearable total capped at ``desired_size`` — this is why §9 reports 5.0 with 8.0 resting),
+    ``spread``/``half_spread``, the ``cost_clearing_threshold``, and ``clears`` (whether
+    ``desired_size`` is observably clearable). ``label`` is ALWAYS ``"COUNTERFACTUAL"`` —
+    this is an OBSERVATION of the book, never an own fill.
+
+    ``cost_clearing_threshold`` is the REPORTED cost-adjusted price a downstream make-vs-take
+    EV compares against (NOT what ``clears`` keys off — ``clears`` is pure size-sufficiency).
+    Per spec §9 it is a DOWNWARD adjustment off the candidate price::
+
+        taker_fee_absolute      = candidate_price * (taker_fee_bps * fee_stress_multiplier) / 10_000
+        cost_clearing_threshold = candidate_price - half_spread - slippage_assumption - taker_fee_absolute
+
+    where ``slippage_assumption`` is LIVE from the pinned :class:`FillAssumptionConfig` and
+    ``half_spread`` is book-derived (``(best_ask - best_bid)/2``). ``spread_assumption`` is a
+    declared FLOOR on the half-spread: the effective half-spread used in the threshold is
+    ``max(book_half_spread, spread_assumption/2)`` when the book is two-sided, and falls back
+    to ``spread_assumption/2`` when a side is missing — so ``spread_assumption`` is never dead.
+    (§9 has a two-sided book and ``spread_assumption=0.0`` → the book half-spread wins.)
+
+    A take against an EMPTY ask side EXCLUDES the market from executability (returns ``None``,
+    "not defaulted to zero" per spec §4.3 / §9), rather than reporting a misleading
+    ``clears=False`` on zero observed depth.
 
     When ``pinned_config_hash`` is given the passed ``fee_config`` is bound to it BEFORE
     measurement (see :func:`bind_fee_config`) so the fee assumptions cannot be edited after
@@ -77,28 +100,37 @@ def measure_take(
     if pinned_config_hash is not None:
         bind_fee_config(fee_config, pinned_config_hash)
 
-    # Depth walk over the asks (mirror of LOB.get_cumulative_size, dir=1): accumulate resting
-    # size at every ask level priced at or inside the candidate price.
-    cumulative_size_to_clear = 0.0
-    available_size_at_price = 0.0
-    for level in snapshot.asks:
-        if level.price > candidate_price:
-            break
-        cumulative_size_to_clear += level.size
-        if level.price == candidate_price:
-            available_size_at_price += level.size
+    # Empty relevant side (asks for a take) → EXCLUDE the market (abstain), never clears=False
+    # on zero depth. The honest snapshot is still recorded by the source; executability abstains.
+    if not snapshot.asks:
+        return None
+
+    # Depth walk over the asks (mirror of LOB.get_cumulative_size, dir=1): sum resting size at
+    # EVERY ask level priced at or inside the candidate price — order-independent (no `break`),
+    # so an unsorted/descending ask side can never under-count.
+    total_clearable = sum(level.size for level in snapshot.asks if level.price <= candidate_price)
+    available_size_at_price = sum(
+        level.size for level in snapshot.asks if level.price == candidate_price
+    )
+    # Size CONSUMED to clear the desired size (capped at desired; §9 reports 5.0 with 8.0 resting).
+    cumulative_size_to_clear = min(total_clearable, desired_size)
+    clears = total_clearable >= desired_size
 
     best_bid = _best_price(snapshot.bids, side="bid")
     best_ask = _best_price(snapshot.asks, side="ask")
-    spread = (best_ask - best_bid) if (best_bid is not None and best_ask is not None) else 0.0
+    two_sided = best_bid is not None and best_ask is not None
+    spread = (best_ask - best_bid) if two_sided else 0.0
     half_spread = spread / 2.0
+    # spread_assumption is a declared FLOOR on the half-spread (fallback when a side is missing).
+    assumed_half_spread = fee_config.spread_assumption / 2.0
+    effective_half_spread = max(half_spread, assumed_half_spread) if two_sided else assumed_half_spread
 
-    # Fee-stressed clearing cost: the counterfactual take pays the (stressed) taker fee on top
-    # of the candidate price. With taker_fee_bps=0 this is exactly the candidate price.
-    fee_fraction = fee_config.taker_fee_bps * fee_config.fee_stress_multiplier / _BPS
-    cost_clearing_threshold = candidate_price * (1.0 + fee_fraction)
-
-    clears = desired_size <= cumulative_size_to_clear
+    # Cost-clearing threshold (spec §9): a DOWNWARD cost adjustment off the candidate price.
+    # taker fee is applied on the candidate price; slippage_assumption is LIVE from the config.
+    taker_fee_absolute = candidate_price * (fee_config.taker_fee_bps * fee_config.fee_stress_multiplier) / _BPS
+    cost_clearing_threshold = (
+        candidate_price - effective_half_spread - fee_config.slippage_assumption - taker_fee_absolute
+    )
 
     return ExecutabilityMeasurement(
         candidate_price=candidate_price,
@@ -213,38 +245,59 @@ def _stepped_ahead(levels: tuple[BookLevel, ...], side: str, native_price: float
     return any(level.price > native_price for level in levels)
 
 
+@runtime_checkable
+class _BookEventLike(Protocol):
+    """A RECORDED book event carrying the recorder's own clock — e.g. ``VenueBookSnapshotEvent``.
+
+    Queue-jump derivation keys off ``recv_ts`` (the recorder's integer-ms arrival clock, the
+    SAME clock as the decision), never the venue-native ``book_ts`` — comparing the two would
+    mix clocks/units and silently void the derivation on real data.
+    """
+
+    recv_ts: int
+    bids: tuple[BookLevel, ...]
+    asks: tuple[BookLevel, ...]
+
+
 def derive_queue_jump(
     decision: QueueJumpDecision,
-    subsequent_book_events: list[BookSnapshot],
+    subsequent_book_events: list[_BookEventLike],
 ) -> QueueJumpDerivation:
     """DERIVE the post-decision queue-jump outcome — a SEPARATE object, never a stored field.
 
-    Walks the post-decision book stream (``subsequent_book_events``, book snapshots observed
-    AFTER ``decision.recv_ts``) and, keyed by ``decision.decision_id``, computes:
+    Walks the post-decision RECORDED book-event stream (``subsequent_book_events`` — each a
+    :class:`~veridex.live_recorder.contracts.VenueBookSnapshotEvent`, or any struct exposing
+    ``recv_ts``/``bids``/``asks``) and, keyed by ``decision.decision_id``, computes:
 
     * ``stepped_ahead_count`` — how many post-decision books showed someone resting strictly
       ahead of our ``native_price`` on our side;
-    * ``outbid_within_ms`` — the ms from ``decision.recv_ts`` to the FIRST such book's
-      ``book_ts`` (``None`` if nobody ever stepped ahead).
+    * ``outbid_within_ms`` — the ms from ``decision.recv_ts`` to the FIRST such event's
+      ``recv_ts`` (``None`` if nobody ever stepped ahead).
+
+    The ms delta keys off each event's **``recv_ts``** (the recorder's local integer-ms clock,
+    the SAME clock as ``decision.recv_ts``) — NOT the venue-native ``book_ts``. Mixing the venue
+    clock with the recorder clock (or seconds with ms) would silently void the derivation on
+    real data; ``book_ts`` may still be recorded on the event for provenance but never drives
+    the delta.
 
     This NEVER mutates ``decision`` or any ``QuoteIntentEvent`` — the result is a fresh
     :class:`QueueJumpDerivation`. No queue-fill probability / simulation is produced.
     """
     stepped_ahead_count = 0
     outbid_within_ms: int | None = None
-    for book in subsequent_book_events:
-        if book.book_ts < decision.recv_ts:
+    for event in subsequent_book_events:
+        if event.recv_ts < decision.recv_ts:
             continue
-        side_levels = book.asks if decision.side.strip().lower() in {
+        side_levels = event.asks if decision.side.strip().lower() in {
             "ask",
             "asks",
             "sell",
             "offer",
-        } else book.bids
+        } else event.bids
         if _stepped_ahead(side_levels, decision.side, decision.native_price):
             stepped_ahead_count += 1
             if outbid_within_ms is None:
-                outbid_within_ms = int(book.book_ts - decision.recv_ts)
+                outbid_within_ms = int(event.recv_ts - decision.recv_ts)
     return QueueJumpDerivation(
         decision_id=decision.decision_id,
         outbid_within_ms=outbid_within_ms,
