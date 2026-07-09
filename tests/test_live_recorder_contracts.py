@@ -11,6 +11,7 @@ import pytest
 from veridex.live_recorder.contracts import (
     FairValueEvent,
     RecorderHeartbeatEvent,
+    VenueBookSnapshotEvent,
 )
 
 
@@ -53,3 +54,21 @@ def test_fair_value_missing_message_id_is_unavailable_lowercase():
     with pytest.raises(Exception): _fv(proof_status="PROVEN")                       # uppercase rejected
     with pytest.raises(Exception): _fv(message_id=None, proof_status="proven")      # no msg_id but claims proven → reject
     with pytest.raises(Exception): _fv(fv=1.4)                                       # decimal/out-of-range rejected
+
+
+def _snap(**kw):
+    base = dict(sequence_no=3, event_type="VenueBookSnapshotEvent", source_ts=None, recv_ts=200000,
+                token_id="tok-1", venue_market_ref="poly|home|full", book_ts=200000,
+                tick_size=0.01, min_price_increment=0.01,
+                bids=({"price": 0.60, "size": 8.0},), asks=({"price": 0.62, "size": 5.0},),
+                is_snapshot=True); base.update(kw); return VenueBookSnapshotEvent(**base)
+
+
+def test_book_snapshot_stores_price_size_levels_not_mid():
+    e = _snap()
+    assert e.bids[0].price == 0.60 and e.bids[0].size == 8.0          # (price,size) levels, not a mid
+    assert e.asks[0].price == 0.62 and e.asks[0].size == 5.0
+    empty = _snap(bids=())
+    assert empty.bids == ()                                            # empty side allowed, NOT imputed
+    with pytest.raises(Exception): _snap(mid=0.61)                    # mid-only summary rejected (extra=forbid)
+    with pytest.raises(Exception): _snap(bids=({"price": 1.4, "size": 8.0},))  # price out of [0,1] rejected

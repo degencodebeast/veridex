@@ -130,3 +130,92 @@ class FairValueEvent(_EventEnvelope):
                 f"a proof status may never be fabricated (got {self.proof_status!r})"
             )
         return self
+
+
+class BookLevel(_FrozenModel):
+    """One depth level: native ``[0,1]`` price and a non-negative size."""
+
+    price: float
+    size: float
+
+    @field_validator("price")
+    @classmethod
+    def _price_in_unit_interval(cls, value: float) -> float:
+        return _reject_price_out_of_unit_interval(value)
+
+    @field_validator("size")
+    @classmethod
+    def _size_non_negative(cls, value: float) -> float:
+        if value < 0.0:
+            raise ValueError(f"size must be >= 0, got {value!r}")
+        return value
+
+
+class BookChange(_FrozenModel):
+    """One incremental book change: level price/size plus the side it applies to."""
+
+    price: float
+    size: float
+    side: str
+
+    @field_validator("price")
+    @classmethod
+    def _price_in_unit_interval(cls, value: float) -> float:
+        return _reject_price_out_of_unit_interval(value)
+
+    @field_validator("size")
+    @classmethod
+    def _size_non_negative(cls, value: float) -> float:
+        if value < 0.0:
+            raise ValueError(f"size must be >= 0, got {value!r}")
+        return value
+
+
+class VenueBookSnapshotEvent(_EventEnvelope):
+    """Full-depth venue book snapshot — stores ``(price, size)`` levels, never a mid.
+
+    An empty side is a legitimate empty tuple and is NEVER imputed. Spread is computed
+    on read, never stored.
+    """
+
+    token_id: str
+    venue_market_ref: str
+    book_ts: int  # integer milliseconds
+    tick_size: float
+    min_price_increment: float
+    bids: tuple[BookLevel, ...]
+    asks: tuple[BookLevel, ...]
+    is_snapshot: bool
+
+
+class VenueBookDeltaEvent(_EventEnvelope):
+    """Incremental venue book update as an ordered tuple of level changes."""
+
+    token_id: str
+    book_ts: int  # integer milliseconds
+    changes: tuple[BookChange, ...]
+
+
+class VenueTradeEvent(_EventEnvelope):
+    """An observed venue trade print (with optional on-chain provenance)."""
+
+    token_id: str
+    trade_ts: int  # integer milliseconds
+    price: float
+    size: float
+    aggressor_side: str
+    block_number: int | None
+    tx_hash: str | None
+    log_index: int | None
+
+    @field_validator("price")
+    @classmethod
+    def _price_in_unit_interval(cls, value: float) -> float:
+        return _reject_price_out_of_unit_interval(value)
+
+    @field_validator("size")
+    @classmethod
+    def _size_non_negative(cls, value: float) -> float:
+        if value < 0.0:
+            raise ValueError(f"size must be >= 0, got {value!r}")
+        return value
