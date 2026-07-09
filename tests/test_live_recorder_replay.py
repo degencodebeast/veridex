@@ -11,7 +11,12 @@ from veridex.live_recorder.contracts import (
     LiveRecorderSessionMeta,
     RecorderGapEvent,
 )
-from veridex.live_recorder.replay import iter_change_series, read_session
+from veridex.live_recorder.recorder import LiveRecorder, session_content_hash
+from veridex.live_recorder.replay import (
+    iter_change_series,
+    read_session,
+    replay_reproduces,
+)
 from veridex.runtime.evidence import serialize_payload
 
 
@@ -93,3 +98,23 @@ def test_replay_drops_truncated_final_line_and_excludes_gap_crossing(tmp_path):
     )
     with pytest.raises(ValueError):
         read_session(session2)
+
+
+def test_replay_byte_determinism_and_duplicate_sequence_raises(tmp_path):
+    session = tmp_path / "s1"
+    rec = LiveRecorder(session, _start_meta())
+    rec.record(_fv_dict(sequence_no=0, recv_ts=100, fv=0.60))
+    rec.record(_fv_dict(sequence_no=0, recv_ts=200, fv=0.61))
+    rec.record(_fv_dict(sequence_no=0, recv_ts=300, fv=0.62))
+    meta = rec.finalize(ended_ts=1_700_000_900)
+    rec.close()
+
+    # replay from the sealed bytes reproduces the same ordered stream + same content_hash
+    assert meta.content_hash is not None
+    assert replay_reproduces(session) is True
+
+    # inject a duplicate sequence_no → the content-hash computation RAISES
+    _, events, _ = read_session(session)
+    events_with_dup_sequence_no = events + [dict(events[-1])]
+    with pytest.raises(ValueError):
+        session_content_hash(events_with_dup_sequence_no)

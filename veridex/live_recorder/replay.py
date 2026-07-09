@@ -11,6 +11,9 @@ from the analysis event stream.
 consecutive change whose interval crosses a recorded gap — a change spanning a gap is not a
 real continuous move and must not enter the analysis series.
 
+:func:`replay_reproduces` recomputes the sealed content hash from the on-disk bytes and
+asserts identity to the recorded ``content_hash`` — byte-determinism.
+
 NO network, NO LLM import; imports nothing from ``veridex.scoring`` or ``veridex.maker``.
 """
 
@@ -21,9 +24,13 @@ from pathlib import Path
 from typing import Any, Iterator
 
 from veridex.live_recorder.contracts import LiveRecorderSessionMeta
-from veridex.live_recorder.recorder import META_FILENAME, RECORDS_FILENAME
+from veridex.live_recorder.recorder import (
+    META_FILENAME,
+    RECORDS_FILENAME,
+    session_content_hash,
+)
 
-__all__ = ["read_session", "iter_change_series"]
+__all__ = ["read_session", "iter_change_series", "replay_reproduces", "session_content_hash"]
 
 
 def read_session(
@@ -94,3 +101,14 @@ def iter_change_series(
             if _crosses_gap(prev["recv_ts"], curr["recv_ts"], gaps):
                 continue
             yield key, prev, curr
+
+
+def replay_reproduces(session_dir: str | Path) -> bool:
+    """True iff the content hash recomputed from the sealed bytes matches the recorded one.
+
+    Reads the session back, recomputes :func:`session_content_hash` over the on-disk event
+    stream (which includes any nested executability labels), and compares to the sealed
+    ``meta.content_hash``. Proves the replay is byte-deterministic.
+    """
+    meta, events, _gaps = read_session(session_dir)
+    return meta.content_hash is not None and meta.content_hash == session_content_hash(events)
