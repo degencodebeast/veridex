@@ -42,8 +42,10 @@ def eligible_fv(fv_history: list[FvPoint], decision_recv_ts: int) -> FvPoint | N
     """The aligned FV for a decision under two-dimensional no-look-ahead rules, or ``None`` to abstain.
 
     Args:
-        fv_history: FV points kept ascending by ``source_ts`` and deduped (latest value wins on a
-            duplicate ``source_ts``). See :func:`_insort_fv`.
+        fv_history: FV points to scan. No ordering or dedup is assumed — eligibility is a full
+            linear scan, so RAW arrival history (corrections included) is the correct input for
+            replay. Do NOT pre-dedupe by ``source_ts`` (that would erase pre-correction values
+            needed by :func:`replay_align`).
         decision_recv_ts: The decision's arrival time (integer **milliseconds**).
 
     Returns:

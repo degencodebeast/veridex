@@ -59,6 +59,13 @@ def test_fair_value_missing_message_id_is_unavailable_lowercase():
     with pytest.raises(Exception): _fv(fv=1.4)                                       # decimal/out-of-range rejected
 
 
+def test_proof_status_unavailable_requires_absent_message_id():
+    import pytest
+    # message_id present but status claims "unavailable_no_message_id" → self-contradictory, reject
+    with pytest.raises(Exception):
+        _fv(message_id="m-1", proof_status="unavailable_no_message_id")
+
+
 def _snap(**kw):
     base = dict(sequence_no=3, event_type="VenueBookSnapshotEvent", source_ts=None, recv_ts=200000,
                 token_id="tok-1", venue_market_ref="poly|home|full", book_ts=200000,

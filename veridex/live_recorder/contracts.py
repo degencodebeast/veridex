@@ -131,6 +131,11 @@ class FairValueEvent(_EventEnvelope):
                 "proof_status must be 'unavailable_no_message_id' when message_id is None; "
                 f"a proof status may never be fabricated (got {self.proof_status!r})"
             )
+        if self.message_id is not None and self.proof_status == "unavailable_no_message_id":
+            raise ValueError(
+                "proof_status 'unavailable_no_message_id' is invalid when message_id is present "
+                f"(got message_id={self.message_id!r})"
+            )
         return self
 
 
