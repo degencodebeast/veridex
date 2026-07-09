@@ -16,3 +16,10 @@ def test_recv_ts_eligibility_then_source_freshness():
     d112 = eligible_fv(h, decision_recv_ts=112000)     # all three received → freshest source
     assert d112.source_ts == 110                        # NOT 105 (late arrival, older source)
     assert eligible_fv(h, decision_recv_ts=99000) is None   # nothing received yet → abstain
+
+
+def test_sub_second_fv_is_ineligible():
+    h = [FvPoint(source_ts=100, recv_ts=100000, value=0.6, sequence_no=1),
+         FvPoint(source_ts=108, recv_ts=107600, value=0.7, sequence_no=2)]
+    got = eligible_fv(h, decision_recv_ts=107000)
+    assert got.source_ts == 100          # the 107_600ms arrival is NOT visible at 107_000ms
