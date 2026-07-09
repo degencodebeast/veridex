@@ -19,8 +19,14 @@ import pytest
 from veridex.live_recorder.contracts import (
     BookLevel,
     FillAssumptionConfig,
+    QuoteIntentEvent,
 )
-from veridex.live_recorder.executability import measure_take
+from veridex.live_recorder.executability import (
+    QueueJumpDecision,
+    derive_queue_jump,
+    measure_take,
+    queue_ahead_at,
+)
 from veridex.live_recorder.sources import BookSnapshot
 
 
@@ -59,3 +65,53 @@ def test_measure_take_is_counterfactual_never_fill():
     assert not hasattr(ex, "fill_price") and not hasattr(ex, "filled_size")
     # 3 @0.60 + 5 @0.61 available -> clearing 5 is observable; this is an OBSERVATION, not a fill
     assert ex.clears is True
+
+
+# --------------------------------------------------------------------------- E5-T2
+def test_queue_jump_is_derived_not_stored():
+    # The decision-time intent stores only decision-time fields (e.g. queue_ahead_size).
+    qi = QuoteIntentEvent(
+        sequence_no=2, event_type="QuoteIntentEvent", source_ts=None, recv_ts=107000,
+        decision_id="d-107", native_price=0.60, desired_size=5.0, side="part1",
+        ladder_rung=0, quote_intent_type="join", queue_ahead_size=8.0,
+    )
+    assert qi.queue_ahead_size == 8.0
+    # The immutable intent has NO post-decision queue-jump field: constructing one raises.
+    with pytest.raises(Exception):
+        QuoteIntentEvent(
+            sequence_no=2, event_type="QuoteIntentEvent", source_ts=None, recv_ts=107000,
+            decision_id="d-107", native_price=0.60, desired_size=5.0, side="part1",
+            ladder_rung=0, quote_intent_type="join", queue_ahead_size=8.0, outbid_within_ms=200,
+        )
+
+    # Post-decision book stream: someone steps ahead of our 0.60 bid (to 0.61) 200ms later.
+    decision = QueueJumpDecision(decision_id="d-107", side="part1", native_price=0.60, recv_ts=107000)
+    subsequent = [
+        BookSnapshot(  # +100ms: nobody ahead yet (best bid still 0.59)
+            token_id="t", venue_market_ref="m", book_ts=107100, tick_size=0.01, min_price_increment=0.01,
+            bids=(BookLevel(price=0.59, size=10.0),), asks=(BookLevel(price=0.62, size=4.0),), is_snapshot=True,
+        ),
+        BookSnapshot(  # +200ms: a 0.61 bid steps AHEAD of our 0.60
+            token_id="t", venue_market_ref="m", book_ts=107200, tick_size=0.01, min_price_increment=0.01,
+            bids=(BookLevel(price=0.61, size=6.0), BookLevel(price=0.59, size=10.0)), asks=(BookLevel(price=0.62, size=4.0),), is_snapshot=True,
+        ),
+        BookSnapshot(  # +300ms: still ahead
+            token_id="t", venue_market_ref="m", book_ts=107300, tick_size=0.01, min_price_increment=0.01,
+            bids=(BookLevel(price=0.61, size=7.0),), asks=(BookLevel(price=0.62, size=4.0),), is_snapshot=True,
+        ),
+    ]
+    d = derive_queue_jump(decision=decision, subsequent_book_events=subsequent)
+    assert d.outbid_within_ms == 200            # derived on the SEPARATE analysis object
+    assert d.stepped_ahead_count == 2           # two post-decision books showed someone ahead
+    assert d.decision_id == "d-107"             # keyed back to the decision, never edits it
+    # The derivation is a SEPARATE object, not a field on the intent.
+    assert not hasattr(qi, "outbid_within_ms")
+    assert not hasattr(qi, "stepped_ahead_count")
+
+
+def test_queue_ahead_at_is_decision_time_size_never_imputed():
+    snap = _snap(bids=(BookLevel(price=0.61, size=4.0), BookLevel(price=0.60, size=8.0), BookLevel(price=0.59, size=2.0)))
+    # Resting bid size at prices at least as good as ours (>= 0.60): 4 @0.61 + 8 @0.60 = 12.
+    assert queue_ahead_at(snap, side="part1", native_price=0.60) == 12.0
+    # An empty book side is honest None (never imputed to 0).
+    assert queue_ahead_at(_snap(bids=()), side="part1", native_price=0.60) is None
