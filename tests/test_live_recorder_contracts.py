@@ -9,6 +9,7 @@ post-decision fields may ever be stored on the immutable events.
 import pytest
 
 from veridex.live_recorder.contracts import (
+    ExecutabilityMeasurement,
     FairValueEvent,
     RecorderHeartbeatEvent,
     VenueBookSnapshotEvent,
@@ -72,3 +73,16 @@ def test_book_snapshot_stores_price_size_levels_not_mid():
     assert empty.bids == ()                                            # empty side allowed, NOT imputed
     with pytest.raises(Exception): _snap(mid=0.61)                    # mid-only summary rejected (extra=forbid)
     with pytest.raises(Exception): _snap(bids=({"price": 1.4, "size": 8.0},))  # price out of [0,1] rejected
+
+
+def _ex(**kw):
+    base = dict(candidate_price=0.60, available_size_at_price=8.0, cumulative_size_to_clear=5.0,
+                spread=0.02, half_spread=0.01, cost_clearing_threshold=0.585, taker_fee_bps=0,
+                fee_stress_multiplier=4, stale_window_s=120, clears=True, label="COUNTERFACTUAL"); base.update(kw); return ExecutabilityMeasurement(**base)
+
+
+def test_executability_label_is_counterfactual_only_and_no_fill():
+    e = _ex(); assert e.label == "COUNTERFACTUAL"
+    with pytest.raises(Exception): _ex(label="FILLED")                 # only COUNTERFACTUAL allowed
+    with pytest.raises(Exception): _ex(fill_price=0.6)                 # no fill field
+    with pytest.raises(Exception): _ex(real_executable_edge_bps=12)   # no executable edge

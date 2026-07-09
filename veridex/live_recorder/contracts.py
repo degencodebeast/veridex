@@ -17,6 +17,8 @@ This module imports nothing from ``veridex.chain.merkle``, ``veridex.scoring``,
 
 from __future__ import annotations
 
+import hashlib
+import json
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, field_validator, model_validator
@@ -169,6 +171,52 @@ class BookChange(_FrozenModel):
         if value < 0.0:
             raise ValueError(f"size must be >= 0, got {value!r}")
         return value
+
+
+class ExecutabilityMeasurement(_FrozenModel):
+    """A COUNTERFACTUAL clearing measurement — what it WOULD cost to clear, never a fill.
+
+    ``label`` is pinned to the literal ``"COUNTERFACTUAL"``: this is an honesty guard so
+    the measurement can never be mistaken for a realized fill. There are deliberately NO
+    ``fill_price``/``filled_size``/``realized_pnl``/``real_executable_edge_bps`` fields;
+    ``extra="forbid"`` rejects any such leaked field at construction.
+    """
+
+    candidate_price: float
+    available_size_at_price: float
+    cumulative_size_to_clear: float
+    spread: float
+    half_spread: float
+    cost_clearing_threshold: float
+    taker_fee_bps: float
+    fee_stress_multiplier: float
+    stale_window_s: int
+    clears: bool
+    label: Literal["COUNTERFACTUAL"]
+
+    @field_validator("candidate_price")
+    @classmethod
+    def _candidate_price_in_unit_interval(cls, value: float) -> float:
+        return _reject_price_out_of_unit_interval(value)
+
+
+class FillAssumptionConfig(_FrozenModel):
+    """Pinned counterfactual fill-cost assumptions. The Rose 4x stress variant is simply
+    ``FillAssumptionConfig(fee_stress_multiplier=4, ...)``."""
+
+    taker_fee_bps: float
+    fee_stress_multiplier: float
+    spread_assumption: float
+    slippage_assumption: float
+
+    def config_hash(self) -> str:
+        """sha256 hexdigest of the canonical JSON dump (stable, sorted keys)."""
+        canonical = json.dumps(
+            self.model_dump(),
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
 class VenueBookSnapshotEvent(_EventEnvelope):
