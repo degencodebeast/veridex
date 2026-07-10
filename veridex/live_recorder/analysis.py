@@ -107,9 +107,12 @@ class AnalysisResult:
     """Full session analysis: cadence, lead-lag, and queue-jump — all observation-only.
 
     ``replay_reproduced`` is the byte-determinism check
-    (:func:`~veridex.live_recorder.replay.replay_reproduces`); ``r4_prereqs_met`` is an
-    honest, closed-form "prerequisites met" boolean (sealed + replay-reproduced + at least
-    one gap-safe FV change observed) — it is never a fill/edge/rank claim.
+    (:func:`~veridex.live_recorder.replay.replay_reproduces`); ``r3_replay_prereq_met`` is
+    an honest, closed-form boolean for the R3-LOCAL replay/cadence prerequisite — R4 gate 1
+    of 4 ONLY (sealed + replay-reproduced + at least one gap-safe FV change observed). It is
+    NEVER a fill/edge/rank claim, and it is NEVER an R4-readiness claim: R4 go/no-go requires
+    three further, independent gates NOT evaluated here (live FV lead confirmed; make-vs-take
+    EV positive under Rose 4× fee stress; guarded-live safety wiring).
     """
 
     session_meta: LiveRecorderSessionMeta
@@ -120,7 +123,7 @@ class AnalysisResult:
     leadlag: ProbeResult
     queue_jump: tuple[QueueJumpObservation, ...]
     replay_reproduced: bool
-    r4_prereqs_met: bool
+    r3_replay_prereq_met: bool
 
 
 def _fv_segments_by_market(
@@ -306,7 +309,10 @@ def analyze_session(path: str | Path) -> AnalysisResult:
     queue_jump = _queue_jump_observations(events, book_events)
 
     replay_reproduced = replay_reproduces(path)
-    r4_prereqs_met = (
+    # R3-LOCAL replay/cadence prerequisite — R4 gate 1 of 4 ONLY. This asserts nothing about
+    # the other three R4 gates (live FV lead confirmed / make-vs-take EV positive under Rose
+    # 4× fee stress / guarded-live safety wiring), which R3 does not and must not evaluate.
+    r3_replay_prereq_met = (
         replay_reproduced
         and meta.ended_ts is not None
         and bool(meta.fixture_ids)
@@ -322,7 +328,7 @@ def analyze_session(path: str | Path) -> AnalysisResult:
         leadlag=leadlag,
         queue_jump=queue_jump,
         replay_reproduced=replay_reproduced,
-        r4_prereqs_met=r4_prereqs_met,
+        r3_replay_prereq_met=r3_replay_prereq_met,
     )
 
 
@@ -335,7 +341,10 @@ def render_session_report(result: AnalysisResult) -> str:
 
     Every executability-adjacent reference is labeled ``COUNTERFACTUAL``; the only claims
     made are observed-size-at-price-at-T, gap-excluded cadence, no-look-ahead
-    replay-reproduced evidence, and R4-prerequisite met/not-met status. When the lead-lag
+    replay-reproduced evidence, and the R3-LOCAL replay/cadence prerequisite (R4 gate 1 of 4)
+    met/not-met status. The report NEVER claims "R4 prerequisites met": R4 go/no-go needs
+    three further gates (live FV lead confirmed / make-vs-take EV positive under Rose 4× fee
+    stress / guarded-live safety wiring) that are NOT evaluated here. When the lead-lag
     probe's own verdict is NOT an actual lead, the full narrative from
     :func:`~scripts.maker.leadlag_probe.render_markdown` (whose callout text is fixed to
     describe a confirmed lead) is deliberately NOT embedded — this section instead states
@@ -347,15 +356,23 @@ def render_session_report(result: AnalysisResult) -> str:
     lines.append(
         "This report is built from a sealed, no-look-ahead-replay-reproduced session. It "
         "makes ONLY the following claims: observed-size-at-price-at-T (COUNTERFACTUAL), "
-        "gap-excluded cadence, no-look-ahead replay-reproduced evidence, and "
-        "R4-prerequisite met/not-met status."
+        "gap-excluded cadence, no-look-ahead replay-reproduced evidence, and the R3-local "
+        "replay/cadence prerequisite (R4 gate 1 of 4) met/not-met status. It does NOT claim "
+        "R4 readiness."
     )
     lines.append("")
     lines.append(f"- session_ts: `{result.session_meta.session_ts}`")
     lines.append(f"- fixture_ids: `{result.fixture_ids}`")
     lines.append(f"- events recorded: {result.n_events}  gaps: {result.n_gaps}")
     lines.append(f"- no-look-ahead replay-reproduced: {result.replay_reproduced}")
-    lines.append(f"- R4 prerequisites met: {result.r4_prereqs_met}")
+    r3_gate_status = "met" if result.r3_replay_prereq_met else "not met"
+    lines.append(
+        f"- R3 replay/cadence prerequisite (R4 gate 1 of 4): {r3_gate_status}"
+    )
+    lines.append(
+        "- R4 gates 2-4 (live FV-lead confirmed / make-vs-take EV positive under Rose 4x / "
+        "guarded-live safety wiring): NOT evaluated -- declared-gated, not run."
+    )
     lines.append("")
 
     lines.append("## Cadence (gap-excluded FV value-change series)")

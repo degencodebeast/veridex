@@ -167,3 +167,38 @@ def test_report_is_observation_labeled(tmp_path):
     assert result.leadlag.verdict in report
     assert "FV LEADS the venue mid" not in report
     assert "no overclaim" in report.lower() or "honestly" in report.lower()
+
+
+# --------------------------------------------------------------------------- E8-T2 (honesty)
+def test_report_does_not_overclaim_r4_readiness(tmp_path):
+    """A toy session satisfying ONLY the R3-local replay/cadence gate (gate 1 of 4) must
+    never let the report claim R4 readiness. R4 go/no-go needs FOUR independent gates
+    (R3 records+replays; live FV lead CONFIRMED; make-vs-take EV positive under Rose 4x
+    fee stress; guarded-live safety wiring) -- gates 2-4 are NOT evaluated here."""
+    from veridex.live_recorder.analysis import analyze_session, render_session_report
+
+    # This session reproduces on replay, is sealed with an ended_ts + fixtures, and has
+    # >=1 gap-safe FV change -- i.e. it satisfies the R3-local gate ONLY. It has NO
+    # confirmed lead, no fee-stress EV, no safety wiring.
+    session, _meta = _build_gapped_session(tmp_path)
+
+    result = analyze_session(session)
+    # the R3-local gate is genuinely met for this session (only gate 1 of 4)
+    assert result.r3_replay_prereq_met is True
+    # ...yet the lead-lag evidence does NOT confirm a lead (gate 2 not satisfied)
+    assert not result.leadlag.verdict.startswith("FV LEADS")
+
+    report = render_session_report(result)
+    lowered = report.lower()
+
+    # (a) NO phrasing that asserts R4 readiness / prerequisites-met as True
+    assert "r4 prerequisites met: true" not in lowered
+    assert "r4 prerequisites met" not in lowered
+    assert "r4 prerequisites: met" not in lowered
+
+    # (b) the R3-local gate IS stated honestly as gate 1 of 4...
+    assert "r3 replay/cadence prerequisite (r4 gate 1 of 4): met" in lowered
+    # ...AND R4 gates 2-4 are explicitly declared not evaluated (declared-gated, not run)
+    assert "r4 gates 2-4" in lowered
+    assert "not evaluated" in lowered
+    assert "declared-gated" in lowered
