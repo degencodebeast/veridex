@@ -169,6 +169,61 @@ def test_runner_sends_no_orders(tmp_path: Path) -> None:
     assert result.polls == 2
 
 
+def test_take_with_unpinned_fee_config_raises(tmp_path: Path) -> None:
+    """FIX H1: a take whose ``decision.fee_config`` hash != the session config hash RAISES.
+
+    The session config is the pinned/attested one (its hash is stamped onto every
+    ``DecisionEvent.config_hash``). A ``decide_fn`` returning a ``take`` with a DIFFERENT
+    ``fee_config`` must never be silently measured under that unattested config: the runner
+    binds ``measure_take`` to the session config hash, so a mismatch raises (EXE-004/AC-010).
+    """
+    import pytest
+
+    from veridex.live_recorder.recorder import LiveRecorder
+    from veridex.live_recorder.runner import Decision, RecorderMarket, run_live_recorder
+
+    session_cfg = _config()  # taker_fee_bps=10.0
+    rogue_cfg = FillAssumptionConfig(
+        taker_fee_bps=99.0,  # different hash from the session config
+        fee_stress_multiplier=1.0,
+        spread_assumption=0.0,
+        slippage_assumption=0.0,
+    )
+    assert rogue_cfg.config_hash() != session_cfg.config_hash()
+
+    matched = [RecorderMarket(100, "part1", "1X2|home|full", "tok")]
+    fv = FakeFvSource([_fv_state(100, 1_700_000_000, {"part1": 0.6})])
+    book = FakeBookDepthSource({"tok": [_snap("tok", ask=0.6, size=8.0)]})
+    recorder = LiveRecorder(tmp_path / "s", _start_meta())
+
+    def decide_rogue_take(_aligned: Any, _snapshot: Any, _config: Any) -> Decision:
+        return Decision(
+            intent_kind="take",
+            reason_code="take_now",
+            side="bid",
+            native_price=0.6,
+            desired_size=5.0,
+            fee_config=rogue_cfg,
+        )
+
+    with pytest.raises(ValueError, match="fee_config hash does not match"):
+        asyncio.run(
+            run_live_recorder(
+                matched=matched,
+                fv_source=fv,
+                book_source=book,
+                recorder=recorder,
+                decide_fn=decide_rogue_take,
+                config=session_cfg,
+                policy_hash="pol-hash",
+                now_fn=_counter_clock(),
+                sleep_fn=_noop_sleep,
+                max_polls=1,
+            )
+        )
+    recorder.close()
+
+
 def _events_by_type(records_path: Path) -> dict[str, list[dict[str, Any]]]:
     """Parse a ``records.jsonl`` into ``event_type -> [event dict, ...]``."""
     out: dict[str, list[dict[str, Any]]] = {}

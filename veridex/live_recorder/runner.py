@@ -205,8 +205,18 @@ async def run_live_recorder(
             if decision.native_price is None or decision.desired_size is None:
                 raise ValueError(f"{intent_kind} decision requires native_price and desired_size")
             if intent_kind == "take":
+                # The session config is the pinned/attested one (its hash is stamped onto
+                # DecisionEvent.config_hash). Bind measure_take to it so a decision.fee_config
+                # whose hash differs from the sealed config RAISES (EXE-004/AC-010) — a
+                # measurement can never be sealed under an unattested config.
                 fee_config = decision.fee_config or config
-                executability = measure_take(snap, decision.native_price, decision.desired_size, fee_config)
+                executability = measure_take(
+                    snap,
+                    decision.native_price,
+                    decision.desired_size,
+                    fee_config,
+                    pinned_config_hash=config_hash,
+                )
                 if executability is None:
                     # No observable ask depth to clear against — abstain honestly (never a fabricated fill).
                     intent_kind = "no_quote"
