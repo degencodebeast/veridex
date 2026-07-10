@@ -129,3 +129,97 @@ def test_denylist_excludes_generic_legit_names():
         assert legit not in R3_R4_RANK_DENYLIST
     for bad in ("queue_ahead_size", "own_fill", "realized_pnl"):
         assert bad in R3_R4_RANK_DENYLIST
+
+
+# ---------------------------------------------------------------------------
+# E7-T4 — directional score_run + sealed maker result stay byte-identical when an
+# R3 live_recorder session runs (SEC-005/AC-011). The rank guards wired in E7-T3
+# are raise-only NO-OPs on clean input, so scoring output is unchanged and the
+# sealed maker JSON on disk is never rewritten.
+# ---------------------------------------------------------------------------
+
+import hashlib  # noqa: E402
+import subprocess  # noqa: E402
+from pathlib import Path  # noqa: E402
+
+from veridex.live_recorder.contracts import (  # noqa: E402
+    ExecutabilityMeasurement,
+    QuoteIntentEvent,
+)
+from veridex.maker.result import assert_score_run_untouched  # noqa: E402
+from veridex.runtime.orchestrator import RunResult  # noqa: E402
+from veridex.scoring import score_run  # noqa: E402
+
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+_SEALED_MAKER_RESULT = "scripts/txline_live/cp1/maker-arena-result.json"
+
+
+def _dir_row(agent_id: str, tick_seq: int, clv_bps: int, confidence: float | None = None) -> dict:
+    """A directional score row in the shape score_run consumes."""
+    params: dict = {"market_key": "OU_2_5", "side": "over"}
+    if confidence is not None:
+        params["confidence"] = confidence
+    return {
+        "agent_id": agent_id,
+        "tick_seq": tick_seq,
+        "clv_bps": clv_bps,
+        "valid": True,
+        "reason": "",
+        "raw_prescore": {"raw_action": {"type": "FLAG_VALUE", "params": params}},
+    }
+
+
+def _representative_run() -> RunResult:
+    rows = [
+        _dir_row("agent-alpha", 0, 15, confidence=0.7),
+        _dir_row("agent-alpha", 1, -5, confidence=0.4),
+        _dir_row("agent-beta", 0, 8, confidence=0.55),
+        _dir_row("agent-beta", 1, 3),
+    ]
+    return RunResult(
+        run_id="run-e7t4",
+        source_mode="replay",
+        agent_ids=["agent-alpha", "agent-beta"],
+        run_events=[],
+        score_rows=rows,
+        evidence_hash="",
+        proof_mode_map={"agent-alpha": "reproducible", "agent-beta": "reproducible"},
+    )
+
+
+def _simulate_r3_live_recorder_session() -> None:
+    """Exercise the MM-R3 recorder lane: build the COUNTERFACTUAL executability + a
+    queue-aware quote intent (both carry R3 denylist field names the recorder PERMITS).
+    Constructing these must not touch the directional scorer in any way."""
+    ExecutabilityMeasurement(
+        candidate_price=0.60, available_size_at_price=8.0, cumulative_size_to_clear=8.0,
+        spread=0.02, half_spread=0.01, cost_clearing_threshold=0.60, taker_fee_bps=0,
+        fee_stress_multiplier=4, stale_window_s=120, clears=True, label="COUNTERFACTUAL",
+    )
+    QuoteIntentEvent(
+        sequence_no=1, event_type="QuoteIntentEvent", source_ts=None, recv_ts=1_000,
+        decision_id="d1", native_price=0.60, desired_size=5.0, side="buy", ladder_rung=1,
+        quote_intent_type="join", queue_ahead_size=3.0,
+    )
+
+
+def test_score_run_untouched_after_live_recorder():
+    run = _representative_run()
+    before = score_run(run)
+
+    _simulate_r3_live_recorder_session()
+
+    after = score_run(run)
+    # AC-011: the directional leaderboard is byte-identical across an R3 recorder session.
+    assert_score_run_untouched(before, after)  # raises iff before != after
+
+    # The sealed maker arena result on disk is unchanged vs its committed content.
+    sealed = _REPO_ROOT / _SEALED_MAKER_RESULT
+    on_disk = sealed.read_bytes()
+    committed = subprocess.run(
+        ["git", "show", f"HEAD:{_SEALED_MAKER_RESULT}"],
+        cwd=_REPO_ROOT, capture_output=True, check=True,
+    ).stdout
+    assert hashlib.sha256(on_disk).hexdigest() == hashlib.sha256(committed).hexdigest(), (
+        "sealed maker-arena-result.json must be byte-identical to its committed content"
+    )
