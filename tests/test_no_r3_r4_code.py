@@ -122,8 +122,12 @@ def _imports_live_recorder(modname: str) -> bool:
 def test_maker_and_scoring_do_not_import_live_recorder() -> None:
     # Import-boundary seam: the scored maker + directional lanes must never depend on
     # the operator-gated recorder lane. A recursive scan of veridex.maker.* plus the
-    # directional scorer module asserts NONE imports veridex.live_recorder.
-    modnames = _walk_modnames(maker_pkg, "veridex.maker.") + ["veridex.scoring"]
+    # directional scorer AND the directional CLV leaderboard (the third guarded rank
+    # surface) asserts NONE imports veridex.live_recorder.
+    modnames = _walk_modnames(maker_pkg, "veridex.maker.") + [
+        "veridex.scoring",
+        "veridex.leaderboard",
+    ]
     offenders = [m for m in modnames if _imports_live_recorder(m)]
     assert not offenders, (
         f"maker/scoring lane must not import veridex.live_recorder: {offenders}"
