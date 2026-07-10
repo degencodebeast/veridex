@@ -1,9 +1,10 @@
 """WS venue book source for the live-recorder lane (MM-R3 WS build, W1).
 
 W1 portion: the core Polymarket CLOB **market-channel** WebSocket stream client — connect,
-subscribe, an app-level 10 s ``PING`` heartbeat, a reconnect/backoff loop with an explicit
-gap signal, and minimal per-frame parsing (JSON-decode + ``event_type`` discriminant +
-arrival ``recv_ts`` stamp). W2/W3 EXTEND this file (book-state merge, ``BookDepthSource``).
+subscribe, an app-level 5 s ``PING`` heartbeat (the server drops the connection after ~10 s
+of silence), a reconnect/backoff loop with an explicit gap signal, and minimal per-frame
+parsing (JSON-decode + ``event_type`` discriminant + arrival ``recv_ts`` stamp). W2/W3
+EXTEND this file (book-state merge, ``BookDepthSource``).
 
 Trust-boundary discipline (mirrors ``veridex/live_recorder/sources.py`` and
 ``veridex/ingest/live_client.py``):

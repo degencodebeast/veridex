@@ -392,6 +392,13 @@ def render_arrival_lead_markdown(lead: ArrivalLeadResult) -> str:
             f"- FV strictly first: {_pct(lead.pct_fv_strictly_first)}",
             f"- tied (same arrival ms): {_pct(lead.pct_tied)}",
             "",
+            (
+                "CAVEAT: a positive median arrival-lead in isolation is NOT evidence of an FV "
+                "lead — a lagging-FV / venue-leading regime produces the same signature. This "
+                "panel is conclusive ONLY jointly with the NEXT-change probe below (next_rate "
+                "meaningfully > 0.5 AND z > 2). Read the probe verdict, not this number alone."
+            ),
+            "",
         ]
     )
 
