@@ -107,6 +107,7 @@ class LiveRecorderSessionMeta(_FrozenModel):
     source_provenance: dict[str, str]
     fixture_ids: tuple[int, ...]
     mapping_hash: str | None = None
+    poll_interval_ms: int | None = None
     event_count: int | None = None
     content_hash: str | None = None
     ended_ts: int | None = None

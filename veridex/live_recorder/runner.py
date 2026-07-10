@@ -77,6 +77,15 @@ def _canonical_hash(payload: dict[str, Any]) -> str:
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
+def _mapping_hash(matched: list[RecorderMarket]) -> str:
+    """CON-003 provenance: a stable sha256 over the resolved ``(fixture_id, side, token_id)`` set."""
+    resolved = sorted(
+        [m.fixture_id, m.txline_side, m.token_id] for m in matched
+    )
+    canonical = json.dumps(resolved, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
 @dataclass(frozen=True)
 class RecorderMarket:
     """A resolved ``(fixture, side)`` → venue-token binding the runner polls.
@@ -457,7 +466,11 @@ async def run_live_recorder(
             await fv_task
         # Seal inside the finally so a mid-session crash (or a raising decide_fn) still
         # finalizes meta.json over whatever was recorded — never leaves it start-only.
-        recorder.finalize(ended_ts=int(now_fn()))
+        recorder.finalize(
+            ended_ts=int(now_fn()),
+            mapping_hash=_mapping_hash(matched),
+            poll_interval_ms=poll_interval_ms,
+        )
 
     return SessionResult(
         polls=polls,

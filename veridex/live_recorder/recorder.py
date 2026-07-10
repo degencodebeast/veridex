@@ -112,19 +112,30 @@ class LiveRecorder:
         self._write_line(payload)
         self._events.append(payload)
 
-    def finalize(self, *, ended_ts: int) -> LiveRecorderSessionMeta:
+    def finalize(
+        self,
+        *,
+        ended_ts: int,
+        mapping_hash: str | None = None,
+        poll_interval_ms: int | None = None,
+    ) -> LiveRecorderSessionMeta:
         """Seal and write ``meta.json`` (finalize_meta-style) at shutdown.
 
         Fills ``ended_ts``, ``event_count`` and the sealed ``content_hash`` (over the full
         recorded event stream — events AND gap markers) onto the start meta and persists it.
+        The caller-supplied ``mapping_hash`` (fixture->token resolution provenance) and
+        ``poll_interval_ms`` are recorded too, unless already present on the start meta.
         """
-        meta = self._start_meta.model_copy(
-            update={
-                "ended_ts": ended_ts,
-                "event_count": len(self._events),
-                "content_hash": session_content_hash(self._events),
-            }
-        )
+        update: dict[str, Any] = {
+            "ended_ts": ended_ts,
+            "event_count": len(self._events),
+            "content_hash": session_content_hash(self._events),
+        }
+        if mapping_hash is not None:
+            update["mapping_hash"] = mapping_hash
+        if poll_interval_ms is not None:
+            update["poll_interval_ms"] = poll_interval_ms
+        meta = self._start_meta.model_copy(update=update)
         self._meta_path.write_text(meta.model_dump_json())
         return meta
 

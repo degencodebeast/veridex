@@ -224,6 +224,50 @@ def test_take_with_unpinned_fee_config_raises(tmp_path: Path) -> None:
     recorder.close()
 
 
+def test_meta_records_mapping_hash_and_poll_interval(tmp_path: Path) -> None:
+    """FIX M4/L1: the sealed meta.json records the fixture->token mapping_hash and poll interval.
+
+    ``mapping_hash`` (CON-003 fixture->token resolution provenance) and the poll interval were
+    never written. A completed run's ``meta.json`` must carry a non-null ``mapping_hash`` and
+    the ``poll_interval_ms`` it ran with.
+    """
+    import json as _json
+
+    from veridex.live_recorder.recorder import LiveRecorder
+    from veridex.live_recorder.runner import Decision, RecorderMarket, run_live_recorder
+
+    matched = [RecorderMarket(100, "part1", "1X2|home|full", "tok")]
+    fv = FakeFvSource([_fv_state(100, 1_700_000_000, {"part1": 0.6})])
+    book = FakeBookDepthSource({"tok": [_snap("tok")]})
+    session_dir = tmp_path / "s"
+    recorder = LiveRecorder(session_dir, _start_meta())
+
+    def decide(_aligned: Any, _snapshot: Any, _config: Any) -> Decision:
+        return Decision(intent_kind="no_quote", reason_code="skip", no_quote_reason="stale")
+
+    asyncio.run(
+        run_live_recorder(
+            matched=matched,
+            fv_source=fv,
+            book_source=book,
+            recorder=recorder,
+            decide_fn=decide,
+            config=_config(),
+            policy_hash="pol-hash",
+            now_fn=_counter_clock(),
+            sleep_fn=_noop_sleep,
+            poll_interval_ms=7_000,
+            max_polls=1,
+        )
+    )
+    recorder.close()
+
+    meta = _json.loads((session_dir / "meta.json").read_text())
+    assert meta["mapping_hash"] is not None
+    assert len(meta["mapping_hash"]) == 64  # sha256 hexdigest
+    assert meta["poll_interval_ms"] == 7_000
+
+
 def test_observe_only_session_seals_observe_only_not_liquidity_missing(tmp_path: Path) -> None:
     """FIX M3: an abstain with no explicit reason seals ``observe_only``, never ``liquidity_missing``.
 
