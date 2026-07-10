@@ -108,6 +108,9 @@ class LiveRecorderSessionMeta(_FrozenModel):
     fixture_ids: tuple[int, ...]
     mapping_hash: str | None = None
     poll_interval_ms: int | None = None
+    # R3 does not record venue trades (queue-jump is derived from book snapshots); trade
+    # recording is a deferred R4 capability. Honestly recorded so the session never implies it.
+    trades_recorded: bool = False
     event_count: int | None = None
     content_hash: str | None = None
     ended_ts: int | None = None

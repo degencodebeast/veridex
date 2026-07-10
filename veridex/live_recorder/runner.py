@@ -56,7 +56,6 @@ from veridex.live_recorder.sources import (
     BookDepthSource,
     BookSnapshot,
     FvSource,
-    VenueTradeSource,
     marketstate_to_fair_value,
 )
 
@@ -154,7 +153,6 @@ async def run_live_recorder(
     matched: list[RecorderMarket],
     fv_source: FvSource,
     book_source: BookDepthSource,
-    trade_source: VenueTradeSource | None = None,
     recorder: LiveRecorder,
     decide_fn: DecideFn,
     config: FillAssumptionConfig,

@@ -222,7 +222,6 @@ async def _run_cli(
             matched=matched,
             fv_source=_DefaultLiveFvSource(creds=creds, base_url=args.base_url),
             book_source=_DefaultBookDepthSource(),
-            trade_source=None,
             recorder=recorder,
             decide_fn=_observe_only_decision,
             config=config,

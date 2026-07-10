@@ -224,6 +224,52 @@ def test_take_with_unpinned_fee_config_raises(tmp_path: Path) -> None:
     recorder.close()
 
 
+def test_meta_records_trades_deferred_and_no_trade_source_param(tmp_path: Path) -> None:
+    """FIX M5: ``trade_source`` is gone from the signature and meta records trades deferred.
+
+    ``trade_source`` was accepted but never used (a supplied source recorded nothing). It is
+    removed; the session meta honestly records ``trades_recorded: false`` (R3 does not record
+    trades — queue-jump uses book snapshots).
+    """
+    import inspect
+    import json as _json
+
+    from veridex.live_recorder.recorder import LiveRecorder
+    from veridex.live_recorder.runner import Decision, RecorderMarket, run_live_recorder
+
+    # (a) the dead parameter is gone from the public signature.
+    assert "trade_source" not in inspect.signature(run_live_recorder).parameters
+
+    # (b) a completed run seals trades_recorded=False in meta.
+    matched = [RecorderMarket(100, "part1", "1X2|home|full", "tok")]
+    fv = FakeFvSource([_fv_state(100, 1_700_000_000, {"part1": 0.6})])
+    book = FakeBookDepthSource({"tok": [_snap("tok")]})
+    session_dir = tmp_path / "s"
+    recorder = LiveRecorder(session_dir, _start_meta())
+
+    def decide(_aligned: Any, _snapshot: Any, _config: Any) -> Decision:
+        return Decision(intent_kind="no_quote", reason_code="skip", no_quote_reason="stale")
+
+    asyncio.run(
+        run_live_recorder(
+            matched=matched,
+            fv_source=fv,
+            book_source=book,
+            recorder=recorder,
+            decide_fn=decide,
+            config=_config(),
+            policy_hash="pol-hash",
+            now_fn=_counter_clock(),
+            sleep_fn=_noop_sleep,
+            max_polls=1,
+        )
+    )
+    recorder.close()
+
+    meta = _json.loads((session_dir / "meta.json").read_text())
+    assert meta["trades_recorded"] is False
+
+
 def test_meta_records_mapping_hash_and_poll_interval(tmp_path: Path) -> None:
     """FIX M4/L1: the sealed meta.json records the fixture->token mapping_hash and poll interval.
 
