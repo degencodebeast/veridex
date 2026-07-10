@@ -42,6 +42,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
+from veridex.rank_guards import assert_no_r3r4_in_rank  # neutral SEC-006 guard — imports no lane
 from veridex.runtime.window import CLV_FIELD_WINDOW  # pure model (pydantic only) — trust-path clean
 
 if TYPE_CHECKING:  # type-only import keeps the trust path free of a runtime dependency / cycle.
@@ -226,6 +227,7 @@ def _rank_key(metrics: dict[str, Any]) -> tuple[Any, ...]:
     Returns:
         A tuple suitable for ``list.sort``/``sorted`` (ascending).
     """
+    assert_no_r3r4_in_rank(metrics)  # SEC-006: no R3/R4 execution field may enter the rank key
     avg = metrics["avg_clv_bps"]
     brier = metrics["brier"]
     return (

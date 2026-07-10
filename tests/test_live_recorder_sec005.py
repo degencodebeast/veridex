@@ -61,3 +61,71 @@ def test_executability_not_convertible_to_fill_or_rank():
 
     # It IS and stays a COUNTERFACTUAL observation.
     assert ex.label == "COUNTERFACTUAL"
+
+
+# ---------------------------------------------------------------------------
+# E7-T3 — SEC-006 canonical R3/R4 rank denylist, enforced at BOTH rank inputs.
+# These are ENFORCEMENT-POINT tests (not helper-only): they drive the real
+# rank_makers / _rank_key entrypoints, proving a clean row passes and an
+# R3/R4-carrying row raises.
+# ---------------------------------------------------------------------------
+
+import pytest  # noqa: E402
+
+from veridex.rank_guards import R3_R4_RANK_DENYLIST  # noqa: E402
+
+
+def _valid_maker_row() -> dict:
+    """A minimal VALID maker rank row (mirrors aggregate_agent_metrics output)."""
+    return {
+        "agent_id": "mm-a",
+        "avg_markout_bps": 1050,
+        "avg_toxicity_loss_bps": 40,
+        "quote_count": 100,
+        "abstained": 0,
+    }
+
+
+def _valid_directional_metrics() -> dict:
+    """A minimal VALID directional metric stack (the fields _rank_key reads)."""
+    return {
+        "agent_id": "dir-a",
+        "avg_clv_bps": 12.0,
+        "total_clv_bps": 24,
+        "brier": None,
+        "max_drawdown": 0.0,
+        "action_count": 2,
+    }
+
+
+def test_maker_rank_rejects_r3r4_field():
+    from veridex.maker.leaderboard import rank_makers
+
+    # Clean row ranks fine (baseline: the guard is a NO-OP on clean input)...
+    assert rank_makers([_valid_maker_row()])[0]["maker_rank"] == 1
+
+    # ...but an R3 queue-observation field smuggled into the rank input must raise.
+    poisoned = _valid_maker_row()
+    poisoned["queue_ahead_size"] = 3.0
+    with pytest.raises(Exception):
+        rank_makers([poisoned])
+
+
+def test_directional_rank_rejects_r3r4_field():
+    from veridex.scoring import _rank_key
+
+    # Clean metrics produce a sort key (NO-OP on clean input)...
+    assert isinstance(_rank_key(_valid_directional_metrics()), tuple)
+
+    # ...but an R4 own-fill field on the directional rank input must raise.
+    poisoned = _valid_directional_metrics()
+    poisoned["own_fill"] = 1
+    with pytest.raises(Exception):
+        _rank_key(poisoned)
+
+
+def test_denylist_excludes_generic_legit_names():
+    for legit in ("side", "spread", "size", "label", "ranked"):
+        assert legit not in R3_R4_RANK_DENYLIST
+    for bad in ("queue_ahead_size", "own_fill", "realized_pnl"):
+        assert bad in R3_R4_RANK_DENYLIST
