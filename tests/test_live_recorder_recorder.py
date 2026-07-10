@@ -24,16 +24,16 @@ def _start_meta() -> LiveRecorderSessionMeta:
 
 def _heartbeat(poll_index: int) -> dict:
     # An E1 model dumped canonically; sequence_no is a placeholder the recorder reassigns.
-    return dict(
-        sequence_no=0,
-        event_type="RecorderHeartbeatEvent",
-        source_ts=None,
-        recv_ts=1_700_000_000_000 + poll_index,
-        poll_index=poll_index,
-        venue_mids_seen=1,
-        fv_points_recv=1,
-        fv_aligned=True,
-    )
+    return {
+        "sequence_no": 0,
+        "event_type": "RecorderHeartbeatEvent",
+        "source_ts": None,
+        "recv_ts": 1_700_000_000_000 + poll_index,
+        "poll_index": poll_index,
+        "venue_mids_seen": 1,
+        "fv_points_recv": 1,
+        "fv_aligned": True,
+    }
 
 
 def test_recorder_appends_and_writes_explicit_gaps(tmp_path):
@@ -57,7 +57,7 @@ def test_recorder_appends_and_writes_explicit_gaps(tmp_path):
     # strictly increasing across the appended lines
     assert seqs == sorted(seqs)
     assert len(set(seqs)) == len(seqs)
-    assert all(b > a for a, b in zip(seqs, seqs[1:]))
+    assert all(b > a for a, b in zip(seqs, seqs[1:], strict=False))
 
     # the gap line is a labeled RecorderGapEvent — never a silent splice
     gap = parsed[-1]
