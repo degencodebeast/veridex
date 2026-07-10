@@ -101,6 +101,35 @@ def test_live_recorder_may_define_r3r4_symbols() -> None:
     )
 
 
+def _imports_live_recorder(modname: str) -> bool:
+    """True iff a module directly imports ``veridex.live_recorder`` (or a submodule)."""
+    tree = ast.parse(inspect.getsource(importlib.import_module(modname)))
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            if any(
+                alias.name == "veridex.live_recorder"
+                or alias.name.startswith("veridex.live_recorder.")
+                for alias in node.names
+            ):
+                return True
+        elif isinstance(node, ast.ImportFrom):
+            module = node.module or ""
+            if module == "veridex.live_recorder" or module.startswith("veridex.live_recorder."):
+                return True
+    return False
+
+
+def test_maker_and_scoring_do_not_import_live_recorder() -> None:
+    # Import-boundary seam: the scored maker + directional lanes must never depend on
+    # the operator-gated recorder lane. A recursive scan of veridex.maker.* plus the
+    # directional scorer module asserts NONE imports veridex.live_recorder.
+    modnames = _walk_modnames(maker_pkg, "veridex.maker.") + ["veridex.scoring"]
+    offenders = [m for m in modnames if _imports_live_recorder(m)]
+    assert not offenders, (
+        f"maker/scoring lane must not import veridex.live_recorder: {offenders}"
+    )
+
+
 def test_assign_rung_never_r3_r4() -> None:
     # Even with EVERY presence flag set True, the gate caps at MM-R1.5 — R3/R4
     # are recorder-lane-only (depth/cancels/own-fills are accepted but ignored here).
