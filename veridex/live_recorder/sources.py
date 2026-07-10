@@ -289,13 +289,16 @@ async def resolve_proofs_batch(
     """
     from veridex.ingest.odds_proof import ERROR, classify_proof
 
-    if validate is None:
-        from veridex.ingest.txline_client import validate_odds as validate  # noqa: PLW2901 — lazy default
+    resolver = validate
+    if resolver is None:
+        from veridex.ingest.txline_client import validate_odds
+
+        resolver = validate_odds
 
     report: dict[tuple[str, int], str] = {}
     for message_id, ts in pairs:
         try:
-            resp = await validate(message_id, ts, base_url=base_url, creds=creds, client=client)
+            resp = await resolver(message_id, ts, base_url=base_url, creds=creds, client=client)
             report[(message_id, ts)] = classify_proof(resp)
         except Exception:  # noqa: BLE001 — report-only: an error is honest "unknown", never voids anything
             report[(message_id, ts)] = ERROR

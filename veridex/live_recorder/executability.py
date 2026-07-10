@@ -119,7 +119,7 @@ def measure_take(
     best_bid = _best_price(snapshot.bids, side="bid")
     best_ask = _best_price(snapshot.asks, side="ask")
     two_sided = best_bid is not None and best_ask is not None
-    spread = (best_ask - best_bid) if two_sided else 0.0
+    spread = (best_ask - best_bid) if (best_bid is not None and best_ask is not None) else 0.0
     half_spread = spread / 2.0
     # spread_assumption is a declared FLOOR on the half-spread (fallback when a side is missing).
     assumed_half_spread = fee_config.spread_assumption / 2.0

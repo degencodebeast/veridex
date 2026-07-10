@@ -20,8 +20,9 @@ NO network, NO LLM import; imports nothing from ``veridex.scoring`` or ``veridex
 from __future__ import annotations
 
 import json
+from collections.abc import Iterator
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any
 
 from veridex.live_recorder.contracts import LiveRecorderSessionMeta
 from veridex.live_recorder.recorder import (
@@ -72,10 +73,7 @@ def read_session(
 def _crosses_gap(prev_ts: int, curr_ts: int, gaps: list[dict[str, Any]]) -> bool:
     """True if the change interval ``[prev_ts, curr_ts]`` overlaps any gap window."""
     lo, hi = (prev_ts, curr_ts) if prev_ts <= curr_ts else (curr_ts, prev_ts)
-    for gap in gaps:
-        if not (gap["to_ts"] < lo or gap["from_ts"] > hi):
-            return True
-    return False
+    return any(not (gap["to_ts"] < lo or gap["from_ts"] > hi) for gap in gaps)
 
 
 def iter_change_series(
@@ -97,7 +95,7 @@ def iter_change_series(
 
     for key, group in series.items():
         ordered = sorted(group, key=lambda e: (e["recv_ts"], e["sequence_no"]))
-        for prev, curr in zip(ordered, ordered[1:]):
+        for prev, curr in zip(ordered, ordered[1:], strict=False):
             if _crosses_gap(prev["recv_ts"], curr["recv_ts"], gaps):
                 continue
             yield key, prev, curr
