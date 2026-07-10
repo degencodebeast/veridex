@@ -224,6 +224,48 @@ def test_take_with_unpinned_fee_config_raises(tmp_path: Path) -> None:
     recorder.close()
 
 
+def test_observe_only_session_seals_observe_only_not_liquidity_missing(tmp_path: Path) -> None:
+    """FIX M3: an abstain with no explicit reason seals ``observe_only``, never ``liquidity_missing``.
+
+    Against a DEEP two-sided book, a policy that abstains without naming a market condition
+    must not seal a FALSE ``liquidity_missing`` claim. The runner's neutral honest default is
+    ``observe_only`` (a policy-abstain reason), NOT a fabricated market condition.
+    """
+    from veridex.live_recorder.recorder import LiveRecorder
+    from veridex.live_recorder.runner import Decision, RecorderMarket, run_live_recorder
+
+    matched = [RecorderMarket(100, "part1", "1X2|home|full", "tok")]
+    fv = FakeFvSource([_fv_state(100, 1_700_000_000, {"part1": 0.6})])
+    # A DEEP two-sided book — there is genuinely liquidity present.
+    book = FakeBookDepthSource({"tok": [_snap("tok", bid=0.4, ask=0.6, size=50.0)]})
+    session_dir = tmp_path / "s"
+    recorder = LiveRecorder(session_dir, _start_meta())
+
+    def decide_observe_only(_aligned: Any, _snapshot: Any, _config: Any) -> Decision:
+        # Abstain WITHOUT naming a market condition (no_quote_reason left unset).
+        return Decision(intent_kind="no_quote", reason_code="observe_only")
+
+    asyncio.run(
+        run_live_recorder(
+            matched=matched,
+            fv_source=fv,
+            book_source=book,
+            recorder=recorder,
+            decide_fn=decide_observe_only,
+            config=_config(),
+            policy_hash="pol-hash",
+            now_fn=_counter_clock(),
+            sleep_fn=_noop_sleep,
+            max_polls=1,
+        )
+    )
+    recorder.close()
+
+    ev = _events_by_type(session_dir / "records.jsonl")
+    assert len(ev["NoQuoteIntentEvent"]) == 1
+    assert ev["NoQuoteIntentEvent"][0]["no_quote_reason"] == "observe_only"
+
+
 def test_runner_emits_heartbeats(tmp_path: Path) -> None:
     """FIX M2: the runner emits a ``RecorderHeartbeatEvent`` once per poll (liveness).
 

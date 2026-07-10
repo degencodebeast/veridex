@@ -67,6 +67,7 @@ _NO_QUOTE_REASONS: tuple[str, ...] = (
     "fee_negative",
     "liquidity_missing",
     "risk_cap",
+    "observe_only",
 )
 
 
@@ -199,7 +200,9 @@ async def run_live_recorder(
         config_hash = config.config_hash()
 
         intent_kind = decision.intent_kind
-        no_quote_reason = decision.no_quote_reason or "liquidity_missing"
+        # Neutral honest default: a policy that abstains without naming a market condition is
+        # "observe_only" (a policy-abstain reason), NOT a fabricated "liquidity_missing" claim.
+        no_quote_reason = decision.no_quote_reason or "observe_only"
         executability = None
         queue_ahead: float | None = None
         if intent_kind in ("make", "take"):

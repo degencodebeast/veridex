@@ -362,6 +362,9 @@ class NoQuoteIntentEvent(_EventEnvelope):
         "fee_negative",
         "liquidity_missing",
         "risk_cap",
+        # A policy-abstain reason: the policy chose not to quote. NOT a market condition —
+        # it never asserts anything (false) about the observed book.
+        "observe_only",
     ]
 
 

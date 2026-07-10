@@ -111,7 +111,8 @@ def _observe_only_decision(_aligned: Any, _snapshot: Any, _config: Any) -> Decis
     return Decision(
         intent_kind="no_quote",
         reason_code="observe_only",
-        no_quote_reason="liquidity_missing",
+        # A policy-abstain reason — NOT a fabricated market condition against a deep book.
+        no_quote_reason="observe_only",
     )
 
 
