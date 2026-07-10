@@ -247,3 +247,37 @@ def test_score_run_untouched_after_live_recorder():
     assert hashlib.sha256(on_disk).hexdigest() == hashlib.sha256(committed).hexdigest(), (
         "sealed maker-arena-result.json must be byte-identical to its committed content"
     )
+
+
+# ---------------------------------------------------------------------------
+# SEC-006 — the directional CLV leaderboard (veridex/leaderboard.py) is the third
+# rank axis named in AC-012, alongside score_run/_rank_key and the maker rank axis
+# already covered above. Its _rank_key must be self-guarded (raise-only, NO-OP on
+# clean input) exactly like veridex.scoring._rank_key and maker.leaderboard.maker_rank_key.
+# ---------------------------------------------------------------------------
+
+
+def _valid_aggregated_clv_row() -> dict:
+    """A minimal VALID aggregated leaderboard row (mirrors leaderboard._aggregate output)."""
+    return {
+        "agent_id": "agent-alpha",
+        "avg_clv_bps": 12.0,
+        "total_clv_bps": 24,
+        "brier": None,
+        "max_drawdown": 0.0,
+        "action_count": 2,
+    }
+
+
+def test_directional_clv_leaderboard_rank_key_is_self_guarded():
+    from veridex.leaderboard import _rank_key
+
+    # A clean aggregated row still returns a sort key (guard is a NO-OP on clean input)...
+    assert isinstance(_rank_key(_valid_aggregated_clv_row()), tuple)
+
+    # ...but calling the exported key directly on an R3-poisoned row must raise
+    # (the guard lives INSIDE the key, matching scoring._rank_key / maker_rank_key).
+    poisoned = _valid_aggregated_clv_row()
+    poisoned["queue_ahead_size"] = 3.0
+    with pytest.raises(Exception):
+        _rank_key(poisoned)
