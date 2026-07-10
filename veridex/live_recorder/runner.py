@@ -432,8 +432,10 @@ async def run_live_recorder(
         fv_task.cancel()
         with contextlib.suppress(asyncio.CancelledError, Exception):
             await fv_task
+        # Seal inside the finally so a mid-session crash (or a raising decide_fn) still
+        # finalizes meta.json over whatever was recorded — never leaves it start-only.
+        recorder.finalize(ended_ts=int(now_fn()))
 
-    recorder.finalize(ended_ts=int(now_fn()))
     return SessionResult(
         polls=polls,
         events_recorded=counters.events,

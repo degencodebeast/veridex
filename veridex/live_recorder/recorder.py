@@ -67,6 +67,9 @@ class LiveRecorder:
         self._seq = 0
         self._events: list[dict[str, Any]] = []
         self._fh = self._records_path.open("a", encoding="utf-8")
+        # Write a START meta.json immediately so a crash BEFORE finalize still leaves a
+        # parseable session (post-start fields stay None until finalize seals them).
+        self._meta_path.write_text(start_meta.model_dump_json())
 
     @property
     def records_path(self) -> Path:

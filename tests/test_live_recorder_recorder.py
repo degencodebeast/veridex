@@ -9,6 +9,7 @@ import json
 
 from veridex.live_recorder.contracts import LiveRecorderSessionMeta
 from veridex.live_recorder.recorder import LiveRecorder
+from veridex.live_recorder.replay import read_session
 
 
 def _start_meta() -> LiveRecorderSessionMeta:
@@ -66,3 +67,24 @@ def test_recorder_appends_and_writes_explicit_gaps(tmp_path):
     assert gap["to_ts"] == 1_700_000_000_900
     assert gap["source"] == "venue"
     assert gap["reason"] == "disconnect"
+
+
+def test_crash_partial_session_is_readable(tmp_path):
+    """FIX M1: a session that crashed BEFORE finalize is still readable.
+
+    ``__init__`` writes a START ``meta.json`` immediately (post-start fields Optional), so a
+    mid-session crash that never calls ``finalize`` leaves a parseable meta and the recorded
+    events — ``read_session`` succeeds instead of raising ``FileNotFoundError``.
+    """
+    rec = LiveRecorder(tmp_path, _start_meta())
+    rec.record(_heartbeat(0))
+    rec.record(_heartbeat(1))
+    # Simulate a crash: DO NOT call finalize(); just close the file handle.
+    rec.close()
+
+    meta, events, gaps = read_session(tmp_path)
+    assert meta.content_hash is None  # never finalized
+    assert meta.ended_ts is None
+    assert meta.session_ts == 1_700_000_000
+    assert len(events) == 2
+    assert [e["poll_index"] for e in events] == [0, 1]
