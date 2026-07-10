@@ -127,3 +127,23 @@ def test_runbook_honest_wording_and_no_overclaim() -> None:
     assert "r4 declared/gated, not run" in low, "runbook missing the honest R4 ship-line wording"
     for forbidden in ("profitable", "real fill", "proven edge", "r4 complete"):
         assert forbidden not in low, f"runbook overclaims (forbidden phrase present): {forbidden!r}"
+
+
+def test_runbook_documents_r4_handoff_gates_and_safety_gaps() -> None:
+    """The R4 handoff section names the four gates, the two safety gaps, and the FREEZE (declared only)."""
+    low = _RUNBOOK.read_text().lower()
+    # Four gates + the sizing formula and freeze.
+    for token in (
+        "four gates",
+        "rose 4",  # Rose 4x fee stress
+        "unit_size",
+        "fixed_fraction",
+        "freeze",
+        "taker-first",
+    ):
+        assert token in low, f"runbook R4 handoff missing: {token!r}"
+    # The two named safety gaps (verified R4-004).
+    assert "max-daily-loss" in low, "runbook missing the max-daily-loss safety gap"
+    assert "cancel-all" in low, "runbook missing the breaker cancel-all safety gap"
+    assert "policyenvelope" in low, "runbook must name PolicyEnvelope for the absent daily-loss cap"
+    assert "circuit_breaker" in low, "runbook must reference the circuit breaker for gap 2"

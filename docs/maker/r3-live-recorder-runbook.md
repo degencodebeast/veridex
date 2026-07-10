@@ -128,3 +128,87 @@ report says so directly — it never embellishes a lead that the evidence does n
 > replayable, no-look-ahead evidence with counterfactual-only executability. It produces no
 > fills, no realized PnL, and no rankable value. MM-R4 (real-money) is declared in the R4
 > handoff section (appended next) and gated — it is not implemented in this lane.
+
+---
+
+## 7. R4 handoff — declared only (no R4 code in this lane)
+
+Everything in this section is a **declaration**. None of the event contracts, gates, or
+safety layers below are implemented here. R4 is the real-money dust lane; it is **frozen**
+in this milestone.
+
+### 7.1 Declared R4 event contracts (handoff types only — NOT implemented)
+
+R4 would extend the recorder's event set with our-own-order provenance. These are named as
+handoff contracts only; no such type is defined in this lane:
+
+- `OwnOrderLifecycleEvent` — our own `place` / `amend` / `cancel` / `partial-fill` / `fill`
+  transitions, tied to **our own** client order ids.
+- `OwnFillEvent` — an own fill reconciled against venue settlement (the first place a
+  realized, own-attributed value could ever appear — it does not exist today).
+- `DustOrderIntentEvent` — a size-capped, taker-first dust order intent under the R4 policy.
+- `KillSwitchEvent` / `CancelAllEvent` — a recorded breaker/kill-switch trip and the
+  resulting cancel-all action.
+
+Until `OwnFillEvent` exists and is reconciled, `real_executable_edge_bps` stays the pinned
+literal `None` across the maker lane — R4 changes nothing about that until it actually runs.
+
+### 7.2 The four gates (ALL must pass before any R4 real-money dust)
+
+1. **R3 records + replays cleanly.** A sealed session `replay_reproduces` byte-identically,
+   with labeled gaps and no-look-ahead alignment intact.
+2. **The live monitor confirms TxLINE FV leads the live venue.** The read-only live monitor
+   (`scripts/maker/live_monitor.py`) must show the TxLINE FV leading the live Polymarket book
+   on real quotes — not only on the backfilled series.
+3. **Make-vs-take EV is positive under the Rose 4× fee stress.** Evaluated with the
+   counterfactual `FillAssumptionConfig(fee_stress_multiplier=4, ...)` stress variant — the
+   edge must survive 4× fees, not just the nominal case.
+4. **A guarded-live safety layer is wired.** The two safety gaps in §7.3 must be closed and
+   verified before a single real order can be armed.
+
+### 7.3 The two real safety gaps (verified in spec R4-004 — must be closed first)
+
+1. **Max-daily-loss limit is ABSENT.** `veridex/policy/envelope.py::PolicyEnvelope` today has
+   no max-daily-loss notional / PnL limit. Its caps are per-order (`max_stake`,
+   `max_stake_live_guarded`) and per-count (`max_orders_per_run` / `_session` / `_day`) plus
+   a `circuit_breaker_threshold` and `kill_switch` — but nothing bounds cumulative daily loss.
+   A notional / PnL daily-loss cap must be added and enforced before R4.
+2. **Breaker-triggered cancel-all is not orchestrated.** The cancel-all *capability* exists —
+   `PolymarketAdapter.cancel_order` delegates to the vendored `cancel_all_orders`
+   (`veridex/venues/polymarket.py`, `veridex/venues/_vendor/polymarket_clob/client.py`) — but
+   **nothing fires it automatically** on a `CircuitBreaker` trip or kill-switch
+   (`veridex/policy/circuit_breaker.py` is a pure state machine that decides nothing on its
+   own; no caller in `veridex/policy/` or `veridex/runtime/` invokes cancel-all on a trip).
+   The automatic breaker→cancel-all wiring must be built and tested before R4.
+
+### 7.4 R4-005 — first dust test properties (declared)
+
+The first R4 real-money test, when the gates and safety layer are satisfied, must be:
+
+- **Taker-first** — start with taker orders, not resting maker quotes.
+- **Isolated funded wallet** — a dedicated wallet, ring-fenced from any other funds.
+- **Max order size** — a hard per-order size cap.
+- **Max-daily-loss cap** — the notional / PnL daily-loss limit from §7.3 gap 1, enforced.
+- **Cancel-all kill switch** — the breaker→cancel-all wiring from §7.3 gap 2, armed.
+- **Idempotent client order IDs** — so a retry can never double-submit.
+- **Full lifecycle logging** — every `place` / `amend` / `cancel` / `partial-fill` / `fill`
+  recorded as own-order evidence.
+- **No autonomous scale-up** — sizing never increases itself; any scale-up is operator-gated.
+
+### 7.5 R4 dust sizing (declared, mechanical)
+
+R4 dust sizing is **mechanical**, never raw Kelly and never discretionary:
+
+```
+unit_size = fixed_fraction × wallet_equity_at_decision
+```
+
+`fixed_fraction` is a small, pinned operator constant; `wallet_equity_at_decision` is the
+equity observed at the decision instant. There is no discretionary override and no Kelly-
+derived sizing.
+
+### FREEZE
+
+**R4 is not implemented in this lane.** No order placement, no `PolymarketAdapter` change, no
+`submit_order`, and no funded-wallet flow exists or is added here. This document declares R4
+and gates it; the recorder above is the only thing that runs.
