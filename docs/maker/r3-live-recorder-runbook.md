@@ -30,7 +30,8 @@ contract in `veridex/live_recorder/contracts.py`:
 | **Latency** | `LatencyEvent` | Per-stage chain latency (fv→book, book→decision) in integer ms. |
 | **Risk gates** | `RiskGateEvent` | Each decision-time gate evaluation (`pass` / `block`). |
 | **Gaps** | `RecorderGapEvent` | An explicit, labeled gap in the source stream — never a silent splice. Gaps are covered by the session content hash and excluded from analysis. |
-| **Replay checkpoints** | `ReplayCheckpointEvent`, `RecorderHeartbeatEvent` | Rolling partial content-hash checkpoints and liveness beats so a crash-partial session is still verifiable. |
+| **Liveness beats** | `RecorderHeartbeatEvent` | Emitted once per poll (`poll_index`, `venue_mids_seen`, `fv_points_recv`, `fv_aligned`) as a liveness record of what the poll loop saw that cycle. |
+| **Replay checkpoints** | `ReplayCheckpointEvent` | A declared contract, **not yet emitted** — no rolling partial content-hash checkpoint is written today. Crash-partial readability instead comes from the start `meta.json` (written at session open) plus the per-poll heartbeats above. |
 
 The default operator policy in the CLI **abstains** (`no_quote`) on every poll, so a session
 captured with the stock command records genuine market evidence (FV, depth, latency, gaps)

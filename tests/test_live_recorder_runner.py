@@ -224,6 +224,51 @@ def test_take_with_unpinned_fee_config_raises(tmp_path: Path) -> None:
     recorder.close()
 
 
+def test_runner_emits_heartbeats(tmp_path: Path) -> None:
+    """FIX M2: the runner emits a ``RecorderHeartbeatEvent`` once per poll (liveness).
+
+    The runbook claimed heartbeats make a crash-partial session verifiable, but none were
+    ever emitted. A fake offline run must now record >=1 ``RecorderHeartbeatEvent`` carrying
+    the poll's counters.
+    """
+    from veridex.live_recorder.recorder import LiveRecorder
+    from veridex.live_recorder.runner import Decision, RecorderMarket, run_live_recorder
+
+    matched = [RecorderMarket(100, "part1", "1X2|home|full", "tok")]
+    fv = FakeFvSource([_fv_state(100, 1_700_000_000, {"part1": 0.6})])
+    book = FakeBookDepthSource({"tok": [_snap("tok"), _snap("tok")]})
+    session_dir = tmp_path / "s"
+    recorder = LiveRecorder(session_dir, _start_meta())
+
+    def decide(_aligned: Any, _snapshot: Any, _config: Any) -> Decision:
+        return Decision(intent_kind="no_quote", reason_code="skip", no_quote_reason="stale")
+
+    asyncio.run(
+        run_live_recorder(
+            matched=matched,
+            fv_source=fv,
+            book_source=book,
+            recorder=recorder,
+            decide_fn=decide,
+            config=_config(),
+            policy_hash="pol-hash",
+            now_fn=_counter_clock(),
+            sleep_fn=_noop_sleep,
+            max_polls=2,
+        )
+    )
+    recorder.close()
+
+    ev = _events_by_type(session_dir / "records.jsonl")
+    heartbeats = ev.get("RecorderHeartbeatEvent", [])
+    assert len(heartbeats) == 2  # one per poll
+    hb = heartbeats[0]
+    assert hb["poll_index"] == 0
+    assert hb["venue_mids_seen"] == 1  # one book observed this poll
+    assert hb["fv_points_recv"] >= 1
+    assert hb["fv_aligned"] is True
+
+
 def _events_by_type(records_path: Path) -> dict[str, list[dict[str, Any]]]:
     """Parse a ``records.jsonl`` into ``event_type -> [event dict, ...]``."""
     out: dict[str, list[dict[str, Any]]] = {}

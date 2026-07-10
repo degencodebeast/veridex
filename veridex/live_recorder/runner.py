@@ -45,6 +45,7 @@ from veridex.live_recorder.contracts import (
     LatencyEvent,
     NoQuoteIntentEvent,
     QuoteIntentEvent,
+    RecorderHeartbeatEvent,
     RiskGateEvent,
     TakeIntentEvent,
     VenueBookSnapshotEvent,
@@ -388,6 +389,8 @@ async def run_live_recorder(
                 *(book_source.fetch_book(m.token_id) for m in matched),
                 return_exceptions=True,
             )
+            venue_mids_seen = 0
+            fv_aligned_this_poll = False
             for m, snap in zip(matched, snapshots, strict=True):
                 if isinstance(snap, BaseException):
                     # One bad book never aborts the round: write an honest, labeled gap and continue.
@@ -402,6 +405,7 @@ async def run_live_recorder(
                     continue
                 if snap is None:
                     continue
+                venue_mids_seen += 1
                 # Book observed on the recorder clock; book_ts stays the venue-native ms.
                 book_obs_ts = int(now_fn())
                 book_id = f"book-{m.token_id}-{book_obs_ts}"
@@ -424,7 +428,23 @@ async def run_live_recorder(
                 # Decision's OWN recv_ts drives eligible_fv — the end-to-end no-look-ahead guarantee.
                 decision_recv_ts = int(now_fn())
                 aligned = eligible_fv(fv_hist[(m.fixture_id, m.txline_side)], decision_recv_ts)
+                if aligned is not None:
+                    fv_aligned_this_poll = True
                 _emit_decision(m, snap, book_id, aligned, book_obs_ts, decision_recv_ts)
+
+            # One liveness heartbeat per poll — what the poll loop saw this cycle.
+            _record(
+                RecorderHeartbeatEvent(
+                    sequence_no=0,
+                    event_type="RecorderHeartbeatEvent",
+                    source_ts=None,
+                    recv_ts=int(now_fn()),
+                    poll_index=polls,
+                    venue_mids_seen=venue_mids_seen,
+                    fv_points_recv=counters.fv_points,
+                    fv_aligned=fv_aligned_this_poll,
+                )
+            )
 
             polls += 1
             await sleep_fn(poll_interval_ms / 1000.0)
