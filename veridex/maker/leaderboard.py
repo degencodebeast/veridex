@@ -100,6 +100,7 @@ def maker_rank_key(metrics: dict[str, Any]) -> tuple[Any, ...]:
     Returns:
         A tuple suitable for ``list.sort``/``sorted`` (ascending, best maker first).
     """
+    assert_no_r3r4_in_rank(metrics)  # SEC-006: guard the KEY itself — closes the direct-sort bypass
     loss = metrics.get("avg_toxicity_loss_bps")
     loss_key = (1, 0.0) if loss is None else (0, loss)  # None last; lower loss first
     return (

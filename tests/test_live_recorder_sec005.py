@@ -111,6 +111,30 @@ def test_maker_rank_rejects_r3r4_field():
         rank_makers([poisoned])
 
 
+def test_maker_rank_key_is_self_guarded():
+    from veridex.maker.leaderboard import maker_rank_key
+
+    # A clean maker row still returns a sort key (guard is a NO-OP on clean input)...
+    assert isinstance(maker_rank_key(_valid_maker_row()), tuple)
+
+    # ...but calling the exported key directly on an R3-poisoned row must raise
+    # (the guard lives INSIDE the key, not only in rank_makers).
+    poisoned = _valid_maker_row()
+    poisoned["queue_ahead_size"] = 3.0
+    with pytest.raises(Exception):
+        maker_rank_key(poisoned)
+
+
+def test_direct_sorted_by_maker_rank_key_rejects_r3r4():
+    from veridex.maker.leaderboard import maker_rank_key
+
+    # A direct sort bypassing rank_makers must NOT smuggle an R3/R4 field through.
+    poisoned = _valid_maker_row()
+    poisoned["queue_ahead_size"] = 3.0
+    with pytest.raises(Exception):
+        sorted([poisoned], key=maker_rank_key)
+
+
 def test_directional_rank_rejects_r3r4_field():
     from veridex.scoring import _rank_key
 
