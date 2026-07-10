@@ -30,14 +30,26 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
+import json
 import signal
 from collections import defaultdict
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
-from veridex.live_recorder.alignment import FvPoint
-from veridex.live_recorder.contracts import FillAssumptionConfig, VenueBookSnapshotEvent
+from veridex.live_recorder.alignment import FvPoint, eligible_fv
+from veridex.live_recorder.contracts import (
+    DecisionEvent,
+    FillAssumptionConfig,
+    LatencyEvent,
+    NoQuoteIntentEvent,
+    QuoteIntentEvent,
+    RiskGateEvent,
+    TakeIntentEvent,
+    VenueBookSnapshotEvent,
+)
+from veridex.live_recorder.executability import measure_take, queue_ahead_at
 from veridex.live_recorder.recorder import LiveRecorder
 from veridex.live_recorder.sources import (
     BookDepthSource,
@@ -46,6 +58,21 @@ from veridex.live_recorder.sources import (
     VenueTradeSource,
     marketstate_to_fair_value,
 )
+
+_NO_QUOTE_REASONS: tuple[str, ...] = (
+    "stale",
+    "event_suspension",
+    "boundary",
+    "fee_negative",
+    "liquidity_missing",
+    "risk_cap",
+)
+
+
+def _canonical_hash(payload: dict[str, Any]) -> str:
+    """sha256 hexdigest of a canonical JSON dump (stable, sorted keys) of the decision inputs."""
+    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
 @dataclass(frozen=True)
@@ -155,6 +182,151 @@ async def run_live_recorder(
         recorder.record(event.model_dump())
         counters.events += 1
 
+    def _emit_decision(
+        m: RecorderMarket,
+        snap: BookSnapshot,
+        book_id: str,
+        aligned: FvPoint | None,
+        book_obs_ts: int,
+        decision_recv_ts: int,
+    ) -> None:
+        """Align → decide → record ONE DecisionEvent + matching intent + latency + risk-gates."""
+        decision = decide_fn(aligned, snap, config)
+        counters.decision_seq += 1
+        decision_id = f"dec-{counters.decision_seq}"
+        fv_event_id = counters.fv_ids.get(aligned.sequence_no, "unaligned") if aligned is not None else "unaligned"
+        config_hash = config.config_hash()
+
+        intent_kind = decision.intent_kind
+        no_quote_reason = decision.no_quote_reason or "liquidity_missing"
+        executability = None
+        queue_ahead: float | None = None
+        if intent_kind in ("make", "take"):
+            if decision.native_price is None or decision.desired_size is None:
+                raise ValueError(f"{intent_kind} decision requires native_price and desired_size")
+            if intent_kind == "take":
+                fee_config = decision.fee_config or config
+                executability = measure_take(snap, decision.native_price, decision.desired_size, fee_config)
+                if executability is None:
+                    # No observable ask depth to clear against — abstain honestly (never a fabricated fill).
+                    intent_kind = "no_quote"
+                    no_quote_reason = "liquidity_missing"
+            else:
+                queue_ahead = queue_ahead_at(snap, decision.side, decision.native_price)
+
+        fv_recv_ts = aligned.recv_ts if aligned is not None else decision_recv_ts
+        model_inputs_hash = _canonical_hash(
+            {
+                "fv_event_id": fv_event_id,
+                "book_snapshot_id": book_id,
+                "config_hash": config_hash,
+                "policy_hash": policy_hash,
+                "fv_recv_ts": fv_recv_ts,
+                "decision_recv_ts": decision_recv_ts,
+                "intent_kind": intent_kind,
+            }
+        )
+
+        _record(
+            DecisionEvent(
+                sequence_no=0,
+                event_type="DecisionEvent",
+                source_ts=None,
+                recv_ts=decision_recv_ts,
+                decision_id=decision_id,
+                fixture_id=m.fixture_id,
+                market_ref=m.venue_market_ref,
+                side=m.txline_side,
+                intent_kind=intent_kind,
+                fv_event_id=fv_event_id,
+                book_snapshot_id=book_id,
+                reason_code=decision.reason_code,
+                config_hash=config_hash,
+                policy_hash=policy_hash,
+                model_inputs_hash=model_inputs_hash,
+            )
+        )
+
+        if intent_kind == "make":
+            assert decision.native_price is not None and decision.desired_size is not None
+            _record(
+                QuoteIntentEvent(
+                    sequence_no=0,
+                    event_type="QuoteIntentEvent",
+                    source_ts=None,
+                    recv_ts=decision_recv_ts,
+                    decision_id=decision_id,
+                    native_price=decision.native_price,
+                    desired_size=decision.desired_size,
+                    side=decision.side,
+                    ladder_rung=decision.ladder_rung,
+                    quote_intent_type=decision.quote_intent_type,
+                    queue_ahead_size=queue_ahead,
+                )
+            )
+        elif intent_kind == "take":
+            assert decision.native_price is not None and decision.desired_size is not None
+            assert executability is not None
+            _record(
+                TakeIntentEvent(
+                    sequence_no=0,
+                    event_type="TakeIntentEvent",
+                    source_ts=None,
+                    recv_ts=decision_recv_ts,
+                    decision_id=decision_id,
+                    native_price=decision.native_price,
+                    desired_size=decision.desired_size,
+                    side=decision.side,
+                    executability=executability,
+                )
+            )
+        else:
+            if no_quote_reason not in _NO_QUOTE_REASONS:
+                raise ValueError(f"no_quote_reason {no_quote_reason!r} is not in the closed set {_NO_QUOTE_REASONS}")
+            _record(
+                NoQuoteIntentEvent(
+                    sequence_no=0,
+                    event_type="NoQuoteIntentEvent",
+                    source_ts=None,
+                    recv_ts=decision_recv_ts,
+                    decision_id=decision_id,
+                    no_quote_reason=cast(Any, no_quote_reason),
+                )
+            )
+
+        _record(
+            LatencyEvent(
+                sequence_no=0,
+                event_type="LatencyEvent",
+                source_ts=None,
+                recv_ts=decision_recv_ts,
+                decision_id=decision_id,
+                fv_recv_ts=fv_recv_ts,
+                decision_ts=decision_recv_ts,
+                book_obs_ts=book_obs_ts,
+                chain_ms={
+                    "fv_to_book": book_obs_ts - fv_recv_ts,
+                    "book_to_decision": decision_recv_ts - book_obs_ts,
+                },
+            )
+        )
+
+        for gate, outcome, detail in decision.risk_gates:
+            if outcome not in ("pass", "block"):
+                raise ValueError(f"risk-gate outcome {outcome!r} must be 'pass' or 'block'")
+            _record(
+                RiskGateEvent(
+                    sequence_no=0,
+                    event_type="RiskGateEvent",
+                    source_ts=None,
+                    recv_ts=decision_recv_ts,
+                    decision_id=decision_id,
+                    gate=gate,
+                    outcome=cast(Any, outcome),
+                    detail=detail,
+                )
+            )
+
     async def _consume_fv() -> None:
         try:
             async for state in fv_source.stream():
@@ -206,10 +378,32 @@ async def run_live_recorder(
                 *(book_source.fetch_book(m.token_id) for m in matched),
                 return_exceptions=True,
             )
-            for _m, snap in zip(matched, snapshots, strict=True):
+            for m, snap in zip(matched, snapshots, strict=True):
                 if isinstance(snap, BaseException) or snap is None:
                     continue
-                _record_book(_record, snap)
+                # Book observed on the recorder clock; book_ts stays the venue-native ms.
+                book_obs_ts = int(now_fn())
+                book_id = f"book-{m.token_id}-{book_obs_ts}"
+                _record(
+                    VenueBookSnapshotEvent(
+                        sequence_no=0,
+                        event_type="VenueBookSnapshotEvent",
+                        source_ts=None,
+                        recv_ts=book_obs_ts,
+                        token_id=snap.token_id,
+                        venue_market_ref=snap.venue_market_ref,
+                        book_ts=snap.book_ts,
+                        tick_size=snap.tick_size,
+                        min_price_increment=snap.min_price_increment,
+                        bids=snap.bids,
+                        asks=snap.asks,
+                        is_snapshot=snap.is_snapshot,
+                    )
+                )
+                # Decision's OWN recv_ts drives eligible_fv — the end-to-end no-look-ahead guarantee.
+                decision_recv_ts = int(now_fn())
+                aligned = eligible_fv(fv_hist[(m.fixture_id, m.txline_side)], decision_recv_ts)
+                _emit_decision(m, snap, book_id, aligned, book_obs_ts, decision_recv_ts)
 
             polls += 1
             await sleep_fn(poll_interval_ms / 1000.0)
@@ -224,28 +418,4 @@ async def run_live_recorder(
         events_recorded=counters.events,
         gaps=counters.gaps,
         fv_points=counters.fv_points,
-    )
-
-
-def _record_book(record: Callable[[Any], None], snap: BookSnapshot) -> None:
-    """Wrap a sourced :class:`BookSnapshot` into a recorded :class:`VenueBookSnapshotEvent`.
-
-    The runner supplies the depth fields + ``recv_ts``; the recorder assigns the authoritative
-    ``sequence_no`` on append.
-    """
-    record(
-        VenueBookSnapshotEvent(
-            sequence_no=0,
-            event_type="VenueBookSnapshotEvent",
-            source_ts=None,
-            recv_ts=snap.book_ts,
-            token_id=snap.token_id,
-            venue_market_ref=snap.venue_market_ref,
-            book_ts=snap.book_ts,
-            tick_size=snap.tick_size,
-            min_price_increment=snap.min_price_increment,
-            bids=snap.bids,
-            asks=snap.asks,
-            is_snapshot=snap.is_snapshot,
-        )
     )

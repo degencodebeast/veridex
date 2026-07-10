@@ -168,3 +168,139 @@ def test_runner_sends_no_orders(tmp_path: Path) -> None:
 
     assert isinstance(result, SessionResult)
     assert result.polls == 2
+
+
+def _events_by_type(records_path: Path) -> dict[str, list[dict[str, Any]]]:
+    """Parse a ``records.jsonl`` into ``event_type -> [event dict, ...]``."""
+    out: dict[str, list[dict[str, Any]]] = {}
+    for line in records_path.read_text().splitlines():
+        ev = json.loads(line)
+        out.setdefault(ev["event_type"], []).append(ev)
+    return out
+
+
+# --------------------------------------------------------------------------- E6-T2
+def test_decision_references_and_no_quote_reason(tmp_path: Path) -> None:
+    """E6-T2: a DecisionEvent carries the reference hashes; a no-quote yields an in-set reason.
+
+    Part 1 (references + no-look-ahead END-TO-END): a ``make`` decision records ONE
+    DecisionEvent carrying ``fv_event_id`` / ``book_snapshot_id`` / ``config_hash`` /
+    ``policy_hash``, ms ``recv_ts``, ``source_ts is None``; a matching QuoteIntentEvent (with
+    a book-derived ``queue_ahead_size``); a LatencyEvent; and any RiskGateEvent. The aligned FV
+    the runner passed to ``decide_fn`` has ``recv_ts <= decision.recv_ts`` — a decision never
+    sees FV that had not arrived by its own recv_ts.
+
+    Part 2 (no-quote): an injected ``no_quote`` decision yields a NoQuoteIntentEvent whose
+    ``no_quote_reason`` is in the closed set.
+    """
+    from veridex.live_recorder.recorder import LiveRecorder
+    from veridex.live_recorder.runner import Decision, RecorderMarket, run_live_recorder
+
+    cfg = _config()
+
+    # ---- Part 1: make decision → references + no-look-ahead ----
+    matched = [RecorderMarket(100, "part1", "1X2|home|full", "tok")]
+    fv = FakeFvSource([_fv_state(100, 1_700_000_000, {"part1": 0.6})])
+    book = FakeBookDepthSource({"tok": [_snap("tok", bid=0.4, ask=0.6, size=8.0)]})
+    recorder = LiveRecorder(tmp_path / "s1", _start_meta())
+    seen_aligned: list[Any] = []
+
+    def decide_make(aligned: Any, _snapshot: Any, _config: Any) -> Decision:
+        seen_aligned.append(aligned)
+        return Decision(
+            intent_kind="make",
+            reason_code="join_top",
+            side="bid",
+            native_price=0.4,
+            desired_size=5.0,
+            ladder_rung=0,
+            quote_intent_type="join",
+            risk_gates=(("exposure", "pass", "within cap"),),
+        )
+
+    asyncio.run(
+        run_live_recorder(
+            matched=matched,
+            fv_source=fv,
+            book_source=book,
+            recorder=recorder,
+            decide_fn=decide_make,
+            config=cfg,
+            policy_hash="pol-hash",
+            now_fn=_counter_clock(),
+            sleep_fn=_noop_sleep,
+            max_polls=1,
+        )
+    )
+    recorder.close()
+
+    ev = _events_by_type((tmp_path / "s1" / "records.jsonl"))
+    assert len(ev["DecisionEvent"]) == 1
+    decision = ev["DecisionEvent"][0]
+    assert decision["source_ts"] is None
+    assert isinstance(decision["recv_ts"], int) and decision["recv_ts"] > 0
+    assert decision["config_hash"] == cfg.config_hash()
+    assert decision["policy_hash"] == "pol-hash"
+    assert decision["fv_event_id"] and decision["fv_event_id"] != "unaligned"
+    assert decision["book_snapshot_id"]
+    assert decision["intent_kind"] == "make"
+    assert decision["market_ref"] == "1X2|home|full"
+
+    assert len(ev["QuoteIntentEvent"]) == 1
+    quote = ev["QuoteIntentEvent"][0]
+    assert quote["decision_id"] == decision["decision_id"]
+    assert quote["queue_ahead_size"] == 8.0  # bids resting at price >= 0.4
+
+    assert len(ev["LatencyEvent"]) == 1
+    assert ev["LatencyEvent"][0]["decision_id"] == decision["decision_id"]
+    assert len(ev["RiskGateEvent"]) == 1
+    assert ev["RiskGateEvent"][0]["outcome"] == "pass"
+
+    # A FairValueEvent was recorded with its ARRIVAL recv_ts.
+    assert len(ev["FairValueEvent"]) == 1
+    assert len(ev["VenueBookSnapshotEvent"]) == 1
+
+    # END-TO-END no-look-ahead: the aligned FV had arrived by the decision's own recv_ts.
+    assert len(seen_aligned) == 1
+    aligned = seen_aligned[0]
+    assert aligned is not None
+    assert aligned.recv_ts <= decision["recv_ts"]
+
+    # ---- Part 2: no-quote decision → in-set reason ----
+    fv2 = FakeFvSource([_fv_state(100, 1_700_000_000, {"part1": 0.6})])
+    book2 = FakeBookDepthSource({"tok": [_snap("tok")]})
+    recorder2 = LiveRecorder(tmp_path / "s2", _start_meta())
+
+    def decide_no_quote(_aligned: Any, _snapshot: Any, _config: Any) -> Decision:
+        return Decision(intent_kind="no_quote", reason_code="too_stale", no_quote_reason="stale")
+
+    asyncio.run(
+        run_live_recorder(
+            matched=matched,
+            fv_source=fv2,
+            book_source=book2,
+            recorder=recorder2,
+            decide_fn=decide_no_quote,
+            config=cfg,
+            policy_hash="pol-hash",
+            now_fn=_counter_clock(),
+            sleep_fn=_noop_sleep,
+            max_polls=1,
+        )
+    )
+    recorder2.close()
+
+    ev2 = _events_by_type((tmp_path / "s2" / "records.jsonl"))
+    assert len(ev2["DecisionEvent"]) == 1
+    assert ev2["DecisionEvent"][0]["intent_kind"] == "no_quote"
+    assert len(ev2["NoQuoteIntentEvent"]) == 1
+    no_quote = ev2["NoQuoteIntentEvent"][0]
+    assert no_quote["no_quote_reason"] in {
+        "stale",
+        "event_suspension",
+        "boundary",
+        "fee_negative",
+        "liquidity_missing",
+        "risk_cap",
+    }
+    assert no_quote["no_quote_reason"] == "stale"
