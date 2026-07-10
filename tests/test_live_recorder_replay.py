@@ -100,6 +100,37 @@ def test_replay_drops_truncated_final_line_and_excludes_gap_crossing(tmp_path):
         read_session(session2)
 
 
+def test_gap_window_tamper_breaks_replay_reproduces(tmp_path):
+    session = tmp_path / "s1"
+    rec = LiveRecorder(session, _start_meta())
+    rec.record(_fv_dict(sequence_no=0, recv_ts=100, fv=0.60))
+    rec.record_gap(from_ts=200, to_ts=300, source="venue", reason="disconnect")
+    rec.record(_fv_dict(sequence_no=0, recv_ts=400, fv=0.62))
+    meta = rec.finalize(ended_ts=1_700_000_900)
+    rec.close()
+
+    # pristine artifact reproduces its sealed content hash
+    assert meta.content_hash is not None
+    assert replay_reproduces(session) is True
+
+    # tamper with ONLY the persisted gap line — widen the window and change the reason
+    records_path = session / "records.jsonl"
+    lines = records_path.read_text().splitlines()
+    tampered = []
+    for line in lines:
+        entry = json.loads(line)
+        if entry.get("event_type") == "RecorderGapEvent":
+            entry["to_ts"] = 950
+            entry["reason"] = "tampered"
+            tampered.append(serialize_payload(entry))
+        else:
+            tampered.append(line)
+    records_path.write_text("\n".join(tampered) + "\n")
+
+    # the sealed content hash MUST cover the gap window → tamper is detected
+    assert replay_reproduces(session) is False
+
+
 def test_replay_byte_determinism_and_duplicate_sequence_raises(tmp_path):
     session = tmp_path / "s1"
     rec = LiveRecorder(session, _start_meta())

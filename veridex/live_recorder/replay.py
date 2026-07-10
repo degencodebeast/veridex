@@ -104,9 +104,14 @@ def iter_change_series(
 def replay_reproduces(session_dir: str | Path) -> bool:
     """True iff the content hash recomputed from the sealed bytes matches the recorded one.
 
-    Reads the session back, recomputes :func:`session_content_hash` over the on-disk event
-    stream (which includes any nested executability labels), and compares to the sealed
-    ``meta.content_hash``. Proves the replay is byte-deterministic.
+    Reads the session back, recomputes :func:`session_content_hash` over the FULL on-disk
+    stream — non-gap events AND gap markers together (``compute_evidence_hash`` re-sorts by
+    ``sequence_no``, reconstructing the sealed order) — and compares to the sealed
+    ``meta.content_hash``. Because gaps are part of the seal, a tampered gap window changes
+    the recomputed hash and this returns False. Proves the replay is byte-deterministic.
     """
-    meta, events, _gaps = read_session(session_dir)
-    return meta.content_hash is not None and meta.content_hash == session_content_hash(events)
+    meta, events, gaps = read_session(session_dir)
+    full_stream = events + gaps
+    return meta.content_hash is not None and meta.content_hash == session_content_hash(
+        full_stream
+    )

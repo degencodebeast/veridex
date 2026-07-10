@@ -87,7 +87,14 @@ class LiveRecorder:
         self._events.append(payload)
 
     def record_gap(self, from_ts: int, to_ts: int, source: str, reason: str) -> None:
-        """Write an explicit, labeled gap marker line (never a silent splice)."""
+        """Write an explicit, labeled gap marker line (never a silent splice).
+
+        The gap draws the next monotonic ``sequence_no`` and is appended to the sealed
+        in-memory event stream (``self._events``) so the finalized ``content_hash`` COVERS the
+        gap window — a tampered gap line therefore breaks :func:`replay_reproduces`. Gaps
+        remain honestly labeled ``RecorderGapEvent`` lines, so analysis (gap-crossing
+        exclusion) is unaffected.
+        """
         gap = RecorderGapEvent(
             sequence_no=self._next_seq(),
             event_type="RecorderGapEvent",
@@ -98,13 +105,15 @@ class LiveRecorder:
             source=source,
             reason=reason,
         )
-        self._write_line(gap.model_dump())
+        payload = gap.model_dump()
+        self._write_line(payload)
+        self._events.append(payload)
 
     def finalize(self, *, ended_ts: int) -> LiveRecorderSessionMeta:
         """Seal and write ``meta.json`` (finalize_meta-style) at shutdown.
 
-        Fills ``ended_ts``, ``event_count`` and the sealed ``content_hash`` (over the
-        recorded non-gap event stream) onto the start meta and persists it.
+        Fills ``ended_ts``, ``event_count`` and the sealed ``content_hash`` (over the full
+        recorded event stream — events AND gap markers) onto the start meta and persists it.
         """
         meta = self._start_meta.model_copy(
             update={
