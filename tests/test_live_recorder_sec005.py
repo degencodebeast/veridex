@@ -36,11 +36,11 @@ _FILL_PNL_FIELDS = (
 
 
 def _ex(**kw) -> ExecutabilityMeasurement:
-    base = dict(
-        candidate_price=0.60, available_size_at_price=8.0, cumulative_size_to_clear=8.0,
-        spread=0.02, half_spread=0.01, cost_clearing_threshold=0.60, taker_fee_bps=0,
-        fee_stress_multiplier=4, stale_window_s=120, clears=True, label="COUNTERFACTUAL",
-    )
+    base = {
+        "candidate_price": 0.60, "available_size_at_price": 8.0, "cumulative_size_to_clear": 8.0,
+        "spread": 0.02, "half_spread": 0.01, "cost_clearing_threshold": 0.60, "taker_fee_bps": 0,
+        "fee_stress_multiplier": 4, "stale_window_s": 120, "clears": True, "label": "COUNTERFACTUAL",
+    }
     base.update(kw)
     return ExecutabilityMeasurement(**base)
 
@@ -107,7 +107,7 @@ def test_maker_rank_rejects_r3r4_field():
     # ...but an R3 queue-observation field smuggled into the rank input must raise.
     poisoned = _valid_maker_row()
     poisoned["queue_ahead_size"] = 3.0
-    with pytest.raises(Exception):
+    with pytest.raises(AssertionError):
         rank_makers([poisoned])
 
 
@@ -121,7 +121,7 @@ def test_maker_rank_key_is_self_guarded():
     # (the guard lives INSIDE the key, not only in rank_makers).
     poisoned = _valid_maker_row()
     poisoned["queue_ahead_size"] = 3.0
-    with pytest.raises(Exception):
+    with pytest.raises(AssertionError):
         maker_rank_key(poisoned)
 
 
@@ -131,7 +131,7 @@ def test_direct_sorted_by_maker_rank_key_rejects_r3r4():
     # A direct sort bypassing rank_makers must NOT smuggle an R3/R4 field through.
     poisoned = _valid_maker_row()
     poisoned["queue_ahead_size"] = 3.0
-    with pytest.raises(Exception):
+    with pytest.raises(AssertionError):
         sorted([poisoned], key=maker_rank_key)
 
 
@@ -144,7 +144,7 @@ def test_directional_rank_rejects_r3r4_field():
     # ...but an R4 own-fill field on the directional rank input must raise.
     poisoned = _valid_directional_metrics()
     poisoned["own_fill"] = 1
-    with pytest.raises(Exception):
+    with pytest.raises(AssertionError):
         _rank_key(poisoned)
 
 
@@ -279,5 +279,5 @@ def test_directional_clv_leaderboard_rank_key_is_self_guarded():
     # (the guard lives INSIDE the key, matching scoring._rank_key / maker_rank_key).
     poisoned = _valid_aggregated_clv_row()
     poisoned["queue_ahead_size"] = 3.0
-    with pytest.raises(Exception):
+    with pytest.raises(AssertionError):
         _rank_key(poisoned)

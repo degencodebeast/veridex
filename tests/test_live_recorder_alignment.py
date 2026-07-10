@@ -2,10 +2,10 @@
 import pytest
 
 from veridex.live_recorder.alignment import (
+    FvPoint,
     assert_append_order,
     eligible_fv,
     replay_align,
-    FvPoint,
 )
 
 

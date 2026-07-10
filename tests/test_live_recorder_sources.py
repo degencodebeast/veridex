@@ -220,7 +220,7 @@ def test_marketstate_to_fair_value_rejects_missing_fv() -> None:
     from veridex.live_recorder.sources import marketstate_to_fair_value
 
     state = _fv_state(100, 1710000000, {"part1": 0.62})
-    with pytest.raises(Exception):
+    with pytest.raises(ValueError):
         marketstate_to_fair_value(state, "part2", "1X2|away|full", recv_ts=1, sequence_no=0)
 
 
@@ -230,11 +230,11 @@ def test_missing_credential_fails_closed_and_no_secret_in_output(capsys, tmp_pat
     from veridex.live_recorder.sources import _scrub, configured, require_live_creds
 
     # Fail closed on absent creds — raises before any I/O.
-    with pytest.raises(Exception):
+    with pytest.raises(ValueError):
         require_live_creds(env={})
 
     # A partial env still fails closed (both required creds must be present).
-    with pytest.raises(Exception):
+    with pytest.raises(ValueError):
         require_live_creds(env={"JWT": "only-one"})
 
     # Present creds resolve to the pair (never logged).

@@ -22,13 +22,12 @@ from pathlib import Path
 from typing import Any
 
 from veridex.ingest.marketstate import MarketState
-from veridex.live_recorder.contracts import FillAssumptionConfig, LiveRecorderSessionMeta
+from veridex.live_recorder.contracts import BookLevel, FillAssumptionConfig, LiveRecorderSessionMeta
 from veridex.live_recorder.sources import (
     BookSnapshot,
     FakeBookDepthSource,
     FakeFvSource,
 )
-from veridex.live_recorder.contracts import BookLevel
 
 _FULL_KEY = "1X2_PARTICIPANT_RESULT||"
 
@@ -234,7 +233,7 @@ def test_decision_references_and_no_quote_reason(tmp_path: Path) -> None:
     )
     recorder.close()
 
-    ev = _events_by_type((tmp_path / "s1" / "records.jsonl"))
+    ev = _events_by_type(tmp_path / "s1" / "records.jsonl")
     assert len(ev["DecisionEvent"]) == 1
     decision = ev["DecisionEvent"][0]
     assert decision["source_ts"] is None
@@ -290,7 +289,7 @@ def test_decision_references_and_no_quote_reason(tmp_path: Path) -> None:
     )
     recorder2.close()
 
-    ev2 = _events_by_type((tmp_path / "s2" / "records.jsonl"))
+    ev2 = _events_by_type(tmp_path / "s2" / "records.jsonl")
     assert len(ev2["DecisionEvent"]) == 1
     assert ev2["DecisionEvent"][0]["intent_kind"] == "no_quote"
     assert len(ev2["NoQuoteIntentEvent"]) == 1
@@ -356,7 +355,7 @@ def test_poll_failure_writes_gap_and_shutdown_seals(tmp_path: Path) -> None:
     )
     recorder.close()
 
-    ev = _events_by_type((session_dir / "records.jsonl"))
+    ev = _events_by_type(session_dir / "records.jsonl")
     # First poll failed → an honest gap; the session did NOT abort.
     assert len(ev["RecorderGapEvent"]) == 1
     gap = ev["RecorderGapEvent"][0]

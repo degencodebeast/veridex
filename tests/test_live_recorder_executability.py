@@ -15,6 +15,7 @@ Trust boundaries under test (the whole point of E5):
 """
 
 import pytest
+from pydantic import ValidationError
 
 from veridex.live_recorder.contracts import (
     BookLevel,
@@ -34,16 +35,16 @@ from veridex.live_recorder.sources import BookSnapshot
 
 
 def _snap(**kw) -> BookSnapshot:
-    base = dict(
-        token_id="t",
-        venue_market_ref="m",
-        book_ts=1000,
-        tick_size=0.01,
-        min_price_increment=0.01,
-        bids=(BookLevel(price=0.59, size=10.0),),
-        asks=(BookLevel(price=0.60, size=3.0), BookLevel(price=0.61, size=5.0)),
-        is_snapshot=True,
-    )
+    base = {
+        "token_id": "t",
+        "venue_market_ref": "m",
+        "book_ts": 1000,
+        "tick_size": 0.01,
+        "min_price_increment": 0.01,
+        "bids": (BookLevel(price=0.59, size=10.0),),
+        "asks": (BookLevel(price=0.60, size=3.0), BookLevel(price=0.61, size=5.0)),
+        "is_snapshot": True,
+    }
     base.update(kw)
     return BookSnapshot(**base)
 
@@ -133,7 +134,7 @@ def test_queue_jump_is_derived_not_stored():
     )
     assert qi.queue_ahead_size == 8.0
     # The immutable intent has NO post-decision queue-jump field: constructing one raises.
-    with pytest.raises(Exception):
+    with pytest.raises(ValidationError):
         QuoteIntentEvent(
             sequence_no=2, event_type="QuoteIntentEvent", source_ts=None, recv_ts=107000,
             decision_id="d-107", native_price=0.60, desired_size=5.0, side="part1",
@@ -213,12 +214,12 @@ def test_executability_binds_pinned_fee_config_no_queue_fill_prob():
     tampered = FillAssumptionConfig(
         taker_fee_bps=10, fee_stress_multiplier=2, spread_assumption=0.0, slippage_assumption=0.0
     )
-    with pytest.raises(Exception):
+    with pytest.raises(ValueError):
         measure_take(
             snapshot=snap, candidate_price=0.61, desired_size=5.0, fee_config=tampered,
             pinned_config_hash=pinned_hash,
         )
-    with pytest.raises(Exception):
+    with pytest.raises(ValueError):
         bind_fee_config(tampered, pinned_hash)
 
     # No queue-fill probability / queue simulation ANYWHERE in the measurement output.
