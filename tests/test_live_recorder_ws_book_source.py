@@ -574,3 +574,112 @@ async def test_ws_source_runner_records_gap_during_stale_window(tmp_path: Any) -
     for event in lines:
         if event["event_type"] == "VenueBookSnapshotEvent":
             assert event["token_id"] == BOOK_ASSET_ID
+
+
+# --------------------------------------------------------------------------- W3-5 (fail-closed)
+# A price_change change missing "price" — a MALFORMED frame the merge must fail closed on
+# (invalidate the affected book) rather than let a KeyError kill the consumer and leave the old
+# cached book returning as FRESH. Seeded on BOOK_ASSET_ID (best_bid .50 / best_ask .52).
+_PRICE_CHANGE_MALFORMED_FRAME: dict[str, Any] = {
+    "market": "0x5f65177b394277fd294cd75650044e32ba009a95022d88a0c1d565897d72f8f1",
+    "price_changes": [
+        {
+            "asset_id": BOOK_ASSET_ID,
+            # NO "price" key — malformed change (would KeyError on float(change["price"])).
+            "size": "12",
+            "side": "BUY",
+            "hash": "badc0de",
+            "best_bid": ".51",
+            "best_ask": ".52",
+        }
+    ],
+    "timestamp": "123456789300",
+    "event_type": "price_change",
+}
+
+
+class _SteppedVenueWsConnection:
+    """A scripted WS connection that releases its canned frames one-at-a-time on ``release()``.
+
+    Lets a test observe ``fetch_book`` deterministically BETWEEN frames (each ``release()`` +
+    ``_drain()`` delivers exactly one more frame, then the receive loop parks). Same ``connect``
+    seam contract as ``FakeVenueWsConnection`` (``send_str`` / ``receive`` / ``close``).
+    """
+
+    def __init__(self, frames: Any) -> None:
+        self._frames = [json.dumps(f) for f in frames]
+        self._i = 0
+        self._step = asyncio.Semaphore(0)
+        self._closed_event = asyncio.Event()
+        self.sent: list[str] = []
+        self.pings: list[str] = []
+        self.closed = False
+
+    async def send_str(self, data: str) -> None:
+        from veridex.live_recorder.ws_book_source import _PING
+
+        self.sent.append(data)
+        if data == _PING:
+            self.pings.append(data)
+
+    async def receive(self) -> Any:
+        from veridex.live_recorder.ws_book_source import WsInbound
+
+        await self._step.acquire()  # park until the test releases the next frame
+        if self._i < len(self._frames):
+            text = self._frames[self._i]
+            self._i += 1
+            return WsInbound("text", text)
+        await self._closed_event.wait()
+        return WsInbound("closed", None)
+
+    async def close(self) -> None:
+        self.closed = True
+        self._closed_event.set()
+        self._step.release()  # unblock a parked receive on teardown
+
+    def release(self) -> None:
+        self._step.release()
+
+
+async def test_malformed_price_change_fails_closed_not_stale_as_fresh() -> None:
+    """W3-(5): a malformed price_change (missing "price") must NOT leave the old book fresh.
+
+    Repro of the honesty-boundary defect: seed a token, then feed a same-token price_change with
+    no "price" field. The merge must fail closed (invalidate the book) so ``fetch_book`` RAISES
+    ``StaleVenueBook`` instead of serving the stale cached snapshot as fresh. A subsequent fresh
+    ``book`` re-seeds it back to service.
+    """
+    from veridex.live_recorder.ws_book_source import (
+        FakeVenueBookWs,
+        StaleVenueBook,
+        WsBookDepthSource,
+    )
+
+    conn = _SteppedVenueWsConnection([BOOK_FRAME, _PRICE_CHANGE_MALFORMED_FRAME, BOOK_FRAME])
+    fake = FakeVenueBookWs([conn])
+    clock = {"now": 1000}
+    src = WsBookDepthSource(
+        [BOOK_ASSET_ID],
+        connect=fake.connect,
+        now_fn=lambda: clock["now"],
+        sleep_fn=_block_sleep,
+        max_cache_age_ms=10_000,
+    )
+    await src.start()
+
+    conn.release()  # deliver the seed book
+    await _drain()
+    assert await src.fetch_book(BOOK_ASSET_ID) is not None  # fresh after seed
+
+    conn.release()  # deliver the malformed price_change
+    await _drain()
+    with pytest.raises(StaleVenueBook):
+        await src.fetch_book(BOOK_ASSET_ID)  # MUST fail closed — never the stale book as fresh
+
+    conn.release()  # deliver a fresh re-seed book
+    await _drain()
+    snap = await src.fetch_book(BOOK_ASSET_ID)
+    assert snap is not None and snap.token_id == BOOK_ASSET_ID  # re-seed restores service
+
+    await src.aclose()

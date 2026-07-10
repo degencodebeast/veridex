@@ -566,6 +566,7 @@ class BookStateMaintainer:
                 continue
             old_mid = state.mid
             last_applied: dict[str, Any] | None = None
+            malformed = False
             for change in changes:
                 side = str(change.get("side", "")).upper()
                 if side == "BUY":
@@ -574,13 +575,20 @@ class BookStateMaintainer:
                     book = state.asks
                 else:
                     continue  # unknown side → never guess which book it belongs to
-                price = float(change["price"])
-                size = float(change["size"])
+                try:
+                    price = float(change["price"])
+                    size = float(change["size"])
+                except (KeyError, TypeError, ValueError):
+                    malformed = True  # missing/non-numeric price or size → fail closed on this book
+                    break
                 if size == 0.0:
                     book.pop(price, None)  # size=="0" DELETES the level
                 else:
                     book[price] = size
                 last_applied = change
+            if malformed:
+                state.invalidate()  # malformed change → discard the book, force a fresh re-snapshot
+                continue
             state.last_ts = ts
             state.recompute()
             # Self-validate the merge against the frame's own best_bid/best_ask checksum.
@@ -741,6 +749,16 @@ class WsBookDepthSource:
             await agen.aclose()
 
     def _on_frame(self, frame: VenueBookFrame) -> None:
+        try:
+            self._process_frame(frame)
+        except Exception:  # noqa: BLE001 — fail closed: ANY frame-processing error gaps EVERY cache
+            # A malformed/unexpected frame must NEVER leave a fresh-returning cache. Gap every known
+            # token so ``fetch_book`` raises ``StaleVenueBook`` until a fresh book re-seeds it, and
+            # swallow so the consume task survives to keep processing (a subsequent book re-seeds).
+            for entry in self._entries.values():
+                entry.gapped = True
+
+    def _process_frame(self, frame: VenueBookFrame) -> None:
         self._maintainer.apply_frame(frame)
         if frame.event_type == _GAP:
             # A disconnect gaps EVERY known token — fetch raises until a fresh book re-seeds it.
