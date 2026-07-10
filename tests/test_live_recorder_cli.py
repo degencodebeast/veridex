@@ -114,3 +114,16 @@ def test_cli_help_shows_expected_flags() -> None:
     help_text = cli.build_parser().format_help()
     for flag in ("--fixtures", "--out", "--poll-interval-ms", "--minutes", "--base-url"):
         assert flag in help_text, f"missing operator flag: {flag}"
+
+
+# --------------------------------------------------------------------------- runbook doc-lint
+_RUNBOOK = _REPO_ROOT / "docs" / "maker" / "r3-live-recorder-runbook.md"
+
+
+def test_runbook_honest_wording_and_no_overclaim() -> None:
+    """The runbook states the honest R3-complete / R4-declared-gated ship line with NO overclaim (AC-014)."""
+    text = _RUNBOOK.read_text()
+    low = text.lower()
+    assert "r4 declared/gated, not run" in low, "runbook missing the honest R4 ship-line wording"
+    for forbidden in ("profitable", "real fill", "proven edge", "r4 complete"):
+        assert forbidden not in low, f"runbook overclaims (forbidden phrase present): {forbidden!r}"
