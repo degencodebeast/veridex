@@ -379,7 +379,18 @@ async def run_live_recorder(
                 return_exceptions=True,
             )
             for m, snap in zip(matched, snapshots, strict=True):
-                if isinstance(snap, BaseException) or snap is None:
+                if isinstance(snap, BaseException):
+                    # One bad book never aborts the round: write an honest, labeled gap and continue.
+                    gap_ts = int(now_fn())
+                    recorder.record_gap(
+                        from_ts=gap_ts,
+                        to_ts=gap_ts,
+                        source=m.token_id,
+                        reason=f"book fetch failed: {type(snap).__name__}",
+                    )
+                    counters.gaps += 1
+                    continue
+                if snap is None:
                     continue
                 # Book observed on the recorder clock; book_ts stays the venue-native ms.
                 book_obs_ts = int(now_fn())

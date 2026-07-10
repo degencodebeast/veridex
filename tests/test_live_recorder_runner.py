@@ -304,3 +304,71 @@ def test_decision_references_and_no_quote_reason(tmp_path: Path) -> None:
         "risk_cap",
     }
     assert no_quote["no_quote_reason"] == "stale"
+
+
+# --------------------------------------------------------------------------- E6-T3
+class _FlakyBook:
+    """A book source that RAISES on its first fetch, then returns a canned snapshot."""
+
+    def __init__(self, snap: BookSnapshot) -> None:
+        self._calls = 0
+        self._snap = snap
+
+    async def fetch_book(self, token_id: str) -> BookSnapshot:
+        self._calls += 1
+        if self._calls == 1:
+            raise RuntimeError("boom book fetch")
+        return self._snap
+
+
+def test_poll_failure_writes_gap_and_shutdown_seals(tmp_path: Path) -> None:
+    """E6-T3: a per-poll book-fetch failure writes an honest gap (session CONTINUES); shutdown seals.
+
+    The first poll's ``fetch_book`` raises → a labeled ``RecorderGapEvent`` is written and the
+    session continues; the second poll succeeds and records a DecisionEvent. On shutdown the
+    runner finalizes ``meta.json`` with a ``content_hash`` over the sealed event stream.
+    """
+    from veridex.live_recorder.recorder import LiveRecorder
+    from veridex.live_recorder.runner import Decision, RecorderMarket, run_live_recorder
+
+    matched = [RecorderMarket(100, "part1", "1X2|home|full", "tok")]
+    fv = FakeFvSource([_fv_state(100, 1_700_000_000, {"part1": 0.6})])
+    book = _FlakyBook(_snap("tok"))
+    session_dir = tmp_path / "s"
+    recorder = LiveRecorder(session_dir, _start_meta())
+
+    def decide(_aligned: Any, _snapshot: Any, _config: Any) -> Decision:
+        return Decision(intent_kind="no_quote", reason_code="skip", no_quote_reason="stale")
+
+    result = asyncio.run(
+        run_live_recorder(
+            matched=matched,
+            fv_source=fv,
+            book_source=book,
+            recorder=recorder,
+            decide_fn=decide,
+            config=_config(),
+            policy_hash="pol-hash",
+            now_fn=_counter_clock(),
+            sleep_fn=_noop_sleep,
+            max_polls=2,
+        )
+    )
+    recorder.close()
+
+    ev = _events_by_type((session_dir / "records.jsonl"))
+    # First poll failed → an honest gap; the session did NOT abort.
+    assert len(ev["RecorderGapEvent"]) == 1
+    gap = ev["RecorderGapEvent"][0]
+    assert gap["source"] and gap["reason"]
+    assert result.gaps == 1
+    assert result.polls == 2
+    # Second poll still recorded a book + a decision (one bad poll never aborts the session).
+    assert len(ev["VenueBookSnapshotEvent"]) == 1
+    assert len(ev["DecisionEvent"]) == 1
+
+    # Shutdown sealed meta.json with a content_hash over the full event stream.
+    meta = json.loads((session_dir / "meta.json").read_text())
+    assert meta["content_hash"]
+    assert meta["ended_ts"] is not None
+    assert meta["event_count"] == result.events_recorded + result.gaps
