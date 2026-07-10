@@ -86,3 +86,9 @@ disallow_untyped_defs = false
 # Optional, lazily-imported deps — don't fail typing when they're absent from the base install.
 module = ["agno.*", "psycopg.*"]
 ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+# Vendored third-party client (veridex/venues/_vendor/polymarket_clob/) — not maintained by
+# this project; our code treats its exports as Any, so don't type-gate its internals.
+module = "veridex.venues._vendor.*"
+ignore_errors = true
