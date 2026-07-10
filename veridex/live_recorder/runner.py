@@ -379,7 +379,9 @@ async def run_live_recorder(
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001 — degrade honestly, never crash the recorder
-            print(f"  FV consumer task died — subsequent polls degrade to fv=None: {type(exc).__name__}: {exc}")
+            # TYPE ONLY — never print the raw exception value (a custom FV source's
+            # exception text could carry a secret).
+            print(f"  FV consumer task died — subsequent polls degrade to fv=None: {type(exc).__name__}")
 
     fv_task = asyncio.create_task(_consume_fv())
     # Give the FV task a scheduling slot before the first alignment read (drains canned FV).
