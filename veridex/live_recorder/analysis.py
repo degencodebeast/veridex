@@ -1,4 +1,4 @@
-"""E8 post-session analysis for the live-recorder lane (MM-R3, milestone E8).
+"""E8 post-session analysis / report for the live-recorder lane (MM-R3, milestone E8).
 
 Reads a SEALED session back via :func:`~veridex.live_recorder.replay.read_session` and
 produces an :class:`AnalysisResult` covering cadence, lead-lag, and queue-jump — all
@@ -10,7 +10,8 @@ primitives and reimplements no trust logic:
   consecutive, never-gap-crossing pairs (:func:`_fv_segments_by_market`
   reconstructs the maximal gap-safe chains from those pairs).
 * :func:`scripts.maker.leadlag_probe.compress_to_change_events` /
-  :func:`~scripts.maker.leadlag_probe.run_leadlag_probe` (committed cadence + lead-lag
+  :func:`~scripts.maker.leadlag_probe.run_leadlag_probe` /
+  :func:`~scripts.maker.leadlag_probe.render_markdown` (committed cadence + lead-lag
   primitives, consumed UNCHANGED).
 * :func:`~veridex.live_recorder.executability.derive_queue_jump` (E5) — queue-jump
   derivation, keyed off the recorder's own ``recv_ts`` clock.
@@ -22,9 +23,14 @@ Trust boundaries enforced here (the whole point of E8):
   maximal event chains that :func:`iter_change_series` never spliced across a gap; a
   lead-lag join window is bounded to one such chain's own timestamp range, so a
   book event recorded inside a gap can never enter either series.
-* **COUNTERFACTUAL / observation only (EXE-003, CON-004, GUD-001).** The result
-  carries NO fill / fill-rate / realized-PnL / rank / "profitable" / "executable
-  edge" field. Every executability-adjacent number is COUNTERFACTUAL.
+* **COUNTERFACTUAL / observation only (EXE-003, CON-004, GUD-001).**
+  :func:`render_session_report` contains NO fill / fill-rate / realized-PnL / rank /
+  "profitable" / "executable edge" claim. The only claims rendered are:
+  observed-size-at-price-at-T (COUNTERFACTUAL), cadence (gap-excluded), no-look-ahead
+  replay-reproduced evidence, and R4-prerequisite met/not-met status. When the
+  lead-lag evidence does not support a lead, the report says so HONESTLY — it does
+  NOT splice in :func:`~scripts.maker.leadlag_probe.render_markdown`'s fixed "FV
+  LEADS" narrative unless the probe's own verdict actually says so.
 
 This module itself imports nothing from ``veridex.scoring`` or ``veridex.maker`` directly
 (only the committed ``scripts.maker.leadlag_probe`` analysis script, which is not a trust
@@ -39,8 +45,10 @@ from pathlib import Path
 from typing import Any
 
 from scripts.maker.leadlag_probe import (
+    HEADLINE_THRESHOLD_BPS,
     ProbeResult,
     compress_to_change_events,
+    render_markdown,
     run_leadlag_probe,
 )
 from veridex.live_recorder.contracts import LiveRecorderSessionMeta, VenueBookSnapshotEvent
@@ -57,6 +65,7 @@ __all__ = [
     "QueueJumpObservation",
     "AnalysisResult",
     "analyze_session",
+    "render_session_report",
 ]
 
 #: A ``(fixture_id, market_ref)`` market key, mirroring ``iter_change_series``'s grouping.
@@ -315,3 +324,106 @@ def analyze_session(path: str | Path) -> AnalysisResult:
         replay_reproduced=replay_reproduced,
         r4_prereqs_met=r4_prereqs_met,
     )
+
+
+def _fmt_optional(value: float | None) -> str:
+    return f"{value:.1f}" if value is not None else "n/a"
+
+
+def render_session_report(result: AnalysisResult) -> str:
+    """Render *result* as an observation-only Markdown report.
+
+    Every executability-adjacent reference is labeled ``COUNTERFACTUAL``; the only claims
+    made are observed-size-at-price-at-T, gap-excluded cadence, no-look-ahead
+    replay-reproduced evidence, and R4-prerequisite met/not-met status. When the lead-lag
+    probe's own verdict is NOT an actual lead, the full narrative from
+    :func:`~scripts.maker.leadlag_probe.render_markdown` (whose callout text is fixed to
+    describe a confirmed lead) is deliberately NOT embedded — this section instead states
+    the honest verdict directly, with no overclaim.
+    """
+    lines: list[str] = []
+    lines.append("# Live-recorder session analysis (observation only, COUNTERFACTUAL)")
+    lines.append("")
+    lines.append(
+        "This report is built from a sealed, no-look-ahead-replay-reproduced session. It "
+        "makes ONLY the following claims: observed-size-at-price-at-T (COUNTERFACTUAL), "
+        "gap-excluded cadence, no-look-ahead replay-reproduced evidence, and "
+        "R4-prerequisite met/not-met status."
+    )
+    lines.append("")
+    lines.append(f"- session_ts: `{result.session_meta.session_ts}`")
+    lines.append(f"- fixture_ids: `{result.fixture_ids}`")
+    lines.append(f"- events recorded: {result.n_events}  gaps: {result.n_gaps}")
+    lines.append(f"- no-look-ahead replay-reproduced: {result.replay_reproduced}")
+    lines.append(f"- R4 prerequisites met: {result.r4_prereqs_met}")
+    lines.append("")
+
+    lines.append("## Cadence (gap-excluded FV value-change series)")
+    lines.append("")
+    if not result.cadence_by_market:
+        lines.append("No FV events recorded in this session.")
+    else:
+        lines.append(
+            "| market (fixture_id, market_ref) | fv events | gap-safe changes | "
+            "mean interval (ms) | median interval (ms) |"
+        )
+        lines.append("|---|---|---|---|---|")
+        for summary in result.cadence_by_market:
+            lines.append(
+                f"| {summary.key} | {summary.n_fv_events} | {summary.n_gap_safe_changes} | "
+                f"{_fmt_optional(summary.mean_interval_ms)} | "
+                f"{_fmt_optional(summary.median_interval_ms)} |"
+            )
+    lines.append("")
+
+    lines.append("## Lead-lag (COUNTERFACTUAL data-freshness observation, gap-excluded)")
+    lines.append("")
+    if result.leadlag.verdict.startswith("FV LEADS"):
+        # Only splice in the full narrative when the probe's own verdict actually says so —
+        # its callout text is fixed and would overclaim a lead if reused unconditionally.
+        lines.append(render_markdown(result.leadlag))
+    else:
+        headline = next(
+            (
+                agg
+                for agg in result.leadlag.aggregates
+                if agg.threshold_bps == HEADLINE_THRESHOLD_BPS
+            ),
+            None,
+        )
+        lines.append(f"VERDICT (honest, no overclaim): {result.leadlag.verdict}")
+        lines.append("")
+        lines.append(
+            "No confirmed lead in this session's gap-safe evidence. This is stated "
+            "honestly, not embellished."
+        )
+        if headline is not None:
+            lines.append("")
+            lines.append(
+                f"- headline (50 bps) NEXT hit rate: {headline.next_rate!r} "
+                f"(n={headline.next_n})"
+            )
+    lines.append("")
+
+    lines.append(
+        "## Queue-jump (COUNTERFACTUAL — derived from the recorded post-decision book "
+        "stream only)"
+    )
+    lines.append("")
+    if not result.queue_jump:
+        lines.append("No decision-time quote intents recorded in this session.")
+    else:
+        lines.append("| decision_id | outbid_within_ms | stepped_ahead_count |")
+        lines.append("|---|---|---|")
+        for observation in result.queue_jump:
+            outbid = (
+                observation.outbid_within_ms
+                if observation.outbid_within_ms is not None
+                else "n/a"
+            )
+            lines.append(
+                f"| {observation.decision_id} | {outbid} | {observation.stepped_ahead_count} |"
+            )
+    lines.append("")
+
+    return "\n".join(lines)

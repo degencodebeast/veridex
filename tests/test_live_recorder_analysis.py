@@ -1,8 +1,14 @@
 """E8 post-session-analysis tests for the live-recorder lane (MM-R3, milestone E8).
 
-Trust boundary under test here (E8-T1): gaps excluded from analysis (AC-008) — a
-cadence/lead-lag series computed from a sealed session must NEVER let a change event span
-a recorded gap window, and the analysis result carries no fill/PnL/rank/realized/edge field.
+Trust boundaries under test:
+
+* E8-T1: gaps excluded from analysis (AC-008) — a cadence/lead-lag series computed from a
+  sealed session must NEVER let a change event span a recorded gap window, and the analysis
+  result carries no fill/PnL/rank/realized/edge field.
+* E8-T2: COUNTERFACTUAL / observation only (EXE-003, CON-004, GUD-001) — the rendered report
+  carries NO fill / fill-rate / realized-PnL / rank / "profitable" / "executable edge" claim,
+  and an honest "no confirmed lead" verdict is stated plainly (never overclaimed via the
+  lead-lag probe's fixed "FV LEADS" narrative).
 """
 
 from __future__ import annotations
@@ -17,6 +23,18 @@ MARKET_REF = "1X2|home|full"
 
 # A produced field/claim must never carry one of these substrings (case-insensitive).
 _FORBIDDEN_FIELD_SUBSTRINGS = ("fill", "pnl", "realized", "edge", "rank", "score_run")
+
+# Forbidden CLAIM phrases in rendered report text -- exact fill/PnL/rank/edge claims, never
+# the honest disclaiming vocabulary already used throughout this lane (e.g. "COUNTERFACTUAL").
+_FORBIDDEN_REPORT_PHRASES = (
+    "fill_price",
+    "filled_size",
+    "realized_pnl",
+    "real_executable_edge_bps",
+    "executable edge",
+    "profitable",
+    "fill rate",
+)
 
 
 def _start_meta() -> LiveRecorderSessionMeta:
@@ -114,3 +132,38 @@ def test_analysis_excludes_gaps_and_is_counterfactual_only(tmp_path):
         "NO CONFIRMED LEAD",
         "FV LEADS (modest, latency-driven)",
     }
+
+
+# --------------------------------------------------------------------------- E8-T2
+def test_report_is_observation_labeled(tmp_path):
+    from veridex.live_recorder.analysis import analyze_session, render_session_report
+
+    # A small session with insufficient gap-safe evidence for a confirmed lead (well below
+    # the leadlag probe's warmup) -- the honest verdict must be a "no lead" one, not "FV LEADS".
+    session = tmp_path / "s2"
+    rec = LiveRecorder(session, _start_meta())
+    rec.record(_fv(recv_ts=100, fv=0.60))
+    rec.record(_fv(recv_ts=200, fv=0.62))
+    rec.record(_book(recv_ts=110, bid=0.59, ask=0.61))
+    rec.record(_book(recv_ts=210, bid=0.61, ask=0.63))
+    rec.finalize(ended_ts=1_700_000_500)
+    rec.close()
+
+    result = analyze_session(session)
+    assert not result.leadlag.verdict.startswith("FV LEADS")  # confirms the honest-no-lead path
+
+    report = render_session_report(result)
+
+    # executability is labeled COUNTERFACTUAL wherever it is referenced
+    assert "COUNTERFACTUAL" in report
+
+    # no forbidden CLAIM phrase anywhere in the rendered text
+    lowered_report = report.lower()
+    for phrase in _FORBIDDEN_REPORT_PHRASES:
+        assert phrase not in lowered_report
+
+    # a no-lead result is stated HONESTLY -- the verdict appears, and the probe's fixed
+    # "FV LEADS" narrative (which would overclaim a lead) is never spliced in
+    assert result.leadlag.verdict in report
+    assert "FV LEADS the venue mid" not in report
+    assert "no overclaim" in report.lower() or "honestly" in report.lower()
