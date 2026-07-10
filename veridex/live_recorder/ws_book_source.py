@@ -186,7 +186,7 @@ async def stream_venue_book_frames(
     *,
     ws_url: str = _MARKET_WS_URL,
     connect: Callable[[str], Awaitable[Any]] | None = None,
-    now_fn: Callable[[], float],
+    now_fn: Callable[[], int],
     sleep_fn: Callable[[float], Awaitable[None]] = asyncio.sleep,
 ) -> AsyncIterator[VenueBookFrame]:
     """Stream Polymarket market-channel frames as :class:`VenueBookFrame`s (arrival-stamped).

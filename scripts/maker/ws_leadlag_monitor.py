@@ -40,6 +40,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import bisect
 import contextlib
 import itertools
 import json
@@ -310,10 +311,10 @@ def direct_arrival_leads(events: list[MonitorEvent]) -> list[int]:
     for ev in ordered:
         if ev.source != "venue" or ev.mid is None:
             continue
-        prior = [r for r in fv_change_recvs if r <= ev.recv_ts]
-        if not prior:
+        idx = bisect.bisect_right(fv_change_recvs, ev.recv_ts)
+        if not idx:
             continue  # no comparable FV change — not scored (honest: no data, not a fabricated 0)
-        leads.append(ev.recv_ts - max(prior))
+        leads.append(ev.recv_ts - fv_change_recvs[idx - 1])
     return leads
 
 

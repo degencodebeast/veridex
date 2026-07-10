@@ -58,24 +58,6 @@ PRICE_CHANGE_FRAME: dict[str, Any] = {
     "event_type": "price_change",
 }
 
-# --- price_change with a size=="0" DELETE (hand-crafted per W0 note; for W2) ------------
-PRICE_CHANGE_DELETE_FRAME: dict[str, Any] = {
-    "market": "0x5f65177b394277fd294cd75650044e32ba009a95022d88a0c1d565897d72f8f1",
-    "price_changes": [
-        {
-            "asset_id": BOOK_ASSET_ID,
-            "price": ".49",
-            "size": "0",
-            "side": "BUY",
-            "hash": "0deadbeef",
-            "best_bid": ".48",
-            "best_ask": ".52",
-        }
-    ],
-    "timestamp": "1757908892400",
-    "event_type": "price_change",
-}
-
 # --- best_bid/best_ask MISMATCH case (hand-crafted checksum-divergence; for W2) ---------
 PRICE_CHANGE_MISMATCH_FRAME: dict[str, Any] = {
     "market": "0x5f65177b394277fd294cd75650044e32ba009a95022d88a0c1d565897d72f8f1",
