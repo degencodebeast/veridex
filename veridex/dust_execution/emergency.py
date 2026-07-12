@@ -46,9 +46,20 @@ from veridex.dust_execution.contracts import (
     CancelAllCause,
     CancelAllTriggeredEvent,
 )
+from veridex.dust_execution.risk import RiskAccumulator
 
 # The two cancel-all lifecycle events the primitive emits into the session stream.
 CancelAllEvent = CancelAllTriggeredEvent | CancelAllAck
+
+
+class ReArmDenied(Exception):
+    """A re-arm precondition could not be POSITIVELY satisfied — the emergency stop STAYS engaged.
+
+    Raised by :meth:`SafetyController.re_arm` when open-order reconciliation is not clean, the
+    risk-state was not reloaded (SAF-002c), or the operator did not explicitly authorize the
+    re-arm. Fail-closed is the whole point: clearing the stop is the dangerous action, so it
+    happens ONLY when every guard is green — never as a side effect of the stop path (SAF-004).
+    """
 
 
 @runtime_checkable
@@ -61,6 +72,18 @@ class CancelAllAdapter(Protocol):
     """
 
     async def cancel_all_orders(self) -> int: ...
+
+
+@runtime_checkable
+class OpenOrderReconciler(Protocol):
+    """Venue seam the SEPARATE re-arm op consults: how many resting orders are STILL open.
+
+    Re-arm may proceed only once reconciliation reports ZERO open orders — a non-zero count means
+    capital is still exposed at the venue, so re-arming would re-open trading on top of dangling
+    orders. Full reconciliation lands in E4; this is the minimal seam re-arm fails closed against.
+    """
+
+    async def open_order_count(self) -> int: ...
 
 
 def _default_clock_ms() -> int:
@@ -167,6 +190,72 @@ class SafetyController:
     ) -> CancelAllAck:
         """Circuit-breaker-open trigger (E2-T3) — routes to the single primitive (``breaker``)."""
         return await self.cancel_all_and_block("breaker", adapter=adapter, session=session)
+
+    async def on_kill_switch(
+        self, *, adapter: CancelAllAdapter, session: DustSafetySession
+    ) -> CancelAllAck:
+        """Kill-switch engage trigger (E2-T4) — routes to the single primitive (``kill_switch``).
+
+        Engage-only and idempotent by construction: the FIRST engage fires the ONE cancel-all wire
+        once and blocks submits; every SUBSEQUENT engage (e.g. a client retry after an uncertain
+        control-plane ACK) is a no-op that STAYS blocked, does NOT re-fire the wire, and re-enables
+        nothing — the primitive never toggles. The stop can be cleared ONLY by the SEPARATE
+        :meth:`re_arm` op, never by re-engaging (SAF-004).
+        """
+        return await self.cancel_all_and_block("kill_switch", adapter=adapter, session=session)
+
+    async def re_arm(
+        self,
+        *,
+        session: DustSafetySession,
+        reconciler: OpenOrderReconciler,
+        risk: RiskAccumulator | None,
+        operator_authorized: bool,
+    ) -> None:
+        """SEPARATE, fail-closed re-arm — the ONLY path that clears the emergency stop (SAF-004).
+
+        Structurally distinct from every stop trigger: a stop can NEVER re-arm as a side effect.
+        Clears ``submit_blocked`` ONLY when ALL THREE preconditions are positively satisfied, and
+        raises :class:`ReArmDenied` (leaving the stop ENGAGED) the moment any one is not:
+
+        1. **Explicit operator authorization** — a deliberate operator act, not an implicit retry.
+        2. **Risk-state reload (SAF-002c)** — a fresh accumulator rebuilt from the durable ledger
+           via :func:`~veridex.dust_execution.ledger.reconstruct_risk` MUST be supplied, so the
+           loss caps that fail-close Mode B are re-established before trading may resume.
+        3. **Open-order reconciliation** — the venue must report ZERO resting orders; any non-zero
+           count means capital is still exposed, so re-arming is refused.
+
+        The checks run auth → risk → reconciliation, evaluating the wire (reconciliation) LAST and
+        only once the cheap authorization/risk guards are green. On success the block is cleared
+        and the recorded block cause + ack are reset so a fresh stop starts clean.
+
+        Args:
+            session: The blocked runtime session to re-arm.
+            reconciler: The open-order reconciliation seam; its ``open_order_count`` is awaited.
+            risk: The reloaded risk accumulator (from ``reconstruct_risk``); ``None`` fails closed.
+            operator_authorized: Whether an operator explicitly authorized this re-arm.
+
+        Raises:
+            ReArmDenied: Any precondition is not positively satisfied; the stop stays engaged.
+        """
+        if not operator_authorized:
+            raise ReArmDenied("re-arm requires explicit operator authorization")
+        if risk is None:
+            raise ReArmDenied(
+                "re-arm requires a reloaded risk-state (reconstruct_risk) before trading may "
+                "resume (SAF-002c)"
+            )
+        open_orders = await reconciler.open_order_count()
+        if open_orders != 0:
+            raise ReArmDenied(
+                f"re-arm requires zero open orders after reconciliation; {open_orders} still "
+                "resting at the venue"
+            )
+
+        # All three preconditions positively satisfied — clear the stop (the ONLY place it clears).
+        session.submit_blocked = False
+        session.block_cause = None
+        session.last_cancel_all_ack = None
 
     def check_can_submit(self, session: DustSafetySession) -> bool:
         """Return whether a new submit is admitted — ``False`` once cancel-all has blocked.

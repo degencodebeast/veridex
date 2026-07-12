@@ -1123,7 +1123,14 @@ def create_app(
         principal: str | None = Depends(_require_operator),  # noqa: B008
         dep_store: Store = Depends(_get_store),  # noqa: B008
     ) -> KillSwitchResponse:
-        """Flip the competition's policy-envelope kill-switch (control-plane write; fail-closed).
+        """ENGAGE the competition's policy-envelope kill-switch (control-plane write; fail-closed).
+
+        Engage-ONLY and idempotent (SAF-004): this SETS the kill-switch True — it never toggles.
+        The first engage stops trading; every subsequent engage (e.g. a client retry after an
+        uncertain control-plane ACK) is a no-op that KEEPS the stop engaged and re-enables nothing.
+        Clearing the stop is impossible here — it requires the SEPARATE, reconciled
+        ``POST /competitions/{id}/re-arm`` operation. (A toggle would let a duplicate call flip the
+        stop OFF and re-open trading — precisely the bug this endpoint forbids.)
 
         Args:
             competition_id: The competition to update.
@@ -1131,7 +1138,7 @@ def create_app(
             dep_store: Injected store dependency.
 
         Returns:
-            A :class:`~veridex.api.schemas.KillSwitchResponse` with the new kill-switch state.
+            A :class:`~veridex.api.schemas.KillSwitchResponse` with ``kill_switch`` always True.
 
         Raises:
             HTTPException: 401 (unauthenticated), 403 (wrong owner), 404 (unknown competition).
@@ -1143,14 +1150,81 @@ def create_app(
         _check_owner(competition, principal)
 
         envelope = competition.config.policy_envelope or _default_policy_envelope()
-        flipped = envelope.model_copy(update={"kill_switch": not envelope.kill_switch})
-        new_config = competition.config.model_copy(update={"policy_envelope": flipped})
+        # ENGAGE-ONLY: explicitly SET True (never `not envelope.kill_switch`). A repeat engage on an
+        # already-engaged switch is an idempotent no-op that keeps the stop on — it cannot re-open.
+        engaged = envelope.model_copy(update={"kill_switch": True})
+        new_config = competition.config.model_copy(update={"policy_envelope": engaged})
         await dep_store.update_competition_config(competition_id, new_config)
 
         return KillSwitchResponse(
             competition_id=competition_id,
-            kill_switch=flipped.kill_switch,
-            status="kill_switch_on" if flipped.kill_switch else "kill_switch_off",
+            kill_switch=True,
+            status="kill_switch_on",
+        )
+
+    # --- POST /competitions/{competition_id}/re-arm (auth) ----------------
+
+    @app.post("/competitions/{competition_id}/re-arm", response_model=KillSwitchResponse)
+    async def re_arm_endpoint(
+        competition_id: str,
+        body: dict[str, Any] | None = None,
+        principal: str | None = Depends(_require_operator),  # noqa: B008
+        dep_store: Store = Depends(_get_store),  # noqa: B008
+    ) -> KillSwitchResponse:
+        """Re-arm (clear the kill-switch) — a SEPARATE, fail-closed control-plane op (SAF-004/002c).
+
+        Deliberately NOT the kill-switch endpoint: engaging the stop can never re-arm it, and
+        re-arming is the dangerous direction, so it is gated by three preconditions that must ALL
+        be positively satisfied before trading may resume:
+
+        1. **Explicit operator authorization** — the request body MUST carry ``{"authorize": true}``
+           (a valid operator token alone is not enough; re-arm is a deliberate act).
+        2. **Open-order reconciliation** — the venue must be confirmed to hold ZERO resting orders.
+        3. **Risk-state reload (SAF-002c)** — the realized-loss caps must be rebuilt from the
+           durable ledger via ``reconstruct_risk`` before the stop clears.
+
+        Full reconciliation + risk-reload wiring for a live R4-A session lands in E4. Until then a
+        control-plane competition has NO attached live-execution runtime to reconcile against, so
+        preconditions (2)/(3) cannot be positively satisfied and this op FAILS CLOSED with 409 —
+        the kill-switch is left ENGAGED. This endpoint therefore NEVER re-opens trading in this
+        build; it exists to prove re-arm is structurally separate and fail-closed.
+
+        Args:
+            competition_id: The competition to re-arm.
+            body: JSON body; must include ``{"authorize": true}`` for explicit operator auth.
+            principal: The authenticated operator principal (injected by ``_require_operator``).
+            dep_store: Injected store dependency.
+
+        Returns:
+            A :class:`~veridex.api.schemas.KillSwitchResponse` (only on a future successful re-arm).
+
+        Raises:
+            HTTPException: 401 (unauthenticated), 403 (wrong owner / not authorized),
+                404 (unknown competition), 409 (fail-closed: reconciliation/risk-reload unmet).
+        """
+        try:
+            competition = await dep_store.get_competition(competition_id)
+        except KeyError:
+            raise HTTPException(status_code=404, detail=f"competition {competition_id!r} not found") from None
+        _check_owner(competition, principal)
+
+        # Precondition 1: explicit operator authorization (beyond mere authentication).
+        if (body or {}).get("authorize") is not True:
+            raise HTTPException(
+                status_code=403,
+                detail="re-arm requires explicit operator authorization ({'authorize': true})",
+            )
+
+        # Preconditions 2 & 3 (open-order reconciliation + SAF-002c risk-state reload) require a
+        # live R4-A execution runtime attached to the competition. That wiring lands in E4; absent
+        # it, re-arm cannot positively confirm zero resting orders or reload the loss caps, so it
+        # FAILS CLOSED and leaves the kill-switch engaged (never re-opens trading).
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "re-arm fail-closed: open-order reconciliation and risk-state reload (SAF-002c) "
+                "cannot be satisfied without a live execution runtime; kill-switch stays engaged"
+            ),
         )
 
     # --- POST /executions/{execution_id}/approve (auth) -------------------
