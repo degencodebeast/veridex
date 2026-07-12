@@ -43,13 +43,22 @@ __all__ = [
 #:
 #: The set ALSO carries the ACTUAL contract attribute names that ``event.model_dump()`` yields
 #: as rank-row keys, so a leaked dumped event is caught by exact key name (defense-in-depth, not
-#: just the friendly canonical alias): ``fill_size`` (``OwnFillEvent``), ``net_inventory``
-#: (``InventoryEvent``), ``markout_bps`` (``PostTradeMarkoutEvent``), ``reconciled_fill_size``
-#: (``RealFillReconciliation``), and ``realized_loss_session`` / ``realized_loss_daily``
-#: (``SessionRiskSnapshot``). Non-alpha operational/intent fields (``status``,
-#: ``reconciled_state``, ``open_order_count``, ``breaker_open``, ``kill_switch_engaged``,
-#: ``side``, ``venue_order_id``, ``reference_price``, ``horizon_ms``, ``token_id``) and
-#: ``real_executable_edge_bps`` are DELIBERATELY excluded.
+#: just the friendly canonical alias). Gate #1 MAJOR-4 (Codex) showed the earlier 13-field set
+#: omitted whole outcome events: an ``OrderCancelEvent`` / ``OrderAckEvent`` dump, or a
+#: ``PostTradeMarkoutEvent`` with ``markout_bps`` removed, passed all three rank guards. Every
+#: realized-execution OUTCOME/DIAGNOSTIC attribute across ``contracts.py`` is now denied:
+#: ``fill_size`` / ``fill_ts`` (``OwnFillEvent``), ``status`` / ``filled_size`` (``OrderStatusEvent``),
+#: ``canceled`` (``OrderCancelEvent`` — its SOLE outcome field), ``ack_status`` (``OrderAckEvent``
+#: — its sole outcome field), ``reconciled_state`` / ``reconciled_fill_size``
+#: (``RealFillReconciliation``), ``net_inventory`` (``InventoryEvent``), ``reference_price`` /
+#: ``markout_bps`` (``PostTradeMarkoutEvent`` — ``reference_price`` REVERSES E1-T5's earlier
+#: exclusion: it leaks a markout diagnostic), and ``realized_loss_session`` /
+#: ``realized_loss_daily`` (``SessionRiskSnapshot``). Pure operational/safety counters that do NOT
+#: reveal alpha are DELIBERATELY excluded (``open_order_count``, ``breaker_open``,
+#: ``kill_switch_engaged``, ``canceled_count``, ``trigger_cause``, ``reject_reason``,
+#: ``reconciliation_path``, ``surfaces_queried``, ``uncertain_state``), as are envelope/join/intent/
+#: config/label fields (``side``, ``venue_order_id``, ``horizon_ms``, ``token_id`` …) and
+#: ``real_executable_edge_bps``.
 R4A_EXECUTION_DENYLIST_FIELDS = frozenset(
     {
         # --- canonical rank-input concept names ---
@@ -67,6 +76,13 @@ R4A_EXECUTION_DENYLIST_FIELDS = frozenset(
         "reconciled_fill_size",
         "realized_loss_session",
         "realized_loss_daily",
+        # --- Gate #1 MAJOR-4: remaining per-event OUTCOME/DIAGNOSTIC attributes ---
+        "canceled",          # OrderCancelEvent — sole outcome field
+        "ack_status",        # OrderAckEvent — sole outcome field
+        "status",            # OrderStatusEvent — fill-lifecycle outcome
+        "reconciled_state",  # RealFillReconciliation — reconciliation outcome
+        "fill_ts",           # OwnFillEvent — fill timestamp = evidence a fill occurred
+        "reference_price",   # PostTradeMarkoutEvent — markout diagnostic (reverses E1-T5)
     }
 )
 

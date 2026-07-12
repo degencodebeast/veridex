@@ -175,11 +175,42 @@ VALID_DIR = {"avg_clv_bps": 0.0, "total_clv_bps": 0.0, "brier": 0.0, "max_drawdo
 # Codex-M2/Fable-m1: parametrize + assert EXACT equality over an INDEPENDENT literal — NOT the
 # production set. `<=` (subset) over the production set is inert: dropping a field shrinks BOTH the
 # set AND the parametrization, so nothing fails. The independent literal is the ground truth.
-EXPECTED_R4A_FIELDS = frozenset({"own_fill", "filled_size", "fill_price", "realized_pnl", "inventory",
-                                 "real_fill_reconciliation", "post_trade_markout",
-                                 # ACTUAL contracts.py attribute names (what model_dump() yields as rank-row keys):
-                                 "fill_size", "net_inventory", "markout_bps", "reconciled_fill_size",
-                                 "realized_loss_session", "realized_loss_daily"})
+#
+# GENUINELY INDEPENDENT hand-classification (Gate#1 MAJOR-4): built by walking EVERY field of
+# EVERY event in dust_execution/contracts.py and classifying it as a realized-execution
+# OUTCOME/DIAGNOSTIC (deny) vs envelope/join/intent/config/label/operational (allow). This is the
+# ground-truth set the production `R4A_EXECUTION_DENYLIST_FIELDS` must EQUAL — never a copy of it.
+# Each entry is annotated with its source event so the classification is auditable field-by-field.
+EXPECTED_R4A_FIELDS = frozenset({
+    # --- OrderStatusEvent (contracts.py) — the fill-lifecycle outcome ---
+    "status",         # partial/filled/rejected/expired/unresolved — did/what a fill did
+    "filled_size",    # matched size
+    "fill_price",     # matched price (also OwnFillEvent)
+    # --- OwnFillEvent — a realized own fill ---
+    "fill_size",      # realized fill magnitude
+    "fill_ts",        # fill timestamp = evidence a fill occurred
+    # --- OrderCancelEvent — its SOLE outcome field ---
+    "canceled",       # without it the whole cancel dump leaks
+    # --- OrderAckEvent — its sole outcome field ---
+    "ack_status",     # venue ack outcome
+    # --- RealFillReconciliation — reconciliation outcome ---
+    "reconciled_state",      # tri-state reconciliation verdict
+    "reconciled_fill_size",  # reconciled realized size
+    # --- InventoryEvent — net position diagnostic (AC-015) ---
+    "net_inventory",
+    # --- PostTradeMarkoutEvent — markout diagnostic (AC-014) ---
+    "reference_price",  # markout reference (Gate#1 MAJOR-4 REVERSES E1-T5's exclusion: it leaks a markout diagnostic)
+    "markout_bps",      # the markout value
+    # --- SessionRiskSnapshot — realized-loss (PnL) magnitudes ---
+    "realized_loss_session",
+    "realized_loss_daily",
+    # --- canonical rank-input CONCEPT aliases (defense-in-depth, not contract attr names) ---
+    "own_fill",
+    "realized_pnl",
+    "inventory",
+    "real_fill_reconciliation",
+    "post_trade_markout",
+})
 @pytest.mark.parametrize("field", sorted(EXPECTED_R4A_FIELDS))
 def test_all_three_surfaces_reject_every_r4a_field(field):
     for keyfn, base in ((dir_key, VALID_DIR), (clv_key, VALID_DIR), (maker_rank_key, {})):
@@ -192,6 +223,77 @@ def test_r4a_field_set_equals_expected_and_is_denylisted():
     assert EXPECTED_R4A_FIELDS <= R3_R4_RANK_DENYLIST             # and the canonical set is enforced
 def test_real_executable_edge_bps_stays_excluded():
     assert dir_key({**VALID_DIR, "real_executable_edge_bps": None}) is not None  # does NOT raise
+
+
+# --- PRIMARY model-derived proof (Gate#1 MAJOR-4): reject REAL event dumps, not a hand literal ---
+# For each realized-execution OUTCOME event, build a VALID instance, model_dump() it, merge the dump
+# into a COMPLETE valid rank-metrics row, and assert ALL THREE rank surfaces raise (incl. the direct
+# sorted(..., key=...) bypass). This proves rejection against the actual contract wire shape — so a
+# NEW outcome field that the hand literal forgot is still caught here the moment it enters a dump.
+from veridex.dust_execution.contracts import (  # noqa: E402
+    OrderCancelEvent,
+    OrderAckEvent,
+    OrderStatusEvent,
+    OwnFillEvent as _OwnFillEvent,
+    RealFillReconciliation as _RealFillReconciliation,
+    InventoryEvent,
+    PostTradeMarkoutEvent,
+)
+
+
+def _outcome_event_dumps() -> list[tuple[str, dict]]:
+    """Every realized-execution OUTCOME event, as its real ``model_dump()`` rank-row payload.
+
+    Includes the ``PostTradeMarkoutEvent`` MINUS ``markout_bps`` case (Codex MAJOR-4 repro): with
+    the obvious markout value removed, ``reference_price`` ALONE must still be rejected.
+    """
+    cancel = OrderCancelEvent(sequence_no=1, event_type="OrderCancelEvent", source_ts=None,
+                              recv_ts=1000, decision_id="d1", client_order_id="c1",
+                              venue_order_id="v1", canceled=True)
+    ack = OrderAckEvent(sequence_no=1, event_type="OrderAckEvent", source_ts=None, recv_ts=1000,
+                        decision_id="d1", client_order_id="c1", venue_order_id="v1",
+                        ack_status="matched")
+    ostatus = OrderStatusEvent(sequence_no=1, event_type="OrderStatusEvent", source_ts=None,
+                               recv_ts=1000, decision_id="d1", client_order_id="c1",
+                               venue_order_id="v1", status="partial", filled_size=1.0,
+                               fill_price=0.5)
+    own = _OwnFillEvent(sequence_no=1, event_type="OwnFillEvent", source_ts=None, recv_ts=1000,
+                        decision_id="d1", client_order_id="c1", venue_order_id="v1", side="buy",
+                        fill_price=0.6, fill_size=1.0, fill_ts=1000)
+    recon = _RealFillReconciliation(sequence_no=1, event_type="RealFillReconciliation",
+                                    source_ts=None, recv_ts=1000, decision_id="d1",
+                                    venue_order_key="vk1", reconciled_state="RESOLVED",
+                                    reconciled_fill_size=1.0)
+    inv = InventoryEvent(sequence_no=1, event_type="InventoryEvent", source_ts=None, recv_ts=1000,
+                         token_id="t1", net_inventory=5.0)
+    markout = PostTradeMarkoutEvent(sequence_no=1, event_type="PostTradeMarkoutEvent",
+                                    source_ts=None, recv_ts=1000, decision_id="d1", horizon_ms=100,
+                                    reference_price=0.5, markout_bps=10.0)
+    markout_no_bps = markout.model_dump()
+    del markout_no_bps["markout_bps"]  # Codex repro: reference_price ALONE must still be rejected
+    return [
+        ("OrderCancelEvent", cancel.model_dump()),
+        ("OrderAckEvent", ack.model_dump()),
+        ("OrderStatusEvent", ostatus.model_dump()),
+        ("OwnFillEvent", own.model_dump()),
+        ("RealFillReconciliation", recon.model_dump()),
+        ("InventoryEvent", inv.model_dump()),
+        ("PostTradeMarkoutEvent", markout.model_dump()),
+        ("PostTradeMarkoutEvent-minus-markout_bps", markout_no_bps),
+    ]
+
+
+@pytest.mark.parametrize("event_name,dump", _outcome_event_dumps(), ids=[n for n, _ in _outcome_event_dumps()])
+def test_complete_outcome_event_dumps_rejected_by_all_rank_surfaces(event_name, dump):
+    # Merge the REAL event dump into a complete valid rank row; the guard runs FIRST on every
+    # surface, so an outcome field in the dump raises AssertionError (not KeyError) on all three
+    # — including the raw sorted(..., key=...) path an attacker might use to bypass a wrapper.
+    for keyfn, base in ((dir_key, VALID_DIR), (clv_key, VALID_DIR), (maker_rank_key, {})):
+        row = {**base, **dump}
+        with pytest.raises(AssertionError):
+            keyfn(row)
+        with pytest.raises(AssertionError):
+            sorted([row], key=keyfn)
 
 
 # =====================================================================================
