@@ -100,6 +100,43 @@ class RiskAccumulator:
         self._net_day = 0.0
         self._current_day: datetime | None = None
 
+    @classmethod
+    def seeded(
+        cls,
+        *,
+        session_id: str,
+        net_session: float,
+        net_day: float,
+        current_day: datetime | None,
+    ) -> RiskAccumulator:
+        """Construct an accumulator pre-loaded with reconstructed session + current-UTC-day nets.
+
+        Restart-safe seeding path for :func:`veridex.dust_execution.ledger.reconstruct_risk`. The
+        ledger computes the fee-inclusive net PnL summed over ALL persisted fills (session) and
+        over ONLY the fills in ``now``'s UTC day (daily) via a DIRECT UTC-day filter, then seeds
+        both here. Daily is thereby DECOUPLED from replay ORDER and from any venue clock skew: a
+        fill dated on a LATER UTC day than ``now`` can no longer advance the daily window past today
+        (the forward-only-rollover under-count the old marker-replay path suffered — SAF-002c /
+        Gate#1 MINOR-1). Subsequent LIVE fills still flow through :meth:`apply_realized_fill` — the
+        anti-inert, type-gated entry point — whose forward-only rollover then rolls the day at the
+        NEXT real UTC-midnight crossing because ``current_day`` is seeded to today.
+
+        Args:
+            session_id: Session identity for the accumulator.
+            net_session: Fee-inclusive signed net PnL summed over ALL persisted fills.
+            net_day: Fee-inclusive signed net PnL summed over ONLY ``now``'s-UTC-day fills.
+            current_day: ``now``'s UTC day at midnight (defines the live daily window); ``None``
+                only when there is no reference day at all.
+
+        Returns:
+            A fresh :class:`RiskAccumulator` with session + daily nets and the current UTC day set.
+        """
+        acc = cls(session_id)
+        acc._net_session = net_session
+        acc._net_day = net_day
+        acc._current_day = current_day
+        return acc
+
     def apply_realized_fill(self, fill: RealizedFillRecord) -> None:
         """Fold one REAL venue-reconciled fill into the session + UTC-day accumulators.
 

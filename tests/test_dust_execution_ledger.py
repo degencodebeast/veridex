@@ -23,7 +23,7 @@ from datetime import UTC, datetime
 import pytest
 
 from veridex.dust_execution.ledger import append_fill, reconstruct_risk
-from veridex.dust_execution.risk import RealizedFillRecord
+from veridex.dust_execution.risk import FailClosed, RealizedFillRecord
 from veridex.store import InMemoryStore
 
 _SESSION = "sess-ledger-001"
@@ -85,6 +85,56 @@ async def test_restart_reconstructs_session_loss_and_rolls_utc_day() -> None:
     acc_day3 = await reconstruct_risk(store, _SESSION, now_fn=lambda: now_day3)
     assert acc_day3.realized_loss_session == pytest.approx(1.03)  # persists across the roll
     assert acc_day3.realized_loss_day == pytest.approx(0.0)  # no fills on day-3
+
+
+async def test_reconstruct_daily_excludes_a_later_utc_day_fill_clock_skew() -> None:
+    """A persisted fill dated on a LATER UTC day than ``now_fn`` must NOT advance the daily window.
+
+    Regression for Gate#1 MINOR-1 (unsafe direction): the old forward-only marker-replay path let a
+    later-UTC-day fill roll ``_current_day`` PAST today, and the net-0 marker at an earlier ``now``
+    could not roll it back — so ``realized_loss_day`` dropped today's real losses (daily UNDER-count
+    -> the daily cap is UNDER-protected at arming). Session loss (sums ALL fills) is unaffected.
+
+    Reachable via venue clock skew across a UTC-midnight boundary, or a corrupt/future timestamp.
+    Rows are injected DIRECTLY into the store to simulate an already-persisted skewed ledger,
+    decoupled from wall-clock and from the append-time future-date guard.
+    """
+    store = InMemoryStore()
+    now_day1 = datetime(2026, 7, 6, 12, 0, 0, tzinfo=UTC)  # "now" is on UTC day-1
+    ts_today = int(datetime(2026, 7, 6, 9, 0, 0, tzinfo=UTC).timestamp() * 1000)  # day-1 (today)
+    ts_later = int(datetime(2026, 7, 7, 3, 0, 0, tzinfo=UTC).timestamp() * 1000)  # day-2 (AHEAD of now)
+
+    await store.append_realized_fill(session_id=_SESSION, realized_pnl=-0.30, fee=0.01, fill_ts_ms=ts_today)
+    await store.append_realized_fill(session_id=_SESSION, realized_pnl=-0.40, fee=0.02, fill_ts_ms=ts_later)
+
+    acc = await reconstruct_risk(store, _SESSION, now_fn=lambda: now_day1)
+
+    # Daily = ONLY today's (day-1) fill loss 0.31; the later-UTC-day fill is EXCLUDED from daily.
+    assert acc.realized_loss_day == pytest.approx(0.31)
+    # Session = ALL fills 0.31 + 0.42 = 0.73, unaffected by the day skew.
+    assert acc.realized_loss_session == pytest.approx(0.73)
+
+
+async def test_append_rejects_a_future_dated_fill_fail_closed() -> None:
+    """Defense-in-depth: a fill dated AFTER append-time ``now`` is rejected fail-closed.
+
+    A corrupt/future timestamp can therefore never enter the durable ledger and poison the
+    UTC-day loss reconstruction (Gate#1 MINOR-1).
+    """
+    store = InMemoryStore()
+    now = datetime(2026, 7, 6, 12, 0, 0, tzinfo=UTC)
+    future_ts = int(datetime(2026, 7, 7, 12, 0, 0, tzinfo=UTC).timestamp() * 1000)  # now + 1 day
+
+    with pytest.raises(FailClosed):
+        await append_fill(store, _SESSION, _fill(-0.50, 0.0, future_ts), now_fn=lambda: now)
+
+    # Nothing was persisted — the ledger stays clean (fail-closed, not a partial write).
+    assert await store.list_realized_fills(_SESSION) == []
+
+    # A present/past-dated fill with the SAME ``now`` is accepted normally.
+    past_ts = int(datetime(2026, 7, 6, 9, 0, 0, tzinfo=UTC).timestamp() * 1000)
+    seq = await append_fill(store, _SESSION, _fill(-0.50, 0.0, past_ts), now_fn=lambda: now)
+    assert seq == 1
 
 
 async def test_ledger_is_append_only_and_session_scoped() -> None:

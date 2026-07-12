@@ -24,22 +24,60 @@ from __future__ import annotations
 from collections.abc import Callable
 from datetime import UTC, datetime
 
-from veridex.dust_execution.risk import RealizedFillRecord, RiskAccumulator
+from veridex.dust_execution.risk import FailClosed, RealizedFillRecord, RiskAccumulator
 from veridex.store import Store
 
 
-async def append_fill(store: Store, session_id: str, fill: RealizedFillRecord) -> int:
+def _utc_day(ts_ms: int) -> datetime:
+    """Return the UTC-midnight day boundary for an integer epoch-millisecond timestamp."""
+    return datetime.fromtimestamp(ts_ms / 1000.0, tz=UTC).replace(
+        hour=0, minute=0, second=0, microsecond=0
+    )
+
+
+def _now_utc() -> datetime:
+    """Default append-time clock (real wall-clock, UTC)."""
+    return datetime.now(UTC)
+
+
+async def append_fill(
+    store: Store,
+    session_id: str,
+    fill: RealizedFillRecord,
+    *,
+    now_fn: Callable[[], datetime] = _now_utc,
+) -> int:
     """Persist one REAL venue-reconciled fill to the durable append-only ledger.
+
+    Fails closed on a FUTURE-DATED fill (``fill_ts_ms`` after append-time ``now``): a realized fill
+    is by definition a past event, so a timestamp ahead of ``now`` is corrupt (or venue clock skew).
+    Rejecting it at the append boundary keeps such a row from ever entering the durable ledger and
+    poisoning the UTC-day loss reconstruction (SAF-002c / Gate#1 MINOR-1). The rejection RAISES
+    (fail-closed) rather than silently dropping, so the caller must treat it as a stop condition.
 
     Args:
         store: The durable store (append-only ``realized_fill_ledger``).
         session_id: Session identity the fill belongs to.
         fill: The real :class:`~veridex.dust_execution.risk.RealizedFillRecord` to persist.
             ``realized_pnl`` AND ``fee`` are both persisted so loss stays fee-inclusive.
+        now_fn: Append-time clock; naive values are treated as UTC. Defaults to real wall-clock UTC.
 
     Returns:
         The store-assigned monotonic unique ``seq`` for the appended row.
+
+    Raises:
+        FailClosed: ``fill.fill_ts_ms`` is dated after append-time ``now`` (future/corrupt).
     """
+    now = now_fn()
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=UTC)
+    now_ms = int(now.timestamp() * 1000)
+    if fill.fill_ts_ms > now_ms:
+        raise FailClosed(
+            f"refusing to append a future-dated realized fill: fill_ts_ms={fill.fill_ts_ms} is "
+            f"after append-time now={now_ms} (a realized fill is a past event; a future/corrupt "
+            "timestamp would poison the durable ledger and the UTC-day loss reconstruction)"
+        )
     return await store.append_realized_fill(
         session_id=session_id,
         realized_pnl=fill.realized_pnl,
@@ -56,12 +94,22 @@ async def reconstruct_risk(
 ) -> RiskAccumulator:
     """Rebuild a FRESH :class:`RiskAccumulator` from the durable ledger (restart-safe).
 
-    Replays every persisted fill for ``session_id`` into a fresh accumulator in fill-time order,
-    so session loss = the accumulated fee-inclusive loss over ALL fills (it persists — never
-    reset to 0). It then folds a single zero-value marker fill at wall-clock ``now`` to align the
-    accumulator's current-UTC-day window with ``now_fn``: this rolls the day forward past the last
-    persisted fill WITHOUT changing any loss magnitude (its ``net`` is 0), so ``realized_loss_day``
-    reflects ONLY the fills that land in ``now_fn``'s UTC day (0 when there are none today).
+    Computes the seed totals by a DIRECT UTC-day filter over the persisted ledger:
+
+      * session loss = fee-inclusive loss over ALL persisted fills (persists — never reset to 0);
+      * daily loss   = fee-inclusive loss over ONLY the fills whose ``fill_ts_ms`` lands in
+        ``now_fn``'s UTC day (0 when there are none today).
+
+    Each row is rebuilt into a :class:`RealizedFillRecord` so the finiteness validation still runs
+    on replay, and its fee-inclusive ``net`` is summed into the session total and — iff its UTC day
+    equals ``now``'s UTC day — the daily total. The result is seeded into a fresh accumulator whose
+    ``current_day`` is ``now``'s UTC day, so subsequent LIVE fills roll the daily window correctly.
+
+    This is correct regardless of fill ORDER or venue clock skew: a fill dated on a LATER UTC day
+    than ``now`` (skew across UTC midnight, or a corrupt/future timestamp) counts toward the session
+    total but is EXCLUDED from the daily total — it can no longer advance the daily window past
+    today and drop today's real losses (the forward-only-rollover under-count of the prior
+    marker-replay path — SAF-002c / Gate#1 MINOR-1).
 
     Runs BEFORE arming so the Mode B loss caps survive a process restart.
 
@@ -74,32 +122,31 @@ async def reconstruct_risk(
         A fresh :class:`RiskAccumulator` seeded from the persisted ledger.
     """
     rows = await store.list_realized_fills(session_id)
-    acc = RiskAccumulator(session_id=session_id)
 
-    # Replay in fill-time order so the accumulator's forward-only UTC-day rollover is correct
-    # even if rows were persisted out of chronological order (seq is the tiebreak).
-    for row in sorted(rows, key=lambda r: (r.fill_ts_ms, r.seq)):
-        acc.apply_realized_fill(
-            RealizedFillRecord(
-                realized_pnl=row.realized_pnl,
-                fee=row.fee,
-                session_id=session_id,
-                fill_ts_ms=row.fill_ts_ms,
-                source=row.source,
-            )
-        )
-
-    # Align the daily window with wall-clock "now" (rolls the day forward past the last fill).
     now = now_fn()
     if now.tzinfo is None:
         now = now.replace(tzinfo=UTC)
-    now_ms = int(now.timestamp() * 1000)
-    acc.apply_realized_fill(
-        RealizedFillRecord(
-            realized_pnl=0.0,
-            fee=0.0,
+    today = now.astimezone(UTC).replace(hour=0, minute=0, second=0, microsecond=0)
+
+    net_session = 0.0
+    net_day = 0.0
+    for row in rows:
+        # Rebuild the real record so the finiteness validation still runs on replay.
+        record = RealizedFillRecord(
+            realized_pnl=row.realized_pnl,
+            fee=row.fee,
             session_id=session_id,
-            fill_ts_ms=now_ms,
+            fill_ts_ms=row.fill_ts_ms,
+            source=row.source,
         )
+        net = record.net_pnl()
+        net_session += net
+        if _utc_day(row.fill_ts_ms) == today:
+            net_day += net
+
+    return RiskAccumulator.seeded(
+        session_id=session_id,
+        net_session=net_session,
+        net_day=net_day,
+        current_day=today,
     )
-    return acc
