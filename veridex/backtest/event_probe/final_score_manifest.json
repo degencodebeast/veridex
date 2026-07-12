@@ -1,0 +1,10 @@
+{
+  "18209181": {
+    "home_team": "France",
+    "away_team": "Morocco",
+    "home_score": 2,
+    "away_score": 0,
+    "source": "TxLINE game_finalised (Seq 1114) cross-checked against 1X2 market prices (home 0.976 / away 0.005 at settlement)",
+    "retrieved_ts": 1783634441191
+  }
+}
