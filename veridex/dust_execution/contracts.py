@@ -48,7 +48,13 @@ TimeInForce = Literal["FAK", "FOK", "GTC", "GTD"]
 # labels the realized-loss-cap breach sweep: mislabeling it as ``breaker``/``manual`` would destroy
 # audit fidelity, so the loss path carries its OWN cause. (§4.1's one-line cause list omitted a loss
 # cause; this ADDITIVE value completes it — Gate #1 spec review must ratify the deviation.)
-CancelAllCause = Literal["breaker", "kill_switch", "shutdown", "manual", "loss_breach"]
+# ``reconciliation_timeout`` (E4-T3) labels the AUTOMATED reconciliation-timeout sweep for the same
+# reason: a bounded-poll timeout fallback is NOT an operator's manual choice, so mislabeling it
+# ``manual`` destroys audit fidelity — it carries its OWN cause (ADDITIVE, mirrors ``loss_breach``;
+# Gate #2 MINOR-1).
+CancelAllCause = Literal[
+    "breaker", "kill_switch", "shutdown", "manual", "loss_breach", "reconciliation_timeout"
+]
 
 # Honest venue order status (AC-013) — matched fill only, never fabricated.
 OrderStatus = Literal["partial", "filled", "rejected", "expired", "unresolved"]

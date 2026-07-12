@@ -24,7 +24,9 @@ import ast
 import contextlib
 import importlib
 import inspect
+import sys
 import time
+import types
 from typing import Any
 
 import pytest
@@ -478,6 +480,12 @@ def poison_all_local_key_ctors():
 
     _poison("eth_account", ("Account",))
     _poison("eth_keys", ("keys",))
+    # ``coincurve`` IS a local-key lib (quantpylib's L2 signer wraps it) — poison its ctor on BOTH
+    # import paths so a coincurve-based local signer entering the Mode-B object graph trips at
+    # runtime too (control #3), not only at the static-AST ban (#1) / object-graph scan (#4). Guarded
+    # by ``_poison`` (a no-op when coincurve is not installed), so this is safe defense-in-depth.
+    _poison("coincurve", ("PrivateKey",))
+    _poison("coincurve.keys", ("PrivateKey",))
     try:
         yield
     finally:
@@ -508,6 +516,51 @@ def test_five_no_local_key_controls():
     # (5) OUTAGE-FREEZE, NEVER local: a provider outage fails closed (never a local-key fallback).
     with pytest.raises(FailClosed):
         OutageFakePrivy_cp().sign_typed_data(COMPILED, binding=BIND, auth=CTX)
+
+
+def test_runtime_poison_covers_coincurve():
+    """Control #3 (runtime constructor-poison) must ALSO cover ``coincurve.PrivateKey`` (MINOR-3).
+
+    ``coincurve`` IS a local-key lib (quantpylib's L2 signer wraps it) and is already in the
+    static-AST ban set (control #1, ``_LOCAL_KEY_BANNED``) and the object-graph scan (control #4),
+    but the runtime poison (control #3) originally poisoned only ``eth_account``/``eth_keys`` — a
+    coincurve-based local signer constructed in the Mode-B path would NOT trip at runtime. This
+    closes that defense-in-depth gap: a coincurve local-key ctor entering the money path explodes.
+
+    ``coincurve`` may not be installed in the venv, so a deterministic STUB module is injected for
+    the poison to target — the point is that IF a coincurve local key is ever constructed in the
+    Mode-B path, control #3 trips (regardless of whether the real wheel is present).
+    """
+    stub = types.ModuleType("coincurve")
+    stub_keys = types.ModuleType("coincurve.keys")
+
+    class _StubPrivateKey:  # a stand-in for coincurve's local-key ctor
+        def __init__(self, *_a: Any, **_k: Any) -> None: ...
+
+    stub.PrivateKey = _StubPrivateKey  # type: ignore[attr-defined]
+    stub_keys.PrivateKey = _StubPrivateKey  # type: ignore[attr-defined]
+    stub.keys = stub_keys  # type: ignore[attr-defined]
+
+    saved = {name: sys.modules.get(name) for name in ("coincurve", "coincurve.keys")}
+    sys.modules["coincurve"] = stub
+    sys.modules["coincurve.keys"] = stub_keys
+    try:
+        # Sanity: OUTSIDE the poison the ctor is a plain callable (proves the poison — not the stub —
+        # is what trips it below).
+        assert isinstance(stub.PrivateKey(), _StubPrivateKey)
+        with poison_all_local_key_ctors():
+            # BOTH import paths (``coincurve.PrivateKey`` and ``coincurve.keys.PrivateKey``) are
+            # poisoned: constructing a coincurve local key in the money path now explodes.
+            with pytest.raises(AssertionError):
+                stub.PrivateKey()
+            with pytest.raises(AssertionError):
+                stub_keys.PrivateKey()
+    finally:
+        for name, original in saved.items():
+            if original is None:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = original
 
 
 # ===============================================================================================

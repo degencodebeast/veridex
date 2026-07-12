@@ -494,7 +494,7 @@ async def resolve_ambiguous_submit(
     sleep: AsyncSleep,
     poll_interval_ms: int,
     timeout_ms: int,
-    timeout_cause: CancelAllCause = "manual",
+    timeout_cause: CancelAllCause = "reconciliation_timeout",
     poll_fn: UncertainPoll | None = None,
 ) -> AmbiguousResolution:
     """Freeze on AMBIGUOUS, poll venue truth on a bounded schedule, and on timeout SWEEP not retry.
@@ -521,7 +521,8 @@ async def resolve_ambiguous_submit(
         poll_interval_ms: Delay between re-queries (the bounded poll cadence).
         timeout_ms: The freeze budget; once elapsed, the loop sweeps instead of retrying.
         timeout_cause: The honest E2-T3 cause the timeout sweep is labelled with (defaults to
-            ``"manual"`` — the sweep hands off to manual operator intervention).
+            ``"reconciliation_timeout"`` — the sweep is an AUTOMATED reconciliation-timeout fallback,
+            NOT an operator's manual choice; it still hands off to manual operator intervention).
         poll_fn: Override for the venue-truth re-query (defaults to :func:`reconcile_uncertain_submit`
             bound to the record + adapter); it RE-QUERIES, it never re-submits.
 

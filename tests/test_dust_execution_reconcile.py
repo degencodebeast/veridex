@@ -611,6 +611,11 @@ async def test_bounded_poll_times_out_to_cancel_all_no_resubmit() -> None:
     assert result.outcome == "SWEPT_ON_TIMEOUT"
     # The timeout fallback is a SWEEP, not a retry: cancel-all fired exactly once and submits blocked.
     assert result.cancel_all_ack is not None
+    # The DEFAULT timeout sweep is an AUTOMATED reconciliation-timeout sweep, NOT an operator's
+    # manual choice — it carries its OWN honest cause ``reconciliation_timeout`` (audit fidelity),
+    # never mislabeled ``manual`` (MINOR-1, mirrors the loss_breach distinct-cause fold).
+    assert result.cancel_all_ack.trigger_cause == "reconciliation_timeout"
+    assert session.block_cause == "reconciliation_timeout"
     assert cancel_spy.cancel_all_calls == 1
     assert session.submit_blocked is True
     assert controller.check_can_submit(session) is False
