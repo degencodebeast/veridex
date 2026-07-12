@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Awaitable, Callable
-from typing import Literal, Protocol, runtime_checkable
+from typing import Any, Literal, Protocol, runtime_checkable
 
 from pydantic import BaseModel
 
@@ -351,4 +351,40 @@ class VenueAdapter(Protocol):
         Returns:
             An :class:`ExecutionReceipt` with no credentials attached.
         """
+        ...
+
+
+@runtime_checkable
+class VenueReconciliationReads(Protocol):
+    """Additive READ / reconciliation surface for own-order status, own-fill history, and fee info.
+
+    Deliberately SEPARATE from :class:`VenueAdapter` (IDM-005/DAT-004, E3-T2): exposing these reads
+    must never alter the sealed four-method adapter contract, so they live in their own structural
+    Protocol. A venue adapter (or a CLOB write client) MAY also implement these without affecting its
+    :class:`VenueAdapter` conformance.
+
+    Every method returns RAW venue records (dicts) — the E3-T0 pinned CLOB-V2 shapes — for the E4
+    own-fill reconciliation path to consume. All four are read-only and non-fund-touching:
+
+    * :meth:`get_orders` — paginated open-order list (E3-T0 §5 OpenOrder shape).
+    * :meth:`get_order` — a single open-order record by id/hash (§5).
+    * :meth:`get_market` — per-market info incl. the ``fd`` fee descriptor (§8).
+    * :meth:`get_fill_history` — own-fill / trade history (§3 ``get_trades`` shape). NET-NEW surface
+      (no single vendored endpoint — G9); it maps to the §3 ``get_trades`` wire in the live wiring.
+    """
+
+    async def get_orders(self, **kwargs: Any) -> list[dict[str, Any]]:
+        """Return the paginated list of open orders (E3-T0 §5 OpenOrder shape)."""
+        ...
+
+    async def get_order(self, order_id: str) -> dict[str, Any]:
+        """Return one open-order record by id/hash (E3-T0 §5)."""
+        ...
+
+    async def get_market(self, condition_id: str) -> dict[str, Any]:
+        """Return per-market info incl. the ``fd`` fee descriptor (E3-T0 §8)."""
+        ...
+
+    async def get_fill_history(self, **kwargs: Any) -> list[dict[str, Any]]:
+        """Return own-fill / trade history (E3-T0 §3 ``get_trades`` shape); net-new surface."""
         ...

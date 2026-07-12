@@ -1,4 +1,10 @@
-"""E3-T1 tests — signer-neutral write seam, fail-closed unarmed (SAF-008, PAT-002, §6 groups 7/11).
+"""E3-T1/T2 tests — signer-neutral write seam + additive venue read/reconciliation surface.
+
+E3-T1 (SAF-008, PAT-002, §6 groups 7/11): signer-neutral write seam, fail-closed unarmed.
+E3-T2 (IDM-005, DAT-004, §6 groups 3/17): expose the vendored ``get_orders``/``get_order``/
+``get_market`` reads plus a NET-NEW ``get_fill_history`` surface on the ``WriteClient`` Protocol +
+``PolymarketAdapter`` — ADDITIVE (the sealed four-method ``VenueAdapter`` contract is untouched),
+tested against the Mode-A FAKE recon client (no network, no signing; Mode B UNARMED).
 
 TRUST-CRITICAL (MONEY-NETWORK BOUNDARY). This lane's write seam is the ONLY thing that could ever
 reach a real-money venue wire, so the load-bearing guarantees are proven here with INJECTED
@@ -41,6 +47,7 @@ from veridex.dust_execution.signer import (
     WalletControlPlane,
     require_armed,
 )
+from veridex.venues.base import VenueAdapter, VenueReconciliationReads
 from veridex.venues.polymarket import PolymarketAdapter, PolymarketWriteDisabled
 from veridex.venues.polymarket_resolver import ResolvedMarket
 
@@ -281,3 +288,231 @@ def test_fake_signer_satisfies_the_provider_neutral_protocol() -> None:
     assert isinstance(signer, WalletControlPlane)
     # ``Signer`` is the public alias of the same provider-neutral Protocol.
     assert Signer is WalletControlPlane
+
+
+# ===========================================================================
+# E3-T2 — additive venue read / reconciliation surface (IDM-005, DAT-004).
+# ===========================================================================
+#
+# expose the vendored get_orders(**kwargs) (paginated) / get_order(order_id) /
+# get_market(condition_id) reads + a NET-NEW get_fill_history surface (§3 get_trades shape) on the
+# WriteClient Protocol AND PolymarketAdapter. These are READ/reconciliation surfaces (own-order
+# status + own-fill history + public fee info), tested against a Mode-A FAKE that emulates the
+# E3-T0 §3/§5/§8 pinned shapes. ADDITIVE: the sealed four-method VenueAdapter contract is untouched.
+# (VenueAdapter + VenueReconciliationReads are imported at the top of this module.)
+
+
+class _ReconWriteClient:
+    """Mode-A FAKE CLOB write+recon client — emulates the E3-T0 §3/§5/§8 pinned shapes, no network.
+
+    ``get_order``/``get_orders`` return the §5 OpenOrder EXACT-SET shape; ``get_market`` the §8
+    ``fd`` fee descriptor; ``get_fill_history`` the §3 Trade EXACT-SET shape keyed by the local
+    ``taker_order_id`` (orderHash). Every call is recorded so delegation is provable.
+    """
+
+    def __init__(self) -> None:
+        self.get_order_calls: list[str] = []
+        self.get_orders_calls: list[dict[str, Any]] = []
+        self.get_market_calls: list[str] = []
+        self.fill_calls: list[dict[str, Any]] = []
+
+    async def limit_order(
+        self,
+        ticker: str,
+        amount: float,
+        price: float,
+        tif: str = "GTC",
+        round_price: bool = True,
+        tick_size: str | None = None,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        return {"success": True, "orderID": "0xabc"}
+
+    def _open_order(self, order_id: str = "0xhash") -> dict[str, Any]:
+        return {  # §5 OpenOrder EXACT SET
+            "id": order_id,
+            "status": "LIVE",
+            "market": "0xcond",
+            "asset_id": "111",
+            "side": "BUY",
+            "original_size": "10",
+            "size_matched": "4",
+            "price": "0.42",
+            "outcome": "YES",
+            "order_type": "GTC",
+            "maker_address": "0xmaker",
+            "owner": "api-key-uuid",
+            "expiration": "0",
+            "associate_trades": [],
+            "created_at": 1710000000,
+        }
+
+    async def get_order(self, order_id: str, **kwargs: Any) -> dict[str, Any]:
+        self.get_order_calls.append(order_id)
+        return self._open_order(order_id)
+
+    async def get_orders(self, **kwargs: Any) -> list[dict[str, Any]]:
+        # Vendored get_orders(**kwargs) is paginated and returns a FLATTENED list of open orders.
+        self.get_orders_calls.append(kwargs)
+        return [self._open_order("0xhash"), self._open_order("0xhash2")]
+
+    async def get_market(self, condition_id: str, **kwargs: Any) -> dict[str, Any]:
+        self.get_market_calls.append(condition_id)
+        return {  # §8 getClobMarketInfo EXACT SET
+            "condition_id": condition_id,
+            "t": [{"t": "111", "o": "yes"}, {"t": "222", "o": "no"}],
+            "mts": 0.01,
+            "nr": False,
+            "fd": {"r": 0.05, "e": 1, "to": True},
+        }
+
+    async def get_fill_history(self, **kwargs: Any) -> list[dict[str, Any]]:
+        # NET-NEW surface (no vendored endpoint, G9) — §3 Trade EXACT SET keyed by orderHash.
+        self.fill_calls.append(kwargs)
+        return [
+            {
+                "id": "t1",
+                "taker_order_id": "0xhash",
+                "market": "0xcond",
+                "asset_id": "111",
+                "side": "BUY",
+                "size": "4",
+                "price": "0.42",
+                "fee_rate_bps": "50",
+                "status": "CONFIRMED",
+                "match_time": 1710000000,
+                "last_update": 1710000001,
+                "outcome": "YES",
+                "owner": "api-key-uuid",
+                "maker_address": "0xmaker",
+                "trader_side": "TAKER",
+                "transaction_hash": "0xtx",
+                "bucket_index": 0,
+                "maker_orders": [],
+            }
+        ]
+
+
+def _recon_adapter(
+    client: _ReconWriteClient,
+    *,
+    write_enabled: bool = True,
+) -> PolymarketAdapter:
+    return PolymarketAdapter(
+        _RESOLVED,
+        _FakeBookClient(),
+        settings=Settings(_env_file=None, polymarket_write_enabled=write_enabled),
+        write_client=client,
+        dry_run=True,  # reads never touch money -> gated on write_enabled only, like get_order_status
+    )
+
+
+# --- Protocol shape: the new reconciliation read surface lives in base.py (additive) --------
+
+
+def test_recon_reads_protocol_is_satisfied_by_the_fake_and_the_adapter() -> None:
+    client = _ReconWriteClient()
+    adapter = _recon_adapter(client)
+    # The FAKE and the real adapter both structurally satisfy the NEW additive read Protocol.
+    assert isinstance(client, VenueReconciliationReads)
+    assert isinstance(adapter, VenueReconciliationReads)
+    # A bare object without the read methods does NOT satisfy it (the Protocol has teeth).
+    assert not isinstance(object(), VenueReconciliationReads)
+
+
+def test_adapter_still_satisfies_sealed_venue_adapter_contract() -> None:
+    # ADDITIVE guarantee: exposing the read surface does not break VenueAdapter conformance.
+    adapter = _recon_adapter(_ReconWriteClient())
+    assert isinstance(adapter, VenueAdapter)
+
+
+# --- Delegation: the adapter exposes each vendored read, gated behind the write flag ---------
+
+
+async def test_get_order_exposes_raw_open_order_record() -> None:
+    client = _ReconWriteClient()
+    adapter = _recon_adapter(client)
+    rec = await adapter.get_order("0xhash")
+    assert client.get_order_calls == ["0xhash"]
+    # §5 OpenOrder EXACT SET keys surfaced verbatim (raw record for E4 reconciliation).
+    assert rec["id"] == "0xhash"
+    assert rec["size_matched"] == "4"
+    assert rec["associate_trades"] == []
+
+
+async def test_get_orders_returns_paginated_flattened_open_orders() -> None:
+    client = _ReconWriteClient()
+    adapter = _recon_adapter(client)
+    orders = await adapter.get_orders(market="0xcond", asset_id="111")
+    assert client.get_orders_calls == [{"market": "0xcond", "asset_id": "111"}]
+    assert isinstance(orders, list)
+    assert [o["id"] for o in orders] == ["0xhash", "0xhash2"]
+
+
+async def test_get_market_returns_fee_descriptor_shape() -> None:
+    client = _ReconWriteClient()
+    adapter = _recon_adapter(client)
+    info = await adapter.get_market("0xcond")
+    assert client.get_market_calls == ["0xcond"]
+    assert info["fd"] == {"r": 0.05, "e": 1, "to": True}
+
+
+async def test_get_fill_history_returns_trade_shape_keyed_by_order_hash() -> None:
+    client = _ReconWriteClient()
+    adapter = _recon_adapter(client)
+    fills = await adapter.get_fill_history(market="0xcond")
+    assert client.fill_calls == [{"market": "0xcond"}]
+    assert isinstance(fills, list)
+    # §3 Trade join key: taker_order_id == the local orderHash we submitted with (E4 reconciliation).
+    assert fills[0]["taker_order_id"] == "0xhash"
+    assert fills[0]["status"] == "CONFIRMED"  # §3c terminal
+    assert fills[0]["bucket_index"] == 0
+
+
+# --- Fail-closed gating: own-order/own-fill reads need write-enabled + a client --------------
+
+
+@pytest.mark.parametrize(
+    "read",
+    ["get_orders", "get_order", "get_fill_history"],
+)
+async def test_recon_reads_fail_closed_when_write_disabled(read: str) -> None:
+    client = _ReconWriteClient()
+    adapter = _recon_adapter(client, write_enabled=False)
+    method = getattr(adapter, read)
+    with pytest.raises(PolymarketWriteDisabled):
+        if read == "get_order":
+            await method("0xhash")
+        else:
+            await method()
+
+
+async def test_recon_reads_fail_closed_when_no_write_client() -> None:
+    adapter = PolymarketAdapter(
+        _RESOLVED,
+        _FakeBookClient(),
+        settings=Settings(_env_file=None, polymarket_write_enabled=True),
+        write_client=None,
+        dry_run=True,
+    )
+    with pytest.raises(PolymarketWriteDisabled):
+        await adapter.get_orders()
+
+
+async def test_get_market_is_public_but_needs_a_client() -> None:
+    # Fee info is a PUBLIC data endpoint (auth: None), so it does NOT require write-enabled; it does
+    # require an injected client to reach the wire (fail-closed when the live path is not wired).
+    client = _ReconWriteClient()
+    adapter = _recon_adapter(client, write_enabled=False)
+    info = await adapter.get_market("0xcond")
+    assert info["condition_id"] == "0xcond"
+
+    no_client = PolymarketAdapter(
+        _RESOLVED,
+        _FakeBookClient(),
+        settings=Settings(_env_file=None, polymarket_write_enabled=True),
+        write_client=None,
+        dry_run=True,
+    )
+    with pytest.raises(PolymarketWriteDisabled):
+        await no_client.get_market("0xcond")

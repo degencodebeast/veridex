@@ -109,6 +109,22 @@ class WriteClient(Protocol):
         """Cancel resting orders (FAK orders never rest, so this is a defensive cleanup)."""
         ...
 
+    # -- ADDITIVE read / reconciliation surface (E3-T2, IDM-005/DAT-004) -----------------------
+    # These expose the vendored CLOB reads upward for E4 own-fill reconciliation + fee lookup. They
+    # are read-only and non-fund-touching; adding them does not change the sealed write behavior.
+
+    async def get_orders(self, **kwargs: Any) -> list[dict[str, Any]]:
+        """Return the paginated list of open orders (E3-T0 §5; vendored ``get_orders(**kwargs)``)."""
+        ...
+
+    async def get_market(self, condition_id: str) -> dict[str, Any]:
+        """Return per-market info incl. the ``fd`` fee descriptor (E3-T0 §8; vendored ``get_market``)."""
+        ...
+
+    async def get_fill_history(self, **kwargs: Any) -> list[dict[str, Any]]:
+        """Return own-fill / trade history (E3-T0 §3 ``get_trades`` shape). NET-NEW surface (G9)."""
+        ...
+
 
 # ---------------------------------------------------------------------------
 # Native (share price q) <-> decimal odds conversion (consumed by T17 write path)
@@ -589,6 +605,92 @@ class PolymarketAdapter:
         response = await client.cancel_all_orders()
         cancelled = bool(response.get("success", True)) if isinstance(response, dict) else False
         return CancelAck(venue_order_id=venue_order_id, cancelled=cancelled)
+
+    # -- read / reconciliation surface (ADDITIVE, E3-T2, IDM-005/DAT-004) ----------------------
+    #
+    # Exposes the vendored CLOB reads upward for E4 own-fill reconciliation + fee lookup. These are
+    # RAW passthroughs (the venue's own record dicts, E3-T0 §3/§5/§8 shapes) — no reconciliation
+    # logic here; E4 owns that. Own-order/own-fill reads need L2 auth (SEC-004 honest reconciliation),
+    # so they are gated behind ``polymarket_write_enabled`` AND an injected write client (like
+    # :meth:`get_order_status`). They never touch money, so — unlike a real submit — they do NOT
+    # require ``dry_run=False``. The write path stays sealed and unchanged.
+
+    async def get_orders(self, **kwargs: Any) -> list[dict[str, Any]]:
+        """Return the paginated list of open orders (E3-T0 §5), for E4 reconciliation.
+
+        Args:
+            **kwargs: Filter/pagination params passed through to the vendored
+                ``get_orders(**kwargs)`` (e.g. ``market``, ``asset_id``).
+
+        Returns:
+            The raw open-order records (paginated, flattened) as returned by the venue.
+
+        Raises:
+            PolymarketWriteDisabled: Unless write-enabled AND a write client is injected.
+        """
+        self._require_write_enabled()
+        client = self._require_write_client()
+        return await client.get_orders(**kwargs)
+
+    async def get_order(self, order_id: str) -> dict[str, Any]:
+        """Return one raw open-order record by id/hash (E3-T0 §5), for E4 reconciliation.
+
+        This is the RAW record (unlike :meth:`get_order_status`, which reconciles it into an honest
+        :class:`~veridex.venues.base.OrderStatus`). E4 consumes the raw shape directly.
+
+        Args:
+            order_id: The venue order id / EIP-712 order hash.
+
+        Returns:
+            The raw open-order record dict.
+
+        Raises:
+            PolymarketWriteDisabled: Unless write-enabled AND a write client is injected.
+        """
+        self._require_write_enabled()
+        client = self._require_write_client()
+        return await client.get_order(order_id)
+
+    async def get_market(self, condition_id: str) -> dict[str, Any]:
+        """Return per-market info incl. the ``fd`` fee descriptor (E3-T0 §8).
+
+        Fee/market info is a PUBLIC data endpoint (auth: none), so — unlike the own-order reads — it
+        does NOT require ``polymarket_write_enabled``; it only needs an injected client to reach the
+        wire (fail-closed when the live path is not wired). This is the fee source
+        :func:`veridex.dust_execution.feesnapshot.pin_fee_snapshot` reads to pin a hashed snapshot.
+
+        Args:
+            condition_id: The market condition id.
+
+        Returns:
+            The raw market-info record dict (carries ``fd`` = fee descriptor).
+
+        Raises:
+            PolymarketWriteDisabled: When no write client is injected (live path not wired).
+        """
+        client = self._require_write_client()
+        return await client.get_market(condition_id)
+
+    async def get_fill_history(self, **kwargs: Any) -> list[dict[str, Any]]:
+        """Return own-fill / trade history (E3-T0 §3 ``get_trades`` shape), for E4 reconciliation.
+
+        NET-NEW surface (no single vendored endpoint — G9): it maps to the §3 ``get_trades`` wire in
+        the live wiring. A trade's ``taker_order_id`` (or ``maker_orders[].order_id``) equals the
+        locally-computed EIP-712 order hash — the durable pre-submit join key E4 reconciles on (§3d).
+
+        Args:
+            **kwargs: Filter params passed through (e.g. ``market``, ``asset_id``, ``maker_address``,
+                ``before``, ``after``) — the §3 ``TradeParams`` fields.
+
+        Returns:
+            The raw trade / fill records as returned by the venue.
+
+        Raises:
+            PolymarketWriteDisabled: Unless write-enabled AND a write client is injected.
+        """
+        self._require_write_enabled()
+        client = self._require_write_client()
+        return await client.get_fill_history(**kwargs)
 
     def normalize_receipt(
         self,
