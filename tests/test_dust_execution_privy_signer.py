@@ -328,17 +328,63 @@ def test_typed_data_only_default_deny_blocks_send_tx_and_raw_hash():
 
 
 def test_policy_content_hash_mismatch_fails_closed():
-    # ref unchanged, content weakened → caught at arming.
+    # ref unchanged, content weakened → caught at arming (live quorum held at a passing fixture so
+    # the POLICY weakening is the isolated failure cause).
     with pytest.raises(FailClosed):
-        arm_mode_b(binding=BIND, live_policy=WEAKENED_POLICY)
+        _arm_offline(live_policy=WEAKENED_POLICY)
+
+
+def _arm_offline(
+    *,
+    binding: ExecutionWalletBinding = BIND,
+    live_policy: PrivyWalletPolicy = TYPED_DATA_ONLY,
+    live_quorum: AuthorizationQuorum = _CORRECT_QUORUM,
+) -> None:
+    """OFFLINE unit-arming helper — supplies canonical-PASSING fixtures for the live observations NOT
+    under test, so a single weakening is the isolated failure cause.
+
+    This is deliberately NOT the production arming path: production :func:`arm_mode_b` requires BOTH a
+    live policy AND a live quorum observation from the caller (Gate#2 MAJOR-2). This helper only lets
+    a unit test vary ONE observation while holding the other at a genuine passing fixture.
+    """
+    arm_mode_b(binding=binding, live_policy=live_policy, live_quorum=live_quorum)
 
 
 def test_policy_resource_and_quorum_must_be_owned():
     # v0.6.3 Codex-m1 / Fable-m5: an app-secret-updatable policy is not real custody.
     with pytest.raises(FailClosed):
-        arm_mode_b(binding=BIND, live_policy=POLICY_NOT_QUORUM_OWNED)
+        _arm_offline(live_policy=POLICY_NOT_QUORUM_OWNED)
     with pytest.raises(FailClosed):
-        arm_mode_b(binding=BIND, live_quorum=QUORUM_CONTENT_HASH_MISMATCH)
+        _arm_offline(live_quorum=QUORUM_CONTENT_HASH_MISMATCH)
+
+
+# ---- Gate#2 MAJOR-2: arm_mode_b must OBSERVE both live policy AND live quorum -------------------
+
+
+def test_arm_mode_b_requires_live_policy_observation():
+    """MAJOR-2: arming without a LIVE policy observation must FAIL CLOSED — no canonical substitution
+    of TYPED_DATA_ONLY for an unobserved live policy."""
+    with pytest.raises(FailClosed):
+        arm_mode_b(binding=BIND, live_quorum=_CORRECT_QUORUM)  # live_policy NOT observed
+
+
+def test_arm_mode_b_requires_live_quorum_observation():
+    """MAJOR-2: arming with a valid live policy but NO live quorum observation must FAIL CLOSED —
+    a missing live quorum can no longer silently skip the quorum ref/content re-check."""
+    with pytest.raises(FailClosed):
+        arm_mode_b(binding=BIND, live_policy=TYPED_DATA_ONLY)  # live_quorum NOT observed
+
+
+def test_arm_mode_b_requires_binding_threshold_to_equal_live_quorum_threshold():
+    """MAJOR-2: the separately-pinned ``binding.quorum_threshold`` MUST equal the live quorum's
+    ``threshold`` — a binding whose pinned threshold disagrees with the observed quorum fails closed."""
+    import dataclasses
+
+    # Same quorum content (hash still that of the threshold-2 _CORRECT_QUORUM) but the SEPARATELY
+    # pinned binding.quorum_threshold field disagrees (1 vs the live quorum's 2).
+    disagree = dataclasses.replace(BIND, quorum_threshold=1)
+    with pytest.raises(FailClosed):
+        arm_mode_b(binding=disagree, live_policy=TYPED_DATA_ONLY, live_quorum=_CORRECT_QUORUM)
 
 
 def test_binding_hash_is_explicit_manifest_field_no_reroute():

@@ -571,12 +571,25 @@ def arm_mode_b(
       whose ref is unchanged but whose content was weakened (e.g. via an app-secret update) is caught;
     * the live policy is typed-data-only default-deny (structural, defence-in-depth);
     * the policy resource is QUORUM-owned, not app-secret-updatable (v0.6.3 Codex-m1 / Fable-m5);
-    * when a live quorum is supplied, its ref + content hash match the pinned quorum.
+    * the live quorum's ref + content hash match the pinned quorum, AND the separately-pinned
+      ``binding.quorum_threshold`` equals the live quorum's ``threshold``.
 
-    ``live_policy`` defaults to the canonical :data:`TYPED_DATA_ONLY` so a caller probing only the quorum
-    still exercises a genuine (passing) policy check.
+    Both ``live_policy`` AND ``live_quorum`` are MANDATORY live observations: this production arming API
+    refuses to arm without reading BOTH (Gate#2 MAJOR-2). A missing observation fails closed — there is
+    NO canonical ``TYPED_DATA_ONLY`` substitution and NO quorum-check skip. An offline unit test that
+    wants to exercise a single check must supply a genuine passing fixture for the OTHER observation.
     """
-    policy = live_policy if live_policy is not None else TYPED_DATA_ONLY
+    if live_policy is None:
+        raise FailClosed(
+            "arm_mode_b requires a LIVE policy observation — refusing to arm without reading the live "
+            "policy (no canonical TYPED_DATA_ONLY substitution for an unobserved policy; REQ-018b)"
+        )
+    if live_quorum is None:
+        raise FailClosed(
+            "arm_mode_b requires a LIVE quorum observation — refusing to arm without reading the live "
+            "quorum (a missing live quorum can no longer skip the quorum re-check; REQ-018b2)"
+        )
+    policy = live_policy
 
     if binding.chain_id != CHAIN_ID_POLYGON:
         raise FailClosed(f"binding.chain_id must be {CHAIN_ID_POLYGON}, got {binding.chain_id!r}")
@@ -597,14 +610,18 @@ def arm_mode_b(
             "(a resource an app secret can weaken is not a real custody control — v0.6.3 Codex-m1)"
         )
 
-    if live_quorum is not None:
-        if live_quorum.quorum_ref != binding.authorization_quorum_ref:
-            raise FailClosed("live authorization quorum ref does not match the pinned binding")
-        if live_quorum.content_hash() != binding.authorization_quorum_content_hash:
-            raise FailClosed(
-                "live authorization quorum CONTENT hash does not match the pinned binding "
-                "(threshold/keys weakened); refusing to arm"
-            )
+    if live_quorum.quorum_ref != binding.authorization_quorum_ref:
+        raise FailClosed("live authorization quorum ref does not match the pinned binding")
+    if live_quorum.content_hash() != binding.authorization_quorum_content_hash:
+        raise FailClosed(
+            "live authorization quorum CONTENT hash does not match the pinned binding "
+            "(threshold/keys weakened); refusing to arm"
+        )
+    if binding.quorum_threshold != live_quorum.threshold:
+        raise FailClosed(
+            "pinned binding.quorum_threshold does not equal the live quorum threshold — the "
+            "separately-pinned threshold and the observed quorum content disagree; refusing to arm"
+        )
 
 
 # ---------------------------------------------------------------------------
