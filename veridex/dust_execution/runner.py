@@ -73,6 +73,7 @@ from veridex.dust_execution.contracts import (
     DustRunLabelEvent,
     ExecutionMode,
     OrderAckEvent,
+    OrderCancelEvent,
     OrderStatus,
     OrderStatusEvent,
     OrderSubmitAttempt,
@@ -80,6 +81,7 @@ from veridex.dust_execution.contracts import (
     PreSubmitRecord,
     RealFillReconciliation,
     SessionRiskSnapshot,
+    TimeInForce,
     UncertainState,
 )
 from veridex.dust_execution.emergency import (
@@ -87,7 +89,7 @@ from veridex.dust_execution.emergency import (
     DustSafetySession,
     SafetyController,
 )
-from veridex.dust_execution.facade import MMExecutionToolRequest
+from veridex.dust_execution.facade import IntentKind, MMExecutionToolRequest, MMIntentParams
 from veridex.dust_execution.manifest import (
     SessionState,
     StrategyAuthorizationDecision,
@@ -101,6 +103,7 @@ from veridex.dust_execution.privy_control_plane import (
     execute_with,
 )
 from veridex.dust_execution.reconcile import UncertainSubmitState, assess_uncertain_submit
+from veridex.dust_execution.resting_order import RestingOrder, submit_resting_order
 from veridex.dust_execution.risk import FailClosed, RealizedFillRecord, RiskAccumulator
 from veridex.dust_execution.signer import Signer, SigningPayload
 from veridex.dust_execution.sizing import resolve_dust_size
@@ -111,7 +114,13 @@ from veridex.dust_execution.wallet_binding import (
 )
 from veridex.policy.circuit_breaker import CircuitBreaker, CircuitState
 from veridex.policy.envelope import PolicyEnvelope
-from veridex.venues.base import Order, VenueAdapter, VenueReconciliationReads
+from veridex.venues.base import (
+    Order,
+    RestingOrderVenue,
+    SingleOrderCancelVenue,
+    VenueAdapter,
+    VenueReconciliationReads,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -187,6 +196,11 @@ class QuoteSource(Protocol):
 #: The single closed vocabulary of abstain reasons — boolean-safe, id-free telemetry (SEC-005).
 #: ``self_cross`` (E5 non-crossing refusal) and ``safety_blocked`` (E2-T3 emergency-stop block) are
 #: the E6-T3 additions — both id-free labels, never an order id or handle.
+#: Gate#3 CRITICAL-1 additions — the runner ABSTAINS on the admitted typed intent's own terms:
+#: ``intent_no_quote`` (the explicit DON'T-TRADE abstention), ``intent_cancel_all`` (the intent
+#: fired the cancel-all sweep, so no NEW order is submitted), ``intent_not_permitted`` (the intent
+#: kind is not in ``manifest.permitted_intent_kinds`` — fail-closed), and ``intent_params_invalid``
+#: (a maker/cancel-replace intent whose typed params are missing/incoherent — fail-closed, no wire).
 AbstainReason = Literal[
     "stale_quote_age",
     "stale_source",
@@ -200,6 +214,10 @@ AbstainReason = Literal[
     "manifest_hash_mismatch",
     "admission_denied",
     "mode_b_not_armed",
+    "intent_no_quote",
+    "intent_cancel_all",
+    "intent_not_permitted",
+    "intent_params_invalid",
 ]
 
 #: Tuple form of :data:`AbstainReason` for membership checks / iteration.
@@ -216,6 +234,10 @@ ABSTAIN_REASONS: tuple[AbstainReason, ...] = (
     "manifest_hash_mismatch",
     "admission_denied",
     "mode_b_not_armed",
+    "intent_no_quote",
+    "intent_cancel_all",
+    "intent_not_permitted",
+    "intent_params_invalid",
 )
 
 #: The venue minimum price increment the non-crossing check rounds/compares against (Polymarket
@@ -403,6 +425,7 @@ LifecycleEvent = (
     | OrderSubmitIntent
     | OrderSubmitAttempt
     | OrderAckEvent
+    | OrderCancelEvent
     | OrderStatusEvent
     | RealFillReconciliation
     | DustRunLabelEvent
@@ -600,6 +623,36 @@ def _require_cancel_all_adapter(adapter: VenueAdapter) -> CancelAllAdapter:
         raise TypeError(
             "a safety trigger fired but the venue adapter cannot sweep resting orders "
             "(missing cancel_all_orders); refusing to block-without-sweep"
+        )
+    return adapter
+
+
+def _require_resting_venue(adapter: VenueAdapter) -> RestingOrderVenue:
+    """Return the adapter as a :class:`RestingOrderVenue`, failing closed if it cannot rest a maker.
+
+    A ``make_quote`` / ``cancel_replace`` intent that reached the ARMED submit point but cannot reach
+    the E3-T3 resting-maker wire (``submit_resting_order``) is a fatal wiring error on the real-money
+    path — fail closed (raise) rather than silently drop the maker order.
+    """
+    if not isinstance(adapter, RestingOrderVenue):
+        raise TypeError(
+            "a make_quote/cancel_replace intent was admitted but the venue adapter cannot rest a "
+            "maker order (missing submit_resting_order); refusing to place-without-wire"
+        )
+    return adapter
+
+
+def _require_single_cancel_venue(adapter: VenueAdapter) -> SingleOrderCancelVenue:
+    """Return the adapter as a :class:`SingleOrderCancelVenue`, failing closed if it cannot cancel one.
+
+    A ``cancel_replace`` intent that cannot reach the E3-T4 single-order ``DELETE /order`` wire
+    (``cancel_single_order``) is a fatal wiring error — fail closed (raise) rather than place the
+    replacement WITHOUT cancelling the named order it is meant to replace.
+    """
+    if not isinstance(adapter, SingleOrderCancelVenue):
+        raise TypeError(
+            "a cancel_replace intent was admitted but the venue adapter cannot cancel a single order "
+            "(missing cancel_single_order); refusing to replace-without-cancel"
         )
     return adapter
 
@@ -913,6 +966,60 @@ def _mode_b_arming_block_reason(
 
 
 # ---------------------------------------------------------------------------
+# Gate#3 CRITICAL-1: dispatch on the ADMITTED typed intent — never a hardcoded BUY/FOK.
+#
+# The runner must ACT ON the intent the strategy proposed (and the manifest admitted), not synthesize
+# a BUY/FOK taker regardless. ``no_quote`` NEVER submits, ``cancel_all`` fires the sweep (no new
+# order), ``cancel_replace`` cancels+replaces, ``make_quote`` rests a post-only maker, ``take`` is a
+# taker — each honoring the ADMITTED side/price/TIF. The wire SIZE is still ``resolve_dust_size``
+# only (never the agent request), and Mode A still places NO order for ANY intent (AC-017).
+# ---------------------------------------------------------------------------
+
+#: The default typed intent for a direct runner call with no agent ``request`` (legacy/self-driven):
+#: a BUY/FOK taker, preserving the pre-dispatch behaviour the E6 gate/lifecycle tests pin.
+_DEFAULT_INTENT: IntentKind = "take"
+
+
+def _effective_intent(request: MMExecutionToolRequest | None) -> tuple[IntentKind, MMIntentParams]:
+    """Resolve the admitted typed intent + params the runner dispatches on.
+
+    A direct runner call with no ``request`` (self-driven / legacy) defaults to the ``take`` taker
+    path with empty params; when a ``request`` is present the runner dispatches on ITS admitted
+    ``intent_kind`` / ``intent_params`` — never a hardcoded BUY/FOK synthesized independently.
+    """
+    if request is None:
+        return _DEFAULT_INTENT, MMIntentParams()
+    return request.intent_kind, request.intent_params
+
+
+def _intent_block_reason(
+    request: MMExecutionToolRequest | None, *, manifest: StrategyExperimentManifest
+) -> AbstainReason | None:
+    """Return the abstain reason a NON-order-placing (or non-permitted) intent must fail-closed to.
+
+    Fail-closed, order-stable, applied ONLY when an agent ``request`` is present (a direct
+    self-driven call has no agent-proposed intent to gate and takes the default taker path):
+
+    #. an ``intent_kind`` NOT in :attr:`~StrategyExperimentManifest.permitted_intent_kinds` →
+       ``"intent_not_permitted"`` (the manifest is the closed set of intents it admits — fail closed);
+    #. ``no_quote`` (the explicit DON'T-TRADE abstention) → ``"intent_no_quote"`` (never a submit);
+    #. ``cancel_all`` → ``"intent_cancel_all"`` (the sweep fires at session level; no NEW order).
+
+    ``make_quote`` / ``take`` / ``cancel_replace`` return ``None`` here — they place/replace an order
+    and are dispatched per-token in :func:`_emit_intent_lifecycle`.
+    """
+    if request is None:
+        return None
+    if request.intent_kind not in manifest.permitted_intent_kinds:
+        return "intent_not_permitted"
+    if request.intent_kind == "no_quote":
+        return "intent_no_quote"
+    if request.intent_kind == "cancel_all":
+        return "intent_cancel_all"
+    return None
+
+
+# ---------------------------------------------------------------------------
 # The runner
 # ---------------------------------------------------------------------------
 
@@ -1097,6 +1204,13 @@ async def run_dust_execution(
         _mode_b_arming_block_reason(arming, manifest=manifest) if mode == "live_guarded" else None
     )
 
+    # Gate#3 CRITICAL-1: dispatch on the ADMITTED typed intent. ``no_quote`` / ``cancel_all`` / a
+    # non-permitted intent block EVERY token from submitting a new order (computed once, mode-
+    # independent); ``take`` / ``make_quote`` / ``cancel_replace`` fall through to the per-token
+    # dispatch. The wire size stays PINNED-input only; the intent NEVER moves it.
+    intent, intent_params = _effective_intent(request)
+    intent_block_reason = _intent_block_reason(request, manifest=manifest)
+
     # The mechanical wire size is PINNED-input only (never the agent request) and identical per token.
     wire_size = _resolve_wire_size(
         manifest=manifest,
@@ -1127,6 +1241,16 @@ async def run_dust_execution(
         enforce=mode == "live_guarded" and arming_block_reason is None,
     )
 
+    # Gate#3 CRITICAL-1: a ``cancel_all`` intent invokes the E2-T3 cancel-all safety/orchestration
+    # path (the SAME single idempotent primitive the safety triggers use) and submits NO new order.
+    # Mode B only touches the wire (Mode A places/cancels nothing, AC-017); the token loop then
+    # abstains every token ``intent_cancel_all``. Idempotent: if a prior sweep already blocked, this
+    # is a no-op that stays blocked.
+    if intent_block_reason == "intent_cancel_all" and mode == "live_guarded":
+        await safety.cancel_all_and_block(
+            "manual", adapter=_require_cancel_all_adapter(adapter), session=session
+        )
+
     decisions: list[SubmitDecision] = []
     for token_id in manifest.universe:
         decision, token_events = await _decide_and_submit(
@@ -1146,6 +1270,9 @@ async def run_dust_execution(
             wire_size=wire_size,
             arming_block_reason=arming_block_reason,
             authorization_block_reason=authorization_block_reason,
+            intent=intent,
+            intent_params=intent_params,
+            intent_block_reason=intent_block_reason,
         )
         decisions.append(decision)
         events.extend(token_events)
@@ -1197,25 +1324,41 @@ async def _decide_and_submit(
     wire_size: float,
     arming_block_reason: AbstainReason | None,
     authorization_block_reason: AbstainReason | None,
+    intent: IntentKind,
+    intent_params: MMIntentParams,
+    intent_block_reason: AbstainReason | None,
 ) -> tuple[SubmitDecision, tuple[LifecycleEvent, ...]]:
-    """Gate one token's quote and, only when clear AND Mode B (ARMED), submit it on the wire.
+    """Gate one token's quote and, only when clear AND Mode B (ARMED), act on the ADMITTED intent.
 
     Also builds the E1-T2 per-decision lifecycle events for a GATE-CLEAR quote — identically shaped
     in both modes (AC-003); see :func:`_emit_order_lifecycle`. A gate-ABSTAINED token (the original
     E6-T1 behavior) emits NO per-decision lifecycle events.
+
+    Gate#3 CRITICAL-1 adds intent dispatch. FIRST — before any I/O — a NON-order-placing / non-
+    permitted intent abstains on ``intent_block_reason`` (``intent_no_quote`` / ``intent_cancel_all``
+    / ``intent_not_permitted``), so an explicit DON'T-TRADE never submits. When the intent DOES place
+    an order (``take`` / ``make_quote`` / ``cancel_replace``) the runner dispatches on it after the
+    gates: ``take`` is a taker honoring the admitted side/TIF, ``make_quote`` rests a post-only maker
+    at the admitted side/price/TIF, and ``cancel_replace`` cancels the named order then rests its
+    replacement — NEVER a hardcoded BUY/FOK.
 
     E6-T3 adds two refusals AFTER the E6-T1 quote gates and BEFORE any submit: an emergency-stop
     check (once the SafetyController has blocked submits, every token abstains ``"safety_blocked"``)
     and the E5 non-crossing check (a self-crossing proposed order abstains ``"self_cross"``). Both
     refuse with no per-decision lifecycle events, identically in both modes.
 
-    E6-T4 adds the Mode A→B HARD GATE / fail-closed arming FIRST — a Mode-B run that is not armed
-    abstains ``"mode_b_not_armed"`` BEFORE any quote I/O (refuse-before-I/O) — and, AFTER the safety
-    check (which must still win for a swept session), the mode-independent manifest-authorization block
+    E6-T4 adds the Mode A→B HARD GATE / fail-closed arming — a Mode-B run that is not armed abstains
+    ``"mode_b_not_armed"`` BEFORE any quote I/O (refuse-before-I/O) — and, AFTER the safety check
+    (which must still win for a swept session), the mode-independent manifest-authorization block
     (``"manifest_hash_mismatch"`` / ``"admission_denied"``). All abstain with no per-decision events.
     The executable size is the PINNED-input ``wire_size`` (:func:`resolve_dust_size`), never the agent
     request.
     """
+    # Gate#3 CRITICAL-1: a non-order-placing / non-permitted intent NEVER submits — abstain on its own
+    # honest terms BEFORE any quote I/O (refuse-before-I/O), regardless of arming.
+    if intent_block_reason is not None:
+        return _abstain(token_id, intent_block_reason), ()
+
     # Mode A→B HARD GATE + arming (Mode B only): an unarmed Mode B places NO order and reads no quote.
     if mode == "live_guarded" and arming_block_reason is not None:
         return _abstain(token_id, arming_block_reason), ()
@@ -1247,18 +1390,63 @@ async def _decide_and_submit(
     if cross_reason is not None:
         return _abstain(token_id, cross_reason), ()
 
-    decision, events = await _emit_order_lifecycle(
-        quote,
-        adapter=adapter,
-        signer=signer,
-        envelope=envelope,
-        manifest=manifest,
-        mode=mode,
-        now_s=now_s,
-        seqc=seqc,
-        wire_size=wire_size,
-        tick_size=tick_size,
-    )
+    # Gate#3 CRITICAL-1: dispatch the ADMITTED order-placing intent (never a hardcoded BUY/FOK). A
+    # maker/cancel-replace intent whose typed params are missing/incoherent fails closed with NO wire.
+    if intent == "take":
+        side, tif, invalid = _resolve_taker_side_tif(intent_params)
+        if invalid:
+            return _abstain(token_id, "intent_params_invalid"), ()
+        decision, events = await _emit_order_lifecycle(
+            quote,
+            adapter=adapter,
+            signer=signer,
+            envelope=envelope,
+            manifest=manifest,
+            mode=mode,
+            now_s=now_s,
+            seqc=seqc,
+            wire_size=wire_size,
+            tick_size=tick_size,
+            side=side,
+            tif=tif,
+        )
+    else:
+        # ``make_quote`` / ``cancel_replace`` both rest a post-only maker; build+validate it once.
+        resting = _build_resting_order(
+            token_id=token_id,
+            manifest=manifest,
+            intent_params=intent_params,
+            wire_size=wire_size,
+            tick_size=tick_size,
+        )
+        if resting is None:
+            return _abstain(token_id, "intent_params_invalid"), ()
+        if intent == "cancel_replace":
+            replaces = intent_params.replaces_client_order_id
+            if not replaces:
+                return _abstain(token_id, "intent_params_invalid"), ()
+            decision, events = await _emit_cancel_replace_lifecycle(
+                quote,
+                adapter=adapter,
+                signer=signer,
+                mode=mode,
+                now_s=now_s,
+                seqc=seqc,
+                resting=resting,
+                replaces_client_order_id=replaces,
+                tick_size=tick_size,
+            )
+        else:  # make_quote
+            decision, events = await _emit_resting_lifecycle(
+                quote,
+                adapter=adapter,
+                signer=signer,
+                mode=mode,
+                now_s=now_s,
+                seqc=seqc,
+                resting=resting,
+                tick_size=tick_size,
+            )
     if decision.submitted:
         logger.info(
             "dust_execution.submit",
@@ -1315,8 +1503,14 @@ async def _emit_order_lifecycle(
     seqc: _SeqCounter,
     wire_size: float,
     tick_size: float,
+    side: str = "BUY",
+    tif: TimeInForce = "FOK",
 ) -> tuple[SubmitDecision, tuple[LifecycleEvent, ...]]:
-    """Build the full E1-T2 per-decision lifecycle chain for a GATE-CLEAR quote (AC-003).
+    """Build the full E1-T2 per-decision lifecycle chain for a GATE-CLEAR TAKER quote (AC-003).
+
+    Gate#3 CRITICAL-1: the taker ``side`` / ``tif`` are the ADMITTED intent's (default BUY/FOK for a
+    self-driven direct call), NEVER hardcoded — a taker crosses at the ask for a BUY and at the bid
+    for a SELL. The wire SIZE is still ``resolve_dust_size`` only (never the agent request).
 
     Emits, in order: ``OrderSubmitIntent -> OrderSubmitAttempt -> OrderAckEvent ->
     OrderStatusEvent -> RealFillReconciliation``. IDENTICAL event TYPES and ORDERING in both
@@ -1346,6 +1540,9 @@ async def _emit_order_lifecycle(
     client_order_id = f"{manifest.strategy_id}:{quote.token_id}"
     decision_id = client_order_id
     source_ts = quote.quote_ts_s
+    # A taker crosses the book: BUY lifts the ask, SELL hits the bid. Both sides are present here
+    # (a missing side would have abstained above), so the native crossing price is safe to read.
+    native_price = quote.ask.price if side == "BUY" else quote.bid.price
 
     intent = OrderSubmitIntent(
         sequence_no=seqc.next(),
@@ -1353,10 +1550,10 @@ async def _emit_order_lifecycle(
         source_ts=source_ts,
         recv_ts=now_ms,
         token_id=quote.token_id,
-        side="BUY",
-        price=quote.ask.price,
+        side=side,
+        price=native_price,
         size=wire_size,  # REAL mechanical size — resolve_dust_size(...), never the agent request
-        tif="FOK",
+        tif=tif,
         client_order_id=client_order_id,
         decision_id=decision_id,
         decision_ts=now_ms,
@@ -1364,10 +1561,10 @@ async def _emit_order_lifecycle(
 
     payload = SigningPayload(
         token_id=quote.token_id,
-        side="BUY",
-        native_price=quote.ask.price,
+        side=side,
+        native_price=native_price,
         size=wire_size,  # REAL mechanical size — resolve_dust_size(...), never the agent request
-        tif="FOK",
+        tif=tif,
         # SINGLE SOURCE: the SAME runner ``tick_size`` the non-crossing gate evaluates against
         # (_non_crossing_gate), losslessly stringified — never a second hardcoded literal that could
         # drift from the tick the crossing check used once E6-T4 binds a real per-market tick.
@@ -1401,11 +1598,12 @@ async def _emit_order_lifecycle(
         # are present here (missing-side would have abstained above), so this is safe.
         order = Order(
             market_ref=manifest.market,
-            side="BUY",
+            side=side,
             size=wire_size,  # REAL mechanical size — resolve_dust_size(...), never the agent request
-            price=_native_to_decimal_odds(quote.ask.price),  # REAL native probability → decimal odds
+            price=_native_to_decimal_odds(native_price),  # REAL native probability → decimal odds
             venue=envelope.venue_allowlist[0] if envelope.venue_allowlist else "dust",
             client_order_id=client_order_id,
+            tif=tif if tif in ("FAK", "FOK") else "FOK",
         )
         ack = await adapter.submit_order(order)
         venue_order_id = ack.venue_order_id
@@ -1469,6 +1667,243 @@ async def _emit_order_lifecycle(
     )
     events: tuple[LifecycleEvent, ...] = (intent, attempt, ack_event, status_event, reconciliation_event)
     return decision, events
+
+
+def _resolve_taker_side_tif(intent_params: MMIntentParams) -> tuple[str, TimeInForce, bool]:
+    """Resolve a ``take`` intent's ADMITTED side/TIF (default BUY/FOK); flag incoherent params.
+
+    A taker is FAK/FOK only (a GTC/GTD ``tif`` on a taker is incoherent — fail closed); side must be
+    ``"BUY"`` / ``"SELL"``. Returns ``(side, tif, invalid)`` — ``invalid`` True means abstain
+    ``intent_params_invalid`` (fail-closed, no wire).
+    """
+    side = intent_params.side if intent_params.side else "BUY"
+    tif: TimeInForce = intent_params.tif if intent_params.tif is not None else "FOK"
+    invalid = side not in ("BUY", "SELL") or tif not in ("FAK", "FOK")
+    return side, tif, invalid
+
+
+def _build_resting_order(
+    *,
+    token_id: str,
+    manifest: StrategyExperimentManifest,
+    intent_params: MMIntentParams,
+    wire_size: float,
+    tick_size: float,
+) -> RestingOrder | None:
+    """Build a post-only :class:`RestingOrder` from a ``make_quote`` / ``cancel_replace`` intent.
+
+    Honors the ADMITTED side / native price / TIF (GTC or GTD post-only); the resting SIZE is the
+    PINNED-input ``wire_size`` (:func:`resolve_dust_size`), NEVER the agent's requested size. Returns
+    ``None`` (fail closed → ``intent_params_invalid``) when a required param is missing or incoherent:
+    a non-BUY/SELL side, an absent native price, a non-GTC/GTD tif, or (GTD without an expiration —
+    :class:`MMIntentParams` carries no expiration field, so GTD is not wireable here) a
+    :class:`RestingOrder` construction that rejects the price/tick/expiration.
+    """
+    side = intent_params.side
+    native_price = intent_params.price
+    tif = intent_params.tif
+    if side not in ("BUY", "SELL") or native_price is None or tif not in ("GTC", "GTD"):
+        return None
+    client_order_id = intent_params.client_order_id or f"{manifest.strategy_id}:{token_id}"
+    try:
+        return RestingOrder(
+            token_id=token_id,
+            side=side,  # type: ignore[arg-type]  # narrowed to BUY/SELL above
+            size=wire_size,  # PINNED mechanical size — resolve_dust_size(...), never the agent request
+            native_price=native_price,
+            tick_size=tick_size,
+            tif=tif,  # narrowed to GTC/GTD above
+            post_only=True,
+            client_order_id=client_order_id,
+        )
+    except ValueError:
+        # A crossing/untick-aligned price, or GTD with no expiration (unwireable from the intent
+        # params): fail closed rather than let a malformed maker reach the wire.
+        return None
+
+
+async def _emit_resting_lifecycle(
+    quote: DustQuote,
+    *,
+    adapter: VenueAdapter,
+    signer: Signer,
+    mode: ExecutionMode,
+    now_s: int,
+    seqc: _SeqCounter,
+    resting: RestingOrder,
+    tick_size: float,
+) -> tuple[SubmitDecision, tuple[LifecycleEvent, ...]]:
+    """Build the per-decision lifecycle for a ``make_quote`` RESTING maker (GTC/GTD post-only).
+
+    Rests the maker on the E3-T3 :func:`~veridex.dust_execution.resting_order.submit_resting_order`
+    wire — a PHYSICALLY DISTINCT surface from the FAK/FOK taker ``adapter.submit_order`` (which is
+    NEVER called here), so ``submit_calls`` stays 0 for a maker. Mode A signs the SAME payload but
+    NEVER touches the resting wire (AC-017). Same event TYPES/ORDER as the taker lifecycle.
+    """
+    now_ms = now_s * 1000
+    client_order_id = resting.client_order_id
+    decision_id = client_order_id
+    source_ts = quote.quote_ts_s
+
+    intent_event = OrderSubmitIntent(
+        sequence_no=seqc.next(),
+        event_type="OrderSubmitIntent",
+        source_ts=source_ts,
+        recv_ts=now_ms,
+        token_id=resting.token_id,
+        side=resting.side,
+        price=resting.native_price,
+        size=resting.size,  # PINNED mechanical size — resolve_dust_size(...), never the agent request
+        tif=resting.tif,
+        client_order_id=client_order_id,
+        decision_id=decision_id,
+        decision_ts=now_ms,
+    )
+    payload = SigningPayload(
+        token_id=resting.token_id,
+        side=resting.side,
+        native_price=resting.native_price,
+        size=resting.size,
+        tif=resting.tif,
+        tick_size=f"{tick_size}",
+        client_order_id=client_order_id,
+    )
+    signed = await signer.sign_order(payload)
+    presubmit = PreSubmitRecord(
+        integrity_commitment_hash=signed.order_digest,
+        venue_order_key=f"provisional-vok:{signed.order_digest}",
+        captured_id=None,
+    )
+    attempt = OrderSubmitAttempt(
+        sequence_no=seqc.next(),
+        event_type="OrderSubmitAttempt",
+        source_ts=source_ts,
+        recv_ts=now_ms,
+        decision_id=decision_id,
+        client_order_id=client_order_id,
+        request_payload_ref=f"scrubbed://dust-execution/{client_order_id}",
+        attempt_ts=now_ms,
+        presubmit_record=presubmit,
+    )
+
+    venue_order_id: str | None = None
+    submitted = False
+    if mode == "live_guarded":
+        # Mode B, every gate clear: rest the ONE maker order the gates protect on the distinct
+        # resting wire (never the taker submit wire); fail closed if the adapter cannot rest.
+        ack = await submit_resting_order(resting, client=_require_resting_venue(adapter))
+        venue_order_id = ack.venue_order_id or None
+        submitted = True
+        ack_event: OrderAckEvent = OrderAckEvent(
+            sequence_no=seqc.next(),
+            event_type="OrderAckEvent",
+            source_ts=source_ts,
+            recv_ts=now_ms,
+            decision_id=decision_id,
+            client_order_id=client_order_id,
+            venue_order_id=venue_order_id,
+            ack_status="accepted" if ack.accepted else "not_accepted",
+        )
+    else:
+        ack_event = OrderAckEvent(
+            sequence_no=seqc.next(),
+            event_type="OrderAckEvent",
+            source_ts=source_ts,
+            recv_ts=now_ms,
+            decision_id=decision_id,
+            client_order_id=client_order_id,
+            venue_order_id=None,
+            ack_status="dry_run_not_submitted",
+        )
+
+    reconciled_state, matched_fill_size = await _reconcile_after_submit(presubmit, adapter=adapter)
+    status_event = OrderStatusEvent(
+        sequence_no=seqc.next(),
+        event_type="OrderStatusEvent",
+        source_ts=source_ts,
+        recv_ts=now_ms,
+        decision_id=decision_id,
+        client_order_id=client_order_id,
+        venue_order_id=venue_order_id,
+        status=_status_for(reconciled_state, matched_fill_size),
+        filled_size=matched_fill_size,
+        fill_price=None,
+    )
+    reconciliation_event = RealFillReconciliation(
+        sequence_no=seqc.next(),
+        event_type="RealFillReconciliation",
+        source_ts=source_ts,
+        recv_ts=now_ms,
+        decision_id=decision_id,
+        venue_order_key=presubmit.venue_order_key,
+        reconciled_state=_RECONCILED_STATE[reconciled_state],
+        reconciled_fill_size=matched_fill_size,
+    )
+
+    decision = SubmitDecision(
+        token_id=resting.token_id,
+        submitted=submitted,
+        abstain_reason=None if submitted else "mode_a_no_orders",
+        venue_order_id=venue_order_id,
+    )
+    events: tuple[LifecycleEvent, ...] = (
+        intent_event,
+        attempt,
+        ack_event,
+        status_event,
+        reconciliation_event,
+    )
+    return decision, events
+
+
+async def _emit_cancel_replace_lifecycle(
+    quote: DustQuote,
+    *,
+    adapter: VenueAdapter,
+    signer: Signer,
+    mode: ExecutionMode,
+    now_s: int,
+    seqc: _SeqCounter,
+    resting: RestingOrder,
+    replaces_client_order_id: str,
+    tick_size: float,
+) -> tuple[SubmitDecision, tuple[LifecycleEvent, ...]]:
+    """Honest cancel-replace: cancel the NAMED order (E3-T4 ``DELETE /order``) then rest the replacement.
+
+    NOT a blind BUY/FOK: it first cancels EXACTLY the named order via the single-order cancel wire
+    (fail closed if the adapter cannot), records an :class:`~veridex.dust_execution.contracts.OrderCancelEvent`
+    (honest ``canceled`` flag; a phantom cancel is never reported as success), THEN rests the
+    replacement maker through :func:`_emit_resting_lifecycle`. Mode A touches NO wire (AC-017).
+    """
+    now_ms = now_s * 1000
+    source_ts = quote.quote_ts_s
+    canceled = False
+    if mode == "live_guarded":
+        cancel_client = _require_single_cancel_venue(adapter)
+        response = await cancel_client.cancel_single_order(replaces_client_order_id)
+        canceled_ids = response.get("canceled") if isinstance(response, dict) else None
+        canceled = isinstance(canceled_ids, list) and replaces_client_order_id in canceled_ids
+    cancel_event = OrderCancelEvent(
+        sequence_no=seqc.next(),
+        event_type="OrderCancelEvent",
+        source_ts=source_ts,
+        recv_ts=now_ms,
+        decision_id=resting.client_order_id,
+        client_order_id=resting.client_order_id,
+        venue_order_id=None,
+        canceled=canceled,
+    )
+    decision, resting_events = await _emit_resting_lifecycle(
+        quote,
+        adapter=adapter,
+        signer=signer,
+        mode=mode,
+        now_s=now_s,
+        seqc=seqc,
+        resting=resting,
+        tick_size=tick_size,
+    )
+    return decision, (cancel_event, *resting_events)
 
 
 def _abstain(token_id: str, reason: AbstainReason) -> SubmitDecision:

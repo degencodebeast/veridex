@@ -225,7 +225,7 @@ def _mm_manifest(**kw: object) -> StrategyExperimentManifest:
         "max_daily_loss": 4.0,
         "session_window": (1_700_000_000_000, 1_700_000_600_000),
         "required_inputs": ("fair_value", "venue_book"),
-        "permitted_intent_kinds": ("make",),
+        "permitted_intent_kinds": ("make_quote", "take", "cancel_replace", "cancel_all", "no_quote"),
         "market_fee_snapshot_hash": "fee" * 4,
         "operator_authorization": "op-ref-1",
         "forbidden_claims": ("PROVEN_EDGE", "CALIBRATED"),
@@ -577,10 +577,13 @@ def _mode_b_mm_manifest(binding: ExecutionWalletBinding) -> StrategyExperimentMa
 def _mode_b_request(
     manifest: StrategyExperimentManifest, envelope: PolicyEnvelope
 ) -> MMExecutionToolRequest:
+    # A ``take`` (taker FOK) intent so the Mode-B arming positive control exercises the taker submit
+    # wire (``FakeVenueAdapter.submit_order``); ``make_quote`` now dispatches to the distinct resting
+    # wire and would not reach ``submit_order`` here (see the runner's per-intent dispatch tests).
     return MMExecutionToolRequest.build(
-        intent_kind="make_quote",
+        intent_kind="take",
         intent_params=MMIntentParams(
-            token_id=_MM_TOKEN, side="BUY", price=0.49, size=1.0, tif="GTC", client_order_id="coid-1"
+            token_id=_MM_TOKEN, side="BUY", size=1.0, tif="FOK", client_order_id="coid-1"
         ),
         strategy_id=manifest.strategy_id,
         strategy_config_hash=manifest.strategy_config_hash,

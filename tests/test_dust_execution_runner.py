@@ -30,6 +30,7 @@ from veridex.dust_execution.contracts import (
     DustRunLabelEvent,
     ExecutionMode,
     OrderAckEvent,
+    OrderCancelEvent,
     OrderStatusEvent,
     OrderSubmitAttempt,
     OrderSubmitIntent,
@@ -116,7 +117,7 @@ def _manifest(**kw: object) -> StrategyExperimentManifest:
         "max_daily_loss": 4.0,
         "session_window": (1_700_000_000_000, 1_700_000_600_000),
         "required_inputs": ("fair_value", "venue_book"),
-        "permitted_intent_kinds": ("make",),
+        "permitted_intent_kinds": ("make_quote", "take", "cancel_replace", "cancel_all", "no_quote"),
         "market_fee_snapshot_hash": "fee" * 4,
         "operator_authorization": "op-ref-1",
         "forbidden_claims": ("PROVEN_EDGE", "CALIBRATED"),
@@ -819,10 +820,17 @@ def _mm_request(
     requested_size: float | None,
     manifest_hash: str | None = None,
 ) -> MMExecutionToolRequest:
-    """A typed agent request declaring the admitted pins; ``confidence``/``size`` are untrusted."""
+    """A typed agent request declaring the admitted pins; ``confidence``/``size`` are untrusted.
+
+    Uses the ``take`` (taker FOK) intent so the mechanical-size proof exercises the DISPATCHED taker
+    submit wire (``adapter.submit_order``); ``make_quote`` now dispatches to a distinct resting-maker
+    wire (see the per-intent dispatch tests), so it would no longer reach ``submit_order`` here.
+    """
     return MMExecutionToolRequest(
-        intent_kind="make_quote",
-        intent_params=MMIntentParams(token_id=_TOKEN, side="BUY", price=0.51, size=requested_size),
+        intent_kind="take",
+        intent_params=MMIntentParams(
+            token_id=_TOKEN, side="BUY", price=0.51, size=requested_size, tif="FOK"
+        ),
         strategy_id=manifest.strategy_id,
         strategy_config_hash=manifest.strategy_config_hash,
         policy_hash=envelope.policy_hash(),
@@ -1472,3 +1480,264 @@ async def test_mode_b_real_submit_with_ambiguous_reconciliation_is_failed() -> N
         "freeze — the MINOR-1 fix must NOT weaken this Mode-B safety property"
     )
     assert result.session_outcome.promoted is False
+
+
+# =====================================================================================
+# Gate#3 CRITICAL-1: the runner DISPATCHES on the ADMITTED typed intent (RED-first).
+#
+# THE FUND-TOUCHING PROPERTY: a fully-armed Mode B run must ACT ON the admitted typed intent —
+# never a hardcoded BUY/FOK taker regardless of what the strategy proposed. One recording-fake
+# negative/positive test per intent kind + the manifest permitted-intent gate:
+#   * ``no_quote``   -> NEVER submits (explicit DON'T-TRADE): submit_calls == 0, no resting order.
+#   * ``make_quote`` -> a RESTING maker (GTC/GTD post-only) honoring the ADMITTED side/price/TIF —
+#                        NOT a FOK taker, NOT a hardcoded BUY.
+#   * ``take``       -> a taker (FOK/FAK) honoring the ADMITTED side — NOT a hardcoded BUY.
+#   * ``cancel_all`` -> the cancel-all safety WIRE fires; NO new order is submitted.
+#   * ``cancel_replace`` -> the NAMED order is cancelled AND the replacement placed (honest cancel).
+#   * manifest gate  -> an intent not in ``permitted_intent_kinds`` is DENIED (fail-closed, no wire).
+#
+# MUTATION: revert the dispatch to "always BUY/FOK taker submit" -> the ``no_quote`` test (submits)
+# AND the ``make_quote`` test (a FOK taker fires, not a resting maker) both fail. That proves the
+# DISPATCH (not merely the presence of new code) is under test.
+
+
+class _MakerRecordingAdapter(RecordingFakeAdapter):
+    """The cancel-all recording fake ALSO wired for the E3-T3 resting-maker + E3-T4 single-cancel wires.
+
+    Records, without ever touching a live venue:
+
+    * ``submit_resting_order`` — the E3-T3 :class:`~veridex.venues.base.RestingOrderVenue` wire the
+      ``make_quote`` / ``cancel_replace`` intents rest an order on. ``resting_calls`` increments ONLY
+      when the coroutine is actually awaited, and every wire kwarg set is captured so a test can prove
+      the ADMITTED side (sign of ``amount``), resting ``order_type`` (GTC/GTD), and ``native_price``
+      reached the wire — NOT a hardcoded BUY/FOK taker. The taker ``submit_calls`` counter is
+      inherited unchanged, so a resting order can never be mistaken for a taker submit.
+    * ``cancel_single_order`` — the E3-T4 :class:`~veridex.venues.base.SingleOrderCancelVenue`
+      ``DELETE /order`` wire the ``cancel_replace`` intent cancels the NAMED order on. Records each
+      cancelled id and returns the venue ``{"canceled": [...], "not_canceled": {...}}`` shape.
+    """
+
+    def __init__(
+        self,
+        *,
+        fill: bool = True,
+        fill_history_matches: bool = False,
+        open_orders: list[dict[str, object]] | None = None,
+    ) -> None:
+        super().__init__(fill=fill, fill_history_matches=fill_history_matches, open_orders=open_orders)
+        self.resting_calls = 0
+        self.resting_wire_kwargs: list[dict[str, object]] = []
+        self.cancel_single_calls = 0
+        self.cancelled_ids: list[str] = []
+
+    async def submit_resting_order(self, **kwargs: object) -> dict[str, object]:
+        self.resting_calls += 1
+        self.resting_wire_kwargs.append(dict(kwargs))
+        return {"orderID": f"0xresting{self.resting_calls}", "success": True}
+
+    async def cancel_single_order(self, order_id: str) -> dict[str, object]:
+        self.cancel_single_calls += 1
+        self.cancelled_ids.append(order_id)
+        return {"canceled": [order_id], "not_canceled": {}}
+
+
+def _intent_request(
+    intent_kind: str,
+    *,
+    manifest: StrategyExperimentManifest,
+    envelope: PolicyEnvelope,
+    params: MMIntentParams,
+    mode: ExecutionMode = "live_guarded",
+) -> MMExecutionToolRequest:
+    """A hash-matched agent request carrying an EXPLICIT typed intent (fail-closed on any mismatch)."""
+    return MMExecutionToolRequest.build(
+        intent_kind=intent_kind,  # type: ignore[arg-type]
+        intent_params=params,
+        strategy_id=manifest.strategy_id,
+        strategy_config_hash=manifest.strategy_config_hash,
+        policy_hash=envelope.policy_hash(),
+        session_id="agent-session",
+        manifest_hash=manifest.manifest_hash(),
+        evidence_class=manifest.evidence_class,
+        mode=mode,
+        admitted_manifest_hash=manifest.manifest_hash(),
+        admitted_policy_hash=envelope.policy_hash(),
+        admitted_strategy_config_hash=manifest.strategy_config_hash,
+    )
+
+
+async def test_no_quote_intent_never_submits_and_abstains_honestly() -> None:
+    """``no_quote`` is an explicit DON'T-TRADE: a fully-armed run submits NOTHING (Gate#3 CRITICAL-1).
+
+    RED before the fix: the runner ignores the typed intent and hardcodes a BUY/FOK taker, so an
+    armed ``no_quote`` request SUBMITS a real BUY (``submit_calls == 1``). After the dispatch fix it
+    NEVER touches the submit wire, places no resting order, and abstains with an honest label.
+    """
+    binding = _binding()
+    manifest = _mode_b_manifest(binding)
+    env = _env()
+    adapter = _MakerRecordingAdapter(fill=True)
+    request = _intent_request("no_quote", manifest=manifest, envelope=env, params=MMIntentParams())
+
+    result = await _run_guarded(
+        adapter=adapter, manifest=manifest, envelope=env, arming=_arming(binding), request=request
+    )
+
+    assert adapter.submit_calls == 0, "an armed no_quote intent must NEVER submit a taker order"
+    assert adapter.resting_calls == 0, "an armed no_quote intent must NEVER place a resting order"
+    assert adapter.cancel_all_calls == 0, "no_quote is an abstain, not a cancel-all"
+    (decision,) = result.decisions
+    assert decision.submitted is False
+    assert decision.abstain_reason == "intent_no_quote"
+    assert decision.venue_order_id is None
+
+
+async def test_make_quote_intent_places_resting_maker_honoring_side_not_taker() -> None:
+    """``make_quote`` rests a GTC/GTD post-only maker honoring the ADMITTED side — NOT a FOK taker.
+
+    RED before the fix: the runner hardcodes a BUY/FOK taker (``submit_calls == 1``), so the SELL
+    resting maker is never placed (``resting_calls == 0``). After the fix a resting order rests on the
+    E3-T3 wire with the admitted SELL side (negative signed ``amount``), the resting ``GTC`` order type,
+    and the admitted native price — and the taker ``submit_order`` wire is never touched.
+    """
+    binding = _binding()
+    manifest = _mode_b_manifest(binding)
+    env = _env()
+    adapter = _MakerRecordingAdapter(fill=True)
+    params = MMIntentParams(token_id=_TOKEN, side="SELL", price=0.49, tif="GTC", client_order_id="coid-mk")
+    request = _intent_request("make_quote", manifest=manifest, envelope=env, params=params)
+
+    result = await _run_guarded(
+        adapter=adapter, manifest=manifest, envelope=env, arming=_arming(binding), request=request
+    )
+
+    assert adapter.submit_calls == 0, "make_quote must NOT fire the FOK taker submit wire"
+    assert adapter.resting_calls == 1, "make_quote must rest exactly one maker order on the E3-T3 wire"
+    (wire,) = adapter.resting_wire_kwargs
+    assert wire["order_type"] == "GTC", "make_quote must rest a GTC/GTD order, never a FOK taker"
+    assert wire["post_only"] is True, "a maker rests post-only (add-liquidity-only), never crossing"
+    assert isinstance(wire["amount"], float) and wire["amount"] < 0.0, (
+        "the ADMITTED SELL side must reach the wire (negative signed amount), NOT a hardcoded BUY"
+    )
+    assert wire["native_price"] == 0.49, "the ADMITTED resting price must reach the wire"
+    (decision,) = result.decisions
+    assert decision.submitted is True and decision.abstain_reason is None
+    assert decision.venue_order_id is not None
+
+
+async def test_take_intent_submits_taker_honoring_side_not_hardcoded_buy() -> None:
+    """``take`` fires a taker (FOK/FAK) honoring the ADMITTED side — NOT a hardcoded BUY.
+
+    Positive control for the taker dispatch: an admitted SELL ``take`` reaches ``submit_order`` with
+    ``side == "SELL"`` (never forced to BUY) and never rests a maker order.
+    """
+    binding = _binding()
+    manifest = _mode_b_manifest(binding)
+    env = _env()
+    adapter = _MakerRecordingAdapter(fill=True)
+    params = MMIntentParams(token_id=_TOKEN, side="SELL", tif="FOK", client_order_id="coid-tk")
+    request = _intent_request("take", manifest=manifest, envelope=env, params=params)
+
+    result = await _run_guarded(
+        adapter=adapter, manifest=manifest, envelope=env, arming=_arming(binding), request=request
+    )
+
+    assert adapter.submit_calls == 1, "an admitted take intent must fire the taker submit wire once"
+    assert adapter.resting_calls == 0, "a taker never rests a maker order"
+    order = adapter.submitted_orders[-1]
+    assert order.side == "SELL", "the ADMITTED SELL side must reach the taker wire, NOT a hardcoded BUY"
+    assert order.tif == "FOK", "a take intent is a FOK/FAK taker"
+    (decision,) = result.decisions
+    assert decision.submitted is True and decision.abstain_reason is None
+
+
+async def test_cancel_all_intent_fires_cancel_wire_and_submits_no_new_order() -> None:
+    """``cancel_all`` invokes the cancel-all safety WIRE and submits NO new order (Gate#3 CRITICAL-1).
+
+    RED before the fix: the runner ignores the intent and submits a BUY/FOK taker. After the fix the
+    E2-T3 cancel-all sweep fires (recording-fake ``cancel_all_calls == 1``), submits are blocked, and
+    no taker/maker order reaches the wire.
+    """
+    binding = _binding()
+    manifest = _mode_b_manifest(binding)
+    env = _env()
+    adapter = _MakerRecordingAdapter(fill=True)
+    safety, session = _make_safety()
+    request = _intent_request("cancel_all", manifest=manifest, envelope=env, params=MMIntentParams())
+
+    result = await _run_guarded(
+        adapter=adapter,
+        manifest=manifest,
+        envelope=env,
+        arming=_arming(binding),
+        request=request,
+        safety=safety,
+        session=session,
+    )
+
+    assert adapter.cancel_all_calls == 1, "cancel_all must fire the E2-T3 cancel-all sweep WIRE"
+    assert adapter.submit_calls == 0, "cancel_all must NOT submit a new taker order"
+    assert adapter.resting_calls == 0, "cancel_all must NOT rest a new maker order"
+    assert session.submit_blocked is True, "cancel_all blocks further submits (fail-closed)"
+    (decision,) = result.decisions
+    assert decision.submitted is False
+    assert decision.abstain_reason == "intent_cancel_all"
+
+
+async def test_cancel_replace_intent_cancels_named_order_then_places_replacement() -> None:
+    """``cancel_replace`` cancels the NAMED order then rests its replacement (honest cancel semantics).
+
+    RED before the fix: the runner ignores the intent and submits a BUY/FOK taker — the named order is
+    never cancelled (``cancel_single_calls == 0``). After the fix the E3-T4 single-order cancel wire
+    fires for the named order AND the resting replacement is placed; no FOK taker is submitted.
+    """
+    binding = _binding()
+    manifest = _mode_b_manifest(binding)
+    env = _env()
+    adapter = _MakerRecordingAdapter(fill=True)
+    params = MMIntentParams(
+        token_id=_TOKEN,
+        side="BUY",
+        price=0.49,
+        tif="GTC",
+        client_order_id="coid-new",
+        replaces_client_order_id="0xnamed-order-to-cancel",
+    )
+    request = _intent_request("cancel_replace", manifest=manifest, envelope=env, params=params)
+
+    result = await _run_guarded(
+        adapter=adapter, manifest=manifest, envelope=env, arming=_arming(binding), request=request
+    )
+
+    assert adapter.cancel_single_calls == 1, "cancel_replace must cancel the NAMED order via DELETE /order"
+    assert adapter.cancelled_ids == ["0xnamed-order-to-cancel"], "exactly the named order is cancelled"
+    assert adapter.resting_calls == 1, "cancel_replace must place the resting replacement"
+    assert adapter.submit_calls == 0, "cancel_replace is not a blind FOK taker submit"
+    cancel_event = next(e for e in result.events if isinstance(e, OrderCancelEvent))
+    assert cancel_event.canceled is True, "the named-order cancel must be honestly recorded"
+    (decision,) = result.decisions
+    assert decision.submitted is True and decision.abstain_reason is None
+
+
+async def test_intent_not_in_permitted_kinds_is_denied_fail_closed() -> None:
+    """An intent NOT in ``manifest.permitted_intent_kinds`` is DENIED — fail-closed, no wire.
+
+    The manifest gates which intents it admits; a ``take`` proposed against a manifest that permits
+    ONLY ``make_quote`` must abstain (``submit_calls == 0``), never submit.
+    """
+    binding = _binding()
+    manifest = _mode_b_manifest(binding, permitted_intent_kinds=("make_quote",))
+    env = _env()
+    adapter = _MakerRecordingAdapter(fill=True)
+    params = MMIntentParams(token_id=_TOKEN, side="BUY", tif="FOK", client_order_id="coid-x")
+    request = _intent_request("take", manifest=manifest, envelope=env, params=params)
+
+    result = await _run_guarded(
+        adapter=adapter, manifest=manifest, envelope=env, arming=_arming(binding), request=request
+    )
+
+    assert adapter.submit_calls == 0, "an intent the manifest does not permit must NOT reach the wire"
+    assert adapter.resting_calls == 0
+    (decision,) = result.decisions
+    assert decision.submitted is False
+    assert decision.abstain_reason == "intent_not_permitted"
