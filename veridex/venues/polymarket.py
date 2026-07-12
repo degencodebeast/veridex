@@ -128,6 +128,15 @@ class WriteClient(Protocol):
         """Cancel resting orders (FAK orders never rest, so this is a defensive cleanup)."""
         ...
 
+    # -- ADDITIVE single-order cancel (E3-T4, REQ-007/008, §6 group 4) --------------------------
+    # NET-NEW (G5): the vendored V1 client has ONLY cancel-all; the single-order authenticated
+    # ``DELETE /order`` (``{"orderID": ...}`` -> ``canceled``/``not_canceled``, E3-T0 §4) is added
+    # here. PHYSICALLY DISTINCT from ``cancel_all_orders`` (the sweep): it cancels ONE named order.
+    async def cancel_single_order(self, order_id: str) -> dict[str, Any]:
+        """Cancel ONE named order via authenticated ``DELETE /order`` (``{"orderID": ...}``) →
+        ``{"canceled": [...], "not_canceled": {...}}`` (E3-T0 §4). NOT a ``/cancel`` route."""
+        ...
+
     # -- ADDITIVE read / reconciliation surface (E3-T2, IDM-005/DAT-004) -----------------------
     # These expose the vendored CLOB reads upward for E4 own-fill reconciliation + fee lookup. They
     # are read-only and non-fund-touching; adding them does not change the sealed write behavior.
@@ -606,13 +615,25 @@ class PolymarketAdapter:
         return _order_status_from_raw(venue_order_id, raw)
 
     async def cancel_order(self, venue_order_id: str) -> CancelAck:
-        """Cancel via the vendored client — gated identically to a real submit.
+        """The cancel-all SWEEP (``cancel_all_orders``) — gated identically to a real submit.
 
-        FAK orders are fill-and-kill (they never rest), so a post-submit cancel is a defensive
-        cleanup; the vendored write surface exposes only ``cancel_all_orders`` (single-order lane).
+        This is EXPLICITLY the cancel-all primitive, NOT a single-order cancel: it fires the
+        vendored ``cancel_all_orders`` sweep (``DELETE /cancel-all``) which removes EVERY resting
+        order. FAK orders are fill-and-kill (they never rest), so a post-submit cancel is a defensive
+        cleanup. The cancel-all lifecycle is modelled by the cause-only
+        :class:`~veridex.dust_execution.contracts.CancelAllTriggeredEvent` /
+        :class:`~veridex.dust_execution.contracts.CancelAllAck` (emitted by the sealed
+        ``SafetyController`` primitive) which carry only a ``trigger_cause`` + swept count and NEVER a
+        single order id (SAF-003). ``venue_order_id`` is echoed on the returned ack ONLY to satisfy
+        the sealed :class:`~veridex.venues.base.VenueAdapter` contract; it is NOT a claim that this
+        one order (and only it) was cancelled — the sweep is all-or-nothing.
+
+        To cancel EXACTLY one named order, use :meth:`cancel_single_order` (the ``DELETE /order``
+        route). ``cancel_replace`` is modelled as cancel-all-then-repost until ``DELETE /order``
+        passes the E3-T5/REQ-017 gate — NO atomic replace is implemented here.
 
         Args:
-            venue_order_id: Opaque order reference (echoed on the ack).
+            venue_order_id: Opaque order reference (echoed on the ack; see caveat above).
 
         Returns:
             A :class:`~veridex.venues.base.CancelAck`.
@@ -624,6 +645,36 @@ class PolymarketAdapter:
         response = await client.cancel_all_orders()
         cancelled = bool(response.get("success", True)) if isinstance(response, dict) else False
         return CancelAck(venue_order_id=venue_order_id, cancelled=cancelled)
+
+    async def cancel_single_order(self, venue_order_id: str) -> dict[str, Any]:
+        """Cancel EXACTLY one named order via authenticated ``DELETE /order`` (E3-T4, REQ-007/008).
+
+        PHYSICALLY DISTINCT from :meth:`cancel_order` (the cancel-all SWEEP): this hits the REAL
+        ``DELETE /order`` route with body ``{"orderID": ...}`` (E3-T0 §4, CONFIRMED against
+        ``py-clob-client-v2`` — NOT a nonexistent ``/cancel`` route) for the ONE named order and
+        returns the venue ``{"canceled": [...], "not_canceled": {...}}`` shape verbatim
+        (``not_canceled`` maps ``orderId -> reason``; an unknown/already-gone id is reported there,
+        never as a phantom cancel — fail-closed). NET-NEW (G5): the vendored V1 client exposes only
+        ``cancel_all_orders``; the single-order ``DELETE /order`` is added for R4-A/CLOB-V2.
+
+        NON-TERMINAL ACK: a ``canceled`` ACK does NOT mark the order definitively absent — only E4
+        reconciliation against complete venue truth may resolve that. The caller must not treat the
+        bare cancel ACK as terminal.
+
+        Gated identically to a real submit (armed = write-enabled AND not DRY_RUN AND client present):
+        cancelling a live order is fund-touching.
+
+        Args:
+            venue_order_id: The venue order hash/id to cancel (the ``{"orderID": ...}`` body).
+
+        Returns:
+            The venue ``{"canceled": [...], "not_canceled": {...}}`` response verbatim.
+
+        Raises:
+            PolymarketWriteDisabled: Unless armed (write-enabled AND not DRY_RUN AND client present).
+        """
+        client = self._require_armed("cancel_single_order")
+        return await client.cancel_single_order(venue_order_id)
 
     async def submit_resting_order(self, resting_order: RestingOrder) -> SubmitAck:
         """Submit a DISTINCT :class:`~veridex.dust_execution.resting_order.RestingOrder` — GTC/GTD,

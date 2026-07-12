@@ -418,3 +418,37 @@ class RestingOrderVenue(Protocol):
     ) -> dict[str, Any]:
         """Rest a GTC/GTD post-only order; return a §2c ``SendOrderResponse`` dict."""
         ...
+
+
+@runtime_checkable
+class SingleOrderCancelVenue(Protocol):
+    """Additive single-order cancel surface (E3-T4, REQ-007/008/009, AC-029, §6 group 4).
+
+    PHYSICALLY DISTINCT from the cancel-all sweep (``cancel_all_orders``, modelled by the cause-only
+    :class:`~veridex.dust_execution.contracts.CancelAllTriggeredEvent` /
+    :class:`~veridex.dust_execution.contracts.CancelAllAck` — those carry only a ``trigger_cause`` +
+    swept count and NEVER a single order id, SAF-003). This method hits the authenticated REAL
+    ``DELETE /order`` route with body ``{"orderID": ...}`` (E3-T0 §4, CONFIRMED against
+    ``py-clob-client-v2`` — NOT a nonexistent ``/cancel`` route) for EXACTLY the one named order and
+    returns the venue ``{"canceled": [...], "not_canceled": {...}}`` shape verbatim (``not_canceled``
+    is a map ``orderId -> reason``; a phantom cancel is never reported as success — fail-closed).
+
+    NET-NEW (G5): the vendored V1 client exposes only ``cancel_all_orders`` (``DELETE /cancel-all``);
+    the single-order ``DELETE /order`` is added for R4-A/CLOB-V2. Keeping it on its OWN structural
+    Protocol leaves the sealed four-method :class:`VenueAdapter` contract untouched (additive).
+
+    NON-TERMINAL ACK: a ``canceled`` ACK does NOT mark the order definitively absent — only E4
+    reconciliation against complete venue truth may resolve that. Callers must not treat the bare
+    cancel ACK as terminal.
+    """
+
+    async def cancel_single_order(self, order_id: str) -> dict[str, Any]:
+        """Cancel EXACTLY one named order via ``DELETE /order`` (E3-T0 §4).
+
+        Args:
+            order_id: The venue order hash/id to cancel (the ``{"orderID": ...}`` body).
+
+        Returns:
+            The venue ``{"canceled": [...], "not_canceled": {...}}`` response verbatim.
+        """
+        ...

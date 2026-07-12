@@ -815,3 +815,153 @@ async def test_adapter_submit_resting_order_fails_closed_when_unarmed(
     with pytest.raises(PolymarketWriteDisabled):
         await adapter.submit_resting_order(resting)
     assert client.submit_resting_calls == [], "unarmed resting submit reached the wire"
+
+
+# ===========================================================================
+# E3-T4 — cancel-all primitive vs single-order DELETE /order (REQ-007/008/009, AC-029, §6 grp 4).
+# ===========================================================================
+#
+# TWO PHYSICALLY DISTINCT cancel operations, provable via a recording fake:
+#   * cancel-all SWEEP (``cancel_order`` -> ``cancel_all_orders``): removes ALL resting orders and is
+#     modelled by the cause-only ``CancelAllTriggeredEvent``/``CancelAllAck`` (trigger cause + swept
+#     count) — it NEVER carries or reads a single order id (SAF-003).
+#   * single cancel (NET-NEW ``cancel_single_order`` -> authenticated ``DELETE /order`` with
+#     ``{"orderID": ...}``, E3-T0 §4 CONFIRMED against ``py-clob-client-v2``): cancels EXACTLY the one
+#     named order and returns the venue ``{"canceled":[...], "not_canceled":{...}}`` shape verbatim.
+# The cancel ACK is NON-TERMINAL (E4 reconciliation, not a bare ACK, decides definitive absence).
+# Tested against a Mode-A FAKE (no network, no signing; Mode B UNARMED). ``cancel_replace`` stays
+# modelled as cancel-all-then-repost until ``DELETE /order`` passes the E3-T5/REQ-017 gate.
+
+
+class _CancelWireClient:
+    """Mode-A FAKE CLOB cancel client — cancel-all SWEEP vs single ``DELETE /order`` (E3-T0 §4/§10).
+
+    ``cancel_all_orders`` sweeps EVERY resting order and NEVER reads a single id; ``cancel_single_order``
+    hits the ``DELETE /order`` route for EXACTLY the named order and returns the §4
+    ``{"canceled":[...], "not_canceled":{...}}`` shape (fail-closed: an unknown/already-gone id is
+    reported under ``not_canceled``, never as a phantom cancel). Every call is recorded so the
+    physical distinction is provable.
+    """
+
+    def __init__(self, resting_ids: tuple[str, ...] = ()) -> None:
+        self._resting: set[str] = set(resting_ids)
+        self.cancel_all_calls = 0
+        self.single_cancel_calls: list[str] = []
+
+    async def limit_order(
+        self,
+        ticker: str,
+        amount: float,
+        price: float,
+        tif: str = "GTC",
+        round_price: bool = True,
+        tick_size: str | None = None,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        return {"success": True, "orderID": "0xabc"}
+
+    async def cancel_all_orders(self) -> dict[str, Any]:
+        # THE SWEEP: removes ALL resting orders. It NEVER reads or reports a single order id.
+        self.cancel_all_calls += 1
+        swept = len(self._resting)
+        self._resting.clear()
+        return {"success": True, "canceled_count": swept}
+
+    async def cancel_single_order(self, order_id: str) -> dict[str, Any]:
+        # DELETE /order (§4): cancels EXACTLY the named order; unknown id -> not_canceled (fail-closed).
+        self.single_cancel_calls.append(order_id)
+        if order_id in self._resting:
+            self._resting.discard(order_id)
+            return {"canceled": [order_id], "not_canceled": {}}
+        return {"canceled": [], "not_canceled": {order_id: "order not found / already gone"}}
+
+
+def _armed_cancel_adapter(client: _CancelWireClient) -> PolymarketAdapter:
+    """Armed adapter (write_enabled AND not dry_run AND client) so a real cancel wire is reachable."""
+    return PolymarketAdapter(
+        _RESOLVED,
+        _FakeBookClient(),
+        settings=Settings(_env_file=None, polymarket_write_enabled=True),
+        write_client=client,
+        dry_run=False,
+    )
+
+
+async def test_cancel_all_never_reads_single_and_delete_order_cancels_named_only() -> None:
+    from veridex.dust_execution.contracts import CancelAllAck, CancelAllTriggeredEvent
+    from veridex.venues.base import CancelAck
+
+    # (A) cancel_order is the CANCEL-ALL SWEEP: it fires cancel_all_orders, NEVER the single DELETE /order.
+    sweep_client = _CancelWireClient(resting_ids=("0xhash", "0xother"))
+    sweep_adapter = _armed_cancel_adapter(sweep_client)
+    ack = await sweep_adapter.cancel_order("0xhash")
+    assert isinstance(ack, CancelAck)  # sealed VenueAdapter contract intact
+    assert sweep_client.cancel_all_calls == 1, "cancel_order must fire the cancel-all sweep"
+    assert sweep_client.single_cancel_calls == [], "the cancel-all sweep must NEVER read the single-cancel path"
+
+    # The cancel-all lifecycle events carry ONLY a trigger cause (+ swept count) — NEVER a single id.
+    triggered = CancelAllTriggeredEvent(
+        sequence_no=0, event_type="CancelAllTriggeredEvent", source_ts=None, recv_ts=1,
+        trigger_cause="manual",
+    )
+    swept = CancelAllAck(
+        sequence_no=1, event_type="CancelAllAck", source_ts=None, recv_ts=2,
+        trigger_cause="manual", canceled_count=2,
+    )
+    assert "venue_order_id" not in type(triggered).model_fields
+    assert "order_id" not in type(swept).model_fields
+    assert "venue_order_id" not in type(swept).model_fields
+    assert triggered.trigger_cause == "manual" and swept.canceled_count == 2
+    # extra="forbid": a single order id can NEVER be smuggled into the cancel-all ack.
+    with pytest.raises(ValidationError):
+        CancelAllAck(
+            sequence_no=1, event_type="CancelAllAck", source_ts=None, recv_ts=2,
+            trigger_cause="manual", canceled_count=2, venue_order_id="0xhash",  # type: ignore[call-arg]
+        )
+
+    # (B) DELETE /order cancels ONLY the named order (§4) — a SEPARATE method, never the sweep.
+    single_client = _CancelWireClient(resting_ids=("0xhash", "0xother"))
+    single_adapter = _armed_cancel_adapter(single_client)
+    result = await single_adapter.cancel_single_order("0xother")
+    assert single_client.single_cancel_calls == ["0xother"], "DELETE /order must target exactly the named order"
+    assert single_client.cancel_all_calls == 0, "a single cancel must NEVER fire the cancel-all sweep"
+    assert result["canceled"] == ["0xother"]
+    assert result["not_canceled"] == {}
+    # The sibling order "0xhash" was NOT touched by cancelling "0xother" (named-only, not a sweep).
+    assert single_client._resting == {"0xhash"}
+    # An unknown/already-gone id is NOT reported as a phantom cancel (fail-closed §4).
+    gone = await single_adapter.cancel_single_order("0xnope")
+    assert gone["canceled"] == []
+    assert "0xnope" in gone["not_canceled"]
+
+
+def test_single_order_cancel_protocol_is_satisfied_by_fake_and_adapter() -> None:
+    # NET-NEW additive Protocol (base.py) — the sealed four-method VenueAdapter contract is untouched.
+    from veridex.venues.base import SingleOrderCancelVenue
+
+    client = _CancelWireClient()
+    adapter = _armed_cancel_adapter(client)
+    assert isinstance(client, SingleOrderCancelVenue)
+    assert isinstance(adapter, SingleOrderCancelVenue)
+    assert not isinstance(object(), SingleOrderCancelVenue)  # the Protocol has teeth
+
+
+@pytest.mark.parametrize(
+    ("write_enabled", "dry_run"),
+    [(False, False), (True, True), (False, True)],
+)
+async def test_cancel_single_order_fails_closed_when_unarmed(
+    write_enabled: bool, dry_run: bool
+) -> None:
+    # DELETE /order is fund-touching -> armed exactly like a real submit/cancel (all three conditions).
+    client = _CancelWireClient(resting_ids=("0xhash",))
+    adapter = PolymarketAdapter(
+        _RESOLVED,
+        _FakeBookClient(),
+        settings=Settings(_env_file=None, polymarket_write_enabled=write_enabled),
+        write_client=client,
+        dry_run=dry_run,
+    )
+    with pytest.raises(PolymarketWriteDisabled):
+        await adapter.cancel_single_order("0xhash")
+    assert client.single_cancel_calls == [], "unarmed single cancel reached the DELETE /order wire"
