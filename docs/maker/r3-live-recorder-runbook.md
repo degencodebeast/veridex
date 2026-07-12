@@ -156,6 +156,20 @@ literal `None` across the maker lane — R4 changes nothing about that until it 
 
 ### 7.2 The four gates (ALL must pass before any R4 real-money dust)
 
+> **⚠️ [SUPERSEDED / PRECEDENCE NOTE — 2026-07-11] — these are the *R3-era* future-R4 gates; do NOT read
+> them as current `EXPERIMENTAL_DUST` admission policy.** Gates 2 ("live monitor confirms TxLINE FV leads
+> the live venue") and 3 ("make-vs-take EV positive under Rose 4× fee") are **research/alpha preconditions
+> from the R3 handoff**; the approved R3 recorder contracts and this historical text are preserved as-is for
+> provenance. **Current doctrine supersedes them:** a safely-admitted, explicitly operator-authorized
+> `EXPERIMENTAL_DUST` run executes on **R4-A safety-admission + operator preconditions + operator
+> authorization**, and does **NOT** require proven alpha or a confirmed FV lead. Research verification is
+> decoupled into **Gate B**, which controls promotion (`EVIDENCE_GATED`/`PROMOTED`), judge-facing "verified"
+> claims, profitability/alpha claims, and capital scaling — not dust capability. See
+> `.omc/plans/r4a-entry-gate.md`, the formal
+> `spec/spec-architecture-post2d-research-verification-gate-b.md`, and `.omc/plans/r4b-strategy-design.md`.
+> (The R4-A spec-prompt records the same precedence at item `20a-1`.) The four gates below remain the
+> honest *historical* R3→R4 handoff record.
+
 1. **R3 records + replays cleanly.** A sealed session `replay_reproduces` byte-identically,
    with labeled gaps and no-look-ahead alignment intact.
 2. **The live monitor confirms TxLINE FV leads the live venue.** The read-only live monitor
