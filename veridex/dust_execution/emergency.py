@@ -12,9 +12,10 @@ Design (SAF-003):
   :meth:`SafetyController.cancel_all_and_block`. There is deliberately no per-trigger cancel
   logic to drift out of sync — the venue cancel-all wire is fired in exactly ONE place, and each
   trigger only supplies its :data:`~veridex.dust_execution.contracts.CancelAllCause`. The
-  breaker-open route (:meth:`on_breaker_open`) is E2-T3; the loss-breach (E2-T5), kill-switch
-  (E2-T4), and shutdown (E6-T6) routes are thin siblings that add a one-line call to this SAME
-  primitive under their own tasks (kept out of this diff so each keeps its own TDD RED step).
+  breaker-open route (:meth:`on_breaker_open`) is E2-T3; the kill-switch (:meth:`on_kill_switch`,
+  E2-T4) and loss-breach (:meth:`on_loss_breach` + the atomic :meth:`on_realized_fill`
+  coordinating method, E2-T5) routes are thin siblings that add a one-line call to this SAME
+  primitive; the shutdown (E6-T6) route lands under its own task with its own TDD RED step.
 * **Recording-fake WIRE, not a flag.** The primitive AWAITS the venue adapter's
   ``cancel_all_orders`` (the real ``DELETE /cancel-all`` seam). Setting a block flag is NOT
   sufficient — the resting orders must actually be swept, so the wire call is load-bearing.
@@ -46,7 +47,8 @@ from veridex.dust_execution.contracts import (
     CancelAllCause,
     CancelAllTriggeredEvent,
 )
-from veridex.dust_execution.risk import RiskAccumulator
+from veridex.dust_execution.risk import RealizedFillRecord, RiskAccumulator
+from veridex.policy.envelope import PolicyEnvelope
 
 # The two cancel-all lifecycle events the primitive emits into the session stream.
 CancelAllEvent = CancelAllTriggeredEvent | CancelAllAck
@@ -203,6 +205,60 @@ class SafetyController:
         :meth:`re_arm` op, never by re-engaging (SAF-004).
         """
         return await self.cancel_all_and_block("kill_switch", adapter=adapter, session=session)
+
+    async def on_loss_breach(
+        self, *, adapter: CancelAllAdapter, session: DustSafetySession
+    ) -> CancelAllAck:
+        """Realized-loss-cap breach trigger (E2-T5) — routes to the single primitive (``loss_breach``).
+
+        A thin sibling of :meth:`on_breaker_open` / :meth:`on_kill_switch`: it fires the ONE
+        cancel-all wire under its OWN honest cause so a loss sweep is never mislabelled as a
+        breaker/manual sweep (SAF-002d audit fidelity). Idempotent by construction via the
+        primitive — a second breach on an already-blocked session is a no-op that STAYS blocked.
+        """
+        return await self.cancel_all_and_block("loss_breach", adapter=adapter, session=session)
+
+    async def on_realized_fill(
+        self,
+        fill: RealizedFillRecord,
+        *,
+        adapter: CancelAllAdapter,
+        session: DustSafetySession,
+        risk: RiskAccumulator,
+        envelope: PolicyEnvelope,
+    ) -> CancelAllAck | None:
+        """Fold a REAL fill into the accumulator; on a loss-cap crossing, ATOMICALLY block + sweep.
+
+        This is the atomic loss-safety coordinating method (SAF-002d). Unlike ``evaluate_pre_quote``
+        — which only DENIES the NEXT quote once a cap is crossed — a breach detected here
+        PROACTIVELY cancels the RESTING orders: if the accumulated fee-inclusive loss crosses
+        ``max_session_loss`` OR ``max_daily_loss``, it routes through :meth:`on_loss_breach` to the
+        SAME idempotent :meth:`cancel_all_and_block` primitive.
+
+        Atomicity (no fill-through window): applying the fill and checking the breach are
+        synchronous (no ``await`` between them), and the sweep primitive sets the submit-block flag
+        BEFORE its cancel-all ``await`` — so there is NO point at which a resting GTC order can keep
+        filling after the breach is detected but before the sweep. Blocking is the fail-safe state:
+        if the wire raises, submits STAY blocked.
+
+        The paper/simulated anti-inert control is preserved: ``apply_realized_fill`` rejects a
+        non-real source AT SOURCE (``ValueError``) before any breach check, so a simulated fill can
+        never fire the sweep.
+
+        Args:
+            fill: A real ``RealizedFillRecord`` (a ``PaperReceipt`` is rejected at source).
+            adapter: The venue cancel-all seam whose ``cancel_all_orders`` the sweep awaits.
+            session: The mutable runtime session whose submit-block flag the sweep sets.
+            risk: The realized-loss accumulator the fill is folded into and the caps checked against.
+            envelope: The policy envelope carrying the ``max_session_loss`` / ``max_daily_loss`` caps.
+
+        Returns:
+            The ``CancelAllAck`` from the loss-breach sweep when a cap is crossed, else ``None``.
+        """
+        risk.apply_realized_fill(fill)
+        if risk.breaches_caps(envelope):
+            return await self.on_loss_breach(adapter=adapter, session=session)
+        return None
 
     async def re_arm(
         self,

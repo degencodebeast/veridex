@@ -17,6 +17,8 @@ from datetime import UTC, datetime
 
 import pytest
 
+from veridex.dust_execution.contracts import CancelAllAck, CancelAllTriggeredEvent
+from veridex.dust_execution.emergency import DustSafetySession, SafetyController
 from veridex.dust_execution.risk import (
     FailClosed,
     PaperReceipt,
@@ -29,6 +31,7 @@ from veridex.policy.envelope import PolicyEnvelope
 from veridex.policy.gate import PreQuoteContext, evaluate_pre_quote
 
 _SESSION = "sess-001"
+_FROZEN_CLOCK_MS = 1_700_000_000_500
 # A fixed UTC-day timestamp (2026-07-06T12:00:00Z) in integer milliseconds.
 _TS_DAY1 = int(datetime(2026, 7, 6, 12, 0, 0, tzinfo=UTC).timestamp() * 1000)
 _TS_DAY2 = int(datetime(2026, 7, 7, 12, 0, 0, tzinfo=UTC).timestamp() * 1000)
@@ -172,3 +175,137 @@ def test_mode_b_rejects_disabled_or_nonfinite_cap() -> None:
 def test_mode_b_authorizes_finite_positive_caps() -> None:
     """Both caps finite + positive -> Mode B admission passes (no raise)."""
     authorize_mode_b(_env(max_session_loss=0.50, max_daily_loss=1.00))
+
+
+# --- SAF-002d: a loss-cap crossing ATOMICALLY blocks + fires the SAME cancel-all sweep ----
+
+
+class _RecordingSweepAdapter:
+    """Venue cancel-all double: ``calls`` moves ONLY when the sweep wire is actually awaited.
+
+    ``canceled_count`` models the resting GTC orders the venue reports swept — a mere
+    submit-block/deny flag flip inside the controller can NEVER move ``calls``, so the test
+    proves the venue SWEEP fired (the resting orders were proactively cancelled), not merely
+    that a deny flag was set (SAF-002d).
+    """
+
+    def __init__(self, *, canceled_count: int) -> None:
+        self.calls = 0
+        self._canceled_count = canceled_count
+
+    async def cancel_all_orders(self) -> int:
+        self.calls += 1
+        return self._canceled_count
+
+
+async def test_cap_crossing_while_gtc_rest_blocks_and_sweeps() -> None:
+    """A realized fill crossing ``max_session_loss`` ATOMICALLY blocks submits AND fires the SAME
+    cancel-all sweep — it does NOT merely deny the next quote while resting GTC orders keep filling.
+
+    Two resting GTC orders are modelled by the recording-fake's ``canceled_count=2``. Feeding a
+    real fill whose fee-inclusive loss (0.61) crosses ``max_session_loss=0.50`` must, in the SAME
+    transition: (a) fire the venue cancel-all WIRE (recording-fake ``calls == 1`` — a deny-flag
+    flip can NEVER move it), (b) block new submits, (c) emit CancelAllTriggeredEvent/CancelAllAck
+    carrying ``trigger_cause == "loss_breach"`` and the swept count, never a single order id.
+    """
+    controller = SafetyController(clock_ms=lambda: _FROZEN_CLOCK_MS)
+    session = DustSafetySession(session_id=_SESSION)
+    acc = RiskAccumulator(session_id=_SESSION)
+    rec = _RecordingSweepAdapter(canceled_count=2)  # two resting GTC orders at the venue
+
+    # Precondition: submits are admitted BEFORE the breach fill lands.
+    assert controller.check_can_submit(session) is True
+
+    ack = await controller.on_realized_fill(
+        _real_fill(-0.60, 0.01),  # fee-inclusive loss 0.61 > cap 0.50
+        adapter=rec,
+        session=session,
+        risk=acc,
+        envelope=_env(max_session_loss=0.50),
+    )
+
+    # (a) SWEEP wire ACTUALLY fired — the two resting GTC orders were swept (recording-fake rule),
+    #     NOT a deny-only flag flip.
+    assert rec.calls == 1
+    # (b) new submits blocked in the SAME transition (no resting order can fill through the breach).
+    assert controller.check_can_submit(session) is False
+    assert session.submit_blocked is True
+    # (c) cause-labelled "loss_breach" on the ack + swept count, never a single order id.
+    assert isinstance(ack, CancelAllAck)
+    assert ack.trigger_cause == "loss_breach"
+    assert ack.canceled_count == 2
+    assert "venue_order_id" not in ack.model_dump()
+    # The CancelAllTriggeredEvent carries the loss_breach cause (SAF-002d audit fidelity, §4.1).
+    triggered = [e for e in session.events if isinstance(e, CancelAllTriggeredEvent)]
+    assert len(triggered) == 1
+    assert triggered[0].trigger_cause == "loss_breach"
+    assert "venue_order_id" not in triggered[0].model_dump()
+
+
+async def test_daily_cap_crossing_also_blocks_and_sweeps() -> None:
+    """The DAILY cap has its OWN atomic breach-sweep path (independent of the session cap)."""
+    controller = SafetyController(clock_ms=lambda: _FROZEN_CLOCK_MS)
+    session = DustSafetySession(session_id=_SESSION)
+    acc = RiskAccumulator(session_id=_SESSION)
+    rec = _RecordingSweepAdapter(canceled_count=3)
+
+    ack = await controller.on_realized_fill(
+        _real_fill(-0.60, 0.01),  # fee-inclusive daily loss 0.61 > cap 0.50
+        adapter=rec,
+        session=session,
+        risk=acc,
+        envelope=_env(max_daily_loss=0.50),  # session cap disabled
+    )
+
+    assert rec.calls == 1
+    assert controller.check_can_submit(session) is False
+    assert isinstance(ack, CancelAllAck)
+    assert ack.trigger_cause == "loss_breach"
+    assert ack.canceled_count == 3
+
+
+async def test_realized_fill_below_cap_does_not_block_or_sweep() -> None:
+    """A fill that does NOT cross either cap fires NO sweep and leaves submits open (no false stop).
+
+    Distinguishes the atomic breach-sweep from a broad "every fill sweeps" bug: the wire is
+    fired ONLY on a crossing.
+    """
+    controller = SafetyController(clock_ms=lambda: _FROZEN_CLOCK_MS)
+    session = DustSafetySession(session_id=_SESSION)
+    acc = RiskAccumulator(session_id=_SESSION)
+    rec = _RecordingSweepAdapter(canceled_count=2)
+
+    result = await controller.on_realized_fill(
+        _real_fill(-0.10, 0.00),  # loss 0.10 < cap 0.50 — no breach
+        adapter=rec,
+        session=session,
+        risk=acc,
+        envelope=_env(max_session_loss=0.50),
+    )
+
+    assert result is None
+    assert rec.calls == 0  # NO sweep on a non-crossing fill
+    assert controller.check_can_submit(session) is True
+    assert session.submit_blocked is False
+    # The fill WAS folded into the accumulator (the accumulator is still fed on non-breach fills).
+    assert acc.realized_loss_session == pytest.approx(0.10)
+
+
+async def test_paper_receipt_cannot_drive_the_breach_sweep() -> None:
+    """The anti-inert control holds on the coordinating method: a paper source is rejected AT
+    SOURCE (``ValueError``) before any breach check — a simulated fill can never fire the sweep."""
+    controller = SafetyController(clock_ms=lambda: _FROZEN_CLOCK_MS)
+    session = DustSafetySession(session_id=_SESSION)
+    acc = RiskAccumulator(session_id=_SESSION)
+    rec = _RecordingSweepAdapter(canceled_count=2)
+
+    with pytest.raises(ValueError):
+        await controller.on_realized_fill(
+            PaperReceipt(simulated_pnl=-99.0, session_id=_SESSION),  # type: ignore[arg-type]
+            adapter=rec,
+            session=session,
+            risk=acc,
+            envelope=_env(max_session_loss=0.50),
+        )
+    assert rec.calls == 0
+    assert controller.check_can_submit(session) is True

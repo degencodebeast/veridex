@@ -44,8 +44,11 @@ ExecutionMode = Literal["dry_run", "live_guarded"]
 # Time-in-force per REQ-016: FAK/FOK are the taker forms, GTC/GTD the post-only maker forms.
 TimeInForce = Literal["FAK", "FOK", "GTC", "GTD"]
 
-# The cancel-all trigger cause — never a single order id (SAF-003).
-CancelAllCause = Literal["breaker", "kill_switch", "shutdown", "manual"]
+# The cancel-all trigger cause — never a single order id (SAF-003). ``loss_breach`` (SAF-002d)
+# labels the realized-loss-cap breach sweep: mislabeling it as ``breaker``/``manual`` would destroy
+# audit fidelity, so the loss path carries its OWN cause. (§4.1's one-line cause list omitted a loss
+# cause; this ADDITIVE value completes it — Gate #1 spec review must ratify the deviation.)
+CancelAllCause = Literal["breaker", "kill_switch", "shutdown", "manual", "loss_breach"]
 
 # Honest venue order status (AC-013) — matched fill only, never fabricated.
 OrderStatus = Literal["partial", "filled", "rejected", "expired", "unresolved"]

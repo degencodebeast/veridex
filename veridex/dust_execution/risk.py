@@ -145,6 +145,28 @@ class RiskAccumulator:
         """Non-negative fee-inclusive realized loss for the current UTC day."""
         return max(0.0, -self._net_day)
 
+    def breaches_caps(self, envelope: PolicyEnvelope) -> bool:
+        """Whether the accumulated fee-inclusive loss crosses either ENABLED loss cap (SAF-002d).
+
+        Mirrors ``gate.evaluate_pre_quote`` EXACTLY (``cap > 0 and loss > cap``) so the proactive
+        breach-sweep and the pre-quote deny agree on the crossing point: a ``<= 0`` cap is disabled
+        (no protection to breach), and the comparison is strict — the cap value itself is admissible.
+
+        This is the breach-DETECTION half of the atomic loss-safety path; the coordinating
+        block+sweep lives in :meth:`veridex.dust_execution.emergency.SafetyController.on_realized_fill`.
+
+        Args:
+            envelope: The policy envelope carrying ``max_session_loss`` / ``max_daily_loss``.
+
+        Returns:
+            ``True`` iff the session OR daily accumulated loss crosses its enabled cap.
+        """
+        if envelope.max_session_loss > 0 and self.realized_loss_session > envelope.max_session_loss:
+            return True
+        if envelope.max_daily_loss > 0 and self.realized_loss_day > envelope.max_daily_loss:
+            return True
+        return False
+
 
 def authorize_mode_b(envelope: PolicyEnvelope) -> None:
     """Mode B (real-money) admission gate for the realized-loss caps — fail closed on a bad cap.
