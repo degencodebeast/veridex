@@ -57,6 +57,7 @@ from veridex.dust_execution.runner import (
     DustExecutionResult,
     DustQuote,
     ModeBArming,
+    OperatorInterlockProof,
     SessionOutcome,
     ShutdownDecision,
     ShutdownPolicy,
@@ -264,6 +265,11 @@ def _mode_b_manifest(binding: ExecutionWalletBinding | None = None, **kw: object
     return _manifest(**fields)
 
 
+#: A RECORDED-satisfied human-operator interlock proof (Gate#3 MAJOR-1). Stands in for the facade's
+#: minted proof so the runner-level E6-T4 arming positive controls still ARM offline.
+_RECORDED_INTERLOCK_PROOF = OperatorInterlockProof(satisfied=True, recording_receipt="operator-interlock:test:recorded")
+
+
 def _arming(
     binding: ExecutionWalletBinding | None = None,
     *,
@@ -273,8 +279,13 @@ def _arming(
     provisioning: ProvisioningResult | None = None,
     live_policy: PrivyWalletPolicy | None = None,
     live_quorum: AuthorizationQuorum | None = None,
+    operator_interlock: OperatorInterlockProof | None = _RECORDED_INTERLOCK_PROOF,
 ) -> ModeBArming:
-    """A fully-passing Mode-B arming bundle, with per-precondition overrides for the failure tests."""
+    """A fully-passing Mode-B arming bundle, with per-precondition overrides for the failure tests.
+
+    Includes the RECORDED-satisfied human-operator interlock proof by default (Gate#3 MAJOR-1) so the
+    E6-T4 technical-arming positive controls still ARM; pass ``operator_interlock=None`` to exercise
+    the facade-bypass case (a technical-only bundle must stay UNARMED)."""
     b = binding if binding is not None else _binding()
     return ModeBArming(
         mode_a_passed=mode_a_passed,
@@ -284,6 +295,25 @@ def _arming(
         binding=b,
         live_policy=live_policy if live_policy is not None else _policy(),
         live_quorum=live_quorum if live_quorum is not None else _quorum(),
+        operator_interlock=operator_interlock,
+    )
+
+
+def _technical_only_arming(binding: ExecutionWalletBinding) -> ModeBArming:
+    """A Mode-B arming bundle satisfying ONLY the six E6-T4 TECHNICAL conditions — carrying NO
+    operator-interlock proof (Gate#3 MAJOR-1, REQ-005).
+
+    A DIRECT runner call with this bundle must stay UNARMED: the six technical conditions alone must
+    never arm real money without a RECORDED human-precondition proof, which only the facade can mint.
+    """
+    return ModeBArming(
+        mode_a_passed=True,
+        clobv2_gate=_clobv2_ok(),
+        privy_preflight=_preflight_ok(),
+        provisioning=_provisioning_ok(),
+        binding=binding,
+        live_policy=_policy(),
+        live_quorum=_quorum(),
     )
 
 
@@ -1039,6 +1069,30 @@ async def test_mode_b_arms_and_submits_when_all_preconditions_pass() -> None:
     assert adapter.submit_calls == 1, "a fully-armed Mode B must reach the submit wire"
     (decision,) = result.decisions
     assert decision.submitted is True and decision.abstain_reason is None
+
+
+async def test_direct_runner_call_with_technical_only_bundle_stays_unarmed() -> None:
+    """Gate#3 MAJOR-1 (REQ-005): the operator-interlock is UNBYPASSABLE via the public runner.
+
+    A DIRECT ``run_dust_execution`` with a bundle satisfying only the SIX technical arming
+    conditions — but carrying NO recorded operator-interlock proof — must NOT arm/submit. Only the
+    facade can mint that proof (after evaluating AND durably recording the five human preconditions);
+    the runner fails closed on its absence, so the interlock cannot be side-stepped by calling the
+    runner directly.
+
+    RED before the fix: the runner accepts the technical-only bundle and submits real money
+    (``submit_calls == 1``). GREEN after: no bound proof → ``operator_interlock_unproven`` → no wire.
+    """
+    adapter = RecordingFakeAdapter(fill=True)
+
+    result = await _run_guarded(adapter=adapter, arming=_technical_only_arming(_binding()))
+
+    assert adapter.submit_calls == 0, (
+        "a technical-only bundle (no recorded interlock proof) must NOT arm/submit — REQ-005"
+    )
+    (decision,) = result.decisions
+    assert decision.submitted is False
+    assert decision.abstain_reason == "operator_interlock_unproven"
 
 
 # --- E6-T4: manifest authorization (missing/mismatched fails closed; admit-but-cap) ----------

@@ -214,6 +214,7 @@ AbstainReason = Literal[
     "manifest_hash_mismatch",
     "admission_denied",
     "mode_b_not_armed",
+    "operator_interlock_unproven",
     "intent_no_quote",
     "intent_cancel_all",
     "intent_not_permitted",
@@ -234,6 +235,7 @@ ABSTAIN_REASONS: tuple[AbstainReason, ...] = (
     "manifest_hash_mismatch",
     "admission_denied",
     "mode_b_not_armed",
+    "operator_interlock_unproven",
     "intent_no_quote",
     "intent_cancel_all",
     "intent_not_permitted",
@@ -270,6 +272,29 @@ class SubmitDecision:
 
 
 @dataclass(frozen=True)
+class OperatorInterlockProof:
+    """The RECORDED-satisfied human-operator interlock proof BOUND into the arming bundle (REQ-005).
+
+    Gate#3 MAJOR-1: the five REQ-005/006 human preconditions are enforced in the facade, but the
+    runner is public/exported, so the arming ARTIFACT the runner consumes must itself carry proof
+    that the human interlock was satisfied AND durably RECORDED — otherwise a direct
+    :func:`run_dust_execution` with only the six TECHNICAL conditions would arm real money and
+    bypass the human gate. The facade is the ONLY sanctioned minter: it constructs this proof solely
+    after :func:`~veridex.dust_execution.facade.evaluate_operator_interlock` reports ``armed`` AND
+    every :class:`~veridex.dust_execution.contracts.OperatorInterlockEvent` was pushed to a durable
+    recording sink, deriving ``recording_receipt`` from those recorded events.
+
+    Fail-closed by construction: :func:`_mode_b_arming_block_reason` arms ONLY when ``satisfied is
+    True`` AND ``recording_receipt`` is a non-empty ref; a defaulted/absent proof (``None``), an
+    unsatisfied one, or one with no receipt keeps Mode B UNARMED. Carries ONLY a bool + a non-secret
+    ref (SEC-005), never a live handle.
+    """
+
+    satisfied: bool
+    recording_receipt: str
+
+
+@dataclass(frozen=True)
 class ModeBArming:
     """The FULL Mode-B (real-money) arming bundle — every precondition must POSITIVELY pass (E6-T4).
 
@@ -298,6 +323,11 @@ class ModeBArming:
     binding: ExecutionWalletBinding
     live_policy: PrivyWalletPolicy
     live_quorum: AuthorizationQuorum
+    #: Gate#3 MAJOR-1 (REQ-005): the RECORDED-satisfied human-operator interlock proof. Additive and
+    #: fail-closed — ``None`` (the default, e.g. a technical-only bundle built directly against the
+    #: runner) keeps Mode B UNARMED. Only the facade mints it, after the five human preconditions are
+    #: satisfied AND durably recorded, so the human gate cannot be bypassed via the public runner.
+    operator_interlock: OperatorInterlockProof | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -997,10 +1027,15 @@ def _mode_b_arming_block_reason(
     #. the binding ``binding_hash`` verifies against the pinned manifest field
        (:func:`execute_with`) AND the LIVE policy/quorum verify against the binding
        (:func:`arm_mode_b`) — a :class:`FailClosed` from either (reroute / weakened policy content
-       hash / quorum) blocks.
+       hash / quorum) blocks;
+    #. Gate#3 MAJOR-1 (REQ-005): a RECORDED-satisfied :class:`OperatorInterlockProof` must be BOUND
+       into the bundle (``satisfied is True`` AND a non-empty ``recording_receipt``) — a
+       missing/unsatisfied/unrecorded human interlock returns ``"operator_interlock_unproven"``, so a
+       direct (facade-bypassing) runner call with only the six technical conditions stays UNARMED.
 
-    Every branch returns the SAME closed-vocab ``"mode_b_not_armed"`` label (no secret / no live
-    handle). Removing ANY branch lets Mode B arm when it must not — the mutation each named test trips.
+    The six technical branches return the SAME closed-vocab ``"mode_b_not_armed"`` label; the human
+    interlock branch returns ``"operator_interlock_unproven"`` (both: no secret / no live handle).
+    Removing ANY branch lets Mode B arm when it must not — the mutation each named test trips.
     """
     if arming is None:
         return "mode_b_not_armed"
@@ -1024,6 +1059,15 @@ def _mode_b_arming_block_reason(
         )
     except FailClosed:
         return "mode_b_not_armed"
+    # Gate#3 MAJOR-1 (REQ-005): the six TECHNICAL conditions above are necessary but NOT sufficient —
+    # the runner is public/exported, so a technical-only bundle must NOT arm real money. The arming
+    # artifact must ALSO carry a RECORDED-satisfied human-operator interlock proof (minted only by the
+    # facade after the five human preconditions were satisfied AND durably recorded). Checked LAST so
+    # a technical-precondition failure still surfaces its own ``mode_b_not_armed`` reason; a
+    # missing/unsatisfied/unrecorded proof fails closed as ``operator_interlock_unproven``.
+    proof = arming.operator_interlock
+    if proof is None or proof.satisfied is not True or not proof.recording_receipt:
+        return "operator_interlock_unproven"
     return None
 
 
@@ -1989,6 +2033,7 @@ __all__ = [
     "DustQuote",
     "LifecycleEvent",
     "ModeBArming",
+    "OperatorInterlockProof",
     "QuoteSource",
     "SessionOutcome",
     "SessionStatus",

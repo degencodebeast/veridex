@@ -735,6 +735,32 @@ async def test_mode_b_arms_and_records_when_all_operator_preconditions_are_satis
     assert all(event.satisfied is True for event in recorded)
 
 
+async def test_mode_b_fails_closed_when_no_recording_sink_even_if_interlock_satisfied() -> None:
+    """Gate#3 MAJOR-1 (REQ-005): a satisfied interlock is only "satisfied" if it was durably
+    RECORDED. With ``interlock_sink=None`` there is NOWHERE to record the five
+    ``OperatorInterlockEvent``s, so Mode B must FAIL CLOSED — no arm, no submit — EVEN when all five
+    preconditions are asserted True. REQ-005 is absolute: satisfied AND recorded.
+
+    RED before the fix: the facade evaluates the armed interlock, records NOTHING (sink None), yet
+    passes the arming bundle through and submits an UNRECORDED real order (``submit_calls == 1``).
+    GREEN after: no sink → withhold the arming bundle → ``submit_calls == 0``.
+    """
+    binding = _mm_binding()
+    adapter = FakeVenueAdapter(fill=True)
+
+    await _drive_mode_b(
+        interlock=_full_interlock(),  # all five human preconditions asserted True
+        arming=_mm_arming(binding),  # a fully-passing E6-T4 technical arming bundle
+        binding=binding,
+        adapter=adapter,
+        interlock_sink=None,  # nowhere to durably record → REQ-005 fails closed
+    )
+
+    assert adapter.submit_calls == 0, (
+        "a satisfied interlock with NO recording sink must FAIL CLOSED — REQ-005 requires recorded"
+    )
+
+
 def test_facade_proposer_is_not_registered_as_a_tool_on_the_tools_empty_agent() -> None:
     """tools=[] invariant (REQ-003): the facade proposer is an INJECTABLE adapter, NOT a callable
     tool on the decision agent. The agent is assembled with an EMPTY tools list and the proposer is
