@@ -152,6 +152,54 @@ def test_post_quote_deep_book_approves() -> None:
     assert r.decision is PolicyDecision.APPROVED and "insufficient_liquidity" not in r.reason_codes
 
 
+# --- SAF-002 (§4.4): loss caps + wired session/day order caps ---------------------------------
+
+
+def test_changing_a_loss_cap_changes_policy_hash() -> None:
+    """The new loss caps fold into ``policy_hash`` via ``model_dump()`` (auto-hashed)."""
+    assert _env(max_session_loss=0.50).policy_hash() != _env(max_session_loss=0.75).policy_hash()
+    assert _env(max_daily_loss=0.50).policy_hash() != _env(max_daily_loss=0.75).policy_hash()
+
+
+def test_pre_quote_session_loss_over_cap_denies() -> None:
+    """A standing session loss above the cap denies pre-quote with ``session_loss_over_max``."""
+    r = evaluate_pre_quote(_pre(realized_loss_session=0.61), _env(max_session_loss=0.50))
+    assert r.decision is PolicyDecision.DENIED and "session_loss_over_max" in r.reason_codes
+
+
+def test_pre_quote_daily_loss_over_cap_denies() -> None:
+    """A standing daily loss above the cap denies pre-quote with ``daily_loss_over_max``."""
+    r = evaluate_pre_quote(_pre(realized_loss_day=0.61), _env(max_daily_loss=0.50))
+    assert r.decision is PolicyDecision.DENIED and "daily_loss_over_max" in r.reason_codes
+
+
+def test_pre_quote_disabled_loss_cap_is_transparent() -> None:
+    """A disabled (``<= 0``, the default) loss cap never contributes a reason code."""
+    r = evaluate_pre_quote(_pre(realized_loss_session=999.0, realized_loss_day=999.0), _env())
+    assert r.decision is PolicyDecision.APPROVED
+    assert "session_loss_over_max" not in r.reason_codes
+    assert "daily_loss_over_max" not in r.reason_codes
+
+
+def test_dead_order_caps_now_enforced() -> None:
+    """The formerly-dead ``max_orders_per_session`` is now read + enforced (spec §4.4)."""
+    r = evaluate_pre_quote(_pre(orders_this_session=2), _env(max_orders_per_session=2))
+    assert r.decision is PolicyDecision.DENIED and "order_cap_session" in r.reason_codes
+
+
+def test_dead_order_cap_day_now_enforced() -> None:
+    """The formerly-dead ``max_orders_per_day`` is now read + enforced (spec §4.4)."""
+    r = evaluate_pre_quote(_pre(orders_this_day=3), _env(max_orders_per_day=3))
+    assert r.decision is PolicyDecision.DENIED and "order_cap_day" in r.reason_codes
+
+
+def test_order_caps_transparent_below_limit() -> None:
+    """Below the session/day order caps the checks stay silent (backward-compatible defaults)."""
+    r = evaluate_pre_quote(_pre(orders_this_session=1, orders_this_day=1), _env())
+    assert r.decision is PolicyDecision.APPROVED
+    assert "order_cap_session" not in r.reason_codes and "order_cap_day" not in r.reason_codes
+
+
 def test_runner_has_no_second_authority() -> None:
     """Single-authority invariant: the runner delegates ALL gating to the policy two-phase gate.
 

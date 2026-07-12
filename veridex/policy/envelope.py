@@ -36,6 +36,12 @@ class PolicyEnvelope(BaseModel):
             live-guarded (real-money) path; ``<= 0`` leaves ``max_stake`` as the only cap.
         circuit_breaker_threshold: Consecutive execution failures that trip the circuit
             breaker OPEN (blocking further execution); ``<= 0`` disables the breaker.
+        max_session_loss: Fee-inclusive realized-loss ceiling for one execution session;
+            ``<= 0`` disables the cap (mirrors ``max_stake_live_guarded``). SAF-002: Mode B
+            (real money) admission REQUIRES a finite positive value; a disabled cap is
+            permitted ONLY in non-money modes.
+        max_daily_loss: Fee-inclusive realized-loss ceiling for one UTC day; ``<= 0``
+            disables the cap. Same Mode B admission requirement as ``max_session_loss``.
         kill_switch: When true, denies everything unconditionally.
     """
 
@@ -53,6 +59,8 @@ class PolicyEnvelope(BaseModel):
     human_approval_threshold: float
     max_stake_live_guarded: float = 0.0
     circuit_breaker_threshold: int = 0
+    max_session_loss: float = 0.0
+    max_daily_loss: float = 0.0
     kill_switch: bool = False
 
     def policy_hash(self) -> str:
