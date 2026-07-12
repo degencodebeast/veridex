@@ -52,6 +52,12 @@ testpaths = ["tests"]
 addopts = "-q"
 # async shell uses asyncio; auto mode lets plain `async def test_*` run without per-test markers.
 asyncio_mode = "auto"
+# R4-A (E0-T1): mark ONLY tests that hit a real network/venue/provider endpoint. CI excludes them via
+# `-m "not live_network"`. Do NOT use a name-substring like `-k "not live"` — that silently drops offline
+# trust suites (e.g. test_live_recorder_*). Registering the marker makes `-m "not live_network"` clean.
+markers = [
+    "live_network: test performs real network I/O to a venue/provider; operator-run only, excluded from CI",
+]
 
 [tool.ruff]
 line-length = 120
