@@ -27,14 +27,18 @@ What these tests pin (§6 group 3, IDM-005 / AC-040 / AC-011):
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Any
 
 from veridex.dust_execution.contracts import PreSubmitRecord
 from veridex.dust_execution.reconcile import (
     DurableSubmitResult,
+    freezes_new_submits,
     reconcile_durable_ack_lost,
+    reconcile_uncertain_submit,
     recover_presubmit_records,
     submit_with_durable_presubmit,
+    worst_case_uncertain_exposure,
 )
 from veridex.store import InMemoryStore, PreSubmitLedgerRow
 
@@ -258,3 +262,205 @@ async def test_durable_ledger_is_append_only_across_multiple_submits() -> None:
     rows = await store.list_presubmit(_SESSION)
     assert [row.captured_id for row in rows] == ["a", "b"]
     assert [row.seq for row in rows] == sorted(row.seq for row in rows)
+
+
+# ===========================================================================
+# E4-T2 — tri-state uncertain-submit reconciliation vs COMPLETE VENUE TRUTH
+# (IDM-002, AC-011/035, §6 group 3). The double-exposure guard.
+# ===========================================================================
+#
+# MONEY-NETWORK BOUNDARY. ``reconcile_uncertain_submit`` queries the E3-T2 read surfaces
+# (get_orders ∪ get_order-by-id ∪ get_fill_history), keyed by the OFFICIAL venue_order_key,
+# BEFORE any retry. ``FakeAdapter`` is a Mode-A fake that structurally matches
+# ``veridex.venues.base.VenueReconciliationReads`` (the same three async reads the real
+# ``PolymarketAdapter`` exposes) — no network, no signing; Mode B UNARMED.
+#
+# The classifier is MUTUALLY EXCLUSIVE — exactly one of RESOLVED / DEFINITIVELY_ABSENT /
+# AMBIGUOUS. RESOLVED requires POSITIVE terminal evidence (a fill in history keyed by
+# venue_order_key, OR a terminal get_order status). Bare zero-open — or a missing/unavailable
+# history surface — is AMBIGUOUS (fail-closed), NEVER DEFINITIVELY_ABSENT (that positive-evidence
+# path is deferred to E4-T6). AMBIGUOUS FREEZES new submits and reserves worst-case exposure.
+
+# The venue keys order/trade/fill responses by the OFFICIAL V2 order hash — never Veridex's
+# private client_order_id (which is never on the wire).
+REC = _record()
+
+# A sentinel meaning "the history surface is UNAVAILABLE" (reader raises), distinct from an
+# available-but-empty history ([]).
+_HISTORY_UNAVAILABLE = object()
+
+
+@dataclass(frozen=True)
+class Fill:
+    """A realized own fill keyed by the OFFICIAL venue order hash (never the private id)."""
+
+    order_hash: str
+    filled: float
+
+
+def _open_order(order_id: str, *, status: str = "LIVE") -> dict[str, Any]:
+    """A §5 OpenOrder record. ``client_order_id`` is DELIBERATELY absent — it is never on the wire."""
+    return {
+        "id": order_id,
+        "status": status,
+        "market": "0xcond",
+        "asset_id": "111",
+        "side": "BUY",
+        "original_size": "10",
+        "size_matched": "0",
+        "price": "0.42",
+    }
+
+
+class FakeAdapter:
+    """Mode-A fake of ``veridex.venues.base.VenueReconciliationReads`` — the complete venue truth.
+
+    Exposes the E3-T2 read surfaces (all async, no network): ``get_orders`` (is it resting?),
+    ``get_order`` (status-by-id), ``get_fill_history`` (did it fill?). Every surface touched is
+    recorded in ``queried`` so "all three queried before any retry" is provable.
+
+    Args:
+        open_orders: The §5 open-order records ``get_orders`` returns (resting candidates).
+        fill_history: ``Fill`` records ``get_fill_history`` maps to §3 trade rows; pass
+            ``_HISTORY_UNAVAILABLE`` to make the surface raise (fail-closed test).
+        status_by_id: id -> §5 status record for ``get_order``; ``None`` means "no record" (the
+            ACK-lost order is not resting under that id → no terminal status).
+    """
+
+    def __init__(
+        self,
+        *,
+        open_orders: list[dict[str, Any]] | None = None,
+        fill_history: list[Fill] | object | None = None,
+        status_by_id: dict[str, dict[str, Any]] | None = None,
+    ) -> None:
+        self._open_orders = open_orders or []
+        self._fill_history = [] if fill_history is None else fill_history
+        self._status_by_id = status_by_id
+        self.queried: list[str] = []
+
+    async def get_orders(self, **kwargs: Any) -> list[dict[str, Any]]:
+        self.queried.append("get_orders")
+        return [dict(o) for o in self._open_orders]
+
+    async def get_order(self, order_id: str, **kwargs: Any) -> dict[str, Any]:
+        self.queried.append("get_order")
+        if self._status_by_id is None:
+            return {}
+        return dict(self._status_by_id.get(order_id, {}))
+
+    async def get_fill_history(self, **kwargs: Any) -> list[dict[str, Any]]:
+        self.queried.append("get_fill_history")
+        if self._fill_history is _HISTORY_UNAVAILABLE:
+            raise RuntimeError("fill-history surface unavailable")
+        # §3 Trade EXACT-SET shape, keyed by the official taker_order_id (the venue_order_key).
+        return [
+            {"taker_order_id": f.order_hash, "size": str(f.filled), "status": "CONFIRMED"}
+            for f in self._fill_history  # type: ignore[union-attr]
+        ]
+
+
+# --- The three verbatim RED tests (the double-exposure guard) --------------------------------
+
+
+async def test_ack_lost_fak_that_filled_is_RESOLVED_not_retried() -> None:
+    # FAK filled before the poll: absent from get_orders but present in fill history.
+    adapter = FakeAdapter(
+        open_orders=[], fill_history=[Fill(order_hash=REC.venue_order_key, filled=1.0)]
+    )
+    # NEVER "did not land": a fill keyed by the official id is POSITIVE terminal evidence.
+    assert await reconcile_uncertain_submit(REC, adapter=adapter) == "RESOLVED"
+
+
+async def test_zero_open_without_terminal_proof_is_AMBIGUOUS_not_absent() -> None:
+    # Zero open, empty history, no status record → NO positive evidence and NO proof of absence.
+    adapter = FakeAdapter(open_orders=[], fill_history=[], status_by_id=None)
+    # fail-closed, no retry — "I see no open order" is NOT proof the order never existed.
+    assert await reconcile_uncertain_submit(REC, adapter=adapter) == "AMBIGUOUS"
+
+
+async def test_multiple_candidates_is_AMBIGUOUS() -> None:
+    o1 = _open_order("0xcand1")
+    o2 = _open_order("0xcand2")
+    # client_order_id is never on the wire → the two open orders are indistinguishable candidates.
+    adapter = FakeAdapter(open_orders=[o1, o2])
+    assert await reconcile_uncertain_submit(REC, adapter=adapter) == "AMBIGUOUS"
+
+
+# --- Fail-closed on a MISSING history surface (taker stays AMBIGUOUS, never absent) ----------
+
+
+async def test_missing_history_surface_keeps_taker_AMBIGUOUS_never_absent() -> None:
+    # The history surface is UNAVAILABLE (raises). A taker with no proof of a fill can NOT be
+    # declared DEFINITIVELY_ABSENT — fail-closed to AMBIGUOUS.
+    adapter = FakeAdapter(open_orders=[], fill_history=_HISTORY_UNAVAILABLE, status_by_id=None)
+    verdict = await reconcile_uncertain_submit(REC, adapter=adapter)
+    assert verdict == "AMBIGUOUS"
+    assert verdict != "DEFINITIVELY_ABSENT"
+
+
+async def test_adapter_lacking_history_surface_is_AMBIGUOUS() -> None:
+    # An adapter that does not even EXPOSE get_fill_history is fail-closed (never absent).
+    class _NoHistoryAdapter:
+        async def get_orders(self, **kwargs: Any) -> list[dict[str, Any]]:
+            return []
+
+        async def get_order(self, order_id: str, **kwargs: Any) -> dict[str, Any]:
+            return {}
+
+    assert await reconcile_uncertain_submit(REC, adapter=_NoHistoryAdapter()) == "AMBIGUOUS"
+
+
+# --- Positive terminal evidence via the get_order status-by-id surface → RESOLVED ------------
+
+
+async def test_terminal_status_via_get_order_is_RESOLVED() -> None:
+    # No fill row and no open order, but get_order-by-id reports a TERMINAL status (killed/expired
+    # etc.) — that is positive terminal evidence → RESOLVED, never "did not land".
+    adapter = FakeAdapter(
+        open_orders=[],
+        fill_history=[],
+        status_by_id={REC.venue_order_key: {"id": REC.venue_order_key, "status": "filled"}},
+    )
+    assert await reconcile_uncertain_submit(REC, adapter=adapter) == "RESOLVED"
+
+
+# --- ALL THREE surfaces are queried, keyed by venue_order_key, BEFORE any retry --------------
+
+
+async def test_all_three_surfaces_queried_by_venue_order_key_before_retry() -> None:
+    adapter = FakeAdapter(open_orders=[], fill_history=[], status_by_id=None)
+    await reconcile_uncertain_submit(REC, adapter=adapter)
+    assert set(adapter.queried) == {"get_orders", "get_order", "get_fill_history"}
+
+
+# --- Mutual exclusivity: the verdict is always exactly one of the closed tri-state -----------
+
+
+async def test_tristate_is_mutually_exclusive() -> None:
+    resolved = await reconcile_uncertain_submit(
+        REC, adapter=FakeAdapter(fill_history=[Fill(order_hash=REC.venue_order_key, filled=2.0)])
+    )
+    ambiguous = await reconcile_uncertain_submit(REC, adapter=FakeAdapter(open_orders=[]))
+    for verdict in (resolved, ambiguous):
+        assert verdict in {"RESOLVED", "DEFINITIVELY_ABSENT", "AMBIGUOUS"}
+    # This task NEVER fabricates DEFINITIVELY_ABSENT (its positive-evidence path is deferred to E4-T6).
+    assert resolved == "RESOLVED"
+    assert ambiguous == "AMBIGUOUS"
+
+
+# --- AMBIGUOUS freezes new submits and reserves worst-case exposure (no double-commit) -------
+
+
+def test_AMBIGUOUS_freezes_new_submits_and_reserves_worst_case_exposure() -> None:
+    # AMBIGUOUS FREEZES new submits (no retry) — a possibly-live order must not be re-sent.
+    assert freezes_new_submits("AMBIGUOUS") is True
+    assert freezes_new_submits("RESOLVED") is False
+    assert freezes_new_submits("DEFINITIVELY_ABSENT") is False
+
+    # Worst-case exposure: a possibly-live AMBIGUOUS order reserves the FULL intended size against
+    # caps + non-crossing (so it is never double-committed). Absent reserves nothing; a RESOLVED
+    # order's real matched size is accounted by its reconciled record → uncertainty reserve released.
+    assert worst_case_uncertain_exposure("AMBIGUOUS", intended_size=7.5) == 7.5
+    assert worst_case_uncertain_exposure("DEFINITIVELY_ABSENT", intended_size=7.5) == 0.0
+    assert worst_case_uncertain_exposure("RESOLVED", intended_size=7.5) == 0.0
