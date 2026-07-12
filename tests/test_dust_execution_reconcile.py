@@ -35,7 +35,10 @@ from veridex.dust_execution.emergency import DustSafetySession, SafetyController
 from veridex.dust_execution.reconcile import (
     AmbiguousResolution,
     DurableSubmitResult,
+    ResubmitAuthorization,
     UncertainSubmitState,
+    authorize_resubmit_against_venue_truth,
+    duplicate_resubmit_authorized,
     freezes_new_submits,
     reconcile_durable_ack_lost,
     reconcile_uncertain_submit,
@@ -708,3 +711,123 @@ async def test_timeout_sweep_uses_injected_cause_and_stays_bounded() -> None:
     assert session.block_cause == "manual"
     # Bounded: it did not spin forever — a small, finite number of polls before the sweep.
     assert 1 <= result.polls <= 5
+
+
+# ===========================================================================
+# E4-T4 — a duplicate client_order_id (or a re-submit after reconciliation)
+# creates NO duplicate live exposure (IDM-003, AC-012, §6 group 3).
+# ===========================================================================
+#
+# MONEY-NETWORK BOUNDARY. The dedup guard consults COMPLETE VENUE TRUTH (the E4-T2 three-surface
+# reconcile, keyed by the OFFICIAL ``venue_order_key``) BEFORE authorizing a (re-)submit — it NEVER
+# compares Veridex-local ``client_order_id``s, because IDM-001 keeps that id OFF the wire (the venue
+# has never seen it, so no venue record is keyed by it). ``FakeAdapter`` is the Mode-A fake; Mode B
+# UNARMED.
+#
+# The invariant (IDM-003 / AC-012): if a submit with a given ``client_order_id`` is already LIVE per
+# venue truth — open (AMBIGUOUS: a resting order is indistinguishable / possibly-live) or filled
+# (RESOLVED: positive terminal evidence) — a SECOND submit with the same ``client_order_id`` (or a
+# re-submit after reconciliation) MUST NOT create a second live order. A re-submit is authorized ONLY
+# when the prior reconciles DEFINITIVELY_ABSENT; RESOLVED (live/filled) and AMBIGUOUS (frozen per
+# E4-T3) both DENY.
+
+# The Veridex-LOCAL id (IDM-001) — never on the wire, so no venue record is keyed by it. A second
+# submit re-using it must not create duplicate exposure.
+_CLIENT_ORDER_ID = "veridex-local-coid-7f3a"
+
+
+async def _absent_reconcile() -> UncertainSubmitState:
+    """A stand-in reconcile verdict of DEFINITIVELY_ABSENT (the classifier defers its positive-evidence
+    path to E4-T6; here it is injected to prove the ONLY state that permits a fresh submit)."""
+    return "DEFINITIVELY_ABSENT"
+
+
+# --- RED anchor: a duplicate client_order_id creates NO duplicate live exposure ---------------
+
+
+async def test_duplicate_client_order_id_creates_no_duplicate_exposure() -> None:
+    """A duplicate ``client_order_id`` (or a re-submit) creates NO duplicate live exposure (IDM-003).
+
+    The dedup guard reconciles the PRIOR submit against complete venue truth by ``venue_order_key``
+    (NEVER by the Veridex-local ``client_order_id``, which the venue has never seen). While the prior
+    is live/filled the duplicate is DENIED; a fresh submit is authorized ONLY when the prior is
+    DEFINITIVELY_ABSENT. The mutation that dedups by comparing ``client_order_id``s (or authorizes a
+    duplicate while the prior is live) fails HERE.
+    """
+    # Prior is FILLED per venue truth (a fill keyed by the official venue_order_key → RESOLVED).
+    filled_adapter = FakeAdapter(
+        open_orders=[], fill_history=[Fill(order_hash=REC.venue_order_key, filled=1.0)]
+    )
+    filled = await authorize_resubmit_against_venue_truth(
+        REC, client_order_id=_CLIENT_ORDER_ID, adapter=filled_adapter
+    )
+    assert isinstance(filled, ResubmitAuthorization)
+    assert filled.prior_state == "RESOLVED"
+    # A second submit re-using the same client_order_id must NOT create a second live order.
+    assert filled.authorized is False
+
+    # Prior is LIVE/OPEN per venue truth (a resting order is possibly-live → AMBIGUOUS, frozen).
+    live_adapter = FakeAdapter(open_orders=[_open_order("0xrestinglive")])
+    live = await authorize_resubmit_against_venue_truth(
+        REC, client_order_id=_CLIENT_ORDER_ID, adapter=live_adapter
+    )
+    assert live.prior_state == "AMBIGUOUS"
+    assert live.authorized is False
+
+    # The guard consulted venue truth (the three read surfaces) BEFORE deciding — not the local id.
+    assert set(live_adapter.queried) <= {"get_orders", "get_order", "get_fill_history"}
+    assert live_adapter.queried  # at least one venue-truth surface was actually queried
+
+    # A re-submit is authorized ONLY when the prior reconciles DEFINITIVELY_ABSENT.
+    absent = await authorize_resubmit_against_venue_truth(
+        REC,
+        client_order_id=_CLIENT_ORDER_ID,
+        adapter=FakeAdapter(open_orders=[], fill_history=[], status_by_id=None),
+        reconcile_fn=_absent_reconcile,
+    )
+    assert absent.prior_state == "DEFINITIVELY_ABSENT"
+    assert absent.authorized is True
+
+
+# --- The permit predicate: ONLY DEFINITIVELY_ABSENT authorizes a duplicate/re-submit ----------
+
+
+def test_duplicate_resubmit_authorized_only_when_definitively_absent() -> None:
+    """The predicate authorizes a duplicate/re-submit ONLY for a DEFINITIVELY_ABSENT prior.
+
+    Stricter than :func:`retry_authorized_while` (which also frees a RESOLVED order for a NEW,
+    DIFFERENT intent): re-using the SAME ``client_order_id`` while its prior is RESOLVED (filled) would
+    duplicate live exposure, so RESOLVED denies here too. Only a definitively-absent prior — the order
+    provably never landed — permits a fresh submit.
+    """
+    assert duplicate_resubmit_authorized("DEFINITIVELY_ABSENT") is True
+    assert duplicate_resubmit_authorized("RESOLVED") is False
+    assert duplicate_resubmit_authorized("AMBIGUOUS") is False
+
+
+# --- Dedup keys on VENUE TRUTH (venue_order_key), NEVER the Veridex-local client_order_id ------
+
+
+async def test_dedup_keys_on_venue_order_key_never_client_order_id() -> None:
+    """The dedup decision is keyed on venue truth (``venue_order_key``), never the local id (IDM-001).
+
+    The venue's open-order records DELIBERATELY carry no ``client_order_id`` (it is never on the wire),
+    so two DIFFERENT local ids against the SAME live prior are BOTH denied — proving the decision is
+    driven by the reconciled venue-truth state, not by comparing local ids (which would find no venue
+    record keyed by the id and wrongly always-authorize).
+    """
+    live_adapter = FakeAdapter(open_orders=[_open_order("0xrestinglive")])  # AMBIGUOUS (possibly-live)
+
+    first = await authorize_resubmit_against_venue_truth(
+        REC, client_order_id="veridex-coid-AAAA", adapter=live_adapter
+    )
+    second = await authorize_resubmit_against_venue_truth(
+        REC, client_order_id="veridex-coid-BBBB", adapter=live_adapter
+    )
+    # DIFFERENT local ids, SAME live prior → BOTH denied (decision keyed on venue truth, not the id).
+    assert first.authorized is False
+    assert second.authorized is False
+    assert first.venue_order_key == REC.venue_order_key
+    # The venue open-order record never exposes a client_order_id (IDM-001) — the guard cannot and
+    # does not compare it.
+    assert "client_order_id" not in _open_order("0xrestinglive")

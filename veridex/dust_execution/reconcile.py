@@ -569,17 +569,146 @@ async def resolve_ambiguous_submit(
         await sleep(poll_interval_ms / 1000.0)
 
 
+# ---------------------------------------------------------------------------
+# E4-T4 — a duplicate client_order_id (or a re-submit after reconciliation)
+# creates NO duplicate live exposure (IDM-003, AC-012, §6 group 3).
+# ---------------------------------------------------------------------------
+#
+# The double-submit dedup guard. ``client_order_id`` is Veridex-LOCAL and NEVER on the wire (IDM-001),
+# so the venue has no record keyed by it — dedup by comparing ``client_order_id``s is structurally
+# impossible (there is nothing on the venue side to compare against). The ONLY sound dedup is against
+# COMPLETE VENUE TRUTH: reconcile the PRIOR submit's ``venue_order_key`` through the E4-T2 three-surface
+# reconcile (:func:`reconcile_uncertain_submit`) BEFORE authorizing the (re-)submit. If the prior is
+# already live/filled the duplicate is DENIED (no second live order); a fresh submit is authorized
+# ONLY when the prior is DEFINITIVELY_ABSENT — RESOLVED (live/filled) and AMBIGUOUS (frozen per E4-T3)
+# both DENY. This is STRICTER than :func:`retry_authorized_while` (which frees a RESOLVED order for a
+# NEW, different intent): re-using the SAME id while its prior is RESOLVED would duplicate exposure.
+
+#: The auditable reason a duplicate/re-submit was authorized or denied — pinned to a closed set so the
+#: decision provenance can never be a free-form afterthought.
+ResubmitDecisionReason = Literal[
+    "AUTHORIZED_PRIOR_DEFINITIVELY_ABSENT",
+    "DENIED_PRIOR_RESOLVED_LIVE_OR_FILLED",
+    "DENIED_PRIOR_AMBIGUOUS_FROZEN",
+]
+
+
+def duplicate_resubmit_authorized(prior_state: UncertainSubmitState) -> bool:
+    """``True`` iff a duplicate/re-submit is authorized for ``prior_state``: ONLY DEFINITIVELY_ABSENT.
+
+    The no-duplicate-exposure guard, in predicate form (IDM-003, AC-012). Re-using a
+    ``client_order_id`` (or re-submitting after reconciliation) is authorized ONLY when the prior
+    order provably never landed (``DEFINITIVELY_ABSENT``). A ``RESOLVED`` prior is live/filled — a
+    second submit would create a SECOND live exposure — and an ``AMBIGUOUS`` prior is possibly-live and
+    frozen (E4-T3); BOTH deny. This is intentionally stricter than :func:`retry_authorized_while`,
+    which frees a RESOLVED order for a NEW, different intent (not a duplicate of the same id).
+
+    Args:
+        prior_state: The tri-state verdict the prior submit reconciled to against venue truth.
+
+    Returns:
+        Whether a duplicate/re-submit is authorized (always ``False`` unless DEFINITIVELY_ABSENT).
+    """
+    return prior_state == "DEFINITIVELY_ABSENT"
+
+
+@dataclass(frozen=True)
+class ResubmitAuthorization:
+    """The auditable verdict of the double-submit dedup guard (IDM-003, AC-012).
+
+    Attributes:
+        authorized: Whether the (re-)submit is authorized — ``True`` ONLY for a DEFINITIVELY_ABSENT
+            prior (no duplicate live exposure).
+        prior_state: The tri-state the PRIOR submit reconciled to against complete venue truth (the
+            basis of the decision — derived from ``venue_order_key``, never from the local id).
+        venue_order_key: The official venue join key the prior was reconciled by (proving the dedup is
+            keyed on venue truth, not on the Veridex-local ``client_order_id``).
+        reason: The closed-set decision provenance.
+    """
+
+    authorized: bool
+    prior_state: UncertainSubmitState
+    venue_order_key: str
+    reason: ResubmitDecisionReason
+
+
+async def authorize_resubmit_against_venue_truth(
+    prior_record: PreSubmitRecord,
+    *,
+    client_order_id: str,
+    adapter: VenueReconciliationReads,
+    reconcile_fn: UncertainPoll | None = None,
+) -> ResubmitAuthorization:
+    """Authorize a duplicate/re-submit ONLY if the prior reconciles DEFINITIVELY_ABSENT (IDM-003).
+
+    The double-submit dedup guard. It CONSULTS complete venue truth BEFORE authorizing: the PRIOR
+    submit's ``prior_record.venue_order_key`` is reconciled through the E4-T2 three-surface reconcile
+    (``get_orders`` ∪ ``get_order``-by-id ∪ ``get_fill_history``, keyed by the OFFICIAL id), and a
+    (re-)submit re-using ``client_order_id`` is authorized ONLY when that prior reconciles
+    DEFINITIVELY_ABSENT (:func:`duplicate_resubmit_authorized`). A RESOLVED (live/filled) or AMBIGUOUS
+    (possibly-live, frozen) prior DENIES the duplicate, so a second live order is never created.
+
+    ``client_order_id`` is IDM-001 Veridex-LOCAL — it is NEVER on the wire and NEVER used as a lookup
+    key here (the venue has no record keyed by it); it is carried only for the caller's audit trail.
+    The dedup is driven ENTIRELY by the reconciled venue-truth state.
+
+    Args:
+        prior_record: The durable pre-submit record of the PRIOR order whose ``venue_order_key`` is
+            reconciled against venue truth (the join key — never the local id).
+        client_order_id: The Veridex-local id being re-used (audit only; NEVER a venue lookup key).
+        adapter: A complete-venue-truth reader (consumed READ-ONLY) the default reconcile queries.
+        reconcile_fn: Override for the venue-truth reconcile (defaults to
+            :func:`reconcile_uncertain_submit` bound to ``prior_record`` + ``adapter``). The
+            positive-evidence path that yields DEFINITIVELY_ABSENT is deferred to E4-T6, so tests
+            inject that terminal here; it RE-QUERIES venue truth, it NEVER re-submits.
+
+    Returns:
+        The auditable :class:`ResubmitAuthorization`.
+    """
+    # ``client_order_id`` is Veridex-LOCAL (IDM-001) — it is deliberately NOT consulted for the dedup
+    # decision; the venue has never seen it, so no venue record is keyed by it. Retained for audit.
+    del client_order_id
+
+    async def _default_reconcile() -> UncertainSubmitState:
+        # Reconcile the PRIOR order by its OFFICIAL venue_order_key across the three surfaces — this is
+        # the venue-truth dedup key, NEVER the Veridex-local client_order_id.
+        return await reconcile_uncertain_submit(prior_record, adapter=adapter)
+
+    reconcile: UncertainPoll = reconcile_fn if reconcile_fn is not None else _default_reconcile
+
+    prior_state = await reconcile()
+    authorized = duplicate_resubmit_authorized(prior_state)
+
+    if authorized:
+        reason: ResubmitDecisionReason = "AUTHORIZED_PRIOR_DEFINITIVELY_ABSENT"
+    elif prior_state == "RESOLVED":
+        reason = "DENIED_PRIOR_RESOLVED_LIVE_OR_FILLED"
+    else:
+        reason = "DENIED_PRIOR_AMBIGUOUS_FROZEN"
+
+    return ResubmitAuthorization(
+        authorized=authorized,
+        prior_state=prior_state,
+        venue_order_key=prior_record.venue_order_key,
+        reason=reason,
+    )
+
+
 __all__ = [
     "AmbiguousOutcome",
     "AmbiguousResolution",
     "AsyncSleep",
     "Clock",
     "DurableSubmitResult",
+    "ResubmitAuthorization",
+    "ResubmitDecisionReason",
     "UncertainPoll",
     "UncertainSubmitState",
     "UncertainSubmitVerdict",
     "WirePost",
     "assess_uncertain_submit",
+    "authorize_resubmit_against_venue_truth",
+    "duplicate_resubmit_authorized",
     "freezes_new_submits",
     "persist_presubmit_record",
     "reconcile_durable_ack_lost",
