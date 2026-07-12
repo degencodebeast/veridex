@@ -1,0 +1,30 @@
+[
+ {
+  "fixture_id": 18209181,
+  "event_slug": "fifwc-fra-mar-2026-07-09",
+  "home_team": "France",
+  "away_team": "Morocco",
+  "kickoff_ts": 1783627200
+ },
+ {
+  "fixture_id": 18218149,
+  "event_slug": "fifwc-esp-bel-2026-07-10",
+  "home_team": "Spain",
+  "away_team": "Belgium",
+  "kickoff_ts": 1783710000
+ },
+ {
+  "fixture_id": 18213979,
+  "event_slug": "fifwc-nor-eng-2026-07-11",
+  "home_team": "Norway",
+  "away_team": "England",
+  "kickoff_ts": 1783803600
+ },
+ {
+  "fixture_id": 18222446,
+  "event_slug": "fifwc-arg-che-2026-07-11",
+  "home_team": "Argentina",
+  "away_team": "Switzerland",
+  "kickoff_ts": 1783818000
+ }
+]
