@@ -652,7 +652,7 @@ async def _run_guarded(
     request: MMExecutionToolRequest | None = None,
     wallet_equity_at_decision: float = _WALLET_EQUITY,
     fixed_fraction: float = _FIXED_FRACTION,
-    shutdown_policy: ShutdownPolicy = "leave_flat",
+    shutdown_policy: ShutdownPolicy = "leave_open",
 ) -> DustExecutionResult:
     binding = _binding()
     effective_manifest = manifest if manifest is not None else _mode_b_manifest(binding)
@@ -1441,14 +1441,20 @@ async def test_startup_sweep_unknown_read_in_mode_a_records_no_wire_no_crash() -
     assert decision.submitted is False and decision.abstain_reason == "mode_a_no_orders"
 
 
-# --- E6-T6: shutdown cancel-all or explicit leave-flat decision (SAF-006, AC-009) -------------
+# --- E6-T6: shutdown cancel-all or explicit leave-open decision (SAF-006, AC-009) -------------
 #
 # THE safety property: at shutdown the outcome must be one of exactly two EXPLICIT states —
-# cancel-all fired (wire cancel + block) OR an explicit recorded leave-flat/leave-open decision. A
+# cancel-all fired (wire cancel + block) OR an explicit recorded leave-open decision. A
 # silent abandon (the run ends with resting orders and NEITHER a fired cancel-all NOR a recorded
 # decision) is the failure these tests expose. Mutation: make shutdown a silent no-op (neither cancel
 # nor record) -> ``result.shutdown_decision`` would not exist / the cancel-all WIRE would not fire ->
 # these tests fail.
+#
+# Gate#3 MINOR-1 (honesty): the no-cancel branch is named ``"leave_open"`` (never ``"leave_flat"`` —
+# that branch leaves resting orders OPEN, not flat), and ``cancel_all_fired`` must be ``True`` ONLY
+# when THIS shutdown call actually fired a FRESH wire sweep — never when an earlier safety trigger
+# already satisfied the cancel-all outcome. Mutation: hardcode ``cancel_all_fired=True`` regardless of
+# whether THIS call fired the wire -> the prior-sweep idempotent test below fails.
 
 
 async def test_shutdown_cancel_all_policy_fires_cancel_all_wire() -> None:
@@ -1469,28 +1475,34 @@ async def test_shutdown_cancel_all_policy_fires_cancel_all_wire() -> None:
     assert "venue_order_id" not in session.last_cancel_all_ack.model_dump()
     assert isinstance(result.shutdown_decision, ShutdownDecision)
     assert result.shutdown_decision.policy == "cancel_all"
-    assert result.shutdown_decision.cancel_all_fired is True
+    assert result.shutdown_decision.cancel_all_fired is True, (
+        "CONTRAST case (Gate#3 MINOR-1): with NO prior safety sweep, a cancel_all shutdown must "
+        "claim it fired the wire, since it did"
+    )
+    assert result.shutdown_decision.already_satisfied_by_prior_sweep is False
 
 
-async def test_shutdown_leave_flat_policy_records_explicit_decision_no_wire() -> None:
-    """SAF-006: a leave-flat shutdown policy records an EXPLICIT decision and fires NO cancel-all
-    wire — a recorded choice, never a silent omission.
+async def test_shutdown_leave_open_policy_records_explicit_decision_no_wire() -> None:
+    """SAF-006 (Gate#3 MINOR-1 honest label): a leave-open shutdown policy records an EXPLICIT
+    decision and fires NO cancel-all wire — a recorded choice, never a silent omission. Named
+    ``"leave_open"`` (never ``"leave_flat"``) because the branch leaves resting orders OPEN.
     """
     adapter = RecordingFakeAdapter(fill=True)
     safety, session = _make_safety()
 
     result = await _run_guarded(
-        adapter=adapter, safety=safety, session=session, shutdown_policy="leave_flat"
+        adapter=adapter, safety=safety, session=session, shutdown_policy="leave_open"
     )
 
-    assert adapter.cancel_all_calls == 0, "a leave-flat shutdown policy must fire NO cancel-all wire"
-    assert session.submit_blocked is False, "leave-flat must never engage the emergency-stop block"
+    assert adapter.cancel_all_calls == 0, "a leave-open shutdown policy must fire NO cancel-all wire"
+    assert session.submit_blocked is False, "leave-open must never engage the emergency-stop block"
     assert isinstance(result.shutdown_decision, ShutdownDecision)
-    assert result.shutdown_decision.policy == "leave_flat"
+    assert result.shutdown_decision.policy == "leave_open"
     assert result.shutdown_decision.cancel_all_fired is False
+    assert result.shutdown_decision.already_satisfied_by_prior_sweep is False
 
 
-async def test_shutdown_default_policy_is_explicit_leave_flat_never_omitted() -> None:
+async def test_shutdown_default_policy_is_explicit_leave_open_never_omitted() -> None:
     """POSITIVE CONTROL: the pinned default shutdown policy still yields an EXPLICIT, non-``None``
     decision — proving the "never silent" property holds even when the caller supplies nothing.
     """
@@ -1499,8 +1511,9 @@ async def test_shutdown_default_policy_is_explicit_leave_flat_never_omitted() ->
     result = await _run_guarded(adapter=adapter)
 
     assert isinstance(result.shutdown_decision, ShutdownDecision)
-    assert result.shutdown_decision.policy == "leave_flat"
+    assert result.shutdown_decision.policy == "leave_open"
     assert result.shutdown_decision.cancel_all_fired is False
+    assert result.shutdown_decision.already_satisfied_by_prior_sweep is False
     assert adapter.cancel_all_calls == 0, "the pinned default must not fire the cancel-all wire"
 
 
@@ -1532,12 +1545,22 @@ async def test_shutdown_mode_a_cancel_all_policy_records_decision_but_touches_no
     assert isinstance(result.shutdown_decision, ShutdownDecision)
     assert result.shutdown_decision.policy == "cancel_all"
     assert result.shutdown_decision.cancel_all_fired is False
+    assert result.shutdown_decision.already_satisfied_by_prior_sweep is False, (
+        "Mode A never attempts a sweep at all (AC-017) — this is a no-attempt, not a "
+        "prior-sweep-already-satisfied outcome"
+    )
 
 
 async def test_shutdown_cancel_all_is_idempotent_after_prior_safety_trigger() -> None:
-    """A cancel-all shutdown after an EARLIER safety trigger already swept is idempotent: the wire is
-    NOT re-fired (the session is already blocked), yet the shutdown outcome is still explicitly
-    recorded — never silently skipped just because the session was already blocked.
+    """Gate#3 MINOR-1 (honesty RED): a cancel-all shutdown AFTER an EARLIER safety trigger already
+    fired+blocked is a wire NO-OP for THIS call — the recording-fake ``cancel_all_calls`` must NOT
+    increment on the shutdown call, and the returned :class:`ShutdownDecision` must NOT claim THIS
+    call fired the wire. Before the MINOR-1 fix, ``cancel_all_fired`` was hardcoded ``True`` whenever
+    ``shutdown_policy == "cancel_all"`` in Mode B, over-claiming a wire fire that a prior breaker sweep
+    had already performed. The honest telemetry instead reports
+    ``cancel_all_fired=False`` + ``already_satisfied_by_prior_sweep=True``: the cancel-all OUTCOME
+    already holds, but this shutdown call touched no wire. The shutdown decision is still explicitly
+    recorded — never silently skipped just because the session was already blocked (SAF-006).
     """
     adapter = RecordingFakeAdapter(fill=True)
     safety, session = _make_safety()
@@ -1551,12 +1574,21 @@ async def test_shutdown_cancel_all_is_idempotent_after_prior_safety_trigger() ->
         shutdown_policy="cancel_all",
     )
 
-    assert adapter.cancel_all_calls == 1, "the idempotent primitive must NOT re-fire the wire at shutdown"
+    assert adapter.cancel_all_calls == 1, (
+        "the idempotent primitive must NOT re-fire the wire at shutdown — the ONE call was the prior "
+        "breaker sweep, not the shutdown call"
+    )
     assert session.last_cancel_all_ack is not None
     assert session.last_cancel_all_ack.trigger_cause == "breaker", "the ORIGINAL trigger cause is preserved"
     assert isinstance(result.shutdown_decision, ShutdownDecision)
     assert result.shutdown_decision.policy == "cancel_all"
-    assert result.shutdown_decision.cancel_all_fired is True
+    assert result.shutdown_decision.cancel_all_fired is False, (
+        "THE HONESTY PROPERTY (Gate#3 MINOR-1): this shutdown call fired NO wire — the prior breaker "
+        "sweep already satisfied the cancel-all outcome — so it must not claim cancel_all_fired=True"
+    )
+    assert result.shutdown_decision.already_satisfied_by_prior_sweep is True, (
+        "telemetry must distinguish 'already satisfied by a prior sweep' from 'this call fired the wire'"
+    )
 
 
 # --- E6-T7: losing-but-bounded session is a lifecycle SUCCESS, not promoted (REQ-014, AC-030) --
