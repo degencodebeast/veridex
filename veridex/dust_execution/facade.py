@@ -35,6 +35,7 @@ from __future__ import annotations
 import hashlib
 import json
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal
 
 from pydantic import field_validator
@@ -43,6 +44,7 @@ from veridex.dust_execution.contracts import (
     DustRunLabelEvent,
     EvidenceClass,
     ExecutionMode,
+    OperatorInterlockEvent,
     TimeInForce,
     _FrozenModel,
     _reject_price_out_of_unit_interval,
@@ -267,6 +269,119 @@ def _to_tool_result(
     )
 
 
+# ---------------------------------------------------------------------------
+# E7-T3 — the human operator precondition interlock that gates Mode-B arming.
+#
+# Mode B (real money) cannot ARM unless ALL FIVE human operator preconditions are POSITIVELY
+# satisfied AND recorded via ``OperatorInterlockEvent`` (REQ-005/006, AC-002). A MISSING precondition
+# is an explicit no-go: the facade WITHHOLDS the Mode-B arming bundle (feeds ``arming=None`` into the
+# EXISTING E6-T4 ``_mode_b_arming_block_reason`` gate), so Mode B stays UNARMED — the SAME fail-closed
+# ``"mode_b_not_armed"`` outcome, never a parallel arming path.
+# ---------------------------------------------------------------------------
+
+#: Precondition (a): an isolated FUNDED execution wallet is provisioned (SAF human gate).
+PRECONDITION_ISOLATED_FUNDED_WALLET = "isolated_funded_wallet"
+#: Precondition (b): the OPERATOR asserts their own jurisdiction/legal comfort. The model RECORDS
+#: this assertion and makes NO jurisdiction/legal conclusion on the operator's behalf (REQ-006).
+PRECONDITION_JURISDICTION_COMFORT = "operator_jurisdiction_comfort"
+#: Precondition (c): a positive max capital-at-risk is DECLARED by the operator.
+PRECONDITION_MAX_CAPITAL_AT_RISK = "declared_max_capital_at_risk"
+#: Precondition (d): the operator confirms kill-switch readiness.
+PRECONDITION_KILL_SWITCH_READY = "kill_switch_ready"
+#: Precondition (e): the operator EXPLICITLY authorizes the first order.
+PRECONDITION_FIRST_ORDER_AUTHORIZED = "first_order_authorized"
+
+#: The five human operator preconditions, in the fixed recording order (deterministic audit trail).
+OPERATOR_PRECONDITIONS: tuple[str, ...] = (
+    PRECONDITION_ISOLATED_FUNDED_WALLET,
+    PRECONDITION_JURISDICTION_COMFORT,
+    PRECONDITION_MAX_CAPITAL_AT_RISK,
+    PRECONDITION_KILL_SWITCH_READY,
+    PRECONDITION_FIRST_ORDER_AUTHORIZED,
+)
+
+
+class OperatorInterlock(_FrozenModel):
+    """The five human operator preconditions that gate Mode-B arming (REQ-005/006, AC-002).
+
+    Every field is an OPERATOR-supplied assertion: the interlock RECORDS it and concludes NOTHING on
+    the operator's behalf — most importantly ``operator_jurisdiction_comfort`` is the operator's OWN
+    legal-comfort assertion, which the model only records (it makes NO jurisdiction/legal
+    conclusion). Each field defaults to the fail-closed value (unset = NOT satisfied), so a
+    partially-filled or defaulted interlock is a no-go — Mode B cannot arm on omission.
+    """
+
+    isolated_funded_wallet: bool = False
+    operator_jurisdiction_comfort: bool = False
+    declared_max_capital_at_risk: float | None = None
+    kill_switch_ready: bool = False
+    first_order_authorized: bool = False
+    operator_authorization_ref: str | None = None
+
+    def satisfied_by_precondition(self) -> dict[str, bool]:
+        """Map each precondition id -> whether the OPERATOR positively satisfied it (fail closed).
+
+        ``declared_max_capital_at_risk`` is satisfied ONLY when a POSITIVE magnitude is declared
+        (``None`` or ``<= 0`` is a no-go); every other precondition is a strict ``is True`` (never a
+        truthy coercion). This is a pure MIRROR of the operator's supplied assertions — it derives
+        no precondition, and in particular reaches NO jurisdiction/legal conclusion.
+        """
+        capital = self.declared_max_capital_at_risk
+        return {
+            PRECONDITION_ISOLATED_FUNDED_WALLET: self.isolated_funded_wallet is True,
+            PRECONDITION_JURISDICTION_COMFORT: self.operator_jurisdiction_comfort is True,
+            PRECONDITION_MAX_CAPITAL_AT_RISK: capital is not None and capital > 0.0,
+            PRECONDITION_KILL_SWITCH_READY: self.kill_switch_ready is True,
+            PRECONDITION_FIRST_ORDER_AUTHORIZED: self.first_order_authorized is True,
+        }
+
+
+@dataclass(frozen=True)
+class OperatorInterlockGate:
+    """The recorded outcome of evaluating the human operator interlock (the REQ-005 audit trail).
+
+    ``armed`` is True ONLY when EVERY precondition is satisfied; ``missing`` names (in the fixed
+    :data:`OPERATOR_PRECONDITIONS` order) each unsatisfied precondition; ``events`` is one recorded
+    :class:`~veridex.dust_execution.contracts.OperatorInterlockEvent` per precondition (``satisfied``
+    True/False). Carries ONLY bool / closed-vocab / non-secret-ref data (SEC-005).
+    """
+
+    armed: bool
+    missing: tuple[str, ...]
+    events: tuple[OperatorInterlockEvent, ...]
+
+
+def evaluate_operator_interlock(
+    interlock: OperatorInterlock | None, *, recv_ts_ms: int
+) -> OperatorInterlockGate:
+    """Evaluate + RECORD the human operator interlock; ``armed`` iff ALL FIVE preconditions hold.
+
+    Fail-closed: a ``None`` interlock (none supplied) is treated as an all-default (all-unsatisfied)
+    interlock — Mode B cannot arm without a positively-satisfied interlock. One
+    :class:`~veridex.dust_execution.contracts.OperatorInterlockEvent` is recorded per precondition,
+    in the fixed :data:`OPERATOR_PRECONDITIONS` order (deterministic), carrying the operator's
+    non-secret ``operator_authorization_ref`` and ``first_order_authorized`` assertion. The model
+    RECORDS the operator's assertions (esp. jurisdiction/legal comfort) and concludes none of them.
+    """
+    effective = interlock if interlock is not None else OperatorInterlock()
+    satisfied = effective.satisfied_by_precondition()
+    events = tuple(
+        OperatorInterlockEvent(
+            sequence_no=index,
+            event_type="OperatorInterlockEvent",
+            source_ts=None,
+            recv_ts=recv_ts_ms,
+            precondition=name,
+            satisfied=satisfied[name],
+            operator_authorization_ref=effective.operator_authorization_ref,
+            first_order_authorized=effective.first_order_authorized,
+        )
+        for index, name in enumerate(OPERATOR_PRECONDITIONS, start=1)
+    )
+    missing = tuple(name for name in OPERATOR_PRECONDITIONS if not satisfied[name])
+    return OperatorInterlockGate(armed=not missing, missing=missing, events=events)
+
+
 async def propose_mm_execution(
     request: MMExecutionToolRequest,
     *,
@@ -280,6 +395,8 @@ async def propose_mm_execution(
     wallet_equity_at_decision: float,
     fixed_fraction: float,
     arming: ModeBArming | None = None,
+    operator_interlock: OperatorInterlock | None = None,
+    interlock_sink: Callable[[OperatorInterlockEvent], None] | None = None,
     event_sink: RuntimeEventSink | None = None,
     agent_id: str = _FACADE_AGENT_ID,
     run_id: str | None = None,
@@ -314,6 +431,12 @@ async def propose_mm_execution(
         wallet_equity_at_decision: PINNED mechanical sizing input (never agent-supplied).
         fixed_fraction: PINNED mechanical sizing input (never agent-supplied).
         arming: Optional Mode-B arming bundle; ``None`` (default) keeps Mode B UNARMED (fail closed).
+        operator_interlock: The E7-T3 human operator precondition interlock (REQ-005/006, AC-002).
+            When Mode B is being armed (``arming`` is supplied), ALL FIVE operator preconditions must
+            be positively satisfied; a missing one is an explicit no-go that WITHHOLDS the arming
+            bundle so Mode B stays UNARMED. ``None`` is treated fail-closed (all-unsatisfied).
+        interlock_sink: Optional sink recording each :class:`OperatorInterlockEvent` (the REQ-005
+            audit trail); when ``None`` the interlock is still evaluated but not externally recorded.
         event_sink: Optional OPS ``RuntimeEvent`` sink; when ``None`` the proposer emits nothing.
         agent_id: Non-secret OPS ``agent_id`` label stamped on emitted telemetry.
         run_id: Optional OPS correlation id for the emitted lifecycle events.
@@ -342,6 +465,19 @@ async def propose_mm_execution(
     _emit(RuntimeEventType.RUN_STARTED, intent_kind=request.intent_kind, mode=request.mode)
     _emit(RuntimeEventType.STATUS_CHANGED, status=RuntimeStatus.RUNNING.value)
 
+    # E7-T3 human operator precondition interlock (REQ-005/006, AC-002): Mode B cannot ARM unless ALL
+    # FIVE operator preconditions are positively satisfied AND recorded. When Mode B is being armed (a
+    # bundle is supplied) but the interlock is not fully satisfied, WITHHOLD the arming bundle so the
+    # EXISTING runner arming gate keeps Mode B UNARMED (fail closed) — never a parallel arming path.
+    effective_arming = arming
+    if request.mode == "live_guarded" and arming is not None:
+        interlock_gate = evaluate_operator_interlock(operator_interlock, recv_ts_ms=now_fn() * 1000)
+        if interlock_sink is not None:
+            for interlock_event in interlock_gate.events:
+                interlock_sink(interlock_event)
+        if not interlock_gate.armed:
+            effective_arming = None  # a missing operator precondition is an explicit no-go
+
     result = await run_dust_execution(
         adapter=adapter,
         signer=signer,
@@ -354,7 +490,7 @@ async def propose_mm_execution(
         wallet_equity_at_decision=wallet_equity_at_decision,
         fixed_fraction=fixed_fraction,
         request=request,
-        arming=arming,
+        arming=effective_arming,
     )
 
     tool_result = _to_tool_result(result, request)
