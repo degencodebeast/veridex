@@ -848,3 +848,195 @@ def test_agent_request_cannot_even_carry_an_analysis_field() -> None:
     # ...but an unmodelled ``analysis`` field is rejected — the boundary cannot carry it at all.
     with pytest.raises(_ValidationError):
         MMExecutionToolRequest(**{**base, "analysis": "the agent's private thesis"})  # type: ignore[arg-type]
+
+
+# =====================================================================================
+# E7-T5 (SEC-001, CON-002/003, REQ-011/014/015, AC-014/019/025/030, §6 group 13): the
+# diagnostic post-trade markout module + the mandatory honesty labels + the scoped-negative
+# relabel-proof. Three LOAD-BEARING isolation/honesty properties proven here:
+#
+#   (1) DIAGNOSTIC markout, NON-RANKABLE + NON-MUTATING. ``analysis.compute_markout`` derives a
+#       NEW ``PostTradeMarkoutEvent`` keyed by ``decision_id`` from a SEALED own-fill event WITHOUT
+#       mutating that sealed event (byte-identity proven before/after). Its output field names
+#       (``reference_price`` / ``markout_bps``) are already on the SEC-006 rank denylist (E1-T5),
+#       so the module can NEVER emit a markout that reaches scoring / leaderboard / maker-leaderboard.
+#       RED (module absent): the derive helper does not exist → ImportError.
+#   (2) MANDATORY honesty labels (AC-025). Every dust run MUST carry ``DUST_LIVE`` / the evidence
+#       class / ``UNCALIBRATED`` / ``NOT_PROVEN_EDGE``. The pinned Literals make a wrong label
+#       UNCONSTRUCTABLE; ``assert_mandatory_dust_run_labels`` additionally rejects any label-like
+#       object that downgrades a mandatory value.
+#   (3) SCOPED-NEGATIVE not relabellable (SEC-001/CON-003). A dust run that proved SAFETY, not alpha,
+#       is a scoped-negative finding; its evidence class is STRUCTURALLY pinned to ``EXPERIMENTAL_DUST``
+#       (there is no channel to set it) and an EXPLICIT promotion request (``EVIDENCE_GATED`` /
+#       ``PROMOTED``) from ANY request field / label / LLM output / metadata is REFUSED fail-closed.
+#       R4-A never claims proven alpha; only Gate B (out of R4-A scope) controls promotion.
+# =====================================================================================
+from veridex.dust_execution.analysis import (  # noqa: E402
+    REQUIRED_DUST_RUN_LABELS,
+    SCOPED_NEGATIVE_EVIDENCE_CLASS,
+    ScopedNegativeRelabelError,
+    assert_mandatory_dust_run_labels,
+    compute_markout,
+    label_for_scoped_negative,
+    reject_scoped_negative_relabel,
+)
+from veridex.dust_execution.contracts import DustRunLabelEvent as _DustRunLabelEvent  # noqa: E402
+from veridex.dust_execution.contracts import OwnFillEvent as _OwnFillE7  # noqa: E402
+
+
+def _sealed_own_fill_e7t5() -> _OwnFillE7:
+    """A SEALED (frozen) realized own-fill event — the source a diagnostic markout is derived from."""
+    return _OwnFillE7(
+        sequence_no=7, event_type="OwnFillEvent", source_ts=None, recv_ts=5_000,
+        decision_id="dec-e7t5", client_order_id="coid-e7t5", venue_order_id="v-e7t5",
+        side="BUY", fill_price=0.40, fill_size=1.0, fill_ts=5_000,
+    )
+
+
+# --- Property (1): diagnostic markout is keyed by decision_id, non-mutating, non-rankable ---
+
+
+def test_compute_markout_is_keyed_by_decision_id() -> None:
+    fill = _sealed_own_fill_e7t5()
+    markout = compute_markout(
+        fill, reference_price=0.55, horizon_ms=1_000, sequence_no=8, recv_ts=6_000
+    )
+    # The diagnostic record is keyed by the SAME decision_id as the sealed fill it was derived from.
+    assert markout.decision_id == fill.decision_id == "dec-e7t5"
+    # BUY filled at 0.40, reference rose to 0.55 → +0.15 favorable = +1500 bps (native-prob move).
+    assert markout.markout_bps == pytest.approx(1500.0)
+    assert markout.reference_price == 0.55
+    assert markout.horizon_ms == 1_000
+
+
+def test_compute_markout_does_not_mutate_the_sealed_fill_event() -> None:
+    # NON-MUTATION (AC-014): deriving markout reads the sealed fill; it must never write back. Prove
+    # byte-identity of the source event's canonical dump + evidence hash before/after, and that the
+    # returned record is a DISTINCT object (a NEW diagnostic, not the mutated source).
+    fill = _sealed_own_fill_e7t5()
+    dump_before = fill.model_dump()
+    hash_before = fill.config_hash()
+
+    markout = compute_markout(
+        fill, reference_price=0.55, horizon_ms=1_000, sequence_no=8, recv_ts=6_000
+    )
+
+    assert fill.model_dump() == dump_before, "sealed fill event must be byte-identical after markout"
+    assert fill.config_hash() == hash_before, "sealed fill evidence hash must be unchanged"
+    assert markout is not fill  # a NEW diagnostic record, never the mutated source
+
+
+def test_compute_markout_output_rejected_by_all_three_rank_surfaces() -> None:
+    # NON-RANKABLE (AC-014): the ACTUAL analysis.py output dump, merged into a complete valid rank
+    # row, is rejected by all three rank surfaces (incl. the raw sorted(..., key=...) bypass). Proves
+    # the NEW module emits ONLY already-denylisted outcome fields — it can never invent a rankable one.
+    fill = _sealed_own_fill_e7t5()
+    markout = compute_markout(
+        fill, reference_price=0.55, horizon_ms=1_000, sequence_no=8, recv_ts=6_000
+    )
+    dump = markout.model_dump()
+    for keyfn, base in ((dir_key, VALID_DIR), (clv_key, VALID_DIR), (maker_rank_key, {})):
+        row = {**base, **dump}
+        with pytest.raises(AssertionError):
+            keyfn(row)
+        with pytest.raises(AssertionError):
+            sorted([row], key=keyfn)
+
+
+def test_compute_markout_signs_a_sell_the_opposite_way() -> None:
+    # A SELL is favorable when the reference FALLS below the fill; the sign flips vs a BUY.
+    sell = _OwnFillE7(
+        sequence_no=7, event_type="OwnFillEvent", source_ts=None, recv_ts=5_000,
+        decision_id="dec-sell", client_order_id="coid", venue_order_id="v", side="SELL",
+        fill_price=0.60, fill_size=1.0, fill_ts=5_000,
+    )
+    markout = compute_markout(sell, reference_price=0.45, horizon_ms=500, sequence_no=8, recv_ts=6_000)
+    # SELL at 0.60, reference fell to 0.45 → +0.15 favorable = +1500 bps.
+    assert markout.markout_bps == pytest.approx(1500.0)
+
+
+# --- Property (2): mandatory honesty labels ---
+
+
+def test_dust_run_label_run_label_is_mandatory_pinned() -> None:
+    # A run cannot emit a label with a softened ``run_label`` — the pinned Literal rejects it.
+    with pytest.raises(_ValidationError):
+        _DustRunLabelEvent(
+            sequence_no=1, event_type="DustRunLabelEvent", source_ts=None, recv_ts=1,
+            run_label="DUST_PAPER", evidence_class="EXPERIMENTAL_DUST",  # type: ignore[arg-type]
+            calibration_label="UNCALIBRATED", edge_label="NOT_PROVEN_EDGE",
+        )
+
+
+def test_assert_mandatory_dust_run_labels_accepts_the_full_honest_label() -> None:
+    label = label_for_scoped_negative(sequence_no=9, recv_ts=1_000)
+    assert_mandatory_dust_run_labels(label)  # does not raise
+    assert REQUIRED_DUST_RUN_LABELS == {
+        "run_label": "DUST_LIVE",
+        "calibration_label": "UNCALIBRATED",
+        "edge_label": "NOT_PROVEN_EDGE",
+    }
+
+
+@pytest.mark.parametrize(
+    "field,downgrade",
+    [
+        ("run_label", "DUST_PAPER"),
+        ("calibration_label", "CALIBRATED"),
+        ("edge_label", "PROVEN_EDGE"),
+    ],
+)
+def test_assert_mandatory_dust_run_labels_rejects_a_downgraded_value(field: str, downgrade: str) -> None:
+    from types import SimpleNamespace
+
+    values = {
+        "run_label": "DUST_LIVE",
+        "calibration_label": "UNCALIBRATED",
+        "edge_label": "NOT_PROVEN_EDGE",
+        "evidence_class": "EXPERIMENTAL_DUST",
+    }
+    values[field] = downgrade
+    with pytest.raises(AssertionError):
+        assert_mandatory_dust_run_labels(SimpleNamespace(**values))
+
+
+# --- Property (3): a scoped-negative finding cannot be relabelled EVIDENCE_GATED / PROMOTED ---
+
+
+def test_scoped_negative_label_is_structurally_experimental_dust() -> None:
+    # No channel to set the evidence class — a scoped-negative run is INTRINSICALLY EXPERIMENTAL_DUST.
+    label = label_for_scoped_negative(sequence_no=1, recv_ts=1_000)
+    assert isinstance(label, _DustRunLabelEvent)
+    assert label.evidence_class == "EXPERIMENTAL_DUST"
+    assert SCOPED_NEGATIVE_EVIDENCE_CLASS == "EXPERIMENTAL_DUST"
+
+
+@pytest.mark.parametrize(
+    "hostile",
+    [
+        "EVIDENCE_GATED",
+        "PROMOTED",
+        "evidence_gated",
+        "  promoted  ",
+        "Promoted",
+        {"evidence_class": "PROMOTED"},  # untrusted metadata
+        "the model recommends we PROMOTE this to EVIDENCE_GATED",  # untrusted LLM output
+    ],
+)
+def test_scoped_negative_relabel_request_is_refused_fail_closed(hostile: object) -> None:
+    # Any request field / label input / LLM output / metadata that asks to relabel a scoped-negative
+    # to a promoted evidence class is REFUSED — both via the guard and via the label emitter.
+    with pytest.raises(ScopedNegativeRelabelError):
+        reject_scoped_negative_relabel(hostile)
+    with pytest.raises(ScopedNegativeRelabelError):
+        label_for_scoped_negative(sequence_no=1, recv_ts=1_000, requested_relabel=hostile)
+
+
+def test_scoped_negative_relabel_guard_is_noop_on_benign_input() -> None:
+    # The guard is fail-closed on promotion ONLY — a benign/empty/experimental input is a NO-OP,
+    # and the emitter still pins EXPERIMENTAL_DUST.
+    reject_scoped_negative_relabel(None)
+    reject_scoped_negative_relabel("EXPERIMENTAL_DUST")
+    reject_scoped_negative_relabel("keep it tiny")
+    label = label_for_scoped_negative(sequence_no=1, recv_ts=1_000, requested_relabel="EXPERIMENTAL_DUST")
+    assert label.evidence_class == "EXPERIMENTAL_DUST"
