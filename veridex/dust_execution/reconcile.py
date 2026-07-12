@@ -889,12 +889,127 @@ def to_order_status_event(
     )
 
 
+# ---------------------------------------------------------------------------
+# E4-T6 — pin ALL §6-group-3 tri-state cases: a restart-survivable AMBIGUOUS
+# freeze + the DEFINITIVELY_ABSENT reachability decision (IDM-002, AC-035).
+# ---------------------------------------------------------------------------
+#
+# Completes the §6-group-3 coverage row. E4-T2 proved RESOLVED (filled-FAK / terminal status) and
+# AMBIGUOUS (zero-open / multiple-candidates); this closes the residual cases and DEFINES the only
+# evidence that could ever yield DEFINITIVELY_ABSENT.
+#
+# THE DEFINITIVELY_ABSENT REACHABILITY DECISION (venue-surface evidence —
+# docs/maker/r4a-clobv2-wire-contract.md §3 get_trades / §5 get_order + get_orders). All three
+# Polymarket read surfaces prove PRESENCE, never definitive non-submission:
+#   * get_orders / get_order  → the order is RESTING (or carries a terminal status once matched/killed);
+#   * get_fill_history        → the order FILLED (a trade keyed by the official venue_order_key).
+# An empty get_order ({}) is INDISTINGUISHABLE from delayed venue visibility (§5's route is itself
+# FAIL-CLOSED/UNCERTAIN; an eventually-visible order is not an absent one). There is NO "never
+# accepted" surface. THEREFORE ``DEFINITIVELY_ABSENT`` is UNREACHABLE via the real Polymarket surfaces
+# — the FAIL-SAFE: bare absence stays AMBIGUOUS (frozen, full worst-case reserve), NEVER
+# DEFINITIVELY_ABSENT. :func:`assess_uncertain_submit` accordingly only ever emits RESOLVED or
+# AMBIGUOUS; the DEFINITIVELY_ABSENT arm of the closed tri-state is reserved for a hypothetical venue
+# that DID offer such a proof, and no real read surface can reach it.
+
+
+@dataclass(frozen=True)
+class FrozenUncertainState:
+    """A tri-state uncertain-submit verdict bundled with its freeze + worst-case reserve.
+
+    The auditable snapshot that a caller freezes on and that a restart reconstructs, so the freeze and
+    the reserved exposure survive a process restart identically.
+
+    Attributes:
+        state: The tri-state verdict (``AMBIGUOUS`` while frozen).
+        frozen: Whether new submits are frozen (``True`` iff ``state`` is AMBIGUOUS — the possibly-live
+            order must not be re-sent).
+        worst_case_exposure: The size reserved against caps + non-crossing while uncertain (the full
+            intended size for AMBIGUOUS; ``0.0`` once RESOLVED / DEFINITIVELY_ABSENT).
+        venue_order_key: The official venue join key the verdict is anchored to.
+        presubmit_record: The durable pre-submit record the state was derived from.
+    """
+
+    state: UncertainSubmitState
+    frozen: bool
+    worst_case_exposure: float
+    venue_order_key: str
+    presubmit_record: PreSubmitRecord
+
+
+async def reconcile_and_freeze(
+    presubmit_record: PreSubmitRecord,
+    *,
+    adapter: VenueReconciliationReads,
+    intended_size: float,
+) -> FrozenUncertainState:
+    """Reconcile vs complete venue truth and bundle the freeze + worst-case reserve (IDM-002, AC-035).
+
+    Runs the E4-T2 three-surface reconcile (:func:`reconcile_uncertain_submit`) and packages the
+    verdict with :func:`freezes_new_submits` and :func:`worst_case_uncertain_exposure` into an
+    auditable :class:`FrozenUncertainState`. An AMBIGUOUS verdict freezes new submits and reserves the
+    FULL ``intended_size`` — the exact snapshot :func:`reconstruct_uncertain_state` rebuilds after a
+    restart.
+
+    Args:
+        presubmit_record: The durable pre-submit record whose ``venue_order_key`` is the join key.
+        adapter: A complete-venue-truth reader (consumed READ-ONLY).
+        intended_size: The size the uncertain order was submitted for (the worst-case reserve basis).
+
+    Returns:
+        The frozen snapshot for the reconciled verdict.
+    """
+    state = await reconcile_uncertain_submit(presubmit_record, adapter=adapter)
+    return FrozenUncertainState(
+        state=state,
+        frozen=freezes_new_submits(state),
+        worst_case_exposure=worst_case_uncertain_exposure(state, intended_size=intended_size),
+        venue_order_key=presubmit_record.venue_order_key,
+        presubmit_record=presubmit_record,
+    )
+
+
+def reconstruct_uncertain_state(
+    presubmit_record: PreSubmitRecord,
+    *,
+    intended_size: float,
+) -> FrozenUncertainState:
+    """Rebuild the frozen state + worst-case reserve from a durable record after a restart (AC-035).
+
+    FAIL-SAFE. A durable pre-submit record recovered after a restart (via
+    :func:`recover_presubmit_records` — a fresh read over the E4-T1 append-only rows) that has NOT been
+    positively reconciled means the order's fate is UNKNOWN: it is presumed AMBIGUOUS (possibly-live),
+    so the freeze holds and the FULL ``intended_size`` stays reserved. This is deliberately
+    OFFLINE — it queries NO venue surface — so the freeze survives a restart even before the venue is
+    reachable again; a positive resolution requires a later :func:`reconcile_and_freeze` against
+    complete venue truth. The reconstructed snapshot equals the pre-restart AMBIGUOUS freeze.
+
+    Args:
+        presubmit_record: The durable pre-submit record recovered from the append-only ledger.
+        intended_size: The size the uncertain order was submitted for, recovered alongside the durable
+            record (the worst-case reserve basis) so the reconstructed reserve matches the pre-restart
+            reserve exactly.
+
+    Returns:
+        The reconstructed frozen snapshot (AMBIGUOUS, frozen, full worst-case reserve).
+    """
+    # An unreconciled durable record → possibly-live → AMBIGUOUS (never presumed absent on a restart).
+    state: UncertainSubmitState = "AMBIGUOUS"
+    return FrozenUncertainState(
+        state=state,
+        frozen=freezes_new_submits(state),
+        worst_case_exposure=worst_case_uncertain_exposure(state, intended_size=intended_size),
+        venue_order_key=presubmit_record.venue_order_key,
+        presubmit_record=presubmit_record,
+    )
+
+
 __all__ = [
     "AmbiguousOutcome",
     "AmbiguousResolution",
     "AsyncSleep",
     "Clock",
     "DurableSubmitResult",
+    "FrozenUncertainState",
     "HonestVenueStatus",
     "ResubmitAuthorization",
     "ResubmitDecisionReason",
@@ -908,8 +1023,10 @@ __all__ = [
     "freezes_new_submits",
     "honest_venue_status",
     "persist_presubmit_record",
+    "reconcile_and_freeze",
     "reconcile_durable_ack_lost",
     "reconcile_uncertain_submit",
+    "reconstruct_uncertain_state",
     "recover_presubmit_records",
     "resolve_ambiguous_submit",
     "retry_authorized_while",

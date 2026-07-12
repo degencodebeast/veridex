@@ -30,11 +30,14 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
+import pytest
+
 from veridex.dust_execution.contracts import OrderStatusEvent, PreSubmitRecord
 from veridex.dust_execution.emergency import DustSafetySession, SafetyController
 from veridex.dust_execution.reconcile import (
     AmbiguousResolution,
     DurableSubmitResult,
+    FrozenUncertainState,
     HonestVenueStatus,
     ResubmitAuthorization,
     UncertainSubmitState,
@@ -42,8 +45,10 @@ from veridex.dust_execution.reconcile import (
     duplicate_resubmit_authorized,
     freezes_new_submits,
     honest_venue_status,
+    reconcile_and_freeze,
     reconcile_durable_ack_lost,
     reconcile_uncertain_submit,
+    reconstruct_uncertain_state,
     recover_presubmit_records,
     resolve_ambiguous_submit,
     retry_authorized_while,
@@ -369,6 +374,18 @@ class FakeAdapter:
             {"taker_order_id": f.order_hash, "size": str(f.filled), "status": "CONFIRMED"}
             for f in self._fill_history  # type: ignore[union-attr]
         ]
+
+    async def prove_non_submission(self, record: PreSubmitRecord) -> bool:
+        """There is NO Polymarket surface that positively proves an order was NEVER accepted.
+
+        The §3/§5 read surfaces (``get_orders`` / ``get_order`` / ``get_fill_history``) all prove
+        PRESENCE (resting / terminal / filled) — none proves definitive non-submission. So a positive
+        "never accepted" proof is UNREACHABLE and this surface fails closed (E4-T6 decision).
+        """
+        del record
+        raise NotImplementedError(
+            "no Polymarket surface positively proves an order was never accepted"
+        )
 
 
 # --- The three verbatim RED tests (the double-exposure guard) --------------------------------
@@ -1027,3 +1044,140 @@ def test_honest_verdict_records_into_sealed_order_status_event() -> None:
     assert unresolved_event.status == "unresolved"
     assert unresolved_event.filled_size == 0.0  # NO fabricated fill on a timeout
     assert unresolved_event.fill_price is None
+
+
+# ===========================================================================
+# E4-T6 — pin ALL §6-group-3 tri-state cases: terminal-kill RESOLVED, delayed-
+# visibility AMBIGUOUS, identical pre-existing AMBIGUOUS, restart-survivable
+# freeze, and the DEFINITIVELY_ABSENT reachability decision (IDM-002, AC-035;
+# Codex-M3 ∩ Fable-m4). The mutual-exclusivity completeness gate.
+# ===========================================================================
+#
+# MONEY-NETWORK BOUNDARY. Every seam is a Mode-A fake (``FakeAdapter`` / ``InMemoryStore``); no
+# network, no signing; Mode B UNARMED.
+#
+# WHY THIS TASK EXISTS. E4-T2 named only filled-FAK, zero-open, and multiple-candidates. A three-value
+# ``Literal`` return does NOT by itself prove mutually-exclusive classification — each residual case
+# must be PINNED to an EXACT verdict. This section adds the rest and DEFINES the only positive evidence
+# that could ever yield ``DEFINITIVELY_ABSENT``.
+#
+# THE DEFINITIVELY_ABSENT REACHABILITY DECISION (venue-surface evidence: r4a-clobv2-wire-contract.md
+# §3 get_trades / §5 get_order + get_orders). All three Polymarket read surfaces prove PRESENCE:
+#   * get_orders / get_order  → the order is RESTING (or carries a terminal status once matched/killed);
+#   * get_fill_history        → the order FILLED (a trade keyed by the official venue_order_key).
+# NONE of them positively proves an order was NEVER accepted: an empty get_order ({}) is
+# indistinguishable from delayed venue visibility (§5 route is FAIL-CLOSED/UNCERTAIN; an eventually-
+# visible order is not an absent one). There is NO "never accepted" surface. THEREFORE, for Polymarket
+# ``DEFINITIVELY_ABSENT`` is UNREACHABLE via the real surfaces — the FAIL-SAFE: bare absence stays
+# AMBIGUOUS (frozen, full worst-case reserve), NEVER DEFINITIVELY_ABSENT. This is the branch encoded
+# below (``prove_non_submission`` raises; the classifier never emits DEFINITIVELY_ABSENT).
+
+# The size the uncertain order was submitted for — recovered alongside the durable presubmit record
+# (in the full system from the E2 decision ledger) so the restart can reconstruct the SAME reserve.
+_INTENDED_SIZE = 6.25
+
+
+async def test_ack_lost_fok_that_killed_is_RESOLVED() -> None:
+    """A terminal ``killed`` on the get_order status surface is RESOLVED — never "did not land".
+
+    An ACK-lost FOK that the venue KILLED (matched-or-kill, no rest) carries a POSITIVE TERMINAL
+    status on ``get_order``-by-id. That is positive evidence the order's fate is settled → RESOLVED,
+    never a fabricated absence.
+    """
+    a = FakeAdapter(
+        open_orders=[],
+        status_by_id={REC.venue_order_key: {"id": REC.venue_order_key, "status": "killed"}},
+        fill_history=[],
+    )
+    assert await reconcile_uncertain_submit(REC, adapter=a) == "RESOLVED"
+
+
+async def test_delayed_visibility_gtc_stays_AMBIGUOUS_until_positive_proof() -> None:
+    """Zero-open + no status + empty history is AMBIGUOUS: eventually-visible is NOT absent.
+
+    A GTC order caught in delayed venue visibility is simply not-yet-visible on any surface — that is
+    NOT proof it never landed. Fail-closed to AMBIGUOUS (frozen) until POSITIVE proof appears; it must
+    NEVER be classified DEFINITIVELY_ABSENT off bare absence.
+    """
+    a = FakeAdapter(open_orders=[], status_by_id=None, fill_history=[])  # eventually-visible ≠ absent
+    verdict = await reconcile_uncertain_submit(REC, adapter=a)
+    assert verdict == "AMBIGUOUS"
+    assert verdict != "DEFINITIVELY_ABSENT"
+
+
+async def test_identical_pre_existing_order_is_AMBIGUOUS() -> None:
+    """A single identical pre-existing open order is AMBIGUOUS: client_order_id is never on the wire.
+
+    The venue open-order record carries NO ``client_order_id`` (IDM-001), so a resting order identical
+    to ours is an INDISTINGUISHABLE candidate — it may or may not be our ACK-lost submit. Fail-closed
+    to AMBIGUOUS (possibly-live, frozen), never RESOLVED and never DEFINITIVELY_ABSENT.
+    """
+    identical_open = _open_order(REC.venue_order_key)  # looks exactly like ours could
+    assert "client_order_id" not in identical_open  # never on the wire → indistinguishable
+    a = FakeAdapter(open_orders=[identical_open])
+    assert await reconcile_uncertain_submit(REC, adapter=a) == "AMBIGUOUS"
+
+
+async def test_restart_during_uncertainty_preserves_freeze_and_worstcase_exposure() -> None:
+    """The AMBIGUOUS freeze + worst-case reserve SURVIVE a restart, rebuilt from the durable ledger.
+
+    Pre-restart, an AMBIGUOUS submit (zero-open) FREEZES and reserves the full worst-case exposure.
+    After a "restart" the frozen state is reconstructed from the E4-T1 DURABLE presubmit record
+    (recovered via ``recover_presubmit_records`` — a fresh read over the persisted rows, NOT the
+    submit-time object) WITHOUT re-querying the venue: the durable record ALONE justifies the freeze.
+    The reconstructed reserve equals the pre-restart reserve.
+    """
+    store = InMemoryStore()
+
+    async def _post() -> dict[str, Any]:
+        return {"success": True}
+
+    # Durable presubmit written BEFORE the (faked) POST (E4-T1).
+    await submit_with_durable_presubmit(
+        store=store, session_id=_SESSION, record=_record(), post=_post
+    )
+
+    # Pre-restart: reconcile against venue truth (zero-open → AMBIGUOUS) and FREEZE.
+    frozen = await reconcile_and_freeze(
+        REC, adapter=FakeAdapter(open_orders=[]), intended_size=_INTENDED_SIZE
+    )
+    assert isinstance(frozen, FrozenUncertainState)
+    assert frozen.state == "AMBIGUOUS"
+    assert frozen.frozen is True
+    assert frozen.worst_case_exposure == _INTENDED_SIZE  # full worst-case reserve
+
+    # "Restart": recover the durable record from the persisted rows (fresh read), then reconstruct the
+    # frozen state from it — no venue query needed (the freeze must survive a restart offline).
+    recovered = await recover_presubmit_records(store, _SESSION)
+    assert len(recovered) == 1
+    reloaded = reconstruct_uncertain_state(recovered[0], intended_size=_INTENDED_SIZE)
+
+    assert reloaded.frozen and reloaded.worst_case_exposure == frozen.worst_case_exposure
+    assert reloaded.state == "AMBIGUOUS"  # unreconciled durable record → presumed possibly-live
+    assert reloaded.presubmit_record.venue_order_key == REC.venue_order_key
+
+
+async def test_DEFINITIVELY_ABSENT_only_on_positive_nonsubmission_proof() -> None:
+    """DEFINITIVELY_ABSENT is UNREACHABLE: Polymarket offers NO positive "never accepted" proof.
+
+    The ONLY evidence that could yield DEFINITIVELY_ABSENT is a venue-contract terminal "never
+    accepted" proof for the captured id. The §3/§5 Polymarket surfaces prove PRESENCE (resting /
+    terminal / filled) — none proves definitive non-submission — so that surface does NOT exist:
+    ``prove_non_submission`` fails closed (raises), and ``reconcile_uncertain_submit`` NEVER returns
+    DEFINITIVELY_ABSENT for any real-surface input (bare absence → AMBIGUOUS, the fail-safe).
+    """
+    a = FakeAdapter(open_orders=[], status_by_id=None, fill_history=[])
+    # There is no positive non-submission surface — it fails closed rather than proving absence.
+    with pytest.raises(NotImplementedError):
+        await a.prove_non_submission(REC)
+    # And DEFINITIVELY_ABSENT is NEVER returned via the real read surfaces — bare absence is AMBIGUOUS.
+    assert await reconcile_uncertain_submit(REC, adapter=a) == "AMBIGUOUS"
+
+    # Exhaustively: across the residual real-surface shapes the classifier only ever emits
+    # RESOLVED or AMBIGUOUS — DEFINITIVELY_ABSENT is unreachable, never fabricated off absence.
+    for adapter in (
+        FakeAdapter(open_orders=[], status_by_id=None, fill_history=[]),  # delayed visibility
+        FakeAdapter(open_orders=[_open_order(REC.venue_order_key)]),  # identical resting
+        FakeAdapter(open_orders=[], fill_history=_HISTORY_UNAVAILABLE, status_by_id=None),  # no history
+    ):
+        assert await reconcile_uncertain_submit(REC, adapter=adapter) != "DEFINITIVELY_ABSENT"
