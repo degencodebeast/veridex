@@ -25,6 +25,7 @@ operator-gated step must satisfy before any R3/R4 claim is admissible.
 
 import ast
 import importlib
+import importlib.util
 import inspect
 import pkgutil
 
@@ -101,21 +102,60 @@ def test_live_recorder_may_define_r3r4_symbols() -> None:
     )
 
 
-def _imports_live_recorder(modname: str) -> bool:
-    """True iff a module directly imports ``veridex.live_recorder`` (or a submodule)."""
-    tree = ast.parse(inspect.getsource(importlib.import_module(modname)))
+def _imports_module(modname: str, target_prefix: str) -> bool:
+    """True iff ``modname`` imports ``target_prefix`` (or a submodule of it).
+
+    Bypass-hardened: matches EVERY statically resolvable import form so the lane bar
+    cannot be sidestepped by choosing a different import spelling —
+    (a) ``import <target>[.x]``; (b) ``from <target>[.x] import ...``;
+    (c) ``from <parent> import <leaf>`` (e.g. ``from veridex import dust_execution``);
+    (d) aliased forms (``import <target> as d``); (e) relative imports from a ranked
+    package that RESOLVE into the target; (f) obvious dynamic imports —
+    ``importlib.import_module("<target>…")`` / ``__import__("<target>…")`` with a
+    STRING-CONSTANT argument. A dynamic import whose target is a non-constant runtime
+    expression is beyond this static ceiling (see the runtime backstop in
+    ``tests/test_dust_execution_sec_isolation.py``).
+    """
+    mod = importlib.import_module(modname)
+    package = getattr(mod, "__package__", "") or ""
+    tree = ast.parse(inspect.getsource(mod))
+
+    def _matches(name: str) -> bool:
+        return name == target_prefix or name.startswith(target_prefix + ".")
+
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
-            if any(
-                alias.name == "veridex.live_recorder"
-                or alias.name.startswith("veridex.live_recorder.")
+            # (a) plain and (d) aliased: alias.name carries the dotted module path.
+            if any(_matches(alias.name) for alias in node.names):
+                return True
+        elif isinstance(node, ast.ImportFrom):
+            if node.level:
+                # (e) relative: resolve against the importing module's package.
+                rel = "." * node.level + (node.module or "")
+                try:
+                    base = importlib.util.resolve_name(rel, package)
+                except (ImportError, ValueError):
+                    base = ""
+            else:
+                base = node.module or ""
+            # (b) the from-target itself resolves into the target package, OR
+            # (c) a leaf name (``from veridex import dust_execution``) does.
+            if _matches(base) or any(
+                _matches(f"{base}.{alias.name}") if base else _matches(alias.name)
                 for alias in node.names
             ):
                 return True
-        elif isinstance(node, ast.ImportFrom):
-            module = node.module or ""
-            if module == "veridex.live_recorder" or module.startswith("veridex.live_recorder."):
-                return True
+        elif isinstance(node, ast.Call):
+            # (f) dynamic: importlib.import_module("…") / __import__("…") — const arg only.
+            func = node.func
+            is_dynamic_import = (
+                isinstance(func, ast.Attribute) and func.attr == "import_module"
+            ) or (isinstance(func, ast.Name) and func.id in ("import_module", "__import__"))
+            if is_dynamic_import and node.args:
+                first = node.args[0]
+                if isinstance(first, ast.Constant) and isinstance(first.value, str):
+                    if _matches(first.value):
+                        return True
     return False
 
 
@@ -128,7 +168,7 @@ def test_maker_and_scoring_do_not_import_live_recorder() -> None:
         "veridex.scoring",
         "veridex.leaderboard",
     ]
-    offenders = [m for m in modnames if _imports_live_recorder(m)]
+    offenders = [m for m in modnames if _imports_module(m, "veridex.live_recorder")]
     assert not offenders, (
         f"maker/scoring lane must not import veridex.live_recorder: {offenders}"
     )
