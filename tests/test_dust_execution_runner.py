@@ -1330,3 +1330,82 @@ async def test_safety_failure_cap_breach_is_not_success() -> None:
         "a realized-loss-cap breach is a SAFETY failure — NOT a lifecycle success"
     )
     assert result.session_outcome.promoted is False
+
+
+# --- Gate#3 MINOR-1: a no-submit AMBIGUOUS reconciliation is NOT a safety freeze ---------------
+#
+# THE DIAGNOSTIC-HONESTY PROPERTY: a reconciliation is a genuine SAFETY FREEZE only when a REAL order
+# was actually submitted to the wire for that decision (a submitted-but-unconfirmed fund state). A
+# clean Mode A dry-run places NO order (``submit_calls == 0``), yet still emits a per-decision
+# ``RealFillReconciliation`` with ``reconciled_state == "AMBIGUOUS"`` — there is no real venue fill to
+# confirm. Counting that no-submit AMBIGUOUS as a freeze conflates "nothing was submitted, nothing to
+# reconcile" (benign — the exact run an operator validates before arming) with "an order was submitted
+# but its fill is unconfirmed" (a genuine Mode-B freeze). The correlation axis is the honest
+# ``OrderAckEvent.ack_status``: ``"dry_run_not_submitted"`` marks that NO wire was touched for that
+# decision; ``"accepted"``/``"not_accepted"`` mark that a real order reached the wire. A reconciliation
+# freezes the session ONLY when its ``decision_id`` joins to an ack that actually submitted.
+#
+# NON-WEAKENING CONTRAST (the guardrail): a REAL Mode-B submit whose reconciliation is AMBIGUOUS is a
+# genuine unresolved-fund-state freeze and MUST still be a lifecycle FAILED. Mutation A: revert to
+# "any AMBIGUOUS == frozen" → the Mode-A-dry-run-SUCCESS test fails again. Mutation B: exclude ALL
+# reconciliations from the freeze → the Mode-B-real-ambiguous-FAILED guardrail fails. Both prove the
+# predicate is EXACTLY "submitted AND ambiguous".
+
+
+async def test_clean_mode_a_dry_run_no_submit_is_lifecycle_success() -> None:
+    """Gate#3 MINOR-1 (RED): a clean, no-submit Mode A dry-run is a lifecycle SUCCESS.
+
+    Mode A places NO order (``submit_calls == 0``) yet still emits an ``AMBIGUOUS``
+    ``RealFillReconciliation`` (there is no real venue fill to confirm). That no-submit AMBIGUOUS must
+    NOT count as a safety freeze — "nothing was submitted, nothing to reconcile" is benign, not the
+    submitted-but-unconfirmed fund state a freeze exists to flag. This is the exact run an operator
+    inspects to VALIDATE before arming, so it must report SUCCESS, not a spurious FAILED.
+    """
+    adapter = FakeVenueAdapter(fill=True)
+    source = _ScriptedSource(quote=_fresh_quote())
+
+    result = await _run(adapter=adapter, source=source, mode="dry_run")
+
+    assert adapter.submit_calls == 0, "Mode A must place NO orders (AC-017)"
+    assert result.submitted_count == 0, "a clean dry-run reaches the wire zero times"
+    recon = next(e for e in result.events if isinstance(e, RealFillReconciliation))
+    assert recon.reconciled_state == "AMBIGUOUS", (
+        "the no-submit dry-run still emits an AMBIGUOUS reconciliation (no real fill to confirm)"
+    )
+    ack = next(e for e in result.events if isinstance(e, OrderAckEvent))
+    assert ack.ack_status == "dry_run_not_submitted", "the ack honestly records that NO wire was touched"
+    assert isinstance(result.session_outcome, SessionOutcome)
+    assert result.session_outcome.status == "SUCCESS", (
+        "a clean, no-submit Mode A dry-run is a lifecycle SUCCESS — a no-submit AMBIGUOUS "
+        "reconciliation is not a safety freeze (Gate#3 MINOR-1)"
+    )
+    assert result.session_outcome.promoted is False, "a dust session is never promoted strategy evidence"
+
+
+async def test_mode_b_real_submit_with_ambiguous_reconciliation_is_failed() -> None:
+    """GUARDRAIL (non-weakening): a REAL Mode-B submit whose reconciliation is AMBIGUOUS is FAILED.
+
+    This is the genuine unresolved-fund-state freeze the MINOR-1 fix must PRESERVE: a real order
+    reached the wire (``submit_calls == 1``, ``ack_status == "accepted"``) but the venue never
+    confirmed the fill (``fill_history_matches=False`` → ``AMBIGUOUS``). That submitted-but-unconfirmed
+    state MUST still be a lifecycle FAILED — the fix narrows the freeze to submitted decisions, it does
+    NOT weaken real Mode-B safety. Must ALREADY pass (proving the freeze exists) and MUST still pass
+    after the fix.
+    """
+    adapter = RecordingFakeAdapter(fill=True, fill_history_matches=False)
+    safety, session = _make_safety()
+
+    result = await _run_guarded(adapter=adapter, safety=safety, session=session)
+
+    assert adapter.submit_calls == 1, "a real Mode-B order must reach the wire for this to be a freeze"
+    assert result.submitted_count == 1
+    recon = next(e for e in result.events if isinstance(e, RealFillReconciliation))
+    assert recon.reconciled_state == "AMBIGUOUS", "the venue never confirmed the submitted order's fill"
+    ack = next(e for e in result.events if isinstance(e, OrderAckEvent))
+    assert ack.ack_status == "accepted", "a real order reached the wire for this decision"
+    assert isinstance(result.session_outcome, SessionOutcome)
+    assert result.session_outcome.status == "FAILED", (
+        "a submitted order with an AMBIGUOUS reconciliation is a genuine unresolved-fund-state "
+        "freeze — the MINOR-1 fix must NOT weaken this Mode-B safety property"
+    )
+    assert result.session_outcome.promoted is False

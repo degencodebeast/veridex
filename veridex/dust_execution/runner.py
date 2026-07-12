@@ -352,14 +352,37 @@ def _resolve_session_outcome(
     ``RealizedFillRecord`` fills has not reached either ENABLED loss cap (:meth:`RiskAccumulator.
     breaches_caps` — the SAME predicate :func:`_apply_safety_triggers` uses to fire the emergency
     sweep, so the two can never drift), the circuit breaker is not OPEN, and the kill switch is not
-    engaged. "Reconciled": no per-decision :class:`RealFillReconciliation` in the numbered stream was
-    left ``AMBIGUOUS`` (unresolved/frozen) against venue truth. A bounded, reconciled session is
-    ``"SUCCESS"`` regardless of whether the accumulated ``realized_pnl`` was positive or negative — a
-    losing-but-bounded run IS the honest safety proof this lane exists to produce. ``promoted`` is
-    ALWAYS ``False`` (see :class:`SessionOutcome`) — no alpha claim is ever implied.
+    engaged. "Reconciled": no per-decision :class:`RealFillReconciliation` for a decision that
+    ACTUALLY SUBMITTED a real order to the wire was left ``AMBIGUOUS`` (unresolved/frozen) against
+    venue truth. A reconciliation is a genuine SAFETY FREEZE only when a real order reached the wire
+    for that decision — a submitted-but-unconfirmed fund state. A Mode A ``dry_run`` (or an abstained
+    token) places NO order yet still emits a per-decision ``AMBIGUOUS`` reconciliation (there is no
+    real venue fill to confirm); "nothing was submitted, nothing to reconcile" is benign and must NOT
+    freeze the session — it is not the "submitted but its fill is unconfirmed" state a freeze exists
+    to flag (Gate#3 MINOR-1). The freeze is correlated per-decision through the honest
+    :class:`~veridex.dust_execution.contracts.OrderAckEvent`: ``ack_status == "dry_run_not_submitted"``
+    marks that NO wire was touched for that decision, so only an ack that actually submitted
+    (``"accepted"`` / ``"not_accepted"``) can make its ``decision_id``'s reconciliation a freeze. A
+    bounded, reconciled session is ``"SUCCESS"`` regardless of whether the accumulated ``realized_pnl``
+    was positive or negative — a losing-but-bounded run IS the honest safety proof this lane exists to
+    produce. ``promoted`` is ALWAYS ``False`` (see :class:`SessionOutcome`) — no alpha claim is ever
+    implied.
     """
+    # The decision_ids that ACTUALLY submitted a real order to the wire. ``OrderAckEvent.ack_status``
+    # is the honest per-decision marker: only Mode B's real submit records ``"accepted"`` /
+    # ``"not_accepted"`` (the order reached the wire); Mode A records ``"dry_run_not_submitted"`` (no
+    # wire touched), which never counts toward a freeze.
+    submitted_decision_ids = {
+        event.decision_id
+        for event in events
+        if isinstance(event, OrderAckEvent) and event.ack_status != "dry_run_not_submitted"
+    }
+    # A reconciliation is FROZEN only when it is AMBIGUOUS AND a real order was submitted for that
+    # decision — a no-submit AMBIGUOUS (dry-run / abstained) is "nothing to reconcile", not a freeze.
     reconciliation_frozen = any(
-        isinstance(event, RealFillReconciliation) and event.reconciled_state == "AMBIGUOUS"
+        isinstance(event, RealFillReconciliation)
+        and event.reconciled_state == "AMBIGUOUS"
+        and event.decision_id in submitted_decision_ids
         for event in events
     )
     safety_failed = (
