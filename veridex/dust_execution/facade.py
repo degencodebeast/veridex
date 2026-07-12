@@ -63,7 +63,29 @@ if TYPE_CHECKING:
 IntentKind = Literal["make_quote", "take", "cancel_replace", "cancel_all", "no_quote"]
 
 # The typed admission verdict returned to the agent (§4.3): approved, denied, or human-gated.
+# NOTE: ``admission`` reports ONLY whether the STRATEGY MANIFEST was admitted — NOT whether an order
+# executed. A withheld/abstained execution can carry ``admission="APPROVED"`` (Gate#3 MAJOR-3), so a
+# consumer MUST read ``execution_status`` (below) to learn what actually happened on the wire.
 Admission = Literal["APPROVED", "DENIED", "REQUIRES_HUMAN"]
+
+# The closed vocabulary of EXECUTION dispositions (Gate#3 MAJOR-3) — what ACTUALLY happened on the
+# wire, DERIVED from the runner's real ``DustExecutionResult`` (submits/abstains), never re-derived
+# from the strategy ``admission``. This is deliberately SEPARATE from ``Admission`` so a Studio /
+# AgentRuntime consumer can read "strategy admitted" and "execution withheld/abstained" INDEPENDENTLY:
+#   * ``SUBMITTED``  — at least one order actually reached the wire;
+#   * ``ABSTAINED``  — the gates/intent abstained (e.g. ``intent_no_quote`` / ``stale_quote_age`` /
+#                      ``safety_blocked``) — the strategy was admitted but no order was placed;
+#   * ``NOT_ARMED``  — Mode B could not arm (``mode_b_not_armed`` / ``operator_interlock_unproven``),
+#                      so execution was WITHHELD — a withheld execution NEVER reads as SUBMITTED;
+#   * ``DENIED``     — the strategy admission itself was DENIED, so no execution was authorized.
+ExecutionStatus = Literal["SUBMITTED", "ABSTAINED", "NOT_ARMED", "DENIED"]
+
+# The abstain reasons that mean "Mode B could not ARM" (execution WITHHELD for want of arming/interlock
+# proof), as opposed to a strategy/gate/intent abstention. Mirrors the runner's ``AbstainReason``
+# closed vocab; membership drives the ``NOT_ARMED`` disposition. A closed set — never an id or secret.
+_NOT_ARMED_ABSTAIN_REASONS: frozenset[str] = frozenset(
+    {"mode_b_not_armed", "operator_interlock_unproven"}
+)
 
 
 class MMIntentParams(_FrozenModel):
@@ -184,10 +206,26 @@ class MMExecutionToolResult(_FrozenModel):
     The honest labels reuse the pinned literals from ``contracts.DustRunLabelEvent`` so a dust run
     can never be relabeled as validated/promoted (AC-025); there is deliberately NO
     ``expected_pnl`` / ``edge_bps`` field — the result implies no profitability/edge claim.
+
+    Gate#3 MAJOR-3: ``admission`` reports ONLY the STRATEGY-MANIFEST verdict ("the strategy was
+    admitted"), NEVER "an order executed". The SEPARATE closed-vocab ``execution_status`` (+ its
+    ``execution_reason_codes``) reports what ACTUALLY happened on the wire — ``SUBMITTED`` /
+    ``ABSTAINED`` / ``NOT_ARMED`` / ``DENIED`` — DERIVED from the runner's real disposition, so a
+    WITHHELD execution (interlock/arming) can never read as an executed approval. The two fields are
+    deliberately distinct: a consumer reads "strategy admitted" and "execution withheld" separately.
+    ``execution_reason_codes`` is a closed-vocab list of the runner's abstain reasons (SEC-005 — never
+    a fill/PnL/rankable value).
     """
 
     admission: Admission
     reason_codes: tuple[str, ...]
+    # FAIL-CLOSED defaults (Gate#3 MAJOR-3): an unspecified execution disposition defaults to
+    # ``ABSTAINED`` ("no order reached the wire") — NEVER ``SUBMITTED`` — so a hand-constructed result
+    # can never falsely imply an execution. The production mapping (:func:`_to_tool_result`) ALWAYS
+    # sets both explicitly from the runner's REAL disposition; the defaults only spare direct
+    # constructors (e.g. offline test doubles) from a wrongly-optimistic execution claim.
+    execution_status: ExecutionStatus = "ABSTAINED"
+    execution_reason_codes: tuple[str, ...] = ()
     lifecycle_receipt_ref: str
     run_label: Literal["DUST_LIVE"]  # pinned, mirrors contracts.DustRunLabelEvent.run_label
     calibration_label: Literal["UNCALIBRATED"]  # mirrors DustRunLabelEvent.calibration_label
@@ -246,21 +284,63 @@ def _terminal_label(result: DustExecutionResult) -> DustRunLabelEvent | None:
     return None
 
 
+def _execution_disposition(
+    result: DustExecutionResult, admission: Admission
+) -> tuple[ExecutionStatus, tuple[str, ...]]:
+    """Derive the EXECUTION disposition from the runner's REAL run (Gate#3 MAJOR-3), never admission.
+
+    Reports what ACTUALLY happened on the wire, threaded from the runner's own
+    :class:`~veridex.dust_execution.runner.DustExecutionResult` disposition — its per-token
+    :class:`~veridex.dust_execution.runner.SubmitDecision` ``submitted``/``abstain_reason`` and the
+    ``submitted_count`` — so a withheld/abstained execution is NEVER re-derived from (and can never be
+    masked by) the strategy ``admission``:
+
+      * a DENIED strategy admission authorizes NO execution → ``DENIED``;
+      * else, at least one order reaching the wire → ``SUBMITTED`` (submission is the strongest, most
+        honest disposition even if other tokens abstained);
+      * else, an abstain caused by Mode B being unable to ARM (``mode_b_not_armed`` /
+        ``operator_interlock_unproven``) → ``NOT_ARMED`` (execution WITHHELD);
+      * else, any other gate/intent abstain → ``ABSTAINED``.
+
+    ``execution_reason_codes`` is the DISTINCT set of the runner's abstain reasons in first-seen order
+    (a closed-vocab, id-free, non-rankable list — SEC-005). It is empty when every decision submitted.
+    """
+    reason_codes = tuple(
+        dict.fromkeys(
+            decision.abstain_reason
+            for decision in result.decisions
+            if decision.abstain_reason is not None
+        )
+    )
+    if admission == "DENIED":
+        return "DENIED", reason_codes
+    if result.submitted_count > 0:
+        return "SUBMITTED", reason_codes
+    if any(reason in _NOT_ARMED_ABSTAIN_REASONS for reason in reason_codes):
+        return "NOT_ARMED", reason_codes
+    return "ABSTAINED", reason_codes
+
+
 def _to_tool_result(
     result: DustExecutionResult, request: MMExecutionToolRequest
 ) -> MMExecutionToolResult:
     """Map the runner's :class:`DustExecutionResult` onto the typed boundary result (AC-020).
 
-    Carries ONLY the admission verdict, ordered reason codes, an OPAQUE lifecycle receipt REF, the
-    honest labels the run actually emitted, and the admitted ``policy_hash`` — NEVER the runner
-    result object, adapter, signer, or any live handle. An ``ALLOW`` admission maps to ``APPROVED``,
-    any ``DENY`` to ``DENIED``.
+    Carries ONLY the STRATEGY admission verdict, ordered reason codes, the SEPARATE EXECUTION
+    disposition (``execution_status`` + ``execution_reason_codes`` — Gate#3 MAJOR-3), an OPAQUE
+    lifecycle receipt REF, the honest labels the run actually emitted, and the admitted ``policy_hash``
+    — NEVER the runner result object, adapter, signer, or any live handle. An ``ALLOW`` admission maps
+    to ``APPROVED``, any ``DENY`` to ``DENIED``; the ``execution_status`` is derived SEPARATELY from
+    the runner's real run disposition so a withheld execution never reads as an executed approval.
     """
     admission: Admission = "APPROVED" if result.admission.verdict == "ALLOW" else "DENIED"
+    execution_status, execution_reason_codes = _execution_disposition(result, admission)
     label = _terminal_label(result)
     return MMExecutionToolResult(
         admission=admission,
         reason_codes=result.admission.reason_codes,
+        execution_status=execution_status,
+        execution_reason_codes=execution_reason_codes,
         lifecycle_receipt_ref=_lifecycle_receipt_ref(result),
         run_label=label.run_label if label is not None else _DEFAULT_RUN_LABEL,
         calibration_label=(
@@ -556,6 +636,7 @@ async def propose_mm_execution(
     _emit(
         RuntimeEventType.ACTION_EMITTED,
         admission=tool_result.admission,
+        execution_status=tool_result.execution_status,
         intent_kind=request.intent_kind,
     )
     _emit(
@@ -563,6 +644,8 @@ async def propose_mm_execution(
         status=RuntimeStatus.COMPLETED.value,
         admission=tool_result.admission,
         reason_codes=list(tool_result.reason_codes),
+        execution_status=tool_result.execution_status,
+        execution_reason_codes=list(tool_result.execution_reason_codes),
         lifecycle_receipt_ref=tool_result.lifecycle_receipt_ref,
         session_status=result.session_outcome.status,
         submitted_count=result.submitted_count,

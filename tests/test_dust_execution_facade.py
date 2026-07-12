@@ -36,6 +36,7 @@ from veridex.dust_execution.facade import (
 )
 from veridex.dust_execution.manifest import StrategyExperimentManifest
 from veridex.dust_execution.privy_control_plane import PrivyPreflightResult, ProvisioningResult
+from veridex.dust_execution.risk import RiskAccumulator
 from veridex.dust_execution.runner import (
     BookSide,
     DustQuote,
@@ -170,6 +171,8 @@ def test_facade_result_never_carries_raw_handles_and_hash_mismatch_denies() -> N
     result = MMExecutionToolResult(
         admission="APPROVED",
         reason_codes=("admitted",),
+        execution_status="SUBMITTED",
+        execution_reason_codes=(),
         lifecycle_receipt_ref="receipt:0xabc",
         run_label="DUST_LIVE",
         calibration_label="UNCALIBRATED",
@@ -187,6 +190,8 @@ def test_facade_result_never_carries_raw_handles_and_hash_mismatch_denies() -> N
         MMExecutionToolResult(
             admission="APPROVED",
             reason_codes=(),
+            execution_status="SUBMITTED",
+            execution_reason_codes=(),
             lifecycle_receipt_ref="receipt:0xabc",
             run_label="DUST_LIVE",
             calibration_label="UNCALIBRATED",
@@ -791,3 +796,187 @@ def test_facade_proposer_is_not_registered_as_a_tool_on_the_tools_empty_agent() 
     assert captured["tools"] == [], "the decision agent must be assembled with tools=[]"
     # ...and the MM facade proposer is NOT registered among them (mutation: appending it flips this).
     assert facade.propose_mm_execution not in captured["tools"]
+
+
+# ---------------------------------------------------------------------------
+# Gate#3 MAJOR-3 — the typed result SEPARATES the strategy MANIFEST ADMISSION
+# from the EXECUTION DISPOSITION, so a WITHHELD execution can never read as an
+# executed approval.
+#
+# Before the fix ``_to_tool_result`` mapped ONLY the strategy-authorization
+# verdict/reason codes: an interlock-withheld run returned ``admission="APPROVED"``,
+# ``reason_codes=()`` while ``submit_calls == 0`` — indistinguishable from
+# "approved AND executed". The result now ALSO carries a closed-vocab
+# ``execution_status`` (+ ``execution_reason_codes``) DERIVED from the runner's REAL
+# ``DustExecutionResult`` disposition (submits / abstains), NOT re-derived from
+# admission. ``admission`` keeps its EXISTING meaning ("the strategy manifest was
+# admitted"), never "an order executed". Each test asserts THE RESULT (the typed
+# fields), not only ``submit_calls`` (Codex: "assert the result, not only submit_calls").
+#
+# RED evidence (current code, before the fix): the interlock-withheld run returns
+# ``('APPROVED', ())`` with ``submit_calls == 0`` and NO ``execution_status`` field —
+# the honesty gap this fold closes (a repro captured the exact tuple).
+# ---------------------------------------------------------------------------
+
+
+async def _drive_mode_b_kind(
+    *,
+    intent_kind: str,
+    intent_params: MMIntentParams,
+    arming: ModeBArming | None,
+    interlock: OperatorInterlock | None,
+    binding: ExecutionWalletBinding,
+    adapter: FakeVenueAdapter,
+    interlock_sink: list[OperatorInterlockEvent] | None = None,
+) -> MMExecutionToolResult:
+    """Drive a Mode-B run for an arbitrary admitted intent kind (hashes built to MATCH the manifest)."""
+    manifest = _mode_b_mm_manifest(binding)
+    envelope = _mm_env()
+    request = MMExecutionToolRequest.build(
+        intent_kind=intent_kind,  # type: ignore[arg-type]
+        intent_params=intent_params,
+        strategy_id=manifest.strategy_id,
+        strategy_config_hash=manifest.strategy_config_hash,
+        policy_hash=envelope.policy_hash(),
+        session_id="sess-mm-b",
+        manifest_hash=manifest.manifest_hash(),
+        evidence_class="EXPERIMENTAL_DUST",
+        mode="live_guarded",
+        admitted_manifest_hash=manifest.manifest_hash(),
+        admitted_policy_hash=envelope.policy_hash(),
+        admitted_strategy_config_hash=manifest.strategy_config_hash,
+    )
+    return await facade.propose_mm_execution(
+        request,
+        adapter=adapter,
+        signer=LocalFakeWalletControlPlane(),
+        sources=_MMScriptedSource(_mm_fresh_quote()),
+        now_fn=_mm_clock,
+        sleep_fn=_mm_noop_sleep,
+        envelope=envelope,
+        manifest=manifest,
+        wallet_equity_at_decision=100.0,
+        fixed_fraction=0.01,
+        arming=arming,
+        operator_interlock=interlock,
+        interlock_sink=(interlock_sink.append if interlock_sink is not None else None),
+    )
+
+
+def _taker_params() -> MMIntentParams:
+    return MMIntentParams(
+        token_id=_MM_TOKEN, side="BUY", size=1.0, tif="FOK", client_order_id="coid-1"
+    )
+
+
+async def test_result_reports_not_armed_when_interlock_withholds_execution() -> None:
+    """Interlock-withheld (``first_order_authorized=False``): the arming bundle is WITHHELD so the
+    runner correctly abstains and NO order reaches the wire — yet the strategy manifest was admitted.
+    The RESULT must make the withheld execution UNMISTAKABLE: ``admission`` stays ``APPROVED`` (manifest
+    admitted) but ``execution_status`` is ``NOT_ARMED`` (carrying the ``mode_b_not_armed`` reason) — NOT
+    a bare ``('APPROVED', ())`` that reads as approved-AND-executed (Gate#3 MAJOR-3)."""
+    binding = _mm_binding()
+    adapter = FakeVenueAdapter(fill=True)
+    recorded: list[OperatorInterlockEvent] = []
+
+    result = await _drive_mode_b_kind(
+        intent_kind="take",
+        intent_params=_taker_params(),
+        arming=_mm_arming(binding),  # a fully-passing E6-T4 TECHNICAL arming bundle
+        interlock=_full_interlock(first_order_authorized=False),  # the human interlock FAILS
+        binding=binding,
+        adapter=adapter,
+        interlock_sink=recorded,
+    )
+
+    # NO order reached the wire — execution was WITHHELD.
+    assert adapter.submit_calls == 0
+    # The strategy MANIFEST was still admitted (existing meaning of ``admission``)...
+    assert result.admission == "APPROVED"
+    # ...but the EXECUTION DISPOSITION is honestly reported as NOT_ARMED — never SUBMITTED, and never
+    # a bare APPROVED/() that a Studio/AgentRuntime consumer would read as approved-and-executed.
+    assert result.execution_status == "NOT_ARMED"
+    assert result.execution_status != "SUBMITTED"
+    assert "mode_b_not_armed" in result.execution_reason_codes
+
+
+async def test_result_reports_abstained_for_an_armed_no_quote_intent() -> None:
+    """Armed ``no_quote``: fully armed (so the abstention is the INTENT's, not a want of arming) — the
+    runner abstains on the explicit DON'T-TRADE intent. The result reports ``execution_status ==
+    ABSTAINED`` with the ``intent_no_quote`` reason, NOT an executed approval (Gate#3 MAJOR-3)."""
+    binding = _mm_binding()
+    adapter = FakeVenueAdapter(fill=True)
+    recorded: list[OperatorInterlockEvent] = []
+
+    result = await _drive_mode_b_kind(
+        intent_kind="no_quote",
+        intent_params=MMIntentParams(),  # an explicit abstention carries no order params
+        arming=_mm_arming(binding),
+        interlock=_full_interlock(),  # fully armed — arming is NOT the reason for the abstain
+        binding=binding,
+        adapter=adapter,
+        interlock_sink=recorded,
+    )
+
+    assert adapter.submit_calls == 0
+    assert result.admission == "APPROVED"  # the manifest admitted the strategy
+    assert result.execution_status == "ABSTAINED"  # abstained on the intent, NOT an executed approval
+    assert "intent_no_quote" in result.execution_reason_codes
+
+
+async def test_result_reports_submitted_for_a_clean_armed_take() -> None:
+    """Clean armed ``take``: a fully-satisfied interlock + fully-passing arming bundle lets an order
+    reach the wire. The result honestly reports BOTH ``admission == APPROVED`` (manifest admitted) AND
+    ``execution_status == SUBMITTED`` (an order actually reached the wire) — the positive control that
+    makes the withheld/abstained cases meaningful (Gate#3 MAJOR-3)."""
+    binding = _mm_binding()
+    adapter = FakeVenueAdapter(fill=True)
+    recorded: list[OperatorInterlockEvent] = []
+
+    result = await _drive_mode_b_kind(
+        intent_kind="take",
+        intent_params=_taker_params(),
+        arming=_mm_arming(binding),
+        interlock=_full_interlock(),
+        binding=binding,
+        adapter=adapter,
+        interlock_sink=recorded,
+    )
+
+    assert adapter.submit_calls == 1
+    assert result.admission == "APPROVED"
+    assert result.execution_status == "SUBMITTED"
+
+
+async def test_result_reports_denied_for_a_strategy_admission_deny() -> None:
+    """Strategy admission DENY (a reached loss cap): ``admission`` is ``DENIED`` and ``execution_status``
+    reflects that NO execution was authorized (``DENIED``). Drives a genuine runner result whose
+    admission verdict is ``DENY`` (seeded breached risk) and maps it through ``_to_tool_result`` — the
+    typed result must not imply any execution (Gate#3 MAJOR-3)."""
+    manifest = _mm_manifest()
+    envelope = _mm_env()
+    breached = RiskAccumulator.seeded(
+        session_id="dust-maker-v0:dry_run", net_session=-2.0, net_day=-2.0, current_day=None
+    )
+    adapter = FakeVenueAdapter(fill=True)
+    result = await run_dust_execution(
+        adapter=adapter,
+        signer=LocalFakeWalletControlPlane(),
+        sources=_MMScriptedSource(_mm_fresh_quote()),
+        now_fn=_mm_clock,
+        sleep_fn=_mm_noop_sleep,
+        envelope=envelope,
+        manifest=manifest,
+        mode="dry_run",
+        wallet_equity_at_decision=100.0,
+        fixed_fraction=0.01,
+        risk=breached,
+    )
+    assert result.admission.verdict == "DENY", "seeded breached risk must DENY admission"
+    assert adapter.submit_calls == 0
+
+    request = _admitted_request(manifest, envelope)
+    tool_result = facade._to_tool_result(result, request)
+
+    assert tool_result.admission == "DENIED"
+    assert tool_result.execution_status == "DENIED"
