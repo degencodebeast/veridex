@@ -24,7 +24,16 @@ test fails) is meaningful and not vacuously green.
 
 from __future__ import annotations
 
-from veridex.dust_execution.contracts import ExecutionMode
+from veridex.dust_execution.contracts import (
+    DustExecutionSessionMeta,
+    DustRunLabelEvent,
+    ExecutionMode,
+    OrderAckEvent,
+    OrderStatusEvent,
+    OrderSubmitAttempt,
+    OrderSubmitIntent,
+    RealFillReconciliation,
+)
 from veridex.dust_execution.manifest import StrategyExperimentManifest
 from veridex.dust_execution.runner import (
     ABSTAIN_REASONS,
@@ -37,8 +46,21 @@ from veridex.dust_execution.runner import (
 )
 from veridex.dust_execution.signer import LocalFakeWalletControlPlane, SignedArtifact
 from veridex.policy.envelope import PolicyEnvelope
+from veridex.runtime.evidence import compute_evidence_hash
 from veridex.venues.base import Order
 from veridex.venues.sx_bet import FakeVenueAdapter
+
+# The E1-T2 canonical lifecycle-stream ordering (session meta precedes this, unnumbered):
+# risk snapshot -> intent -> attempt -> ack/reject -> status -> fill/reconciliation -> labels.
+_EXPECTED_EVENT_TYPES: tuple[str, ...] = (
+    "SessionRiskSnapshot",
+    "OrderSubmitIntent",
+    "OrderSubmitAttempt",
+    "OrderAckEvent",
+    "OrderStatusEvent",
+    "RealFillReconciliation",
+    "DustRunLabelEvent",
+)
 
 # --- Fixtures --------------------------------------------------------------------------------
 
@@ -288,3 +310,80 @@ async def test_no_raw_handle_or_secret_in_result_telemetry() -> None:
     for d in result.decisions:
         assert d.abstain_reason is None or d.abstain_reason in ABSTAIN_REASONS
     assert "mode_a_no_orders" in ABSTAIN_REASONS and "stale_quote_age" in ABSTAIN_REASONS
+
+
+# --- E6-T2: full lifecycle-event stream, identical contract shape in Mode A and Mode B --------
+
+
+async def test_mode_a_and_mode_b_emit_identical_lifecycle_contract_shape() -> None:
+    """AC-003: the SAME pinned clean quote yields IDENTICAL event TYPES + ORDERING in both modes.
+
+    The stream is: session meta (unnumbered) -> risk snapshot -> intent -> attempt -> ack ->
+    status -> fill/reconciliation -> labels. Only the recorded DATA differs (whether a real order
+    moved) -- never the shape.
+    """
+    quote = _fresh_quote()
+
+    result_a = await _run(
+        adapter=FakeVenueAdapter(fill=True), source=_ScriptedSource(quote=quote), mode="dry_run"
+    )
+    result_b = await _run(
+        adapter=FakeVenueAdapter(fill=True), source=_ScriptedSource(quote=quote), mode="live_guarded"
+    )
+
+    assert isinstance(result_a.session_meta, DustExecutionSessionMeta)
+    assert isinstance(result_b.session_meta, DustExecutionSessionMeta)
+    assert result_a.session_meta.mode == "dry_run"
+    assert result_b.session_meta.mode == "live_guarded"
+
+    types_a = tuple(type(e).__name__ for e in result_a.events)
+    types_b = tuple(type(e).__name__ for e in result_b.events)
+    assert types_a == _EXPECTED_EVENT_TYPES, f"Mode A stream shape drifted: {types_a}"
+    assert types_b == _EXPECTED_EVENT_TYPES, f"Mode B stream shape drifted: {types_b}"
+    assert types_a == types_b, "Mode A and Mode B must emit the IDENTICAL event-type stream (AC-003)"
+
+    # The ONLY difference is whether a real order moved -- not the shape of the contracts.
+    ack_a = next(e for e in result_a.events if isinstance(e, OrderAckEvent))
+    ack_b = next(e for e in result_b.events if isinstance(e, OrderAckEvent))
+    assert ack_a.venue_order_id is None, "Mode A must never fabricate a venue_order_id"
+    assert ack_b.venue_order_id is not None, "Mode B's clean-gate ack must carry a real venue_order_id"
+    assert ack_a.ack_status != ack_b.ack_status
+
+    status_a = next(e for e in result_a.events if isinstance(e, OrderStatusEvent))
+    status_b = next(e for e in result_b.events if isinstance(e, OrderStatusEvent))
+    assert status_a.status == status_b.status  # same honest provisional status label, both modes
+
+    assert quote.ask is not None
+    intent_a = next(e for e in result_a.events if isinstance(e, OrderSubmitIntent))
+    intent_b = next(e for e in result_b.events if isinstance(e, OrderSubmitIntent))
+    assert intent_a.token_id == intent_b.token_id == _TOKEN
+    assert intent_a.price == intent_b.price == quote.ask.price
+
+    attempt_a = next(e for e in result_a.events if isinstance(e, OrderSubmitAttempt))
+    attempt_b = next(e for e in result_b.events if isinstance(e, OrderSubmitAttempt))
+    assert attempt_a.presubmit_record.integrity_commitment_hash
+    assert attempt_b.presubmit_record.integrity_commitment_hash
+
+    recon_a = next(e for e in result_a.events if isinstance(e, RealFillReconciliation))
+    recon_b = next(e for e in result_b.events if isinstance(e, RealFillReconciliation))
+    assert recon_a.reconciled_state == recon_b.reconciled_state
+
+    labels_a = next(e for e in result_a.events if isinstance(e, DustRunLabelEvent))
+    labels_b = next(e for e in result_b.events if isinstance(e, DustRunLabelEvent))
+    assert labels_a.run_label == labels_b.run_label == "DUST_LIVE"
+    assert labels_a.calibration_label == labels_b.calibration_label == "UNCALIBRATED"
+    assert labels_a.edge_label == labels_b.edge_label == "NOT_PROVEN_EDGE"
+
+
+async def test_sequence_no_unique_append_only_monotonic() -> None:
+    """``sequence_no`` is append-only, unique, and gap-free across the whole event stream."""
+    result = await _run(
+        adapter=FakeVenueAdapter(fill=True), source=_ScriptedSource(quote=_fresh_quote()), mode="live_guarded"
+    )
+
+    seqs = [e.sequence_no for e in result.events]
+    assert len(seqs) >= len(_EXPECTED_EVENT_TYPES)
+    assert seqs == list(range(1, len(seqs) + 1)), "sequence_no must be append-only, unique, and gap-free"
+
+    # The shared canonical evidence-hash helper independently rejects a duplicate sequence_no.
+    compute_evidence_hash([e.model_dump() for e in result.events])

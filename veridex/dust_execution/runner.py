@@ -1,4 +1,5 @@
-"""E6-T1 — ``run_dust_execution`` skeleton + submit gates (SAF-007, AC-010/017, §6 group 6).
+"""E6-T1/E6-T2 — ``run_dust_execution`` skeleton + submit gates + full lifecycle-event stream
+(SAF-007, AC-010/017, AC-003, §6 group 6).
 
 The REAL-fill dust-execution runner's SKELETON and the SAFETY-CORE submit gates. Everything is
 INJECTED — the venue ``adapter``, the ``signer`` control plane, the quote ``sources``, the
@@ -22,13 +23,32 @@ submit an order on the wire; in ``dry_run`` (Mode A) a clean quote still places 
 decision telemetry is boolean/id/closed-vocab only — no secret, signer artifact, order, or raw
 venue handle ever crosses into :class:`SubmitDecision` (SEC-005 discipline).
 
-SCOPE (E6-T1): skeleton + submit gates ONLY. The following are DELIBERATELY left as clean seams for
-later E6 tasks and are NOT wired here — full lifecycle-event emission (E6-T2); risk / emergency /
-reconcile / non-crossing wiring and ``SafetyController`` delegation (E6-T3); the Mode A→B arming
-gate, manifest authorization, and ``resolve_dust_size`` binding + native→decimal pricing (E6-T4);
-the startup sweep (E6-T5); shutdown (E6-T6); losing-session status (E6-T7). The Mode B order built
-here uses PROVISIONAL price/size placeholders purely to exercise the (recording-fake, offline)
-submit wire the gates protect — real sizing/pricing binding is E6-T4.
+E6-T2 (lifecycle-event emission, AC-003). For every GATE-CLEAR quote the runner also builds the
+E1-T2 append-only, unique-``sequence_no`` lifecycle stream: a session-identity preamble
+(:class:`~veridex.dust_execution.contracts.DustExecutionSessionMeta`, unnumbered — it carries no
+``sequence_no``) followed by the numbered stream ``SessionRiskSnapshot -> OrderSubmitIntent ->
+OrderSubmitAttempt -> OrderAckEvent -> OrderStatusEvent -> RealFillReconciliation ->
+DustRunLabelEvent``. Mode A and Mode B emit the IDENTICAL event TYPES in the IDENTICAL ORDER for
+the same input — the ONLY difference is whether a real order moved (Mode A's ``OrderAckEvent``
+honestly records ``ack_status="dry_run_not_submitted"`` and a ``None`` venue_order_id instead of
+fabricating a real acknowledgement; Mode A still NEVER calls ``adapter.submit_order`` — the E6-T1
+``adapter.submit_calls == 0`` / AC-017 invariant is unchanged). A gate-ABSTAINED token emits NO
+per-decision lifecycle events — there is no honest order-lifecycle data to record for a decision
+that never proceeded past the gate.
+
+SCOPE (E6-T2): the lifecycle-event emission ONLY, over the E6-T1 gate/submit path. The following
+remain DELIBERATELY provisional / unwired seams for later E6 tasks (each event field that stands in
+for one is flagged PROVISIONAL at its construction site below): the real realized-loss / breaker /
+kill-switch accumulator and ``SafetyController`` delegation feeding ``SessionRiskSnapshot`` (E6-T3);
+real order-status polling and real venue reconciliation feeding ``OrderStatusEvent`` /
+``RealFillReconciliation`` (E6-T3); the Mode A→B arming gate, manifest authorization, and
+``resolve_dust_size`` binding + native→decimal pricing still using the E6-T1 placeholder price/size
+(E6-T4); a durable operator-assigned ``session_id`` and the sealed ``content_hash`` at session end
+(E6-T5 startup sweep / E6-T6 shutdown); the real EIP-712 V2 order-hash (``venue_order_key``) binding
+via ``veridex.dust_execution.signing_compiler`` (a later task — this module's placeholder is
+distinct from the private integrity digest, never equal to it). The Mode B order built here still
+uses PROVISIONAL price/size placeholders purely to exercise the (recording-fake, offline) submit
+wire the gates protect — real sizing/pricing binding is E6-T4.
 
 SEC-003: this module imports only intra-lane ``veridex.dust_execution.*``, the shared
 ``veridex.policy.envelope`` (the single breach-boundary source of truth, not a ranked lane), and
@@ -44,7 +64,18 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Literal, Protocol, runtime_checkable
 
-from veridex.dust_execution.contracts import ExecutionMode
+from veridex.dust_execution.contracts import (
+    DustExecutionSessionMeta,
+    DustRunLabelEvent,
+    ExecutionMode,
+    OrderAckEvent,
+    OrderStatusEvent,
+    OrderSubmitAttempt,
+    OrderSubmitIntent,
+    PreSubmitRecord,
+    RealFillReconciliation,
+    SessionRiskSnapshot,
+)
 from veridex.dust_execution.manifest import StrategyExperimentManifest
 from veridex.dust_execution.signer import Signer, SigningPayload
 from veridex.policy.envelope import PolicyEnvelope
@@ -158,12 +189,34 @@ class SubmitDecision:
     venue_order_id: str | None = None
 
 
+#: The E1-T2 numbered lifecycle-event union this runner emits (session meta precedes it, unnumbered
+#: — :class:`DustExecutionSessionMeta` carries no ``sequence_no``). Ordered per event, one variant
+#: per stage: risk snapshot, intent, attempt, ack, status, fill/reconciliation, labels.
+LifecycleEvent = (
+    SessionRiskSnapshot
+    | OrderSubmitIntent
+    | OrderSubmitAttempt
+    | OrderAckEvent
+    | OrderStatusEvent
+    | RealFillReconciliation
+    | DustRunLabelEvent
+)
+
+
 @dataclass(frozen=True)
 class DustExecutionResult:
-    """The result of one dust-execution pass over the manifest universe."""
+    """The result of one dust-execution pass over the manifest universe.
+
+    ``session_meta`` is the unnumbered session-identity preamble; ``events`` is the append-only,
+    unique/monotonic-``sequence_no`` E1-T2 lifecycle stream that follows it. Mode A and Mode B emit
+    IDENTICAL event TYPES in IDENTICAL ORDER for the same input (AC-003) — only the recorded DATA
+    (e.g. ``ack_status`` / ``venue_order_id``) differs, reflecting whether a real order moved.
+    """
 
     mode: ExecutionMode
     decisions: tuple[SubmitDecision, ...]
+    session_meta: DustExecutionSessionMeta
+    events: tuple[LifecycleEvent, ...]
 
     @property
     def submitted_count(self) -> int:
@@ -205,6 +258,104 @@ def _evaluate_submit_gate(quote: DustQuote, *, now_s: int, max_quote_age_s: int)
 
 
 # ---------------------------------------------------------------------------
+# Deterministic, monotonic sequence_no allocation (E6-T2, AC-003)
+# ---------------------------------------------------------------------------
+
+
+class _SeqCounter:
+    """Deterministic, monotonic ``sequence_no`` allocator for one run's lifecycle stream.
+
+    Starts at ``1`` and increments by exactly ``1`` per call — append-only, unique, gap-free by
+    construction. Not a randomness/clock seam: purely arithmetic, so it needs no injection.
+    """
+
+    def __init__(self) -> None:
+        self._next = 1
+
+    def next(self) -> int:
+        """Return the next ``sequence_no`` and advance the counter."""
+        n = self._next
+        self._next += 1
+        return n
+
+
+# ---------------------------------------------------------------------------
+# Session-level event builders (preamble + once-per-run stages)
+# ---------------------------------------------------------------------------
+
+
+def _build_session_meta(
+    *,
+    manifest: StrategyExperimentManifest,
+    envelope: PolicyEnvelope,
+    signer: Signer,
+    mode: ExecutionMode,
+) -> DustExecutionSessionMeta:
+    """Session identity/provenance preamble (unnumbered — carries no ``sequence_no``).
+
+    PROVISIONAL SEAM: ``session_id`` is derived from ``(strategy_id, mode)`` — a durable,
+    operator-assigned session identity and the sealed ``content_hash`` are wired by later tasks
+    (E6-T5 startup sweep / E6-T6 shutdown). ``wallet_ref`` is the signer's own non-secret provider
+    label (never a key/address). Every other field is REAL, sourced directly from the pinned
+    ``manifest`` / ``envelope``.
+    """
+    return DustExecutionSessionMeta(
+        session_id=f"{manifest.strategy_id}:{mode}",  # PROVISIONAL — real session identity: later task
+        mode=mode,
+        wallet_ref=signer.mode,
+        manifest_hash=manifest.manifest_hash(),
+        policy_hash=envelope.policy_hash(),
+        caps_snapshot={
+            "max_orders": float(manifest.max_orders),
+            "max_notional": manifest.max_notional,
+            "max_session_loss": manifest.max_session_loss,
+            "max_daily_loss": manifest.max_daily_loss,
+        },
+        market_fee_snapshot_hash=manifest.market_fee_snapshot_hash,
+        operator_authorization_ref=manifest.operator_authorization,
+        partial_content_hash=None,
+        content_hash=None,  # PROVISIONAL — sealed at session end: later task (E6-T6 shutdown)
+    )
+
+
+def _build_risk_snapshot(*, seq: int, now_ms: int, envelope: PolicyEnvelope) -> SessionRiskSnapshot:
+    """Session-level risk snapshot (``decision_id=None``) — first event in the numbered stream.
+
+    PROVISIONAL SEAM: the realized-loss accumulator / open-order-count / breaker wiring
+    (``veridex.dust_execution.risk.RiskAccumulator`` + ``emergency.SafetyController``) is E6-T3's
+    job; this snapshot reports honest ZERO placeholders for those fields — never a fabricated
+    non-zero value. ``kill_switch_engaged`` is REAL today: ``envelope.kill_switch`` is already
+    available to the runner.
+    """
+    return SessionRiskSnapshot(
+        sequence_no=seq,
+        event_type="SessionRiskSnapshot",
+        source_ts=None,
+        recv_ts=now_ms,
+        decision_id=None,
+        realized_loss_session=0.0,  # PROVISIONAL — real accumulator wiring: E6-T3
+        realized_loss_daily=0.0,  # PROVISIONAL — real accumulator wiring: E6-T3
+        open_order_count=0,  # PROVISIONAL — real accumulator wiring: E6-T3
+        breaker_open=False,  # PROVISIONAL — real accumulator wiring: E6-T3
+        kill_switch_engaged=envelope.kill_switch,
+    )
+
+
+def _build_label_event(*, seq: int, now_ms: int, manifest: StrategyExperimentManifest) -> DustRunLabelEvent:
+    """Mandatory honesty labels (AC-025) — last event in the numbered stream, once per run."""
+    return DustRunLabelEvent(
+        sequence_no=seq,
+        event_type="DustRunLabelEvent",
+        source_ts=None,
+        recv_ts=now_ms,
+        run_label="DUST_LIVE",
+        evidence_class=manifest.evidence_class,
+        calibration_label="UNCALIBRATED",
+        edge_label="NOT_PROVEN_EDGE",
+    )
+
+
+# ---------------------------------------------------------------------------
 # The runner
 # ---------------------------------------------------------------------------
 
@@ -227,6 +378,13 @@ async def run_dust_execution(
     (Mode B) does it build and submit an order; in ``dry_run`` (Mode A) a clean quote still places
     NO order.
 
+    E6-T2: the runner also assembles the full E1-T2 lifecycle-event stream — a session-identity
+    preamble (:class:`DustExecutionSessionMeta`) followed by the numbered stream (session-level
+    :class:`SessionRiskSnapshot`, then per GATE-CLEAR token: intent -> attempt -> ack -> status ->
+    fill/reconciliation, then a session-level :class:`DustRunLabelEvent`). Mode A and Mode B emit
+    the IDENTICAL event-type stream for the same input (AC-003); a gate-ABSTAINED token contributes
+    no per-decision events (there is no honest order-lifecycle data to record for it).
+
     ``sleep_fn`` is the injected async delay seam for the E6 polling loop (added by a later task);
     this skeleton makes a single deterministic pass and does not sleep. The Mode B order uses
     PROVISIONAL price/size placeholders purely to exercise the (offline recording-fake) submit wire
@@ -236,30 +394,48 @@ async def run_dust_execution(
         adapter: Injected venue adapter (a recording-fake in tests; never a live venue in E6-T1).
         signer: Injected provider-neutral signing control plane (Mode-A fake offline).
         sources: Injected quote source; raises :class:`StaleVenueBook` when gapped/disconnected.
-        now_fn: Injected clock returning integer SECONDS (used for the staleness gate).
+        now_fn: Injected clock returning integer SECONDS (used for the staleness gate and, x1000,
+            for every event's integer-millisecond ``recv_ts``).
         sleep_fn: Injected async delay seam (unused in this single-pass skeleton; wired later).
         envelope: Policy envelope providing ``max_quote_age_s`` and the venue allowlist.
         manifest: Pinned strategy manifest providing the token ``universe`` to quote.
         mode: Execution mode — ``"dry_run"`` (Mode A, no orders) or ``"live_guarded"`` (Mode B).
 
     Returns:
-        A :class:`DustExecutionResult` with one :class:`SubmitDecision` per token in the universe.
+        A :class:`DustExecutionResult` with one :class:`SubmitDecision` per token, the session
+        preamble, and the full ordered lifecycle-event stream.
     """
+    seqc = _SeqCounter()
+    session_meta = _build_session_meta(manifest=manifest, envelope=envelope, signer=signer, mode=mode)
+
+    events: list[LifecycleEvent] = [
+        _build_risk_snapshot(seq=seqc.next(), now_ms=now_fn() * 1000, envelope=envelope)
+    ]
+
     decisions: list[SubmitDecision] = []
     for token_id in manifest.universe:
-        decisions.append(
-            await _decide_and_submit(
-                token_id,
-                adapter=adapter,
-                signer=signer,
-                sources=sources,
-                now_fn=now_fn,
-                envelope=envelope,
-                manifest=manifest,
-                mode=mode,
-            )
+        decision, token_events = await _decide_and_submit(
+            token_id,
+            adapter=adapter,
+            signer=signer,
+            sources=sources,
+            now_fn=now_fn,
+            envelope=envelope,
+            manifest=manifest,
+            mode=mode,
+            seqc=seqc,
         )
-    return DustExecutionResult(mode=mode, decisions=tuple(decisions))
+        decisions.append(decision)
+        events.extend(token_events)
+
+    events.append(_build_label_event(seq=seqc.next(), now_ms=now_fn() * 1000, manifest=manifest))
+
+    return DustExecutionResult(
+        mode=mode,
+        decisions=tuple(decisions),
+        session_meta=session_meta,
+        events=tuple(events),
+    )
 
 
 async def _decide_and_submit(
@@ -272,73 +448,198 @@ async def _decide_and_submit(
     envelope: PolicyEnvelope,
     manifest: StrategyExperimentManifest,
     mode: ExecutionMode,
-) -> SubmitDecision:
-    """Gate one token's quote and, only when clear AND Mode B, submit it on the wire."""
+    seqc: _SeqCounter,
+) -> tuple[SubmitDecision, tuple[LifecycleEvent, ...]]:
+    """Gate one token's quote and, only when clear AND Mode B, submit it on the wire.
+
+    Also builds the E1-T2 per-decision lifecycle events for a GATE-CLEAR quote — identically shaped
+    in both modes (AC-003); see :func:`_emit_order_lifecycle`. A gate-ABSTAINED token (the original
+    E6-T1 behavior) emits NO per-decision lifecycle events.
+    """
     try:
         quote = await sources.read_quote(token_id)
     except StaleVenueBook:
         # A gapped / disconnected / mid-resync source — abstain, nothing reaches the wire.
-        return _abstain(token_id, "stale_source")
+        return _abstain(token_id, "stale_source"), ()
 
-    reason = _evaluate_submit_gate(quote, now_s=now_fn(), max_quote_age_s=envelope.max_quote_age_s)
+    now_s = now_fn()
+    reason = _evaluate_submit_gate(quote, now_s=now_s, max_quote_age_s=envelope.max_quote_age_s)
     if reason is not None:
-        return _abstain(token_id, reason)
+        return _abstain(token_id, reason), ()
 
-    if mode != "live_guarded":
-        # Mode A (dry_run) places NO orders even when every gate is clear (AC-017).
-        return _abstain(token_id, "mode_a_no_orders")
-
-    # Mode B, every gate clear: sign then submit the ONE order the gates protect. Both sides are
-    # present here (missing-side would have abstained above), so the assertions below are safe.
-    assert quote.bid is not None and quote.ask is not None  # noqa: S101 - narrows for type-checker
-    ack = await _sign_and_submit(quote, adapter=adapter, signer=signer, envelope=envelope, manifest=manifest)
-    logger.info(
-        "dust_execution.submit",
-        extra={"token_id": token_id, "submitted": True, "mode": mode},
+    decision, events = await _emit_order_lifecycle(
+        quote,
+        adapter=adapter,
+        signer=signer,
+        envelope=envelope,
+        manifest=manifest,
+        mode=mode,
+        now_s=now_s,
+        seqc=seqc,
     )
-    return SubmitDecision(
-        token_id=token_id,
-        submitted=True,
-        abstain_reason=None,
-        venue_order_id=ack,
-    )
+    if decision.submitted:
+        logger.info(
+            "dust_execution.submit",
+            extra={"token_id": token_id, "submitted": True, "mode": mode},
+        )
+    else:
+        logger.info(
+            "dust_execution.abstain",
+            extra={"token_id": token_id, "submitted": False, "abstain_reason": decision.abstain_reason},
+        )
+    return decision, events
 
 
-async def _sign_and_submit(
+async def _emit_order_lifecycle(
     quote: DustQuote,
     *,
     adapter: VenueAdapter,
     signer: Signer,
     envelope: PolicyEnvelope,
     manifest: StrategyExperimentManifest,
-) -> str:
-    """Sign the (provisional) payload then submit the order; return the venue order id.
+    mode: ExecutionMode,
+    now_s: int,
+    seqc: _SeqCounter,
+) -> tuple[SubmitDecision, tuple[LifecycleEvent, ...]]:
+    """Build the full E1-T2 per-decision lifecycle chain for a GATE-CLEAR quote (AC-003).
 
-    PROVISIONAL binding: the price/size here are skeleton placeholders that exercise the submit
-    wire only — real ``resolve_dust_size`` sizing and native→decimal pricing land in E6-T4.
+    Emits, in order: ``OrderSubmitIntent -> OrderSubmitAttempt -> OrderAckEvent ->
+    OrderStatusEvent -> RealFillReconciliation``. IDENTICAL event TYPES and ORDERING in both
+    modes — Mode A signs the SAME payload but NEVER calls ``adapter.submit_order`` (the E6-T1
+    ``adapter.submit_calls == 0`` / AC-017 invariant is unchanged); its ``OrderAckEvent`` honestly
+    records ``ack_status="dry_run_not_submitted"`` and a ``None`` venue_order_id instead of
+    fabricating a real acknowledgement. The status + reconciliation stages report honest
+    PROVISIONAL data in BOTH modes — real status polling / reconciliation wiring is E6-T3's job;
+    this only proves the stream SHAPE, not a resolved fill.
+
+    PROVISIONAL: price/size are the E6-T1 placeholders (real sizing is E6-T4); the presubmit
+    record's ``venue_order_key`` is a placeholder distinct from the private integrity digest — the
+    real EIP-712 V2 order-hash binding (``veridex.dust_execution.signing_compiler``) is wired by a
+    later task.
     """
-    assert quote.ask is not None  # gate guaranteed both sides present
+    assert quote.bid is not None and quote.ask is not None  # noqa: S101 - gate guaranteed both sides
+
+    now_ms = now_s * 1000
     client_order_id = f"{manifest.strategy_id}:{quote.token_id}"
+    decision_id = client_order_id
+    source_ts = quote.quote_ts_s
+
+    intent = OrderSubmitIntent(
+        sequence_no=seqc.next(),
+        event_type="OrderSubmitIntent",
+        source_ts=source_ts,
+        recv_ts=now_ms,
+        token_id=quote.token_id,
+        side="BUY",
+        price=quote.ask.price,
+        size=1.0,  # provisional placeholder — real size binding is E6-T4 (resolve_dust_size)
+        tif="FOK",
+        client_order_id=client_order_id,
+        decision_id=decision_id,
+        decision_ts=now_ms,
+    )
+
     payload = SigningPayload(
         token_id=quote.token_id,
         side="BUY",
         native_price=quote.ask.price,
-        size=1.0,  # provisional placeholder — real size binding is E6-T4 (resolve_dust_size)
+        size=1.0,  # provisional placeholder — real size binding is E6-T4
         tif="FOK",
         tick_size="0.01",
         client_order_id=client_order_id,
     )
-    await signer.sign_order(payload)
-    order = Order(
-        market_ref=manifest.market,
-        side="BUY",
-        size=1.0,  # provisional placeholder — real size binding is E6-T4
-        price=1.0 / quote.ask.price,  # provisional native→decimal — real pricing is E6-T4
-        venue=envelope.venue_allowlist[0] if envelope.venue_allowlist else "dust",
-        client_order_id=client_order_id,
+    signed = await signer.sign_order(payload)
+    presubmit = PreSubmitRecord(
+        integrity_commitment_hash=signed.order_digest,
+        # PROVISIONAL: a placeholder join key distinct from the private integrity digest — the
+        # real EIP-712 V2 order hash (signing_compiler.eip712_digest) is wired by a later task.
+        venue_order_key=f"provisional-vok:{signed.order_digest}",
+        captured_id=None,
     )
-    ack = await adapter.submit_order(order)
-    return ack.venue_order_id
+    attempt = OrderSubmitAttempt(
+        sequence_no=seqc.next(),
+        event_type="OrderSubmitAttempt",
+        source_ts=source_ts,
+        recv_ts=now_ms,
+        decision_id=decision_id,
+        client_order_id=client_order_id,
+        request_payload_ref=f"scrubbed://dust-execution/{client_order_id}",
+        attempt_ts=now_ms,
+        presubmit_record=presubmit,
+    )
+
+    venue_order_id: str | None = None
+    submitted = False
+    if mode == "live_guarded":
+        # Mode B, every gate clear: sign then submit the ONE order the gates protect. Both sides
+        # are present here (missing-side would have abstained above), so this is safe.
+        order = Order(
+            market_ref=manifest.market,
+            side="BUY",
+            size=1.0,  # provisional placeholder — real size binding is E6-T4
+            price=1.0 / quote.ask.price,  # provisional native→decimal — real pricing is E6-T4
+            venue=envelope.venue_allowlist[0] if envelope.venue_allowlist else "dust",
+            client_order_id=client_order_id,
+        )
+        ack = await adapter.submit_order(order)
+        venue_order_id = ack.venue_order_id
+        submitted = True
+        ack_event: OrderAckEvent = OrderAckEvent(
+            sequence_no=seqc.next(),
+            event_type="OrderAckEvent",
+            source_ts=source_ts,
+            recv_ts=now_ms,
+            decision_id=decision_id,
+            client_order_id=client_order_id,
+            venue_order_id=venue_order_id,
+            ack_status="accepted" if ack.accepted else "not_accepted",
+        )
+    else:
+        # Mode A (dry_run): the SAME typed ack-stage event, honestly recording that NO wire was
+        # touched — AC-003 keeps the contract SHAPE identical while never reaching
+        # adapter.submit_order (AC-017 / the E6-T1 invariant).
+        ack_event = OrderAckEvent(
+            sequence_no=seqc.next(),
+            event_type="OrderAckEvent",
+            source_ts=source_ts,
+            recv_ts=now_ms,
+            decision_id=decision_id,
+            client_order_id=client_order_id,
+            venue_order_id=None,
+            ack_status="dry_run_not_submitted",
+        )
+
+    status_event = OrderStatusEvent(
+        sequence_no=seqc.next(),
+        event_type="OrderStatusEvent",
+        source_ts=source_ts,
+        recv_ts=now_ms,
+        decision_id=decision_id,
+        client_order_id=client_order_id,
+        venue_order_id=venue_order_id,
+        status="unresolved",  # PROVISIONAL — real status polling is wired by E6-T3 (reconcile)
+        filled_size=0.0,
+        fill_price=None,
+    )
+    reconciliation_event = RealFillReconciliation(
+        sequence_no=seqc.next(),
+        event_type="RealFillReconciliation",
+        source_ts=source_ts,
+        recv_ts=now_ms,
+        decision_id=decision_id,
+        venue_order_key=presubmit.venue_order_key,
+        reconciled_state="AMBIGUOUS",  # PROVISIONAL — real reconcile wiring is E6-T3
+        reconciled_fill_size=0.0,
+    )
+
+    decision = SubmitDecision(
+        token_id=quote.token_id,
+        submitted=submitted,
+        abstain_reason=None if submitted else "mode_a_no_orders",
+        venue_order_id=venue_order_id,
+    )
+    events: tuple[LifecycleEvent, ...] = (intent, attempt, ack_event, status_event, reconciliation_event)
+    return decision, events
 
 
 def _abstain(token_id: str, reason: AbstainReason) -> SubmitDecision:
@@ -356,6 +657,7 @@ __all__ = [
     "BookSide",
     "DustExecutionResult",
     "DustQuote",
+    "LifecycleEvent",
     "QuoteSource",
     "StaleVenueBook",
     "SubmitDecision",
