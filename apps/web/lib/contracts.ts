@@ -95,6 +95,70 @@ export interface LeaderboardRow {
   low_sample: boolean;
 }
 
+// ---- MAKER LANE view-model (maker_arena_result.v1) ----
+// SEC-005: a SEPARATE, Maker-prefixed view-model — distinct from LeaderboardRow. The maker lane
+// ranks on `avg_toxicity_loss_bps` (asc — lower is better), NOT any directional CLV. `maker_rank`
+// (NOT `rank`) is the placement; `real_executable_edge_bps` is ALWAYS null (no fill/PnL claim).
+export interface MakerLeaderboardRow {
+  agent_id: string;
+  maker_rank: number;            // NOT `rank` — maker-lane placement
+  avg_toxicity_loss_bps: number; // THE rank axis (lower is better)
+  avg_markout_bps: number;       // diagnostic, NOT a rank input
+  quote_count: number;
+  scored: number;
+  abstained: number;
+  real_executable_edge_bps: null; // always null (no fill/PnL claim)
+}
+
+export interface MakerFalsification {
+  verdict: string;
+  headline: string;
+  delta_bps: number;
+  ci_low_bps: number;
+  ci_high_bps: number;
+}
+
+export interface MakerWindowClvAnalog {
+  window_markout_bps: number;
+  window_action_count: number;
+  note: string;
+}
+
+export interface MakerProofCard {
+  rung: string;
+  uncalibrated: boolean;
+  headline: string;
+  n_fixtures: number;
+  small_n_note: string;
+  trades_not_fills_caveat: string | null;
+  window_clv_analog: MakerWindowClvAnalog;
+  falsification: MakerFalsification;
+}
+
+// The assembled MAKER snapshot the (future) maker screen would render — Maker-prefixed, never routed
+// through the taker/CLV LeaderboardRow adapter.
+export interface MakerArenaResultView {
+  schema_version: string;
+  lane: string;
+  source_mode: SourceMode;
+  rank_axis: string;             // "avg_toxicity_loss_bps"
+  rank_axis_direction: string;   // "asc"
+  rung: string;
+  fixture_universe_n: number;
+  small_n_flag: boolean;
+  real_executable_edge_bps: null; // top-level: always null
+  leaderboard: MakerLeaderboardRow[];
+  falsification: MakerFalsification;
+  window_clv_analog: MakerWindowClvAnalog;
+  proof_card: MakerProofCard;
+  // The rank-axis honesty labels, carried verbatim (never a scored value).
+  diagnostics: {
+    avg_markout_bps_label: string;
+    avg_toxicity_loss_bps_label: string;
+    real_executable_edge_bps_label: string;
+  };
+}
+
 // NON-SCORING off-chain venue artifact (SEC-004).
 export type ReceiptStatus =
   | 'proposed' | 'law_approved' | 'policy_approved' | 'submitted' | 'filled'

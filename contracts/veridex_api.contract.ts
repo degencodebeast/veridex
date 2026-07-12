@@ -81,3 +81,48 @@ export interface RuntimeEvent {
   ts: number; channel: "OPS"; payload: Record<string, unknown>;
 }
 export interface RuntimeEventsResponse { events: RuntimeEvent[]; }  // object wrapper; bind to .events
+
+// ---- MAKER LANE (maker_arena_result.v1) ----
+// SEPARATE Maker*-prefixed family (SEC-005): MUST NOT reuse LeaderboardRow/ProofArtifact. The maker
+// lane ranks on avg_toxicity_loss_bps (asc — lower is better), NOT any directional CLV.
+// real_executable_edge_bps is ALWAYS null (no fill/PnL claim).
+export interface MakerFalsificationWire {
+  delta_bps: number; ci_low_bps: number; ci_high_bps: number; verdict: string; headline: string;
+}
+export interface MakerWindowClvAnalogWire {
+  window_markout_bps: number; window_action_count: number; note: string;
+}
+export interface MakerLeaderboardRowWire {   // `maker_rank` (NOT `rank`); edge always null
+  agent_id: string; avg_markout_bps: number; avg_toxicity_loss_bps: number;
+  quote_count: number; scored: number; abstained: number;
+  excluded: Record<string, unknown>; real_executable_edge_bps: null; maker_rank: number;
+}
+export interface MakerPerAgentWire {         // same fields, NO maker_rank
+  agent_id: string; avg_markout_bps: number; avg_toxicity_loss_bps: number;
+  quote_count: number; scored: number; abstained: number;
+  excluded: Record<string, unknown>; real_executable_edge_bps: null;
+}
+export interface MakerArenaResultWire {
+  protocol_id: string; config_hash: string; rung: string; fixtures: number[];
+  per_agent: MakerPerAgentWire[]; maker_leaderboard: MakerLeaderboardRowWire[];
+  falsification: MakerFalsificationWire;
+  trade_aware_diagnostic: Record<string, unknown> | null;
+  markout_adverse_decomposition: Record<string, unknown> | null;
+  event_gate_timeline: Record<string, unknown> | null;
+  window_clv_analog: MakerWindowClvAnalogWire;
+  real_executable_edge_bps: null; fixture_universe_n: number; small_n_flag: boolean;
+  excluded_by_reason: Record<string, unknown>; r2_bracket: Record<string, unknown> | null;
+}
+export interface MakerProofCardWire {
+  rung: string; uncalibrated: boolean; headline: string;
+  window_clv_analog: MakerWindowClvAnalogWire; falsification: MakerFalsificationWire;
+  n_fixtures: number; small_n_note: string; trades_not_fills_caveat: string | null;
+}
+export interface MakerDiagnosticsWire {
+  avg_markout_bps_label: string; avg_toxicity_loss_bps_label: string; real_executable_edge_bps_label: string;
+}
+export interface MakerArenaResultResponseWire {   // GET /maker/arena-result
+  schema_version: string; lane: string; source_mode: string;
+  rank_axis: string; rank_axis_direction: string;
+  result: MakerArenaResultWire; proof_card: MakerProofCardWire; diagnostics: MakerDiagnosticsWire;
+}

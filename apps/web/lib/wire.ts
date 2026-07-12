@@ -138,3 +138,100 @@ export interface RuntimeEvent {
 export interface RuntimeEventsResponse {
   events: RuntimeEvent[];
 }
+
+// ---- MAKER LANE (maker_arena_result.v1) ----
+// The sealed MAKER envelope (GET /maker/arena-result). SEC-005 at the boundary: these are a
+// SEPARATE, `Maker*`-prefixed type family — they MUST NOT reuse LeaderboardRow/LeaderboardResponse/
+// ProofArtifact. The maker lane ranks on `avg_toxicity_loss_bps` (lower is better, `asc`), NOT on
+// any directional CLV. `real_executable_edge_bps` is ALWAYS `null` (no fill/PnL claim — honesty).
+
+export interface MakerFalsificationWire {
+  delta_bps: number;
+  ci_low_bps: number;
+  ci_high_bps: number;
+  verdict: string;
+  headline: string;
+}
+
+export interface MakerWindowClvAnalogWire {
+  window_markout_bps: number;
+  window_action_count: number;
+  note: string;
+}
+
+// One agent's quote-quality row. `maker_rank` (NOT `rank`) is the maker-lane placement.
+// `real_executable_edge_bps` is typed `null` — never a number (no fill/PnL claim, SEC-005).
+export interface MakerLeaderboardRowWire {
+  agent_id: string;
+  avg_markout_bps: number;       // diagnostic, NOT the rank axis
+  avg_toxicity_loss_bps: number; // THE rank axis (asc — lower is better)
+  quote_count: number;
+  scored: number;
+  abstained: number;
+  excluded: Record<string, unknown>;
+  real_executable_edge_bps: null;
+  maker_rank: number;
+}
+
+// Per-agent aggregate row (same quote-quality fields, but NO `maker_rank` — ranking is applied
+// only in `maker_leaderboard`).
+export interface MakerPerAgentWire {
+  agent_id: string;
+  avg_markout_bps: number;
+  avg_toxicity_loss_bps: number;
+  quote_count: number;
+  scored: number;
+  abstained: number;
+  excluded: Record<string, unknown>;
+  real_executable_edge_bps: null;
+}
+
+export interface MakerArenaResultWire {
+  protocol_id: string;
+  config_hash: string;
+  rung: string; // e.g. "MM-R1"
+  fixtures: number[];
+  per_agent: MakerPerAgentWire[];
+  maker_leaderboard: MakerLeaderboardRowWire[];
+  falsification: MakerFalsificationWire;
+  trade_aware_diagnostic: Record<string, unknown> | null;
+  markout_adverse_decomposition: Record<string, unknown> | null;
+  event_gate_timeline: Record<string, unknown> | null;
+  window_clv_analog: MakerWindowClvAnalogWire;
+  real_executable_edge_bps: null; // top-level: always null (no fill/PnL claim)
+  fixture_universe_n: number;
+  small_n_flag: boolean;
+  excluded_by_reason: Record<string, unknown>;
+  r2_bracket: Record<string, unknown> | null;
+}
+
+export interface MakerProofCardWire {
+  rung: string;
+  uncalibrated: boolean;
+  headline: string;
+  window_clv_analog: MakerWindowClvAnalogWire;
+  falsification: MakerFalsificationWire;
+  n_fixtures: number;
+  small_n_note: string;
+  trades_not_fills_caveat: string | null;
+  trade_aware_diagnostic_note: string | null;
+  r2_overlay_label: string | null;
+}
+
+export interface MakerDiagnosticsWire {
+  avg_markout_bps_label: string;       // "diagnostic_not_rank_axis"
+  avg_toxicity_loss_bps_label: string; // "rank_axis_lower_is_better"
+  real_executable_edge_bps_label: string; // "always_null_no_fill_or_pnl_claim"
+}
+
+// GET /maker/arena-result — the frozen `maker_arena_result.v1` envelope.
+export interface MakerArenaResultResponseWire {
+  schema_version: string; // "maker_arena_result.v1"
+  lane: string;           // "maker"
+  source_mode: string;    // "replay"
+  rank_axis: string;      // "avg_toxicity_loss_bps"
+  rank_axis_direction: string; // "asc"
+  result: MakerArenaResultWire;
+  proof_card: MakerProofCardWire;
+  diagnostics: MakerDiagnosticsWire;
+}

@@ -1,0 +1,209 @@
+# cp1 convergence probe -- does the TxLINE FV lead the venue mid?
+
+OFFLINE probe (committed ReplayPack + pinned venue frames; no network). Reach is read from the basis-adjusted RESIDUAL only via the audited `build_convergence_reach`. The lead signal is the ASYMMETRY = (FV->venue reach) - (venue->FV reach): a POSITIVE value beyond 0.05 on a well-resolved venue == FV leads; ~0 == co-movement. Per-market, never pooled; forward horizon, no look-ahead; no settled value used as FV.
+
+---
+
+> ## ⟳ CORRECTED (2026-07-08) — THE "INCONCLUSIVE" VERDICT BELOW IS WRONG (3 independent reviews agree)
+> The frozen-reference `build_convergence_reach` construction is **vacuous** for lead-lag: `decompose_gap` median-demeans, so a frozen anchor cancels exactly (identical `0.41667` for every frozen ∈ {0.10…0.90}). It never compared FV to venue. An event-aligned **signed-response** test on the SAME tape shows **FV DOES lead the venue — real, non-circular, modest, latency-driven** (fable found it, opus + Codex independently reproduced it):
+> - **Honest headline (Codex-reconciled): hit ~0.63, pooled z≈+6.9 (fixture-level z≈+3.8), 16/18 fixtures.** This is the **NEXT-change** event definition (predict the *next* qualifying venue move from the prior residual sign). The **0.78 / z≈+15** figure is the **SAME-change** definition (scoring the residual against the very move being "predicted") — near-circular, NOT for sizing. State which event timing is the claim. Placebo (post-move residual) correctly anti-predictive (~0.28).
+> - **Non-circular:** FV = external de-margined sportsbook consensus (`TXLineStablePriceDemargined`, BookmakerId 10021), NOT Polymarket — repo-verified end-to-end by two reviewers (venue = disjoint `polymarket`/`clob-prices-history` frames). Residual: TxLINE proprietary upstream is unprovable from repo → **ask the feed provider** whether its consensus ingests any prediction-market prices.
+> - **Latency, not model alpha:** lead survives the venue's own-autocorrelation null; mechanism = data-freshness edge on a **BACKFILLED** 60s-fidelity series, venue-change spacing ~**20–40 min** (aggregation-dependent: 40.2min tape-mid / 29.9min raw-frame / 20.1min per-market-median; NOT uniquely 49min).
+> - **BLOCKER before sizing:** confirm the LIVE venue is as stale as this backfill implies — the multi-minute lag may be a `clob-prices-history` fidelity artifact that shrinks/erases the edge on real quotes. Size on **next-change 0.63 / fixture-z≈+3.8**, never same-change 0.78 / z+15.
+> - **⚠ NOT YET SEALED (Codex):** the corrected signed-response test lives in ephemeral scratch scripts; the committed `convergence_probe.py` still reruns to INCONCLUSIVE. Commit the signed-response probe (with its exact next-change event definition) before treating this as reproducible/sealed or bringing it to quants as a "result to attack."
+
+## VERDICT: INCONCLUSIVE  *(← SUPERSEDED — see correction above)*
+
+> The venue mid is too coarsely sampled to answer the lead question. Within any hour-scale window the venue makes only a handful of distinct moves (median `venue_moves` below), while the TxLINE FV moves continuously. Freezing FV and watching the near-flat venue forces the FV->venue reach toward 0, which reads as a spurious 'venue leads' -- a SAMPLING-CADENCE ARTIFACT, not price leadership. We therefore refuse a directional verdict: **no FV lead is established, and the apparent venue-leads asymmetry is an artifact, not a finding.**
+
+## Aggregate across markets (per horizon)
+
+| horizon_s | n_markets | med FV->venue | med venue->FV | med asym | mean asym | med venue_moves | #FV-leads | #venue-leads | #co-move | #inconclusive | verdict |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| 600 | 54 | 0.000 | 0.494 | -0.480 | -0.439 | 2.000 | 0 | 0 | 0 | 54 | INCONCLUSIVE |
+| 1800 | 54 | 0.314 | 0.486 | -0.167 | -0.174 | 3.000 | 0 | 0 | 1 | 53 | INCONCLUSIVE |
+| 3600 | 54 | 0.345 | 0.479 | -0.130 | -0.136 | 5.000 | 0 | 0 | 3 | 51 | INCONCLUSIVE |
+
+## Per-market reach -- horizon 600s
+
+| fixture_id | venue_market_ref | basis_bps | FV->venue | venue->FV | asymmetry | venue_moves | fv_moves | resolution_ok | n | n_windows |
+|---|---|---|---|---|---|---|---|---|---|---|
+| 18179763 | 1X2\|away\|full | 37 | 0.315 | 0.459 | -0.145 | 2.000 | 47.000 | False | 979 | 569 |
+| 18179551 | 1X2\|away\|full | 70 | 0.328 | 0.473 | -0.145 | 2.000 | 23.500 | False | 647 | 262 |
+| 18179763 | 1X2\|draw\|full | -32 | 0.303 | 0.454 | -0.151 | 2.000 | 52.000 | False | 980 | 617 |
+| 18179551 | 1X2\|draw\|full | -37 | 0.311 | 0.503 | -0.191 | 2.000 | 48.000 | False | 642 | 379 |
+| 17588234 | 1X2\|home\|full | -32 | 0.247 | 0.472 | -0.224 | 2.000 | 15.000 | False | 819 | 287 |
+| 17588234 | 1X2\|away\|full | -61 | 0.213 | 0.445 | -0.232 | 2.000 | 12.000 | False | 822 | 315 |
+| 18179551 | 1X2\|home\|full | -33 | 0.229 | 0.524 | -0.295 | 2.000 | 32.500 | False | 642 | 384 |
+| 17588325 | 1X2\|draw\|full | 40 | 0.107 | 0.462 | -0.355 | 2.000 | 41.500 | False | 543 | 140 |
+| 18175918 | 1X2\|away\|full | 23 | 0.117 | 0.486 | -0.369 | 2.000 | 38.000 | False | 801 | 403 |
+| 18179763 | 1X2\|home\|full | -35 | 0.128 | 0.498 | -0.370 | 2.000 | 46.000 | False | 979 | 603 |
+| 17588234 | 1X2\|draw\|full | 51 | 0.098 | 0.495 | -0.396 | 2.000 | 21.000 | False | 822 | 214 |
+| 17588325 | 1X2\|away\|full | -44 | 0.076 | 0.488 | -0.412 | 2.000 | 19.000 | False | 539 | 119 |
+| 18179550 | 1X2\|draw\|full | 4 | 0.048 | 0.475 | -0.427 | 2.000 | 45.000 | False | 957 | 499 |
+| 17588325 | 1X2\|home\|full | -5 | 0.070 | 0.497 | -0.428 | 2.000 | 21.000 | False | 538 | 201 |
+| 18179759 | 1X2\|away\|full | 28 | 0.045 | 0.484 | -0.439 | 2.000 | 25.000 | False | 644 | 288 |
+| 18179550 | 1X2\|home\|full | -29 | 0.063 | 0.512 | -0.449 | 2.000 | 42.000 | False | 957 | 552 |
+| 17588245 | 1X2\|away\|full | 24 | 0.042 | 0.497 | -0.455 | 2.000 | 42.000 | False | 1178 | 577 |
+| 17588404 | 1X2\|home\|full | 44 | 0.025 | 0.488 | -0.463 | 2.000 | 40.000 | False | 1060 | 354 |
+| 18175981 | 1X2\|away\|full | 120 | 0.027 | 0.494 | -0.466 | 2.000 | 24.000 | False | 701 | 291 |
+| 18176123 | 1X2\|draw\|full | -52 | 0.000 | 0.466 | -0.466 | 2.000 | 49.000 | False | 848 | 368 |
+| 17588391 | 1X2\|home\|full | -77 | 0.000 | 0.467 | -0.467 | 2.000 | 54.000 | False | 1121 | 463 |
+| 18179759 | 1X2\|home\|full | -9 | 0.000 | 0.467 | -0.467 | 2.000 | 26.000 | False | 639 | 298 |
+| 18179759 | 1X2\|draw\|full | -51 | 0.006 | 0.477 | -0.471 | 2.000 | 36.000 | False | 639 | 328 |
+| 18175918 | 1X2\|home\|full | -89 | 0.000 | 0.474 | -0.474 | 2.000 | 45.500 | False | 808 | 378 |
+| 18175981 | 1X2\|draw\|full | -7 | 0.000 | 0.476 | -0.476 | 2.000 | 49.000 | False | 702 | 249 |
+| 17588245 | 1X2\|home\|full | -47 | 0.000 | 0.477 | -0.477 | 2.000 | 43.000 | False | 1178 | 588 |
+| 17588229 | 1X2\|away\|full | -8 | 0.000 | 0.479 | -0.479 | 2.000 | 47.000 | False | 1051 | 505 |
+| 18167317 | 1X2\|home\|full | 33 | 0.000 | 0.480 | -0.480 | 2.000 | 54.000 | False | 1066 | 511 |
+| 18175918 | 1X2\|draw\|full | 38 | 0.000 | 0.482 | -0.482 | 2.000 | 63.000 | False | 797 | 351 |
+| 17588245 | 1X2\|draw\|full | -20 | 0.000 | 0.484 | -0.484 | 2.000 | 53.000 | False | 1179 | 549 |
+| 18179550 | 1X2\|away\|full | 38 | 0.000 | 0.486 | -0.486 | 2.000 | 40.000 | False | 957 | 471 |
+| 17588229 | 1X2\|home\|full | -46 | 0.000 | 0.487 | -0.487 | 2.000 | 44.000 | False | 1048 | 529 |
+| 17588404 | 1X2\|away\|full | -43 | 0.000 | 0.489 | -0.489 | 2.000 | 35.000 | False | 1059 | 478 |
+| 17588229 | 1X2\|draw\|full | 13 | 0.000 | 0.491 | -0.491 | 2.000 | 42.000 | False | 1051 | 527 |
+| 17588404 | 1X2\|draw\|full | -16 | 0.000 | 0.495 | -0.495 | 2.000 | 51.000 | False | 1059 | 538 |
+| 18167317 | 1X2\|away\|full | -60 | 0.000 | 0.496 | -0.496 | 2.000 | 56.000 | False | 1064 | 522 |
+| 18175983 | 1X2\|away\|full | 76 | 0.000 | 0.498 | -0.498 | 2.000 | 47.000 | False | 1177 | 503 |
+| 18172469 | 1X2\|draw\|full | 20 | 0.000 | 0.500 | -0.500 | 2.000 | 68.000 | False | 1331 | 690 |
+| 17588391 | 1X2\|draw\|full | 116 | 0.000 | 0.500 | -0.500 | 2.000 | 55.000 | False | 1121 | 496 |
+| 18172469 | 1X2\|home\|full | -88 | 0.000 | 0.501 | -0.501 | 2.000 | 71.000 | False | 1342 | 698 |
+| 17926593 | 1X2\|home\|full | 8 | 0.000 | 0.503 | -0.503 | 2.000 | 57.500 | False | 1395 | 614 |
+| 18176123 | 1X2\|away\|full | -1 | 0.000 | 0.503 | -0.503 | 2.000 | 49.000 | False | 850 | 448 |
+| 18167317 | 1X2\|draw\|full | -15 | 0.000 | 0.504 | -0.504 | 2.000 | 59.000 | False | 1065 | 598 |
+| 18172280 | 1X2\|draw\|full | -45 | 0.000 | 0.504 | -0.504 | 2.000 | 50.000 | False | 1101 | 472 |
+| 17588391 | 1X2\|away\|full | -82 | 0.000 | 0.506 | -0.506 | 2.000 | 47.000 | False | 1121 | 581 |
+| 18175983 | 1X2\|home\|full | -82 | 0.000 | 0.507 | -0.507 | 2.000 | 82.000 | False | 1179 | 596 |
+| 18176123 | 1X2\|home\|full | 9 | 0.000 | 0.507 | -0.507 | 2.000 | 47.000 | False | 848 | 420 |
+| 18175981 | 1X2\|home\|full | -86 | 0.000 | 0.510 | -0.510 | 2.000 | 32.000 | False | 701 | 293 |
+| 18175983 | 1X2\|draw\|full | 21 | 0.000 | 0.510 | -0.510 | 2.000 | 75.000 | False | 1182 | 583 |
+| 18172280 | 1X2\|home\|full | -10 | 0.000 | 0.510 | -0.510 | 2.000 | 46.000 | False | 1099 | 522 |
+| 17926593 | 1X2\|away\|full | -98 | 0.000 | 0.511 | -0.511 | 2.000 | 57.000 | False | 1391 | 572 |
+| 17926593 | 1X2\|draw\|full | 104 | 0.000 | 0.515 | -0.515 | 2.000 | 58.000 | False | 1395 | 565 |
+| 18172280 | 1X2\|away\|full | 36 | 0.000 | 0.515 | -0.515 | 2.000 | 50.000 | False | 1101 | 385 |
+| 18172469 | 1X2\|away\|full | 15 | 0.000 | 0.517 | -0.517 | 2.000 | 59.000 | False | 1334 | 519 |
+
+## Per-market reach -- horizon 1800s
+
+| fixture_id | venue_market_ref | basis_bps | FV->venue | venue->FV | asymmetry | venue_moves | fv_moves | resolution_ok | n | n_windows |
+|---|---|---|---|---|---|---|---|---|---|---|
+| 18179763 | 1X2\|away\|full | 37 | 0.518 | 0.450 | 0.068 | 3.000 | 117.000 | False | 979 | 767 |
+| 17926593 | 1X2\|home\|full | 8 | 0.433 | 0.473 | -0.040 | 3.000 | 149.000 | False | 1395 | 797 |
+| 17588234 | 1X2\|away\|full | -61 | 0.393 | 0.467 | -0.075 | 4.000 | 23.000 | False | 822 | 405 |
+| 18179763 | 1X2\|draw\|full | -32 | 0.364 | 0.451 | -0.086 | 4.000 | 131.000 | False | 980 | 733 |
+| 17588234 | 1X2\|home\|full | -32 | 0.405 | 0.502 | -0.096 | 3.000 | 27.000 | False | 819 | 409 |
+| 18172280 | 1X2\|home\|full | -10 | 0.364 | 0.462 | -0.098 | 3.000 | 125.000 | False | 1099 | 655 |
+| 18179759 | 1X2\|draw\|full | -51 | 0.388 | 0.489 | -0.101 | 4.000 | 67.000 | False | 639 | 421 |
+| 17588325 | 1X2\|home\|full | -5 | 0.374 | 0.486 | -0.112 | 3.000 | 21.000 | False | 538 | 262 |
+| 17588234 | 1X2\|draw\|full | 51 | 0.363 | 0.481 | -0.118 | 3.000 | 51.000 | False | 822 | 361 |
+| 18167317 | 1X2\|home\|full | 33 | 0.366 | 0.490 | -0.124 | 3.000 | 134.000 | False | 1066 | 708 |
+| 18179550 | 1X2\|draw\|full | 4 | 0.342 | 0.469 | -0.126 | 4.000 | 109.000 | False | 957 | 601 |
+| 17588229 | 1X2\|away\|full | -8 | 0.350 | 0.477 | -0.127 | 3.000 | 116.000 | False | 1051 | 590 |
+| 17588325 | 1X2\|draw\|full | 40 | 0.364 | 0.492 | -0.128 | 3.000 | 50.000 | False | 543 | 195 |
+| 18179759 | 1X2\|away\|full | 28 | 0.361 | 0.490 | -0.128 | 3.000 | 63.000 | False | 644 | 424 |
+| 18179550 | 1X2\|home\|full | -29 | 0.375 | 0.505 | -0.130 | 4.000 | 109.000 | False | 957 | 631 |
+| 18179551 | 1X2\|draw\|full | -37 | 0.339 | 0.469 | -0.130 | 3.000 | 75.000 | False | 642 | 455 |
+| 18176123 | 1X2\|away\|full | -1 | 0.336 | 0.467 | -0.131 | 4.000 | 114.000 | False | 850 | 525 |
+| 17588229 | 1X2\|draw\|full | 13 | 0.337 | 0.479 | -0.142 | 4.000 | 98.000 | False | 1051 | 596 |
+| 17588245 | 1X2\|home\|full | -47 | 0.315 | 0.460 | -0.145 | 3.000 | 97.000 | False | 1178 | 701 |
+| 18175983 | 1X2\|home\|full | -82 | 0.331 | 0.479 | -0.148 | 3.000 | 132.000 | False | 1179 | 703 |
+| 18175981 | 1X2\|draw\|full | -7 | 0.333 | 0.486 | -0.153 | 3.000 | 121.000 | False | 702 | 304 |
+| 18175918 | 1X2\|away\|full | 23 | 0.332 | 0.486 | -0.154 | 3.000 | 85.000 | False | 801 | 501 |
+| 18172469 | 1X2\|home\|full | -88 | 0.339 | 0.493 | -0.155 | 3.000 | 183.000 | False | 1342 | 795 |
+| 18167317 | 1X2\|draw\|full | -15 | 0.338 | 0.495 | -0.157 | 3.000 | 149.000 | False | 1065 | 689 |
+| 18175983 | 1X2\|draw\|full | 21 | 0.325 | 0.488 | -0.162 | 3.000 | 148.000 | False | 1182 | 699 |
+| 17588391 | 1X2\|draw\|full | 116 | 0.319 | 0.485 | -0.166 | 3.000 | 131.000 | False | 1121 | 627 |
+| 18179759 | 1X2\|home\|full | -9 | 0.312 | 0.478 | -0.166 | 3.000 | 53.000 | False | 639 | 418 |
+| 18179551 | 1X2\|home\|full | -33 | 0.314 | 0.483 | -0.169 | 3.000 | 53.500 | False | 642 | 480 |
+| 17588404 | 1X2\|draw\|full | -16 | 0.300 | 0.473 | -0.173 | 3.000 | 121.000 | False | 1059 | 637 |
+| 18172280 | 1X2\|draw\|full | -45 | 0.303 | 0.477 | -0.174 | 3.000 | 144.000 | False | 1101 | 593 |
+| 17588404 | 1X2\|away\|full | -43 | 0.283 | 0.458 | -0.175 | 3.000 | 80.000 | False | 1059 | 690 |
+| 17588229 | 1X2\|home\|full | -46 | 0.296 | 0.473 | -0.177 | 4.000 | 114.000 | False | 1048 | 598 |
+| 17588391 | 1X2\|home\|full | -77 | 0.288 | 0.481 | -0.193 | 3.000 | 124.000 | False | 1121 | 693 |
+| 18179551 | 1X2\|away\|full | 70 | 0.278 | 0.473 | -0.195 | 3.000 | 62.500 | False | 647 | 452 |
+| 18175918 | 1X2\|home\|full | -89 | 0.290 | 0.485 | -0.195 | 3.000 | 85.000 | False | 808 | 453 |
+| 17588325 | 1X2\|away\|full | -44 | 0.321 | 0.516 | -0.195 | 3.000 | 38.000 | False | 539 | 193 |
+| 18172469 | 1X2\|draw\|full | 20 | 0.303 | 0.499 | -0.197 | 4.000 | 177.000 | False | 1331 | 781 |
+| 17588391 | 1X2\|away\|full | -82 | 0.296 | 0.498 | -0.202 | 3.000 | 115.000 | False | 1121 | 697 |
+| 18179550 | 1X2\|away\|full | 38 | 0.282 | 0.489 | -0.207 | 4.000 | 97.000 | False | 957 | 614 |
+| 18179763 | 1X2\|home\|full | -35 | 0.279 | 0.491 | -0.212 | 4.000 | 123.000 | False | 979 | 733 |
+| 18167317 | 1X2\|away\|full | -60 | 0.278 | 0.491 | -0.213 | 3.000 | 128.000 | False | 1064 | 751 |
+| 18176123 | 1X2\|home\|full | 9 | 0.269 | 0.483 | -0.214 | 3.000 | 98.000 | False | 848 | 511 |
+| 17926593 | 1X2\|draw\|full | 104 | 0.279 | 0.496 | -0.217 | 3.000 | 144.500 | False | 1395 | 730 |
+| 18172280 | 1X2\|away\|full | 36 | 0.293 | 0.512 | -0.219 | 3.000 | 136.000 | False | 1101 | 546 |
+| 17926593 | 1X2\|away\|full | -98 | 0.284 | 0.504 | -0.220 | 3.000 | 144.000 | False | 1391 | 842 |
+| 17588245 | 1X2\|draw\|full | -20 | 0.216 | 0.451 | -0.236 | 3.000 | 126.500 | False | 1179 | 630 |
+| 18176123 | 1X2\|draw\|full | -52 | 0.195 | 0.463 | -0.268 | 3.000 | 115.000 | False | 848 | 502 |
+| 17588245 | 1X2\|away\|full | 24 | 0.241 | 0.514 | -0.273 | 4.000 | 96.000 | False | 1178 | 695 |
+| 18175981 | 1X2\|home\|full | -86 | 0.265 | 0.540 | -0.275 | 4.000 | 80.000 | False | 701 | 336 |
+| 18175981 | 1X2\|away\|full | 120 | 0.208 | 0.495 | -0.288 | 4.000 | 58.000 | False | 701 | 307 |
+| 18172469 | 1X2\|away\|full | 15 | 0.252 | 0.540 | -0.289 | 3.000 | 147.000 | False | 1334 | 736 |
+| 18175983 | 1X2\|away\|full | 76 | 0.188 | 0.497 | -0.309 | 3.000 | 97.000 | False | 1177 | 719 |
+| 18175918 | 1X2\|draw\|full | 38 | 0.166 | 0.484 | -0.318 | 3.000 | 115.000 | False | 797 | 460 |
+| 17588404 | 1X2\|home\|full | 44 | 0.143 | 0.491 | -0.349 | 2.000 | 104.000 | False | 1060 | 602 |
+
+## Per-market reach -- horizon 3600s
+
+| fixture_id | venue_market_ref | basis_bps | FV->venue | venue->FV | asymmetry | venue_moves | fv_moves | resolution_ok | n | n_windows |
+|---|---|---|---|---|---|---|---|---|---|---|
+| 18179763 | 1X2\|away\|full | 37 | 0.507 | 0.461 | 0.046 | 6.000 | 210.000 | False | 979 | 809 |
+| 18179550 | 1X2\|home\|full | -29 | 0.469 | 0.482 | -0.013 | 6.000 | 204.000 | False | 957 | 649 |
+| 17588245 | 1X2\|home\|full | -47 | 0.423 | 0.462 | -0.038 | 5.000 | 154.000 | False | 1178 | 738 |
+| 17588391 | 1X2\|home\|full | -77 | 0.417 | 0.473 | -0.056 | 4.000 | 219.000 | False | 1121 | 752 |
+| 17588234 | 1X2\|draw\|full | 51 | 0.409 | 0.475 | -0.066 | 5.000 | 88.500 | False | 822 | 394 |
+| 18175918 | 1X2\|home\|full | -89 | 0.417 | 0.487 | -0.070 | 4.000 | 124.000 | False | 808 | 497 |
+| 18179759 | 1X2\|away\|full | 28 | 0.410 | 0.481 | -0.072 | 6.000 | 99.500 | False | 644 | 446 |
+| 18179763 | 1X2\|draw\|full | -32 | 0.377 | 0.449 | -0.072 | 6.000 | 233.000 | False | 980 | 788 |
+| 17588229 | 1X2\|home\|full | -46 | 0.383 | 0.458 | -0.075 | 6.000 | 214.000 | False | 1048 | 625 |
+| 17588229 | 1X2\|draw\|full | 13 | 0.385 | 0.466 | -0.081 | 6.000 | 183.000 | False | 1051 | 615 |
+| 17926593 | 1X2\|away\|full | -98 | 0.437 | 0.527 | -0.090 | 5.000 | 264.000 | False | 1391 | 881 |
+| 17588325 | 1X2\|home\|full | -5 | 0.407 | 0.499 | -0.092 | 4.000 | 19.000 | False | 538 | 314 |
+| 17588234 | 1X2\|away\|full | -61 | 0.379 | 0.472 | -0.093 | 5.000 | 36.000 | False | 822 | 470 |
+| 18167317 | 1X2\|home\|full | 33 | 0.389 | 0.488 | -0.099 | 5.000 | 240.000 | False | 1066 | 739 |
+| 17926593 | 1X2\|home\|full | 8 | 0.384 | 0.484 | -0.100 | 5.000 | 259.000 | False | 1395 | 842 |
+| 18175983 | 1X2\|home\|full | -82 | 0.362 | 0.469 | -0.108 | 5.000 | 246.000 | False | 1179 | 753 |
+| 17588229 | 1X2\|away\|full | -8 | 0.357 | 0.471 | -0.114 | 6.000 | 217.000 | False | 1051 | 623 |
+| 17588325 | 1X2\|draw\|full | 40 | 0.365 | 0.480 | -0.115 | 4.000 | 51.000 | False | 543 | 203 |
+| 18179550 | 1X2\|draw\|full | 4 | 0.344 | 0.459 | -0.115 | 6.000 | 207.000 | False | 957 | 649 |
+| 18175983 | 1X2\|draw\|full | 21 | 0.364 | 0.481 | -0.117 | 4.000 | 265.500 | False | 1182 | 724 |
+| 18179550 | 1X2\|away\|full | 38 | 0.345 | 0.462 | -0.117 | 5.000 | 177.000 | False | 957 | 672 |
+| 17588391 | 1X2\|away\|full | -82 | 0.362 | 0.483 | -0.120 | 5.000 | 209.000 | False | 1121 | 741 |
+| 18172469 | 1X2\|draw\|full | 20 | 0.369 | 0.490 | -0.121 | 5.000 | 291.000 | False | 1331 | 815 |
+| 17588391 | 1X2\|draw\|full | 116 | 0.344 | 0.468 | -0.124 | 5.000 | 234.000 | False | 1121 | 654 |
+| 18179759 | 1X2\|draw\|full | -51 | 0.361 | 0.485 | -0.125 | 6.000 | 122.000 | False | 639 | 437 |
+| 18167317 | 1X2\|draw\|full | -15 | 0.353 | 0.482 | -0.129 | 6.000 | 246.000 | False | 1065 | 717 |
+| 18172280 | 1X2\|home\|full | -10 | 0.324 | 0.454 | -0.129 | 5.000 | 215.000 | False | 1099 | 711 |
+| 18175981 | 1X2\|draw\|full | -7 | 0.342 | 0.472 | -0.130 | 6.000 | 144.000 | False | 702 | 321 |
+| 17588325 | 1X2\|away\|full | -44 | 0.362 | 0.496 | -0.134 | 4.000 | 31.500 | False | 539 | 220 |
+| 18179763 | 1X2\|home\|full | -35 | 0.357 | 0.495 | -0.138 | 6.000 | 228.500 | False | 979 | 802 |
+| 17926593 | 1X2\|draw\|full | 104 | 0.348 | 0.487 | -0.139 | 5.000 | 257.000 | False | 1395 | 790 |
+| 18172469 | 1X2\|home\|full | -88 | 0.326 | 0.470 | -0.144 | 5.000 | 297.000 | False | 1342 | 862 |
+| 18179759 | 1X2\|home\|full | -9 | 0.326 | 0.471 | -0.144 | 5.000 | 89.000 | False | 639 | 445 |
+| 18167317 | 1X2\|away\|full | -60 | 0.332 | 0.482 | -0.150 | 4.000 | 210.000 | False | 1064 | 817 |
+| 18175918 | 1X2\|away\|full | 23 | 0.333 | 0.487 | -0.154 | 4.000 | 113.000 | False | 801 | 580 |
+| 18179551 | 1X2\|away\|full | 70 | 0.300 | 0.455 | -0.155 | 5.000 | 99.000 | False | 647 | 499 |
+| 18175918 | 1X2\|draw\|full | 38 | 0.319 | 0.478 | -0.158 | 4.000 | 164.000 | False | 797 | 463 |
+| 18176123 | 1X2\|home\|full | 9 | 0.320 | 0.486 | -0.166 | 5.000 | 138.000 | False | 848 | 525 |
+| 18176123 | 1X2\|draw\|full | -52 | 0.268 | 0.438 | -0.170 | 4.000 | 184.000 | False | 848 | 518 |
+| 17588234 | 1X2\|home\|full | -32 | 0.320 | 0.497 | -0.177 | 4.000 | 51.000 | False | 819 | 469 |
+| 18172280 | 1X2\|draw\|full | -45 | 0.268 | 0.450 | -0.182 | 6.000 | 231.000 | False | 1101 | 620 |
+| 17588404 | 1X2\|away\|full | -43 | 0.257 | 0.442 | -0.185 | 4.000 | 130.000 | False | 1059 | 762 |
+| 18179551 | 1X2\|home\|full | -33 | 0.295 | 0.485 | -0.190 | 5.000 | 93.000 | False | 642 | 509 |
+| 18172469 | 1X2\|away\|full | 15 | 0.304 | 0.497 | -0.194 | 4.000 | 265.500 | False | 1334 | 810 |
+| 18176123 | 1X2\|away\|full | -1 | 0.269 | 0.464 | -0.195 | 6.000 | 171.000 | False | 850 | 548 |
+| 18179551 | 1X2\|draw\|full | -37 | 0.267 | 0.464 | -0.197 | 5.000 | 99.500 | False | 642 | 492 |
+| 17588404 | 1X2\|draw\|full | -16 | 0.244 | 0.454 | -0.210 | 5.000 | 205.000 | False | 1059 | 693 |
+| 18175981 | 1X2\|away\|full | 120 | 0.299 | 0.510 | -0.210 | 6.000 | 94.500 | False | 701 | 328 |
+| 18172280 | 1X2\|away\|full | 36 | 0.275 | 0.492 | -0.217 | 4.000 | 224.000 | False | 1101 | 636 |
+| 17588245 | 1X2\|draw\|full | -20 | 0.233 | 0.451 | -0.218 | 5.000 | 204.000 | False | 1179 | 688 |
+| 17588245 | 1X2\|away\|full | 24 | 0.302 | 0.527 | -0.225 | 5.000 | 163.000 | False | 1178 | 747 |
+| 18175983 | 1X2\|away\|full | 76 | 0.246 | 0.485 | -0.240 | 4.000 | 172.000 | False | 1177 | 745 |
+| 18175981 | 1X2\|home\|full | -86 | 0.309 | 0.549 | -0.240 | 5.000 | 90.000 | False | 701 | 381 |
+| 17588404 | 1X2\|home\|full | 44 | 0.194 | 0.459 | -0.265 | 3.000 | 162.000 | False | 1060 | 695 |
+
+## Honest caveats
+
+- **`reach_from_residual` has no power on well-sampled series.** It counts step-to-step residual shrinkage and sits at ~0.5 for any noisy stationary gap; it only departs from 0.5 for a CLEAN decaying-amplitude convergence. A near-0.5 or near-zero-asymmetry reading is a TRUTHFUL 'no tradeable lead', not a detector failure.
+- **The venue-resolution trust gate is load-bearing.** A directional verdict is emitted only when the venue mover is adequately sampled (median venue_moves >= 8). The cp1 venue mid is a slow step function (~40-min median refresh), so FV->venue reach collapses toward 0 for lack of venue movement, not lack of convergence; that asymmetry is an artifact and is reported as INCONCLUSIVE.
+- `basis_bps` is the structural (median) offset, reported SEPARATELY and never counted as a lead signal.
+- cp1 venue frames are bursty (dense ~3s FV ticks vs ~40-min venue refresh). At 30/60/120s the venue does not move at all, so only 600/1800/3600s horizons are swept -- and even there the venue makes only a few distinct moves per window.

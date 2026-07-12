@@ -49,6 +49,7 @@ from veridex.api.demo_fixtures import (
     contrarian_agent,
 )
 from veridex.api.deploy import DeployDeps, cancel_deploy_tasks, register_deploy_routes
+from veridex.api.maker_router import register_maker_routes
 from veridex.api.schemas import (
     AgentRegisterResponse,
     ApprovalResponse,
@@ -1254,5 +1255,11 @@ def create_app(
         anchor_fn = anchor_memo if resolved_settings.solana_keypair_path is not None else None
         resolved_deploy_deps = DeployDeps(anchor_fn=anchor_fn)
     register_deploy_routes(app, store=resolved_store, deploy_deps=resolved_deploy_deps)
+
+    # --- GET /maker/arena-result (read-only maker-UI bridge; SEC-005 isolated lane) ----
+    # Separate namespace over the SEALED maker arena artifact — never re-runs the arena, never
+    # imports the directional scorer/leaderboard. Registered last so it composes like the deploy
+    # and arena route groups above.
+    register_maker_routes(app)
 
     return app

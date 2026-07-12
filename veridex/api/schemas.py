@@ -378,3 +378,38 @@ class BacktestRunResponse(BaseModel):
     backtest_id: str
     mode_label: str
     run_id: str
+
+
+# ---------------------------------------------------------------------------
+# Maker arena lane — read-only sealed-result envelope (separate lane, SEC-005)
+# ---------------------------------------------------------------------------
+
+
+class MakerArenaResultResponse(BaseModel):
+    """Response envelope for ``GET /maker/arena-result`` (read-only maker-UI bridge).
+
+    Serves the SEALED :class:`~veridex.maker.result.MakerArenaResult` artifact over HTTP for the
+    frontend. This is a SEPARATE lane from the directional leaderboard (SEC-005): the maker rank
+    axis is ``avg_toxicity_loss_bps`` (ascending — lower quote toxicity is better), which is NOT a
+    CLV/PnL/edge/return metric and is never relabelled as one. ``real_executable_edge_bps`` is
+    pinned ``None`` throughout — the maker lane makes no fill or PnL claim.
+
+    Attributes:
+        schema_version: Frozen envelope version tag (``"maker_arena_result.v1"``).
+        lane: Always ``"maker"`` — distinguishes this from the directional lane.
+        source_mode: Always ``"replay"`` — the sealed artifact is a replay over the cp1 tape.
+        rank_axis: The maker ranking metric name (``"avg_toxicity_loss_bps"``).
+        rank_axis_direction: ``"asc"`` — lower toxicity loss ranks better.
+        result: The sealed ``MakerArenaResult`` JSON (fields preserved unchanged).
+        proof_card: ``render_proof_card(result)`` JSON — the honest one-glance summary.
+        diagnostics: Axis-honesty labels distinguishing the rank axis from diagnostics.
+    """
+
+    schema_version: str = "maker_arena_result.v1"
+    lane: str = "maker"
+    source_mode: str = "replay"
+    rank_axis: str = "avg_toxicity_loss_bps"
+    rank_axis_direction: str = "asc"
+    result: dict[str, Any]
+    proof_card: dict[str, Any]
+    diagnostics: dict[str, Any]
