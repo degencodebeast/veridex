@@ -2079,6 +2079,66 @@ async def test_non_crossing_admits_a_make_quote_sell_that_does_not_cross() -> No
     assert decision.submitted is True and decision.abstain_reason is None
 
 
+async def test_non_crossing_gates_the_real_take_buy_not_phantom() -> None:
+    """A ``take`` BUY that self-crosses an OWN resting SELL is REFUSED — no order on the taker wire.
+
+    Own resting ``SELL YES @ 0.50`` and an admitted ``take BUY`` (lifts the ask at 0.51): the REAL
+    taker BUY @ 0.51 crosses the own SELL @ 0.50 (0.51 >= 0.50). CONTROLLER-added coverage for the
+    TAKER branch (the C-2 fold's own suite tested only the maker branch): BOTH order-placing branches
+    must feed the exact typed order into the E5 gate, never a phantom ``BUY @ quote.ask``.
+    """
+    binding = _binding()
+    manifest = _mode_b_manifest(binding)
+    env = _env()
+    adapter = _MakerRecordingAdapter(fill=True)
+    own = (OwnOrderLeg(token_id=_TOKEN, side="SELL", price=0.50, kind=LegKind.OPEN),)
+    params = MMIntentParams(token_id=_TOKEN, side="BUY", tif="FOK", client_order_id="coid-tk")
+    request = _intent_request("take", manifest=manifest, envelope=env, params=params)
+
+    result = await _run_guarded(
+        adapter=adapter,
+        manifest=manifest,
+        envelope=env,
+        arming=_arming(binding),
+        request=request,
+        own_legs=own,
+    )
+
+    assert adapter.submit_calls == 0, "a self-crossing take BUY must NOT reach the taker submit wire"
+    assert adapter.resting_calls == 0
+    (decision,) = result.decisions
+    assert decision.submitted is False
+    assert decision.abstain_reason == "self_cross"
+
+
+async def test_non_crossing_admits_a_take_buy_that_does_not_cross() -> None:
+    """POSITIVE CONTROL: a ``take`` BUY that does NOT cross the own SELL still submits once.
+
+    Own resting ``SELL YES @ 0.55`` and an admitted ``take BUY`` @ 0.51 (the ask): 0.51 < 0.55 → no
+    self-cross → the real taker order submits exactly once. Makes the taker refusal meaningful.
+    """
+    binding = _binding()
+    manifest = _mode_b_manifest(binding)
+    env = _env()
+    adapter = _MakerRecordingAdapter(fill=True)
+    own = (OwnOrderLeg(token_id=_TOKEN, side="SELL", price=0.55, kind=LegKind.OPEN),)
+    params = MMIntentParams(token_id=_TOKEN, side="BUY", tif="FOK", client_order_id="coid-tk2")
+    request = _intent_request("take", manifest=manifest, envelope=env, params=params)
+
+    result = await _run_guarded(
+        adapter=adapter,
+        manifest=manifest,
+        envelope=env,
+        arming=_arming(binding),
+        request=request,
+        own_legs=own,
+    )
+
+    assert adapter.submit_calls == 1, "a non-crossing take BUY must submit exactly one taker order"
+    (decision,) = result.decisions
+    assert decision.submitted is True and decision.abstain_reason is None
+
+
 # =====================================================================================
 # Gate#3 C-4 (CRITICAL): a SINGULAR order-placing intent targets EXACTLY its admitted
 # ``intent_params.token_id`` — it must NOT fan out across the whole manifest universe.
