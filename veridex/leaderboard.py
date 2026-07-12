@@ -33,6 +33,7 @@ from __future__ import annotations
 from typing import Any
 
 from veridex.clv_confidence import clv_confidence
+from veridex.rank_guards import assert_no_r3r4_in_rank  # neutral SEC-006 guard — imports no lane
 
 # ---------------------------------------------------------------------------
 # Internal helpers
@@ -217,6 +218,7 @@ def _rank_key(row: dict[str, Any]) -> tuple[Any, ...]:
         A tuple suitable for ``list.sort`` (ascending) so that the best agent
         sorts first.
     """
+    assert_no_r3r4_in_rank(row)  # SEC-006: no R3/R4 execution field may enter the rank key
     avg = row["avg_clv_bps"]
     brier = row["brier"]
     return (

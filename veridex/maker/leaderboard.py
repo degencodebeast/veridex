@@ -10,6 +10,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from veridex.rank_guards import assert_no_r3r4_in_rank  # neutral SEC-006 guard — imports no lane
+
 __all__ = [
     "assert_bracket_not_ranked",
     "maker_rank_key",
@@ -98,6 +100,7 @@ def maker_rank_key(metrics: dict[str, Any]) -> tuple[Any, ...]:
     Returns:
         A tuple suitable for ``list.sort``/``sorted`` (ascending, best maker first).
     """
+    assert_no_r3r4_in_rank(metrics)  # SEC-006: guard the KEY itself — closes the direct-sort bypass
     loss = metrics.get("avg_toxicity_loss_bps")
     loss_key = (1, 0.0) if loss is None else (0, loss)  # None last; lower loss first
     return (
@@ -141,6 +144,8 @@ def rank_makers(agent_metrics: list[dict[str, Any]]) -> list[dict[str, Any]]:
         Copies of the input rows sorted by the maker key, each with ``maker_rank`` (1..N) added.
         Inputs are not mutated.
     """
+    for row in agent_metrics:  # SEC-006: no R3/R4 execution field may enter the maker rank input
+        assert_no_r3r4_in_rank(row)
     assert_bracket_not_ranked(agent_metrics)
     ranked = sorted((dict(row) for row in agent_metrics), key=maker_rank_key)
     for position, row in enumerate(ranked, start=1):

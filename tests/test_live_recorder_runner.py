@@ -1,0 +1,605 @@
+"""E6 — decision runner / live-recorder orchestration tests (MM-R3).
+
+The runner ASSEMBLES the already-built, already-trust-verified E1–E5 components: it
+streams FV (recording each arrival with its integer-ms ``recv_ts``), polls the venue
+book, aligns FV with the E2 two-dimensional no-look-ahead rule *using the decision's own
+recv_ts*, and records a DecisionEvent + matching intent + latency + risk-gate line per
+poll. It sends NO orders (records evidence only), writes an honest gap on a per-poll
+failure (the session continues), and seals ``meta.json`` + ``content_hash`` on shutdown.
+
+Every test drives the runner with offline fakes (canned ``MarketState`` FV, scripted
+``/book`` snapshots, a real on-disk ``LiveRecorder``) and an INJECTED clock/sleep +
+``max_polls`` — NO network, NO real time. Mirrors the offline-fake discipline of
+``tests/test_live_recorder_sources.py`` and ``tests/test_maker_live_monitor.py``.
+"""
+
+from __future__ import annotations
+
+import ast
+import asyncio
+import json
+from pathlib import Path
+from typing import Any
+
+from veridex.ingest.marketstate import MarketState
+from veridex.live_recorder.contracts import BookLevel, FillAssumptionConfig, LiveRecorderSessionMeta
+from veridex.live_recorder.sources import (
+    BookSnapshot,
+    FakeBookDepthSource,
+    FakeFvSource,
+)
+
+_FULL_KEY = "1X2_PARTICIPANT_RESULT||"
+
+
+def _fv_state(
+    fixture_id: int,
+    ts: int,
+    fv_by_side: dict[str, float],
+    *,
+    phase: int = 1,
+    suspended: bool = False,
+) -> MarketState:
+    """Build a ``MarketState`` carrying the 1X2 full-match market with the given per-side FV."""
+    return MarketState(
+        fixture_id=fixture_id,
+        tick_seq=0,
+        ts=ts,
+        phase=phase,
+        markets={
+            _FULL_KEY: {
+                "stable_prob_bps": {side: round(fv * 1e4) for side, fv in fv_by_side.items()},
+                "suspended": suspended,
+            }
+        },
+        scores={},
+    )
+
+
+def _snap(token_id: str, *, book_ts: int = 1, bid: float = 0.4, ask: float = 0.6, size: float = 8.0) -> BookSnapshot:
+    """A minimal two-sided full-depth book snapshot for the given token."""
+    return BookSnapshot(
+        token_id=token_id,
+        venue_market_ref="1X2|home|full",
+        book_ts=book_ts,
+        tick_size=0.01,
+        min_price_increment=0.01,
+        bids=(BookLevel(price=bid, size=size),),
+        asks=(BookLevel(price=ask, size=size),),
+        is_snapshot=True,
+    )
+
+
+def _counter_clock(start: int = 1_000) -> Any:
+    """A deterministic, strictly increasing integer-ms clock (one tick per call)."""
+    state = {"now": start}
+
+    def now() -> int:
+        state["now"] += 1
+        return state["now"]
+
+    return now
+
+
+async def _noop_sleep(_seconds: float) -> None:
+    return None
+
+
+def _start_meta(fixture_ids: tuple[int, ...] = (100,)) -> LiveRecorderSessionMeta:
+    return LiveRecorderSessionMeta(
+        session_ts=1_700_000_000,
+        endpoints={"venue": "wss://example.invalid"},
+        tool_version="test-e6",
+        config_hash="cfg-hash",
+        source_provenance={"venue": "poly"},
+        fixture_ids=fixture_ids,
+    )
+
+
+def _config() -> FillAssumptionConfig:
+    return FillAssumptionConfig(
+        taker_fee_bps=10.0,
+        fee_stress_multiplier=1.0,
+        spread_assumption=0.0,
+        slippage_assumption=0.0,
+    )
+
+
+# --------------------------------------------------------------------------- E6-T1
+def test_runner_sends_no_orders(tmp_path: Path) -> None:
+    """E6-T1: the runner records evidence and references NO order/write symbol anywhere.
+
+    (a) Source audit: ``runner.py`` contains no ``submit_order``/``cancel_order``/
+        ``place_order``/venue-write symbol and imports nothing from ``veridex.maker`` or
+        ``veridex.scoring``.
+    (b) A fully-injected offline run (fake FV, scripted book, real recorder, ``max_polls``)
+        completes and returns a ``SessionResult`` — the fakes expose NO order API, so a
+        completed run is proof the runner never attempted an order.
+    """
+    import veridex.live_recorder.runner as mod
+    from veridex.live_recorder.runner import (
+        Decision,
+        RecorderMarket,
+        SessionResult,
+        run_live_recorder,
+    )
+
+    # (a) source audit — forbidden order/write symbols and trust-path imports never appear.
+    source = Path(mod.__file__).read_text()
+    forbidden = ("submit_order", "cancel_order", "place_order", "create_order", "post_order")
+    for symbol in forbidden:
+        assert symbol not in source, f"runner references an order/write symbol: {symbol}"
+    tree = ast.parse(source)
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.module:
+            root = node.module.split(".")
+            assert root[:2] != ["veridex", "maker"], f"runner imports veridex.maker ({node.module})"
+            assert root[:2] != ["veridex", "scoring"], f"runner imports veridex.scoring ({node.module})"
+
+    # (b) fully-injected offline run — completes, returns a SessionResult, touches no order API.
+    from veridex.live_recorder.recorder import LiveRecorder
+
+    matched = [RecorderMarket(100, "part1", "1X2|home|full", "tok")]
+    fv = FakeFvSource([_fv_state(100, 1_700_000_000, {"part1": 0.6})])
+    book = FakeBookDepthSource({"tok": [_snap("tok"), _snap("tok"), _snap("tok")]})
+    recorder = LiveRecorder(tmp_path, _start_meta())
+
+    def decide(_aligned: Any, _snapshot: Any, _config: Any) -> Decision:
+        return Decision(intent_kind="no_quote", reason_code="skip", no_quote_reason="stale")
+
+    result = asyncio.run(
+        run_live_recorder(
+            matched=matched,
+            fv_source=fv,
+            book_source=book,
+            recorder=recorder,
+            decide_fn=decide,
+            config=_config(),
+            policy_hash="pol-hash",
+            now_fn=_counter_clock(),
+            sleep_fn=_noop_sleep,
+            poll_interval_ms=5_000,
+            minutes=30.0,
+            max_polls=2,
+        )
+    )
+    recorder.close()
+
+    assert isinstance(result, SessionResult)
+    assert result.polls == 2
+
+
+def test_take_with_unpinned_fee_config_raises(tmp_path: Path) -> None:
+    """FIX H1: a take whose ``decision.fee_config`` hash != the session config hash RAISES.
+
+    The session config is the pinned/attested one (its hash is stamped onto every
+    ``DecisionEvent.config_hash``). A ``decide_fn`` returning a ``take`` with a DIFFERENT
+    ``fee_config`` must never be silently measured under that unattested config: the runner
+    binds ``measure_take`` to the session config hash, so a mismatch raises (EXE-004/AC-010).
+    """
+    import pytest
+
+    from veridex.live_recorder.recorder import LiveRecorder
+    from veridex.live_recorder.runner import Decision, RecorderMarket, run_live_recorder
+
+    session_cfg = _config()  # taker_fee_bps=10.0
+    rogue_cfg = FillAssumptionConfig(
+        taker_fee_bps=99.0,  # different hash from the session config
+        fee_stress_multiplier=1.0,
+        spread_assumption=0.0,
+        slippage_assumption=0.0,
+    )
+    assert rogue_cfg.config_hash() != session_cfg.config_hash()
+
+    matched = [RecorderMarket(100, "part1", "1X2|home|full", "tok")]
+    fv = FakeFvSource([_fv_state(100, 1_700_000_000, {"part1": 0.6})])
+    book = FakeBookDepthSource({"tok": [_snap("tok", ask=0.6, size=8.0)]})
+    recorder = LiveRecorder(tmp_path / "s", _start_meta())
+
+    def decide_rogue_take(_aligned: Any, _snapshot: Any, _config: Any) -> Decision:
+        return Decision(
+            intent_kind="take",
+            reason_code="take_now",
+            side="bid",
+            native_price=0.6,
+            desired_size=5.0,
+            fee_config=rogue_cfg,
+        )
+
+    with pytest.raises(ValueError, match="fee_config hash does not match"):
+        asyncio.run(
+            run_live_recorder(
+                matched=matched,
+                fv_source=fv,
+                book_source=book,
+                recorder=recorder,
+                decide_fn=decide_rogue_take,
+                config=session_cfg,
+                policy_hash="pol-hash",
+                now_fn=_counter_clock(),
+                sleep_fn=_noop_sleep,
+                max_polls=1,
+            )
+        )
+    recorder.close()
+
+
+def test_meta_records_trades_deferred_and_no_trade_source_param(tmp_path: Path) -> None:
+    """FIX M5: ``trade_source`` is gone from the signature and meta records trades deferred.
+
+    ``trade_source`` was accepted but never used (a supplied source recorded nothing). It is
+    removed; the session meta honestly records ``trades_recorded: false`` (R3 does not record
+    trades — queue-jump uses book snapshots).
+    """
+    import inspect
+    import json as _json
+
+    from veridex.live_recorder.recorder import LiveRecorder
+    from veridex.live_recorder.runner import Decision, RecorderMarket, run_live_recorder
+
+    # (a) the dead parameter is gone from the public signature.
+    assert "trade_source" not in inspect.signature(run_live_recorder).parameters
+
+    # (b) a completed run seals trades_recorded=False in meta.
+    matched = [RecorderMarket(100, "part1", "1X2|home|full", "tok")]
+    fv = FakeFvSource([_fv_state(100, 1_700_000_000, {"part1": 0.6})])
+    book = FakeBookDepthSource({"tok": [_snap("tok")]})
+    session_dir = tmp_path / "s"
+    recorder = LiveRecorder(session_dir, _start_meta())
+
+    def decide(_aligned: Any, _snapshot: Any, _config: Any) -> Decision:
+        return Decision(intent_kind="no_quote", reason_code="skip", no_quote_reason="stale")
+
+    asyncio.run(
+        run_live_recorder(
+            matched=matched,
+            fv_source=fv,
+            book_source=book,
+            recorder=recorder,
+            decide_fn=decide,
+            config=_config(),
+            policy_hash="pol-hash",
+            now_fn=_counter_clock(),
+            sleep_fn=_noop_sleep,
+            max_polls=1,
+        )
+    )
+    recorder.close()
+
+    meta = _json.loads((session_dir / "meta.json").read_text())
+    assert meta["trades_recorded"] is False
+
+
+def test_meta_records_mapping_hash_and_poll_interval(tmp_path: Path) -> None:
+    """FIX M4/L1: the sealed meta.json records the fixture->token mapping_hash and poll interval.
+
+    ``mapping_hash`` (CON-003 fixture->token resolution provenance) and the poll interval were
+    never written. A completed run's ``meta.json`` must carry a non-null ``mapping_hash`` and
+    the ``poll_interval_ms`` it ran with.
+    """
+    import json as _json
+
+    from veridex.live_recorder.recorder import LiveRecorder
+    from veridex.live_recorder.runner import Decision, RecorderMarket, run_live_recorder
+
+    matched = [RecorderMarket(100, "part1", "1X2|home|full", "tok")]
+    fv = FakeFvSource([_fv_state(100, 1_700_000_000, {"part1": 0.6})])
+    book = FakeBookDepthSource({"tok": [_snap("tok")]})
+    session_dir = tmp_path / "s"
+    recorder = LiveRecorder(session_dir, _start_meta())
+
+    def decide(_aligned: Any, _snapshot: Any, _config: Any) -> Decision:
+        return Decision(intent_kind="no_quote", reason_code="skip", no_quote_reason="stale")
+
+    asyncio.run(
+        run_live_recorder(
+            matched=matched,
+            fv_source=fv,
+            book_source=book,
+            recorder=recorder,
+            decide_fn=decide,
+            config=_config(),
+            policy_hash="pol-hash",
+            now_fn=_counter_clock(),
+            sleep_fn=_noop_sleep,
+            poll_interval_ms=7_000,
+            max_polls=1,
+        )
+    )
+    recorder.close()
+
+    meta = _json.loads((session_dir / "meta.json").read_text())
+    assert meta["mapping_hash"] is not None
+    assert len(meta["mapping_hash"]) == 64  # sha256 hexdigest
+    assert meta["poll_interval_ms"] == 7_000
+
+
+def test_observe_only_session_seals_observe_only_not_liquidity_missing(tmp_path: Path) -> None:
+    """FIX M3: an abstain with no explicit reason seals ``observe_only``, never ``liquidity_missing``.
+
+    Against a DEEP two-sided book, a policy that abstains without naming a market condition
+    must not seal a FALSE ``liquidity_missing`` claim. The runner's neutral honest default is
+    ``observe_only`` (a policy-abstain reason), NOT a fabricated market condition.
+    """
+    from veridex.live_recorder.recorder import LiveRecorder
+    from veridex.live_recorder.runner import Decision, RecorderMarket, run_live_recorder
+
+    matched = [RecorderMarket(100, "part1", "1X2|home|full", "tok")]
+    fv = FakeFvSource([_fv_state(100, 1_700_000_000, {"part1": 0.6})])
+    # A DEEP two-sided book — there is genuinely liquidity present.
+    book = FakeBookDepthSource({"tok": [_snap("tok", bid=0.4, ask=0.6, size=50.0)]})
+    session_dir = tmp_path / "s"
+    recorder = LiveRecorder(session_dir, _start_meta())
+
+    def decide_observe_only(_aligned: Any, _snapshot: Any, _config: Any) -> Decision:
+        # Abstain WITHOUT naming a market condition (no_quote_reason left unset).
+        return Decision(intent_kind="no_quote", reason_code="observe_only")
+
+    asyncio.run(
+        run_live_recorder(
+            matched=matched,
+            fv_source=fv,
+            book_source=book,
+            recorder=recorder,
+            decide_fn=decide_observe_only,
+            config=_config(),
+            policy_hash="pol-hash",
+            now_fn=_counter_clock(),
+            sleep_fn=_noop_sleep,
+            max_polls=1,
+        )
+    )
+    recorder.close()
+
+    ev = _events_by_type(session_dir / "records.jsonl")
+    assert len(ev["NoQuoteIntentEvent"]) == 1
+    assert ev["NoQuoteIntentEvent"][0]["no_quote_reason"] == "observe_only"
+
+
+def test_runner_emits_heartbeats(tmp_path: Path) -> None:
+    """FIX M2: the runner emits a ``RecorderHeartbeatEvent`` once per poll (liveness).
+
+    The runbook claimed heartbeats make a crash-partial session verifiable, but none were
+    ever emitted. A fake offline run must now record >=1 ``RecorderHeartbeatEvent`` carrying
+    the poll's counters.
+    """
+    from veridex.live_recorder.recorder import LiveRecorder
+    from veridex.live_recorder.runner import Decision, RecorderMarket, run_live_recorder
+
+    matched = [RecorderMarket(100, "part1", "1X2|home|full", "tok")]
+    fv = FakeFvSource([_fv_state(100, 1_700_000_000, {"part1": 0.6})])
+    book = FakeBookDepthSource({"tok": [_snap("tok"), _snap("tok")]})
+    session_dir = tmp_path / "s"
+    recorder = LiveRecorder(session_dir, _start_meta())
+
+    def decide(_aligned: Any, _snapshot: Any, _config: Any) -> Decision:
+        return Decision(intent_kind="no_quote", reason_code="skip", no_quote_reason="stale")
+
+    asyncio.run(
+        run_live_recorder(
+            matched=matched,
+            fv_source=fv,
+            book_source=book,
+            recorder=recorder,
+            decide_fn=decide,
+            config=_config(),
+            policy_hash="pol-hash",
+            now_fn=_counter_clock(),
+            sleep_fn=_noop_sleep,
+            max_polls=2,
+        )
+    )
+    recorder.close()
+
+    ev = _events_by_type(session_dir / "records.jsonl")
+    heartbeats = ev.get("RecorderHeartbeatEvent", [])
+    assert len(heartbeats) == 2  # one per poll
+    hb = heartbeats[0]
+    assert hb["poll_index"] == 0
+    assert hb["venue_mids_seen"] == 1  # one book observed this poll
+    assert hb["fv_points_recv"] >= 1
+    assert hb["fv_aligned"] is True
+
+
+def _events_by_type(records_path: Path) -> dict[str, list[dict[str, Any]]]:
+    """Parse a ``records.jsonl`` into ``event_type -> [event dict, ...]``."""
+    out: dict[str, list[dict[str, Any]]] = {}
+    for line in records_path.read_text().splitlines():
+        ev = json.loads(line)
+        out.setdefault(ev["event_type"], []).append(ev)
+    return out
+
+
+# --------------------------------------------------------------------------- E6-T2
+def test_decision_references_and_no_quote_reason(tmp_path: Path) -> None:
+    """E6-T2: a DecisionEvent carries the reference hashes; a no-quote yields an in-set reason.
+
+    Part 1 (references + no-look-ahead END-TO-END): a ``make`` decision records ONE
+    DecisionEvent carrying ``fv_event_id`` / ``book_snapshot_id`` / ``config_hash`` /
+    ``policy_hash``, ms ``recv_ts``, ``source_ts is None``; a matching QuoteIntentEvent (with
+    a book-derived ``queue_ahead_size``); a LatencyEvent; and any RiskGateEvent. The aligned FV
+    the runner passed to ``decide_fn`` has ``recv_ts <= decision.recv_ts`` — a decision never
+    sees FV that had not arrived by its own recv_ts.
+
+    Part 2 (no-quote): an injected ``no_quote`` decision yields a NoQuoteIntentEvent whose
+    ``no_quote_reason`` is in the closed set.
+    """
+    from veridex.live_recorder.recorder import LiveRecorder
+    from veridex.live_recorder.runner import Decision, RecorderMarket, run_live_recorder
+
+    cfg = _config()
+
+    # ---- Part 1: make decision → references + no-look-ahead ----
+    matched = [RecorderMarket(100, "part1", "1X2|home|full", "tok")]
+    fv = FakeFvSource([_fv_state(100, 1_700_000_000, {"part1": 0.6})])
+    book = FakeBookDepthSource({"tok": [_snap("tok", bid=0.4, ask=0.6, size=8.0)]})
+    recorder = LiveRecorder(tmp_path / "s1", _start_meta())
+    seen_aligned: list[Any] = []
+
+    def decide_make(aligned: Any, _snapshot: Any, _config: Any) -> Decision:
+        seen_aligned.append(aligned)
+        return Decision(
+            intent_kind="make",
+            reason_code="join_top",
+            side="bid",
+            native_price=0.4,
+            desired_size=5.0,
+            ladder_rung=0,
+            quote_intent_type="join",
+            risk_gates=(("exposure", "pass", "within cap"),),
+        )
+
+    asyncio.run(
+        run_live_recorder(
+            matched=matched,
+            fv_source=fv,
+            book_source=book,
+            recorder=recorder,
+            decide_fn=decide_make,
+            config=cfg,
+            policy_hash="pol-hash",
+            now_fn=_counter_clock(),
+            sleep_fn=_noop_sleep,
+            max_polls=1,
+        )
+    )
+    recorder.close()
+
+    ev = _events_by_type(tmp_path / "s1" / "records.jsonl")
+    assert len(ev["DecisionEvent"]) == 1
+    decision = ev["DecisionEvent"][0]
+    assert decision["source_ts"] is None
+    assert isinstance(decision["recv_ts"], int) and decision["recv_ts"] > 0
+    assert decision["config_hash"] == cfg.config_hash()
+    assert decision["policy_hash"] == "pol-hash"
+    assert decision["fv_event_id"] and decision["fv_event_id"] != "unaligned"
+    assert decision["book_snapshot_id"]
+    assert decision["intent_kind"] == "make"
+    assert decision["market_ref"] == "1X2|home|full"
+
+    assert len(ev["QuoteIntentEvent"]) == 1
+    quote = ev["QuoteIntentEvent"][0]
+    assert quote["decision_id"] == decision["decision_id"]
+    assert quote["queue_ahead_size"] == 8.0  # bids resting at price >= 0.4
+
+    assert len(ev["LatencyEvent"]) == 1
+    assert ev["LatencyEvent"][0]["decision_id"] == decision["decision_id"]
+    assert len(ev["RiskGateEvent"]) == 1
+    assert ev["RiskGateEvent"][0]["outcome"] == "pass"
+
+    # A FairValueEvent was recorded with its ARRIVAL recv_ts.
+    assert len(ev["FairValueEvent"]) == 1
+    assert len(ev["VenueBookSnapshotEvent"]) == 1
+
+    # END-TO-END no-look-ahead: the aligned FV had arrived by the decision's own recv_ts.
+    assert len(seen_aligned) == 1
+    aligned = seen_aligned[0]
+    assert aligned is not None
+    assert aligned.recv_ts <= decision["recv_ts"]
+
+    # ---- Part 2: no-quote decision → in-set reason ----
+    fv2 = FakeFvSource([_fv_state(100, 1_700_000_000, {"part1": 0.6})])
+    book2 = FakeBookDepthSource({"tok": [_snap("tok")]})
+    recorder2 = LiveRecorder(tmp_path / "s2", _start_meta())
+
+    def decide_no_quote(_aligned: Any, _snapshot: Any, _config: Any) -> Decision:
+        return Decision(intent_kind="no_quote", reason_code="too_stale", no_quote_reason="stale")
+
+    asyncio.run(
+        run_live_recorder(
+            matched=matched,
+            fv_source=fv2,
+            book_source=book2,
+            recorder=recorder2,
+            decide_fn=decide_no_quote,
+            config=cfg,
+            policy_hash="pol-hash",
+            now_fn=_counter_clock(),
+            sleep_fn=_noop_sleep,
+            max_polls=1,
+        )
+    )
+    recorder2.close()
+
+    ev2 = _events_by_type(tmp_path / "s2" / "records.jsonl")
+    assert len(ev2["DecisionEvent"]) == 1
+    assert ev2["DecisionEvent"][0]["intent_kind"] == "no_quote"
+    assert len(ev2["NoQuoteIntentEvent"]) == 1
+    no_quote = ev2["NoQuoteIntentEvent"][0]
+    assert no_quote["no_quote_reason"] in {
+        "stale",
+        "event_suspension",
+        "boundary",
+        "fee_negative",
+        "liquidity_missing",
+        "risk_cap",
+    }
+    assert no_quote["no_quote_reason"] == "stale"
+
+
+# --------------------------------------------------------------------------- E6-T3
+class _FlakyBook:
+    """A book source that RAISES on its first fetch, then returns a canned snapshot."""
+
+    def __init__(self, snap: BookSnapshot) -> None:
+        self._calls = 0
+        self._snap = snap
+
+    async def fetch_book(self, token_id: str) -> BookSnapshot:
+        self._calls += 1
+        if self._calls == 1:
+            raise RuntimeError("boom book fetch")
+        return self._snap
+
+
+def test_poll_failure_writes_gap_and_shutdown_seals(tmp_path: Path) -> None:
+    """E6-T3: a per-poll book-fetch failure writes an honest gap (session CONTINUES); shutdown seals.
+
+    The first poll's ``fetch_book`` raises → a labeled ``RecorderGapEvent`` is written and the
+    session continues; the second poll succeeds and records a DecisionEvent. On shutdown the
+    runner finalizes ``meta.json`` with a ``content_hash`` over the sealed event stream.
+    """
+    from veridex.live_recorder.recorder import LiveRecorder
+    from veridex.live_recorder.runner import Decision, RecorderMarket, run_live_recorder
+
+    matched = [RecorderMarket(100, "part1", "1X2|home|full", "tok")]
+    fv = FakeFvSource([_fv_state(100, 1_700_000_000, {"part1": 0.6})])
+    book = _FlakyBook(_snap("tok"))
+    session_dir = tmp_path / "s"
+    recorder = LiveRecorder(session_dir, _start_meta())
+
+    def decide(_aligned: Any, _snapshot: Any, _config: Any) -> Decision:
+        return Decision(intent_kind="no_quote", reason_code="skip", no_quote_reason="stale")
+
+    result = asyncio.run(
+        run_live_recorder(
+            matched=matched,
+            fv_source=fv,
+            book_source=book,
+            recorder=recorder,
+            decide_fn=decide,
+            config=_config(),
+            policy_hash="pol-hash",
+            now_fn=_counter_clock(),
+            sleep_fn=_noop_sleep,
+            max_polls=2,
+        )
+    )
+    recorder.close()
+
+    ev = _events_by_type(session_dir / "records.jsonl")
+    # First poll failed → an honest gap; the session did NOT abort.
+    assert len(ev["RecorderGapEvent"]) == 1
+    gap = ev["RecorderGapEvent"][0]
+    assert gap["source"] and gap["reason"]
+    assert result.gaps == 1
+    assert result.polls == 2
+    # Second poll still recorded a book + a decision (one bad poll never aborts the session).
+    assert len(ev["VenueBookSnapshotEvent"]) == 1
+    assert len(ev["DecisionEvent"]) == 1
+
+    # Shutdown sealed meta.json with a content_hash over the full event stream.
+    meta = json.loads((session_dir / "meta.json").read_text())
+    assert meta["content_hash"]
+    assert meta["ended_ts"] is not None
+    assert meta["event_count"] == result.events_recorded + result.gaps
