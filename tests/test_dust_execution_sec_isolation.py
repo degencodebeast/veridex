@@ -176,7 +176,10 @@ VALID_DIR = {"avg_clv_bps": 0.0, "total_clv_bps": 0.0, "brier": 0.0, "max_drawdo
 # production set. `<=` (subset) over the production set is inert: dropping a field shrinks BOTH the
 # set AND the parametrization, so nothing fails. The independent literal is the ground truth.
 EXPECTED_R4A_FIELDS = frozenset({"own_fill", "filled_size", "fill_price", "realized_pnl", "inventory",
-                                 "real_fill_reconciliation", "post_trade_markout"})  # + any E1-T2/E2 field
+                                 "real_fill_reconciliation", "post_trade_markout",
+                                 # ACTUAL contracts.py attribute names (what model_dump() yields as rank-row keys):
+                                 "fill_size", "net_inventory", "markout_bps", "reconciled_fill_size",
+                                 "realized_loss_session", "realized_loss_daily"})
 @pytest.mark.parametrize("field", sorted(EXPECTED_R4A_FIELDS))
 def test_all_three_surfaces_reject_every_r4a_field(field):
     for keyfn, base in ((dir_key, VALID_DIR), (clv_key, VALID_DIR), (maker_rank_key, {})):

@@ -39,9 +39,20 @@ __all__ = [
 #: ``OrderStatusEvent`` (``filled_size``/``fill_price``), the realized-PnL concept (recorded as
 #: ``realized_loss_*`` on ``SessionRiskSnapshot``), ``InventoryEvent`` (``inventory``),
 #: ``RealFillReconciliation`` (``real_fill_reconciliation``) and ``PostTradeMarkoutEvent``
-#: (``post_trade_markout``); this set is their canonical rank-input names.
+#: (``post_trade_markout``); these are their canonical rank-input names.
+#:
+#: The set ALSO carries the ACTUAL contract attribute names that ``event.model_dump()`` yields
+#: as rank-row keys, so a leaked dumped event is caught by exact key name (defense-in-depth, not
+#: just the friendly canonical alias): ``fill_size`` (``OwnFillEvent``), ``net_inventory``
+#: (``InventoryEvent``), ``markout_bps`` (``PostTradeMarkoutEvent``), ``reconciled_fill_size``
+#: (``RealFillReconciliation``), and ``realized_loss_session`` / ``realized_loss_daily``
+#: (``SessionRiskSnapshot``). Non-alpha operational/intent fields (``status``,
+#: ``reconciled_state``, ``open_order_count``, ``breaker_open``, ``kill_switch_engaged``,
+#: ``side``, ``venue_order_id``, ``reference_price``, ``horizon_ms``, ``token_id``) and
+#: ``real_executable_edge_bps`` are DELIBERATELY excluded.
 R4A_EXECUTION_DENYLIST_FIELDS = frozenset(
     {
+        # --- canonical rank-input concept names ---
         "own_fill",
         "filled_size",
         "fill_price",
@@ -49,6 +60,13 @@ R4A_EXECUTION_DENYLIST_FIELDS = frozenset(
         "inventory",
         "real_fill_reconciliation",
         "post_trade_markout",
+        # --- ACTUAL contracts.py attribute names (model_dump() rank-row keys) ---
+        "fill_size",
+        "net_inventory",
+        "markout_bps",
+        "reconciled_fill_size",
+        "realized_loss_session",
+        "realized_loss_daily",
     }
 )
 
