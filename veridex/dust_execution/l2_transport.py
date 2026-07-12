@@ -336,7 +336,10 @@ def _match_fill_size(trades: Iterable[Mapping[str, Any]], venue_order_key: str) 
                 found = True
     if not found:
         return None
-    return matched if matched > 0.0 else None
+    # Final aggregate guard: individually-finite components can still SUM to +inf (e.g. two 1e308
+    # rows). `inf > 0.0` is True, so require the aggregate be FINITE and strictly positive — an
+    # overflowed total is not fill proof and must fail closed to no-proof (Gate#2 MAJOR-R2-1).
+    return matched if (math.isfinite(matched) and matched > 0.0) else None
 
 
 async def reconcile_ack_lost(

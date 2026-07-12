@@ -27,6 +27,7 @@ What these tests pin (§6 group 3, IDM-005 / AC-040 / AC-011):
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Any
 
@@ -296,6 +297,71 @@ async def test_malformed_fill_amount_is_ambiguous_via_assess_uncertain_submit(
     assert verdict.state == "AMBIGUOUS"
     assert verdict.state != "RESOLVED"
     assert verdict.matched_fill_size == 0.0
+
+
+# ---------------------------------------------------------------------------
+# Gate#2 MAJOR-R2-1 — individually-finite fill COMPONENTS whose AGGREGATE overflows to +inf are NOT
+# positive fill proof. The MAJOR-3 per-component guard passes each 1e308 (math.isfinite(1e308) is
+# True, and it is non-negative), but 1e308 + 1e308 == +inf and `inf > 0.0` is True — so without a
+# FINAL aggregate-finiteness guard the single-source matcher returns inf and BOTH reconcilers release
+# the ACK-lost uncertainty as RESOLVED with an inf size. The aggregate must fail closed to no-proof
+# (→ AMBIGUOUS), NEVER RESOLVED, NEVER inf — on BOTH the restart-join (reconcile_durable_ack_lost)
+# and three-surface (assess_uncertain_submit) paths, for BOTH taker-order and maker-order rows.
+# ---------------------------------------------------------------------------
+
+
+def _overflow_trade_rows(shape: str, key: str) -> list[dict[str, Any]]:
+    """Two §3 trade rows matching ``key``, each an individually-finite 1e308 amount summing to +inf.
+
+    Each 1e308 component passes the per-component finite/non-negative guard, but the AGGREGATE
+    1e308 + 1e308 overflows to +inf — the residual the final aggregate-finiteness guard must catch.
+    """
+    huge = "1e308"
+    if shape == "taker":
+        return [
+            {"taker_order_id": key, "size": huge, "status": "CONFIRMED"},
+            {"taker_order_id": key, "size": huge, "status": "CONFIRMED"},
+        ]
+    return [
+        {"maker_orders": [{"order_id": key, "matched_amount": huge}], "status": "CONFIRMED"},
+        {"maker_orders": [{"order_id": key, "matched_amount": huge}], "status": "CONFIRMED"},
+    ]
+
+
+@pytest.mark.parametrize("shape", ["taker", "maker"])
+async def test_overflow_aggregate_fill_is_ambiguous_via_reconcile_ack_lost(shape: str) -> None:
+    store = InMemoryStore()
+
+    async def _post() -> dict[str, Any]:
+        return {"success": True}
+
+    await submit_with_durable_presubmit(
+        store=store, session_id=_SESSION, record=_record(), post=_post
+    )
+
+    async def _reader(key: str) -> dict[str, Any]:
+        return {"trades": _overflow_trade_rows(shape, key)}
+
+    # Two finite components overflowing to +inf is NOT positive fill proof: fail closed to AMBIGUOUS,
+    # never RESOLVED, and never surface an inf size.
+    reconciled = await reconcile_durable_ack_lost(store, _SESSION, _reader)
+    assert len(reconciled) == 1
+    assert reconciled[0].reconciled_state == "AMBIGUOUS"
+    assert reconciled[0].reconciled_state != "RESOLVED"
+    assert reconciled[0].reconciled_fill_size == 0.0
+    assert math.isfinite(reconciled[0].reconciled_fill_size)
+
+
+@pytest.mark.parametrize("shape", ["taker", "maker"])
+async def test_overflow_aggregate_fill_is_ambiguous_via_assess_uncertain_submit(shape: str) -> None:
+    adapter = _MalformedFillAdapter(_overflow_trade_rows(shape, REC.venue_order_key))
+    # No terminal get_order status and no FINITE positive fill proof → AMBIGUOUS (never RESOLVED,
+    # never an inf matched size).
+    verdict = await assess_uncertain_submit(REC, adapter=adapter)
+    assert verdict.state == "AMBIGUOUS"
+    assert verdict.state != "RESOLVED"
+    assert verdict.matched_fill_size == 0.0
+    assert math.isfinite(verdict.matched_fill_size)
 
 
 # ---------------------------------------------------------------------------
