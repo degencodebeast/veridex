@@ -41,7 +41,14 @@ def test_ranked_import_leaves_no_dust_execution_in_sys_modules() -> None:
         "veridex.scoring",
         "veridex.leaderboard",
     ]
-    sys.modules.pop("veridex.dust_execution", None)
+    # Clear the ENTIRE veridex.dust_execution namespace (package + any submodules a sibling
+    # test already imported at collection time) so the post-import check attributes any (re)load
+    # PURELY to the ranked-lane imports below — not to unrelated test-ordering pollution. Popping
+    # only the package left sibling-loaded submodules (e.g. .contracts/.manifest) resident, which
+    # misfired this guard in the full milestone suite. A clean slate is also stronger teeth: any
+    # reappearance below is attributable ONLY to a ranked-lane import, even if a sibling had it.
+    for _dust_mod in [m for m in list(sys.modules) if m == "veridex.dust_execution" or m.startswith("veridex.dust_execution.")]:
+        sys.modules.pop(_dust_mod, None)
     for modname in modnames:
         importlib.import_module(modname)
     dust_loaded = [m for m in sys.modules if m == "veridex.dust_execution" or m.startswith("veridex.dust_execution.")]
