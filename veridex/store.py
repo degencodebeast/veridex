@@ -124,6 +124,45 @@ class RealizedFillLedgerRow:
 
 
 # ---------------------------------------------------------------------------
+# Pre-submit ledger row (IDM-005 — durable, append-only compound pre-submit record)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class PreSubmitLedgerRow:
+    """One immutable row of the append-only pre-submit ledger (IDM-005).
+
+    The durable backing for the compound :class:`~veridex.dust_execution.contracts.PreSubmitRecord`
+    persisted BEFORE a live wire POST, so an order stays identifiable in complete venue truth even
+    if the ACK is lost or it never opens. Mirrors the ``realized_fill_ledger`` /
+    ``competition_events`` APPEND-ONLY shape (INSERT-only, unique monotonic ``seq``), NOT the
+    ``execution_records`` upsert: rows are never updated or deleted.
+
+    Stores ONLY the non-secret fields of the compound record — the one-way
+    ``integrity_commitment_hash`` (a sha256 digest, safe to store; the raw ``owner`` cannot be
+    recovered from it), the public ``venue_order_key`` (the venue-recognized V2 order hash the
+    reconciler joins fill history on), and an optional captured venue id. NO raw owner / L2 cred /
+    signature ever enters a row.
+
+    Attributes:
+        seq: Store-assigned monotonic unique sequence (append order across all sessions).
+        session_id: Session identity the pre-submit record belongs to.
+        integrity_commitment_hash: Veridex's PRIVATE one-way digest over the intended POST body
+            (a sha256 digest — NOT a venue join key; reconciliation NEVER matches on it).
+        venue_order_key: The venue-recognized V2 order hash/id that order/trade/fill responses are
+            keyed by — the reconciliation join key (Codex-M2).
+        captured_id: A captured venue order id when the POST returned one (Mode A fake receipt id or
+            a Mode B venue id); ``None`` otherwise.
+    """
+
+    seq: int
+    session_id: str
+    integrity_commitment_hash: str
+    venue_order_key: str
+    captured_id: str | None
+
+
+# ---------------------------------------------------------------------------
 # Protocol
 # ---------------------------------------------------------------------------
 
@@ -331,6 +370,46 @@ class Store(Protocol):
         """
         ...
 
+    async def append_presubmit(
+        self,
+        *,
+        session_id: str,
+        integrity_commitment_hash: str,
+        venue_order_key: str,
+        captured_id: str | None = None,
+    ) -> int:
+        """Append ONE compound pre-submit record to the durable, append-only ledger (IDM-005).
+
+        The durable backing for a :class:`~veridex.dust_execution.contracts.PreSubmitRecord` written
+        BEFORE a live wire POST. Mirrors the ``realized_fill_ledger`` / ``competition_events``
+        APPEND-ONLY contract (INSERT-only; never updated or deleted). The store assigns a monotonic
+        unique ``seq`` and returns it. Persists ONLY the non-secret fields — the one-way integrity
+        digest, the public venue join key, and an optional captured id (NO raw owner / cred / sig).
+
+        Args:
+            session_id: Session identity the pre-submit record belongs to.
+            integrity_commitment_hash: Veridex's PRIVATE one-way digest (safe to store; not a join key).
+            venue_order_key: The venue-recognized V2 order hash (the reconciliation join key).
+            captured_id: Captured venue order id if the POST returned one (else ``None``).
+
+        Returns:
+            The store-assigned monotonic unique ``seq`` for the appended row.
+        """
+        ...
+
+    async def list_presubmit(self, session_id: str) -> list[PreSubmitLedgerRow]:
+        """Return every persisted pre-submit row for ``session_id``, ordered by ``seq`` ascending.
+
+        A fresh read reconstructs the durable compound records after a restart (IDM-005).
+
+        Args:
+            session_id: The session whose pre-submit ledger to read.
+
+        Returns:
+            :class:`PreSubmitLedgerRow` objects for this session, sorted by ``seq`` ascending.
+        """
+        ...
+
     async def persist_agent_instance(self, instance: AgentInstance) -> None:
         """Persist a deployed :class:`~veridex.deploy.instance.AgentInstance` (source of truth).
 
@@ -460,6 +539,9 @@ class InMemoryStore:
         # Append-only realized-fill ledger + its monotonic unique-seq counter (SAF-002b/c).
         self._realized_fills: list[RealizedFillLedgerRow] = []
         self._realized_fill_seq: int = 0
+        # Append-only pre-submit ledger + its monotonic unique-seq counter (IDM-005).
+        self._presubmit_rows: list[PreSubmitLedgerRow] = []
+        self._presubmit_seq: int = 0
 
     # --- run methods (Phase-1, unchanged) ---
 
@@ -745,6 +827,54 @@ class InMemoryStore:
         """
         return [row for row in sorted(self._realized_fills, key=lambda r: r.seq) if row.session_id == session_id]
 
+    # --- pre-submit ledger methods (IDM-005 — append-only, non-secret compound record) ---
+
+    async def append_presubmit(
+        self,
+        *,
+        session_id: str,
+        integrity_commitment_hash: str,
+        venue_order_key: str,
+        captured_id: str | None = None,
+    ) -> int:
+        """Append one pre-submit row (append-only) and return its monotonic unique ``seq``.
+
+        Mirrors the ``realized_fill_ledger`` append-only shape: rows are only ever added, never
+        updated or deleted. ``seq`` is a process-global monotonic counter (unique across sessions).
+
+        Args:
+            session_id: Session identity the pre-submit record belongs to.
+            integrity_commitment_hash: Veridex's private one-way digest (safe to store; not a join key).
+            venue_order_key: The venue-recognized V2 order hash (the reconciliation join key).
+            captured_id: Captured venue order id if the POST returned one (else ``None``).
+
+        Returns:
+            The assigned monotonic unique ``seq``.
+        """
+        self._presubmit_seq += 1
+        row = PreSubmitLedgerRow(
+            seq=self._presubmit_seq,
+            session_id=session_id,
+            integrity_commitment_hash=integrity_commitment_hash,
+            venue_order_key=venue_order_key,
+            captured_id=captured_id,
+        )
+        self._presubmit_rows.append(row)
+        return row.seq
+
+    async def list_presubmit(self, session_id: str) -> list[PreSubmitLedgerRow]:
+        """Return this session's pre-submit rows, sorted by ``seq`` ascending.
+
+        Rows are frozen dataclasses, so returning references is safe (immutable).
+
+        Args:
+            session_id: The session whose pre-submit ledger to read.
+
+        Returns:
+            Matching :class:`PreSubmitLedgerRow` objects, sorted by ``seq`` ascending.
+        """
+        return [row for row in sorted(self._presubmit_rows, key=lambda r: r.seq) if row.session_id == session_id]
+
     # --- agent-instance methods (Phase-2D deploy — REQ-2D-701A) ---
 
     async def persist_agent_instance(self, instance: AgentInstance) -> None:
@@ -994,6 +1124,26 @@ class PostgresStore:
             )
             await cur.execute(
                 "CREATE INDEX IF NOT EXISTS idx_realized_fill_ledger_session ON realized_fill_ledger(session_id)"
+            )
+
+            # --- pre-submit ledger (IDM-005 — durable, APPEND-ONLY compound pre-submit record) ---
+            # BIGSERIAL PK gives a monotonic unique seq; INSERT-only (never UPDATE/DELETE), mirroring
+            # the realized_fill_ledger / competition_events append-only pattern. Columns hold ONLY the
+            # non-secret compound-record fields (the one-way integrity digest + the public venue join
+            # key + an optional captured id) — NO raw owner / L2 cred / signature.
+            await cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS presubmit_ledger (
+                    seq BIGSERIAL PRIMARY KEY,
+                    session_id TEXT NOT NULL,
+                    integrity_commitment_hash TEXT NOT NULL,
+                    venue_order_key TEXT NOT NULL,
+                    captured_id TEXT
+                )
+                """
+            )
+            await cur.execute(
+                "CREATE INDEX IF NOT EXISTS idx_presubmit_ledger_session ON presubmit_ledger(session_id)"
             )
         await conn.commit()
 
@@ -1490,6 +1640,76 @@ class PostgresStore:
                 fee=float(r[3]),
                 fill_ts_ms=int(r[4]),
                 source=r[5],
+            )
+            for r in rows
+        ]
+
+    # --- pre-submit ledger methods (IDM-005 — append-only, non-secret compound record) ---
+
+    async def append_presubmit(
+        self,
+        *,
+        session_id: str,
+        integrity_commitment_hash: str,
+        venue_order_key: str,
+        captured_id: str | None = None,
+    ) -> int:
+        """INSERT one pre-submit row (append-only) and return the DB-assigned ``seq``.
+
+        Uses ``INSERT … RETURNING seq`` against the ``BIGSERIAL`` primary key — never an UPDATE or
+        DELETE, mirroring the ``realized_fill_ledger`` append-only pattern. All SQL is parameterized;
+        psycopg stays lazy. Only the non-secret compound-record fields are written.
+
+        Args:
+            session_id: Session identity the pre-submit record belongs to.
+            integrity_commitment_hash: Veridex's private one-way digest (safe to store; not a join key).
+            venue_order_key: The venue-recognized V2 order hash (the reconciliation join key).
+            captured_id: Captured venue order id if the POST returned one (else ``None``).
+
+        Returns:
+            The DB-assigned monotonic unique ``seq``.
+        """
+        conn = await self._connect()
+        try:
+            async with conn.transaction(), conn.cursor() as cur:
+                await cur.execute(
+                    "INSERT INTO presubmit_ledger "
+                    "(session_id, integrity_commitment_hash, venue_order_key, captured_id) "
+                    "VALUES (%s, %s, %s, %s) RETURNING seq",
+                    (session_id, integrity_commitment_hash, venue_order_key, captured_id),
+                )
+                row = await cur.fetchone()
+        finally:
+            await conn.close()
+        return int(row[0])
+
+    async def list_presubmit(self, session_id: str) -> list[PreSubmitLedgerRow]:
+        """Return this session's pre-submit rows, ordered by ``seq`` ascending.
+
+        Args:
+            session_id: The session whose pre-submit ledger to read.
+
+        Returns:
+            Reconstructed :class:`PreSubmitLedgerRow` objects, sorted by ``seq`` ascending.
+        """
+        conn = await self._connect()
+        try:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "SELECT seq, session_id, integrity_commitment_hash, venue_order_key, captured_id "
+                    "FROM presubmit_ledger WHERE session_id = %s ORDER BY seq",
+                    (session_id,),
+                )
+                rows = await cur.fetchall()
+        finally:
+            await conn.close()
+        return [
+            PreSubmitLedgerRow(
+                seq=int(r[0]),
+                session_id=r[1],
+                integrity_commitment_hash=r[2],
+                venue_order_key=r[3],
+                captured_id=r[4],
             )
             for r in rows
         ]
