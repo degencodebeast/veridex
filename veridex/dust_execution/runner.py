@@ -42,13 +42,12 @@ for one is flagged PROVISIONAL at its construction site below): the real realize
 kill-switch accumulator and ``SafetyController`` delegation feeding ``SessionRiskSnapshot`` (E6-T3);
 real order-status polling and real venue reconciliation feeding ``OrderStatusEvent`` /
 ``RealFillReconciliation`` (E6-T3); the Mode A→B arming gate, manifest authorization, and
-``resolve_dust_size`` binding + native→decimal pricing still using the E6-T1 placeholder price/size
-(E6-T4); a durable operator-assigned ``session_id`` and the sealed ``content_hash`` at session end
-(E6-T5 startup sweep / E6-T6 shutdown); the real EIP-712 V2 order-hash (``venue_order_key``) binding
-via ``veridex.dust_execution.signing_compiler`` (a later task — this module's placeholder is
-distinct from the private integrity digest, never equal to it). The Mode B order built here still
-uses PROVISIONAL price/size placeholders purely to exercise the (recording-fake, offline) submit
-wire the gates protect — real sizing/pricing binding is E6-T4.
+``resolve_dust_size`` binding + native→decimal pricing (E6-T4 — NOW CLOSED: the wire size comes ONLY
+from ``resolve_dust_size`` over pinned inputs, and Mode B arms only when every precondition passes);
+a durable operator-assigned ``session_id`` and the sealed ``content_hash`` at session end (E6-T5
+startup sweep / E6-T6 shutdown); the real EIP-712 V2 order-hash (``venue_order_key``) binding via
+``veridex.dust_execution.signing_compiler`` (a later task — this module's placeholder is distinct
+from the private integrity digest, never equal to it).
 
 SEC-003: this module imports only intra-lane ``veridex.dust_execution.*``, the shared
 ``veridex.policy.envelope`` (the single breach-boundary source of truth, not a ranked lane), and
@@ -64,6 +63,7 @@ from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from typing import Literal, Protocol, cast, runtime_checkable
 
+from veridex.dust_execution.clobv2_gate import Clobv2GateResult
 from veridex.dust_execution.contracts import (
     DustExecutionSessionMeta,
     DustRunLabelEvent,
@@ -83,11 +83,28 @@ from veridex.dust_execution.emergency import (
     DustSafetySession,
     SafetyController,
 )
-from veridex.dust_execution.manifest import StrategyExperimentManifest
+from veridex.dust_execution.facade import MMExecutionToolRequest
+from veridex.dust_execution.manifest import (
+    SessionState,
+    StrategyAuthorizationDecision,
+    StrategyExperimentManifest,
+)
 from veridex.dust_execution.noncrossing import LegKind, OwnOrderLeg, check_non_crossing
+from veridex.dust_execution.privy_control_plane import (
+    PrivyPreflightResult,
+    ProvisioningResult,
+    arm_mode_b,
+    execute_with,
+)
 from veridex.dust_execution.reconcile import UncertainSubmitState, assess_uncertain_submit
-from veridex.dust_execution.risk import RealizedFillRecord, RiskAccumulator
+from veridex.dust_execution.risk import FailClosed, RealizedFillRecord, RiskAccumulator
 from veridex.dust_execution.signer import Signer, SigningPayload
+from veridex.dust_execution.sizing import resolve_dust_size
+from veridex.dust_execution.wallet_binding import (
+    AuthorizationQuorum,
+    ExecutionWalletBinding,
+    PrivyWalletPolicy,
+)
 from veridex.policy.circuit_breaker import CircuitBreaker, CircuitState
 from veridex.policy.envelope import PolicyEnvelope
 from veridex.venues.base import Order, VenueAdapter, VenueReconciliationReads
@@ -176,6 +193,9 @@ AbstainReason = Literal[
     "self_cross",
     "safety_blocked",
     "mode_a_no_orders",
+    "manifest_hash_mismatch",
+    "admission_denied",
+    "mode_b_not_armed",
 ]
 
 #: Tuple form of :data:`AbstainReason` for membership checks / iteration.
@@ -189,6 +209,9 @@ ABSTAIN_REASONS: tuple[AbstainReason, ...] = (
     "self_cross",
     "safety_blocked",
     "mode_a_no_orders",
+    "manifest_hash_mismatch",
+    "admission_denied",
+    "mode_b_not_armed",
 )
 
 #: The venue minimum price increment the non-crossing check rounds/compares against (Polymarket
@@ -220,6 +243,37 @@ class SubmitDecision:
     venue_order_id: str | None = None
 
 
+@dataclass(frozen=True)
+class ModeBArming:
+    """The FULL Mode-B (real-money) arming bundle — every precondition must POSITIVELY pass (E6-T4).
+
+    Modelled as a frozen snapshot so the arming check cannot be partially mutated into a write. Mode B
+    arms ONLY when ALL of the following hold (fail-closed AND — a missing/failing member blocks):
+
+    * ``mode_a_passed`` — the HARD GATE: Mode A (fake/dry-run) MUST have passed first;
+    * ``clobv2_gate`` — the E3-T5 CLOB-V2 write-contract gate is ``mode_b_admitted`` (machine
+      fixture-match AND an operator-confirmed production smoke — ``operator_smoke_ok is True``);
+    * ``privy_preflight`` — the E3-T8 operator-run Privy signing preflight passed (``ok is True``);
+    * ``provisioning`` — the E3-T8 operator-run pUSD/approvals/gas provisioning passed (``ok is True``);
+    * ``binding`` + ``live_policy`` + ``live_quorum`` — a valid :class:`ExecutionWalletBinding` whose
+      ``binding_hash`` verifies against the pinned manifest field (:func:`execute_with`) AND whose
+      ``privy_policy_content_hash`` + quorum verify against the LIVE policy/quorum
+      (:func:`arm_mode_b`). Any mismatch/weakening fails closed.
+
+    ``clobv2_gate`` / ``privy_preflight`` / ``provisioning`` carry the OPERATOR-supplied tri-states
+    (``ok=None`` until an operator runs them OUT of CI); offline tests drive each pass/fail with a
+    genuine fixture — Mode B stays UNARMED and no live venue/Privy/provisioning call is ever made.
+    """
+
+    mode_a_passed: bool
+    clobv2_gate: Clobv2GateResult
+    privy_preflight: PrivyPreflightResult
+    provisioning: ProvisioningResult
+    binding: ExecutionWalletBinding
+    live_policy: PrivyWalletPolicy
+    live_quorum: AuthorizationQuorum
+
+
 #: The E1-T2 numbered lifecycle-event union this runner emits (session meta precedes it, unnumbered
 #: — :class:`DustExecutionSessionMeta` carries no ``sequence_no``). Ordered per event, one variant
 #: per stage: risk snapshot, intent, attempt, ack, status, fill/reconciliation, labels.
@@ -248,6 +302,7 @@ class DustExecutionResult:
     decisions: tuple[SubmitDecision, ...]
     session_meta: DustExecutionSessionMeta
     events: tuple[LifecycleEvent, ...]
+    admission: StrategyAuthorizationDecision
 
     @property
     def submitted_count(self) -> int:
@@ -475,6 +530,157 @@ def _non_crossing_gate(
 
 
 # ---------------------------------------------------------------------------
+# E6-T4: mechanical size, native→decimal price, manifest authorization, Mode A→B arming
+# ---------------------------------------------------------------------------
+
+
+def _resolve_wire_size(
+    *,
+    manifest: StrategyExperimentManifest,
+    envelope: PolicyEnvelope,
+    wallet_equity_at_decision: float,
+    fixed_fraction: float,
+) -> float:
+    """The ONE source of the executable wire size: :func:`resolve_dust_size` and NOTHING else.
+
+    Deterministic ``fixed_fraction * wallet_equity_at_decision`` clamped by the manifest notional cap
+    AND the per-order policy cap (the tighter live-guarded cap when enabled, else ``max_stake``). No
+    agent ``confidence`` / requested ``size`` is an input here — an agent value can never RAISE or move
+    the executable size (GUD-001, Codex-M4). This is the "check the value that FEEDS the wire" binding.
+    """
+    max_per_order = (
+        envelope.max_stake_live_guarded
+        if envelope.max_stake_live_guarded > 0.0
+        else envelope.max_stake
+    )
+    return resolve_dust_size(
+        fixed_fraction=fixed_fraction,
+        wallet_equity_at_decision=wallet_equity_at_decision,
+        max_notional=manifest.max_notional,
+        max_per_order=max_per_order,
+    )
+
+
+def _native_to_decimal_odds(native_price: float) -> float:
+    """Convert a native ``(0,1]`` probability price to decimal odds (``1 / native``), fail-closed.
+
+    The dust lane's native price is a Polymarket-style probability in the unit interval (validated by
+    :class:`~veridex.dust_execution.signer.SigningPayload`); decimal odds are its reciprocal. A
+    non-finite or non-positive native price is a nonsensical cost-to-fill and fails closed rather than
+    emit a garbage (or infinite) decimal price on the wire.
+    """
+    if not (native_price > 0.0) or native_price > 1.0:
+        raise ValueError(
+            f"native price must be a probability in (0, 1] to convert to decimal odds, got {native_price!r}"
+        )
+    return 1.0 / native_price
+
+
+def _build_admission(
+    *,
+    manifest: StrategyExperimentManifest,
+    envelope: PolicyEnvelope,
+    risk: RiskAccumulator,
+    breaker: CircuitBreaker | None,
+    session_id: str,
+    open_order_count: int,
+) -> StrategyAuthorizationDecision:
+    """Deterministic pre-submit admission (E1-T2/E2-T1) — a pure function of manifest + policy + session.
+
+    Delegates to :meth:`StrategyAuthorizationDecision.evaluate`, which admits an ``EXPERIMENTAL_DUST``
+    manifest WITHOUT any profitability flag yet still DENYs on a reached loss cap / breaker / kill
+    switch. It is MODE-INDEPENDENT: identical ``(manifest, policy_hash, session)`` → identical verdict
+    in dry-run and live-guarded (AC-021), so it is computed once per run and surfaced on the result.
+    """
+    return StrategyAuthorizationDecision.evaluate(
+        manifest=manifest,
+        policy_hash=envelope.policy_hash(),
+        session=SessionState(
+            session_id=session_id,
+            realized_loss_session=risk.realized_loss_session,
+            realized_loss_daily=risk.realized_loss_day,
+            open_order_count=open_order_count,
+            breaker_open=breaker is not None and breaker.state is CircuitState.OPEN,
+            kill_switch_engaged=envelope.kill_switch,
+        ),
+    )
+
+
+def _authorization_block_reason(
+    *,
+    manifest: StrategyExperimentManifest,
+    envelope: PolicyEnvelope,
+    request: MMExecutionToolRequest | None,
+    admission: StrategyAuthorizationDecision,
+) -> AbstainReason | None:
+    """Session-level, mode-independent authorization gate (fail-closed to abstain).
+
+    Two checks:
+
+    * **Declared-hash cross-check.** When an agent ``request`` is supplied, its DECLARED
+      ``manifest_hash`` / ``policy_hash`` / ``strategy_config_hash`` MUST match the admitted pins; a
+      mismatch fails closed (``"manifest_hash_mismatch"``) so an approved intent can never be silently
+      rebound to a different manifest/policy/strategy config.
+    * **Admission verdict.** A ``DENY`` from :func:`_build_admission` (missing manifest, reached loss
+      cap, breaker, or kill switch) fails closed (``"admission_denied"``).
+    """
+    if request is not None and (
+        request.manifest_hash != manifest.manifest_hash()
+        or request.policy_hash != envelope.policy_hash()
+        or request.strategy_config_hash != manifest.strategy_config_hash
+    ):
+        return "manifest_hash_mismatch"
+    if admission.verdict == "DENY":
+        return "admission_denied"
+    return None
+
+
+def _mode_b_arming_block_reason(
+    arming: ModeBArming | None, *, manifest: StrategyExperimentManifest
+) -> AbstainReason | None:
+    """Return ``"mode_b_not_armed"`` unless EVERY Mode-B arming precondition positively passes.
+
+    Fail-closed AND (default-deny), in a fixed order so the check cannot be partially satisfied:
+
+    #. an absent bundle (no binding at all) → blocked;
+    #. the Mode A→B **HARD GATE**: ``mode_a_passed`` MUST be true first;
+    #. the E3-T5 CLOB-V2 gate ``mode_b_admitted`` (machine + operator smoke);
+    #. the E3-T8 Privy signing preflight ``ok is True``;
+    #. the E3-T8 pUSD/approvals/gas provisioning ``ok is True``;
+    #. the binding ``binding_hash`` verifies against the pinned manifest field
+       (:func:`execute_with`) AND the LIVE policy/quorum verify against the binding
+       (:func:`arm_mode_b`) — a :class:`FailClosed` from either (reroute / weakened policy content
+       hash / quorum) blocks.
+
+    Every branch returns the SAME closed-vocab ``"mode_b_not_armed"`` label (no secret / no live
+    handle). Removing ANY branch lets Mode B arm when it must not — the mutation each named test trips.
+    """
+    if arming is None:
+        return "mode_b_not_armed"
+    if not arming.mode_a_passed:
+        # HARD GATE: Mode A (dry-run) must pass before Mode B can arm — even if all else is valid.
+        return "mode_b_not_armed"
+    if not arming.clobv2_gate.mode_b_admitted:
+        return "mode_b_not_armed"
+    if arming.privy_preflight.ok is not True:
+        return "mode_b_not_armed"
+    if arming.provisioning.ok is not True:
+        return "mode_b_not_armed"
+    try:
+        # Binding-hash vs the pinned manifest field (reroute guard), THEN live policy/quorum content
+        # hashes vs the binding (weakened-policy / quorum guard). Both fail closed by raising.
+        execute_with(manifest, live_binding=arming.binding)
+        arm_mode_b(
+            binding=arming.binding,
+            live_policy=arming.live_policy,
+            live_quorum=arming.live_quorum,
+        )
+    except FailClosed:
+        return "mode_b_not_armed"
+    return None
+
+
+# ---------------------------------------------------------------------------
 # The runner
 # ---------------------------------------------------------------------------
 
@@ -489,6 +695,10 @@ async def run_dust_execution(
     envelope: PolicyEnvelope,
     manifest: StrategyExperimentManifest,
     mode: ExecutionMode,
+    wallet_equity_at_decision: float,
+    fixed_fraction: float,
+    request: MMExecutionToolRequest | None = None,
+    arming: ModeBArming | None = None,
     safety: SafetyController | None = None,
     session: DustSafetySession | None = None,
     risk: RiskAccumulator | None = None,
@@ -528,8 +738,27 @@ async def run_dust_execution(
       ``venue_order_key``, so the ``OrderStatusEvent`` / ``RealFillReconciliation`` reflect venue
       truth (RESOLVED/AMBIGUOUS) rather than the E6-T2 hardcoded placeholders.
 
-    Still DELIBERATELY provisional (later tasks): the Mode B order's price/size placeholders and the
-    Mode A→B arming gate (E6-T4), the startup sweep (E6-T5), and shutdown-as-a-lifecycle-stage (E6-T6).
+    E6-T4 (REQ-012/013, AC-004/018/021/024, GUD-001) closes the sizing/pricing + arming seams:
+
+    * **Mechanical size bound to the wire (Codex-M4).** The executable order size comes ONLY from
+      :func:`resolve_dust_size` (via :func:`_resolve_wire_size`) over the PINNED
+      ``wallet_equity_at_decision`` / ``fixed_fraction`` and the manifest/policy caps — NEVER from the
+      agent ``request``'s ``confidence`` / requested ``size`` (they are untrusted metadata with no gate
+      or size effect). The E6-T1 ``size=1.0`` placeholder and ``1/native`` price placeholder are now
+      real (native probability → decimal odds via :func:`_native_to_decimal_odds`).
+    * **Manifest authorization (AC-021/024).** A once-per-run deterministic
+      :class:`StrategyAuthorizationDecision` (surfaced on the result): a mismatched declared request
+      hash fails closed (``"manifest_hash_mismatch"``); an ``EXPERIMENTAL_DUST`` manifest admits
+      WITHOUT a profitability flag yet a reached loss cap DENYs (``"admission_denied"``). Identical
+      request + hashes → identical admission in dry-run and live-guarded.
+    * **Mode A→B HARD GATE + fail-closed arming (AC-004/018).** Mode B builds/submits an order ONLY
+      when the ``arming`` bundle passes EVERY precondition (:func:`_mode_b_arming_block_reason`):
+      Mode A passed first, the E3-T5 CLOB-V2 gate, the E3-T8 Privy preflight AND pUSD/approvals
+      provisioning, and a valid binding whose hash + policy content hash verify. Otherwise every token
+      abstains ``"mode_b_not_armed"`` — Mode B stays UNARMED and no order reaches the wire.
+
+    Still DELIBERATELY provisional (later tasks): the startup sweep (E6-T5) and
+    shutdown-as-a-lifecycle-stage (E6-T6).
 
     ``sleep_fn`` is the injected async delay seam for the E6 polling loop (added by a later task);
     this pass makes a single deterministic sweep and does not sleep.
@@ -545,6 +774,14 @@ async def run_dust_execution(
         envelope: Policy envelope providing ``max_quote_age_s``, the loss caps, and ``kill_switch``.
         manifest: Pinned strategy manifest providing the token ``universe`` to quote.
         mode: Execution mode — ``"dry_run"`` (Mode A, no orders) or ``"live_guarded"`` (Mode B).
+        wallet_equity_at_decision: PINNED wallet equity at decision time; a mechanical
+            :func:`resolve_dust_size` input — never agent-supplied.
+        fixed_fraction: PINNED fraction of equity per unit; a mechanical :func:`resolve_dust_size`
+            input — never agent-supplied.
+        request: Optional typed agent intent. Its declared hashes are cross-checked (fail closed on
+            mismatch); its ``confidence`` / ``size`` are untrusted metadata that NEVER reach the wire.
+        arming: The Mode-B arming bundle; ``None`` (or any failing precondition) keeps Mode B UNARMED
+            (fail closed). Ignored in Mode A (dry-run never arms).
         safety: The E2-T3 emergency orchestrator the runner delegates every trigger to (a fresh
             :class:`SafetyController` when omitted).
         session: The mutable emergency-stop runtime state (a fresh :class:`DustSafetySession` keyed on
@@ -582,6 +819,33 @@ async def run_dust_execution(
     )
 
     open_order_count = sum(1 for leg in own_legs if leg.kind is LegKind.OPEN)
+
+    # Session-level, mode-independent manifest authorization (computed ONCE, surfaced on the result).
+    admission = _build_admission(
+        manifest=manifest,
+        envelope=envelope,
+        risk=risk,
+        breaker=breaker,
+        session_id=session.session_id,
+        open_order_count=open_order_count,
+    )
+    authorization_block_reason = _authorization_block_reason(
+        manifest=manifest, envelope=envelope, request=request, admission=admission
+    )
+
+    # Mode A→B HARD GATE + fail-closed arming: computed once; Mode A never arms (reason is None).
+    arming_block_reason = (
+        _mode_b_arming_block_reason(arming, manifest=manifest) if mode == "live_guarded" else None
+    )
+
+    # The mechanical wire size is PINNED-input only (never the agent request) and identical per token.
+    wire_size = _resolve_wire_size(
+        manifest=manifest,
+        envelope=envelope,
+        wallet_equity_at_decision=wallet_equity_at_decision,
+        fixed_fraction=fixed_fraction,
+    )
+
     events: list[LifecycleEvent] = [
         _build_risk_snapshot(
             seq=seqc.next(),
@@ -609,6 +873,9 @@ async def run_dust_execution(
             session=session,
             own_legs=own_legs,
             tick_size=tick_size,
+            wire_size=wire_size,
+            arming_block_reason=arming_block_reason,
+            authorization_block_reason=authorization_block_reason,
         )
         decisions.append(decision)
         events.extend(token_events)
@@ -620,6 +887,7 @@ async def run_dust_execution(
         decisions=tuple(decisions),
         session_meta=session_meta,
         events=tuple(events),
+        admission=admission,
     )
 
 
@@ -638,8 +906,11 @@ async def _decide_and_submit(
     session: DustSafetySession,
     own_legs: Sequence[OwnOrderLeg],
     tick_size: float,
+    wire_size: float,
+    arming_block_reason: AbstainReason | None,
+    authorization_block_reason: AbstainReason | None,
 ) -> tuple[SubmitDecision, tuple[LifecycleEvent, ...]]:
-    """Gate one token's quote and, only when clear AND Mode B, submit it on the wire.
+    """Gate one token's quote and, only when clear AND Mode B (ARMED), submit it on the wire.
 
     Also builds the E1-T2 per-decision lifecycle events for a GATE-CLEAR quote — identically shaped
     in both modes (AC-003); see :func:`_emit_order_lifecycle`. A gate-ABSTAINED token (the original
@@ -649,7 +920,18 @@ async def _decide_and_submit(
     check (once the SafetyController has blocked submits, every token abstains ``"safety_blocked"``)
     and the E5 non-crossing check (a self-crossing proposed order abstains ``"self_cross"``). Both
     refuse with no per-decision lifecycle events, identically in both modes.
+
+    E6-T4 adds the Mode A→B HARD GATE / fail-closed arming FIRST — a Mode-B run that is not armed
+    abstains ``"mode_b_not_armed"`` BEFORE any quote I/O (refuse-before-I/O) — and, AFTER the safety
+    check (which must still win for a swept session), the mode-independent manifest-authorization block
+    (``"manifest_hash_mismatch"`` / ``"admission_denied"``). All abstain with no per-decision events.
+    The executable size is the PINNED-input ``wire_size`` (:func:`resolve_dust_size`), never the agent
+    request.
     """
+    # Mode A→B HARD GATE + arming (Mode B only): an unarmed Mode B places NO order and reads no quote.
+    if mode == "live_guarded" and arming_block_reason is not None:
+        return _abstain(token_id, arming_block_reason), ()
+
     try:
         quote = await sources.read_quote(token_id)
     except StaleVenueBook:
@@ -661,9 +943,15 @@ async def _decide_and_submit(
     if reason is not None:
         return _abstain(token_id, reason), ()
 
-    # Emergency stop: a swept/blocked session admits NO further submit (SAF-002/003).
+    # Emergency stop: a swept/blocked session admits NO further submit (SAF-002/003). Checked BEFORE
+    # the (also-blocking) admission gate so a loss/breaker/kill sweep keeps its honest ``safety_blocked``.
     if not safety.check_can_submit(session):
         return _abstain(token_id, "safety_blocked"), ()
+
+    # Manifest authorization: a mismatched declared request hash or a DENY admission fails closed
+    # (mode-independent — an unauthorized run submits in neither mode).
+    if authorization_block_reason is not None:
+        return _abstain(token_id, authorization_block_reason), ()
 
     # Non-crossing: refuse a proposed order that self-crosses an own leg (E5, SAF-009). Mode-
     # independent — a crossing order is refused in Mode A and Mode B alike.
@@ -680,6 +968,7 @@ async def _decide_and_submit(
         mode=mode,
         now_s=now_s,
         seqc=seqc,
+        wire_size=wire_size,
     )
     if decision.submitted:
         logger.info(
@@ -735,6 +1024,7 @@ async def _emit_order_lifecycle(
     mode: ExecutionMode,
     now_s: int,
     seqc: _SeqCounter,
+    wire_size: float,
 ) -> tuple[SubmitDecision, tuple[LifecycleEvent, ...]]:
     """Build the full E1-T2 per-decision lifecycle chain for a GATE-CLEAR quote (AC-003).
 
@@ -750,10 +1040,15 @@ async def _emit_order_lifecycle(
     the ``venue_order_key`` — an adapter with no reconciliation surface degrades fail-closed to
     AMBIGUOUS/``unresolved`` (the honest "no resolved fill" state), identically in both modes.
 
-    PROVISIONAL: price/size are the E6-T1 placeholders (real sizing is E6-T4); the presubmit
-    record's ``venue_order_key`` is a placeholder distinct from the private integrity digest — the
-    real EIP-712 V2 order-hash binding (``veridex.dust_execution.signing_compiler``) is wired by a
-    later task.
+    E6-T4 binds the REAL executable size: ``wire_size`` (the PINNED-input :func:`resolve_dust_size`
+    value — never the agent request's ``confidence`` / requested ``size``) flows into the intent, the
+    signing payload, AND the submitted :class:`Order` identically. The Mode B order's decimal price is
+    the real native→decimal-odds conversion (:func:`_native_to_decimal_odds`), not the E6-T1 ``1/native``
+    placeholder. Mode A signs the SAME real-size payload but still never submits (AC-003 / AC-017).
+
+    PROVISIONAL: the presubmit record's ``venue_order_key`` is a placeholder distinct from the private
+    integrity digest — the real EIP-712 V2 order-hash binding
+    (``veridex.dust_execution.signing_compiler``) is wired by a later task.
     """
     assert quote.bid is not None and quote.ask is not None  # noqa: S101 - gate guaranteed both sides
 
@@ -770,7 +1065,7 @@ async def _emit_order_lifecycle(
         token_id=quote.token_id,
         side="BUY",
         price=quote.ask.price,
-        size=1.0,  # provisional placeholder — real size binding is E6-T4 (resolve_dust_size)
+        size=wire_size,  # REAL mechanical size — resolve_dust_size(...), never the agent request
         tif="FOK",
         client_order_id=client_order_id,
         decision_id=decision_id,
@@ -781,7 +1076,7 @@ async def _emit_order_lifecycle(
         token_id=quote.token_id,
         side="BUY",
         native_price=quote.ask.price,
-        size=1.0,  # provisional placeholder — real size binding is E6-T4
+        size=wire_size,  # REAL mechanical size — resolve_dust_size(...), never the agent request
         tif="FOK",
         tick_size="0.01",
         client_order_id=client_order_id,
@@ -814,8 +1109,8 @@ async def _emit_order_lifecycle(
         order = Order(
             market_ref=manifest.market,
             side="BUY",
-            size=1.0,  # provisional placeholder — real size binding is E6-T4
-            price=1.0 / quote.ask.price,  # provisional native→decimal — real pricing is E6-T4
+            size=wire_size,  # REAL mechanical size — resolve_dust_size(...), never the agent request
+            price=_native_to_decimal_odds(quote.ask.price),  # REAL native probability → decimal odds
             venue=envelope.venue_allowlist[0] if envelope.venue_allowlist else "dust",
             client_order_id=client_order_id,
         )
@@ -899,6 +1194,7 @@ __all__ = [
     "DustExecutionResult",
     "DustQuote",
     "LifecycleEvent",
+    "ModeBArming",
     "QuoteSource",
     "StaleVenueBook",
     "SubmitDecision",

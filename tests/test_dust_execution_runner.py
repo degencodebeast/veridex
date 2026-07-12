@@ -24,6 +24,7 @@ test fails) is meaningful and not vacuously green.
 
 from __future__ import annotations
 
+from veridex.dust_execution.clobv2_gate import Clobv2GateResult
 from veridex.dust_execution.contracts import (
     DustExecutionSessionMeta,
     DustRunLabelEvent,
@@ -36,23 +37,43 @@ from veridex.dust_execution.contracts import (
     SessionRiskSnapshot,
 )
 from veridex.dust_execution.emergency import DustSafetySession, SafetyController
-from veridex.dust_execution.manifest import StrategyExperimentManifest
+from veridex.dust_execution.facade import MMExecutionToolRequest, MMIntentParams
+from veridex.dust_execution.manifest import (
+    StrategyAuthorizationDecision,
+    StrategyExperimentManifest,
+)
 from veridex.dust_execution.noncrossing import LegKind, OwnOrderLeg
+from veridex.dust_execution.privy_control_plane import (
+    PrivyPreflightResult,
+    ProvisioningResult,
+)
 from veridex.dust_execution.risk import RealizedFillRecord, RiskAccumulator
 from veridex.dust_execution.runner import (
     ABSTAIN_REASONS,
     BookSide,
     DustExecutionResult,
     DustQuote,
+    ModeBArming,
     StaleVenueBook,
     SubmitDecision,
     run_dust_execution,
 )
 from veridex.dust_execution.signer import LocalFakeWalletControlPlane, SignedArtifact
+from veridex.dust_execution.sizing import resolve_dust_size
+from veridex.dust_execution.wallet_binding import (
+    ALLOWED_SIGN_METHOD,
+    CHAIN_ID_POLYGON,
+    CLOB_AUTH_PRIMARY_TYPE,
+    ORDER_PRIMARY_TYPE,
+    AuthorizationQuorum,
+    ExecutionWalletBinding,
+    PolicyRule,
+    PrivyWalletPolicy,
+)
 from veridex.policy.circuit_breaker import CircuitBreaker, CircuitState
 from veridex.policy.envelope import PolicyEnvelope
 from veridex.runtime.evidence import compute_evidence_hash
-from veridex.venues.base import Order
+from veridex.venues.base import Order, SubmitAck
 from veridex.venues.sx_bet import FakeVenueAdapter
 
 # The E1-T2 canonical lifecycle-stream ordering (session meta precedes this, unnumbered):
@@ -158,7 +179,111 @@ async def _noop_sleep(_seconds: float) -> None:  # injected sleep seam — never
     return None
 
 
+# --- E6-T4 pinned sizing inputs + Mode-B arming fixtures -------------------------------------
+#
+# The pinned (never agent-supplied) sizing state: fixed_fraction * wallet_equity, clamped by the
+# manifest/policy caps. With these defaults resolve_dust_size == min(1.0, 5.0, 100.0) == 1.0, so the
+# real wire size matches the E6-T1 placeholder and the AC-003 equivalence tests are unaffected.
+_WALLET_EQUITY = 100.0
+_FIXED_FRACTION = 0.01
+
+
+def _policy() -> PrivyWalletPolicy:
+    """The pinned default-deny, typed-data-only wallet policy the arming gate verifies against."""
+    return PrivyWalletPolicy(
+        rules=(
+            PolicyRule(ALLOWED_SIGN_METHOD, ORDER_PRIMARY_TYPE, "ALLOW"),
+            PolicyRule(ALLOWED_SIGN_METHOD, CLOB_AUTH_PRIMARY_TYPE, "ALLOW"),
+        ),
+        default_action="DENY",
+        owner_type="quorum",
+    )
+
+
+def _quorum() -> AuthorizationQuorum:
+    return AuthorizationQuorum(quorum_ref="q-mode-b", authorization_key_refs=("k1", "k2"), threshold=2)
+
+
+def _binding(*, wallet_address: str = "0xExecWalletModeB") -> ExecutionWalletBinding:
+    """A valid, deterministic custody binding (equal-by-value across calls → identical hash)."""
+    policy = _policy()
+    quorum = _quorum()
+    return ExecutionWalletBinding(
+        provider="privy",
+        wallet_ref="wallet-mode-b",
+        wallet_address=wallet_address,
+        chain_id=CHAIN_ID_POLYGON,
+        venue="polymarket",
+        privy_policy_content_hash=policy.content_hash(),
+        authorization_quorum_ref=quorum.quorum_ref,
+        authorization_quorum_content_hash=quorum.content_hash(),
+        quorum_threshold=quorum.threshold,
+    )
+
+
+def _clobv2_ok() -> Clobv2GateResult:
+    return Clobv2GateResult(
+        supported_client=True,
+        client_version="2",
+        fixtures_match=True,
+        cancel_verified=True,
+        get_orders_verified=True,
+        operator_smoke_ok=True,
+    )
+
+
+def _preflight_ok() -> PrivyPreflightResult:
+    return PrivyPreflightResult(
+        ok=True,
+        detail="operator-confirmed",
+        exercised_rules=(CLOB_AUTH_PRIMARY_TYPE, ORDER_PRIMARY_TYPE),
+        recovery_verified=True,
+    )
+
+
+def _provisioning_ok() -> ProvisioningResult:
+    return ProvisioningResult(ok=True, detail="operator-confirmed")
+
+
+def _mode_b_manifest(binding: ExecutionWalletBinding | None = None, **kw: object) -> StrategyExperimentManifest:
+    """A Mode-B manifest whose explicit ``execution_wallet_binding_hash`` pins the binding."""
+    b = binding if binding is not None else _binding()
+    fields: dict[str, object] = {"mode": "live_guarded", "execution_wallet_binding_hash": b.binding_hash()}
+    fields.update(kw)
+    return _manifest(**fields)
+
+
+def _arming(
+    binding: ExecutionWalletBinding | None = None,
+    *,
+    mode_a_passed: bool = True,
+    clobv2: Clobv2GateResult | None = None,
+    preflight: PrivyPreflightResult | None = None,
+    provisioning: ProvisioningResult | None = None,
+    live_policy: PrivyWalletPolicy | None = None,
+    live_quorum: AuthorizationQuorum | None = None,
+) -> ModeBArming:
+    """A fully-passing Mode-B arming bundle, with per-precondition overrides for the failure tests."""
+    b = binding if binding is not None else _binding()
+    return ModeBArming(
+        mode_a_passed=mode_a_passed,
+        clobv2_gate=clobv2 if clobv2 is not None else _clobv2_ok(),
+        privy_preflight=preflight if preflight is not None else _preflight_ok(),
+        provisioning=provisioning if provisioning is not None else _provisioning_ok(),
+        binding=b,
+        live_policy=live_policy if live_policy is not None else _policy(),
+        live_quorum=live_quorum if live_quorum is not None else _quorum(),
+    )
+
+
+#: Sentinel so ``_run_guarded`` can distinguish "arming not passed" (default → valid) from an
+#: explicit ``arming=None`` (the "binding absent" fail-closed case).
+_ARMING_DEFAULT: object = object()
+
+
 async def _run(*, adapter: FakeVenueAdapter, source: _ScriptedSource, mode: ExecutionMode) -> DustExecutionResult:
+    binding = _binding()
+    manifest = _mode_b_manifest(binding) if mode == "live_guarded" else _manifest(mode=mode)
     return await run_dust_execution(
         adapter=adapter,
         signer=LocalFakeWalletControlPlane(),
@@ -166,8 +291,11 @@ async def _run(*, adapter: FakeVenueAdapter, source: _ScriptedSource, mode: Exec
         now_fn=_clock,
         sleep_fn=_noop_sleep,
         envelope=_env(),
-        manifest=_manifest(mode=mode),
+        manifest=manifest,
         mode=mode,
+        wallet_equity_at_decision=_WALLET_EQUITY,
+        fixed_fraction=_FIXED_FRACTION,
+        arming=_arming(binding) if mode == "live_guarded" else None,
     )
 
 
@@ -422,6 +550,13 @@ class RecordingFakeAdapter(FakeVenueAdapter):
         super().__init__(fill=fill)
         self.cancel_all_calls = 0
         self._fill_history_matches = fill_history_matches
+        #: Every ``Order`` that actually reached the submit wire — the wire-size proof (E6-T4) reads
+        #: the size off the ORDER the runner built, never the value the agent requested.
+        self.submitted_orders: list[Order] = []
+
+    async def submit_order(self, order: Order) -> SubmitAck:
+        self.submitted_orders.append(order)
+        return await super().submit_order(order)
 
     async def cancel_all_orders(self) -> int:
         self.cancel_all_calls += 1
@@ -453,7 +588,15 @@ async def _run_guarded(
     own_legs: tuple[OwnOrderLeg, ...] = (),
     envelope: PolicyEnvelope | None = None,
     source: _ScriptedSource | None = None,
+    arming: object = _ARMING_DEFAULT,
+    manifest: StrategyExperimentManifest | None = None,
+    request: MMExecutionToolRequest | None = None,
+    wallet_equity_at_decision: float = _WALLET_EQUITY,
+    fixed_fraction: float = _FIXED_FRACTION,
 ) -> DustExecutionResult:
+    binding = _binding()
+    effective_manifest = manifest if manifest is not None else _mode_b_manifest(binding)
+    effective_arming = _arming(binding) if arming is _ARMING_DEFAULT else arming
     return await run_dust_execution(
         adapter=adapter,
         signer=LocalFakeWalletControlPlane(),
@@ -461,8 +604,12 @@ async def _run_guarded(
         now_fn=_clock,
         sleep_fn=_noop_sleep,
         envelope=envelope if envelope is not None else _env(),
-        manifest=_manifest(mode="live_guarded"),
+        manifest=effective_manifest,
         mode="live_guarded",
+        wallet_equity_at_decision=wallet_equity_at_decision,
+        fixed_fraction=fixed_fraction,
+        arming=effective_arming,  # type: ignore[arg-type]
+        request=request,
         safety=safety,
         session=session,
         risk=risk,
@@ -626,3 +773,261 @@ async def test_runner_risk_snapshot_threads_real_realized_loss() -> None:
     assert snap.kill_switch_engaged is False
     assert adapter.cancel_all_calls == 0, "a non-breaching fill must NOT fire the cancel-all wire"
     assert adapter.submit_calls == 1, "a non-breaching fill leaves the submit path open"
+
+
+# --- E6-T4: mechanical size bound to the wire (Codex-M4 / Fable-m3) --------------------------
+#
+# THE load-bearing proof: the size that reaches the submit wire is ``resolve_dust_size(...)`` and
+# NOTHING else. Two different agent ``confidence`` / requested ``size`` values on the SAME pinned
+# state MUST produce the SAME wire size. Mutation: point the runner's submit at the agent-requested
+# size instead of ``resolve_dust_size`` → this test fails.
+
+
+def _mm_request(
+    *,
+    manifest: StrategyExperimentManifest,
+    envelope: PolicyEnvelope,
+    confidence: float | None,
+    requested_size: float | None,
+    manifest_hash: str | None = None,
+) -> MMExecutionToolRequest:
+    """A typed agent request declaring the admitted pins; ``confidence``/``size`` are untrusted."""
+    return MMExecutionToolRequest(
+        intent_kind="make_quote",
+        intent_params=MMIntentParams(token_id=_TOKEN, side="BUY", price=0.51, size=requested_size),
+        strategy_id=manifest.strategy_id,
+        strategy_config_hash=manifest.strategy_config_hash,
+        policy_hash=envelope.policy_hash(),
+        session_id="agent-session",
+        manifest_hash=manifest_hash if manifest_hash is not None else manifest.manifest_hash(),
+        evidence_class=manifest.evidence_class,
+        mode="live_guarded",
+        reason="agent rationale (untrusted)",
+        confidence=confidence,
+    )
+
+
+async def test_runner_wire_size_is_mechanical_regardless_of_agent_input() -> None:
+    """The wire size == ``resolve_dust_size(...)`` for BOTH agent inputs — never the requested size.
+
+    Same pinned state (wallet_equity, fixed_fraction, manifest); two DIFFERENT agent
+    ``confidence``/requested-``size`` values. The size that reaches ``RecordingFakeAdapter`` is
+    IDENTICAL in both and equals ``resolve_dust_size(...)``. A confidence/size term can never RAISE
+    or move the executable size (GUD-001).
+    """
+    binding = _binding()
+    manifest = _mode_b_manifest(binding)
+    env = _env()
+    # A clamping case so the proof is non-trivial: 0.5 * 100 == 50, clamped by max_notional 5.0.
+    fixed_fraction, wallet_equity = 0.5, 100.0
+    expected = resolve_dust_size(
+        fixed_fraction=fixed_fraction,
+        wallet_equity_at_decision=wallet_equity,
+        max_notional=manifest.max_notional,
+        max_per_order=env.max_stake,
+    )
+    assert expected == 5.0  # min(50.0, 5.0, 100.0)
+
+    adapter_hi = RecordingFakeAdapter(fill=True)
+    await _run_guarded(
+        adapter=adapter_hi,
+        manifest=manifest,
+        envelope=env,
+        arming=_arming(binding),
+        request=_mm_request(manifest=manifest, envelope=env, confidence=0.99, requested_size=999.0),
+        wallet_equity_at_decision=wallet_equity,
+        fixed_fraction=fixed_fraction,
+    )
+    adapter_lo = RecordingFakeAdapter(fill=True)
+    await _run_guarded(
+        adapter=adapter_lo,
+        manifest=manifest,
+        envelope=env,
+        arming=_arming(binding),
+        request=_mm_request(manifest=manifest, envelope=env, confidence=0.01, requested_size=0.001),
+        wallet_equity_at_decision=wallet_equity,
+        fixed_fraction=fixed_fraction,
+    )
+
+    assert adapter_hi.submitted_orders and adapter_lo.submitted_orders
+    size_hi = adapter_hi.submitted_orders[-1].size
+    size_lo = adapter_lo.submitted_orders[-1].size
+    assert size_hi == size_lo == expected, "the wire size must be resolve_dust_size(...), identical"
+    assert size_hi not in (999.0, 0.001), "the agent-requested size must NEVER reach the wire"
+
+
+# --- E6-T4: Mode A -> Mode B hard gate + fail-closed arming ----------------------------------
+
+
+async def test_mode_b_hard_gate_blocks_until_mode_a_passes() -> None:
+    """HARD GATE: Mode B cannot arm until Mode A (dry-run) has passed, even if all else is valid.
+
+    Mutation: allow Mode B to arm without Mode A passing → this test fails (it would submit).
+    """
+    binding = _binding()
+    adapter = RecordingFakeAdapter(fill=True)
+
+    result = await _run_guarded(
+        adapter=adapter,
+        manifest=_mode_b_manifest(binding),
+        arming=_arming(binding, mode_a_passed=False),  # every OTHER precondition is valid
+    )
+
+    assert adapter.submit_calls == 0, "Mode B must stay blocked until Mode A passes"
+    (decision,) = result.decisions
+    assert decision.submitted is False
+    assert decision.abstain_reason == "mode_b_not_armed"
+
+
+async def test_mode_b_blocked_when_any_arming_precondition_fails() -> None:
+    """Mode B stays BLOCKED if ANY arming precondition fails, the binding is absent, or the policy
+    content hash mismatches. Each case is driven OFFLINE via a passing/failing fixture — no live call.
+    """
+    binding = _binding()
+    manifest = _mode_b_manifest(binding)
+
+    # A policy whose CONTENT differs from the pinned binding (arm_mode_b content-hash mismatch).
+    weakened_policy = PrivyWalletPolicy(
+        rules=(
+            PolicyRule(ALLOWED_SIGN_METHOD, ORDER_PRIMARY_TYPE, "ALLOW"),
+            PolicyRule(ALLOWED_SIGN_METHOD, CLOB_AUTH_PRIMARY_TYPE, "ALLOW"),
+        ),
+        default_action="ALLOW",  # weakened default → different content_hash than the pinned binding
+        owner_type="quorum",
+    )
+    # A binding pinned to a DIFFERENT wallet → its hash ≠ the manifest's pinned field.
+    rerouted_binding = _binding(wallet_address="0xAttackerWallet")
+
+    cases: dict[str, object | None] = {
+        "binding_absent": None,
+        "mode_a_not_passed": _arming(binding, mode_a_passed=False),
+        "clobv2_gate_pending": _arming(
+            binding,
+            clobv2=Clobv2GateResult(
+                supported_client=True,
+                client_version="2",
+                fixtures_match=True,
+                cancel_verified=True,
+                get_orders_verified=True,
+                operator_smoke_ok=None,  # operator smoke not run → mode_b_admitted is False
+            ),
+        ),
+        "privy_preflight_pending": _arming(
+            binding, preflight=PrivyPreflightResult(ok=None, detail="operator-pending")
+        ),
+        "provisioning_pending": _arming(
+            binding, provisioning=ProvisioningResult(ok=None, detail="operator-pending")
+        ),
+        "policy_content_hash_mismatch": _arming(binding, live_policy=weakened_policy),
+        "binding_hash_mismatch": _arming(rerouted_binding),
+    }
+
+    for name, arming in cases.items():
+        adapter = RecordingFakeAdapter(fill=True)
+        result = await _run_guarded(adapter=adapter, manifest=manifest, arming=arming)
+        assert adapter.submit_calls == 0, f"{name}: Mode B must stay blocked (no order on the wire)"
+        (decision,) = result.decisions
+        assert decision.submitted is False, name
+        assert decision.abstain_reason == "mode_b_not_armed", name
+
+
+async def test_mode_b_arms_and_submits_when_all_preconditions_pass() -> None:
+    """POSITIVE CONTROL: with Mode A passed AND every arming precondition valid, Mode B submits once.
+
+    Makes the hard-gate / blocked-on-precondition MUTATIONS meaningful (not vacuously green).
+    """
+    adapter = RecordingFakeAdapter(fill=True)
+
+    result = await _run_guarded(adapter=adapter)  # default: valid arming + pinned Mode-B manifest
+
+    assert adapter.submit_calls == 1, "a fully-armed Mode B must reach the submit wire"
+    (decision,) = result.decisions
+    assert decision.submitted is True and decision.abstain_reason is None
+
+
+# --- E6-T4: manifest authorization (missing/mismatched fails closed; admit-but-cap) ----------
+
+
+async def test_mismatched_manifest_hash_on_request_fails_closed() -> None:
+    """A request whose DECLARED manifest hash does not match the admitted pin fails closed."""
+    binding = _binding()
+    manifest = _mode_b_manifest(binding)
+    env = _env()
+    bad_request = _mm_request(
+        manifest=manifest, envelope=env, confidence=0.5, requested_size=1.0, manifest_hash="00" * 32
+    )
+    adapter = RecordingFakeAdapter(fill=True)
+
+    result = await _run_guarded(
+        adapter=adapter, manifest=manifest, envelope=env, arming=_arming(binding), request=bad_request
+    )
+
+    assert adapter.submit_calls == 0, "a mismatched declared manifest hash must NOT reach the wire"
+    (decision,) = result.decisions
+    assert decision.submitted is False
+    assert decision.abstain_reason == "manifest_hash_mismatch"
+
+
+async def test_experimental_dust_admits_without_profitability_but_trips_loss_cap() -> None:
+    """An EXPERIMENTAL_DUST manifest admits WITHOUT a profitability flag yet still trips the loss cap.
+
+    (a) fresh session → ``ALLOW`` (no profitability flag required) → submits.
+    (b) accumulated loss reaching ``max_session_loss`` → admission ``DENY`` → no order on the wire.
+    """
+    binding = _binding()
+    manifest = _mode_b_manifest(binding)  # evidence_class == EXPERIMENTAL_DUST, max_session_loss 2.0
+    assert manifest.evidence_class == "EXPERIMENTAL_DUST"
+
+    # (a) admitted at the strictest caps, no profitability flag anywhere.
+    adapter_ok = RecordingFakeAdapter(fill=True)
+    result_ok = await _run_guarded(adapter=adapter_ok, manifest=manifest)
+    assert result_ok.admission.verdict == "ALLOW"
+    assert result_ok.admission.reason_codes == ()
+    assert adapter_ok.submit_calls == 1
+
+    # (b) the loss cap is still enforced — a session at the cap is DENIED admission.
+    adapter_capped = RecordingFakeAdapter(fill=True)
+    breached_risk = RiskAccumulator.seeded(
+        session_id="dust-maker-v0:live_guarded", net_session=-2.0, net_day=-2.0, current_day=None
+    )
+    result_capped = await _run_guarded(adapter=adapter_capped, manifest=manifest, risk=breached_risk)
+    assert result_capped.admission.verdict == "DENY"
+    assert "session_loss_cap" in result_capped.admission.reason_codes
+    assert adapter_capped.submit_calls == 0
+    (decision,) = result_capped.decisions
+    assert decision.submitted is False
+    assert decision.abstain_reason == "admission_denied"
+
+
+async def test_identical_request_and_hashes_yield_identical_admission_across_modes() -> None:
+    """Identical request + hashes → IDENTICAL admission verdict in dry-run and live-guarded (AC-021)."""
+    binding = _binding()
+    manifest = _mode_b_manifest(binding)
+    env = _env()
+    request = _mm_request(manifest=manifest, envelope=env, confidence=0.7, requested_size=2.0)
+
+    async def _admit(mode: ExecutionMode, arming: ModeBArming | None) -> StrategyAuthorizationDecision:
+        # A shared session identity so the admission is a pure function of manifest+policy+session
+        # (mode-independent); the session_id is otherwise mode-tagged by the runner.
+        result = await run_dust_execution(
+            adapter=RecordingFakeAdapter(fill=True),
+            signer=LocalFakeWalletControlPlane(),
+            sources=_ScriptedSource(quote=_fresh_quote()),
+            now_fn=_clock,
+            sleep_fn=_noop_sleep,
+            envelope=env,
+            manifest=manifest,
+            mode=mode,
+            wallet_equity_at_decision=_WALLET_EQUITY,
+            fixed_fraction=_FIXED_FRACTION,
+            arming=arming,
+            request=request,
+            session=DustSafetySession(session_id="admission-parity"),
+        )
+        return result.admission
+
+    admission_dry = await _admit("dry_run", None)
+    admission_live = await _admit("live_guarded", _arming(binding))
+
+    assert admission_dry == admission_live, "admission must be identical across runner modes (AC-021)"
+    assert admission_dry.verdict == "ALLOW"
