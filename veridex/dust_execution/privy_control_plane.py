@@ -49,6 +49,8 @@ from veridex.dust_execution.manifest import StrategyExperimentManifest
 from veridex.dust_execution.risk import FailClosed
 from veridex.dust_execution.signing_compiler import (
     CompiledSigningPayload,
+    _addr32,
+    _u256,
     keccak256,
     order_hash_from_typed_data,
 )
@@ -191,14 +193,6 @@ _CLOB_AUTH_TYPE_STRING: str = (
 )
 _CLOB_AUTH_DOMAIN_TYPE_HASH: bytes = keccak256(_CLOB_AUTH_DOMAIN_TYPE_STRING.encode("utf-8"))
 _CLOB_AUTH_TYPE_HASH: bytes = keccak256(_CLOB_AUTH_TYPE_STRING.encode("utf-8"))
-
-
-def _u256(value: int) -> bytes:
-    return int(value).to_bytes(32, "big")
-
-
-def _addr32(value: str) -> bytes:
-    return int(value, 16).to_bytes(32, "big")
 
 
 def _kstr(value: str) -> bytes:

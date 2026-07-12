@@ -34,6 +34,7 @@ from enum import Enum
 from typing import TYPE_CHECKING, Literal
 
 from veridex.dust_execution.reconcile import UncertainSubmitState
+from veridex.dust_execution.resting_order import _TICK_ATOL
 from veridex.dust_execution.risk import FailClosed
 
 if TYPE_CHECKING:  # pragma: no cover - typing only; keep the module import light + offline-safe.
@@ -58,8 +59,8 @@ __all__ = [
 ]
 
 # Absolute tolerance for tick-alignment / boundary checks — well below the smallest sane Polymarket
-# tick (0.001). Mirrors ``veridex.dust_execution.resting_order._TICK_ATOL``.
-_TICK_ATOL: float = 1e-9
+# tick (0.001). SINGLE-SOURCED from ``veridex.dust_execution.resting_order._TICK_ATOL`` (imported
+# above) so the two tick-alignment paths can never silently drift apart.
 
 #: Order sides: BUY is a bid (buys the outcome token), SELL is an ask (sells it). The self-cross
 #: invariant compares the highest own BID against the lowest own ASK.

@@ -33,7 +33,8 @@ id. NO raw owner / L2 cred / signature is ever written.
 
 from __future__ import annotations
 
-from collections.abc import Awaitable, Callable, Iterable, Mapping
+import logging
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Literal
 
@@ -42,9 +43,12 @@ from veridex.dust_execution.l2_transport import (
     FillHistoryReader,
     InMemoryPreSubmitStore,
     ReconciledFill,
+    _match_fill_size,
     reconcile_ack_lost,
 )
 from veridex.store import Store
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:  # pragma: no cover - typing only, no runtime coupling (E4-T1 injection style)
     from veridex.dust_execution.contracts import CancelAllCause
@@ -214,28 +218,6 @@ class UncertainSubmitVerdict:
     open_candidate_count: int
 
 
-def _fill_size_for_key(trades: Iterable[Mapping[str, Any]], venue_order_key: str) -> float | None:
-    """Sum matched sizes for trades whose OFFICIAL id equals ``venue_order_key`` (``None`` if none).
-
-    Matches ONLY on the venue's official ids (``taker_order_id`` when we are taker, or a
-    ``maker_orders[].order_id`` when we are the resting maker) — NEVER on Veridex's private
-    ``client_order_id`` (which is never on the wire). Mirrors the E3-T8 restart-join matcher; kept
-    local so this module consumes the read surfaces without depending on a private helper.
-    """
-    matched = 0.0
-    found = False
-    for trade in trades:
-        if str(trade.get("taker_order_id", "")) == venue_order_key:
-            matched += float(trade.get("size", 0.0) or 0.0)
-            found = True
-            continue
-        for maker in trade.get("maker_orders", []) or []:
-            if str(maker.get("order_id", "")) == venue_order_key:
-                matched += float(maker.get("matched_amount", 0.0) or 0.0)
-                found = True
-    return matched if found else None
-
-
 async def _fill_history_evidence(
     adapter: VenueReconciliationReads, venue_order_key: str
 ) -> float | None:
@@ -244,6 +226,9 @@ async def _fill_history_evidence(
     FAIL-CLOSED: a missing surface (the adapter lacks ``get_fill_history``) or a reader that raises
     yields ``None`` — "no proof of a fill", never a fabricated absence. This is exactly what keeps a
     taker with an unavailable history surface AMBIGUOUS and NEVER ``DEFINITIVELY_ABSENT``.
+
+    Reuses the SINGLE-SOURCE venue-fill matcher :func:`veridex.dust_execution.l2_transport._match_fill_size`
+    (the same matcher the E3-T8 restart-join reconcile uses) — one matcher feeds BOTH fund-touching paths.
     """
     reader = getattr(adapter, "get_fill_history", None)
     if reader is None:
@@ -251,9 +236,17 @@ async def _fill_history_evidence(
     try:
         page = await reader(venue_order_key=venue_order_key)
     except Exception:
+        # FAIL-CLOSED to "no proof" (→ AMBIGUOUS). Logged at debug so a latent reader bug stays
+        # findable; the venue_order_key is a PUBLIC official id (no secret), the fail-direction is
+        # unchanged.
+        logger.debug(
+            "get_fill_history read failed for venue_order_key=%s; degrading to no-proof (AMBIGUOUS)",
+            venue_order_key,
+            exc_info=True,
+        )
         return None
     trades = (page.get("trades") or page.get("data") or []) if isinstance(page, Mapping) else page
-    return _fill_size_for_key(trades or [], venue_order_key)
+    return _match_fill_size(trades or [], venue_order_key)
 
 
 async def _terminal_status_evidence(
@@ -270,6 +263,13 @@ async def _terminal_status_evidence(
     try:
         record = await getter(venue_order_key)
     except Exception:
+        # FAIL-CLOSED to "no terminal proof" (keeps the submit AMBIGUOUS). Logged at debug so a
+        # latent reader bug stays findable; venue_order_key is a PUBLIC official id (no secret).
+        logger.debug(
+            "get_order read failed for venue_order_key=%s; degrading to no-terminal-proof",
+            venue_order_key,
+            exc_info=True,
+        )
         return False
     if not record:
         return False
@@ -289,6 +289,12 @@ async def _open_candidate_count(adapter: VenueReconciliationReads) -> int:
     try:
         orders = await getter()
     except Exception:
+        # FAIL-CLOSED to zero candidates (never manufactures proof of absence on its own). Logged at
+        # debug so a latent reader bug stays findable; no order payload is logged (no secret).
+        logger.debug(
+            "get_orders read failed; degrading to zero open candidates",
+            exc_info=True,
+        )
         return 0
     return len(orders or [])
 

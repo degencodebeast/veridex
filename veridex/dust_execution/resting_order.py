@@ -40,6 +40,8 @@ from veridex.venues.base import RestingOrderVenue, SubmitAck
 
 # Native prices are probability-like share prices in the OPEN interval (0, 1). Absolute tolerance for
 # tick-alignment / boundary checks — well below the smallest sane Polymarket tick (0.001).
+# SINGLE SOURCE: ``veridex.dust_execution.noncrossing`` imports this exact constant so the two
+# tick-alignment paths share one value and can never silently drift apart.
 _TICK_ATOL: float = 1e-9
 
 
