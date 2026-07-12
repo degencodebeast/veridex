@@ -1,0 +1,20 @@
+{
+  "_comment": "STALE V1-shaped SendOrder: carries removed fields (taker, nonce, feeRateBps) and is MISSING the V2 additions (timestamp, builder). A fixture built against this stale schema MUST fail closed against the V2 exact-set (§1b/§2b).",
+  "order": {
+    "salt": "479249096354",
+    "maker": "0x1111111111111111111111111111111111111111",
+    "signer": "0x1111111111111111111111111111111111111111",
+    "taker": "0x0000000000000000000000000000000000000000",
+    "tokenId": "1029364920843200000000000000000000000000000000000000000000000000000",
+    "makerAmount": "1000000",
+    "takerAmount": "2000000",
+    "side": "BUY",
+    "expiration": "0",
+    "nonce": "0",
+    "feeRateBps": "0",
+    "signatureType": 0,
+    "signature": "0xdeadbeef"
+  },
+  "owner": "00000000-0000-0000-0000-000000000000",
+  "orderType": "GTC"
+}
