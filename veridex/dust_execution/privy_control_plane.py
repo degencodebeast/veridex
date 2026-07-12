@@ -173,6 +173,94 @@ def recover_signer_address(digest: bytes, signature: bytes) -> str:
 
 
 # ---------------------------------------------------------------------------
+# L1 ``ClobAuth`` EIP-712 (E3-T0 §7a) — the typed-data signed to create/derive L2 creds.
+# Domain STAYS ``version:"1"`` in V2 (only the exchange order domain bumped to "2").
+# ---------------------------------------------------------------------------
+
+#: §7a ClobAuth domain (NO ``verifyingContract`` — only name/version/chainId).
+_CLOB_AUTH_DOMAIN_NAME: str = "ClobAuthDomain"
+_CLOB_AUTH_DOMAIN_VERSION: str = "1"
+_CLOB_AUTH_CHAIN_ID: int = 137
+#: §7a fixed attestation message.
+CLOB_AUTH_MESSAGE: str = "This message attests that I control the given wallet"
+
+# EIP-712 type strings for the ClobAuth domain (no verifyingContract) + the ClobAuth struct.
+_CLOB_AUTH_DOMAIN_TYPE_STRING: str = "EIP712Domain(string name,string version,uint256 chainId)"
+_CLOB_AUTH_TYPE_STRING: str = (
+    "ClobAuth(address address,string timestamp,uint256 nonce,string message)"
+)
+_CLOB_AUTH_DOMAIN_TYPE_HASH: bytes = keccak256(_CLOB_AUTH_DOMAIN_TYPE_STRING.encode("utf-8"))
+_CLOB_AUTH_TYPE_HASH: bytes = keccak256(_CLOB_AUTH_TYPE_STRING.encode("utf-8"))
+
+
+def _u256(value: int) -> bytes:
+    return int(value).to_bytes(32, "big")
+
+
+def _addr32(value: str) -> bytes:
+    return int(value, 16).to_bytes(32, "big")
+
+
+def _kstr(value: str) -> bytes:
+    """EIP-712 encoding of a dynamic ``string`` value: ``keccak256(utf-8 bytes)``."""
+    return keccak256(str(value).encode("utf-8"))
+
+
+def build_clob_auth_typed_data(*, address: str, timestamp: str, nonce: int = 0) -> dict[str, Any]:
+    """Build the §7a L1 ``ClobAuth`` typed data for ``address`` (default nonce 0)."""
+    return {
+        "primaryType": CLOB_AUTH_PRIMARY_TYPE,
+        "types": {
+            "EIP712Domain": [
+                {"name": "name", "type": "string"},
+                {"name": "version", "type": "string"},
+                {"name": "chainId", "type": "uint256"},
+            ],
+            "ClobAuth": [
+                {"name": "address", "type": "address"},
+                {"name": "timestamp", "type": "string"},
+                {"name": "nonce", "type": "uint256"},
+                {"name": "message", "type": "string"},
+            ],
+        },
+        "domain": {
+            "name": _CLOB_AUTH_DOMAIN_NAME,
+            "version": _CLOB_AUTH_DOMAIN_VERSION,
+            "chainId": _CLOB_AUTH_CHAIN_ID,
+        },
+        "message": {
+            "address": address,
+            "timestamp": str(timestamp),
+            "nonce": int(nonce),
+            "message": CLOB_AUTH_MESSAGE,
+        },
+    }
+
+
+def clob_auth_hash_from_typed_data(typed_data: dict[str, Any]) -> str:
+    """Compute the §7a L1 ``ClobAuth`` EIP-712 digest = ``keccak(0x1901 || domainSep || structHash)``.
+
+    Pure stdlib keccak (via :func:`veridex.dust_execution.signing_compiler.keccak256`); NO local key.
+    """
+    domain = typed_data["domain"]
+    message = typed_data["message"]
+    domain_separator = keccak256(
+        _CLOB_AUTH_DOMAIN_TYPE_HASH
+        + _kstr(domain["name"])
+        + _kstr(domain["version"])
+        + _u256(int(domain["chainId"]))
+    )
+    struct_hash = keccak256(
+        _CLOB_AUTH_TYPE_HASH
+        + _addr32(str(message["address"]))
+        + _kstr(message["timestamp"])
+        + _u256(int(message["nonce"]))
+        + _kstr(message["message"])
+    )
+    return "0x" + keccak256(b"\x19\x01" + domain_separator + struct_hash).hex()
+
+
+# ---------------------------------------------------------------------------
 # Authorization context (owner/quorum + signed replay-expiry + idempotency)
 # ---------------------------------------------------------------------------
 
@@ -289,6 +377,13 @@ class PrivyEvmWalletControlPlane:
         self._validate_auth(auth)
 
         typed_data = compiled_payload.canonical_v2_typed_data
+        # Default-deny domain guard: this path signs ONLY the V2 ``Order`` domain. Any other
+        # ``primaryType`` (a non-order EIP-712 domain) is refused at custody before any I/O.
+        if typed_data.get("primaryType") != ORDER_PRIMARY_TYPE:
+            raise FailClosed(
+                f"default-deny: sign_typed_data signs ONLY the V2 {ORDER_PRIMARY_TYPE!r} domain, got "
+                f"primaryType {typed_data.get('primaryType')!r} (REQ-018a)"
+            )
         message = typed_data.get("message", {})
         order_signer = str(message.get("signer", ""))
 
@@ -332,6 +427,68 @@ class PrivyEvmWalletControlPlane:
                 "recovered signer does not equal the compiled order signer (fail closed)"
             )
 
+        return TypedDataSignature(
+            method=ALLOWED_SIGN_METHOD,
+            signature=signature_hex,
+            eip712_digest=local_digest_hex,
+            recovered_address=recovered,
+        )
+
+    # -- the L1 ClobAuth signing path (create/derive L2 creds) ---------------------------------------
+
+    def sign_clob_auth(
+        self,
+        clob_auth_typed_data: dict[str, Any],
+        *,
+        binding: ExecutionWalletBinding,
+        auth: PrivyAuthContext,
+    ) -> TypedDataSignature:
+        """Sign the §7a L1 ``ClobAuth`` typed data via ``eth_signTypedData_v4`` (recover-and-require).
+
+        Same fail-closed order as :meth:`sign_typed_data`: validate auth → default-deny primaryType
+        guard (ONLY ``ClobAuth``) → recompute the L1 digest LOCALLY → sign via the recording-fake Privy
+        client → recover the signer and REQUIRE it equals BOTH ``binding.wallet_address`` AND the
+        ClobAuth ``address`` field. A provider error FREEZES (never a local-key fallback).
+        """
+        self._validate_auth(auth)
+
+        if clob_auth_typed_data.get("primaryType") != CLOB_AUTH_PRIMARY_TYPE:
+            raise FailClosed(
+                f"default-deny: sign_clob_auth signs ONLY the L1 {CLOB_AUTH_PRIMARY_TYPE!r} domain, got "
+                f"primaryType {clob_auth_typed_data.get('primaryType')!r} (REQ-018f)"
+            )
+        message = clob_auth_typed_data.get("message", {})
+        clob_address = str(message.get("address", ""))
+
+        local_digest_hex = clob_auth_hash_from_typed_data(clob_auth_typed_data)
+        if clob_address.lower() != binding.wallet_address.lower():
+            raise FailClosed(
+                "ClobAuth address does not equal the bound wallet address (custody mismatch)"
+            )
+
+        try:
+            response = self._client.sign_typed_data(
+                wallet_ref=binding.wallet_ref, typed_data=clob_auth_typed_data, auth=auth
+            )
+        except FailClosed:
+            raise
+        except Exception as exc:  # provider outage / any error → freeze, NEVER local
+            raise FailClosed(
+                "Privy provider error while signing ClobAuth — freezing (Mode-B never falls back to a "
+                "local key)"
+            ) from exc
+
+        signature_hex = self._extract_signature(response)
+        digest_bytes = bytes.fromhex(_strip0x(local_digest_hex))
+        recovered = recover_signer_address(digest_bytes, bytes.fromhex(_strip0x(signature_hex)))
+        if recovered.lower() != binding.wallet_address.lower():
+            raise FailClosed(
+                "recovered ClobAuth signer does not equal binding.wallet_address (fail closed)"
+            )
+        if recovered.lower() != clob_address.lower():
+            raise FailClosed(
+                "recovered ClobAuth signer does not equal the ClobAuth address field (fail closed)"
+            )
         return TypedDataSignature(
             method=ALLOWED_SIGN_METHOD,
             signature=signature_hex,
@@ -503,6 +660,226 @@ def execute_with(
 
 
 # ---------------------------------------------------------------------------
+# L2 credential lifecycle: create/derive HMAC creds via a CLOB-V2 auth client (§7a endpoints)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class L2ApiCredentials:
+    """The L2 HMAC credentials derived from an L1 ClobAuth signature (§7b) — SECRETS held in memory.
+
+    ``api_key`` (the ``owner`` UUID), ``api_secret`` (the base64url HMAC secret) and ``api_passphrase``
+    are SECRETS: NEVER persisted to the manifest/ledger, NEVER logged, NEVER placed in evidence. Only
+    the NON-secret ``derivation_ref`` + ``derivation_nonce`` are persistable — enough to RE-DERIVE the
+    creds via the L1 path, never the creds themselves. ``__repr__``/``__str__`` are scrubbed so a stray
+    log line can never leak a secret.
+    """
+
+    api_key: str
+    api_secret: str
+    api_passphrase: str
+    derivation_ref: str
+    derivation_nonce: int = 0
+
+    def __repr__(self) -> str:  # never leak secrets through repr/str
+        return (
+            f"L2ApiCredentials(derivation_ref={self.derivation_ref!r}, "
+            f"derivation_nonce={self.derivation_nonce}, <secrets redacted>)"
+        )
+
+    __str__ = __repr__
+
+    def persistable_reference(self) -> dict[str, Any]:
+        """The ONLY thing that may be persisted: the non-secret re-derivation reference."""
+        return {"derivation_ref": self.derivation_ref, "derivation_nonce": self.derivation_nonce}
+
+    def secret_values(self) -> tuple[str, ...]:
+        """The raw secret values — for a store-scan assertion ONLY (never a persistence sink)."""
+        return (self.api_key, self.api_secret, self.api_passphrase)
+
+
+@runtime_checkable
+class ClobAuthClient(Protocol):
+    """The small CLOB-V2 L1 auth client (§7a ``POST /auth/api-key`` / ``GET /auth/derive-api-key``).
+
+    ONLY ever a RECORDING-FAKE in tests. Given the L1 ``POLY_*`` headers, it returns the derived
+    ``ApiCreds`` mapping ``{api_key, api_secret, api_passphrase}``.
+    """
+
+    def create_or_derive_api_key(self, *, l1_headers: dict[str, str]) -> dict[str, str]: ...
+
+
+def build_l1_headers(
+    signature: TypedDataSignature, *, address: str, timestamp: str, nonce: int = 0
+) -> dict[str, str]:
+    """Build the §7a L1 ``POLY_*`` headers from a ClobAuth signature (``POLY_SIGNATURE`` is the sig)."""
+    return {
+        "POLY_ADDRESS": address,
+        "POLY_SIGNATURE": signature.signature,
+        "POLY_TIMESTAMP": str(timestamp),
+        "POLY_NONCE": str(nonce),
+    }
+
+
+def mint_l2_credentials(
+    control_plane: PrivyEvmWalletControlPlane,
+    *,
+    binding: ExecutionWalletBinding,
+    auth: PrivyAuthContext,
+    clob_auth_client: ClobAuthClient,
+    timestamp: str,
+    nonce: int = 0,
+) -> L2ApiCredentials:
+    """Mint L2 HMAC creds: sign L1 ClobAuth via Privy → derive ``ApiCreds`` via the auth client.
+
+    The L1 ``ClobAuth`` typed data is signed through the Privy control plane (recover-and-require), the
+    resulting §7a ``POLY_*`` headers drive the auth client's create/derive, and the returned secrets are
+    wrapped in an in-memory :class:`L2ApiCredentials` (never persisted; only the nonce/ref is).
+    """
+    typed_data = build_clob_auth_typed_data(
+        address=binding.wallet_address, timestamp=timestamp, nonce=nonce
+    )
+    signature = control_plane.sign_clob_auth(typed_data, binding=binding, auth=auth)
+    l1_headers = build_l1_headers(
+        signature, address=binding.wallet_address, timestamp=timestamp, nonce=nonce
+    )
+    creds = clob_auth_client.create_or_derive_api_key(l1_headers=l1_headers)
+    missing = {"api_key", "api_secret", "api_passphrase"} - set(creds)
+    if missing:
+        raise FailClosed(f"CLOB-V2 auth client returned no {sorted(missing)} — cannot derive L2 creds")
+    return L2ApiCredentials(
+        api_key=creds["api_key"],
+        api_secret=creds["api_secret"],
+        api_passphrase=creds["api_passphrase"],
+        derivation_ref=f"{binding.wallet_ref}:{nonce}",
+        derivation_nonce=nonce,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Operator-gated Privy preflight + pUSD/approvals/gas provisioning (ok=None until operator-run)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class PrivyPreflightResult:
+    """The operator-gated Privy signing preflight verdict (ok=None until an operator runs it).
+
+    When run, it signs the allowed-domain-but-signed-field-INVALID fixture (Codex-M4: bad token + zero
+    amounts — NOT an expired wrapper, since V2 ``expiration`` is unsigned), exercising BOTH the L1
+    ``ClobAuth`` and V2 ``Order`` rules, and verifies recovery. It NEVER submits and NEVER persists.
+    """
+
+    ok: bool | None
+    detail: str
+    exercised_rules: tuple[str, ...] = ()
+    recovery_verified: bool = False
+    submitted: bool = False
+    persisted: bool = False
+
+
+def operator_privy_preflight(
+    control_plane: PrivyEvmWalletControlPlane,
+    *,
+    binding: ExecutionWalletBinding,
+    invalid_order_payload: CompiledSigningPayload,
+    order_auth: PrivyAuthContext,
+    clob_auth: PrivyAuthContext,
+    timestamp: str = "0",
+    nonce: int = 0,
+    operator_ran: bool = False,
+) -> PrivyPreflightResult:
+    """Operator-gated Privy preflight — ``ok=None`` until an operator runs it (OUT of CI).
+
+    When ``operator_ran`` is True it signs the L1 ``ClobAuth`` AND the signed-field-invalid V2 order
+    (allowed domains, non-executable message fields), relying on the control plane's recover-and-require
+    to verify recovery. It NEVER calls a submit/persist surface. ``ok=None`` while pending.
+    """
+    if not operator_ran:
+        return PrivyPreflightResult(
+            ok=None,
+            detail=(
+                "operator-pending: the Privy signing preflight is OPERATOR-RUN and OUT of CI — it has "
+                "not been run, so ok=None (never auto-True; signs a signed-field-invalid fixture only)"
+            ),
+        )
+
+    clob_typed = build_clob_auth_typed_data(
+        address=binding.wallet_address, timestamp=timestamp, nonce=nonce
+    )
+    # Exercise BOTH allowed rules; recover-and-require inside each call verifies recovery.
+    control_plane.sign_clob_auth(clob_typed, binding=binding, auth=clob_auth)
+    control_plane.sign_typed_data(invalid_order_payload, binding=binding, auth=order_auth)
+    return PrivyPreflightResult(
+        ok=True,
+        detail=(
+            "operator-confirmed: signed the allowed-domain, signed-field-invalid fixture (bad token + "
+            "zero amounts) for BOTH the ClobAuth and V2 Order rules; recovery verified; never submitted"
+        ),
+        exercised_rules=(CLOB_AUTH_PRIMARY_TYPE, ORDER_PRIMARY_TYPE),
+        recovery_verified=True,
+        submitted=False,
+        persisted=False,
+    )
+
+
+@dataclass(frozen=True)
+class ProvisioningResult:
+    """The operator-gated pUSD/approvals/gas one-time provisioning verdict (ok=None until run).
+
+    Asserts (when run): pUSD balance ≥ session need, approvals present, the default-deny policy is
+    restored, and the policy content hash is re-pinned to the binding's pinned hash.
+    """
+
+    ok: bool | None
+    detail: str
+
+
+def operator_pusd_provisioning_preflight(
+    *,
+    pusd_balance: float,
+    session_need: float,
+    approvals_present: bool,
+    default_deny_restored: bool,
+    live_policy_content_hash: str,
+    pinned_policy_content_hash: str,
+    operator_ran: bool = False,
+) -> ProvisioningResult:
+    """Operator-gated pUSD/approvals/gas provisioning preflight — ``ok=None`` until an operator runs it.
+
+    Fail-closed AND of: balance ≥ session need, approvals present, default-deny policy restored, and the
+    live policy content hash re-pinned to the pinned binding hash. ``ok=None`` while pending.
+    """
+    if not operator_ran:
+        return ProvisioningResult(
+            ok=None,
+            detail=(
+                "operator-pending: the one-time pUSD/approvals/gas provisioning is OPERATOR-RUN and OUT "
+                "of CI — it has not been run, so ok=None (never auto-True)"
+            ),
+        )
+    reasons: list[str] = []
+    if not (pusd_balance + 1e-9 >= session_need):
+        reasons.append(f"pUSD balance {pusd_balance:g} < session need {session_need:g}")
+    if not approvals_present:
+        reasons.append("required approvals are not present")
+    if not default_deny_restored:
+        reasons.append("default-deny policy was not restored")
+    if live_policy_content_hash != pinned_policy_content_hash:
+        reasons.append("policy content hash was not re-pinned to the binding's pinned hash")
+    ok = not reasons
+    return ProvisioningResult(
+        ok=ok,
+        detail=(
+            "operator-confirmed: pUSD balance ≥ session need, approvals present, default-deny restored, "
+            "content hash re-pinned"
+            if ok
+            else "provisioning FAILED: " + "; ".join(reasons)
+        ),
+    )
+
+
+# ---------------------------------------------------------------------------
 # Mode-B factory (factory-shape: params ⊆ {binding, privy_client, l2_creds, http})
 # ---------------------------------------------------------------------------
 
@@ -524,14 +901,25 @@ def build_mode_b(
 
 
 __all__ = [
+    "CLOB_AUTH_MESSAGE",
     "TYPED_DATA_ONLY",
+    "ClobAuthClient",
+    "L2ApiCredentials",
     "PrivyAuthContext",
     "PrivyEvmWalletControlPlane",
+    "PrivyPreflightResult",
+    "ProvisioningResult",
     "RecordingPrivyClient",
     "TypedDataSignature",
     "arm_mode_b",
+    "build_clob_auth_typed_data",
+    "build_l1_headers",
     "build_mode_b",
+    "clob_auth_hash_from_typed_data",
     "execute_with",
+    "mint_l2_credentials",
+    "operator_privy_preflight",
+    "operator_pusd_provisioning_preflight",
     "pin_manifest",
     "recover_signer_address",
 ]

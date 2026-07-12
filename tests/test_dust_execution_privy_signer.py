@@ -508,3 +508,376 @@ def test_five_no_local_key_controls():
     # (5) OUTAGE-FREEZE, NEVER local: a provider outage fails closed (never a local-key fallback).
     with pytest.raises(FailClosed):
         OutageFakePrivy_cp().sign_typed_data(COMPILED, binding=BIND, auth=CTX)
+
+
+# ===============================================================================================
+# E3-T8 — L1 ClobAuth cred lifecycle + keyless L2 HMAC transport (live commitment wiring) +
+# operator Privy preflight + pUSD provisioning gate + POLY_* scrubbing (REQ-018a/d/f/f2/g).
+# ===============================================================================================
+
+import base64  # noqa: E402
+import copy  # noqa: E402
+import json  # noqa: E402
+
+from veridex.dust_execution import l2_transport as l2t  # noqa: E402
+from veridex.dust_execution.l2_transport import (  # noqa: E402
+    POLY_L2_HEADER_NAMES,
+    InMemoryPreSubmitStore,
+    KeylessL2Transport,
+    build_l2_headers,
+    reconcile_ack_lost,
+    scrub_headers_for_output,
+    scrub_l2_output,
+)
+from veridex.dust_execution.privy_control_plane import (  # noqa: E402
+    CLOB_AUTH_PRIMARY_TYPE,
+    L2ApiCredentials,
+    build_clob_auth_typed_data,
+    mint_l2_credentials,
+    operator_privy_preflight,
+    operator_pusd_provisioning_preflight,
+)
+from veridex.dust_execution.signing_compiler import order_hash_from_typed_data  # noqa: E402
+
+# --- UNIQUE fake secrets (Codex-M3 store-scan) — never collide with a real value ------------------
+_SECRET_OWNER = "UNIQUE-OWNER-UUID-Zzq9Kx7-SECRET-DO-NOT-PERSIST"
+_SECRET_API_SECRET = base64.urlsafe_b64encode(b"UNIQUE-HMAC-SECRET-Xy7v-DO-NOT-PERSIST").decode()
+_SECRET_PASSPHRASE = "UNIQUE-PASSPHRASE-Q42w-SECRET-DO-NOT-PERSIST"
+
+
+def _compile_owner(owner: str, *, maker_amount: str = "1000000", taker_amount: str = "2000000",
+                   token_id: str = "123456789"):
+    compiler = PolymarketV2SigningCompiler()
+    intent = AdmittedPostRoundingIntent(
+        side="BUY", maker_amount=maker_amount, taker_amount=taker_amount,
+        native_price=0.5, size=1.0, tif="GTC",
+    )
+    market = OrderMarket(token_id=token_id, neg_risk=False)
+    binding = SignerBinding(
+        salt="1", maker=_WALLET_ADDRESS, owner=owner, timestamp="1700000000", signer=_WALLET_ADDRESS,
+    )
+    return compiler.compile(intent, market=market, binding=binding)
+
+
+COMPILED_L2 = _compile_owner(_SECRET_OWNER)
+
+_CREDS = L2ApiCredentials(
+    api_key=_SECRET_OWNER, api_secret=_SECRET_API_SECRET, api_passphrase=_SECRET_PASSPHRASE,
+    derivation_ref="wallet-ref-1:0", derivation_nonce=0,
+)
+
+
+class L2FakePrivy(PolicyFakePrivy):
+    """A recording-fake Privy that signs BOTH the V2 Order and the L1 ClobAuth domains."""
+
+    def __init__(self, *, events: list[str] | None = None, priv: int = _ENCLAVE_PRIV) -> None:
+        super().__init__(priv=priv)
+        self._events = events
+
+    def sign_typed_data(self, *, wallet_ref: str, typed_data: dict[str, Any], auth: PrivyAuthContext):
+        pt = typed_data.get("primaryType")
+        self.sign_calls.append({"wallet_ref": wallet_ref, "auth": auth, "primary_type": pt})
+        if pt == "Order":
+            if self._events is not None:
+                self._events.append("sign")
+            digest_hex = order_hash_from_typed_data(typed_data)
+        elif pt == "ClobAuth":
+            from veridex.dust_execution.privy_control_plane import clob_auth_hash_from_typed_data
+            digest_hex = clob_auth_hash_from_typed_data(typed_data)
+        else:  # pragma: no cover - the control plane must never route a disallowed domain here
+            raise AssertionError(f"fake asked to sign disallowed primaryType {pt!r}")
+        sig = _sign(self._priv, bytes.fromhex(digest_hex[2:]))
+        return {"method": ALLOWED_SIGN_METHOD, "data": {"signature": "0x" + sig.hex(), "encoding": "hex"}}
+
+
+class _LoggingStore(InMemoryPreSubmitStore):
+    """An append-only store that logs a 'persist' event so persist-before-sign is provable."""
+
+    def __init__(self, events: list[str]) -> None:
+        super().__init__()
+        self._events = events
+
+    def append_presubmit(self, record) -> None:
+        self._events.append("persist")
+        super().append_presubmit(record)
+
+
+class _RecordingHttp:
+    """A recording-fake async HTTP transport (never a live venue)."""
+
+    def __init__(self) -> None:
+        self.received: dict[str, Any] | None = None
+
+    async def post(self, *, path: str, headers: dict[str, str], body: bytes) -> dict[str, Any]:
+        self.received = {"path": path, "headers": dict(headers), "body": body}
+        return {
+            "success": True, "orderID": "0xVENUEACK", "status": "live",
+            "makingAmount": "", "takingAmount": "", "transactionsHashes": [], "tradeIDs": [],
+            "errorMsg": "",
+        }
+
+
+class _FakeClobAuthClient:
+    """A recording-fake L1 CLOB-V2 auth client returning deterministic ApiCreds."""
+
+    def __init__(self) -> None:
+        self.calls: list[dict[str, str]] = []
+
+    def create_or_derive_api_key(self, *, l1_headers: dict[str, str]) -> dict[str, str]:
+        self.calls.append(l1_headers)
+        return {
+            "api_key": _SECRET_OWNER, "api_secret": _SECRET_API_SECRET,
+            "api_passphrase": _SECRET_PASSPHRASE,
+        }
+
+
+def _transport(*, events: list[str], http: _RecordingHttp, store: _LoggingStore) -> KeylessL2Transport:
+    return KeylessL2Transport(
+        control_plane=PrivyEvmWalletControlPlane(client=L2FakePrivy(events=events), binding=BIND),
+        creds=_CREDS, http=http, store=store, now_s=lambda: 1_700_000_123,
+    )
+
+
+def _store_scan_text(store) -> str:
+    """Everything in the append-only store, stringified — for the UNIQUE-secret store-scan."""
+    return repr(store.list_presubmit())
+
+
+async def test_live_submit_path_persists_compound_presubmit_presign_and_byte_verifies_wire_body(
+    monkeypatch,
+):
+    events: list[str] = []
+    http = _RecordingHttp()
+    store = _LoggingStore(events)
+    transport = _transport(events=events, http=http, store=store)
+
+    # Spy the byte-verify AT ITS l2_transport call site (proves the commitment control is WIRED here,
+    # not in a helper elsewhere — Fable-MAJOR-1). The spy records the exact post_body it verified.
+    captured: dict[str, Any] = {"called": False}
+    real_verify = l2t.verify_post_body_against_commitment
+
+    def _spy(post_body, commitment):
+        captured["called"] = True
+        captured["post_body"] = copy.deepcopy(post_body)
+        return real_verify(post_body, commitment)
+
+    monkeypatch.setattr(l2t, "verify_post_body_against_commitment", _spy)
+
+    result = await transport.submit_live_order(COMPILED_L2, binding=BIND, auth=CTX)
+
+    rows = store.list_presubmit()
+    assert len(rows) == 1
+
+    # (c) NO raw owner / L2 creds / signature in the persisted row (UNIQUE-secret store-scan, Codex-M3).
+    #     Checked FIRST so a raw-wrapper persist (leaking owner) is caught here specifically.
+    scan = _store_scan_text(store)
+    eth_signature = json.loads(result.wire_bytes)["order"]["signature"]
+    for secret in (_SECRET_OWNER, _SECRET_API_SECRET, _SECRET_PASSPHRASE, eth_signature):
+        assert secret not in scan
+
+    # (a) the COMPOUND PreSubmitRecord (non-null venue_order_key == official V2 order hash, DISTINCT
+    #     from the private integrity digest) is in the append-only store BEFORE the sign call.
+    rec = rows[0]
+    assert rec.venue_order_key == COMPILED_L2.venue_order_key == COMPILED_L2.eip712_digest
+    assert rec.venue_order_key != rec.integrity_commitment_hash  # NOT a bare digest
+    assert rec.integrity_commitment_hash == COMPILED_L2.integrity_commitment_hash
+    assert events.index("persist") < events.index("sign")  # persist-BEFORE-sign
+
+    # (b) the byte-verify ran (WIRED here) and the EXACT bytes handed to the HMAC transport equal the
+    #     byte-verified bytes (no re-serialization between verify and send).
+    assert captured["called"] is True
+    from veridex.runtime.evidence import serialize_payload
+    assert serialize_payload(captured["post_body"]).encode("utf-8") == http.received["body"]
+    assert result.wire_bytes == http.received["body"]
+    # the five POLY_* L2 headers are present on the wire.
+    for name in POLY_L2_HEADER_NAMES:
+        assert name in http.received["headers"]
+
+    # (d) restart-join: a reconciler that knows ONLY venue_order_key resolves the ACK-lost fill to
+    #     RESOLVED (fill history is keyed by the official V2 id, not Veridex's digest — Codex round-6).
+    fill_key = COMPILED_L2.venue_order_key
+
+    async def _fill_reader(key: str) -> dict[str, Any]:
+        if key == fill_key:
+            return {"trades": [{"taker_order_id": key, "size": 3.0, "status": "CONFIRMED"}]}
+        return {"trades": []}
+
+    reconciled = await reconcile_ack_lost(store, _fill_reader)
+    assert len(reconciled) == 1
+    assert reconciled[0].reconciled_state == "RESOLVED"
+    assert reconciled[0].reconciled_fill_size == 3.0
+
+
+async def test_mode_b_blocked_until_all_three_gates():
+    from veridex.dust_execution.clobv2_gate import evaluate_from_fixture_dir
+    from veridex.policy.envelope import PolicyEnvelope
+    from veridex.venues.polymarket_preflight import run_preflight
+    from veridex.venues.polymarket_resolver import ResolvedMarket
+
+    class _Balances:
+        async def get_balance_allowance(self, asset_type, token_id=None, signature_type=-1, **kw):
+            return {"balance": 100.0, "allowance": 100.0} if asset_type == "COLLATERAL" else {"balance": 5.0, "allowance": 5.0}
+
+    class _Quote:
+        async def quote_market(self, market_ref, for_size=None):
+            from veridex.venues.base import Quote
+            return Quote(market_ref="ref", price=1.90, native_price=0.526, size=50.0, for_size=for_size or 0.0, ts=0)
+
+    class _Egress:
+        async def reachable(self):
+            return True
+
+    envelope = PolicyEnvelope(
+        max_stake=1000.0, max_orders_per_run=100, max_orders_per_session=100, max_orders_per_day=100,
+        venue_allowlist=["polymarket"], market_allowlist=["ref"], min_edge_bps=0, max_slippage_bps=500,
+        max_price=100.0, max_quote_age_s=60, cooldown_s=0, human_approval_threshold=1_000_000.0,
+        kill_switch=False,
+    )
+    gate = evaluate_from_fixture_dir(operator_smoke_ok=True)  # CLOB-V2 gate FULLY admits
+
+    async def _run(*, privy_preflight_ok, provisioning_ok):
+        return await run_preflight(
+            market_ref="ref", order_size=10.0, required_usdc=10.0,
+            resolved=ResolvedMarket(condition_id="0xcond", token_id_yes="111", token_id_no="222", tick_size=0.01),
+            quote_adapter=_Quote(), balances=_Balances(), egress=_Egress(), envelope=envelope,
+            actual_sig_type=2, expected_sig_type=2, max_slippage_bps=500, reference_price=1.90,
+            dry_run=True, neg_risk_approved=True, fak_smoke_passed=True, clobv2_gate=gate,
+            privy_preflight_ok=privy_preflight_ok, provisioning_ok=provisioning_ok,
+        )
+
+    # CLOB-V2 admits but the two operator gates are pending → Mode B NOT armable.
+    r = await _run(privy_preflight_ok=None, provisioning_ok=None)
+    assert r.mode_b_ready is True  # clobv2 gate alone
+    assert r.mode_b_armable is False
+    # Privy preflight passes but provisioning pending → still blocked.
+    assert (await _run(privy_preflight_ok=True, provisioning_ok=None)).mode_b_armable is False
+    # Provisioning passes but Privy preflight pending → still blocked.
+    assert (await _run(privy_preflight_ok=None, provisioning_ok=True)).mode_b_armable is False
+    # A failed gate → blocked.
+    assert (await _run(privy_preflight_ok=False, provisioning_ok=True)).mode_b_armable is False
+    # ALL THREE pass → armable.
+    r_ok = await _run(privy_preflight_ok=True, provisioning_ok=True)
+    assert r_ok.mode_b_armable is True
+    names = {c.name for c in r_ok.checks}
+    assert {"privy_preflight", "pusd_provisioning"} <= names
+
+
+def test_preflight_fixture_non_executable_by_signed_fields():
+    cp = PrivyEvmWalletControlPlane(client=L2FakePrivy(), binding=BIND)
+    # Codex-M4: allowed-domain but signed-field-INVALID — bad token + ZERO amounts (NOT an expired
+    # wrapper, since V2 expiration is unsigned). Signs fine (recovery verified), never executable.
+    invalid = _compile_owner(_SECRET_OWNER, maker_amount="0", taker_amount="0", token_id="0")
+    assert invalid.canonical_v2_typed_data["message"]["makerAmount"] == "0"
+
+    # Operator-pending by default: ok=None, nothing signed/submitted.
+    pending = operator_privy_preflight(
+        cp, binding=BIND, invalid_order_payload=invalid, order_auth=CTX, clob_auth=CTX,
+        operator_ran=False,
+    )
+    assert pending.ok is None
+    assert pending.submitted is False and pending.persisted is False
+
+    # Operator-run: exercises BOTH the ClobAuth and Order rules, recovery verified, never submitted.
+    ran = operator_privy_preflight(
+        cp, binding=BIND, invalid_order_payload=invalid, order_auth=CTX, clob_auth=CTX,
+        operator_ran=True,
+    )
+    assert ran.ok is True
+    assert set(ran.exercised_rules) == {CLOB_AUTH_PRIMARY_TYPE, "Order"}
+    assert ran.recovery_verified is True
+    assert ran.submitted is False and ran.persisted is False
+
+
+def test_provisioning_preflight_operator_gated():
+    # Pending by default (ok=None), never auto-True.
+    assert operator_pusd_provisioning_preflight(
+        pusd_balance=100.0, session_need=10.0, approvals_present=True, default_deny_restored=True,
+        live_policy_content_hash="h", pinned_policy_content_hash="h", operator_ran=False,
+    ).ok is None
+    # Operator-run, all conditions met → True.
+    assert operator_pusd_provisioning_preflight(
+        pusd_balance=100.0, session_need=10.0, approvals_present=True, default_deny_restored=True,
+        live_policy_content_hash="h", pinned_policy_content_hash="h", operator_ran=True,
+    ).ok is True
+    # Under-funded / weakened policy → fail closed.
+    assert operator_pusd_provisioning_preflight(
+        pusd_balance=1.0, session_need=10.0, approvals_present=True, default_deny_restored=True,
+        live_policy_content_hash="h", pinned_policy_content_hash="h", operator_ran=True,
+    ).ok is False
+    assert operator_pusd_provisioning_preflight(
+        pusd_balance=100.0, session_need=10.0, approvals_present=True, default_deny_restored=True,
+        live_policy_content_hash="live", pinned_policy_content_hash="pinned", operator_ran=True,
+    ).ok is False
+
+
+def test_non_order_domain_denied_by_default_deny():
+    cp = PrivyEvmWalletControlPlane(client=L2FakePrivy(), binding=BIND)
+    # A non-order, non-ClobAuth EIP-712 domain (e.g. a Permit) is denied at custody by default-deny.
+    permit = build_clob_auth_typed_data(address=_WALLET_ADDRESS, timestamp="1700000000")
+    permit = copy.deepcopy(permit)
+    permit["primaryType"] = "Permit"
+    with pytest.raises(FailClosed):
+        cp.sign_clob_auth(permit, binding=BIND, auth=CTX)
+    # And the order path refuses a non-Order primaryType too.
+    import dataclasses
+    bogus = copy.deepcopy(COMPILED_L2.canonical_v2_typed_data)
+    bogus["primaryType"] = "Permit"
+    bad = dataclasses.replace(COMPILED_L2, canonical_v2_typed_data=bogus)
+    with pytest.raises(FailClosed):
+        cp.sign_typed_data(bad, binding=BIND, auth=CTX)
+
+
+def test_poly_and_l2_headers_scrubbed_from_all_output():
+    headers = build_l2_headers(
+        _CREDS, address=_WALLET_ADDRESS, timestamp="1700000000", method="POST",
+        request_path="/order", body='{"order":{}}',
+    )
+    # An error/log line that accidentally embeds the headers must be scrubbed of every L2 secret.
+    leaky = (
+        f"submit failed headers={headers} owner={_SECRET_OWNER} secret={_SECRET_API_SECRET} "
+        f"pass={_SECRET_PASSPHRASE}"
+    )
+    scrubbed = scrub_l2_output(leaky, *_CREDS.secret_values(), headers["POLY_SIGNATURE"])
+    for secret in (_SECRET_OWNER, _SECRET_API_SECRET, _SECRET_PASSPHRASE, headers["POLY_SIGNATURE"]):
+        assert secret not in scrubbed
+    assert "[REDACTED]" in scrubbed
+
+    # scrub_headers_for_output redacts the secret-bearing POLY_* header values.
+    safe = scrub_headers_for_output(headers, _CREDS)
+    assert safe["POLY_API_KEY"] == "[REDACTED]"
+    assert safe["POLY_PASSPHRASE"] == "[REDACTED]"
+    assert safe["POLY_SIGNATURE"] == "[REDACTED]"
+
+    # The creds repr/str never leaks a secret.
+    assert _SECRET_OWNER not in repr(_CREDS)
+    assert _SECRET_API_SECRET not in str(_CREDS)
+
+
+def test_l2_transport_needs_no_private_key():
+    # The L2 transport module imports NO local-key crypto surface (extends the no-local-key sweep).
+    assert_no_imports("veridex.dust_execution.l2_transport", _LOCAL_KEY_BANNED)
+    # The transport constructor takes NO key/signer parameter — only a control plane + HMAC creds.
+    assert set(inspect.signature(KeylessL2Transport.__init__).parameters) <= {
+        "self", "control_plane", "creds", "http", "store", "now_s",
+    }
+    # The HMAC path works with only the base64url secret (an HMAC secret, not a signing key).
+    sig = l2t.l2_hmac_signature(
+        api_secret=_SECRET_API_SECRET, timestamp="1", method="POST", request_path="/order", body="{}",
+    )
+    assert isinstance(sig, str) and sig
+
+
+async def test_mint_l2_credentials_signs_clobauth_and_holds_no_secret_in_reference():
+    cp = PrivyEvmWalletControlPlane(client=L2FakePrivy(), binding=BIND)
+    client = _FakeClobAuthClient()
+    creds = mint_l2_credentials(
+        cp, binding=BIND, auth=CTX, clob_auth_client=client, timestamp="1700000000", nonce=0,
+    )
+    # The L1 ClobAuth was signed (POLY_SIGNATURE header present) to derive the creds.
+    assert len(client.calls) == 1
+    assert "POLY_SIGNATURE" in client.calls[0]
+    # Only a NON-secret re-derivation reference is persistable — never the raw creds.
+    ref = creds.persistable_reference()
+    assert set(ref) == {"derivation_ref", "derivation_nonce"}
+    for secret in (_SECRET_OWNER, _SECRET_API_SECRET, _SECRET_PASSPHRASE):
+        assert secret not in repr(ref)
