@@ -60,26 +60,37 @@ and never a ranked maker/scoring/leaderboard module. :class:`StaleVenueBook` is 
 from __future__ import annotations
 
 import logging
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
-from typing import Literal, Protocol, runtime_checkable
+from typing import Literal, Protocol, cast, runtime_checkable
 
 from veridex.dust_execution.contracts import (
     DustExecutionSessionMeta,
     DustRunLabelEvent,
     ExecutionMode,
     OrderAckEvent,
+    OrderStatus,
     OrderStatusEvent,
     OrderSubmitAttempt,
     OrderSubmitIntent,
     PreSubmitRecord,
     RealFillReconciliation,
     SessionRiskSnapshot,
+    UncertainState,
+)
+from veridex.dust_execution.emergency import (
+    CancelAllAdapter,
+    DustSafetySession,
+    SafetyController,
 )
 from veridex.dust_execution.manifest import StrategyExperimentManifest
+from veridex.dust_execution.noncrossing import LegKind, OwnOrderLeg, check_non_crossing
+from veridex.dust_execution.reconcile import UncertainSubmitState, assess_uncertain_submit
+from veridex.dust_execution.risk import RealizedFillRecord, RiskAccumulator
 from veridex.dust_execution.signer import Signer, SigningPayload
+from veridex.policy.circuit_breaker import CircuitBreaker, CircuitState
 from veridex.policy.envelope import PolicyEnvelope
-from veridex.venues.base import Order, VenueAdapter
+from veridex.venues.base import Order, VenueAdapter, VenueReconciliationReads
 
 logger = logging.getLogger(__name__)
 
@@ -153,6 +164,8 @@ class QuoteSource(Protocol):
 # ---------------------------------------------------------------------------
 
 #: The single closed vocabulary of abstain reasons — boolean-safe, id-free telemetry (SEC-005).
+#: ``self_cross`` (E5 non-crossing refusal) and ``safety_blocked`` (E2-T3 emergency-stop block) are
+#: the E6-T3 additions — both id-free labels, never an order id or handle.
 AbstainReason = Literal[
     "stale_quote_age",
     "stale_source",
@@ -160,6 +173,8 @@ AbstainReason = Literal[
     "no_quote",
     "missing_book_side",
     "negative_liquidity",
+    "self_cross",
+    "safety_blocked",
     "mode_a_no_orders",
 ]
 
@@ -171,8 +186,24 @@ ABSTAIN_REASONS: tuple[AbstainReason, ...] = (
     "no_quote",
     "missing_book_side",
     "negative_liquidity",
+    "self_cross",
+    "safety_blocked",
     "mode_a_no_orders",
 )
+
+#: The venue minimum price increment the non-crossing check rounds/compares against (Polymarket
+#: default). E6-T4 will bind the real per-market tick from the resolved market; this is the seam
+#: default the runner routes every proposed order through :func:`check_non_crossing` with.
+_DEFAULT_TICK_SIZE: float = 0.01
+
+#: Boundary map from the E4 in-code tri-state (underscore) to the persisted-event
+#: :data:`~veridex.dust_execution.contracts.UncertainState` (hyphenated ``DEFINITIVELY-ABSENT``).
+#: The two spellings are a deliberate boundary (see ``reconcile.UncertainSubmitState``), not a drift.
+_RECONCILED_STATE: dict[UncertainSubmitState, UncertainState] = {
+    "RESOLVED": "RESOLVED",
+    "AMBIGUOUS": "AMBIGUOUS",
+    "DEFINITIVELY_ABSENT": "DEFINITIVELY-ABSENT",
+}
 
 
 @dataclass(frozen=True)
@@ -318,14 +349,23 @@ def _build_session_meta(
     )
 
 
-def _build_risk_snapshot(*, seq: int, now_ms: int, envelope: PolicyEnvelope) -> SessionRiskSnapshot:
+def _build_risk_snapshot(
+    *,
+    seq: int,
+    now_ms: int,
+    envelope: PolicyEnvelope,
+    risk: RiskAccumulator,
+    breaker: CircuitBreaker | None,
+    open_order_count: int,
+) -> SessionRiskSnapshot:
     """Session-level risk snapshot (``decision_id=None``) — first event in the numbered stream.
 
-    PROVISIONAL SEAM: the realized-loss accumulator / open-order-count / breaker wiring
-    (``veridex.dust_execution.risk.RiskAccumulator`` + ``emergency.SafetyController``) is E6-T3's
-    job; this snapshot reports honest ZERO placeholders for those fields — never a fabricated
-    non-zero value. ``kill_switch_engaged`` is REAL today: ``envelope.kill_switch`` is already
-    available to the runner.
+    E6-T3 closes the E6-T2 PROVISIONAL risk seam: ``realized_loss_session/daily`` now carry the REAL
+    fee-inclusive loss from the threaded :class:`~veridex.dust_execution.risk.RiskAccumulator` (fed
+    from real venue-reconciled fills BEFORE this snapshot is built), ``breaker_open`` reflects the
+    injected :class:`~veridex.policy.circuit_breaker.CircuitBreaker` state, and ``open_order_count``
+    the runner's count of own resting legs. ``kill_switch_engaged`` was already real
+    (``envelope.kill_switch``). Every value is honest — never a fabricated non-zero.
     """
     return SessionRiskSnapshot(
         sequence_no=seq,
@@ -333,10 +373,10 @@ def _build_risk_snapshot(*, seq: int, now_ms: int, envelope: PolicyEnvelope) -> 
         source_ts=None,
         recv_ts=now_ms,
         decision_id=None,
-        realized_loss_session=0.0,  # PROVISIONAL — real accumulator wiring: E6-T3
-        realized_loss_daily=0.0,  # PROVISIONAL — real accumulator wiring: E6-T3
-        open_order_count=0,  # PROVISIONAL — real accumulator wiring: E6-T3
-        breaker_open=False,  # PROVISIONAL — real accumulator wiring: E6-T3
+        realized_loss_session=risk.realized_loss_session,
+        realized_loss_daily=risk.realized_loss_day,
+        open_order_count=open_order_count,
+        breaker_open=breaker is not None and breaker.state is CircuitState.OPEN,
         kill_switch_engaged=envelope.kill_switch,
     )
 
@@ -356,6 +396,85 @@ def _build_label_event(*, seq: int, now_ms: int, manifest: StrategyExperimentMan
 
 
 # ---------------------------------------------------------------------------
+# Emergency-stop delegation: the runner DELEGATES every trigger to the E2-T3
+# SafetyController's single idempotent cancel_all_and_block primitive (SAF-002/003).
+# ---------------------------------------------------------------------------
+
+
+def _require_cancel_all_adapter(adapter: VenueAdapter) -> CancelAllAdapter:
+    """Return the venue adapter as a :class:`CancelAllAdapter`, failing closed if it cannot sweep.
+
+    A safety trigger that cannot fire the venue ``cancel_all_orders`` sweep is a fatal wiring error
+    on the real-money path — blocking without sweeping would leave resting orders exposed. Fail
+    closed (raise) rather than silently skip the sweep.
+    """
+    if not isinstance(adapter, CancelAllAdapter):
+        raise TypeError(
+            "a safety trigger fired but the venue adapter cannot sweep resting orders "
+            "(missing cancel_all_orders); refusing to block-without-sweep"
+        )
+    return adapter
+
+
+async def _apply_safety_triggers(
+    *,
+    adapter: VenueAdapter,
+    safety: SafetyController,
+    session: DustSafetySession,
+    risk: RiskAccumulator,
+    envelope: PolicyEnvelope,
+    breaker: CircuitBreaker | None,
+    realized_fills: Sequence[RealizedFillRecord],
+) -> None:
+    """Fold real fills into risk and DELEGATE every runner-reachable trigger to the SafetyController.
+
+    The runner does NOT reimplement cancel-all: each trigger routes through the E2-T3 single
+    idempotent :meth:`~veridex.dust_execution.emergency.SafetyController.cancel_all_and_block`
+    primitive (via its typed ``on_*`` entry points), which fires the venue ``cancel_all_orders`` wire
+    AND sets the submit-block flag. Triggers handled here (each idempotent — the first blocks, the
+    rest are no-ops that stay blocked):
+
+    * **realized-loss-cap breach** — every real ``RealizedFillRecord`` is folded through
+      :meth:`SafetyController.on_realized_fill`, which accumulates fee-inclusive loss and, on a cap
+      crossing, ATOMICALLY blocks + sweeps under the honest ``loss_breach`` cause;
+    * **breaker-open** — an OPEN :class:`CircuitBreaker` delegates to :meth:`on_breaker_open`;
+    * **kill-switch** — ``envelope.kill_switch`` delegates to :meth:`on_kill_switch`.
+
+    Fills are folded FIRST so the following :func:`_build_risk_snapshot` carries the real loss.
+    """
+    for fill in realized_fills:
+        await safety.on_realized_fill(
+            fill,
+            adapter=_require_cancel_all_adapter(adapter),
+            session=session,
+            risk=risk,
+            envelope=envelope,
+        )
+    if breaker is not None and breaker.state is CircuitState.OPEN:
+        await safety.on_breaker_open(adapter=_require_cancel_all_adapter(adapter), session=session)
+    if envelope.kill_switch:
+        await safety.on_kill_switch(adapter=_require_cancel_all_adapter(adapter), session=session)
+
+
+def _non_crossing_gate(
+    quote: DustQuote, *, own_legs: Sequence[OwnOrderLeg], tick_size: float
+) -> AbstainReason | None:
+    """Return ``"self_cross"`` if the proposed BUY self-crosses an own leg, else ``None`` (E5, SAF-009).
+
+    Routes the proposed order (a BUY at the quote's ask) THROUGH the pure E5
+    :func:`~veridex.dust_execution.noncrossing.check_non_crossing` over the possibly-live union of
+    the runner's own resting legs plus the proposed leg. A REJECT verdict refuses the submit; this is
+    the wire the submit path must not bypass (mutation: bypassing it lets a crossing order submit).
+    """
+    assert quote.ask is not None  # noqa: S101 - gate guaranteed both sides before this runs
+    proposed = OwnOrderLeg(
+        token_id=quote.token_id, side="BUY", price=quote.ask.price, kind=LegKind.PROPOSED
+    )
+    verdict = check_non_crossing((*own_legs, proposed), tick_size=tick_size)
+    return None if verdict.admitted else "self_cross"
+
+
+# ---------------------------------------------------------------------------
 # The runner
 # ---------------------------------------------------------------------------
 
@@ -370,6 +489,13 @@ async def run_dust_execution(
     envelope: PolicyEnvelope,
     manifest: StrategyExperimentManifest,
     mode: ExecutionMode,
+    safety: SafetyController | None = None,
+    session: DustSafetySession | None = None,
+    risk: RiskAccumulator | None = None,
+    breaker: CircuitBreaker | None = None,
+    realized_fills: Sequence[RealizedFillRecord] = (),
+    own_legs: Sequence[OwnOrderLeg] = (),
+    tick_size: float = _DEFAULT_TICK_SIZE,
 ) -> DustExecutionResult:
     """Run one dust-execution pass over the manifest universe, applying the submit gates.
 
@@ -385,21 +511,52 @@ async def run_dust_execution(
     the IDENTICAL event-type stream for the same input (AC-003); a gate-ABSTAINED token contributes
     no per-decision events (there is no honest order-lifecycle data to record for it).
 
+    E6-T3 (SAF-002/003/009/010) threads the SAFETY WIRING the E6-T2 seams left provisional:
+
+    * **Emergency-stop delegation.** BEFORE the token loop the runner DELEGATES every runner-reachable
+      trigger — a realized-loss-cap breach (folded from real fills through the ``RiskAccumulator``), a
+      breaker-open, or a kill-switch engage — to the E2-T3 :class:`SafetyController`, which fires the
+      venue ``cancel_all_orders`` sweep and BLOCKS submits (:func:`_apply_safety_triggers`). Once
+      blocked, every token abstains ``"safety_blocked"`` — no order reaches the wire.
+    * **Real risk snapshot.** The ``SessionRiskSnapshot`` now carries the accumulator's REAL
+      fee-inclusive loss and the breaker state (not the E6-T2 zero placeholders).
+    * **Non-crossing.** Every proposed order routes through the E5
+      :func:`~veridex.dust_execution.noncrossing.check_non_crossing` guard before submit; a
+      self-crossing order abstains ``"self_cross"`` (SAF-009) — in BOTH modes (mode-independent).
+    * **Tri-state reconcile.** After the (Mode B) submit the runner routes the presubmit through the
+      E4 :func:`~veridex.dust_execution.reconcile.assess_uncertain_submit` keyed on the
+      ``venue_order_key``, so the ``OrderStatusEvent`` / ``RealFillReconciliation`` reflect venue
+      truth (RESOLVED/AMBIGUOUS) rather than the E6-T2 hardcoded placeholders.
+
+    Still DELIBERATELY provisional (later tasks): the Mode B order's price/size placeholders and the
+    Mode A→B arming gate (E6-T4), the startup sweep (E6-T5), and shutdown-as-a-lifecycle-stage (E6-T6).
+
     ``sleep_fn`` is the injected async delay seam for the E6 polling loop (added by a later task);
-    this skeleton makes a single deterministic pass and does not sleep. The Mode B order uses
-    PROVISIONAL price/size placeholders purely to exercise the (offline recording-fake) submit wire
-    the gates protect — real sizing/pricing (``resolve_dust_size`` + native→decimal) is E6-T4.
+    this pass makes a single deterministic sweep and does not sleep.
 
     Args:
-        adapter: Injected venue adapter (a recording-fake in tests; never a live venue in E6-T1).
+        adapter: Injected venue adapter (a recording-fake in tests; never a live venue in E6-T1). For
+            the safety path it must also expose ``cancel_all_orders`` (a ``CancelAllAdapter``).
         signer: Injected provider-neutral signing control plane (Mode-A fake offline).
         sources: Injected quote source; raises :class:`StaleVenueBook` when gapped/disconnected.
         now_fn: Injected clock returning integer SECONDS (used for the staleness gate and, x1000,
             for every event's integer-millisecond ``recv_ts``).
         sleep_fn: Injected async delay seam (unused in this single-pass skeleton; wired later).
-        envelope: Policy envelope providing ``max_quote_age_s`` and the venue allowlist.
+        envelope: Policy envelope providing ``max_quote_age_s``, the loss caps, and ``kill_switch``.
         manifest: Pinned strategy manifest providing the token ``universe`` to quote.
         mode: Execution mode — ``"dry_run"`` (Mode A, no orders) or ``"live_guarded"`` (Mode B).
+        safety: The E2-T3 emergency orchestrator the runner delegates every trigger to (a fresh
+            :class:`SafetyController` when omitted).
+        session: The mutable emergency-stop runtime state (a fresh :class:`DustSafetySession` keyed on
+            the session id when omitted).
+        risk: The realized-loss accumulator threaded into the risk snapshot and the breach check (a
+            fresh one keyed on the session id when omitted).
+        breaker: The injected circuit-breaker state; an OPEN breaker delegates to the SafetyController.
+        realized_fills: Real venue-reconciled fills folded through the accumulator BEFORE the snapshot;
+            a fill that crosses a loss cap fires the emergency sweep.
+        own_legs: The runner's own resting legs the non-crossing union is evaluated against.
+        tick_size: The venue minimum price increment the non-crossing check uses (E6-T4 binds the real
+            per-market tick).
 
     Returns:
         A :class:`DustExecutionResult` with one :class:`SubmitDecision` per token, the session
@@ -408,8 +565,32 @@ async def run_dust_execution(
     seqc = _SeqCounter()
     session_meta = _build_session_meta(manifest=manifest, envelope=envelope, signer=signer, mode=mode)
 
+    safety = safety if safety is not None else SafetyController()
+    session = session if session is not None else DustSafetySession(session_id=session_meta.session_id)
+    risk = risk if risk is not None else RiskAccumulator(session.session_id)
+
+    # DELEGATE every runner-reachable trigger to the SafetyController BEFORE the snapshot, so the
+    # snapshot carries the real accumulated loss and a swept session blocks every subsequent submit.
+    await _apply_safety_triggers(
+        adapter=adapter,
+        safety=safety,
+        session=session,
+        risk=risk,
+        envelope=envelope,
+        breaker=breaker,
+        realized_fills=realized_fills,
+    )
+
+    open_order_count = sum(1 for leg in own_legs if leg.kind is LegKind.OPEN)
     events: list[LifecycleEvent] = [
-        _build_risk_snapshot(seq=seqc.next(), now_ms=now_fn() * 1000, envelope=envelope)
+        _build_risk_snapshot(
+            seq=seqc.next(),
+            now_ms=now_fn() * 1000,
+            envelope=envelope,
+            risk=risk,
+            breaker=breaker,
+            open_order_count=open_order_count,
+        )
     ]
 
     decisions: list[SubmitDecision] = []
@@ -424,6 +605,10 @@ async def run_dust_execution(
             manifest=manifest,
             mode=mode,
             seqc=seqc,
+            safety=safety,
+            session=session,
+            own_legs=own_legs,
+            tick_size=tick_size,
         )
         decisions.append(decision)
         events.extend(token_events)
@@ -449,12 +634,21 @@ async def _decide_and_submit(
     manifest: StrategyExperimentManifest,
     mode: ExecutionMode,
     seqc: _SeqCounter,
+    safety: SafetyController,
+    session: DustSafetySession,
+    own_legs: Sequence[OwnOrderLeg],
+    tick_size: float,
 ) -> tuple[SubmitDecision, tuple[LifecycleEvent, ...]]:
     """Gate one token's quote and, only when clear AND Mode B, submit it on the wire.
 
     Also builds the E1-T2 per-decision lifecycle events for a GATE-CLEAR quote — identically shaped
     in both modes (AC-003); see :func:`_emit_order_lifecycle`. A gate-ABSTAINED token (the original
     E6-T1 behavior) emits NO per-decision lifecycle events.
+
+    E6-T3 adds two refusals AFTER the E6-T1 quote gates and BEFORE any submit: an emergency-stop
+    check (once the SafetyController has blocked submits, every token abstains ``"safety_blocked"``)
+    and the E5 non-crossing check (a self-crossing proposed order abstains ``"self_cross"``). Both
+    refuse with no per-decision lifecycle events, identically in both modes.
     """
     try:
         quote = await sources.read_quote(token_id)
@@ -466,6 +660,16 @@ async def _decide_and_submit(
     reason = _evaluate_submit_gate(quote, now_s=now_s, max_quote_age_s=envelope.max_quote_age_s)
     if reason is not None:
         return _abstain(token_id, reason), ()
+
+    # Emergency stop: a swept/blocked session admits NO further submit (SAF-002/003).
+    if not safety.check_can_submit(session):
+        return _abstain(token_id, "safety_blocked"), ()
+
+    # Non-crossing: refuse a proposed order that self-crosses an own leg (E5, SAF-009). Mode-
+    # independent — a crossing order is refused in Mode A and Mode B alike.
+    cross_reason = _non_crossing_gate(quote, own_legs=own_legs, tick_size=tick_size)
+    if cross_reason is not None:
+        return _abstain(token_id, cross_reason), ()
 
     decision, events = await _emit_order_lifecycle(
         quote,
@@ -490,6 +694,37 @@ async def _decide_and_submit(
     return decision, events
 
 
+async def _reconcile_after_submit(
+    presubmit: PreSubmitRecord, *, adapter: VenueAdapter
+) -> tuple[UncertainSubmitState, float]:
+    """Reconcile the presubmit against complete venue truth (E4) — the honest tri-state + matched size.
+
+    Routes through the E4 :func:`~veridex.dust_execution.reconcile.assess_uncertain_submit`, keyed on
+    the ``venue_order_key``. The adapter is consumed READ-ONLY: ``assess_uncertain_submit`` queries the
+    :class:`~veridex.venues.base.VenueReconciliationReads` surfaces defensively (via ``getattr``), so an
+    adapter that lacks them degrades fail-closed to AMBIGUOUS with zero matched size — never a fabricated
+    fill. The cast reflects that structural, read-only consumption (no reconciliation surface is required
+    of every adapter).
+    """
+    verdict = await assess_uncertain_submit(
+        presubmit, adapter=cast("VenueReconciliationReads", adapter)
+    )
+    return verdict.state, verdict.matched_fill_size
+
+
+def _status_for(state: UncertainSubmitState, matched_fill_size: float) -> OrderStatus:
+    """Map the E4 reconcile verdict to the honest :data:`~veridex.dust_execution.contracts.OrderStatus`.
+
+    AMBIGUOUS (no positive proof, or an unresolved/uncertain submit) is honestly ``"unresolved"``.
+    RESOLVED with a matched fill is ``"filled"``; RESOLVED without a matched fill is a terminal that
+    left no fill (killed/canceled/expired), reported conservatively as ``"expired"``. Fill size and
+    status can never be fabricated — both flow from the reconcile verdict.
+    """
+    if state == "AMBIGUOUS":
+        return "unresolved"
+    return "filled" if matched_fill_size > 0.0 else "expired"
+
+
 async def _emit_order_lifecycle(
     quote: DustQuote,
     *,
@@ -508,9 +743,12 @@ async def _emit_order_lifecycle(
     modes — Mode A signs the SAME payload but NEVER calls ``adapter.submit_order`` (the E6-T1
     ``adapter.submit_calls == 0`` / AC-017 invariant is unchanged); its ``OrderAckEvent`` honestly
     records ``ack_status="dry_run_not_submitted"`` and a ``None`` venue_order_id instead of
-    fabricating a real acknowledgement. The status + reconciliation stages report honest
-    PROVISIONAL data in BOTH modes — real status polling / reconciliation wiring is E6-T3's job;
-    this only proves the stream SHAPE, not a resolved fill.
+    fabricating a real acknowledgement.
+
+    E6-T3 closes the status/reconcile seam: the ``OrderStatusEvent`` / ``RealFillReconciliation`` now
+    reflect the E4 tri-state reconcile against venue truth (:func:`_reconcile_after_submit`) keyed on
+    the ``venue_order_key`` — an adapter with no reconciliation surface degrades fail-closed to
+    AMBIGUOUS/``unresolved`` (the honest "no resolved fill" state), identically in both modes.
 
     PROVISIONAL: price/size are the E6-T1 placeholders (real sizing is E6-T4); the presubmit
     record's ``venue_order_key`` is a placeholder distinct from the private integrity digest — the
@@ -609,6 +847,9 @@ async def _emit_order_lifecycle(
             ack_status="dry_run_not_submitted",
         )
 
+    # E6-T3: route the presubmit through the E4 tri-state reconcile keyed on the venue_order_key, so
+    # status/reconciliation reflect the (recording-fake) venue truth — no longer hardcoded placeholders.
+    reconciled_state, matched_fill_size = await _reconcile_after_submit(presubmit, adapter=adapter)
     status_event = OrderStatusEvent(
         sequence_no=seqc.next(),
         event_type="OrderStatusEvent",
@@ -617,8 +858,8 @@ async def _emit_order_lifecycle(
         decision_id=decision_id,
         client_order_id=client_order_id,
         venue_order_id=venue_order_id,
-        status="unresolved",  # PROVISIONAL — real status polling is wired by E6-T3 (reconcile)
-        filled_size=0.0,
+        status=_status_for(reconciled_state, matched_fill_size),
+        filled_size=matched_fill_size,
         fill_price=None,
     )
     reconciliation_event = RealFillReconciliation(
@@ -628,8 +869,8 @@ async def _emit_order_lifecycle(
         recv_ts=now_ms,
         decision_id=decision_id,
         venue_order_key=presubmit.venue_order_key,
-        reconciled_state="AMBIGUOUS",  # PROVISIONAL — real reconcile wiring is E6-T3
-        reconciled_fill_size=0.0,
+        reconciled_state=_RECONCILED_STATE[reconciled_state],
+        reconciled_fill_size=matched_fill_size,
     )
 
     decision = SubmitDecision(

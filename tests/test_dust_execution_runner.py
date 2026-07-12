@@ -33,8 +33,12 @@ from veridex.dust_execution.contracts import (
     OrderSubmitAttempt,
     OrderSubmitIntent,
     RealFillReconciliation,
+    SessionRiskSnapshot,
 )
+from veridex.dust_execution.emergency import DustSafetySession, SafetyController
 from veridex.dust_execution.manifest import StrategyExperimentManifest
+from veridex.dust_execution.noncrossing import LegKind, OwnOrderLeg
+from veridex.dust_execution.risk import RealizedFillRecord, RiskAccumulator
 from veridex.dust_execution.runner import (
     ABSTAIN_REASONS,
     BookSide,
@@ -45,6 +49,7 @@ from veridex.dust_execution.runner import (
     run_dust_execution,
 )
 from veridex.dust_execution.signer import LocalFakeWalletControlPlane, SignedArtifact
+from veridex.policy.circuit_breaker import CircuitBreaker, CircuitState
 from veridex.policy.envelope import PolicyEnvelope
 from veridex.runtime.evidence import compute_evidence_hash
 from veridex.venues.base import Order
@@ -387,3 +392,237 @@ async def test_sequence_no_unique_append_only_monotonic() -> None:
 
     # The shared canonical evidence-hash helper independently rejects a duplicate sequence_no.
     compute_evidence_hash([e.model_dump() for e in result.events])
+
+
+# --- E6-T3: runner delegates breaker/loss/kill to SafetyController + non-crossing + reconcile ---
+#
+# Anti-inert discipline (Codex-M3 / Fable-m2): the RED assertion is on the WIRE — the recording-fake
+# adapter's ``cancel_all_orders`` was ACTUALLY awaited, subsequent submits are BLOCKED — NOT that the
+# SafetyController is internally correct. A controller that is standalone-correct but that the runner
+# never CALLS must make ``test_runner_delegates_breaker_loss_kill_to_safety_controller`` RED.
+
+
+class RecordingFakeAdapter(FakeVenueAdapter):
+    """The established :class:`FakeVenueAdapter` extended to RECORD the cancel-all WIRE call.
+
+    Inherits the sealed four-method :class:`~veridex.venues.base.VenueAdapter` behaviour (submit /
+    status / cancel / quote) unchanged and ADDS the two seams E6-T3 wires:
+
+    * ``cancel_all_orders`` — the E2-T3 :class:`~veridex.dust_execution.emergency.CancelAllAdapter`
+      sweep wire. ``cancel_all_calls`` increments ONLY when the coroutine is actually awaited, so a
+      mere submit-block flag flip inside the controller can never move it (that is the load-bearing
+      recording-fake rule: prove the venue sweep FIRED, not that a boolean was set).
+    * ``get_fill_history`` — the E4 :class:`~veridex.venues.base.VenueReconciliationReads` surface
+      the tri-state reconcile queries by ``venue_order_key``. When ``fill_history_matches`` it echoes
+      a matching own trade so the reconcile resolves to ``RESOLVED``; otherwise it stays empty (the
+      fail-closed AMBIGUOUS default), so a run that never submits can never fabricate a fill.
+    """
+
+    def __init__(self, *, fill: bool = True, fill_history_matches: bool = False) -> None:
+        super().__init__(fill=fill)
+        self.cancel_all_calls = 0
+        self._fill_history_matches = fill_history_matches
+
+    async def cancel_all_orders(self) -> int:
+        self.cancel_all_calls += 1
+        return 3
+
+    async def get_fill_history(self, **kwargs: object) -> list[dict[str, object]]:
+        key = kwargs.get("venue_order_key")
+        if not self._fill_history_matches or not isinstance(key, str):
+            return []
+        # A matched own trade keyed on the OFFICIAL venue_order_key (never Veridex's private digest).
+        return [{"taker_order_id": key, "size": 1.0}]
+
+
+_SESSION_ID = "dust-maker-v0:live_guarded"
+
+
+def _make_safety() -> tuple[SafetyController, DustSafetySession]:
+    return SafetyController(clock_ms=lambda: _NOW_S * 1000), DustSafetySession(session_id=_SESSION_ID)
+
+
+async def _run_guarded(
+    *,
+    adapter: FakeVenueAdapter,
+    safety: SafetyController | None = None,
+    session: DustSafetySession | None = None,
+    risk: RiskAccumulator | None = None,
+    breaker: CircuitBreaker | None = None,
+    realized_fills: tuple[RealizedFillRecord, ...] = (),
+    own_legs: tuple[OwnOrderLeg, ...] = (),
+    envelope: PolicyEnvelope | None = None,
+    source: _ScriptedSource | None = None,
+) -> DustExecutionResult:
+    return await run_dust_execution(
+        adapter=adapter,
+        signer=LocalFakeWalletControlPlane(),
+        sources=source if source is not None else _ScriptedSource(quote=_fresh_quote()),
+        now_fn=_clock,
+        sleep_fn=_noop_sleep,
+        envelope=envelope if envelope is not None else _env(),
+        manifest=_manifest(mode="live_guarded"),
+        mode="live_guarded",
+        safety=safety,
+        session=session,
+        risk=risk,
+        breaker=breaker,
+        realized_fills=realized_fills,
+        own_legs=own_legs,
+    )
+
+
+async def test_runner_delegates_breaker_loss_kill_to_safety_controller() -> None:
+    """LOAD-BEARING anti-inert: each runner-reachable trigger reaches the SafetyController WIRE.
+
+    Three sub-cases — (a) breaker-open, (b) realized-loss-cap breach via a REAL fill, (c) kill-switch
+    engage. For EACH: the runner delegates to the E2-T3 :class:`SafetyController`, the recording-fake
+    ``cancel_all_orders`` WIRE is ACTUALLY fired, subsequent submits are BLOCKED (no order reaches the
+    submit wire), and the ack carries the honest trigger CAUSE, never an order id.
+    """
+    # (a) BREAKER-OPEN — an OPEN circuit breaker surfaced to the runner.
+    adapter = RecordingFakeAdapter(fill=True)
+    safety, session = _make_safety()
+    breaker = CircuitBreaker(state=CircuitState.OPEN, opened_at=0.0, consecutive_failures=5)
+
+    result = await _run_guarded(adapter=adapter, safety=safety, session=session, breaker=breaker)
+
+    assert adapter.cancel_all_calls == 1, "breaker-open must fire the recording-fake cancel-all WIRE"
+    assert session.submit_blocked is True
+    assert safety.check_can_submit(session) is False
+    assert adapter.submit_calls == 0, "a swept session must place NO further orders on the wire"
+    (decision,) = result.decisions
+    assert decision.submitted is False and decision.abstain_reason == "safety_blocked"
+    assert session.last_cancel_all_ack is not None
+    assert session.last_cancel_all_ack.trigger_cause == "breaker"
+    assert "venue_order_id" not in session.last_cancel_all_ack.model_dump()
+
+    # (b) REALIZED-LOSS-CAP BREACH — driven by a REAL fill through the RiskAccumulator.
+    adapter = RecordingFakeAdapter(fill=True)
+    safety, session = _make_safety()
+    risk = RiskAccumulator(_SESSION_ID)
+    loss_fill = RealizedFillRecord(
+        realized_pnl=-2.5, fee=0.0, session_id=_SESSION_ID, fill_ts_ms=_NOW_S * 1000
+    )
+    env = _env(max_session_loss=2.0, max_daily_loss=4.0)
+
+    result = await _run_guarded(
+        adapter=adapter,
+        safety=safety,
+        session=session,
+        risk=risk,
+        realized_fills=(loss_fill,),
+        envelope=env,
+    )
+
+    assert adapter.cancel_all_calls == 1, "a realized-loss breach must fire the cancel-all WIRE"
+    assert session.submit_blocked is True
+    assert adapter.submit_calls == 0
+    (decision,) = result.decisions
+    assert decision.submitted is False and decision.abstain_reason == "safety_blocked"
+    assert session.last_cancel_all_ack is not None
+    assert session.last_cancel_all_ack.trigger_cause == "loss_breach"
+    assert "venue_order_id" not in session.last_cancel_all_ack.model_dump()
+
+    # (c) KILL-SWITCH ENGAGE — envelope.kill_switch surfaced to the runner.
+    adapter = RecordingFakeAdapter(fill=True)
+    safety, session = _make_safety()
+    env = _env(kill_switch=True)
+
+    result = await _run_guarded(adapter=adapter, safety=safety, session=session, envelope=env)
+
+    assert adapter.cancel_all_calls == 1, "kill-switch engage must fire the cancel-all WIRE"
+    assert session.submit_blocked is True
+    assert adapter.submit_calls == 0
+    (decision,) = result.decisions
+    assert decision.submitted is False and decision.abstain_reason == "safety_blocked"
+    assert session.last_cancel_all_ack is not None
+    assert session.last_cancel_all_ack.trigger_cause == "kill_switch"
+    assert "venue_order_id" not in session.last_cancel_all_ack.model_dump()
+
+
+async def test_crossing_order_refused_in_submit_path() -> None:
+    """MUTATION TARGET (non-crossing): a proposed order that self-crosses an own leg NEVER submits.
+
+    An own resting SELL (ask) at 0.50 on the SAME token, with the proposed BUY at the quote's ask
+    (0.51), self-crosses (``highest_own_bid 0.51 >= lowest_own_ask 0.50``). The runner MUST route the
+    proposed order through :func:`~veridex.dust_execution.noncrossing.check_non_crossing` BEFORE the
+    submit wire and REFUSE it. Bypassing that call lets the crossing order reach ``submit_order``.
+    """
+    adapter = RecordingFakeAdapter(fill=True)
+    safety, session = _make_safety()
+    own = (OwnOrderLeg(token_id=_TOKEN, side="SELL", price=0.50, kind=LegKind.OPEN),)
+
+    result = await _run_guarded(adapter=adapter, safety=safety, session=session, own_legs=own)
+
+    assert adapter.submit_calls == 0, "a self-crossing proposed order must NOT reach the submit wire"
+    (decision,) = result.decisions
+    assert decision.submitted is False
+    assert decision.abstain_reason == "self_cross"
+
+
+async def test_non_crossing_clear_order_still_submits() -> None:
+    """POSITIVE CONTROL for the non-crossing gate: a NON-crossing own leg still lets the order submit.
+
+    Makes the crossing MUTATION meaningful: an own SELL at 0.80 (well above the proposed BUY 0.51) does
+    NOT cross, so the clean order still reaches the wire exactly once.
+    """
+    adapter = RecordingFakeAdapter(fill=True)
+    safety, session = _make_safety()
+    own = (OwnOrderLeg(token_id=_TOKEN, side="SELL", price=0.80, kind=LegKind.OPEN),)
+
+    result = await _run_guarded(adapter=adapter, safety=safety, session=session, own_legs=own)
+
+    assert adapter.submit_calls == 1
+    (decision,) = result.decisions
+    assert decision.submitted is True and decision.abstain_reason is None
+
+
+async def test_runner_wires_real_reconcile_resolved_status() -> None:
+    """The E6-T2 PROVISIONAL status/reconcile seam is CLOSED: it reflects recording-fake venue truth.
+
+    Mode B submits, then the runner routes the presubmit through the E4 tri-state reconcile
+    (:func:`~veridex.dust_execution.reconcile.assess_uncertain_submit`) keyed on the ``venue_order_key``.
+    The recording-fake echoes a matching own fill, so the status resolves to ``filled`` and the
+    reconciliation to ``RESOLVED`` with the matched size — never the hardcoded ``unresolved`` /
+    ``AMBIGUOUS`` placeholders.
+    """
+    adapter = RecordingFakeAdapter(fill=True, fill_history_matches=True)
+    safety, session = _make_safety()
+
+    result = await _run_guarded(adapter=adapter, safety=safety, session=session)
+
+    assert adapter.submit_calls == 1
+    status = next(e for e in result.events if isinstance(e, OrderStatusEvent))
+    recon = next(e for e in result.events if isinstance(e, RealFillReconciliation))
+    assert status.status == "filled", "reconcile against venue truth must resolve the honest status"
+    assert status.filled_size == 1.0
+    assert recon.reconciled_state == "RESOLVED"
+    assert recon.reconciled_fill_size == 1.0
+
+
+async def test_runner_risk_snapshot_threads_real_realized_loss() -> None:
+    """The E6-T2 PROVISIONAL risk seam is CLOSED: the snapshot carries the RiskAccumulator's real loss.
+
+    A REAL fill (fee-inclusive loss 1.25) that does NOT breach the (disabled) caps is folded through
+    the accumulator; the ``SessionRiskSnapshot`` reports the real ``realized_loss_session/daily`` (1.25)
+    instead of the hardcoded 0.0 placeholder, and the run still proceeds (no sweep).
+    """
+    adapter = RecordingFakeAdapter(fill=True)
+    safety, session = _make_safety()
+    risk = RiskAccumulator(_SESSION_ID)
+    fill = RealizedFillRecord(
+        realized_pnl=-1.0, fee=0.25, session_id=_SESSION_ID, fill_ts_ms=_NOW_S * 1000
+    )
+
+    result = await _run_guarded(
+        adapter=adapter, safety=safety, session=session, risk=risk, realized_fills=(fill,)
+    )
+
+    snap = next(e for e in result.events if isinstance(e, SessionRiskSnapshot))
+    assert snap.realized_loss_session == 1.25
+    assert snap.realized_loss_daily == 1.25
+    assert snap.breaker_open is False
+    assert snap.kill_switch_engaged is False
+    assert adapter.cancel_all_calls == 0, "a non-breaching fill must NOT fire the cancel-all wire"
+    assert adapter.submit_calls == 1, "a non-breaching fill leaves the submit path open"
