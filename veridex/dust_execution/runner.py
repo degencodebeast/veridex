@@ -45,7 +45,8 @@ real order-status polling and real venue reconciliation feeding ``OrderStatusEve
 ``resolve_dust_size`` binding + native→decimal pricing (E6-T4 — NOW CLOSED: the wire size comes ONLY
 from ``resolve_dust_size`` over pinned inputs, and Mode B arms only when every precondition passes);
 a durable operator-assigned ``session_id`` and the sealed ``content_hash`` at session end (E6-T5
-startup sweep / E6-T6 shutdown); the real EIP-712 V2 order-hash (``venue_order_key``) binding via
+closed the startup-sweep half; E6-T6 closed the shutdown cancel-all / explicit leave-flat decision
+— SEALING ``content_hash`` itself remains a later task); the real EIP-712 V2 order-hash (``venue_order_key``) binding via
 ``veridex.dust_execution.signing_compiler`` (a later task — this module's placeholder is distinct
 from the private integrity digest, never equal to it).
 
@@ -274,6 +275,33 @@ class ModeBArming:
     live_quorum: AuthorizationQuorum
 
 
+# ---------------------------------------------------------------------------
+# E6-T6: shutdown cancel-all or explicit leave-flat decision (SAF-006, AC-009)
+# ---------------------------------------------------------------------------
+
+#: The two — and ONLY two — explicit shutdown outcomes (SAF-006). There is deliberately no third
+#: value: a shutdown MUST resolve to either sweeping resting orders or an explicit, recorded choice
+#: to leave them resting; a silent abandon is not a representable state in this closed vocabulary.
+ShutdownPolicy = Literal["cancel_all", "leave_flat"]
+
+
+@dataclass(frozen=True)
+class ShutdownDecision:
+    """The explicit SAF-006 shutdown outcome — carries ONLY JSON-primitive telemetry, never silent.
+
+    Recorded on every :class:`DustExecutionResult`, in BOTH modes, so a run can never end without an
+    explicit, inspectable shutdown record. ``policy`` is the resolved :data:`ShutdownPolicy`;
+    ``cancel_all_fired`` is ``True`` only when the ``"cancel_all"`` branch actually routed through the
+    E2-T3 :meth:`~veridex.dust_execution.emergency.SafetyController.cancel_all_and_block` primitive
+    (Mode B only — Mode A places no orders, so there is nothing to sweep, AC-017). A ``"leave_flat"``
+    policy always carries ``cancel_all_fired=False`` — the explicit choice to leave resting orders
+    open, never an omission.
+    """
+
+    policy: ShutdownPolicy
+    cancel_all_fired: bool
+
+
 #: The E1-T2 numbered lifecycle-event union this runner emits (session meta precedes it, unnumbered
 #: — :class:`DustExecutionSessionMeta` carries no ``sequence_no``). Ordered per event, one variant
 #: per stage: risk snapshot, intent, attempt, ack, status, fill/reconciliation, labels.
@@ -296,6 +324,10 @@ class DustExecutionResult:
     unique/monotonic-``sequence_no`` E1-T2 lifecycle stream that follows it. Mode A and Mode B emit
     IDENTICAL event TYPES in IDENTICAL ORDER for the same input (AC-003) — only the recorded DATA
     (e.g. ``ack_status`` / ``venue_order_id``) differs, reflecting whether a real order moved.
+
+    ``shutdown_decision`` is the SAF-006 explicit end-of-run outcome (E6-T6): either the cancel-all
+    wire fired or an explicit leave-flat/leave-open choice was recorded — NEVER a silent abandon of
+    resting orders. Always populated, in both modes.
     """
 
     mode: ExecutionMode
@@ -303,6 +335,7 @@ class DustExecutionResult:
     session_meta: DustExecutionSessionMeta
     events: tuple[LifecycleEvent, ...]
     admission: StrategyAuthorizationDecision
+    shutdown_decision: ShutdownDecision
 
     @property
     def submitted_count(self) -> int:
@@ -567,6 +600,49 @@ async def _startup_open_order_sweep(
     return count
 
 
+async def _apply_shutdown_decision(
+    *,
+    adapter: VenueAdapter,
+    safety: SafetyController,
+    session: DustSafetySession,
+    mode: ExecutionMode,
+    shutdown_policy: ShutdownPolicy,
+) -> ShutdownDecision:
+    """SAF-006/AC-009: shutdown resolves to exactly one EXPLICIT outcome — never a silent abandon.
+
+    Runs at the END of the run (after the token loop, before the run returns): either the cancel-all
+    WIRE fires — DELEGATING to the SAME E2-T3 idempotent
+    :meth:`~veridex.dust_execution.emergency.SafetyController.cancel_all_and_block` primitive under
+    the ``"shutdown"`` cause (already a member of the closed
+    :data:`~veridex.dust_execution.contracts.CancelAllCause` vocab; no per-trigger cancel logic is
+    reimplemented here) — OR an EXPLICIT ``"leave_flat"`` policy decision is recorded. There is no
+    third path: a run ending with resting orders and NEITHER a fired cancel-all NOR a recorded
+    decision is the silent-abandon failure this function exists to close.
+
+    ``shutdown_policy == "cancel_all"`` touches the real wire ONLY in Mode B (``live_guarded``); Mode A
+    (dry-run) never places an order (AC-017), so there is nothing to sweep — the SAME explicit decision
+    contract is still recorded (mirrors the AC-003 / E6-T5 startup-sweep discipline: identical recorded
+    outcome shape in both modes, only Mode B touches the wire). ``shutdown_policy == "leave_flat"``
+    never touches the wire in either mode — an explicit, recorded choice to leave resting orders open.
+
+    Idempotent by construction: if a prior safety trigger (breaker/loss/kill-switch/startup-sweep)
+    already blocked the session, a ``"cancel_all"`` shutdown routes through the SAME idempotent
+    primitive and is a no-op on the wire (:meth:`SafetyController.cancel_all_and_block` never re-fires
+    once blocked) — the shutdown decision is still explicitly returned.
+
+    Returns:
+        The :class:`ShutdownDecision` recording the resolved policy and whether cancel-all fired.
+    """
+    if shutdown_policy == "cancel_all" and mode == "live_guarded":
+        await safety.cancel_all_and_block(
+            "shutdown", adapter=_require_cancel_all_adapter(adapter), session=session
+        )
+        logger.info("dust_execution.shutdown", extra={"shutdown_policy": "cancel_all", "mode": mode})
+        return ShutdownDecision(policy="cancel_all", cancel_all_fired=True)
+    logger.info("dust_execution.shutdown", extra={"shutdown_policy": shutdown_policy, "mode": mode})
+    return ShutdownDecision(policy=shutdown_policy, cancel_all_fired=False)
+
+
 def _non_crossing_gate(
     quote: DustQuote, *, own_legs: Sequence[OwnOrderLeg], tick_size: float
 ) -> AbstainReason | None:
@@ -762,6 +838,7 @@ async def run_dust_execution(
     realized_fills: Sequence[RealizedFillRecord] = (),
     own_legs: Sequence[OwnOrderLeg] = (),
     tick_size: float = _DEFAULT_TICK_SIZE,
+    shutdown_policy: ShutdownPolicy = "leave_flat",
 ) -> DustExecutionResult:
     """Run one dust-execution pass over the manifest universe, applying the submit gates.
 
@@ -821,7 +898,13 @@ async def run_dust_execution(
     wire AND blocks submits, so every token then abstains ``"safety_blocked"`` — no order lands atop the
     pre-existing orders. Mode A exercises the read but touches no wire (dry-run places no orders).
 
-    Still DELIBERATELY provisional (later task): shutdown-as-a-lifecycle-stage (E6-T6).
+    E6-T6 (SAF-006, AC-009) closes the shutdown seam: at the END of the run — after the token loop —
+    the runner resolves the pinned ``shutdown_policy`` into an EXPLICIT :class:`ShutdownDecision`
+    (:func:`_apply_shutdown_decision`), surfaced on the result. Either the cancel-all wire fires (Mode
+    B only, via the SAME E2-T3 :meth:`SafetyController.cancel_all_and_block` primitive under the
+    ``"shutdown"`` cause) or an explicit ``"leave_flat"`` decision is recorded — NEVER a silent
+    abandon of resting orders. Mode A records the identical decision contract but never touches the
+    wire (AC-017 / AC-003 discipline, mirroring the E6-T5 startup sweep).
 
     ``sleep_fn`` is the injected async delay seam for the E6 polling loop (added by a later task);
     this pass makes a single deterministic sweep and does not sleep.
@@ -857,10 +940,14 @@ async def run_dust_execution(
         own_legs: The runner's own resting legs the non-crossing union is evaluated against.
         tick_size: The venue minimum price increment the non-crossing check uses (E6-T4 binds the real
             per-market tick).
+        shutdown_policy: The pinned SAF-006 end-of-run policy — ``"cancel_all"`` fires the E2-T3
+            cancel-all wire (Mode B only) or ``"leave_flat"`` (the default) records an explicit
+            leave-flat/leave-open decision without touching the wire. Always recorded, never omitted.
 
     Returns:
         A :class:`DustExecutionResult` with one :class:`SubmitDecision` per token, the session
-        preamble, and the full ordered lifecycle-event stream.
+        preamble, the full ordered lifecycle-event stream, and the explicit SAF-006
+        :class:`ShutdownDecision`.
     """
     seqc = _SeqCounter()
     session_meta = _build_session_meta(manifest=manifest, envelope=envelope, signer=signer, mode=mode)
@@ -956,12 +1043,24 @@ async def run_dust_execution(
 
     events.append(_build_label_event(seq=seqc.next(), now_ms=now_fn() * 1000, manifest=manifest))
 
+    # E6-T6 (SAF-006/AC-009): resolve the pinned shutdown policy into an EXPLICIT, recorded decision
+    # at the END of the run — cancel-all fires (Mode B only) or an explicit leave-flat/leave-open
+    # choice is recorded. Never a silent abandon of resting orders.
+    shutdown_decision = await _apply_shutdown_decision(
+        adapter=adapter,
+        safety=safety,
+        session=session,
+        mode=mode,
+        shutdown_policy=shutdown_policy,
+    )
+
     return DustExecutionResult(
         mode=mode,
         decisions=tuple(decisions),
         session_meta=session_meta,
         events=tuple(events),
         admission=admission,
+        shutdown_decision=shutdown_decision,
     )
 
 
@@ -1270,6 +1369,8 @@ __all__ = [
     "LifecycleEvent",
     "ModeBArming",
     "QuoteSource",
+    "ShutdownDecision",
+    "ShutdownPolicy",
     "StaleVenueBook",
     "SubmitDecision",
     "run_dust_execution",

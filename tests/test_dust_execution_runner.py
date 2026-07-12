@@ -54,6 +54,8 @@ from veridex.dust_execution.runner import (
     DustExecutionResult,
     DustQuote,
     ModeBArming,
+    ShutdownDecision,
+    ShutdownPolicy,
     StaleVenueBook,
     SubmitDecision,
     run_dust_execution,
@@ -611,6 +613,7 @@ async def _run_guarded(
     request: MMExecutionToolRequest | None = None,
     wallet_equity_at_decision: float = _WALLET_EQUITY,
     fixed_fraction: float = _FIXED_FRACTION,
+    shutdown_policy: ShutdownPolicy = "leave_flat",
 ) -> DustExecutionResult:
     binding = _binding()
     effective_manifest = manifest if manifest is not None else _mode_b_manifest(binding)
@@ -634,6 +637,7 @@ async def _run_guarded(
         breaker=breaker,
         realized_fills=realized_fills,
         own_legs=own_legs,
+        shutdown_policy=shutdown_policy,
     )
 
 
@@ -1136,3 +1140,121 @@ async def test_startup_sweep_contract_exercised_in_mode_a_no_wire_touched() -> N
     assert adapter.submit_calls == 0, "Mode A places no orders (AC-017)"
     (decision,) = result.decisions
     assert decision.submitted is False and decision.abstain_reason == "mode_a_no_orders"
+
+
+# --- E6-T6: shutdown cancel-all or explicit leave-flat decision (SAF-006, AC-009) -------------
+#
+# THE safety property: at shutdown the outcome must be one of exactly two EXPLICIT states —
+# cancel-all fired (wire cancel + block) OR an explicit recorded leave-flat/leave-open decision. A
+# silent abandon (the run ends with resting orders and NEITHER a fired cancel-all NOR a recorded
+# decision) is the failure these tests expose. Mutation: make shutdown a silent no-op (neither cancel
+# nor record) -> ``result.shutdown_decision`` would not exist / the cancel-all WIRE would not fire ->
+# these tests fail.
+
+
+async def test_shutdown_cancel_all_policy_fires_cancel_all_wire() -> None:
+    """SAF-006/AC-009: a cancel-all shutdown policy fires the E2-T3 cancel-all WIRE under the honest
+    ``"shutdown"`` cause (never an order id) and the outcome is explicitly recorded on the result.
+    """
+    adapter = RecordingFakeAdapter(fill=True)
+    safety, session = _make_safety()
+
+    result = await _run_guarded(
+        adapter=adapter, safety=safety, session=session, shutdown_policy="cancel_all"
+    )
+
+    assert adapter.cancel_all_calls == 1, "a cancel-all shutdown policy must fire the recording-fake cancel-all WIRE"
+    assert session.submit_blocked is True
+    assert session.last_cancel_all_ack is not None
+    assert session.last_cancel_all_ack.trigger_cause == "shutdown"
+    assert "venue_order_id" not in session.last_cancel_all_ack.model_dump()
+    assert isinstance(result.shutdown_decision, ShutdownDecision)
+    assert result.shutdown_decision.policy == "cancel_all"
+    assert result.shutdown_decision.cancel_all_fired is True
+
+
+async def test_shutdown_leave_flat_policy_records_explicit_decision_no_wire() -> None:
+    """SAF-006: a leave-flat shutdown policy records an EXPLICIT decision and fires NO cancel-all
+    wire — a recorded choice, never a silent omission.
+    """
+    adapter = RecordingFakeAdapter(fill=True)
+    safety, session = _make_safety()
+
+    result = await _run_guarded(
+        adapter=adapter, safety=safety, session=session, shutdown_policy="leave_flat"
+    )
+
+    assert adapter.cancel_all_calls == 0, "a leave-flat shutdown policy must fire NO cancel-all wire"
+    assert session.submit_blocked is False, "leave-flat must never engage the emergency-stop block"
+    assert isinstance(result.shutdown_decision, ShutdownDecision)
+    assert result.shutdown_decision.policy == "leave_flat"
+    assert result.shutdown_decision.cancel_all_fired is False
+
+
+async def test_shutdown_default_policy_is_explicit_leave_flat_never_omitted() -> None:
+    """POSITIVE CONTROL: the pinned default shutdown policy still yields an EXPLICIT, non-``None``
+    decision — proving the "never silent" property holds even when the caller supplies nothing.
+    """
+    adapter = RecordingFakeAdapter(fill=True)
+
+    result = await _run_guarded(adapter=adapter)
+
+    assert isinstance(result.shutdown_decision, ShutdownDecision)
+    assert result.shutdown_decision.policy == "leave_flat"
+    assert result.shutdown_decision.cancel_all_fired is False
+    assert adapter.cancel_all_calls == 0, "the pinned default must not fire the cancel-all wire"
+
+
+async def test_shutdown_mode_a_cancel_all_policy_records_decision_but_touches_no_wire() -> None:
+    """Mode A (dry-run) records the SAME explicit shutdown-decision contract but NEVER touches the
+    cancel-all wire, even under a ``"cancel_all"`` policy — dry-run places no orders, so there is
+    nothing to sweep (AC-017), mirroring the E6-T5 startup-sweep Mode A discipline (AC-003).
+    """
+    adapter = RecordingFakeAdapter(fill=True)
+    source = _ScriptedSource(quote=_fresh_quote())
+
+    result = await run_dust_execution(
+        adapter=adapter,
+        signer=LocalFakeWalletControlPlane(),
+        sources=source,
+        now_fn=_clock,
+        sleep_fn=_noop_sleep,
+        envelope=_env(),
+        manifest=_manifest(mode="dry_run"),
+        mode="dry_run",
+        wallet_equity_at_decision=_WALLET_EQUITY,
+        fixed_fraction=_FIXED_FRACTION,
+        arming=None,
+        shutdown_policy="cancel_all",
+    )
+
+    assert adapter.cancel_all_calls == 0, "Mode A must fire NO cancel wire even under a cancel-all shutdown policy"
+    assert adapter.submit_calls == 0, "Mode A places no orders (AC-017)"
+    assert isinstance(result.shutdown_decision, ShutdownDecision)
+    assert result.shutdown_decision.policy == "cancel_all"
+    assert result.shutdown_decision.cancel_all_fired is False
+
+
+async def test_shutdown_cancel_all_is_idempotent_after_prior_safety_trigger() -> None:
+    """A cancel-all shutdown after an EARLIER safety trigger already swept is idempotent: the wire is
+    NOT re-fired (the session is already blocked), yet the shutdown outcome is still explicitly
+    recorded — never silently skipped just because the session was already blocked.
+    """
+    adapter = RecordingFakeAdapter(fill=True)
+    safety, session = _make_safety()
+    breaker = CircuitBreaker(state=CircuitState.OPEN, opened_at=0.0, consecutive_failures=5)
+
+    result = await _run_guarded(
+        adapter=adapter,
+        safety=safety,
+        session=session,
+        breaker=breaker,
+        shutdown_policy="cancel_all",
+    )
+
+    assert adapter.cancel_all_calls == 1, "the idempotent primitive must NOT re-fire the wire at shutdown"
+    assert session.last_cancel_all_ack is not None
+    assert session.last_cancel_all_ack.trigger_cause == "breaker", "the ORIGINAL trigger cause is preserved"
+    assert isinstance(result.shutdown_decision, ShutdownDecision)
+    assert result.shutdown_decision.policy == "cancel_all"
+    assert result.shutdown_decision.cancel_all_fired is True
