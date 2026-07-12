@@ -192,3 +192,126 @@ def test_r4a_field_set_equals_expected_and_is_denylisted():
     assert EXPECTED_R4A_FIELDS <= R3_R4_RANK_DENYLIST             # and the canonical set is enforced
 def test_real_executable_edge_bps_stays_excluded():
     assert dir_key({**VALID_DIR, "real_executable_edge_bps": None}) is not None  # does NOT raise
+
+
+# =====================================================================================
+# E1-T6 (SEC-004, AC-016, §6 group 9): the sealed maker/scoring output is BYTE-IDENTICAL
+# after exercising the R4-A dust-execution lane.
+#
+# Mirrors test_live_recorder_sec005.py:230-249 (the R3 recorder analogue): capture
+# score_run(run) before, construct + use REAL R4-A lifecycle contracts, capture score_run
+# after, and assert byte-identity via the shared veridex.maker.result.assert_score_run_untouched
+# (imported, not re-defined). Constructing/using the R4-A contracts must not perturb the
+# sealed directional leaderboard, and the sealed maker-arena-result.json on disk must remain
+# byte-identical to its committed content. Being a "nothing changed" preservation guard it
+# PASSES when the system is correct; its teeth are proven by the mutation checks (see task).
+# =====================================================================================
+import hashlib  # noqa: E402
+import subprocess  # noqa: E402
+
+from veridex.dust_execution.contracts import (  # noqa: E402
+    DustExecutionSessionMeta,
+    OwnFillEvent,
+    RealFillReconciliation,
+)
+from veridex.maker.result import assert_score_run_untouched  # noqa: E402
+from veridex.runtime.orchestrator import RunResult  # noqa: E402
+from veridex.scoring import score_run  # noqa: E402
+
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+_SEALED_MAKER_RESULT = "scripts/txline_live/cp1/maker-arena-result.json"
+
+
+def _dir_row_e1t6(agent_id: str, tick_seq: int, clv_bps: int, confidence: float | None = None) -> dict:
+    """A directional score row in the shape score_run consumes (mirrors sec005._dir_row)."""
+    params: dict = {"market_key": "OU_2_5", "side": "over"}
+    if confidence is not None:
+        params["confidence"] = confidence
+    return {
+        "agent_id": agent_id,
+        "tick_seq": tick_seq,
+        "clv_bps": clv_bps,
+        "valid": True,
+        "reason": "",
+        "raw_prescore": {"raw_action": {"type": "FLAG_VALUE", "params": params}},
+    }
+
+
+def _representative_run_e1t6() -> RunResult:
+    """A representative directional run (mirrors sec005._representative_run)."""
+    rows = [
+        _dir_row_e1t6("agent-alpha", 0, 15, confidence=0.7),
+        _dir_row_e1t6("agent-alpha", 1, -5, confidence=0.4),
+        _dir_row_e1t6("agent-beta", 0, 8, confidence=0.55),
+        _dir_row_e1t6("agent-beta", 1, 3),
+    ]
+    return RunResult(
+        run_id="run-e1t6",
+        source_mode="replay",
+        agent_ids=["agent-alpha", "agent-beta"],
+        run_events=[],
+        score_rows=rows,
+        evidence_hash="",
+        proof_mode_map={"agent-alpha": "reproducible", "agent-beta": "reproducible"},
+    )
+
+
+def _simulate_r4a_dust_execution_session() -> None:
+    """Exercise the R4-A dust-execution lane: build the session identity + a realized OWN fill +
+    its reconciliation against complete venue truth (the REAL fill-carrying contracts that are the
+    whole point of the lane). Constructing/using these must not touch the directional scorer."""
+    DustExecutionSessionMeta(
+        session_id="dust-sess-e1t6",
+        mode="dry_run",
+        wallet_ref="wallet-ref-e1t6",
+        manifest_hash="m" * 64,
+        policy_hash="p" * 64,
+        caps_snapshot={"max_notional": 5.0, "max_order": 1.0},
+        market_fee_snapshot_hash="f" * 64,
+        operator_authorization_ref="op-auth-e1t6",
+    )
+    OwnFillEvent(
+        sequence_no=1,
+        event_type="OwnFillEvent",
+        source_ts=None,
+        recv_ts=1_000,
+        decision_id="d1",
+        client_order_id="c1",
+        venue_order_id="v1",
+        side="buy",
+        fill_price=0.60,
+        fill_size=1.0,
+        fill_ts=1_000,
+    )
+    RealFillReconciliation(
+        sequence_no=2,
+        event_type="RealFillReconciliation",
+        source_ts=None,
+        recv_ts=1_100,
+        decision_id="d1",
+        venue_order_key="vk1",
+        reconciled_state="RESOLVED",
+        reconciled_fill_size=1.0,
+    )
+
+
+def test_score_run_untouched_after_dust_execution_session():
+    run = _representative_run_e1t6()
+    before = score_run(run)
+
+    _simulate_r4a_dust_execution_session()
+
+    after = score_run(run)
+    # AC-016/SEC-004: the directional leaderboard is byte-identical across an R4-A session.
+    assert_score_run_untouched(before, after)  # raises iff before != after
+
+    # The sealed maker arena result on disk is byte-identical to its committed content.
+    sealed = _REPO_ROOT / _SEALED_MAKER_RESULT
+    on_disk = sealed.read_bytes()
+    committed = subprocess.run(
+        ["git", "show", f"HEAD:{_SEALED_MAKER_RESULT}"],
+        cwd=_REPO_ROOT, capture_output=True, check=True,
+    ).stdout
+    assert hashlib.sha256(on_disk).hexdigest() == hashlib.sha256(committed).hexdigest(), (
+        "sealed maker-arena-result.json must be byte-identical to its committed content"
+    )
