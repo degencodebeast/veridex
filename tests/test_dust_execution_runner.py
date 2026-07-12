@@ -2000,3 +2000,145 @@ async def test_intent_not_in_permitted_kinds_is_denied_fail_closed() -> None:
     (decision,) = result.decisions
     assert decision.submitted is False
     assert decision.abstain_reason == "intent_not_permitted"
+
+
+# =====================================================================================
+# Gate#3 C-2 (CRITICAL): non-crossing must gate the EXACT proposed typed order — its real
+# token/side/native-price — NEVER a phantom hardcoded BUY-at-the-venue-ask.
+#
+# THE SELF-CROSS INVARIANT (E5, SAF-009): the order actually placed can be a SELL make_quote at a
+# native price that crosses an OWN resting BUY. The pre-fix gate evaluated an unrelated BUY@ask, so
+# the real SELL slipped past the self-cross guard and rested atop the own book. Non-crossing must see
+# the order that reaches the wire.
+#
+# MUTATION: re-hardcode ``_non_crossing_gate`` to a BUY@ask phantom -> the crossing test below admits
+# the SELL and rests it (``resting_calls == 1``), so the test FAILS. That proves the gate now reads
+# the REAL proposed order, not a phantom.
+
+_TOKEN_NO = "0xtokenNO"  # the complementary outcome token for the multi-token universe C-4 cases
+
+
+async def test_non_crossing_gates_the_real_make_quote_sell_not_phantom_buy() -> None:
+    """A ``make_quote`` SELL that self-crosses an OWN resting BUY is REFUSED — no order on the wire.
+
+    An own resting ``BUY YES @ 0.50`` and an admitted ``make_quote SELL YES @ 0.49``: the REAL SELL
+    (lowest_own_ask 0.49) crosses the own BUY (highest_own_bid 0.50). RED before the fix: the gate
+    evaluated a phantom ``BUY @ quote.ask`` (two bids, no ask → admitted), so the crossing SELL rested
+    (``resting_calls == 1``, ``submitted``). After the fix the gate sees the real SELL and abstains.
+    """
+    binding = _binding()
+    manifest = _mode_b_manifest(binding)
+    env = _env()
+    adapter = _MakerRecordingAdapter(fill=True)
+    own = (OwnOrderLeg(token_id=_TOKEN, side="BUY", price=0.50, kind=LegKind.OPEN),)
+    params = MMIntentParams(token_id=_TOKEN, side="SELL", price=0.49, tif="GTC", client_order_id="coid-mk")
+    request = _intent_request("make_quote", manifest=manifest, envelope=env, params=params)
+
+    result = await _run_guarded(
+        adapter=adapter,
+        manifest=manifest,
+        envelope=env,
+        arming=_arming(binding),
+        request=request,
+        own_legs=own,
+    )
+
+    assert adapter.resting_calls == 0, "a self-crossing make_quote SELL must NOT rest an order"
+    assert adapter.submit_calls == 0, "and must NOT reach the taker submit wire either"
+    (decision,) = result.decisions
+    assert decision.submitted is False
+    assert decision.abstain_reason == "self_cross"
+
+
+async def test_non_crossing_admits_a_make_quote_sell_that_does_not_cross() -> None:
+    """POSITIVE CONTROL: a ``make_quote`` SELL that does NOT cross the own BUY still rests once.
+
+    Own resting ``BUY YES @ 0.50`` and an admitted ``make_quote SELL YES @ 0.52``: highest_own_bid
+    0.50 < lowest_own_ask 0.52 → no self-cross → the real SELL rests exactly once. Makes the crossing
+    refusal above meaningful (the gate admits the non-crossing real order, refuses the crossing one).
+    """
+    binding = _binding()
+    manifest = _mode_b_manifest(binding)
+    env = _env()
+    adapter = _MakerRecordingAdapter(fill=True)
+    own = (OwnOrderLeg(token_id=_TOKEN, side="BUY", price=0.50, kind=LegKind.OPEN),)
+    params = MMIntentParams(token_id=_TOKEN, side="SELL", price=0.52, tif="GTC", client_order_id="coid-mk2")
+    request = _intent_request("make_quote", manifest=manifest, envelope=env, params=params)
+
+    result = await _run_guarded(
+        adapter=adapter,
+        manifest=manifest,
+        envelope=env,
+        arming=_arming(binding),
+        request=request,
+        own_legs=own,
+    )
+
+    assert adapter.resting_calls == 1, "a non-crossing make_quote SELL must rest exactly one order"
+    (decision,) = result.decisions
+    assert decision.submitted is True and decision.abstain_reason is None
+
+
+# =====================================================================================
+# Gate#3 C-4 (CRITICAL): a SINGULAR order-placing intent targets EXACTLY its admitted
+# ``intent_params.token_id`` — it must NOT fan out across the whole manifest universe.
+#
+# THE FUND-TOUCHING PROPERTY: one ``make_quote`` for ``0xtokenYES`` in a two-token universe must move
+# funds on ``0xtokenYES`` ONLY; every other token abstains with the closed-vocabulary token-mismatch
+# reason. A missing / out-of-universe ``intent_params.token_id`` fails closed (all abstain, zero wire).
+#
+# MUTATION: remove the token-match guard (loop applies the intent to all tokens) -> the multi-token
+# test rests TWO orders (``resting_calls == 2``), so the test FAILS. That proves the guard is under test.
+
+
+async def test_singular_make_quote_targets_only_its_admitted_token() -> None:
+    """One ``make_quote`` for ``0xtokenYES`` in a ``[YES, NO]`` universe rests for YES ONLY.
+
+    RED before the fix: the token loop applies the SAME intent to EVERY token, so it rests an order for
+    BOTH ``0xtokenYES`` AND ``0xtokenNO`` (``resting_calls == 2``) — the request authorized one token
+    but moved funds on another. After the fix ``0xtokenNO`` abstains ``intent_token_mismatch`` and
+    exactly one resting order lands on ``0xtokenYES``.
+    """
+    binding = _binding()
+    manifest = _mode_b_manifest(binding, universe=(_TOKEN, _TOKEN_NO))
+    env = _env()
+    adapter = _MakerRecordingAdapter(fill=True)
+    params = MMIntentParams(token_id=_TOKEN, side="SELL", price=0.52, tif="GTC", client_order_id="coid-mk")
+    request = _intent_request("make_quote", manifest=manifest, envelope=env, params=params)
+
+    result = await _run_guarded(
+        adapter=adapter, manifest=manifest, envelope=env, arming=_arming(binding), request=request
+    )
+
+    assert adapter.resting_calls == 1, "a singular make_quote must rest EXACTLY one order (its token)"
+    assert adapter.submit_calls == 0
+    by_token = {d.token_id: d for d in result.decisions}
+    assert by_token[_TOKEN].submitted is True and by_token[_TOKEN].abstain_reason is None
+    assert by_token[_TOKEN_NO].submitted is False, "the non-target token must NOT move funds"
+    assert by_token[_TOKEN_NO].abstain_reason == "intent_token_mismatch"
+
+
+async def test_singular_make_quote_token_not_in_universe_fails_closed() -> None:
+    """An ``intent_params.token_id`` NOT in the manifest universe fails closed: all abstain, zero wire.
+
+    RED before the fix: the loop ignores ``intent_params.token_id`` entirely and rests an order for
+    each universe token (``resting_calls == 2``). After the fix — since NO universe token equals the
+    out-of-universe target — every token abstains ``intent_token_mismatch`` and nothing reaches the wire.
+    """
+    binding = _binding()
+    manifest = _mode_b_manifest(binding, universe=(_TOKEN, _TOKEN_NO))
+    env = _env()
+    adapter = _MakerRecordingAdapter(fill=True)
+    params = MMIntentParams(
+        token_id="0xtokenOTHER", side="SELL", price=0.52, tif="GTC", client_order_id="coid-mk"
+    )
+    request = _intent_request("make_quote", manifest=manifest, envelope=env, params=params)
+
+    result = await _run_guarded(
+        adapter=adapter, manifest=manifest, envelope=env, arming=_arming(binding), request=request
+    )
+
+    assert adapter.resting_calls == 0, "a token outside the universe must never move funds"
+    assert adapter.submit_calls == 0
+    assert all(not d.submitted for d in result.decisions)
+    assert all(d.abstain_reason == "intent_token_mismatch" for d in result.decisions)

@@ -95,7 +95,7 @@ from veridex.dust_execution.manifest import (
     StrategyAuthorizationDecision,
     StrategyExperimentManifest,
 )
-from veridex.dust_execution.noncrossing import LegKind, OwnOrderLeg, check_non_crossing
+from veridex.dust_execution.noncrossing import LegKind, OwnOrderLeg, Side, check_non_crossing
 from veridex.dust_execution.privy_control_plane import (
     PrivyPreflightResult,
     ProvisioningResult,
@@ -199,8 +199,11 @@ class QuoteSource(Protocol):
 #: Gate#3 CRITICAL-1 additions — the runner ABSTAINS on the admitted typed intent's own terms:
 #: ``intent_no_quote`` (the explicit DON'T-TRADE abstention), ``intent_cancel_all`` (the intent
 #: fired the cancel-all sweep, so no NEW order is submitted), ``intent_not_permitted`` (the intent
-#: kind is not in ``manifest.permitted_intent_kinds`` — fail-closed), and ``intent_params_invalid``
-#: (a maker/cancel-replace intent whose typed params are missing/incoherent — fail-closed, no wire).
+#: kind is not in ``manifest.permitted_intent_kinds`` — fail-closed), ``intent_params_invalid``
+#: (a maker/cancel-replace intent whose typed params are missing/incoherent — fail-closed, no wire),
+#: and ``intent_token_mismatch`` (Gate#3 C-4: a SINGULAR order-placing intent whose admitted
+#: ``intent_params.token_id`` is not THIS loop token — a singular intent moves ONE admitted token, so
+#: every other universe token abstains; a missing / out-of-universe target fails closed, all abstain).
 AbstainReason = Literal[
     "stale_quote_age",
     "stale_source",
@@ -219,6 +222,7 @@ AbstainReason = Literal[
     "intent_cancel_all",
     "intent_not_permitted",
     "intent_params_invalid",
+    "intent_token_mismatch",
 ]
 
 #: Tuple form of :data:`AbstainReason` for membership checks / iteration.
@@ -240,6 +244,7 @@ ABSTAIN_REASONS: tuple[AbstainReason, ...] = (
     "intent_cancel_all",
     "intent_not_permitted",
     "intent_params_invalid",
+    "intent_token_mismatch",
 )
 
 #: The venue minimum price increment the non-crossing check rounds/compares against (Polymarket
@@ -926,19 +931,18 @@ async def _apply_shutdown_decision(
 
 
 def _non_crossing_gate(
-    quote: DustQuote, *, own_legs: Sequence[OwnOrderLeg], tick_size: float
+    proposed: OwnOrderLeg, *, own_legs: Sequence[OwnOrderLeg], tick_size: float
 ) -> AbstainReason | None:
-    """Return ``"self_cross"`` if the proposed BUY self-crosses an own leg, else ``None`` (E5, SAF-009).
+    """Return ``"self_cross"`` if the ``proposed`` order self-crosses an own leg, else ``None`` (E5).
 
-    Routes the proposed order (a BUY at the quote's ask) THROUGH the pure E5
-    :func:`~veridex.dust_execution.noncrossing.check_non_crossing` over the possibly-live union of
-    the runner's own resting legs plus the proposed leg. A REJECT verdict refuses the submit; this is
-    the wire the submit path must not bypass (mutation: bypassing it lets a crossing order submit).
+    Gate#3 C-2 (SAF-009): ``proposed`` is the EXACT typed order about to reach the wire — its real
+    token_id, side, and native price (a SELL make_quote, a taker crossing side, or a cancel_replace
+    replacement), NEVER a phantom hardcoded BUY at the venue ask. It routes THROUGH the pure E5
+    :func:`~veridex.dust_execution.noncrossing.check_non_crossing` over the possibly-live union of the
+    runner's own resting legs plus this proposed leg. A REJECT verdict refuses the submit; this is the
+    wire the submit path must not bypass (mutation: re-hardcode ``proposed`` to a BUY@ask phantom and a
+    crossing SELL slips onto the book).
     """
-    assert quote.ask is not None  # noqa: S101 - gate guaranteed both sides before this runs
-    proposed = OwnOrderLeg(
-        token_id=quote.token_id, side="BUY", price=quote.ask.price, kind=LegKind.PROPOSED
-    )
     verdict = check_non_crossing((*own_legs, proposed), tick_size=tick_size)
     return None if verdict.admitted else "self_cross"
 
@@ -1361,6 +1365,13 @@ async def run_dust_execution(
     intent, intent_params = _effective_intent(request)
     intent_block_reason = _intent_block_reason(request, manifest=manifest)
 
+    # Gate#3 C-4: a singular order-placing intent from an AGENT request targets EXACTLY its admitted
+    # ``intent_params.token_id`` — enforcement is active only for an agent order-placing intent
+    # (``intent_block_reason is None`` rules out no_quote / cancel_all / not_permitted; a self-driven
+    # call with no ``request`` fans out per token by design and is NOT token-targeted).
+    enforce_intent_token = request is not None and intent_block_reason is None
+    intent_target_token = intent_params.token_id if enforce_intent_token else None
+
     # The mechanical wire size is PINNED-input only (never the agent request) and identical per token.
     wire_size = _resolve_wire_size(
         manifest=manifest,
@@ -1423,6 +1434,8 @@ async def run_dust_execution(
             intent=intent,
             intent_params=intent_params,
             intent_block_reason=intent_block_reason,
+            enforce_intent_token=enforce_intent_token,
+            intent_target_token=intent_target_token,
         )
         decisions.append(decision)
         events.extend(token_events)
@@ -1477,6 +1490,8 @@ async def _decide_and_submit(
     intent: IntentKind,
     intent_params: MMIntentParams,
     intent_block_reason: AbstainReason | None,
+    enforce_intent_token: bool,
+    intent_target_token: str | None,
 ) -> tuple[SubmitDecision, tuple[LifecycleEvent, ...]]:
     """Gate one token's quote and, only when clear AND Mode B (ARMED), act on the ADMITTED intent.
 
@@ -1509,6 +1524,14 @@ async def _decide_and_submit(
     if intent_block_reason is not None:
         return _abstain(token_id, intent_block_reason), ()
 
+    # Gate#3 C-4: a SINGULAR order-placing intent (make_quote / take / cancel_replace) targets EXACTLY
+    # its admitted ``intent_params.token_id``. Every OTHER universe token abstains here — the request
+    # authorized ONE token, so it must never fan out and move funds on another. A missing /
+    # out-of-universe target matches no loop token, so every token abstains (fail closed, zero wire).
+    # Refuse before any quote I/O — a non-target token does no venue read.
+    if enforce_intent_token and token_id != intent_target_token:
+        return _abstain(token_id, "intent_token_mismatch"), ()
+
     # Mode A→B HARD GATE + arming (Mode B only): an unarmed Mode B places NO order and reads no quote.
     if mode == "live_guarded" and arming_block_reason is not None:
         return _abstain(token_id, arming_block_reason), ()
@@ -1534,18 +1557,27 @@ async def _decide_and_submit(
     if authorization_block_reason is not None:
         return _abstain(token_id, authorization_block_reason), ()
 
-    # Non-crossing: refuse a proposed order that self-crosses an own leg (E5, SAF-009). Mode-
-    # independent — a crossing order is refused in Mode A and Mode B alike.
-    cross_reason = _non_crossing_gate(quote, own_legs=own_legs, tick_size=tick_size)
-    if cross_reason is not None:
-        return _abstain(token_id, cross_reason), ()
-
-    # Gate#3 CRITICAL-1: dispatch the ADMITTED order-placing intent (never a hardcoded BUY/FOK). A
-    # maker/cancel-replace intent whose typed params are missing/incoherent fails closed with NO wire.
+    # Gate#3 CRITICAL-1 + C-2: dispatch the ADMITTED order-placing intent (never a hardcoded BUY/FOK),
+    # and gate the EXACT proposed typed order — its real token_id/side/native price — through the E5
+    # non-crossing check BEFORE any submit (SAF-009). A maker/cancel-replace intent whose typed params
+    # are missing/incoherent fails closed with NO wire. Non-crossing is mode-independent (refused in
+    # Mode A and Mode B alike).
     if intent == "take":
         side, tif, invalid = _resolve_taker_side_tif(intent_params)
         if invalid:
             return _abstain(token_id, "intent_params_invalid"), ()
+        # A taker crosses the book: BUY lifts the ask, SELL hits the bid — the REAL crossing price the
+        # order rests at. Both sides are present (a missing side abstained above); safe to read.
+        assert quote.bid is not None and quote.ask is not None  # noqa: S101 - gate guaranteed both sides
+        proposed = OwnOrderLeg(
+            token_id=token_id,
+            side=cast("Side", side),  # narrowed to BUY/SELL by _resolve_taker_side_tif (invalid=False)
+            price=quote.ask.price if side == "BUY" else quote.bid.price,
+            kind=LegKind.PROPOSED,
+        )
+        cross_reason = _non_crossing_gate(proposed, own_legs=own_legs, tick_size=tick_size)
+        if cross_reason is not None:
+            return _abstain(token_id, cross_reason), ()
         decision, events = await _emit_order_lifecycle(
             quote,
             adapter=adapter,
@@ -1561,7 +1593,8 @@ async def _decide_and_submit(
             tif=tif,
         )
     else:
-        # ``make_quote`` / ``cancel_replace`` both rest a post-only maker; build+validate it once.
+        # ``make_quote`` / ``cancel_replace`` both rest a post-only maker; build+validate it once, then
+        # gate the REAL resting order (its admitted side/native price) through non-crossing.
         resting = _build_resting_order(
             token_id=token_id,
             manifest=manifest,
@@ -1571,6 +1604,15 @@ async def _decide_and_submit(
         )
         if resting is None:
             return _abstain(token_id, "intent_params_invalid"), ()
+        proposed = OwnOrderLeg(
+            token_id=resting.token_id,
+            side=resting.side,
+            price=resting.native_price,
+            kind=LegKind.PROPOSED,
+        )
+        cross_reason = _non_crossing_gate(proposed, own_legs=own_legs, tick_size=tick_size)
+        if cross_reason is not None:
+            return _abstain(token_id, cross_reason), ()
         if intent == "cancel_replace":
             replaces = intent_params.replaces_client_order_id
             if not replaces:
