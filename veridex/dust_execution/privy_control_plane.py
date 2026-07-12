@@ -367,8 +367,9 @@ class PrivyEvmWalletControlPlane:
         binding address and the compiled order signer. A provider error freezes (FailClosed), never a
         local-key fallback.
         """
-        # (1) AUTH MECHANICS first — refuse before any provider I/O.
-        self._validate_auth(auth)
+        # (1) AUTH MECHANICS first — refuse before any provider I/O. The request's self-declared
+        #     quorum_threshold MUST equal the PINNED binding threshold (a request cannot downgrade it).
+        self._validate_auth(auth, pinned_threshold=binding.quorum_threshold)
 
         typed_data = compiled_payload.canonical_v2_typed_data
         # Default-deny domain guard: this path signs ONLY the V2 ``Order`` domain. Any other
@@ -444,7 +445,9 @@ class PrivyEvmWalletControlPlane:
         client → recover the signer and REQUIRE it equals BOTH ``binding.wallet_address`` AND the
         ClobAuth ``address`` field. A provider error FREEZES (never a local-key fallback).
         """
-        self._validate_auth(auth)
+        # AUTH MECHANICS first (refuse-before-I/O): the request's quorum_threshold MUST equal the
+        # PINNED binding threshold on THIS path too — the ClobAuth request cannot self-downgrade it.
+        self._validate_auth(auth, pinned_threshold=binding.quorum_threshold)
 
         if clob_auth_typed_data.get("primaryType") != CLOB_AUTH_PRIMARY_TYPE:
             raise FailClosed(
@@ -509,16 +512,27 @@ class PrivyEvmWalletControlPlane:
 
     # -- internals ----------------------------------------------------------------------------------
 
-    def _validate_auth(self, auth: PrivyAuthContext) -> None:
+    def _validate_auth(self, auth: PrivyAuthContext, *, pinned_threshold: int) -> None:
+        """Validate the auth wrapper against the PINNED quorum threshold (refuse-before-I/O).
+
+        ``pinned_threshold`` is the server-resolved ``binding.quorum_threshold`` — NOT the request's
+        own value. The request may not self-downgrade the quorum: its ``auth.quorum_threshold`` MUST
+        equal the pinned threshold, and distinct signatures are counted against that PINNED value.
+        """
         if auth.request_expiry_ms <= self._now_ms():
             raise FailClosed(
                 "privy-request-expiry has passed — refusing (signed replay guard, fail closed)"
             )
-        if auth.quorum_threshold < 1:
-            raise FailClosed("quorum_threshold must be >= 1 (a signature set is required)")
-        if len(set(auth.quorum_signatures)) < auth.quorum_threshold:
+        if pinned_threshold < 1:
+            raise FailClosed("pinned quorum_threshold must be >= 1 (a signature set is required)")
+        if auth.quorum_threshold != pinned_threshold:
             raise FailClosed(
-                "authorization quorum not met: fewer distinct signatures than the required threshold"
+                "authorization quorum_threshold does not equal the pinned binding threshold — a "
+                "request may not self-downgrade the pinned quorum (fail closed before any I/O)"
+            )
+        if len(set(auth.quorum_signatures)) < pinned_threshold:
+            raise FailClosed(
+                "authorization quorum not met: fewer distinct signatures than the PINNED threshold"
             )
         if not auth.idempotency_key:
             raise FailClosed("auth is missing an idempotency_key")

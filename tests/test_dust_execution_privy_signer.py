@@ -934,3 +934,43 @@ async def test_mint_l2_credentials_signs_clobauth_and_holds_no_secret_in_referen
     assert set(ref) == {"derivation_ref", "derivation_nonce"}
     for secret in (_SECRET_OWNER, _SECRET_API_SECRET, _SECRET_PASSPHRASE):
         assert secret not in repr(ref)
+
+
+# ===============================================================================================
+# Gate#2 MAJOR-1 — a request may NOT self-downgrade the pinned Privy quorum threshold.
+# The auth wrapper carries its OWN quorum_threshold; it MUST equal the pinned
+# binding.quorum_threshold (2), and distinct signatures are counted against that PINNED value —
+# else a one-signature request declaring threshold=1 would authorize below quorum. Fail closed
+# BEFORE any provider I/O, on BOTH the V2 Order and the L1 ClobAuth signing paths.
+# ===============================================================================================
+
+# ONE signature + a self-declared threshold of 1 (below the pinned binding threshold of 2).
+_SELF_DOWNGRADE_AUTH = PrivyAuthContext(
+    request_expiry_ms=_future_ms(),
+    quorum_signatures=("sig-A",),
+    quorum_threshold=1,
+    idempotency_key="idem-1",
+)
+
+
+def test_request_cannot_self_downgrade_pinned_quorum_threshold_order():
+    """MAJOR-1 (Order): a request declaring threshold=1 with one signature vs a pinned binding
+    threshold of 2 must FAIL CLOSED before any provider I/O — the request cannot self-downgrade."""
+    assert BIND.quorum_threshold == 2  # the PINNED authorization threshold
+    fake = PolicyFakePrivy()
+    cp = PrivyEvmWalletControlPlane(client=fake, binding=BIND)
+    with pytest.raises(FailClosed):
+        cp.sign_typed_data(COMPILED, binding=BIND, auth=_SELF_DOWNGRADE_AUTH)
+    assert fake.sign_calls == []  # refused BEFORE any provider call (refuse-before-I/O)
+
+
+def test_request_cannot_self_downgrade_pinned_quorum_threshold_clobauth():
+    """MAJOR-1 (ClobAuth): the same self-downgrade attempt on the L1 ClobAuth path fails closed
+    before any provider I/O — the pinned threshold guard covers BOTH signing paths."""
+    assert BIND.quorum_threshold == 2
+    fake = L2FakePrivy()
+    cp = PrivyEvmWalletControlPlane(client=fake, binding=BIND)
+    clob_typed = build_clob_auth_typed_data(address=_WALLET_ADDRESS, timestamp="1700000000")
+    with pytest.raises(FailClosed):
+        cp.sign_clob_auth(clob_typed, binding=BIND, auth=_SELF_DOWNGRADE_AUTH)
+    assert fake.sign_calls == []  # refused BEFORE any provider call (refuse-before-I/O)
