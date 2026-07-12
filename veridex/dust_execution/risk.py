@@ -26,6 +26,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from typing import ClassVar
 
 from veridex.policy.envelope import PolicyEnvelope, cap_breached
 
@@ -50,9 +51,16 @@ class RealizedFillRecord:
         session_id: Immutable session identity this fill belongs to.
         fill_ts_ms: Venue fill time in integer epoch **milliseconds** (UTC), used for the
             UTC-day boundary.
-        source: Provenance marker pinned to the real venue-reconciled source; a non-real
-            source cannot construct this record (it is a distinct type, ``PaperReceipt``).
+        source: Provenance marker pinned to the ONE real venue-reconciled source. It fails
+            closed at construction unless it is exactly ``"venue_reconciled"`` (see
+            ``__post_init__``): a paper/simulated source wrapped AS a ``RealizedFillRecord``
+            can therefore never construct a valid real-fill carrier, and a corrupt-source
+            ledger row fails closed on replay. The ``PaperReceipt`` type-rejection in
+            ``apply_realized_fill`` is a SEPARATE, complementary control.
     """
+
+    #: The ONLY admissible provenance — a real, venue-reconciled fill (anti-inert, SAF-002b).
+    VENUE_SOURCE: ClassVar[str] = "venue_reconciled"
 
     realized_pnl: float
     fee: float
@@ -67,6 +75,16 @@ class RealizedFillRecord:
             raise ValueError(f"fee must be finite, got {self.fee!r}")
         if self.fee < 0.0:
             raise ValueError(f"fee must be >= 0, got {self.fee!r}")
+        # Anti-inert provenance (SAF-002b / Gate#1 MAJOR-1): the record admits ONLY a real
+        # venue-reconciled source. Fail closed on anything else so a paper/simulated fill
+        # wrapped as a RealizedFillRecord can never move a real-money loss cap, and a
+        # corrupt-source ledger row fails closed on reconstruct/replay.
+        if self.source != self.VENUE_SOURCE:
+            raise FailClosed(
+                f"RealizedFillRecord admits ONLY a real {self.VENUE_SOURCE!r} source; refusing "
+                f"source={self.source!r} (a paper/simulated source can never move a real-money "
+                "loss cap; a corrupt-source ledger row fails closed on replay)"
+            )
 
     def net_pnl(self) -> float:
         """Fee-inclusive signed PnL for this fill (``realized_pnl - fee``)."""

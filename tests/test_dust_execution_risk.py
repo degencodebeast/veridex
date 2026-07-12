@@ -165,6 +165,85 @@ def test_realized_fill_record_rejects_non_finite_pnl_or_negative_fee() -> None:
         RealizedFillRecord(realized_pnl=0.0, fee=-0.01, session_id=_SESSION, fill_ts_ms=_TS_DAY1)
 
 
+# --- SAF-002(b): provenance is fail-closed — a non-venue source can never construct the ----
+#     record (Gate#1 MAJOR-1). The PaperReceipt type-rejection above is a SEPARATE control;
+#     this closes the bypass where a paper/simulated source is wrapped AS a RealizedFillRecord.
+
+
+def test_realized_fill_record_rejects_a_non_venue_source_at_construction() -> None:
+    """A non ``venue_reconciled`` ``source`` fails closed at construction (anti-inert provenance).
+
+    Before the fix ``source`` was an unconstrained ``str`` validated by nothing, so a paper /
+    simulated fill wrapped as ``RealizedFillRecord(source="paper")`` was a fully valid real-fill
+    carrier. The record now fails closed unless ``source == "venue_reconciled"``.
+    """
+    for bad in ("paper", "simulated", "sim", "", "VENUE_RECONCILED"):
+        with pytest.raises(FailClosed):
+            RealizedFillRecord(
+                realized_pnl=-10.0, fee=0.0, session_id=_SESSION, fill_ts_ms=_TS_DAY1, source=bad
+            )
+    # The real venue-reconciled source (the default) still constructs.
+    RealizedFillRecord(realized_pnl=-10.0, fee=0.0, session_id=_SESSION, fill_ts_ms=_TS_DAY1)
+    RealizedFillRecord(
+        realized_pnl=-10.0,
+        fee=0.0,
+        session_id=_SESSION,
+        fill_ts_ms=_TS_DAY1,
+        source="venue_reconciled",
+    )
+
+
+def test_paper_source_wrapped_as_realized_fill_cannot_move_the_accumulator() -> None:
+    """Feeding a paper-source fill through ``apply_realized_fill`` fails closed and moves nothing.
+
+    Constructs the ADVERSARIAL object and feeds it (not merely the type check): a paper/simulated
+    source wrapped as a ``RealizedFillRecord`` must never trip a real-money loss cap. The rejection
+    fires at construction (fail-closed provenance), so the accumulator is left untouched.
+    """
+    acc = RiskAccumulator(session_id=_SESSION)
+    with pytest.raises((FailClosed, ValueError)):
+        acc.apply_realized_fill(
+            RealizedFillRecord(
+                realized_pnl=-10.0,
+                fee=0.0,
+                session_id=_SESSION,
+                fill_ts_ms=_TS_DAY1,
+                source="paper",
+            )
+        )
+    # Nothing was folded in and no cap can have been breached by the rejected paper fill.
+    assert acc.realized_loss_session == pytest.approx(0.0)
+    assert acc.realized_loss_day == pytest.approx(0.0)
+    assert acc.breaches_caps(_env(max_session_loss=0.50, max_daily_loss=0.50)) is False
+
+
+async def test_paper_source_wrapped_as_realized_fill_cannot_drive_breach_sweep() -> None:
+    """The provenance control holds on the coordinating method: a paper-source fill wrapped as a
+    ``RealizedFillRecord`` fails closed BEFORE any breach check — it can never fire the sweep."""
+    controller = SafetyController(clock_ms=lambda: _FROZEN_CLOCK_MS)
+    session = DustSafetySession(session_id=_SESSION)
+    acc = RiskAccumulator(session_id=_SESSION)
+    rec = _RecordingSweepAdapter(canceled_count=2)
+
+    with pytest.raises((FailClosed, ValueError)):
+        await controller.on_realized_fill(
+            RealizedFillRecord(
+                realized_pnl=-99.0,
+                fee=0.0,
+                session_id=_SESSION,
+                fill_ts_ms=_TS_DAY1,
+                source="paper",
+            ),
+            adapter=rec,
+            session=session,
+            risk=acc,
+            envelope=_env(max_session_loss=0.50),
+        )
+    assert rec.calls == 0  # the venue sweep never fired for a paper source
+    assert controller.check_can_submit(session) is True
+    assert acc.realized_loss_session == pytest.approx(0.0)
+
+
 # --- SAF-002(a): Mode B admission fails closed on a bad/disabled cap ---------------------
 
 

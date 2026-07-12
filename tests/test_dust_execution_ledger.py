@@ -46,6 +46,16 @@ def _fill(realized_pnl: float, fee: float, ts_ms: int) -> RealizedFillRecord:
     )
 
 
+def _fill_for(session_id: str, realized_pnl: float, fee: float, ts_ms: int) -> RealizedFillRecord:
+    """A real fill carrying an EXPLICIT session identity (for cross-session isolation tests)."""
+    return RealizedFillRecord(
+        realized_pnl=realized_pnl,
+        fee=fee,
+        session_id=session_id,
+        fill_ts_ms=ts_ms,
+    )
+
+
 async def test_restart_reconstructs_session_loss_and_rolls_utc_day() -> None:
     """Persist 3 real fills spanning a UTC-day boundary, then rebuild risk from the ledger.
 
@@ -56,9 +66,9 @@ async def test_restart_reconstructs_session_loss_and_rolls_utc_day() -> None:
     """
     store = InMemoryStore()
 
-    seq_a = await append_fill(store, _SESSION, _fill(-0.30, 0.01, _TS_DAY1_A))
-    seq_b = await append_fill(store, _SESSION, _fill(-0.20, 0.00, _TS_DAY1_B))
-    seq_c = await append_fill(store, _SESSION, _fill(-0.40, 0.02, _TS_DAY2))
+    seq_a = await append_fill(store, _fill(-0.30, 0.01, _TS_DAY1_A))
+    seq_b = await append_fill(store, _fill(-0.20, 0.00, _TS_DAY1_B))
+    seq_c = await append_fill(store, _fill(-0.40, 0.02, _TS_DAY2))
 
     # Append-only + unique monotonic sequence.
     assert seq_a < seq_b < seq_c
@@ -74,7 +84,7 @@ async def test_restart_reconstructs_session_loss_and_rolls_utc_day() -> None:
     assert acc_restart.realized_loss_day == pytest.approx(0.42)
 
     # The ledger is durable across the "restart": append one more day-2 fill and rebuild again.
-    await append_fill(store, _SESSION, _fill(-0.10, 0.00, _TS_DAY2))
+    await append_fill(store, _fill(-0.10, 0.00, _TS_DAY2))
     acc_after = await reconstruct_risk(store, _SESSION, now_fn=lambda: _NOW_DAY2)
     assert acc_after.realized_loss_session == pytest.approx(1.03)  # 0.93 + 0.10
     assert acc_after.realized_loss_day == pytest.approx(0.52)  # 0.42 + 0.10
@@ -126,32 +136,41 @@ async def test_append_rejects_a_future_dated_fill_fail_closed() -> None:
     future_ts = int(datetime(2026, 7, 7, 12, 0, 0, tzinfo=UTC).timestamp() * 1000)  # now + 1 day
 
     with pytest.raises(FailClosed):
-        await append_fill(store, _SESSION, _fill(-0.50, 0.0, future_ts), now_fn=lambda: now)
+        await append_fill(store, _fill(-0.50, 0.0, future_ts), now_fn=lambda: now)
 
     # Nothing was persisted — the ledger stays clean (fail-closed, not a partial write).
     assert await store.list_realized_fills(_SESSION) == []
 
     # A present/past-dated fill with the SAME ``now`` is accepted normally.
     past_ts = int(datetime(2026, 7, 6, 9, 0, 0, tzinfo=UTC).timestamp() * 1000)
-    seq = await append_fill(store, _SESSION, _fill(-0.50, 0.0, past_ts), now_fn=lambda: now)
+    seq = await append_fill(store, _fill(-0.50, 0.0, past_ts), now_fn=lambda: now)
     assert seq == 1
 
 
-async def test_ledger_is_append_only_and_session_scoped() -> None:
-    """Fills are stored append-only with a global monotonic seq and queried per session."""
+async def test_ledger_persists_under_the_records_own_session_identity() -> None:
+    """A fill is ALWAYS persisted under its OWN immutable ``session_id`` — a caller CANNOT rebind
+    it to another session (Gate#1 MAJOR-2, unsafe-direction under-count).
+
+    ``append_fill`` takes NO separate session argument: the rebind that under-counted a real loss
+    (``append_fill(store, "B", fill_for_A)`` -> A UNDER-counts) is now unrepresentable. Two real
+    ``_SESSION`` fills and one genuine ``other``-session fill each land under their OWN identity;
+    neither session's real loss leaks into or is dropped from the other.
+    """
     store = InMemoryStore()
     other = "sess-ledger-OTHER"
 
-    s1 = await append_fill(store, _SESSION, _fill(-0.10, 0.0, _TS_DAY1_A))
-    s2 = await append_fill(store, other, _fill(-0.99, 0.0, _TS_DAY1_A))
-    s3 = await append_fill(store, _SESSION, _fill(-0.20, 0.0, _TS_DAY1_B))
+    s1 = await append_fill(store, _fill(-0.10, 0.0, _TS_DAY1_A))  # _SESSION
+    s2 = await append_fill(store, _fill_for(other, -0.99, 0.0, _TS_DAY1_A))  # other
+    s3 = await append_fill(store, _fill(-0.20, 0.0, _TS_DAY1_B))  # _SESSION
 
     assert s1 < s2 < s3  # monotonic across sessions (unique seq)
 
     rows = await store.list_realized_fills(_SESSION)
-    assert [r.seq for r in rows] == [s1, s3]  # only this session, seq-ordered
-    assert all(r.session_id == _SESSION for r in rows)
+    assert [r.seq for r in rows] == [s1, s3]  # only THIS session, seq-ordered
+    assert all(r.session_id == _SESSION for r in rows)  # persisted under the record's own identity
 
-    # The other session's fill never leaks into this session's reconstruction.
+    # Neither session's real loss leaks into or is dropped from the other on reconstruction.
     acc = await reconstruct_risk(store, _SESSION, now_fn=lambda: _NOW_DAY2)
     assert acc.realized_loss_session == pytest.approx(0.30)  # 0.10 + 0.20, NOT 0.99
+    acc_other = await reconstruct_risk(store, other, now_fn=lambda: _NOW_DAY2)
+    assert acc_other.realized_loss_session == pytest.approx(0.99)  # the other fill counted HERE, not lost
