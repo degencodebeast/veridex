@@ -158,3 +158,34 @@ def test_no_combo_rfq_relayer_sdk_in_dust_execution(tmp_path: Path) -> None:
     assert not neg_hits, (
         f"fence false-tripped on a docstring/comment mention (prose, not code): {neg_hits}"
     )
+
+
+# =====================================================================================
+# E1-T5 (SEC-006, AC-014/015): freeze + denylist the FULL R4-A execution field set so a
+# forgotten field can never rank across all three rank surfaces (closes Codex-M7).
+# =====================================================================================
+import pytest
+from veridex.rank_guards import R4A_EXECUTION_DENYLIST_FIELDS, R3_R4_RANK_DENYLIST
+from veridex.scoring import _rank_key as dir_key
+from veridex.leaderboard import _rank_key as clv_key
+from veridex.maker.leaderboard import maker_rank_key
+# NOTE (Fable-m5): dir_key/clv_key SUBSCRIPT required metric keys, so a bare {poison} raises KeyError,
+# NOT the guard. Build a COMPLETE valid metrics row + the poisoned key so the guard is the ONLY reason.
+VALID_DIR = {"avg_clv_bps": 0.0, "total_clv_bps": 0.0, "brier": 0.0, "max_drawdown": 0.0, "action_count": 0, "agent_id": "a"}
+# Codex-M2/Fable-m1: parametrize + assert EXACT equality over an INDEPENDENT literal — NOT the
+# production set. `<=` (subset) over the production set is inert: dropping a field shrinks BOTH the
+# set AND the parametrization, so nothing fails. The independent literal is the ground truth.
+EXPECTED_R4A_FIELDS = frozenset({"own_fill", "filled_size", "fill_price", "realized_pnl", "inventory",
+                                 "real_fill_reconciliation", "post_trade_markout"})  # + any E1-T2/E2 field
+@pytest.mark.parametrize("field", sorted(EXPECTED_R4A_FIELDS))
+def test_all_three_surfaces_reject_every_r4a_field(field):
+    for keyfn, base in ((dir_key, VALID_DIR), (clv_key, VALID_DIR), (maker_rank_key, {})):
+        with pytest.raises(AssertionError):          # the guard (AssertionError), not KeyError
+            keyfn({**base, field: 1.0})
+        with pytest.raises(AssertionError):          # sorted() bypass also raises
+            sorted([{**base, field: 1.0}], key=keyfn)
+def test_r4a_field_set_equals_expected_and_is_denylisted():
+    assert R4A_EXECUTION_DENYLIST_FIELDS == EXPECTED_R4A_FIELDS   # EXACT equality vs independent literal → omission fails HERE
+    assert EXPECTED_R4A_FIELDS <= R3_R4_RANK_DENYLIST             # and the canonical set is enforced
+def test_real_executable_edge_bps_stays_excluded():
+    assert dir_key({**VALID_DIR, "real_executable_edge_bps": None}) is not None  # does NOT raise
