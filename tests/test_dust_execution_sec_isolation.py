@@ -10,14 +10,17 @@ STATIC-AST CEILING (honest scope of ``_imports_module``): the AST bar matches ev
 ``from veridex import dust_execution``, relative imports resolving into the target, and
 dynamic ``importlib.import_module("…")`` / ``__import__("…")`` with a STRING-CONSTANT
 argument. It CANNOT see a dynamic import whose module name is a non-constant expression
-(computed at runtime). To keep the AC-039 "no ranked lane depends on dust_execution" claim
-true past that ceiling, ``test_ranked_import_leaves_no_dust_execution_in_sys_modules`` adds a
-runtime module-dependency assertion: importing each ranked module must not pull
-``veridex.dust_execution`` into ``sys.modules``.
+(computed at runtime) — including one performed at import TIME in a module body. To keep the
+AC-039 "no ranked lane depends on dust_execution" claim true past that ceiling,
+``test_ranked_import_in_fresh_interpreter_loads_no_dust_execution`` runs a FRESH-SUBPROCESS
+module-dependency audit: in a clean interpreter where NEITHER the ranked lanes NOR
+``veridex.dust_execution`` are preloaded, importing the ranked modules re-executes every module
+body and must not pull ``veridex.dust_execution`` into ``sys.modules``. This closes the
+Gate#1 MAJOR-3 hole where the earlier in-process backstop re-imported already-CACHED ranked
+modules (bodies never re-ran), so an import-TIME computed dynamic import was never re-observed.
 """
 
 import ast
-import importlib
 import sys
 from pathlib import Path
 
@@ -35,28 +38,104 @@ def test_maker_scoring_do_not_import_dust_execution() -> None:
     assert not offenders, f"ranked lanes must not import veridex.dust_execution: {offenders}"
 
 
-def test_ranked_import_leaves_no_dust_execution_in_sys_modules() -> None:
-    # Runtime backstop past the static-AST ceiling: importing a ranked module must never
-    # (transitively) load veridex.dust_execution. Catches dynamic imports whose target is a
-    # non-constant expression that the AST bar cannot resolve.
-    modnames = _walk_modnames(veridex.maker, "veridex.maker.") + [
+# --- Fresh-subprocess ranked-import audit (Gate#1 MAJOR-3) ---------------------------------
+# The earlier in-process backstop popped only veridex.dust_execution* from sys.modules and then
+# re-imported ranked modules that were STILL CACHED — their bodies never re-executed, so a
+# module-level (import-TIME) computed dynamic import of dust_execution was never re-observed. An
+# import-TIME dependency therefore passed BOTH the static AST bar AND that runtime check. The
+# audit script below runs in a FRESH interpreter where NEITHER ranked NOR dust modules are
+# preloaded: importing the ranked lanes genuinely re-executes every module body, so any transitive
+# (even import-TIME, even computed) veridex.dust_execution load is observed. It reads a JSON
+# payload {sys_path, modules} on stdin, imports the modules, and exits 3 (naming the offenders on
+# stdout) if any veridex.dust_execution* is resident, else 0. Offline: no creds/network/scrubbing.
+_RANKED_IMPORT_AUDIT = """
+import importlib, json, sys
+
+payload = json.loads(sys.stdin.read())
+for _extra in payload.get("sys_path", []):
+    sys.path.insert(0, _extra)
+for _name in payload["modules"]:
+    importlib.import_module(_name)
+_dust = sorted(
+    m for m in sys.modules
+    if m == "veridex.dust_execution" or m.startswith("veridex.dust_execution.")
+)
+if _dust:
+    sys.stdout.write(json.dumps(_dust))
+    sys.exit(3)
+sys.exit(0)
+"""
+
+
+def _ranked_modnames() -> list[str]:
+    # Same enumeration as the static bar: recursive walk of veridex.maker.* plus the two
+    # directional rank surfaces (scoring, leaderboard).
+    return _walk_modnames(veridex.maker, "veridex.maker.") + [
         "veridex.scoring",
         "veridex.leaderboard",
     ]
-    # Clear the ENTIRE veridex.dust_execution namespace (package + any submodules a sibling
-    # test already imported at collection time) so the post-import check attributes any (re)load
-    # PURELY to the ranked-lane imports below — not to unrelated test-ordering pollution. Popping
-    # only the package left sibling-loaded submodules (e.g. .contracts/.manifest) resident, which
-    # misfired this guard in the full milestone suite. A clean slate is also stronger teeth: any
-    # reappearance below is attributable ONLY to a ranked-lane import, even if a sibling had it.
-    for _dust_mod in [m for m in list(sys.modules) if m == "veridex.dust_execution" or m.startswith("veridex.dust_execution.")]:
-        sys.modules.pop(_dust_mod, None)
-    for modname in modnames:
-        importlib.import_module(modname)
-    dust_loaded = [m for m in sys.modules if m == "veridex.dust_execution" or m.startswith("veridex.dust_execution.")]
-    assert not dust_loaded, (
-        f"importing ranked lanes must not load veridex.dust_execution at runtime: {dust_loaded}"
+
+
+def _run_ranked_import_audit(modules: list[str], sys_path: list[str] | None = None) -> tuple[int, str]:
+    """Import ``modules`` in a FRESH interpreter (cwd=repo root so ``veridex`` is importable via the
+    ``-c`` empty ``sys.path[0]``) and report whether veridex.dust_execution* got loaded.
+
+    Returns ``(returncode, stdout)``: rc==0 means no dust_execution load; rc==3 means it was loaded
+    and stdout is the JSON list of offending module names.
+    """
+    import json as _json
+    import subprocess as _subprocess
+
+    proc = _subprocess.run(
+        [sys.executable, "-c", _RANKED_IMPORT_AUDIT],
+        input=_json.dumps({"modules": list(modules), "sys_path": list(sys_path or [])}),
+        cwd=str(Path(__file__).resolve().parents[1]),
+        capture_output=True,
+        text=True,
     )
+    return proc.returncode, proc.stdout
+
+
+def test_ranked_import_in_fresh_interpreter_loads_no_dust_execution() -> None:
+    # Runtime backstop past the static-AST ceiling, HARDENED (Gate#1 MAJOR-3): a fresh interpreter
+    # imports ONLY the real ranked lanes; none may pull veridex.dust_execution into sys.modules —
+    # including via an import-TIME computed dynamic import that the old cached in-process check and
+    # the static AST bar both miss. The real lanes genuinely do not depend on dust_execution → rc==0.
+    rc, out = _run_ranked_import_audit(_ranked_modnames())
+    assert rc == 0, (
+        "importing ranked lanes in a clean interpreter must not load veridex.dust_execution; "
+        f"audit reported: {out}"
+    )
+
+
+def test_fresh_subprocess_audit_catches_import_time_computed_dust(tmp_path: Path) -> None:
+    # POSITIVE MUTATION / teeth (Gate#1 MAJOR-3): a ranked-like module whose BODY performs an
+    # import-TIME *computed* (non-constant) import of veridex.dust_execution evades BOTH the static
+    # AST bar AND the old cached in-process runtime check. The fresh-subprocess audit MUST catch it.
+    adv = tmp_path / "adv_ranked_import_time_dust.py"
+    adv.write_text(
+        "import importlib\n"
+        "# import-TIME computed (non-constant) target: invisible to the static AST bar\n"
+        'target = ".".join(("veridex", "dust_execution"))\n'
+        "importlib.import_module(target)\n",
+        encoding="utf-8",
+    )
+
+    # (a) Document the ceiling: the static AST bar does NOT resolve the computed import-TIME target.
+    sys.path.insert(0, str(tmp_path))
+    try:
+        assert not _imports_module("adv_ranked_import_time_dust", "veridex.dust_execution"), (
+            "static AST bar unexpectedly resolved a computed import-TIME target"
+        )
+    finally:
+        sys.path.remove(str(tmp_path))
+        sys.modules.pop("adv_ranked_import_time_dust", None)
+
+    # (b) The mutation: the fresh-subprocess audit re-executes the module body in a clean
+    # interpreter, observes the import-TIME dust load, and FAILS (non-zero), naming the offender.
+    rc, out = _run_ranked_import_audit(["adv_ranked_import_time_dust"], sys_path=[str(tmp_path)])
+    assert rc != 0, "fresh-subprocess audit failed to catch an import-TIME computed dust import"
+    assert "veridex.dust_execution" in out, f"audit did not name the offending module: {out!r}"
 
 
 # Out-of-scope surfaces (CON scope-fence, §6 group 15) matched CASE-INSENSITIVELY as substrings.
