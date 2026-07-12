@@ -54,6 +54,7 @@ from veridex.dust_execution.runner import (
     DustExecutionResult,
     DustQuote,
     ModeBArming,
+    SessionOutcome,
     ShutdownDecision,
     ShutdownPolicy,
     StaleVenueBook,
@@ -1258,3 +1259,74 @@ async def test_shutdown_cancel_all_is_idempotent_after_prior_safety_trigger() ->
     assert isinstance(result.shutdown_decision, ShutdownDecision)
     assert result.shutdown_decision.policy == "cancel_all"
     assert result.shutdown_decision.cancel_all_fired is True
+
+
+# --- E6-T7: losing-but-bounded session is a lifecycle SUCCESS, not promoted (REQ-014, AC-030) --
+#
+# THE HONESTY PROPERTY: R4-A proves SAFETY, not alpha. A dust session that stays within its loss
+# caps and reconciles CLEANLY against venue truth is a lifecycle SUCCESS even when realized_pnl is
+# NEGATIVE — a losing dust PnL is the EXPECTED outcome of a strategy-neutral safety proof and must
+# NEVER flip the status to FAILED. The SAME session is simultaneously NEVER marked as promoted
+# strategy evidence (no alpha was proven — the two are distinct: operationally-successful AND
+# not-promoted). CONTRAST: a real SAFETY failure (a realized-loss-cap breach) is NOT a success — the
+# status derives from the SAFETY outcome, never from PnL sign alone. Mutation: flip the status logic
+# to fail on realized_pnl < 0 -> the losing-bounded-success test fails; mark a losing session
+# promoted=True -> the not-promoted assertion fails.
+
+
+async def test_losing_bounded_reconciled_session_is_success_not_promoted() -> None:
+    """A bounded (loss caps not breached), cleanly RECONCILED session with realized_pnl < 0 is a
+    lifecycle SUCCESS — a negative dust PnL never flips the status — and is NEVER promoted (REQ-014).
+    """
+    adapter = RecordingFakeAdapter(fill=True, fill_history_matches=True)
+    safety, session = _make_safety()
+    risk = RiskAccumulator(_SESSION_ID)
+    losing_fill = RealizedFillRecord(
+        realized_pnl=-1.0, fee=0.25, session_id=_SESSION_ID, fill_ts_ms=_NOW_S * 1000
+    )
+
+    result = await _run_guarded(
+        adapter=adapter, safety=safety, session=session, risk=risk, realized_fills=(losing_fill,)
+    )
+
+    recon = next(e for e in result.events if isinstance(e, RealFillReconciliation))
+    assert recon.reconciled_state == "RESOLVED", "the session must be cleanly reconciled (not frozen)"
+    assert risk.realized_loss_session == 1.25, "the session realized a NEGATIVE fee-inclusive PnL"
+    assert session.submit_blocked is False, "a bounded loss must NOT trip the emergency-stop sweep"
+    assert isinstance(result.session_outcome, SessionOutcome)
+    assert result.session_outcome.status == "SUCCESS", (
+        "a bounded, reconciled session is a lifecycle SUCCESS even though it lost money (REQ-014)"
+    )
+    assert result.session_outcome.promoted is False, (
+        "a losing dust session must NEVER be marked as promoted strategy evidence (no alpha proven)"
+    )
+
+
+async def test_safety_failure_cap_breach_is_not_success() -> None:
+    """CONTRAST: a SAFETY failure (a real realized-loss-cap breach) is NOT a lifecycle SUCCESS — the
+    terminal status derives from the SAFETY outcome, never from PnL sign alone.
+    """
+    adapter = RecordingFakeAdapter(fill=True, fill_history_matches=True)
+    safety, session = _make_safety()
+    risk = RiskAccumulator(_SESSION_ID)
+    breaching_fill = RealizedFillRecord(
+        realized_pnl=-2.5, fee=0.0, session_id=_SESSION_ID, fill_ts_ms=_NOW_S * 1000
+    )
+    env = _env(max_session_loss=2.0, max_daily_loss=4.0)
+
+    result = await _run_guarded(
+        adapter=adapter,
+        safety=safety,
+        session=session,
+        risk=risk,
+        realized_fills=(breaching_fill,),
+        envelope=env,
+    )
+
+    assert adapter.cancel_all_calls == 1, "the cap breach must fire the emergency-stop sweep"
+    assert session.submit_blocked is True
+    assert isinstance(result.session_outcome, SessionOutcome)
+    assert result.session_outcome.status == "FAILED", (
+        "a realized-loss-cap breach is a SAFETY failure — NOT a lifecycle success"
+    )
+    assert result.session_outcome.promoted is False

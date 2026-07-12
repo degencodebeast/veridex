@@ -48,7 +48,10 @@ a durable operator-assigned ``session_id`` and the sealed ``content_hash`` at se
 closed the startup-sweep half; E6-T6 closed the shutdown cancel-all / explicit leave-flat decision
 — SEALING ``content_hash`` itself remains a later task); the real EIP-712 V2 order-hash (``venue_order_key``) binding via
 ``veridex.dust_execution.signing_compiler`` (a later task — this module's placeholder is distinct
-from the private integrity digest, never equal to it).
+from the private integrity digest, never equal to it). E6-T7 CLOSES the final E6 seam: the terminal
+lifecycle ``SessionOutcome`` (REQ-014/AC-030) — a bounded, reconciled session is a lifecycle
+``"SUCCESS"`` even if it lost money, and ``promoted`` is always ``False`` (no alpha claim is ever
+implied). This completes E6.
 
 SEC-003: this module imports only intra-lane ``veridex.dust_execution.*``, the shared
 ``veridex.policy.envelope`` (the single breach-boundary source of truth, not a ranked lane), and
@@ -302,6 +305,73 @@ class ShutdownDecision:
     cancel_all_fired: bool
 
 
+# ---------------------------------------------------------------------------
+# E6-T7: terminal lifecycle status — a bounded, reconciled session is a SUCCESS
+# EVEN IF IT LOST MONEY; never promoted strategy evidence (REQ-014, AC-030).
+# ---------------------------------------------------------------------------
+
+#: The two — and ONLY two — terminal lifecycle outcomes (REQ-014). Derived PURELY from the SAFETY
+#: outcome (loss caps / breaker / kill-switch / reconciliation) — NEVER from ``realized_pnl`` sign.
+SessionStatus = Literal["SUCCESS", "FAILED"]
+
+
+@dataclass(frozen=True)
+class SessionOutcome:
+    """The REQ-014/AC-030 terminal lifecycle outcome — SAFETY-derived, NEVER PnL-sign-derived.
+
+    R4-A proves SAFETY, not alpha (§6 group 13). A dust session that stays within its loss caps AND
+    reconciles cleanly against venue truth is a lifecycle ``"SUCCESS"`` even when it realized a
+    NEGATIVE PnL — a losing dust session is the EXPECTED, honest outcome of a strategy-neutral
+    safety proof, and a negative PnL must NEVER flip ``status`` to ``"FAILED"``. ``status`` flips to
+    ``"FAILED"`` ONLY on an actual SAFETY failure: a realized-loss-cap breach (SAF-002d, via the SAME
+    ``RiskAccumulator.breaches_caps`` predicate the emergency-stop sweep uses — ONE source of truth),
+    an open circuit breaker, an engaged kill switch, or an unresolved/frozen (``AMBIGUOUS``)
+    reconciliation against venue truth — never on losing money.
+
+    ``promoted`` is ALWAYS ``False``: this lane proves safety, never an alpha claim (mirrors the
+    pinned ``DustRunLabelEvent.edge_label == "NOT_PROVEN_EDGE"``), so no dust-execution session —
+    winning or losing, ``SUCCESS`` or ``FAILED`` — is ever marked as promoted strategy evidence. A
+    lifecycle ``"SUCCESS"`` proves the run was SAFE, not that an edge was proven; the two properties
+    are deliberately distinct and computed independently.
+    """
+
+    status: SessionStatus
+    promoted: bool
+
+
+def _resolve_session_outcome(
+    *,
+    risk: RiskAccumulator,
+    envelope: PolicyEnvelope,
+    breaker: CircuitBreaker | None,
+    events: Sequence[LifecycleEvent],
+) -> SessionOutcome:
+    """Derive the terminal :class:`SessionOutcome` from the SAFETY outcome, never from PnL sign.
+
+    "Bounded": the fee-inclusive realized loss folded from the real, E2-T2-ledger-sourced
+    ``RealizedFillRecord`` fills has not reached either ENABLED loss cap (:meth:`RiskAccumulator.
+    breaches_caps` — the SAME predicate :func:`_apply_safety_triggers` uses to fire the emergency
+    sweep, so the two can never drift), the circuit breaker is not OPEN, and the kill switch is not
+    engaged. "Reconciled": no per-decision :class:`RealFillReconciliation` in the numbered stream was
+    left ``AMBIGUOUS`` (unresolved/frozen) against venue truth. A bounded, reconciled session is
+    ``"SUCCESS"`` regardless of whether the accumulated ``realized_pnl`` was positive or negative — a
+    losing-but-bounded run IS the honest safety proof this lane exists to produce. ``promoted`` is
+    ALWAYS ``False`` (see :class:`SessionOutcome`) — no alpha claim is ever implied.
+    """
+    reconciliation_frozen = any(
+        isinstance(event, RealFillReconciliation) and event.reconciled_state == "AMBIGUOUS"
+        for event in events
+    )
+    safety_failed = (
+        risk.breaches_caps(envelope)
+        or (breaker is not None and breaker.state is CircuitState.OPEN)
+        or envelope.kill_switch
+        or reconciliation_frozen
+    )
+    status: SessionStatus = "FAILED" if safety_failed else "SUCCESS"
+    return SessionOutcome(status=status, promoted=False)
+
+
 #: The E1-T2 numbered lifecycle-event union this runner emits (session meta precedes it, unnumbered
 #: — :class:`DustExecutionSessionMeta` carries no ``sequence_no``). Ordered per event, one variant
 #: per stage: risk snapshot, intent, attempt, ack, status, fill/reconciliation, labels.
@@ -328,6 +398,12 @@ class DustExecutionResult:
     ``shutdown_decision`` is the SAF-006 explicit end-of-run outcome (E6-T6): either the cancel-all
     wire fired or an explicit leave-flat/leave-open choice was recorded — NEVER a silent abandon of
     resting orders. Always populated, in both modes.
+
+    ``session_outcome`` is the REQ-014/AC-030 terminal lifecycle status (E6-T7): a
+    :class:`SessionOutcome` derived PURELY from the SAFETY outcome (loss caps / breaker /
+    kill-switch / reconciliation) — a bounded, reconciled session is a ``"SUCCESS"`` even if it lost
+    money, and ``promoted`` is always ``False`` (no alpha claim is ever implied). Always populated,
+    in both modes.
     """
 
     mode: ExecutionMode
@@ -336,6 +412,7 @@ class DustExecutionResult:
     events: tuple[LifecycleEvent, ...]
     admission: StrategyAuthorizationDecision
     shutdown_decision: ShutdownDecision
+    session_outcome: SessionOutcome
 
     @property
     def submitted_count(self) -> int:
@@ -906,6 +983,15 @@ async def run_dust_execution(
     abandon of resting orders. Mode A records the identical decision contract but never touches the
     wire (AC-017 / AC-003 discipline, mirroring the E6-T5 startup sweep).
 
+    E6-T7 (REQ-014, AC-030, §6 group 13) closes the FINAL E6 seam: the terminal lifecycle
+    :class:`SessionOutcome`, surfaced on the result. ``status`` is derived PURELY from the SAFETY
+    outcome (:func:`_resolve_session_outcome`) — a bounded (loss caps not breached, breaker not
+    open, kill switch not engaged) AND cleanly reconciled (no ``AMBIGUOUS`` :class:`RealFillReconciliation`)
+    session is ``"SUCCESS"`` even when it realized a NEGATIVE PnL; a negative dust PnL is the
+    EXPECTED, honest outcome of a strategy-neutral safety proof and never flips the status. ``promoted``
+    is ALWAYS ``False`` — this lane proves safety, never an alpha claim, so no dust session is ever
+    marked as promoted strategy evidence, independent of its ``status``.
+
     ``sleep_fn`` is the injected async delay seam for the E6 polling loop (added by a later task);
     this pass makes a single deterministic sweep and does not sleep.
 
@@ -946,8 +1032,8 @@ async def run_dust_execution(
 
     Returns:
         A :class:`DustExecutionResult` with one :class:`SubmitDecision` per token, the session
-        preamble, the full ordered lifecycle-event stream, and the explicit SAF-006
-        :class:`ShutdownDecision`.
+        preamble, the full ordered lifecycle-event stream, the explicit SAF-006
+        :class:`ShutdownDecision`, and the terminal REQ-014 :class:`SessionOutcome`.
     """
     seqc = _SeqCounter()
     session_meta = _build_session_meta(manifest=manifest, envelope=envelope, signer=signer, mode=mode)
@@ -1054,6 +1140,11 @@ async def run_dust_execution(
         shutdown_policy=shutdown_policy,
     )
 
+    # E6-T7 (REQ-014/AC-030): the terminal lifecycle STATUS is derived from the SAFETY outcome
+    # (bounded loss caps + breaker + kill-switch + clean reconciliation) — NEVER from realized_pnl
+    # sign. A bounded, reconciled session is a SUCCESS even if it lost money; it is never promoted.
+    session_outcome = _resolve_session_outcome(risk=risk, envelope=envelope, breaker=breaker, events=events)
+
     return DustExecutionResult(
         mode=mode,
         decisions=tuple(decisions),
@@ -1061,6 +1152,7 @@ async def run_dust_execution(
         events=tuple(events),
         admission=admission,
         shutdown_decision=shutdown_decision,
+        session_outcome=session_outcome,
     )
 
 
@@ -1369,6 +1461,8 @@ __all__ = [
     "LifecycleEvent",
     "ModeBArming",
     "QuoteSource",
+    "SessionOutcome",
+    "SessionStatus",
     "ShutdownDecision",
     "ShutdownPolicy",
     "StaleVenueBook",
