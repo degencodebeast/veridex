@@ -31,12 +31,17 @@ from dataclasses import dataclass
 from typing import Any
 
 from veridex.dust_execution.contracts import PreSubmitRecord
+from veridex.dust_execution.emergency import DustSafetySession, SafetyController
 from veridex.dust_execution.reconcile import (
+    AmbiguousResolution,
     DurableSubmitResult,
+    UncertainSubmitState,
     freezes_new_submits,
     reconcile_durable_ack_lost,
     reconcile_uncertain_submit,
     recover_presubmit_records,
+    resolve_ambiguous_submit,
+    retry_authorized_while,
     submit_with_durable_presubmit,
     worst_case_uncertain_exposure,
 )
@@ -464,3 +469,242 @@ def test_AMBIGUOUS_freezes_new_submits_and_reserves_worst_case_exposure() -> Non
     assert worst_case_uncertain_exposure("AMBIGUOUS", intended_size=7.5) == 7.5
     assert worst_case_uncertain_exposure("DEFINITIVELY_ABSENT", intended_size=7.5) == 0.0
     assert worst_case_uncertain_exposure("RESOLVED", intended_size=7.5) == 0.0
+
+
+# ===========================================================================
+# E4-T3 — AMBIGUOUS freeze + bounded venue-truth polling + cancel-all timeout
+# fallback (IDM-002, AC-011, §6 group 3). The no-blind-retry safety loop.
+# ===========================================================================
+#
+# MONEY-NETWORK BOUNDARY. The loop re-runs the E4-T2 three-surface reconcile on an INJECTED clock +
+# INJECTED async sleep (deterministic, fully offline): each poll RE-QUERIES venue truth by
+# venue_order_key — it does NOT re-submit. On timeout it falls back to the E2-T3
+# ``SafetyController.cancel_all_and_block`` sweep (+ manual operator escalation) — NEVER a blind
+# retry, which is the exact double-exposure bug this guards. Mode B UNARMED.
+
+
+class _InjectedClock:
+    """A deterministic monotonic clock (integer ms) + async sleep that advances IT, not wall time.
+
+    ``sleep(seconds)`` advances the injected ``now_ms`` by exactly that many ms and records the
+    request — so the bounded poll runs fully offline with no real ``asyncio.sleep`` and the timeout
+    boundary is exactly reproducible.
+    """
+
+    def __init__(self, *, start_ms: int = 0) -> None:
+        self.now_ms = start_ms
+        self.sleeps: list[float] = []
+
+    def clock(self) -> int:
+        return self.now_ms
+
+    async def sleep(self, seconds: float) -> None:
+        self.sleeps.append(seconds)
+        self.now_ms += int(round(seconds * 1000))
+
+
+class _CancelAllSpy:
+    """Mode-A fake of the E2-T3 ``CancelAllAdapter`` — counts the ONE cancel-all sweep wire."""
+
+    def __init__(self, *, canceled: int = 2) -> None:
+        self.cancel_all_calls = 0
+        self._canceled = canceled
+
+    async def cancel_all_orders(self) -> int:
+        self.cancel_all_calls += 1
+        return self._canceled
+
+
+class _ScriptedFillAdapter(FakeAdapter):
+    """AMBIGUOUS until the Nth ``get_fill_history`` re-query, when the fill appears (re-query resolves).
+
+    Proves the poll genuinely RE-QUERIES venue truth by ``venue_order_key`` across ticks (it does NOT
+    re-submit): the FAK is absent from open orders / history on early polls, then lands in fill
+    history on poll ``resolve_on_call`` — flipping the real reconcile AMBIGUOUS → RESOLVED.
+    """
+
+    def __init__(self, *, resolve_on_call: int, order_hash: str) -> None:
+        super().__init__(open_orders=[], fill_history=[], status_by_id=None)
+        self._resolve_on_call = resolve_on_call
+        self._order_hash = order_hash
+        self._history_calls = 0
+
+    async def get_fill_history(self, **kwargs: Any) -> list[dict[str, Any]]:
+        self._history_calls += 1
+        self.queried.append("get_fill_history")
+        if self._history_calls >= self._resolve_on_call:
+            return [{"taker_order_id": self._order_hash, "size": "3.0", "status": "CONFIRMED"}]
+        return []
+
+
+# --- RED anchor: an AMBIGUOUS state that authorizes a retry BEFORE timeout → assertion fails ---
+
+
+def test_retry_never_authorized_while_AMBIGUOUS_before_timeout() -> None:
+    """A possibly-live AMBIGUOUS order is FROZEN: no retry is authorized before the timeout elapses.
+
+    The double-exposure guard. A blind re-submit of an AMBIGUOUS order risks a double fill, so it is
+    authorized in NEITHER phase — not while the poll is still running (``before_timeout=True``,
+    frozen) and not when it elapses (``before_timeout=False``, the fallback is cancel-all, never a
+    retry). The mutation that makes AMBIGUOUS authorize a retry before timeout fails HERE.
+    """
+    assert retry_authorized_while("AMBIGUOUS", before_timeout=True) is False
+    assert retry_authorized_while("AMBIGUOUS", before_timeout=False) is False
+    # A resolved / definitively-absent order is no longer frozen — the wallet/market is free again.
+    assert retry_authorized_while("RESOLVED", before_timeout=True) is True
+    assert retry_authorized_while("DEFINITIVELY_ABSENT", before_timeout=True) is True
+
+
+# --- Bounded poll on an injected clock: N polls then timeout → cancel-all, NEVER a resubmit ----
+
+
+async def test_bounded_poll_times_out_to_cancel_all_no_resubmit() -> None:
+    """Persistently AMBIGUOUS: the bounded poll times out and falls back to the cancel-all SWEEP.
+
+    Injected clock: the reconcile stays AMBIGUOUS every tick, the poll runs a bounded number of
+    times, then the timeout elapses and the loop fires the E2-T3 ``cancel_all_and_block`` primitive
+    ONCE (+ blocks new submits) — it NEVER blindly re-POSTs the order. The mutation that blind-retries
+    on timeout (instead of sweeping) fails HERE.
+    """
+    adapter = FakeAdapter(open_orders=[], fill_history=[], status_by_id=None)  # always AMBIGUOUS
+    clk = _InjectedClock()
+    cancel_spy = _CancelAllSpy(canceled=3)
+    controller = SafetyController(clock_ms=clk.clock)
+    session = DustSafetySession("dust-sess-ambig")
+
+    result = await resolve_ambiguous_submit(
+        REC,
+        adapter=adapter,
+        controller=controller,
+        session=session,
+        cancel_adapter=cancel_spy,
+        clock_ms=clk.clock,
+        sleep=clk.sleep,
+        poll_interval_ms=100,
+        timeout_ms=300,
+    )
+
+    assert isinstance(result, AmbiguousResolution)
+    assert result.outcome == "SWEPT_ON_TIMEOUT"
+    # The timeout fallback is a SWEEP, not a retry: cancel-all fired exactly once and submits blocked.
+    assert result.cancel_all_ack is not None
+    assert cancel_spy.cancel_all_calls == 1
+    assert session.submit_blocked is True
+    assert controller.check_can_submit(session) is False
+    # Bounded polling actually happened before the timeout (100ms ticks up to the 300ms bound).
+    assert result.polls >= 3
+    assert result.elapsed_ms >= 300
+    # NO resubmit: the loop has no submit seam — only the three read surfaces were ever touched.
+    assert set(adapter.queried) <= {"get_orders", "get_order", "get_fill_history"}
+
+
+# --- Resolves mid-poll: poll 2 returns RESOLVED → freeze lifts cleanly, NO cancel-all, NO retry -
+
+
+async def test_poll_resolves_mid_poll_lifts_freeze_no_cancel_all() -> None:
+    """A mid-poll RESOLVED lifts the freeze cleanly: no cancel-all sweep, no retry, correct exit.
+
+    The order was AMBIGUOUS on poll 1 and the FAK lands in fill history by poll 2 — a genuine
+    RE-QUERY by ``venue_order_key`` flips the real reconcile to RESOLVED. Only AMBIGUOUS holds the
+    freeze, so the loop exits WITHOUT sweeping and WITHOUT re-submitting.
+    """
+    adapter = _ScriptedFillAdapter(resolve_on_call=2, order_hash=REC.venue_order_key)
+    clk = _InjectedClock()
+    cancel_spy = _CancelAllSpy()
+    controller = SafetyController(clock_ms=clk.clock)
+    session = DustSafetySession("dust-sess-resolve")
+
+    result = await resolve_ambiguous_submit(
+        REC,
+        adapter=adapter,
+        controller=controller,
+        session=session,
+        cancel_adapter=cancel_spy,
+        clock_ms=clk.clock,
+        sleep=clk.sleep,
+        poll_interval_ms=100,
+        timeout_ms=10_000,
+    )
+
+    assert result.outcome == "RESOLVED"
+    assert result.resolved_state == "RESOLVED"
+    assert result.polls == 2  # AMBIGUOUS, then RESOLVED
+    # Freeze lifted cleanly: NO cancel-all sweep and NO block.
+    assert result.cancel_all_ack is None
+    assert cancel_spy.cancel_all_calls == 0
+    assert session.submit_blocked is False
+    assert controller.check_can_submit(session) is True
+    # The poll RE-QUERIED venue truth (it did not re-submit): the read surface was hit across ticks.
+    assert adapter.queried.count("get_fill_history") == 2
+
+
+# --- Resolves to DEFINITIVELY_ABSENT mid-poll: freeze lifts cleanly (E4-T6's positive absence) ---
+
+
+async def test_poll_resolves_to_definitively_absent_lifts_freeze() -> None:
+    """A DEFINITIVELY_ABSENT resolution also lifts the freeze cleanly — no sweep, no retry.
+
+    Only AMBIGUOUS holds the freeze. Uses an injected poll (the positive-absence path that yields
+    DEFINITIVELY_ABSENT is deferred to E4-T6; the loop treats any non-AMBIGUOUS terminal as a clean
+    freeze lift).
+    """
+    states = iter(["AMBIGUOUS", "AMBIGUOUS", "DEFINITIVELY_ABSENT"])
+
+    async def _poll() -> UncertainSubmitState:
+        return next(states)  # type: ignore[return-value]
+
+    clk = _InjectedClock()
+    cancel_spy = _CancelAllSpy()
+    controller = SafetyController(clock_ms=clk.clock)
+    session = DustSafetySession("dust-sess-absent")
+
+    result = await resolve_ambiguous_submit(
+        REC,
+        adapter=FakeAdapter(),
+        controller=controller,
+        session=session,
+        cancel_adapter=cancel_spy,
+        clock_ms=clk.clock,
+        sleep=clk.sleep,
+        poll_interval_ms=50,
+        timeout_ms=10_000,
+        poll_fn=_poll,
+    )
+
+    assert result.outcome == "DEFINITIVELY_ABSENT"
+    assert result.polls == 3
+    assert result.cancel_all_ack is None
+    assert cancel_spy.cancel_all_calls == 0
+    assert session.submit_blocked is False
+
+
+# --- The timeout sweep carries an honest cause and re-queries (never re-submits) before it fires --
+
+
+async def test_timeout_sweep_uses_injected_cause_and_stays_bounded() -> None:
+    """The timeout fallback fires the sweep under its injected honest cause; polling stays bounded."""
+    adapter = FakeAdapter(open_orders=[], fill_history=[], status_by_id=None)  # always AMBIGUOUS
+    clk = _InjectedClock()
+    cancel_spy = _CancelAllSpy(canceled=1)
+    controller = SafetyController(clock_ms=clk.clock)
+    session = DustSafetySession("dust-sess-cause")
+
+    result = await resolve_ambiguous_submit(
+        REC,
+        adapter=adapter,
+        controller=controller,
+        session=session,
+        cancel_adapter=cancel_spy,
+        clock_ms=clk.clock,
+        sleep=clk.sleep,
+        poll_interval_ms=50,
+        timeout_ms=100,
+        timeout_cause="manual",
+    )
+
+    assert result.outcome == "SWEPT_ON_TIMEOUT"
+    assert result.cancel_all_ack is not None
+    assert result.cancel_all_ack.trigger_cause == "manual"
+    assert session.block_cause == "manual"
+    # Bounded: it did not spin forever — a small, finite number of polls before the sweep.
+    assert 1 <= result.polls <= 5

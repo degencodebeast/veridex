@@ -47,6 +47,13 @@ from veridex.dust_execution.l2_transport import (
 from veridex.store import Store
 
 if TYPE_CHECKING:  # pragma: no cover - typing only, no runtime coupling (E4-T1 injection style)
+    from veridex.dust_execution.contracts import CancelAllCause
+    from veridex.dust_execution.emergency import (
+        CancelAllAck,
+        CancelAllAdapter,
+        DustSafetySession,
+        SafetyController,
+    )
     from veridex.venues.base import VenueReconciliationReads
 
 #: The injected wire POST boundary — a zero-arg async callable returning the venue response. ONLY a
@@ -399,8 +406,176 @@ def worst_case_uncertain_exposure(
     return 0.0
 
 
+# ---------------------------------------------------------------------------
+# E4-T3 — AMBIGUOUS freeze + bounded venue-truth polling + cancel-all timeout
+# fallback (IDM-002, AC-011, §6 group 3). The no-blind-retry safety loop.
+# ---------------------------------------------------------------------------
+#
+# Builds directly on E4-T2: while :func:`reconcile_uncertain_submit` reports AMBIGUOUS the
+# wallet/market is FROZEN (no new submit), and the three-surface reconcile is re-run on a bounded
+# schedule against an INJECTED clock + INJECTED async sleep until it resolves — each poll RE-QUERIES
+# venue truth by ``venue_order_key`` and NEVER re-submits. On timeout the loop falls back to the
+# E2-T3 :meth:`~veridex.dust_execution.emergency.SafetyController.cancel_all_and_block` SWEEP
+# (+ manual operator escalation), NEVER a blind retry — a blind re-POST is the exact double-exposure
+# bug this guards.
+
+#: The injected monotonic clock (integer ms) the bounded poll measures its timeout against. Injected
+#: so the loop is DETERMINISTIC and fully offline in tests — mirrors the E2-T3 clock-injection style.
+Clock = Callable[[], int]
+
+#: The injected async sleep between poll ticks. In tests it advances the injected clock (not real
+#: wall time), so the bounded schedule runs offline with no real ``asyncio.sleep``.
+AsyncSleep = Callable[[float], Awaitable[None]]
+
+#: The venue-truth re-query the poll re-runs each tick. It RE-QUERIES by ``venue_order_key`` across
+#: the three E4-T2 surfaces and NEVER re-submits; defaults to :func:`reconcile_uncertain_submit`
+#: bound to the record + adapter.
+UncertainPoll = Callable[[], Awaitable[UncertainSubmitState]]
+
+#: How the AMBIGUOUS freeze was left: the order resolved (``RESOLVED`` / ``DEFINITIVELY_ABSENT``, the
+#: freeze lifts cleanly) or the bounded poll timed out and the loop fell back to the cancel-all sweep
+#: (``SWEPT_ON_TIMEOUT`` — NEVER a blind retry).
+AmbiguousOutcome = Literal["RESOLVED", "DEFINITIVELY_ABSENT", "SWEPT_ON_TIMEOUT"]
+
+
+@dataclass(frozen=True)
+class AmbiguousResolution:
+    """The auditable outcome of one AMBIGUOUS freeze + bounded-poll + timeout-fallback loop.
+
+    Attributes:
+        outcome: How the freeze was left — a clean resolution (``RESOLVED`` /
+            ``DEFINITIVELY_ABSENT``) or the timeout sweep (``SWEPT_ON_TIMEOUT``).
+        polls: How many times venue truth was re-queried (the bound is provable from this).
+        resolved_state: The terminal tri-state the poll settled on (``AMBIGUOUS`` when swept on
+            timeout — it never positively resolved).
+        cancel_all_ack: The E2-T3 sweep ack — set ONLY on the timeout fallback, ``None`` on a clean
+            resolution (a clean lift never sweeps).
+        elapsed_ms: Injected-clock elapsed time from the first poll to the exit.
+    """
+
+    outcome: AmbiguousOutcome
+    polls: int
+    resolved_state: UncertainSubmitState
+    cancel_all_ack: CancelAllAck | None
+    elapsed_ms: int
+
+
+def retry_authorized_while(state: UncertainSubmitState, *, before_timeout: bool) -> bool:
+    """``True`` iff a NEW submit is authorized for ``state`` at this phase — never while AMBIGUOUS.
+
+    The double-exposure guard, in predicate form. A possibly-live AMBIGUOUS order is FROZEN, so a
+    blind re-submit is authorized in NEITHER phase: not while the bounded poll is still running
+    (``before_timeout=True``, frozen) and not once it elapses (``before_timeout=False`` — the
+    fallback is the cancel-all sweep, never a retry). Any other state (``RESOLVED`` /
+    ``DEFINITIVELY_ABSENT``) has lifted the freeze, so the wallet/market is free to submit again.
+
+    Args:
+        state: The tri-state verdict from :func:`reconcile_uncertain_submit`.
+        before_timeout: Whether the bounded poll is still within its window; retained to make the
+            invariant explicit — AMBIGUOUS authorizes no retry in EITHER phase.
+
+    Returns:
+        Whether a new submit/retry is authorized (always ``False`` for AMBIGUOUS).
+    """
+    # ``before_timeout`` is part of the contract but does NOT relax the guard: AMBIGUOUS authorizes
+    # no retry in EITHER phase (frozen before timeout; cancel-all — not retry — on timeout).
+    del before_timeout
+    return state != "AMBIGUOUS"
+
+
+async def resolve_ambiguous_submit(
+    presubmit_record: PreSubmitRecord,
+    *,
+    adapter: VenueReconciliationReads,
+    controller: SafetyController,
+    session: DustSafetySession,
+    cancel_adapter: CancelAllAdapter,
+    clock_ms: Clock,
+    sleep: AsyncSleep,
+    poll_interval_ms: int,
+    timeout_ms: int,
+    timeout_cause: CancelAllCause = "manual",
+    poll_fn: UncertainPoll | None = None,
+) -> AmbiguousResolution:
+    """Freeze on AMBIGUOUS, poll venue truth on a bounded schedule, and on timeout SWEEP not retry.
+
+    The no-blind-retry safety loop (IDM-002, AC-011). While the E4-T2 three-surface reconcile reports
+    AMBIGUOUS the wallet/market is FROZEN — no new submit is authorized (:func:`retry_authorized_while`).
+    On the INJECTED clock, the reconcile is re-run every ``poll_interval_ms`` (each poll RE-QUERIES
+    venue truth by ``venue_order_key`` — it does NOT re-submit) until it resolves to a non-AMBIGUOUS
+    terminal (``RESOLVED`` / ``DEFINITIVELY_ABSENT``), which lifts the freeze CLEANLY (no sweep), or
+    ``timeout_ms`` elapses. On timeout the loop falls back to the E2-T3
+    :meth:`~veridex.dust_execution.emergency.SafetyController.cancel_all_and_block` SWEEP under
+    ``timeout_cause`` (which also blocks new submits and hands off to manual operator intervention) —
+    it NEVER blindly re-POSTs the order.
+
+    Args:
+        presubmit_record: The durable pre-submit record whose ``venue_order_key`` is re-queried.
+        adapter: The complete-venue-truth reader the default poll re-queries (consumed READ-ONLY).
+        controller: The E2-T3 emergency orchestrator whose single cancel-all primitive the timeout
+            fallback routes through.
+        session: The mutable runtime session the sweep blocks (its submit-block flag).
+        cancel_adapter: The venue cancel-all seam the timeout sweep fires.
+        clock_ms: Injected monotonic clock (integer ms) the timeout is measured against.
+        sleep: Injected async sleep between poll ticks (advances the injected clock in tests).
+        poll_interval_ms: Delay between re-queries (the bounded poll cadence).
+        timeout_ms: The freeze budget; once elapsed, the loop sweeps instead of retrying.
+        timeout_cause: The honest E2-T3 cause the timeout sweep is labelled with (defaults to
+            ``"manual"`` — the sweep hands off to manual operator intervention).
+        poll_fn: Override for the venue-truth re-query (defaults to :func:`reconcile_uncertain_submit`
+            bound to the record + adapter); it RE-QUERIES, it never re-submits.
+
+    Returns:
+        The auditable :class:`AmbiguousResolution` describing how the freeze was left.
+    """
+
+    async def _default_poll() -> UncertainSubmitState:
+        # RE-QUERY venue truth by venue_order_key across all three surfaces — never a re-submit.
+        return await reconcile_uncertain_submit(presubmit_record, adapter=adapter)
+
+    poll: UncertainPoll = poll_fn if poll_fn is not None else _default_poll
+
+    start = clock_ms()
+    polls = 0
+    while True:
+        state = await poll()
+        polls += 1
+
+        if state != "AMBIGUOUS":
+            # RESOLVED or DEFINITIVELY_ABSENT: only AMBIGUOUS holds the freeze, so it lifts CLEANLY —
+            # NO cancel-all sweep, NO retry.
+            return AmbiguousResolution(
+                outcome=state,
+                polls=polls,
+                resolved_state=state,
+                cancel_all_ack=None,
+                elapsed_ms=clock_ms() - start,
+            )
+
+        # Still AMBIGUOUS → FROZEN (no new submit authorized). Bounded: on timeout, SWEEP not retry.
+        if clock_ms() - start >= timeout_ms:
+            ack = await controller.cancel_all_and_block(
+                timeout_cause, adapter=cancel_adapter, session=session
+            )
+            return AmbiguousResolution(
+                outcome="SWEPT_ON_TIMEOUT",
+                polls=polls,
+                resolved_state="AMBIGUOUS",
+                cancel_all_ack=ack,
+                elapsed_ms=clock_ms() - start,
+            )
+
+        # Wait one bounded tick, then RE-QUERY (never re-submit) again.
+        await sleep(poll_interval_ms / 1000.0)
+
+
 __all__ = [
+    "AmbiguousOutcome",
+    "AmbiguousResolution",
+    "AsyncSleep",
+    "Clock",
     "DurableSubmitResult",
+    "UncertainPoll",
     "UncertainSubmitState",
     "UncertainSubmitVerdict",
     "WirePost",
@@ -410,6 +585,8 @@ __all__ = [
     "reconcile_durable_ack_lost",
     "reconcile_uncertain_submit",
     "recover_presubmit_records",
+    "resolve_ambiguous_submit",
+    "retry_authorized_while",
     "submit_with_durable_presubmit",
     "worst_case_uncertain_exposure",
 ]
