@@ -16,11 +16,19 @@ from __future__ import annotations
 
 import pytest
 
+from veridex.dust_execution.feesnapshot import FeeSnapshot
 from veridex.dust_execution.noncrossing import (
+    CanonicalLeg,
+    Leg,
     LegKind,
     OwnOrderLeg,
+    RawOrder,
     check_non_crossing,
+    complementary_lock_check,
+    normalize,
 )
+from veridex.dust_execution.risk import FailClosed
+from veridex.venues.polymarket_resolver import ResolvedMarket
 
 _TICK = 0.01
 _TOKEN = "token-yes"
@@ -143,3 +151,163 @@ def test_invalid_tick_size_fails_closed() -> None:
 def test_unknown_side_fails_closed() -> None:
     with pytest.raises(ValueError):
         check_non_crossing([_leg("LONG", 0.40, LegKind.PROPOSED)], tick_size=_TICK)
+
+
+# ---------------------------------------------------------------------------
+# E5-T2 — §4.6 canonical complement-normalization + worst-price-first slice-wise
+# ladder lock check (SAF-010, AC-028/037). YES/NO complementary-ECONOMIC lock:
+# separate YES+NO bids can lock (pay >= $1 for a $1 payout) while each token's own
+# book passes SAF-009. Averaging a multi-level ladder to one effective price HIDES
+# a locked rung; the lock is per SLICE, not average.
+# ---------------------------------------------------------------------------
+
+_RESOLVED = ResolvedMarket(
+    condition_id="cond-1",
+    token_id_yes="TID_YES",
+    token_id_no="TID_NO",
+    tick_size=0.01,
+)
+#: Zero-rate snapshot — isolates the four-form PRICE mapping from fee arithmetic.
+_SNAP_ZERO = FeeSnapshot(condition_id="cond-1", fee_rate=0.0, fee_exponent=1, taker_only=True)
+#: 5% category rate — exercises the symmetric taker fee round5(feeRate·p·(1−p)).
+_SNAP_5PCT = FeeSnapshot(condition_id="cond-1", fee_rate=0.05, fee_exponent=1, taker_only=True)
+
+
+# --- complementary_lock_check: slice-wise ladder lock (the load-bearing tests) ---
+
+def test_ladder_counterexample_rejects_where_average_would_admit() -> None:
+    yes = [Leg("YES", 0.60, 1, "MAKER", 0.0), Leg("YES", 0.30, 99, "MAKER", 0.0)]
+    no = [Leg("NO", 0.45, 100, "MAKER", 0.0)]
+    # avg YES ~0.303 -> 0.303+0.45=0.753<1 would WRONGLY admit; slice-wise top slice 0.60+0.45=1.05>=1
+    assert complementary_lock_check(yes, no) == "REJECT"
+
+
+def test_safe_multilevel_pair_admits_every_slice() -> None:
+    yes = [Leg("YES", 0.55, 2, "MAKER", 0.0), Leg("YES", 0.50, 8, "MAKER", 0.0)]
+    no = [Leg("NO", 0.40, 5, "MAKER", 0.0), Leg("NO", 0.35, 5, "MAKER", 0.0)]
+    assert complementary_lock_check(yes, no) == "ADMIT"  # every slice <1
+
+
+def test_missing_mapping_or_fee_snapshot_fails_closed() -> None:
+    # An unknown/unavailable per-rung fee (fee is None) is a fund-touching input -> never admit.
+    yes_with_unknown_fee = [Leg("YES", 0.55, 5, "TAKER", None)]
+    no = [Leg("NO", 0.40, 5, "MAKER", 0.0)]
+    with pytest.raises(FailClosed):
+        complementary_lock_check(yes_with_unknown_fee, no)
+
+
+def test_per_rung_fee_pushes_an_otherwise_safe_slice_into_a_lock() -> None:
+    # Prices ALONE sum to 0.99 (< 1, would admit); the per-share taker fees at the p≈0.5 peak
+    # (round5(0.05·p·(1−p)) ≈ 0.0125 each) push the slice total to >= 1 -> REJECT. This proves the
+    # per-rung fee is summed into the slice test — the fee, not just the price, is load-bearing.
+    yes = [Leg("YES", 0.50, 5, "TAKER", _SNAP_5PCT.taker_fee(shares=1, price=0.50))]
+    no = [Leg("NO", 0.49, 5, "TAKER", _SNAP_5PCT.taker_fee(shares=1, price=0.49))]
+    assert complementary_lock_check(yes, no) == "REJECT"
+
+
+def test_walk_continues_past_admitting_slices_before_a_later_lock() -> None:
+    # No early-ADMIT exit: the first (dearest) slice admits, and the walk MUST continue and test the
+    # remaining slices. Here a cheap-but-large NO rung is fully consumed across several YES rungs, and
+    # a deeper YES rung locks against it -> REJECT (a mid-walk lock is not skipped).
+    yes = [Leg("YES", 0.20, 3, "MAKER", 0.0), Leg("YES", 0.58, 7, "MAKER", 0.0)]
+    no = [Leg("NO", 0.45, 10, "MAKER", 0.0)]
+    # worst-price-first: YES sorts to [0.58, 0.20]; slice1 0.58+0.45=1.03 >=1 -> REJECT.
+    assert complementary_lock_check(yes, no) == "REJECT"
+
+
+def test_partial_overlap_residual_one_sided_allowed() -> None:
+    # After pairing, unmatched YES-only size is a one-sided residual (not a lock) -> ADMIT.
+    yes = [Leg("YES", 0.55, 100, "MAKER", 0.0)]
+    no = [Leg("NO", 0.40, 3, "MAKER", 0.0)]
+    assert complementary_lock_check(yes, no) == "ADMIT"
+
+
+def test_empty_ladders_admit() -> None:
+    assert complementary_lock_check([], []) == "ADMIT"
+    assert complementary_lock_check([Leg("YES", 0.55, 5, "MAKER", 0.0)], []) == "ADMIT"
+
+
+def test_boundary_exactly_one_is_a_lock_strict() -> None:
+    # STRICT < 1 to admit: a slice summing to exactly 1 (0.55+0.45) is a lock -> REJECT.
+    yes = [Leg("YES", 0.55, 5, "MAKER", 0.0)]
+    no = [Leg("NO", 0.45, 5, "MAKER", 0.0)]
+    assert complementary_lock_check(yes, no) == "REJECT"
+
+
+# --- normalize: four-form BUY/SELL × YES/NO -> canonical BUY rung via YES+NO=$1 ---
+
+def test_normalize_buy_yes_is_canonical_buy_yes() -> None:
+    leg = normalize(
+        RawOrder(side="yes", action="BUY", price=0.60, size=1, role="MAKER"),
+        resolved=_RESOLVED,
+        fee_snapshot=_SNAP_ZERO,
+        tick_size=0.01,
+    )
+    assert leg == CanonicalLeg(outcome="YES", price=0.60, size=1, role="MAKER", fee=0.0)
+
+
+def test_normalize_sell_yes_maps_to_buy_no_at_complement() -> None:
+    leg = normalize(
+        RawOrder(side="yes", action="SELL", price=0.60, size=1, role="MAKER"),
+        resolved=_RESOLVED,
+        fee_snapshot=_SNAP_ZERO,
+        tick_size=0.01,
+    )
+    assert leg.outcome == "NO"
+    assert leg.price == pytest.approx(0.40)
+
+
+def test_normalize_buy_no_and_sell_no() -> None:
+    buy_no = normalize(
+        RawOrder(side="no", action="BUY", price=0.45, size=1, role="MAKER"),
+        resolved=_RESOLVED,
+        fee_snapshot=_SNAP_ZERO,
+        tick_size=0.01,
+    )
+    assert buy_no.outcome == "NO" and buy_no.price == pytest.approx(0.45)
+    sell_no = normalize(
+        RawOrder(side="no", action="SELL", price=0.45, size=1, role="MAKER"),
+        resolved=_RESOLVED,
+        fee_snapshot=_SNAP_ZERO,
+        tick_size=0.01,
+    )
+    assert sell_no.outcome == "YES" and sell_no.price == pytest.approx(0.55)
+
+
+def test_normalize_taker_fee_from_snapshot_round5() -> None:
+    leg = normalize(
+        RawOrder(side="yes", action="BUY", price=0.50, size=1, role="TAKER"),
+        resolved=_RESOLVED,
+        fee_snapshot=_SNAP_5PCT,
+        tick_size=0.01,
+    )
+    # round5(0.05 · 0.5 · 0.5) = round5(0.0125) = 0.0125 (peak at p=0.5).
+    assert leg.fee == pytest.approx(0.0125)
+
+
+def test_normalize_missing_mapping_fails_closed() -> None:
+    with pytest.raises(FailClosed):
+        normalize(
+            RawOrder(side="bogus", action="BUY", price=0.50, size=1, role="MAKER"),
+            resolved=_RESOLVED,
+            fee_snapshot=_SNAP_ZERO,
+            tick_size=0.01,
+        )
+    # 'draw' on a non-draw market is an ambiguous mapping -> fail closed (not routed to YES).
+    with pytest.raises(FailClosed):
+        normalize(
+            RawOrder(side="draw", action="BUY", price=0.50, size=1, role="MAKER"),
+            resolved=_RESOLVED,
+            fee_snapshot=_SNAP_ZERO,
+            tick_size=0.01,
+        )
+
+
+def test_normalize_unavailable_fee_snapshot_fails_closed() -> None:
+    with pytest.raises(FailClosed):
+        normalize(
+            RawOrder(side="yes", action="BUY", price=0.50, size=1, role="TAKER"),
+            resolved=_RESOLVED,
+            fee_snapshot=None,
+            tick_size=0.01,
+        )
