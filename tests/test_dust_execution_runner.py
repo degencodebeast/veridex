@@ -544,12 +544,26 @@ class RecordingFakeAdapter(FakeVenueAdapter):
       the tri-state reconcile queries by ``venue_order_key``. When ``fill_history_matches`` it echoes
       a matching own trade so the reconcile resolves to ``RESOLVED``; otherwise it stays empty (the
       fail-closed AMBIGUOUS default), so a run that never submits can never fabricate a fill.
+    * ``get_orders`` — the E3-T2 :class:`~veridex.venues.base.VenueReconciliationReads` open-order read
+      surface the E6-T5 STARTUP SWEEP queries. Returns the injected ``open_orders`` (empty by default →
+      no pre-existing exposure) and records ``get_orders_calls`` so a test can prove the runner ACTUALLY
+      queried the isolated wallet's resting orders on arm (not merely that a sweep exists in the code).
     """
 
-    def __init__(self, *, fill: bool = True, fill_history_matches: bool = False) -> None:
+    def __init__(
+        self,
+        *,
+        fill: bool = True,
+        fill_history_matches: bool = False,
+        open_orders: list[dict[str, object]] | None = None,
+    ) -> None:
         super().__init__(fill=fill)
         self.cancel_all_calls = 0
         self._fill_history_matches = fill_history_matches
+        #: The pre-existing OPEN orders ``get_orders`` reports for the isolated wallet (E6-T5 sweep).
+        self._open_orders: list[dict[str, object]] = list(open_orders) if open_orders else []
+        #: How many times the runner queried the open-order read on arm (the sweep-QUERIED proof).
+        self.get_orders_calls = 0
         #: Every ``Order`` that actually reached the submit wire — the wire-size proof (E6-T4) reads
         #: the size off the ORDER the runner built, never the value the agent requested.
         self.submitted_orders: list[Order] = []
@@ -561,6 +575,10 @@ class RecordingFakeAdapter(FakeVenueAdapter):
     async def cancel_all_orders(self) -> int:
         self.cancel_all_calls += 1
         return 3
+
+    async def get_orders(self, **kwargs: object) -> list[dict[str, object]]:
+        self.get_orders_calls += 1
+        return list(self._open_orders)
 
     async def get_fill_history(self, **kwargs: object) -> list[dict[str, object]]:
         key = kwargs.get("venue_order_key")
@@ -1031,3 +1049,90 @@ async def test_identical_request_and_hashes_yield_identical_admission_across_mod
 
     assert admission_dry == admission_live, "admission must be identical across runner modes (AC-021)"
     assert admission_dry.verdict == "ALLOW"
+
+
+# --- E6-T5: startup open-order sweep before arming (SAF-005) ---------------------------------
+#
+# THE safety property: on arm, the runner MUST query ``get_orders`` for the isolated wallet and
+# reconcile/cancel any pre-existing open orders BEFORE it submits anything — it cannot blindly submit
+# into pre-existing exposure. The load-bearing anti-inert proof is on the WIRE: ``get_orders`` was
+# ACTUALLY queried AND the recording-fake ``cancel_all_orders`` sweep WIRE fired, and NO order reached
+# the submit wire atop the pre-existing orders. Mutation: skip the startup sweep → the clean quote
+# submits atop the pre-existing open orders → this test fails.
+
+_PREEXISTING_OPEN_ORDERS: list[dict[str, object]] = [
+    {"order_id": "0xpre1", "asset_id": _TOKEN, "size": 5.0},
+    {"order_id": "0xpre2", "asset_id": _TOKEN, "size": 3.0},
+]
+
+
+async def test_startup_sweep_cancels_preexisting_orders_before_any_submit() -> None:
+    """SAF-005: on arm, pre-existing open orders are swept BEFORE any submit — never submitted atop.
+
+    A fully-armed Mode B run whose isolated wallet already carries resting orders (``get_orders``
+    reports two) MUST query ``get_orders``, fire the cancel-all WIRE to sweep them, BLOCK submits, and
+    place NO order atop the pre-existing exposure. Mutation: skip the startup sweep → the clean quote
+    submits atop the pre-existing orders → this test fails (``submit_calls == 1``, no cancel wire).
+    """
+    adapter = RecordingFakeAdapter(fill=True, open_orders=_PREEXISTING_OPEN_ORDERS)
+    safety, session = _make_safety()
+
+    result = await _run_guarded(adapter=adapter, safety=safety, session=session)
+
+    assert adapter.get_orders_calls >= 1, "the runner must query get_orders for pre-existing exposure on arm"
+    assert adapter.cancel_all_calls == 1, "pre-existing open orders must be swept via the cancel-all WIRE"
+    assert session.submit_blocked is True, "a startup sweep of pre-existing orders must block submits (fail-closed)"
+    assert adapter.submit_calls == 0, "no order may be submitted atop pre-existing exposure (SAF-005)"
+    (decision,) = result.decisions
+    assert decision.submitted is False
+    assert decision.abstain_reason == "safety_blocked"
+    assert session.last_cancel_all_ack is not None
+    assert session.last_cancel_all_ack.trigger_cause == "manual"
+    assert "venue_order_id" not in session.last_cancel_all_ack.model_dump()
+
+
+async def test_startup_sweep_with_no_preexisting_orders_still_submits() -> None:
+    """POSITIVE CONTROL: an armed Mode B with an EMPTY open-order book queries get_orders, sweeps
+    nothing, and submits once — so the startup-sweep MUTATION is not vacuously green.
+    """
+    adapter = RecordingFakeAdapter(fill=True, open_orders=[])
+    safety, session = _make_safety()
+
+    result = await _run_guarded(adapter=adapter, safety=safety, session=session)
+
+    assert adapter.get_orders_calls >= 1, "the runner must query get_orders on arm even when the book is empty"
+    assert adapter.cancel_all_calls == 0, "an empty open-order book must fire NO cancel sweep"
+    assert adapter.submit_calls == 1, "a clean startup (no pre-existing orders) must still reach the submit wire"
+    (decision,) = result.decisions
+    assert decision.submitted is True and decision.abstain_reason is None
+
+
+async def test_startup_sweep_contract_exercised_in_mode_a_no_wire_touched() -> None:
+    """Mode A (dry-run) still EXERCISES the sweep read (queries get_orders) but touches NO wire.
+
+    Dry-run places no orders, so there is no submit to protect from pre-existing exposure; the runner
+    queries ``get_orders`` to exercise the SAF-005 contract but fires NO cancel wire and submits
+    nothing (the AC-017 ``submit_calls == 0`` invariant is preserved).
+    """
+    adapter = RecordingFakeAdapter(fill=True, open_orders=_PREEXISTING_OPEN_ORDERS)
+    source = _ScriptedSource(quote=_fresh_quote())
+
+    result = await run_dust_execution(
+        adapter=adapter,
+        signer=LocalFakeWalletControlPlane(),
+        sources=source,
+        now_fn=_clock,
+        sleep_fn=_noop_sleep,
+        envelope=_env(),
+        manifest=_manifest(mode="dry_run"),
+        mode="dry_run",
+        wallet_equity_at_decision=_WALLET_EQUITY,
+        fixed_fraction=_FIXED_FRACTION,
+        arming=None,
+    )
+
+    assert adapter.get_orders_calls >= 1, "Mode A must still exercise the get_orders sweep read (contract wired)"
+    assert adapter.cancel_all_calls == 0, "Mode A (dry-run) must fire NO cancel wire"
+    assert adapter.submit_calls == 0, "Mode A places no orders (AC-017)"
+    (decision,) = result.decisions
+    assert decision.submitted is False and decision.abstain_reason == "mode_a_no_orders"

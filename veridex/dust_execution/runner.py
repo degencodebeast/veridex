@@ -511,6 +511,62 @@ async def _apply_safety_triggers(
         await safety.on_kill_switch(adapter=_require_cancel_all_adapter(adapter), session=session)
 
 
+async def _startup_open_order_sweep(
+    *,
+    adapter: VenueAdapter,
+    safety: SafetyController,
+    session: DustSafetySession,
+    enforce: bool,
+) -> int:
+    """SAF-005 startup sweep: reconcile/cancel the isolated wallet's PRE-EXISTING open orders on arm.
+
+    On arm, the runner cannot BLINDLY submit into pre-existing exposure: it MUST first query the
+    venue's own open orders and reconcile/cancel them BEFORE any submit. This runs BEFORE the token
+    loop so no order is ever placed atop a pre-existing resting order.
+
+    QUERY (both modes). The E3-T2 ``get_orders`` read surface is consumed FAIL-CLOSED via ``getattr``
+    (mirroring :func:`veridex.dust_execution.reconcile._open_candidate_count`): a missing/raising read
+    yields ZERO candidates — it never manufactures a proof of absence on its own, and no order payload
+    is logged (SEC-005). ``client_order_id`` is Veridex-LOCAL and never on the wire, so every open
+    order is an INDISTINGUISHABLE candidate; the worst-case reconcile is to sweep them all.
+
+    CANCEL (armed Mode B only — the "on arm" moment, ``enforce`` True). When at least one pre-existing
+    open order is present the sweep DELEGATES to the E2-T3 single idempotent
+    :meth:`~veridex.dust_execution.emergency.SafetyController.cancel_all_and_block` (it does NOT
+    reimplement cancel): the venue ``cancel_all_orders`` wire is FIRED and submits are BLOCKED, so the
+    token loop's :meth:`SafetyController.check_can_submit` gate then abstains every token
+    ``"safety_blocked"`` — nothing lands atop the pre-existing exposure. An adapter that cannot sweep
+    fails closed (:func:`_require_cancel_all_adapter`) rather than block-without-sweeping.
+
+    The sweep is labelled ``"manual"`` — the closest honest cause in the closed
+    :data:`~veridex.dust_execution.contracts.CancelAllCause` vocab (an operator-initiated ARM-time
+    reconcile, not an automated breaker/loss/timeout reaction). A dedicated startup-sweep cause is a
+    later ``contracts.py`` addition, out of E6-T5 scope.
+
+    In Mode A (``enforce`` False) the read is still EXERCISED — the SAF-005 contract is wired — but NO
+    cancel wire is touched: dry-run places no orders, so there is no submit to protect (AC-017).
+
+    Returns the count of pre-existing open orders observed (``0`` when the read surface is absent).
+    """
+    getter = getattr(adapter, "get_orders", None)
+    if getter is None:
+        return 0
+    try:
+        open_orders = await getter()
+    except Exception:
+        # FAIL-CLOSED to zero candidates (never manufacture proof of absence); no payload logged.
+        logger.debug("startup get_orders read failed; degrading to zero open candidates", exc_info=True)
+        return 0
+    count = len(open_orders or [])
+    if enforce and count > 0:
+        # Reuse the single idempotent cancel primitive; fail closed if the adapter cannot sweep.
+        await safety.cancel_all_and_block(
+            "manual", adapter=_require_cancel_all_adapter(adapter), session=session
+        )
+        logger.info("dust_execution.startup_sweep", extra={"open_order_count": count, "swept": True})
+    return count
+
+
 def _non_crossing_gate(
     quote: DustQuote, *, own_legs: Sequence[OwnOrderLeg], tick_size: float
 ) -> AbstainReason | None:
@@ -757,8 +813,15 @@ async def run_dust_execution(
       provisioning, and a valid binding whose hash + policy content hash verify. Otherwise every token
       abstains ``"mode_b_not_armed"`` — Mode B stays UNARMED and no order reaches the wire.
 
-    Still DELIBERATELY provisional (later tasks): the startup sweep (E6-T5) and
-    shutdown-as-a-lifecycle-stage (E6-T6).
+    E6-T5 (SAF-005) adds the STARTUP OPEN-ORDER SWEEP before arming: on arm, BEFORE the token loop,
+    the runner queries the isolated wallet's PRE-EXISTING open orders (the E3-T2 ``get_orders`` read)
+    and, when armed (Mode B), reconciles/cancels them by DELEGATING to the E2-T3
+    :meth:`SafetyController.cancel_all_and_block` (:func:`_startup_open_order_sweep`) — it cannot
+    blindly submit into pre-existing exposure. A pre-existing resting order fires the ``cancel_all_orders``
+    wire AND blocks submits, so every token then abstains ``"safety_blocked"`` — no order lands atop the
+    pre-existing orders. Mode A exercises the read but touches no wire (dry-run places no orders).
+
+    Still DELIBERATELY provisional (later task): shutdown-as-a-lifecycle-stage (E6-T6).
 
     ``sleep_fn`` is the injected async delay seam for the E6 polling loop (added by a later task);
     this pass makes a single deterministic sweep and does not sleep.
@@ -856,6 +919,17 @@ async def run_dust_execution(
             open_order_count=open_order_count,
         )
     ]
+
+    # E6-T5 (SAF-005) STARTUP SWEEP: on arm, reconcile/cancel any PRE-EXISTING open orders for the
+    # isolated wallet BEFORE the token loop — the runner cannot blindly submit into pre-existing
+    # exposure. Enforced (query + cancel-all + block) only when Mode B is ARMED (the "on arm" moment);
+    # Mode A / unarmed Mode B exercise the read but touch no wire (they place no order to protect).
+    await _startup_open_order_sweep(
+        adapter=adapter,
+        safety=safety,
+        session=session,
+        enforce=mode == "live_guarded" and arming_block_reason is None,
+    )
 
     decisions: list[SubmitDecision] = []
     for token_id in manifest.universe:
