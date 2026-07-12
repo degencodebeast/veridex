@@ -37,7 +37,7 @@ from collections.abc import Awaitable, Callable, Iterable, Mapping
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Literal
 
-from veridex.dust_execution.contracts import PreSubmitRecord
+from veridex.dust_execution.contracts import OrderStatus, OrderStatusEvent, PreSubmitRecord
 from veridex.dust_execution.l2_transport import (
     FillHistoryReader,
     InMemoryPreSubmitStore,
@@ -694,12 +694,208 @@ async def authorize_resubmit_against_venue_truth(
     )
 
 
+# ---------------------------------------------------------------------------
+# E4-T5 — honest venue status recorded from REAL venue data; fill size NEVER
+# fabricated on timeout (IDM-004, AC-013, §6 group 3). The no-fabrication guard.
+# ---------------------------------------------------------------------------
+#
+# Records the terminal :data:`~veridex.dust_execution.contracts.OrderStatus`
+# (partial / filled / rejected / expired / unresolved) HONESTLY from the SEC-004 matched-fill read —
+# the REAL ``size_matched`` the venue reports in its §5 ``get_order`` record, the SAME field
+# :meth:`veridex.venues.polymarket.PolymarketAdapter.get_order_status` /
+# ``_order_status_from_raw`` parses. It is consumed READ-ONLY; nothing is inferred, invented, or
+# rounded. The three honesty invariants:
+#
+#   * **Status from real venue data only.** The verdict is derived from the venue's own status string
+#     and the REAL ``size_matched`` — never guessed from the request or a timeout.
+#   * **Fill size is NEVER fabricated.** On a timeout / missing-status / still-working record the fill
+#     size stays the REAL matched size (``0.0`` when nothing matched, or a real partial if positively
+#     known) — it is NEVER filled in with the requested size. A timeout produces NO fabricated fill.
+#   * **partial vs filled from the real matched size.** A real partial (``size_matched`` < requested)
+#     is ``partial`` with the REAL matched size; a full match is ``filled``; a partial is NEVER
+#     rounded up to ``filled``.
+#
+# The requested size is the venue's own ``original_size`` when the record carries it (the size the
+# venue booked), falling back to the caller's ``requested_size`` only when the record omits it.
+
+#: Venue-native raw status strings that positively prove a TERMINAL no-fill EXPIRY. Mirrors the E3-T0
+#: pinned CLOB-V2 status vocabulary (kept LOCAL so the dust lane stays isolated from the venue module
+#: per SEC-003 — no runtime import of the private ``polymarket._POLY_*`` sets).
+_VENUE_EXPIRED_STATUSES: frozenset[str] = frozenset({"expired"})
+
+#: Venue-native raw status strings that positively prove a TERMINAL no-fill REJECT (a killed/unmatched
+#: FAK). Distinct from a still-working order — only these are recorded as ``rejected``.
+_VENUE_REJECTED_STATUSES: frozenset[str] = frozenset(
+    {"unmatched", "rejected", "matched", "killed", "canceled", "cancelled"}
+)
+
+#: Venue-native raw status strings that are NON-TERMINAL (still working). A record still in one of
+#: these — or a timeout / an unknown string — is ``unresolved`` (never a guessed fill).
+_VENUE_LIVE_STATUSES: frozenset[str] = frozenset({"live", "delayed", "open", "pending"})
+
+
+@dataclass(frozen=True)
+class HonestVenueStatus:
+    """The honestly-recorded venue verdict: a closed-set status + the REAL matched fill (IDM-004).
+
+    Attributes:
+        status: The closed-set :data:`~veridex.dust_execution.contracts.OrderStatus`
+            (partial / filled / rejected / expired / unresolved) recorded from real venue data.
+        filled_size: The REAL matched size read from the venue (``size_matched``). ``0.0`` means "no
+            fill proven" — it is NEVER the requested/fabricated size.
+        fill_price: The native ``[0,1]`` matched price when a fill is proven, else ``None`` (no fill →
+            no fill price).
+        is_fill_proven: ``True`` iff a POSITIVE real matched size proves a fill (``partial``/``filled``).
+        requested_size: The size the verdict was judged against (the venue's ``original_size`` when
+            present, else the caller's ``requested_size``) — audit of the partial-vs-filled decision.
+    """
+
+    status: OrderStatus
+    filled_size: float
+    fill_price: float | None
+    is_fill_proven: bool
+    requested_size: float
+
+
+def honest_venue_status(
+    record: Mapping[str, Any] | None,
+    *,
+    requested_size: float,
+    timed_out: bool = False,
+) -> HonestVenueStatus:
+    """Record the honest venue status + the REAL matched fill size — never fabricated (IDM-004, AC-013).
+
+    Reads the SEC-004 matched-fill truth from the venue's §5 ``get_order`` record (the same
+    ``size_matched`` :func:`veridex.venues.polymarket._order_status_from_raw` parses) and maps it to a
+    closed-set :data:`~veridex.dust_execution.contracts.OrderStatus` WITHOUT inventing anything:
+
+    * A POSITIVE real ``size_matched`` is a proven fill — ``filled`` when it reaches the requested size
+      (the venue's ``original_size`` when present, else ``requested_size``), otherwise ``partial`` — and
+      it carries the REAL matched size, NEVER rounded up to ``filled`` and NEVER inflated to the ask.
+    * Nothing matched (``size_matched == 0``) + a timeout / a still-working (non-terminal) / a
+      missing / an unknown status → ``unresolved`` with a ``0.0`` fill: a timeout produces NO
+      fabricated fill (the requested size is NEVER recorded as filled).
+    * Nothing matched + a positively terminal no-fill status → ``expired`` / ``rejected`` (recorded
+      from the venue's OWN status, with a ``0.0`` fill).
+
+    A partial that is positively known even at ``timed_out=True`` keeps its REAL matched size (the fill
+    is proven regardless of the timeout).
+
+    Args:
+        record: The venue's §5 ``get_order`` record (``size_matched`` / ``original_size`` / ``status`` /
+            ``price``), consumed READ-ONLY; ``None`` means "no status obtained" → ``unresolved``.
+        requested_size: The order's requested size, used for the partial-vs-filled decision ONLY when
+            the record omits ``original_size``.
+        timed_out: Whether the poll timed out on this (last observed) record; a timeout with no
+            positive matched size is ``unresolved`` and fabricates NO fill.
+
+    Returns:
+        The honestly-recorded :class:`HonestVenueStatus`.
+    """
+    # No record at all (no status obtained): honest UNRESOLVED with NO fabricated fill.
+    if record is None:
+        return HonestVenueStatus(
+            status="unresolved",
+            filled_size=0.0,
+            fill_price=None,
+            is_fill_proven=False,
+            requested_size=float(requested_size),
+        )
+
+    # Read the REAL matched size straight from the venue (SEC-004) — never the request, never a guess.
+    size_matched = float(record.get("size_matched", 0.0) or 0.0)
+    original_size = float(record.get("original_size", 0.0) or 0.0)
+    # The requested size is the venue's OWN booked size when present, else the caller's request.
+    requested = original_size if original_size > 0.0 else float(requested_size)
+    raw_status = str(record.get("status", "")).strip().lower()
+
+    raw_price = record.get("price")
+    native_price: float | None = None
+    if raw_price is not None and raw_price != "":
+        native_price = float(raw_price)
+
+    # A POSITIVE real matched size is a proven fill. partial vs filled is decided ONLY from the REAL
+    # matched size vs the requested size — a real partial is recorded with the REAL size and is NEVER
+    # rounded up to ``filled``. This holds even at timeout (the fill is positively known).
+    if size_matched > 0.0:
+        if requested > 0.0 and size_matched + 1e-9 >= requested:
+            status: OrderStatus = "filled"
+        else:
+            status = "partial"
+        return HonestVenueStatus(
+            status=status,
+            filled_size=size_matched,  # the REAL matched size — never fabricated, never rounded
+            fill_price=native_price,
+            is_fill_proven=True,
+            requested_size=requested,
+        )
+
+    # Nothing matched. A timeout, a still-working (non-terminal) record, or an unknown/absent status is
+    # UNRESOLVED — the fill size stays 0.0 (no fill proven), NEVER fabricated to the requested size.
+    if timed_out or raw_status in _VENUE_LIVE_STATUSES or not raw_status:
+        return HonestVenueStatus("unresolved", 0.0, None, False, requested)
+
+    # Nothing matched + a positively terminal no-fill status, recorded from the venue's OWN status.
+    if raw_status in _VENUE_EXPIRED_STATUSES:
+        return HonestVenueStatus("expired", 0.0, None, False, requested)
+    if raw_status in _VENUE_REJECTED_STATUSES:
+        return HonestVenueStatus("rejected", 0.0, None, False, requested)
+
+    # An unmapped terminal-ish string with no fill: fail-closed to UNRESOLVED — never guess a fill,
+    # never invent a reject/expiry from an unrecognized label.
+    return HonestVenueStatus("unresolved", 0.0, None, False, requested)
+
+
+def to_order_status_event(
+    honest: HonestVenueStatus,
+    *,
+    sequence_no: int,
+    decision_id: str,
+    client_order_id: str,
+    venue_order_id: str | None,
+    source_ts: int | None,
+    recv_ts: int,
+) -> OrderStatusEvent:
+    """Record the honest verdict into the sealed ``OrderStatusEvent`` (AC-013) — no fabrication added.
+
+    The event carries the honest ``status`` + the REAL ``filled_size`` verbatim; ``fill_price`` is the
+    native matched price ONLY when a fill is proven (``None`` otherwise). An ``unresolved`` timeout
+    therefore records a ``0.0`` fill and NO fill price — the no-fabrication invariant survives the
+    persistence boundary, and ``extra="forbid"`` still rejects any leaked field.
+
+    Args:
+        honest: The :class:`HonestVenueStatus` verdict to record.
+        sequence_no: The event-envelope sequence number.
+        decision_id: The Veridex-local decision join key.
+        client_order_id: The Veridex-local order id (IDM-001 — audit only).
+        venue_order_id: The venue order id, or ``None`` if the ack carried none.
+        source_ts: Venue/source timestamp (integer seconds) or ``None``.
+        recv_ts: Recorder-clock receive time (integer milliseconds).
+
+    Returns:
+        The sealed :class:`~veridex.dust_execution.contracts.OrderStatusEvent`.
+    """
+    return OrderStatusEvent(
+        sequence_no=sequence_no,
+        event_type="OrderStatusEvent",
+        source_ts=source_ts,
+        recv_ts=recv_ts,
+        decision_id=decision_id,
+        client_order_id=client_order_id,
+        venue_order_id=venue_order_id,
+        status=honest.status,
+        filled_size=honest.filled_size,
+        fill_price=honest.fill_price if honest.is_fill_proven else None,
+    )
+
+
 __all__ = [
     "AmbiguousOutcome",
     "AmbiguousResolution",
     "AsyncSleep",
     "Clock",
     "DurableSubmitResult",
+    "HonestVenueStatus",
     "ResubmitAuthorization",
     "ResubmitDecisionReason",
     "UncertainPoll",
@@ -710,6 +906,7 @@ __all__ = [
     "authorize_resubmit_against_venue_truth",
     "duplicate_resubmit_authorized",
     "freezes_new_submits",
+    "honest_venue_status",
     "persist_presubmit_record",
     "reconcile_durable_ack_lost",
     "reconcile_uncertain_submit",
@@ -717,5 +914,6 @@ __all__ = [
     "resolve_ambiguous_submit",
     "retry_authorized_while",
     "submit_with_durable_presubmit",
+    "to_order_status_event",
     "worst_case_uncertain_exposure",
 ]

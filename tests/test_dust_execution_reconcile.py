@@ -30,22 +30,25 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-from veridex.dust_execution.contracts import PreSubmitRecord
+from veridex.dust_execution.contracts import OrderStatusEvent, PreSubmitRecord
 from veridex.dust_execution.emergency import DustSafetySession, SafetyController
 from veridex.dust_execution.reconcile import (
     AmbiguousResolution,
     DurableSubmitResult,
+    HonestVenueStatus,
     ResubmitAuthorization,
     UncertainSubmitState,
     authorize_resubmit_against_venue_truth,
     duplicate_resubmit_authorized,
     freezes_new_submits,
+    honest_venue_status,
     reconcile_durable_ack_lost,
     reconcile_uncertain_submit,
     recover_presubmit_records,
     resolve_ambiguous_submit,
     retry_authorized_while,
     submit_with_durable_presubmit,
+    to_order_status_event,
     worst_case_uncertain_exposure,
 )
 from veridex.store import InMemoryStore, PreSubmitLedgerRow
@@ -831,3 +834,196 @@ async def test_dedup_keys_on_venue_order_key_never_client_order_id() -> None:
     # The venue open-order record never exposes a client_order_id (IDM-001) — the guard cannot and
     # does not compare it.
     assert "client_order_id" not in _open_order("0xrestinglive")
+
+
+# ===========================================================================
+# E4-T5 — honest venue status recorded from REAL venue data; fill size NEVER
+# fabricated on timeout (IDM-004, AC-013, §6 group 3). The no-fabrication guard.
+# ===========================================================================
+#
+# MONEY-NETWORK BOUNDARY. Every record here is a Mode-A fake §5 ``get_order`` shape — the SAME real
+# read surface ``PolymarketAdapter.get_order_status`` (SEC-004) parses for the honest ``size_matched``.
+# No network, no signing; Mode B UNARMED.
+#
+# The three honesty invariants pinned here:
+#   * STATUS FROM REAL VENUE DATA ONLY — partial/filled/rejected/expired/unresolved is recorded from
+#     the actual venue status + the REAL ``size_matched``, never inferred or invented.
+#   * FILL SIZE IS NEVER FABRICATED — a timeout / missing-status / non-terminal record yields
+#     ``unresolved`` with the REAL matched size (0.0 when nothing matched), NEVER the requested size.
+#   * PARTIAL vs FILLED FROM REAL MATCHED SIZE — a real partial (``size_matched`` < requested) is
+#     ``partial`` with the REAL matched size, NEVER rounded up to ``filled``.
+
+_REQUESTED_SIZE = 10.0
+
+
+def _venue_record(
+    *,
+    size_matched: float,
+    original_size: float = _REQUESTED_SIZE,
+    status: str = "live",
+    price: str | None = "0.42",
+) -> dict[str, Any]:
+    """A §5 ``get_order`` record — the SEC-004 read surface ``size_matched`` is the honest fill size.
+
+    Mirrors the E3-T0 pinned CLOB-V2 open-order shape ``PolymarketAdapter._order_status_from_raw``
+    reads. ``client_order_id`` is DELIBERATELY absent (IDM-001 — never on the wire).
+    """
+    rec: dict[str, Any] = {
+        "id": "0xvenueorderid",
+        "status": status,
+        "original_size": str(original_size),
+        "size_matched": str(size_matched),
+    }
+    if price is not None:
+        rec["price"] = price
+    return rec
+
+
+# --- RED anchor: honest status NEVER fabricates a fill size on timeout -----------------------
+
+
+def test_venue_status_honest_never_fabricates_fill_size() -> None:
+    """The venue status is honest: a timeout invents no fill, a real partial is not rounded to filled.
+
+    RED (the honest-status mapping is absent): three real venue reads must map to honest verdicts —
+    a timed-out / still-live record → ``unresolved`` with NO fabricated fill (0.0, never the requested
+    size); a REAL partial (``size_matched`` < requested) → ``partial`` with the REAL matched size (not
+    rounded up to ``filled``); a REAL full match → ``filled``. The mutations (fabricate a fill on
+    timeout; round a partial up to filled) fail HERE.
+    """
+    # (1) TIMEOUT / still-working: the last observed record matched nothing. The fill size is NOT
+    #     fabricated to the requested size — it stays 0.0 (no fill proven) and the status is honest.
+    timed_out = honest_venue_status(
+        _venue_record(size_matched=0.0, status="live"),
+        requested_size=_REQUESTED_SIZE,
+        timed_out=True,
+    )
+    assert isinstance(timed_out, HonestVenueStatus)
+    assert timed_out.status == "unresolved"
+    assert timed_out.filled_size == 0.0  # NEVER the requested 10.0 — a timeout fabricates no fill
+    assert timed_out.filled_size != _REQUESTED_SIZE
+    assert timed_out.is_fill_proven is False
+    assert timed_out.fill_price is None
+
+    # (2) REAL PARTIAL: the venue matched 3 of the requested 10. Recorded as ``partial`` with the REAL
+    #     matched size — NEVER rounded up to ``filled`` and NEVER inflated to the requested size.
+    partial = honest_venue_status(
+        _venue_record(size_matched=3.0, original_size=10.0, status="live"),
+        requested_size=_REQUESTED_SIZE,
+    )
+    assert partial.status == "partial"
+    assert partial.filled_size == 3.0  # the REAL matched size — not rounded to filled, not the ask
+    assert partial.filled_size != _REQUESTED_SIZE
+    assert partial.is_fill_proven is True
+
+    # (3) REAL FULL MATCH: the venue matched the full requested size → ``filled`` with the real size.
+    filled = honest_venue_status(
+        _venue_record(size_matched=10.0, original_size=10.0, status="matched"),
+        requested_size=_REQUESTED_SIZE,
+    )
+    assert filled.status == "filled"
+    assert filled.filled_size == 10.0
+    assert filled.is_fill_proven is True
+
+
+def test_missing_status_record_is_unresolved_never_fabricated() -> None:
+    """A missing/absent venue record (no status obtained) is ``unresolved`` with NO fabricated fill."""
+    verdict = honest_venue_status(None, requested_size=_REQUESTED_SIZE)
+    assert verdict.status == "unresolved"
+    assert verdict.filled_size == 0.0
+    assert verdict.filled_size != _REQUESTED_SIZE
+    assert verdict.is_fill_proven is False
+
+
+def test_partial_observed_at_timeout_keeps_real_matched_size() -> None:
+    """A REAL partial observed even at timeout keeps the REAL matched size — honestly, never inflated.
+
+    "Fill size stays the real matched size if positively known" — a positive ``size_matched`` is a
+    proven partial fill regardless of the timeout, so it is recorded with the REAL size (3.0), never
+    fabricated up to the requested size and never dropped to 0.
+    """
+    verdict = honest_venue_status(
+        _venue_record(size_matched=3.0, original_size=10.0, status="live"),
+        requested_size=_REQUESTED_SIZE,
+        timed_out=True,
+    )
+    assert verdict.status == "partial"
+    assert verdict.filled_size == 3.0
+    assert verdict.filled_size != _REQUESTED_SIZE
+    assert verdict.is_fill_proven is True
+
+
+def test_rejected_and_expired_recorded_from_real_status_no_fill() -> None:
+    """A no-fill terminal status (rejected / expired) is recorded from the REAL venue status; 0 fill."""
+    rejected = honest_venue_status(
+        _venue_record(size_matched=0.0, status="unmatched"),
+        requested_size=_REQUESTED_SIZE,
+    )
+    assert rejected.status == "rejected"
+    assert rejected.filled_size == 0.0
+    assert rejected.is_fill_proven is False
+
+    expired = honest_venue_status(
+        _venue_record(size_matched=0.0, status="expired"),
+        requested_size=_REQUESTED_SIZE,
+    )
+    assert expired.status == "expired"
+    assert expired.filled_size == 0.0
+    assert expired.is_fill_proven is False
+
+
+def test_status_is_from_the_closed_honest_literal_set() -> None:
+    """Every recorded status is a member of the closed OrderStatus literal set (AC-013)."""
+    closed = {"partial", "filled", "rejected", "expired", "unresolved"}
+    for rec in (
+        _venue_record(size_matched=0.0, status="live"),
+        _venue_record(size_matched=3.0, original_size=10.0),
+        _venue_record(size_matched=10.0, original_size=10.0, status="matched"),
+        _venue_record(size_matched=0.0, status="unmatched"),
+        _venue_record(size_matched=0.0, status="expired"),
+        _venue_record(size_matched=0.0, status="some-unknown-string"),
+    ):
+        assert honest_venue_status(rec, requested_size=_REQUESTED_SIZE).status in closed
+
+
+def test_honest_verdict_records_into_sealed_order_status_event() -> None:
+    """The honest verdict flows into the sealed ``OrderStatusEvent`` verbatim — no fabrication added.
+
+    A partial carries the REAL matched size + the native fill price; an unresolved timeout carries a
+    0 fill and NO fill price (``extra="forbid"`` still rejects any leaked field).
+    """
+    partial = honest_venue_status(
+        _venue_record(size_matched=3.0, original_size=10.0, status="live", price="0.42"),
+        requested_size=_REQUESTED_SIZE,
+    )
+    event = to_order_status_event(
+        partial,
+        sequence_no=1,
+        decision_id="dec-1",
+        client_order_id=_CLIENT_ORDER_ID,
+        venue_order_id="0xvenueorderid",
+        source_ts=None,
+        recv_ts=1234,
+    )
+    assert isinstance(event, OrderStatusEvent)
+    assert event.status == "partial"
+    assert event.filled_size == 3.0  # the REAL matched size, verbatim
+    assert event.fill_price == 0.42  # native [0,1] matched price
+
+    unresolved = honest_venue_status(
+        _venue_record(size_matched=0.0, status="live"),
+        requested_size=_REQUESTED_SIZE,
+        timed_out=True,
+    )
+    unresolved_event = to_order_status_event(
+        unresolved,
+        sequence_no=2,
+        decision_id="dec-1",
+        client_order_id=_CLIENT_ORDER_ID,
+        venue_order_id="0xvenueorderid",
+        source_ts=None,
+        recv_ts=1235,
+    )
+    assert unresolved_event.status == "unresolved"
+    assert unresolved_event.filled_size == 0.0  # NO fabricated fill on a timeout
+    assert unresolved_event.fill_price is None
