@@ -13,8 +13,11 @@ deterministic ``ALLOW``/``DENY`` verdict BEFORE any execution attempt — identi
 identical result (AC-021). A missing manifest blocks execution (Section 6 group 12); an
 ``EXPERIMENTAL_DUST`` manifest admits WITHOUT a profitability flag but still trips the loss caps.
 
-This module imports only ``.contracts`` (same isolated package) and the standard library — no
-``veridex.live_recorder`` and no ranked-lane dependency (SEC-003).
+This module imports ``.contracts`` (same isolated package), ``veridex.runtime.evidence`` (the
+canonical serializer), and the shared ``cap_breached`` loss-cap predicate from
+``veridex.policy.envelope`` — the single source of truth for the breach boundary (``policy`` is
+NOT a ranked lane, so SEC-003 is preserved). It imports no ``veridex.live_recorder`` and no
+ranked-lane (``veridex.maker.*`` / ``veridex.scoring`` / ``veridex.leaderboard``) dependency.
 """
 
 from __future__ import annotations
@@ -29,6 +32,7 @@ from veridex.dust_execution.contracts import (
     ExecutionMode,
     _FrozenModel,
 )
+from veridex.policy.envelope import cap_breached
 from veridex.runtime.evidence import serialize_payload
 
 AdmissionVerdict = Literal["ALLOW", "DENY"]
@@ -123,8 +127,8 @@ class StrategyAuthorizationDecision(_FrozenModel):
         * no manifest → ``DENY`` (``missing_manifest``) — never admit without a pinned manifest;
         * kill switch engaged → ``DENY`` (``kill_switch_engaged``);
         * breaker open → ``DENY`` (``breaker_open``);
-        * a positive session-loss cap already met/exceeded → ``DENY`` (``session_loss_cap``);
-        * a positive daily-loss cap already met/exceeded → ``DENY`` (``daily_loss_cap``);
+        * a positive session-loss cap reached (``cap_breached``) → ``DENY`` (``session_loss_cap``);
+        * a positive daily-loss cap reached (``cap_breached``) → ``DENY`` (``daily_loss_cap``);
         * otherwise ``ALLOW`` — an ``EXPERIMENTAL_DUST`` manifest admits WITHOUT a profitability
           flag, at the strictest caps (REQ-010/AC-024).
 
@@ -145,10 +149,12 @@ class StrategyAuthorizationDecision(_FrozenModel):
             reason_codes.append("kill_switch_engaged")
         if session.breaker_open:
             reason_codes.append("breaker_open")
-        # Loss caps are magnitudes; a cap <= 0 is disabled (mirrors max_stake_live_guarded).
-        if manifest.max_session_loss > 0.0 and session.realized_loss_session >= manifest.max_session_loss:
+        # Loss caps are magnitudes; the breach boundary lives in ONE place — ``cap_breached``
+        # (veridex.policy.envelope) — shared with the pre-quote gate and the atomic breach-sweep
+        # so the three surfaces cannot drift. A cap <= 0 is disabled (mirrors max_stake_live_guarded).
+        if cap_breached(manifest.max_session_loss, session.realized_loss_session):
             reason_codes.append("session_loss_cap")
-        if manifest.max_daily_loss > 0.0 and session.realized_loss_daily >= manifest.max_daily_loss:
+        if cap_breached(manifest.max_daily_loss, session.realized_loss_daily):
             reason_codes.append("daily_loss_cap")
 
         verdict: AdmissionVerdict = "DENY" if reason_codes else "ALLOW"

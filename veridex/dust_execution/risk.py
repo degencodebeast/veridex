@@ -27,7 +27,7 @@ import math
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
-from veridex.policy.envelope import PolicyEnvelope
+from veridex.policy.envelope import PolicyEnvelope, cap_breached
 
 
 class FailClosed(Exception):
@@ -183,11 +183,14 @@ class RiskAccumulator:
         return max(0.0, -self._net_day)
 
     def breaches_caps(self, envelope: PolicyEnvelope) -> bool:
-        """Whether the accumulated fee-inclusive loss crosses either ENABLED loss cap (SAF-002d).
+        """Whether the accumulated fee-inclusive loss reaches either ENABLED loss cap (SAF-002d).
 
-        Mirrors ``gate.evaluate_pre_quote`` EXACTLY (``cap > 0 and loss > cap``) so the proactive
-        breach-sweep and the pre-quote deny agree on the crossing point: a ``<= 0`` cap is disabled
-        (no protection to breach), and the comparison is strict — the cap value itself is admissible.
+        Routes through the single ``cap_breached`` predicate (:func:`veridex.policy.envelope.cap_breached`)
+        — the ONE source of truth shared with ``gate.evaluate_pre_quote`` and the
+        ``manifest.StrategyAuthorizationDecision.evaluate`` admission decision — so the proactive
+        breach-sweep, the pre-quote deny, and admission can never drift on the crossing point. A
+        ``<= 0`` cap is disabled (no protection to breach); an enabled cap is breached once loss
+        ``>=`` it (the conservative, fail-closed boundary — HALT when loss reaches the ceiling).
 
         This is the breach-DETECTION half of the atomic loss-safety path; the coordinating
         block+sweep lives in :meth:`veridex.dust_execution.emergency.SafetyController.on_realized_fill`.
@@ -196,13 +199,11 @@ class RiskAccumulator:
             envelope: The policy envelope carrying ``max_session_loss`` / ``max_daily_loss``.
 
         Returns:
-            ``True`` iff the session OR daily accumulated loss crosses its enabled cap.
+            ``True`` iff the session OR daily accumulated loss reaches its enabled cap.
         """
-        if envelope.max_session_loss > 0 and self.realized_loss_session > envelope.max_session_loss:
-            return True
-        if envelope.max_daily_loss > 0 and self.realized_loss_day > envelope.max_daily_loss:
-            return True
-        return False
+        return cap_breached(envelope.max_session_loss, self.realized_loss_session) or cap_breached(
+            envelope.max_daily_loss, self.realized_loss_day
+        )
 
 
 def authorize_mode_b(envelope: PolicyEnvelope) -> None:

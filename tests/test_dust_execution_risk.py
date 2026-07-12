@@ -19,6 +19,11 @@ import pytest
 
 from veridex.dust_execution.contracts import CancelAllAck, CancelAllTriggeredEvent
 from veridex.dust_execution.emergency import DustSafetySession, SafetyController
+from veridex.dust_execution.manifest import (
+    SessionState,
+    StrategyAuthorizationDecision,
+    StrategyExperimentManifest,
+)
 from veridex.dust_execution.risk import (
     FailClosed,
     PaperReceipt,
@@ -309,3 +314,112 @@ async def test_paper_receipt_cannot_drive_the_breach_sweep() -> None:
         )
     assert rec.calls == 0
     assert controller.check_can_submit(session) is True
+
+
+# --- Gate#1 MINOR-A/B: the loss-cap breach boundary AGREES across gate/risk/admission --------
+#
+# The predicate ``cap > 0 and loss <op> cap`` used to be copy-pasted in three safety surfaces and
+# had DRIFTED: the pre-quote gate + the atomic breach-sweep used ``>`` while admission used ``>=``.
+# At a loss EXACTLY == cap the three DISAGREED. All three now route through the single
+# ``cap_breached`` predicate (``veridex.policy.envelope``), canonical operator ``>=`` (conservative
+# fail-closed: HALT when loss REACHES the max). This test pins the boundary agreement.
+
+
+def _admission_manifest(**kw: object) -> StrategyExperimentManifest:
+    base: dict[str, object] = {
+        "strategy_id": "dust-maker-v0",
+        "strategy_config_hash": "cfg" * 4,
+        "evidence_class": "EXPERIMENTAL_DUST",
+        "market": "0xcondition",
+        "universe": ("0xtokenYES", "0xtokenNO"),
+        "mode": "dry_run",
+        "max_orders": 3,
+        "max_notional": 5.0,
+        "max_session_loss": 0.50,
+        "max_daily_loss": 0.50,
+        "session_window": (1_700_000_000_000, 1_700_000_600_000),
+        "required_inputs": ("fair_value", "venue_book"),
+        "permitted_intent_kinds": ("make",),
+        "market_fee_snapshot_hash": "fee" * 4,
+        "operator_authorization": "op-ref-1",
+        "forbidden_claims": ("PROVEN_EDGE",),
+    }
+    base.update(kw)
+    return StrategyExperimentManifest(**base)  # type: ignore[arg-type]
+
+
+def _admission_session(**kw: object) -> SessionState:
+    base: dict[str, object] = {
+        "session_id": _SESSION,
+        "realized_loss_session": 0.0,
+        "realized_loss_daily": 0.0,
+        "open_order_count": 0,
+        "breaker_open": False,
+        "kill_switch_engaged": False,
+    }
+    base.update(kw)
+    return SessionState(**base)  # type: ignore[arg-type]
+
+
+def _gate_breaches_session(cap: float, loss: float) -> bool:
+    """Does the pre-quote gate deny on the SESSION loss cap at this (cap, loss)?"""
+    r = evaluate_pre_quote(_pre(realized_loss_session=loss), _env(max_session_loss=cap))
+    return "session_loss_over_max" in r.reason_codes
+
+
+def _risk_breaches_session(cap: float, loss: float) -> bool:
+    """Does the atomic breach-sweep detector fire on the SESSION loss cap at this (cap, loss)?"""
+    acc = RiskAccumulator(session_id=_SESSION)
+    # Drive the accumulator to EXACTLY ``loss`` via one real, fee-free losing fill.
+    acc.apply_realized_fill(_real_fill(-loss, 0.0))
+    assert acc.realized_loss_session == pytest.approx(loss)
+    return acc.breaches_caps(_env(max_session_loss=cap))
+
+
+def _admission_breaches_session(cap: float, loss: float) -> bool:
+    """Does the admission decision DENY on the SESSION loss cap at this (cap, loss)?"""
+    d = StrategyAuthorizationDecision.evaluate(
+        manifest=_admission_manifest(max_session_loss=cap),
+        policy_hash="pol-hash",
+        session=_admission_session(realized_loss_session=loss),
+    )
+    return "session_loss_cap" in d.reason_codes
+
+
+def test_loss_cap_breach_boundary_agrees_across_gate_risk_admission() -> None:
+    """MINOR-A/B: at a loss EXACTLY == cap, gate, atomic sweep, and admission AGREE.
+
+    Before the fix this FAILS at the exact boundary: admission used ``>=`` (breach at ==) while
+    the gate and the sweep used ``>`` (no breach at ==) — a genuine three-way divergence held
+    together only by hand + a docstring. Routing all three through the single ``cap_breached``
+    predicate (canonical ``>=``) makes them agree at every point on the boundary.
+    """
+    cap = 0.50
+
+    # (1) EXACT boundary loss == cap: the three surfaces MUST agree (drift point).
+    at_boundary = (
+        _gate_breaches_session(cap, cap),
+        _risk_breaches_session(cap, cap),
+        _admission_breaches_session(cap, cap),
+    )
+    assert at_boundary[0] == at_boundary[1] == at_boundary[2], (
+        f"loss==cap breach must AGREE across (gate, risk, admission); got {at_boundary}"
+    )
+    # Canonical operator is ``>=`` -> all three breach exactly at the cap.
+    assert at_boundary == (True, True, True)
+
+    # (2) strictly BELOW: none breach (agreement preserved, unchanged behavior).
+    below = 0.49
+    assert (
+        _gate_breaches_session(cap, below),
+        _risk_breaches_session(cap, below),
+        _admission_breaches_session(cap, below),
+    ) == (False, False, False)
+
+    # (3) strictly OVER: all breach (agreement preserved, unchanged behavior).
+    over = 0.61
+    assert (
+        _gate_breaches_session(cap, over),
+        _risk_breaches_session(cap, over),
+        _admission_breaches_session(cap, over),
+    ) == (True, True, True)

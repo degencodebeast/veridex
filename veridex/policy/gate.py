@@ -43,7 +43,7 @@ from veridex.policy.engine import (
     PolicyDecision,
     PolicyResult,
 )
-from veridex.policy.envelope import PolicyEnvelope
+from veridex.policy.envelope import PolicyEnvelope, cap_breached
 
 
 class PreQuoteContext(BaseModel):
@@ -140,11 +140,14 @@ def evaluate_pre_quote(ctx: PreQuoteContext, envelope: PolicyEnvelope) -> Policy
         reasons.append(_REASON_ORDER_CAP_SESSION)
     if ctx.orders_this_day >= envelope.max_orders_per_day:
         reasons.append(_REASON_ORDER_CAP_DAY)
-    # Fee-inclusive realized-loss ceilings (SAF-002): a standing loss over an ENABLED (``> 0``)
-    # cap denies BEFORE submit. Disabled (``<= 0``) caps are transparent — no reason emitted.
-    if envelope.max_session_loss > 0 and ctx.realized_loss_session > envelope.max_session_loss:
+    # Fee-inclusive realized-loss ceilings (SAF-002): a standing loss that REACHES an ENABLED
+    # (``> 0``) cap denies BEFORE submit. The breach boundary lives in ONE place —
+    # ``cap_breached`` (veridex.policy.envelope) — shared with the atomic breach-sweep
+    # (risk.breaches_caps) and admission (manifest.evaluate) so it cannot drift. Disabled
+    # (``<= 0``) caps are transparent — no reason emitted.
+    if cap_breached(envelope.max_session_loss, ctx.realized_loss_session):
         reasons.append(_REASON_SESSION_LOSS_OVER_MAX)
-    if envelope.max_daily_loss > 0 and ctx.realized_loss_day > envelope.max_daily_loss:
+    if cap_breached(envelope.max_daily_loss, ctx.realized_loss_day):
         reasons.append(_REASON_DAILY_LOSS_OVER_MAX)
     if ctx.seconds_since_last_order is not None and ctx.seconds_since_last_order < envelope.cooldown_s:
         reasons.append(_REASON_COOLDOWN_ACTIVE)
