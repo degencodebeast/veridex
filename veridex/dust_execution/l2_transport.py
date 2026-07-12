@@ -33,6 +33,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import hmac
+import math
 import time
 from collections.abc import Awaitable, Callable, Iterable, Mapping
 from dataclasses import dataclass
@@ -286,24 +287,56 @@ class ReconciledFill:
     reconciled_fill_size: float
 
 
+def _coerce_fill_amount(value: Any) -> float | None:
+    """Coerce a venue fill amount to a finite, NON-NEGATIVE float, or ``None`` if it is malformed.
+
+    FAIL CLOSED to no-proof: a missing (``None``), unparseable (``"garbage"``), non-finite
+    (``nan``/``inf``), or negative amount returns ``None`` — a component that is not a valid positive
+    fill quantity is not proof of a fill and must never be summed into a partial (Gate#2 MAJOR-3).
+    """
+    if value is None:
+        return None
+    try:
+        amount = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(amount) or amount < 0.0:
+        return None
+    return amount
+
+
 def _match_fill_size(trades: Iterable[Mapping[str, Any]], venue_order_key: str) -> float | None:
-    """Sum matched sizes for trades whose OFFICIAL id equals ``venue_order_key`` (None if no match).
+    """Sum matched sizes for trades whose OFFICIAL id equals ``venue_order_key`` (None if no proof).
 
     Matches on the venue's official ids only (``taker_order_id`` when we are taker, or a
     ``maker_orders[].order_id`` when we are the resting maker) — never on Veridex's private digest.
+
+    FAIL-CLOSED validation (single-source, so BOTH the restart-join and three-surface reconcilers
+    benefit): every matched component must be finite and ``>= 0``; a malformed / non-finite / negative
+    component degrades the WHOLE match to ``None`` (no proof, never a partial). Only a strictly
+    POSITIVE aggregate returns a size — a zero (or fully-absent) matched total returns ``None`` too,
+    since a zero venue amount is not positive fill proof (Gate#2 MAJOR-3).
     """
     matched = 0.0
     found = False
     for trade in trades:
         if str(trade.get("taker_order_id", "")) == venue_order_key:
-            matched += float(trade.get("size", 0.0) or 0.0)
+            amount = _coerce_fill_amount(trade.get("size"))
+            if amount is None:
+                return None  # a matched-but-malformed/non-positive component → fail closed to no-proof
+            matched += amount
             found = True
             continue
         for maker in trade.get("maker_orders", []) or []:
             if str(maker.get("order_id", "")) == venue_order_key:
-                matched += float(maker.get("matched_amount", 0.0) or 0.0)
+                amount = _coerce_fill_amount(maker.get("matched_amount"))
+                if amount is None:
+                    return None
+                matched += amount
                 found = True
-    return matched if found else None
+    if not found:
+        return None
+    return matched if matched > 0.0 else None
 
 
 async def reconcile_ack_lost(

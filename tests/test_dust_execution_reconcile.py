@@ -41,6 +41,7 @@ from veridex.dust_execution.reconcile import (
     HonestVenueStatus,
     ResubmitAuthorization,
     UncertainSubmitState,
+    assess_uncertain_submit,
     authorize_resubmit_against_venue_truth,
     duplicate_resubmit_authorized,
     freezes_new_submits,
@@ -221,6 +222,80 @@ async def test_ack_lost_unmatched_fill_is_ambiguous_never_fabricated() -> None:
     assert len(reconciled) == 1
     assert reconciled[0].reconciled_state == "AMBIGUOUS"
     assert reconciled[0].reconciled_fill_size == 0.0
+
+
+# ---------------------------------------------------------------------------
+# Gate#2 MAJOR-3 — a malformed / zero / negative / non-finite matching fill amount is NOT positive
+# fill proof: the SINGLE-SOURCE matcher must fail closed to no-proof (→ AMBIGUOUS) and NEVER raise,
+# on BOTH the restart-join (reconcile_ack_lost / reconcile_durable_ack_lost) and the three-surface
+# (assess_uncertain_submit) reconciliation paths, for BOTH taker-order and maker-order rows.
+# ---------------------------------------------------------------------------
+
+# Repro amounts: '0'/'−1'/'nan'/'inf' formerly released as RESOLVED with a bogus size; 'garbage'
+# crashed with a ValueError instead of degrading to no-proof.
+_MALFORMED_FILL_AMOUNTS = ["0", "-1", "nan", "inf", "garbage"]
+
+
+def _malformed_trade_row(shape: str, key: str, amount: str) -> dict[str, Any]:
+    """A §3 trade row matching ``key`` whose fill amount is (possibly) malformed / non-positive."""
+    if shape == "taker":
+        return {"taker_order_id": key, "size": amount, "status": "CONFIRMED"}
+    return {"maker_orders": [{"order_id": key, "matched_amount": amount}], "status": "CONFIRMED"}
+
+
+class _MalformedFillAdapter:
+    """A complete-venue-truth reader whose ``get_fill_history`` returns a single matching trade with a
+    caller-supplied (possibly malformed) amount; ``get_order``/``get_orders`` give NO other evidence."""
+
+    def __init__(self, trades: list[dict[str, Any]]) -> None:
+        self._trades = trades
+
+    async def get_orders(self, **kwargs: Any) -> list[dict[str, Any]]:
+        return []
+
+    async def get_order(self, order_id: str, **kwargs: Any) -> dict[str, Any]:
+        return {}
+
+    async def get_fill_history(self, **kwargs: Any) -> list[dict[str, Any]]:
+        return [dict(t) for t in self._trades]
+
+
+@pytest.mark.parametrize("amount", _MALFORMED_FILL_AMOUNTS)
+@pytest.mark.parametrize("shape", ["taker", "maker"])
+async def test_malformed_fill_amount_is_ambiguous_via_reconcile_ack_lost(
+    shape: str, amount: str
+) -> None:
+    store = InMemoryStore()
+
+    async def _post() -> dict[str, Any]:
+        return {"success": True}
+
+    await submit_with_durable_presubmit(
+        store=store, session_id=_SESSION, record=_record(), post=_post
+    )
+
+    async def _reader(key: str) -> dict[str, Any]:
+        return {"trades": [_malformed_trade_row(shape, key, amount)]}
+
+    # Must NOT raise (a malformed string degrades to no-proof, never a ValueError) and must NOT
+    # release the ACK-lost uncertainty as RESOLVED on a zero/negative/non-finite amount.
+    reconciled = await reconcile_durable_ack_lost(store, _SESSION, _reader)
+    assert len(reconciled) == 1
+    assert reconciled[0].reconciled_state == "AMBIGUOUS"
+    assert reconciled[0].reconciled_fill_size == 0.0
+
+
+@pytest.mark.parametrize("amount", _MALFORMED_FILL_AMOUNTS)
+@pytest.mark.parametrize("shape", ["taker", "maker"])
+async def test_malformed_fill_amount_is_ambiguous_via_assess_uncertain_submit(
+    shape: str, amount: str
+) -> None:
+    adapter = _MalformedFillAdapter([_malformed_trade_row(shape, REC.venue_order_key, amount)])
+    # No terminal get_order status and no positive fill proof → AMBIGUOUS (never RESOLVED, never raise).
+    verdict = await assess_uncertain_submit(REC, adapter=adapter)
+    assert verdict.state == "AMBIGUOUS"
+    assert verdict.state != "RESOLVED"
+    assert verdict.matched_fill_size == 0.0
 
 
 # ---------------------------------------------------------------------------
