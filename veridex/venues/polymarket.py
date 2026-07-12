@@ -55,6 +55,7 @@ from veridex.venues.polymarket_resolver import ResolvedMarket, side_to_token
 
 if TYPE_CHECKING:
     from veridex.config import Settings
+    from veridex.dust_execution.resting_order import RestingOrder
 
 # Timestamps above this bound are Unix milliseconds (Polymarket CLOB) rather than seconds; used to
 # normalise the book timestamp to the seconds unit :attr:`Quote.ts` documents. ~Sat Mar 2033 in ms.
@@ -103,6 +104,24 @@ class WriteClient(Protocol):
 
     async def get_order(self, order_id: str) -> dict[str, Any]:
         """Return the raw order record (carries ``size_matched`` and the matched native ``price``)."""
+        ...
+
+    # -- ADDITIVE resting-maker WRITE surface (E3-T3, REQ-016, §6 group 16) ---------------------
+    # DISTINCT from the taker FAK/FOK ``limit_order`` path: a resting order (GTC/GTD, post-only) RESTS
+    # on the book and later appears in ``get_orders``. Adding it leaves the sealed FAK/FOK write
+    # behavior unchanged. Mirrors :class:`~veridex.venues.base.RestingOrderVenue`.
+    async def submit_resting_order(
+        self,
+        *,
+        token_id: str,
+        amount: float,
+        native_price: float,
+        order_type: str,
+        post_only: bool,
+        expiration: int,
+        tick_size: str | None = ...,
+    ) -> dict[str, Any]:
+        """Rest a GTC/GTD post-only order (§6 wire); ``native_price`` is the NATIVE tick-unit price."""
         ...
 
     async def cancel_all_orders(self) -> dict[str, Any]:
@@ -605,6 +624,39 @@ class PolymarketAdapter:
         response = await client.cancel_all_orders()
         cancelled = bool(response.get("success", True)) if isinstance(response, dict) else False
         return CancelAck(venue_order_id=venue_order_id, cancelled=cancelled)
+
+    async def submit_resting_order(self, resting_order: RestingOrder) -> SubmitAck:
+        """Submit a DISTINCT :class:`~veridex.dust_execution.resting_order.RestingOrder` — GTC/GTD,
+        post-only, RESTS on the book (E3-T3, REQ-016, §6 group 16).
+
+        Physically distinct from :meth:`submit_order` (which only takes the FAK/FOK taker
+        :class:`~veridex.venues.base.Order` and NEVER rests): the parameter type is a ``RestingOrder``,
+        so a taker order can never travel this path and a resting order can never travel the taker
+        path. Armed identically to a real submit (:meth:`_require_armed`: ``polymarket_write_enabled``
+        true AND ``dry_run=False`` AND a write client present), then delegates the §6 resting-maker
+        wire kwargs to the venue client. ``resting_order.native_price`` is ALREADY a native tick-unit
+        share price (validated on the contract), so no decimal-odds value ever reaches the wire (§4.3).
+
+        Args:
+            resting_order: The GTC/GTD post-only resting order to rest on the book.
+
+        Returns:
+            A :class:`~veridex.venues.base.SubmitAck` parsed from the venue response.
+
+        Raises:
+            PolymarketWriteDisabled: Unless armed (write-enabled AND not DRY_RUN AND client present).
+        """
+        client = self._require_armed("submit_resting_order")
+        # Defense-in-depth (real money): a valid native share price is strictly inside (0, 1). The
+        # RestingOrder contract already enforces this, but the money path never trusts the wire to
+        # catch a pathological price — fail CLOSED before any I/O.
+        if not 0.0 < resting_order.native_price < 1.0:
+            raise PolymarketWriteDisabled(
+                f"refusing to rest order: native price {resting_order.native_price!r} outside (0, 1) "
+                "— fail-closed on the money path"
+            )
+        response = await client.submit_resting_order(**resting_order.to_wire_kwargs())
+        return _submit_ack_from_response(response)
 
     # -- read / reconciliation surface (ADDITIVE, E3-T2, IDM-005/DAT-004) ----------------------
     #

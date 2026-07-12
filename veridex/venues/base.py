@@ -388,3 +388,33 @@ class VenueReconciliationReads(Protocol):
     async def get_fill_history(self, **kwargs: Any) -> list[dict[str, Any]]:
         """Return own-fill / trade history (E3-T0 §3 ``get_trades`` shape); net-new surface."""
         ...
+
+
+@runtime_checkable
+class RestingOrderVenue(Protocol):
+    """Additive resting-maker WRITE surface (E3-T3, REQ-016, §6 group 16).
+
+    Deliberately SEPARATE from :class:`VenueAdapter`'s sealed FAK/FOK ``submit_order``: a resting order
+    (GTC/GTD, post-only) RESTS on the book and later appears in ``get_orders``, whereas a FAK/FOK taker
+    order fills-and-kills and NEVER rests. Keeping the resting write on its own Protocol leaves the
+    sealed four-method taker adapter contract — and its GTC-ban test — untouched (REQ-016: a single
+    order type MUST NOT be overloaded for both maker and taker).
+
+    Method kwargs are the E3-T0 §6 pinned resting-maker wire fields; the value contract that produces
+    them (``RestingOrder.to_wire_kwargs``) lives in :mod:`veridex.dust_execution.resting_order`, so this
+    Protocol carries NO dependency on the dust-execution lane (structural typing only).
+    """
+
+    async def submit_resting_order(
+        self,
+        *,
+        token_id: str,
+        amount: float,
+        native_price: float,
+        order_type: str,
+        post_only: bool,
+        expiration: int,
+        tick_size: str | None = None,
+    ) -> dict[str, Any]:
+        """Rest a GTC/GTD post-only order; return a §2c ``SendOrderResponse`` dict."""
+        ...

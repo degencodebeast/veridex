@@ -516,3 +516,302 @@ async def test_get_market_is_public_but_needs_a_client() -> None:
     )
     with pytest.raises(PolymarketWriteDisabled):
         await no_client.get_market("0xcond")
+
+
+# ===========================================================================
+# E3-T3 — distinct GTC/GTD post-only resting-order contract (REQ-016, AC-031, §6 grp 16).
+# ===========================================================================
+#
+# CONTRACT DECISION (resolves Fable-M1 + REQ-016): the directional taker
+# ``veridex.venues.base.Order`` stays FAK/FOK-only and its GTC-ban test stays GREEN. R4-A introduces
+# a PHYSICALLY DISTINCT resting-order contract (``veridex.dust_execution.resting_order.RestingOrder``,
+# ``tif: Literal["GTC","GTD"]``, rests on the book) in its OWN lane. FAK/FOK never rest; the two order
+# types are separate Python types — a maker demo cannot submit a taker order and a directional taker
+# can never emit GTC.
+#
+# Built against the E3-T0 §6 pinned resting-maker wire:
+#   * post-only field: top-level ``postOnly`` (bool), ALO semantic; valid ONLY with GTC/GTD.
+#   * GTC/GTD: ``orderType`` string enum ``"GTC"``/``"GTD"``.
+#   * GTD expiration: ``order.expiration`` (unix SECONDS), NOT signed; must be >= 3 min in the future.
+# Tested against the Mode-A FAKE resting venue (no network, no signing; Mode B UNARMED).
+
+from pydantic import ValidationError  # noqa: E402
+
+from veridex.venues.base import Order as _TakerOrder  # noqa: E402
+
+
+class _RestingVenueClient:
+    """Mode-A FAKE CLOB resting-venue client — a resting order RESTS; a FAK order NEVER rests.
+
+    ``submit_resting_order`` (the §6 resting wire) adds the order to the open-order book and returns a
+    ``status:"live"`` SendOrderResponse (§2c). ``limit_order`` is the taker FAK path — it fills-or-kills
+    and is NEVER added to the resting book. ``get_orders`` returns the resting open orders (§5), so the
+    "rested vs never-rested" distinction is observable exactly as E4 reconciliation will see it.
+    """
+
+    def __init__(self, now: int = 1_000_000) -> None:
+        self._now = now
+        self._resting: list[dict[str, Any]] = []
+        self.submit_resting_calls: list[dict[str, Any]] = []
+        self.fak_calls: list[dict[str, Any]] = []
+
+    async def submit_resting_order(
+        self,
+        *,
+        token_id: str,
+        amount: float,
+        native_price: float,
+        order_type: str,
+        post_only: bool,
+        expiration: int,
+        tick_size: str | None = None,
+    ) -> dict[str, Any]:
+        self.submit_resting_calls.append(
+            {
+                "token_id": token_id,
+                "amount": amount,
+                "native_price": native_price,
+                "order_type": order_type,
+                "post_only": post_only,
+                "expiration": expiration,
+            }
+        )
+        # §6 GTD temporal rule: expiration must be >= 3 minutes in the future, else INVALID_ORDER_EXPIRATION.
+        if order_type == "GTD" and expiration < self._now + 180:
+            return {"success": False, "orderID": "", "status": "unmatched",
+                    "errorMsg": "INVALID_ORDER_EXPIRATION"}
+        order_id = f"0xresting{len(self._resting)}"
+        self._resting.append(
+            {  # §5 OpenOrder EXACT SET
+                "id": order_id,
+                "status": "LIVE",
+                "market": "0xcond",
+                "asset_id": token_id,
+                "side": "BUY" if amount > 0 else "SELL",
+                "original_size": str(abs(amount)),
+                "size_matched": "0",
+                "price": str(native_price),
+                "outcome": "YES",
+                "order_type": order_type,
+                "maker_address": "0xmaker",
+                "owner": "api-key-uuid",
+                "expiration": str(expiration),
+                "associate_trades": [],
+                "created_at": self._now,
+            }
+        )
+        return {"success": True, "orderID": order_id, "status": "live", "errorMsg": ""}
+
+    async def limit_order(
+        self,
+        ticker: str,
+        amount: float,
+        price: float,
+        tif: str = "GTC",
+        round_price: bool = True,
+        tick_size: str | None = None,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        # Taker FAK path: fill-and-kill. It NEVER rests — the resting book is untouched.
+        self.fak_calls.append({"ticker": ticker, "amount": amount, "tif": tif})
+        return {"success": True, "orderID": "0xfak", "status": "matched"}
+
+    async def get_orders(self, **kwargs: Any) -> list[dict[str, Any]]:
+        return list(self._resting)
+
+
+def _resting_adapter(client: _RestingVenueClient, *, armed: bool = True) -> PolymarketAdapter:
+    return PolymarketAdapter(
+        _RESOLVED,
+        _FakeBookClient(),
+        settings=Settings(_env_file=None, polymarket_write_enabled=armed),
+        write_client=client,
+        dry_run=not armed,
+    )
+
+
+# --- Step 1 keep-green guard (FIRST): the sealed taker contract is UNTOUCHED -----------------
+
+
+def test_directional_order_still_bans_gtc() -> None:
+    # KEEP-GREEN GUARD (must pass at ALL times, incl. RED): R4-A did NOT touch the sealed taker
+    # ``Order`` — its ``tif`` Literal still excludes GTC, so ``Order(tif="GTC")`` still fails.
+    # (No dependency on the not-yet-existing resting primitive → green even before GREEN.)
+    with pytest.raises(ValidationError):
+        _TakerOrder(
+            market_ref="OU|2.5|full",
+            side="over",
+            size=100.0,
+            price=2.0,
+            venue="polymarket",
+            client_order_id="c1",
+            tif="GTC",  # type: ignore[arg-type]
+        )
+
+
+# --- The distinct RestingOrder rests; the taker FAK order never rests ------------------------
+
+
+async def test_resting_order_rests_and_appears_in_get_orders_fak_never_rests() -> None:
+    # Local import so RED = ImportError HERE (Mode B maker admission blocked until the primitive
+    # exists), while the keep-green guard above still passes.
+    from veridex.dust_execution.resting_order import (
+        RestingOrder,
+        maker_mode_b_resting_primitive_ready,
+        submit_resting_order,
+    )
+
+    # Mode B maker admission is UNBLOCKED only once this primitive is present.
+    assert maker_mode_b_resting_primitive_ready() is True
+
+    client = _RestingVenueClient()
+    resting = RestingOrder(
+        token_id="111",
+        side="BUY",
+        size=5.0,
+        native_price=0.42,
+        tick_size=0.01,
+        tif="GTC",
+        post_only=True,
+        client_order_id="coid-rest-1",
+    )
+    ack = await submit_resting_order(resting, client=client)
+    assert ack.accepted is True
+    assert ack.venue_order_id  # a resting order id came back
+
+    # The GTC post-only order RESTS and appears in get_orders (§5 open-order book).
+    open_orders = await client.get_orders()
+    assert [o["order_type"] for o in open_orders] == ["GTC"]
+    assert open_orders[0]["asset_id"] == "111"
+    assert open_orders[0]["status"] == "LIVE"
+
+    # A taker FAK order NEVER rests: submitting it does not add to the resting book.
+    taker = _TakerOrder(
+        market_ref="OU|2.5|full", side="over", size=5.0, price=2.05,
+        venue="polymarket", client_order_id="coid-fak-1", tif="FAK",
+    )
+    await client.limit_order(ticker="111", amount=taker.size, price=0.49, tif=taker.tif)
+    still_only_resting = await client.get_orders()
+    assert len(still_only_resting) == 1, "a FAK order must NEVER rest in the open-order book"
+    assert client.fak_calls[0]["tif"] == "FAK"
+
+
+def test_resting_order_is_physically_distinct_from_taker_order() -> None:
+    from veridex.dust_execution.resting_order import RestingOrder
+
+    resting = RestingOrder(
+        token_id="111", side="BUY", size=5.0, native_price=0.42, tick_size=0.01,
+        tif="GTC", client_order_id="c1",
+    )
+    # Two separate Python types: a RestingOrder is NOT a taker Order and vice-versa.
+    assert not isinstance(resting, _TakerOrder)
+    # The taker Order cannot represent GTC/GTD (FAK/FOK only); the RestingOrder cannot represent
+    # FAK/FOK (GTC/GTD only). The overload REQ-016 forbids is impossible by construction.
+    with pytest.raises(ValidationError):
+        _TakerOrder(market_ref="m", side="over", size=1.0, price=2.0, venue="polymarket",
+                    client_order_id="c", tif="GTD")  # type: ignore[arg-type]
+    with pytest.raises(ValidationError):
+        RestingOrder(token_id="111", side="BUY", size=1.0, native_price=0.42, tick_size=0.01,
+                     tif="FAK", client_order_id="c")  # type: ignore[arg-type]
+
+
+def test_post_only_is_a_real_wire_contract_not_a_decorative_flag() -> None:
+    from veridex.dust_execution.resting_order import RestingOrder
+
+    # post_only maps to the §6 top-level ``post_only`` wire field; tif maps to ``order_type``;
+    # a GTD expiration maps to the ``expiration`` (unix seconds) wire field. Real wire, not decoration.
+    gtd = RestingOrder(
+        token_id="111", side="SELL", size=3.0, native_price=0.30, tick_size=0.01,
+        tif="GTD", post_only=True, gtd_expiration_ts=1_000_500, client_order_id="c-gtd",
+    )
+    kw = gtd.to_wire_kwargs()
+    assert kw["order_type"] == "GTD"
+    assert kw["post_only"] is True
+    assert kw["expiration"] == 1_000_500
+    assert kw["native_price"] == 0.30
+    assert kw["amount"] == -3.0  # SELL => negative signed amount
+
+
+def test_gtd_requires_expiration_and_gtc_forbids_it() -> None:
+    from veridex.dust_execution.resting_order import RestingOrder
+
+    # GTD without an expiration is incoherent -> fail closed.
+    with pytest.raises(ValidationError):
+        RestingOrder(token_id="111", side="BUY", size=1.0, native_price=0.42, tick_size=0.01,
+                     tif="GTD", client_order_id="c")
+    # GTC carrying an expiration is incoherent -> fail closed.
+    with pytest.raises(ValidationError):
+        RestingOrder(token_id="111", side="BUY", size=1.0, native_price=0.42, tick_size=0.01,
+                     tif="GTC", gtd_expiration_ts=1_000_500, client_order_id="c")
+
+
+def test_resting_order_native_tick_and_size_validation() -> None:
+    from veridex.dust_execution.resting_order import RestingOrder
+
+    # Native price must be a tick-aligned probability strictly inside (0, 1).
+    with pytest.raises(ValidationError):
+        RestingOrder(token_id="111", side="BUY", size=1.0, native_price=0.425, tick_size=0.01,
+                     tif="GTC", client_order_id="c")  # not tick-aligned
+    with pytest.raises(ValidationError):
+        RestingOrder(token_id="111", side="BUY", size=1.0, native_price=1.5, tick_size=0.01,
+                     tif="GTC", client_order_id="c")  # outside (0,1)
+    with pytest.raises(ValidationError):
+        RestingOrder(token_id="111", side="BUY", size=0.0, native_price=0.42, tick_size=0.01,
+                     tif="GTC", client_order_id="c")  # non-positive size
+
+
+async def test_gtd_temporal_rule_rejected_by_fake_wire_when_too_soon() -> None:
+    from veridex.dust_execution.resting_order import RestingOrder, submit_resting_order
+
+    client = _RestingVenueClient(now=1_000_000)
+    too_soon = RestingOrder(
+        token_id="111", side="BUY", size=1.0, native_price=0.42, tick_size=0.01,
+        tif="GTD", gtd_expiration_ts=1_000_010, client_order_id="c",  # < now+180
+    )
+    ack = await submit_resting_order(too_soon, client=client)
+    assert ack.accepted is False  # §6: INVALID_ORDER_EXPIRATION -> not rested
+    assert await client.get_orders() == []
+
+
+# --- The PolymarketAdapter resting-order method: armed all-three, additive -------------------
+
+
+async def test_adapter_submit_resting_order_arms_and_rests() -> None:
+    from veridex.dust_execution.resting_order import RestingOrder
+
+    client = _RestingVenueClient()
+    adapter = _resting_adapter(client, armed=True)  # write_enabled AND not dry_run AND client
+    resting = RestingOrder(
+        token_id="111", side="BUY", size=2.0, native_price=0.42, tick_size=0.01,
+        tif="GTC", client_order_id="c1",
+    )
+    ack = await adapter.submit_resting_order(resting)
+    assert ack.accepted is True
+    assert len(client.submit_resting_calls) == 1
+    assert (await client.get_orders())[0]["order_type"] == "GTC"
+
+
+@pytest.mark.parametrize(
+    ("write_enabled", "dry_run"),
+    [(False, False), (True, True), (False, True)],
+)
+async def test_adapter_submit_resting_order_fails_closed_when_unarmed(
+    write_enabled: bool, dry_run: bool
+) -> None:
+    from veridex.dust_execution.resting_order import RestingOrder
+
+    client = _RestingVenueClient()
+    adapter = PolymarketAdapter(
+        _RESOLVED,
+        _FakeBookClient(),
+        settings=Settings(_env_file=None, polymarket_write_enabled=write_enabled),
+        write_client=client,
+        dry_run=dry_run,
+    )
+    resting = RestingOrder(
+        token_id="111", side="BUY", size=2.0, native_price=0.42, tick_size=0.01,
+        tif="GTC", client_order_id="c1",
+    )
+    with pytest.raises(PolymarketWriteDisabled):
+        await adapter.submit_resting_order(resting)
+    assert client.submit_resting_calls == [], "unarmed resting submit reached the wire"

@@ -476,6 +476,25 @@ def _simulate_r4a_dust_execution_session() -> None:
     )
 
 
+# =====================================================================================
+# E3-T3 keep-green (REQ-016): the distinct R4-A resting-order lane must NOT touch the sealed
+# directional taker ``Order`` contract. Its ``tif`` Literal still bans GTC — asserted from within
+# the dust isolation suite so the "R4-A introduced a separate resting type, not an overload"
+# invariant is guarded here too (mirrors test_venue_adapter_v2::test_order_tif_gtc_is_unrepresentable).
+# =====================================================================================
+from pydantic import ValidationError as _ValidationError  # noqa: E402
+
+from veridex.venues.base import Order as _TakerOrderE3T3  # noqa: E402
+
+
+def test_taker_order_still_bans_gtc_keep_green() -> None:
+    with pytest.raises(_ValidationError):
+        _TakerOrderE3T3(
+            market_ref="OU|2.5|full", side="over", size=100.0, price=2.0,
+            venue="polymarket", client_order_id="c1", tif="GTC",  # type: ignore[arg-type]
+        )
+
+
 def test_score_run_untouched_after_dust_execution_session():
     run = _representative_run_e1t6()
     before = score_run(run)
