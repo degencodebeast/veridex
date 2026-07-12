@@ -61,7 +61,12 @@ from veridex.dust_execution.runner import (
     SubmitDecision,
     run_dust_execution,
 )
-from veridex.dust_execution.signer import LocalFakeWalletControlPlane, SignedArtifact
+from veridex.dust_execution.signer import (
+    LocalFakeWalletControlPlane,
+    SignedArtifact,
+    SignerMode,
+    SigningPayload,
+)
 from veridex.dust_execution.sizing import resolve_dust_size
 from veridex.dust_execution.wallet_binding import (
     ALLOWED_SIGN_METHOD,
@@ -877,6 +882,64 @@ async def test_runner_wire_size_is_mechanical_regardless_of_agent_input() -> Non
     size_lo = adapter_lo.submitted_orders[-1].size
     assert size_hi == size_lo == expected, "the wire size must be resolve_dust_size(...), identical"
     assert size_hi not in (999.0, 0.001), "the agent-requested size must NEVER reach the wire"
+
+
+class _RecordingSigner:
+    """The Mode-A signer, wrapped to CAPTURE each :class:`SigningPayload` it signs.
+
+    Delegates the actual (offline, deterministic) signing to :class:`LocalFakeWalletControlPlane`, but
+    records every payload so a test can assert the SIGNED order carries the runner's injected
+    ``tick_size`` — the single-source proof for the non-crossing gate ↔ signed-payload tick.
+    """
+
+    mode: SignerMode = "FAKE_LOCAL"
+
+    def __init__(self) -> None:
+        self._inner = LocalFakeWalletControlPlane()
+        self.signed_payloads: list[SigningPayload] = []
+
+    async def sign_order(self, payload: SigningPayload) -> SignedArtifact:
+        self.signed_payloads.append(payload)
+        return await self._inner.sign_order(payload)
+
+
+async def test_signed_payload_tick_is_single_sourced_from_runner_tick_size() -> None:
+    """MINOR-1: the SIGNED payload's ``tick_size`` is the runner's ``tick_size`` param, ONE source.
+
+    The non-crossing gate and the signed order payload must read the tick from a SINGLE source that
+    cannot drift. Drives the Mode-B submit path with a NON-default ``tick_size=0.005``; the recording
+    signer captures the exact payload the runner signs. Its ``tick_size`` MUST be ``"0.005"`` (the
+    injected tick, losslessly stringified) — NOT a hardcoded ``"0.01"`` literal.
+
+    MUTATION: re-hardcode ``SigningPayload(tick_size="0.01")`` → the signed tick diverges from the
+    injected non-crossing tick and this test fails; a single change to the runner's tick source now
+    moves BOTH the non-crossing gate AND the signed payload.
+    """
+    binding = _binding()
+    adapter = RecordingFakeAdapter(fill=True)
+    signer = _RecordingSigner()
+
+    result = await run_dust_execution(
+        adapter=adapter,
+        signer=signer,
+        sources=_ScriptedSource(quote=_fresh_quote()),
+        now_fn=_clock,
+        sleep_fn=_noop_sleep,
+        envelope=_env(),
+        manifest=_mode_b_manifest(binding),
+        mode="live_guarded",
+        wallet_equity_at_decision=_WALLET_EQUITY,
+        fixed_fraction=_FIXED_FRACTION,
+        arming=_arming(binding),
+        tick_size=0.005,  # NON-default: exposes a hardcoded "0.01" in the signed payload
+    )
+
+    (decision,) = result.decisions
+    assert decision.submitted is True, "positive control: the clean Mode-B order must sign+submit"
+    assert len(signer.signed_payloads) == 1, "the runner must sign exactly one order for one token"
+    assert signer.signed_payloads[-1].tick_size == "0.005", (
+        "the SIGNED payload tick must be the runner's injected tick (single source), not '0.01'"
+    )
 
 
 # --- E6-T4: Mode A -> Mode B hard gate + fail-closed arming ----------------------------------

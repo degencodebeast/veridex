@@ -19,6 +19,7 @@ Trust boundaries proven here:
 
 from __future__ import annotations
 
+import dataclasses
 import typing
 
 import pytest
@@ -26,7 +27,7 @@ from pydantic import BaseModel, ValidationError
 
 from veridex.dust_execution import facade  # module handle: proposer looked up dynamically (RED-clean)
 from veridex.dust_execution.clobv2_gate import Clobv2GateResult
-from veridex.dust_execution.contracts import OperatorInterlockEvent
+from veridex.dust_execution.contracts import DustRunLabelEvent, OperatorInterlockEvent
 from veridex.dust_execution.facade import (
     MMExecutionToolRequest,
     MMExecutionToolResult,
@@ -35,7 +36,12 @@ from veridex.dust_execution.facade import (
 )
 from veridex.dust_execution.manifest import StrategyExperimentManifest
 from veridex.dust_execution.privy_control_plane import PrivyPreflightResult, ProvisioningResult
-from veridex.dust_execution.runner import BookSide, DustQuote, ModeBArming
+from veridex.dust_execution.runner import (
+    BookSide,
+    DustQuote,
+    ModeBArming,
+    run_dust_execution,
+)
 from veridex.dust_execution.signer import LocalFakeWalletControlPlane
 from veridex.dust_execution.wallet_binding import (
     ALLOWED_SIGN_METHOD,
@@ -413,6 +419,47 @@ async def test_facade_ships_with_pinned_experimental_dust_manifest_alone() -> No
     assert result.admission == "APPROVED"
     assert result.evidence_class == "EXPERIMENTAL_DUST"
     assert result.edge_label == "NOT_PROVEN_EDGE"
+
+
+async def test_to_tool_result_evidence_class_fallback_pins_canonical_not_request() -> None:
+    """NIT-1: the ``evidence_class`` fallback PINS the canonical default, never the agent request.
+
+    The full flow always emits a terminal :class:`DustRunLabelEvent`, so the ``label is None``
+    fallback in ``_to_tool_result`` is unreachable in practice — but it must still PIN the honest
+    default like its sibling label fallbacks (run/calibration/edge), never let the agent-supplied
+    ``evidence_class`` influence the honest evidence class even defensively. Drives a genuine Mode-A
+    result, STRIPS its terminal label so the fallback fires, and calls ``_to_tool_result`` with a
+    request whose ``evidence_class`` is a NON-canonical ``"PROMOTED"``. The fallback MUST return
+    ``"EXPERIMENTAL_DUST"``, never echo the request's ``"PROMOTED"``.
+    """
+    manifest = _mm_manifest()
+    envelope = _mm_env()
+    result = await run_dust_execution(
+        adapter=FakeVenueAdapter(fill=True),
+        signer=LocalFakeWalletControlPlane(),
+        sources=_MMScriptedSource(_mm_fresh_quote()),
+        now_fn=_mm_clock,
+        sleep_fn=_mm_noop_sleep,
+        envelope=envelope,
+        manifest=manifest,
+        mode="dry_run",
+        wallet_equity_at_decision=100.0,
+        fixed_fraction=0.01,
+    )
+    # Strip the terminal label so ``_terminal_label`` returns None → exercise the fallback branch.
+    stripped = dataclasses.replace(
+        result,
+        events=tuple(e for e in result.events if not isinstance(e, DustRunLabelEvent)),
+    )
+    assert facade._terminal_label(stripped) is None, "label must be stripped to reach the fallback"
+
+    # An agent request that tries to smuggle a NON-canonical evidence class through the fallback.
+    request = _admitted_request(manifest, envelope, evidence_class="PROMOTED")
+    tool_result = facade._to_tool_result(stripped, request)
+
+    assert tool_result.evidence_class == "EXPERIMENTAL_DUST", (
+        "the evidence_class fallback must PIN the canonical default, not echo the agent request"
+    )
 
 
 # ---------------------------------------------------------------------------

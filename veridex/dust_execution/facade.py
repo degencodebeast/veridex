@@ -209,6 +209,9 @@ _FACADE_AGENT_ID = "dust-execution-mm"
 _DEFAULT_RUN_LABEL: Literal["DUST_LIVE"] = "DUST_LIVE"
 _DEFAULT_CALIBRATION_LABEL: Literal["UNCALIBRATED"] = "UNCALIBRATED"
 _DEFAULT_EDGE_LABEL: Literal["NOT_PROVEN_EDGE"] = "NOT_PROVEN_EDGE"
+#: The honest evidence class a dust run defaults to — PINNED like its sibling labels, never taken
+#: from the (untrusted) agent request even on the unreachable fallback path (AC-025 consistency).
+_DEFAULT_EVIDENCE_CLASS: Literal["EXPERIMENTAL_DUST"] = "EXPERIMENTAL_DUST"
 
 
 def _lifecycle_receipt_ref(result: DustExecutionResult) -> str:
@@ -264,7 +267,7 @@ def _to_tool_result(
             label.calibration_label if label is not None else _DEFAULT_CALIBRATION_LABEL
         ),
         edge_label=label.edge_label if label is not None else _DEFAULT_EDGE_LABEL,
-        evidence_class=label.evidence_class if label is not None else request.evidence_class,
+        evidence_class=label.evidence_class if label is not None else _DEFAULT_EVIDENCE_CLASS,
         policy_hash=result.admission.policy_hash,
     )
 

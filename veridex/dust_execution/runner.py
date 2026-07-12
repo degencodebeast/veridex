@@ -1257,6 +1257,7 @@ async def _decide_and_submit(
         now_s=now_s,
         seqc=seqc,
         wire_size=wire_size,
+        tick_size=tick_size,
     )
     if decision.submitted:
         logger.info(
@@ -1313,6 +1314,7 @@ async def _emit_order_lifecycle(
     now_s: int,
     seqc: _SeqCounter,
     wire_size: float,
+    tick_size: float,
 ) -> tuple[SubmitDecision, tuple[LifecycleEvent, ...]]:
     """Build the full E1-T2 per-decision lifecycle chain for a GATE-CLEAR quote (AC-003).
 
@@ -1366,7 +1368,10 @@ async def _emit_order_lifecycle(
         native_price=quote.ask.price,
         size=wire_size,  # REAL mechanical size — resolve_dust_size(...), never the agent request
         tif="FOK",
-        tick_size="0.01",
+        # SINGLE SOURCE: the SAME runner ``tick_size`` the non-crossing gate evaluates against
+        # (_non_crossing_gate), losslessly stringified — never a second hardcoded literal that could
+        # drift from the tick the crossing check used once E6-T4 binds a real per-market tick.
+        tick_size=f"{tick_size}",
         client_order_id=client_order_id,
     )
     signed = await signer.sign_order(payload)

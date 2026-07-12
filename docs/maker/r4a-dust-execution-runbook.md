@@ -174,11 +174,13 @@ Fail-closed is the whole point.
 
 The operator-only CLI is `scripts/maker/dust_execution.py` (E7-T4, SEC-005):
 
-- A bare / `--dry-run` invocation prints status (`configured: <bool>`, the selected signer
-  mode, `mode_b_armed: false`) and **never** a secret (SEC-005). Mode B stays UNARMED.
-- Arming is never implicit: the operator must pass `--i-am-operator` (AC-023).
-- It **fails closed** on a missing signer / precondition and drives the facade with
-  `arming=None` — a bare invocation cannot reach a live venue.
+- The `status` subcommand is READ-ONLY: it prints status (`configured: <bool>`, the selected
+  signer mode, `mode_b_armed: false`) and **never** a secret (SEC-005). It neither arms nor
+  submits — Mode B stays UNARMED.
+- Arming is never implicit: the `arm` subcommand REFUSES unless the operator passes
+  `--i-am-operator` (AC-023). A subcommand is required (there is no bare-invocation default).
+- Both verbs **fail closed** on a missing signer / precondition and drive the facade with
+  `arming=None` — the CLI cannot reach a live venue.
 
 ## 9. Gate-B-parallel / non-blocking posture
 
