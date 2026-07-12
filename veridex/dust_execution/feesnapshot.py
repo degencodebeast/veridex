@@ -52,11 +52,14 @@ _FEE_MIN = 1e-5
 
 
 def round5(x: float) -> float:
-    """Apply the venue's fee precision: round to 5 dp; ``|q| < 0.00001`` -> ``0``; no upward floor.
+    """Apply the venue's fee precision: RAW magnitude ``< 0.00001`` -> ``0`` (checked BEFORE rounding);
+    else round to 5 dp. No upward floor.
 
-    Implements the E3-T0 §8 rule verbatim. Rounding is nearest-to-5-dp (so ``0.000006`` -> ``0.00001``),
-    then any magnitude strictly below ``0.00001`` collapses to ``0`` (``0.000004`` -> ``0.0``). A
-    sub-threshold value is NEVER bumped UP to the ``0.00001`` minimum — it drops to zero.
+    Implements the E3-T0 §8 / AC-041 rule: a COMPUTED fee whose RAW magnitude is strictly below
+    ``0.00001`` is zero — the threshold is tested on the raw value BEFORE rounding, so ``0.000009999``
+    -> ``0.0`` (it is NOT rounded up to ``0.00001``); a raw magnitude at/above the threshold rounds to
+    5 dp (``0.00001`` -> ``0.00001``). A sub-threshold value is NEVER bumped UP to the ``0.00001``
+    minimum — it drops to zero.
 
     Args:
         x: The raw computed fee (must be finite; a fund-touching NaN/inf fails closed).
@@ -69,8 +72,12 @@ def round5(x: float) -> float:
     """
     if not math.isfinite(x):
         raise FailClosed(f"refusing to round a non-finite fee: {x!r}")
-    q = round(x, _FEE_DP)
-    return 0.0 if abs(q) < _FEE_MIN else q
+    # AC-041: the threshold is on the RAW COMPUTED magnitude, checked BEFORE rounding — a computed fee
+    # below 0.00001 is zero. Rounding first would let a raw value in [5e-6, 1e-5) round UP to 1e-5
+    # (an effective upward floor the spec forbids).
+    if abs(x) < _FEE_MIN:
+        return 0.0
+    return round(x, _FEE_DP)
 
 
 class FeeSnapshot(_FrozenModel):

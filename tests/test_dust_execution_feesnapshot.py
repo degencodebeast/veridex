@@ -89,10 +89,10 @@ async def test_fee_snapshot_hashed_and_round5_boundary() -> None:
     # raw = 0.00004 * 1 * 0.25 = 0.00001 exactly -> stays 0.00001 (not zeroed).
     assert smallest.taker_fee(shares=1.0, price=0.5) == 0.00001
 
-    # --- round5 helper: nearest (not floor); sub-threshold -> 0 --------------------------
-    assert round5(0.000004) == 0.0  # below threshold -> zero
-    assert round5(0.00001) == 0.00001  # smallest nonzero, unchanged
-    assert round5(0.000006) == 0.00001  # nearest rounds UP a >=half value; not an upward floor
+    # --- round5 helper: RAW magnitude below 1e-5 -> 0 (checked before rounding, AC-041) ----
+    assert round5(0.000004) == 0.0  # raw below threshold -> zero
+    assert round5(0.00001) == 0.00001  # smallest nonzero, unchanged (raw exactly at threshold)
+    assert round5(0.000006) == 0.0  # raw 6e-6 < 1e-5 -> zero (NOT rounded UP to the 1e-5 minimum)
 
     # --- snapshot unavailable -> fail closed (never a silent 0 / guessed default) --------
     with pytest.raises(FailClosed):

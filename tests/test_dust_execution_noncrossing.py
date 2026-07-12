@@ -530,10 +530,12 @@ def test_round5_fee_boundaries_from_snapshot() -> None:
     assert below.taker_fee(shares=1, price=0.50) == 0.0
     # (ii) smallest nonzero fee is exactly 0.00001.
     assert at_min.taker_fee(shares=1, price=0.50) == pytest.approx(1e-5)
-    # And the round5 primitive itself: just-below drops, at/above rounds to the 1e-5 grid.
+    # And the round5 primitive itself: a raw magnitude below 1e-5 DROPS to 0 (checked BEFORE rounding,
+    # AC-041), and only a raw magnitude at/above 1e-5 rounds onto the 1e-5 grid.
     assert round5(4e-6) == 0.0
-    assert round5(9.75e-6) == pytest.approx(1e-5)  # rounds UP to nearest 5dp, then kept (>= 1e-5)
-    assert round5(1e-5) == pytest.approx(1e-5)
+    assert round5(0.000009999) == 0.0  # just-below: a COMPUTED fee < 1e-5 is zero (AC-041 boundary)
+    assert round5(9.75e-6) == 0.0  # 0.00000975 raw < 1e-5 → zero (NOT rounded UP to 1e-5)
+    assert round5(1e-5) == pytest.approx(1e-5)  # the smallest nonzero fee (raw exactly at threshold)
 
 
 def test_round5_dropzero_vs_clampup_flips_the_lock_verdict() -> None:
