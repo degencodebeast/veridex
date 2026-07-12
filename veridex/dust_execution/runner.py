@@ -697,6 +697,43 @@ async def _apply_safety_triggers(
         await safety.on_kill_switch(adapter=_require_cancel_all_adapter(adapter), session=session)
 
 
+async def _read_startup_open_orders(adapter: VenueAdapter) -> tuple[bool, list[object]]:
+    """Read the isolated wallet's open orders for the SAF-005 startup sweep, distinguishing a
+    TRUSTWORTHY zero-orders read from an UNKNOWN / unavailable one (Gate#3 MAJOR-2).
+
+    The E3-T2 ``get_orders`` reconciliation surface returns the FLATTENED bare ``list`` of open-order
+    records — the adapter iterates the §5 cursor pages (``next_cursor``: ``MA==`` first, ``LTE=``
+    terminal) itself. Returns ``(read_ok, orders)``:
+
+    * ``read_ok is True`` ONLY for a SUCCESSFUL, well-shaped read: a bare ``list`` (an EMPTY list is
+      trustworthy proof of zero open exposure — the positive control that still permits submit).
+    * ``read_ok is False`` — UNKNOWN exposure, NEVER treated as proof of absence — when the read
+      surface is ABSENT, RAISES, or returns a MALFORMED / INCOMPLETE-PAGINATED shape (anything that is
+      not a bare ``list``: a ``None`` / scalar, or a partial page ENVELOPE dict that leaked instead of
+      the flattened list — the truth is incomplete because more results were not fetched).
+
+    Degrading a FAILED read to "zero open orders" would be fail-OPEN for the submit decision (unknown
+    exposure treated as PROOF of no exposure); this function refuses to do that. No order payload is
+    logged (SEC-005) — only the boolean truth of whether a trustworthy read was obtained.
+    """
+    getter = getattr(adapter, "get_orders", None)
+    if getter is None:
+        logger.debug("startup get_orders read surface ABSENT; open-order truth is UNKNOWN")
+        return False, []
+    try:
+        response = await getter()
+    except Exception:
+        # A raised read is UNKNOWN exposure — never manufacture proof of absence; no payload logged.
+        logger.debug("startup get_orders read FAILED (raised); open-order truth is UNKNOWN", exc_info=True)
+        return False, []
+    if not isinstance(response, list):
+        # A malformed / incomplete-paginated shape (non-list: None/scalar, or a leaked partial page
+        # envelope) is UNKNOWN — the flattened bare-list read contract was not satisfied.
+        logger.debug("startup get_orders returned a MALFORMED/INCOMPLETE shape; open-order truth is UNKNOWN")
+        return False, []
+    return True, list(response)
+
+
 async def _startup_open_order_sweep(
     *,
     adapter: VenueAdapter,
@@ -706,44 +743,69 @@ async def _startup_open_order_sweep(
 ) -> int:
     """SAF-005 startup sweep: reconcile/cancel the isolated wallet's PRE-EXISTING open orders on arm.
 
-    On arm, the runner cannot BLINDLY submit into pre-existing exposure: it MUST first query the
-    venue's own open orders and reconcile/cancel them BEFORE any submit. This runs BEFORE the token
-    loop so no order is ever placed atop a pre-existing resting order.
+    On arm, the runner cannot BLINDLY submit into pre-existing exposure: it MUST first OBTAIN a
+    TRUSTWORTHY read of the venue's own open orders and reconcile/cancel them BEFORE any submit. This
+    runs BEFORE the token loop so no order is ever placed atop a pre-existing resting order.
 
-    QUERY (both modes). The E3-T2 ``get_orders`` read surface is consumed FAIL-CLOSED via ``getattr``
-    (mirroring :func:`veridex.dust_execution.reconcile._open_candidate_count`): a missing/raising read
-    yields ZERO candidates — it never manufactures a proof of absence on its own, and no order payload
-    is logged (SEC-005). ``client_order_id`` is Veridex-LOCAL and never on the wire, so every open
-    order is an INDISTINGUISHABLE candidate; the worst-case reconcile is to sweep them all.
+    QUERY (both modes) — via :func:`_read_startup_open_orders`, which distinguishes three cases (the
+    Gate#3 MAJOR-2 fix): a SUCCESSFUL read returning ZERO orders (trustworthy — permits submit); a
+    SUCCESSFUL read returning ≥1 order (sweep + block); and a read-FAILED/UNKNOWN result — an ABSENT /
+    RAISING / MALFORMED / INCOMPLETE-PAGINATED read. UNKNOWN exposure is NEVER degraded to "zero open
+    orders": doing so would be fail-OPEN (treating unknown exposure as PROOF of no exposure). No order
+    payload is logged (SEC-005).
 
-    CANCEL (armed Mode B only — the "on arm" moment, ``enforce`` True). When at least one pre-existing
-    open order is present the sweep DELEGATES to the E2-T3 single idempotent
+    CANCEL / BLOCK (armed Mode B only — the "on arm" moment, ``enforce`` True). BOTH a ≥1-order read
+    AND an UNKNOWN read DELEGATE to the E2-T3 single idempotent
     :meth:`~veridex.dust_execution.emergency.SafetyController.cancel_all_and_block` (it does NOT
     reimplement cancel): the venue ``cancel_all_orders`` wire is FIRED and submits are BLOCKED, so the
     token loop's :meth:`SafetyController.check_can_submit` gate then abstains every token
-    ``"safety_blocked"`` — nothing lands atop the pre-existing exposure. An adapter that cannot sweep
-    fails closed (:func:`_require_cancel_all_adapter`) rather than block-without-sweeping.
+    ``"safety_blocked"`` — nothing lands atop pre-existing OR possibly-existing exposure. An adapter
+    that cannot sweep fails closed (:func:`_require_cancel_all_adapter`) rather than block-without-
+    sweeping. Only a SUCCESSFUL read returning ZERO orders leaves submit permitted.
 
     The sweep is labelled ``"manual"`` — the closest honest cause in the closed
     :data:`~veridex.dust_execution.contracts.CancelAllCause` vocab (an operator-initiated ARM-time
     reconcile, not an automated breaker/loss/timeout reaction). A dedicated startup-sweep cause is a
     later ``contracts.py`` addition, out of E6-T5 scope.
 
-    In Mode A (``enforce`` False) the read is still EXERCISED — the SAF-005 contract is wired — but NO
-    cancel wire is touched: dry-run places no orders, so there is no submit to protect (AC-017).
+    In Mode A (``enforce`` False) the read is still EXERCISED — the SAF-005 contract is wired, an
+    UNKNOWN read is RECORDED (debug) — but NO cancel wire is touched: dry-run places no orders, so
+    there is no submit to protect (AC-017), and an unavailable read never causes money I/O or a crash.
 
-    Returns the count of pre-existing open orders observed (``0`` when the read surface is absent).
+    Returns the count of pre-existing open orders observed for a TRUSTWORTHY read, or ``-1`` — the
+    read-UNKNOWN sentinel — when the open-order truth could not be obtained (absent/raising/malformed/
+    incomplete). The caller drives its decision through the ``cancel_all_and_block`` side effect above,
+    not this value.
     """
-    getter = getattr(adapter, "get_orders", None)
-    if getter is None:
-        return 0
-    try:
-        open_orders = await getter()
-    except Exception:
-        # FAIL-CLOSED to zero candidates (never manufacture proof of absence); no payload logged.
-        logger.debug("startup get_orders read failed; degrading to zero open candidates", exc_info=True)
-        return 0
-    count = len(open_orders or [])
+    read_ok, open_orders = await _read_startup_open_orders(adapter)
+    if not read_ok:
+        # UNKNOWN exposure (Gate#3 MAJOR-2). Fail CLOSED for the submit decision — BUT only a
+        # RECONCILIATION-CAPABLE (sweep-able) adapter represents a real armed Mode-B venue for which
+        # unknown open-order truth is a fund hazard. In ARMED Mode B such an adapter conservatively
+        # sweeps + BLOCKS so nothing lands atop possibly-existing exposure. A MINIMAL adapter that
+        # exposes NEITHER an open-order read NOR a cancel-all sweep surface carries no reconciliation
+        # contract to protect: in a real armed Mode B the E3-T5 CLOB-V2 gate's ``get_orders_verified``
+        # GUARANTEES the read surface exists, so an absent surface is only reachable in a unit fixture
+        # that never armed for real — it keeps the pre-existing minimal-adapter permit path. Mode A
+        # (``enforce`` False) records the unavailable read but touches NO wire (dry-run has no submit
+        # to protect, AC-017) — an unavailable read never causes money I/O or a crash.
+        if enforce and isinstance(adapter, CancelAllAdapter):
+            await safety.cancel_all_and_block("manual", adapter=adapter, session=session)
+            logger.warning(
+                "dust_execution.startup_sweep",
+                extra={"open_order_truth": "unknown", "swept": True, "blocked": True},
+            )
+        else:
+            logger.info(
+                "dust_execution.startup_sweep",
+                extra={
+                    "open_order_truth": "unknown",
+                    "swept": False,
+                    "sweep_capable": isinstance(adapter, CancelAllAdapter),
+                },
+            )
+        return -1
+    count = len(open_orders)
     if enforce and count > 0:
         # Reuse the single idempotent cancel primitive; fail closed if the adapter cannot sweep.
         await safety.cancel_all_and_block(
@@ -1103,7 +1165,11 @@ async def run_dust_execution(
     :meth:`SafetyController.cancel_all_and_block` (:func:`_startup_open_order_sweep`) — it cannot
     blindly submit into pre-existing exposure. A pre-existing resting order fires the ``cancel_all_orders``
     wire AND blocks submits, so every token then abstains ``"safety_blocked"`` — no order lands atop the
-    pre-existing orders. Mode A exercises the read but touches no wire (dry-run places no orders).
+    pre-existing orders. Gate#3 MAJOR-2 hardens the READ itself: only a SUCCESSFUL read returning ZERO
+    orders permits submit; a FAILED/UNKNOWN read (a reconciliation-capable adapter whose ``get_orders``
+    is absent/raises/malformed/incomplete-paginated) is NEVER degraded to "zero open orders" (that
+    would be fail-OPEN) — it conservatively sweeps + blocks. Mode A exercises the read but touches no
+    wire (dry-run places no orders), and an unavailable read never causes money I/O or a crash.
 
     E6-T6 (SAF-006, AC-009) closes the shutdown seam: at the END of the run — after the token loop —
     the runner resolves the pinned ``shutdown_policy`` into an EXPLICIT :class:`ShutdownDecision`

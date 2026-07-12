@@ -24,6 +24,8 @@ test fails) is meaningful and not vacuously green.
 
 from __future__ import annotations
 
+from typing import cast
+
 from veridex.dust_execution.clobv2_gate import Clobv2GateResult
 from veridex.dust_execution.contracts import (
     DustExecutionSessionMeta,
@@ -1209,6 +1211,177 @@ async def test_startup_sweep_contract_exercised_in_mode_a_no_wire_touched() -> N
 
     assert adapter.get_orders_calls >= 1, "Mode A must still exercise the get_orders sweep read (contract wired)"
     assert adapter.cancel_all_calls == 0, "Mode A (dry-run) must fire NO cancel wire"
+    assert adapter.submit_calls == 0, "Mode A places no orders (AC-017)"
+    (decision,) = result.decisions
+    assert decision.submitted is False and decision.abstain_reason == "mode_a_no_orders"
+
+
+# --- Gate#3 MAJOR-2: an UNKNOWN startup open-order read must BLOCK submit (never fail-open to 0) ---
+#
+# THE safety property (SAF-005): in ARMED Mode B the startup open-order truth must be OBTAINED and
+# TRUSTWORTHY before any submit. A SUCCESSFUL read returning zero orders permits submit (the E6-T5
+# positive control above); a SUCCESSFUL read returning >=1 order sweeps + blocks (E6-T5, preserved);
+# but an ABSENT / RAISING / MALFORMED / INCOMPLETE-PAGINATED read is UNKNOWN exposure -- it is NOT
+# proof of zero open orders, so it must fail CLOSED: conservatively fire the cancel-all WIRE and
+# BLOCK submits so nothing lands atop possibly-existing exposure. The bug this closes degraded a
+# FAILED read to "0 open orders" and PERMITTED submit (fail-OPEN). Mutation: revert the fix so an
+# unknown read degrades to 0-and-permit -> these four tests fail (submit_calls == 1, no cancel wire).
+
+
+class _NoGetOrdersAdapter(FakeVenueAdapter):
+    """A misconfigured ARMED adapter that CANNOT report open orders (no ``get_orders``) but CAN sweep.
+
+    ``getattr(adapter, "get_orders", None)`` is ``None`` here -- the startup open-order truth is
+    UNKNOWN. It still exposes the E2-T3 ``cancel_all_orders`` sweep wire so the conservative
+    fail-closed block-via-sweep can actually fire (records ``cancel_all_calls``).
+    """
+
+    def __init__(self, *, fill: bool = True) -> None:
+        super().__init__(fill=fill)
+        self.cancel_all_calls = 0
+
+    async def cancel_all_orders(self) -> int:
+        self.cancel_all_calls += 1
+        return 3
+
+
+class _RaisingGetOrdersAdapter(RecordingFakeAdapter):
+    """The Codex repro: ``get_orders`` RAISES (venue open-order read timed out / unavailable)."""
+
+    async def get_orders(self, **kwargs: object) -> list[dict[str, object]]:
+        self.get_orders_calls += 1
+        raise RuntimeError("startup read unavailable")
+
+
+class _MalformedGetOrdersAdapter(RecordingFakeAdapter):
+    """``get_orders`` returns a MALFORMED / INCOMPLETE-PAGINATED shape (not the flattened bare list)."""
+
+    def __init__(self, *, response: object, fill: bool = True) -> None:
+        super().__init__(fill=fill)
+        self._response = response
+
+    async def get_orders(self, **kwargs: object) -> list[dict[str, object]]:
+        self.get_orders_calls += 1
+        # A recording fake deliberately VIOLATING the ``list[dict]`` read contract at runtime (a
+        # misbehaving venue): the cast keeps the static override signature honest.
+        return cast("list[dict[str, object]]", self._response)
+
+
+async def test_startup_sweep_absent_read_surface_blocks_submit() -> None:
+    """Gate#3 MAJOR-2: an armed adapter with NO ``get_orders`` surface has UNKNOWN exposure -> BLOCK.
+
+    An absent read surface is NOT proof of zero open orders. Fail-closed: the runner conservatively
+    fires the cancel-all WIRE and blocks submits so no order lands atop possibly-existing exposure.
+    Today the absent read degrades to zero and the clean quote submits (fail-open) -> this fails RED.
+    """
+    adapter = _NoGetOrdersAdapter(fill=True)
+    safety, session = _make_safety()
+
+    result = await _run_guarded(adapter=adapter, safety=safety, session=session)
+
+    assert adapter.cancel_all_calls == 1, "an UNKNOWN (absent) open-order read must fire the cancel-all WIRE"
+    assert session.submit_blocked is True, "an UNKNOWN open-order read must block submits (fail-closed)"
+    assert adapter.submit_calls == 0, "no order may be submitted atop UNKNOWN exposure (SAF-005 / MAJOR-2)"
+    (decision,) = result.decisions
+    assert decision.submitted is False and decision.abstain_reason == "safety_blocked"
+
+
+async def test_startup_sweep_raising_read_blocks_submit() -> None:
+    """Gate#3 MAJOR-2 (the Codex repro): a ``get_orders`` that RAISES is UNKNOWN exposure -> BLOCK.
+
+    A venue open-order read that times out / raises is NOT proof of no exposure. Today the runner
+    degrades the raised read to zero and submits one order (fail-open); it must instead fail closed.
+    """
+    adapter = _RaisingGetOrdersAdapter(fill=True)
+    safety, session = _make_safety()
+
+    result = await _run_guarded(adapter=adapter, safety=safety, session=session)
+
+    assert adapter.get_orders_calls >= 1, "the runner must ATTEMPT the open-order read on arm"
+    assert adapter.cancel_all_calls == 1, "a RAISING open-order read must fire the cancel-all WIRE"
+    assert session.submit_blocked is True
+    assert adapter.submit_calls == 0, "a raised startup read must NOT fail-open to a submit"
+    (decision,) = result.decisions
+    assert decision.submitted is False and decision.abstain_reason == "safety_blocked"
+
+
+async def test_startup_sweep_malformed_read_blocks_submit() -> None:
+    """Gate#3 MAJOR-2: a ``get_orders`` returning a MALFORMED (non-list ``None``) shape -> BLOCK.
+
+    The read contract is a flattened bare list of open-order records; a ``None`` / non-list response
+    is not trustworthy proof of zero exposure. Today ``len(None or [])`` degrades it to zero and the
+    clean quote submits (fail-open) -> this fails RED; the fix must fail closed (never a submit).
+    """
+    adapter = _MalformedGetOrdersAdapter(response=None, fill=True)
+    safety, session = _make_safety()
+
+    result = await _run_guarded(adapter=adapter, safety=safety, session=session)
+
+    assert adapter.get_orders_calls >= 1
+    assert adapter.cancel_all_calls == 1, "a MALFORMED open-order read must fire the cancel-all WIRE"
+    assert session.submit_blocked is True
+    assert adapter.submit_calls == 0, "a malformed startup read must NOT fail-open to a submit"
+    (decision,) = result.decisions
+    assert decision.submitted is False and decision.abstain_reason == "safety_blocked"
+
+
+async def test_startup_sweep_incomplete_pagination_blocks_submit() -> None:
+    """Gate#3 MAJOR-2: a ``get_orders`` returning a PARTIAL page (pagination not completed) -> BLOCK.
+
+    The reconciliation read surface (``VenueReconciliationReads.get_orders``) returns the FLATTENED
+    bare list of open orders -- the surface itself has NO pagination; the adapter is responsible for
+    iterating the §5 cursor pages (``next_cursor``: ``MA==`` first, ``LTE=`` terminal) and flattening
+    them. A response STILL shaped as a partial page ENVELOPE (a non-list dict carrying a NON-terminal
+    ``next_cursor``) means pagination LEAKED / did not complete: more open orders exist that were not
+    fetched, so the open-order truth is INCOMPLETE / UNKNOWN. The fix routes it through the SAME
+    non-list UNKNOWN guard as the malformed case and blocks submit. (This truncated shape is
+    truthy, so it happens to block under today's ``len``-counts-keys code too; the load-bearing
+    fail-OPEN proof lives in the absent / raises / malformed(None) tests, which permit submit today.)
+    """
+    partial_page = {
+        "data": [{"order_id": "0xpre1", "asset_id": _TOKEN}],
+        "count": 1,
+        "next_cursor": "MTA=",  # NON-terminal (terminal is "LTE=") -> more pages not fetched
+    }
+    adapter = _MalformedGetOrdersAdapter(response=partial_page, fill=True)
+    safety, session = _make_safety()
+
+    result = await _run_guarded(adapter=adapter, safety=safety, session=session)
+
+    assert adapter.get_orders_calls >= 1
+    assert adapter.cancel_all_calls == 1, "an INCOMPLETE-paginated open-order read must fire the cancel-all WIRE"
+    assert session.submit_blocked is True
+    assert adapter.submit_calls == 0, "an incomplete-paginated startup read must NOT fail-open to a submit"
+    (decision,) = result.decisions
+    assert decision.submitted is False and decision.abstain_reason == "safety_blocked"
+
+
+async def test_startup_sweep_unknown_read_in_mode_a_records_no_wire_no_crash() -> None:
+    """Gate#3 MAJOR-2: Mode A (dry-run) with a RAISING open-order read records the unavailable read
+    WITHOUT any money I/O and WITHOUT crashing.
+
+    Dry-run places no orders, so there is nothing to protect: the read is exercised (the SAF-005
+    contract is wired) but NO cancel wire and NO submit wire is touched (AC-017).
+    """
+    adapter = _RaisingGetOrdersAdapter(fill=True)
+    source = _ScriptedSource(quote=_fresh_quote())
+
+    result = await run_dust_execution(
+        adapter=adapter,
+        signer=LocalFakeWalletControlPlane(),
+        sources=source,
+        now_fn=_clock,
+        sleep_fn=_noop_sleep,
+        envelope=_env(),
+        manifest=_manifest(mode="dry_run"),
+        mode="dry_run",
+        wallet_equity_at_decision=_WALLET_EQUITY,
+        fixed_fraction=_FIXED_FRACTION,
+        arming=None,
+    )
+
+    assert adapter.get_orders_calls >= 1, "Mode A must still EXERCISE the open-order read (contract wired)"
+    assert adapter.cancel_all_calls == 0, "Mode A (dry-run) must fire NO cancel wire even on an unknown read"
     assert adapter.submit_calls == 0, "Mode A places no orders (AC-017)"
     (decision,) = result.decisions
     assert decision.submitted is False and decision.abstain_reason == "mode_a_no_orders"
