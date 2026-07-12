@@ -597,3 +597,254 @@ def test_no_local_key_crypto_anywhere_in_dust_execution_lane() -> None:
     assert caught & surface == {"eth_account", "Account", "web3"}, (
         "no-local-key detector must flag banned local-key surfaces used as real imports"
     )
+
+
+# =====================================================================================
+# E7-T2 (SEC-006, AC-020/022, §6 group 10): the AGENT-BOUNDARY isolation audit — the two
+# properties proving the UNTRUSTED R4-B/agent surface can neither REACH money-network
+# capability nor MOVE admission.
+#
+# (1) STRUCTURAL import-audit (mirrors test_no_r3_r4_code.py's AST/import-walk technique): the
+#     agent-facing tool surface — the facade BOUNDARY module (the typed R4-B intent -> R4-A
+#     contracts + the injectable proposer) and the ``tools=[]`` decision agent — imports NONE of:
+#     the raw venue writes ``submit_order`` / ``cancel_order`` / ``cancel_all_orders``, a
+#     wire-capable / key-export signer surface (``SignerBackedWriteSeam`` + local-key crypto), or
+#     the vendored CLOB client (``veridex.venues._vendor.polymarket_clob``).
+#
+#     SCOPE — honest limitation (the E3-era lesson: the AST bar is NOT transitive). This is a
+#     DIRECT PER-MODULE import-surface audit: the WHOLE-AST import set of EACH named agent-facing
+#     module (so it ALSO catches a lazy/deferred in-function import and a ``TYPE_CHECKING`` import)
+#     — NOT a transitive closure. A transitive closure is DELIBERATELY not used here: the facade
+#     delegates execution to the privileged runner via a SANCTIONED lazy ``import run_dust_execution``,
+#     and following that edge would reach the runner's LEGITIMATE venue-write calls (a false
+#     positive). The property proven is precisely: the agent-facing surface does not ITSELF import
+#     raw write / key-export / vendored-client capability — money-network reach exists ONLY BEHIND
+#     the boundary, in the operator-injected runner. Teeth: a REAL import of ``submit_order`` (or the
+#     vendored CLOB client) into ``facade.py`` flips the audit RED, as does the synthetic control.
+#
+# (2) BEHAVIORAL (metadata cannot move admission, AC-022): the SAME admitted request state with the
+#     SAME pinned hashes but DIFFERENT untrusted agent ``confidence`` / ``reason`` drives the runner
+#     to an IDENTICAL admission (verdict + reason_codes + policy_hash). Distinct from E6-T4's wire
+#     SIZE binding — this is the admission VERDICT. Teeth: making the admission path read
+#     ``confidence`` flips the identical-admission assertion RED.
+# =====================================================================================
+# Reuse the REAL facade drivers (same pattern as ``from tests.test_no_r3_r4_code import ...``) so the
+# behavioral half exercises the identical admission path, not a re-implementation.
+from tests.test_dust_execution_facade import (  # noqa: E402
+    _drive_facade,
+    _mm_env,
+    _mm_manifest,
+)
+from veridex.dust_execution.facade import MMExecutionToolRequest, MMIntentParams  # noqa: E402
+from veridex.dust_execution.signer import LocalFakeWalletControlPlane  # noqa: E402
+from veridex.venues.sx_bet import FakeVenueAdapter  # noqa: E402
+
+# The agent-facing tool surface audited: the facade BOUNDARY module (the typed R4-B intent -> R4-A
+# contracts + the injectable proposer) and the ``tools=[]`` decision agent. Everything an agent / the
+# R4-B intent path DIRECTLY touches lives here; the money-network runner is imported LAZILY behind the
+# boundary and is intentionally NOT in this set (see the SCOPE note above).
+_AGENT_FACING_MODULES = ("veridex.dust_execution.facade", "veridex.runtime.agent")
+
+# Forbidden as EXACT imported symbol names: raw venue write methods + a wire-capable/key-export signer
+# surface + local-key crypto (reuses the E3-T7 no-local-key set for the crypto surfaces).
+_AGENT_BOUNDARY_FORBIDDEN_NAMES = frozenset(
+    {"submit_order", "cancel_order", "cancel_all_orders", "SignerBackedWriteSeam"}
+) | _NO_LOCAL_KEY_BANNED
+
+# Forbidden as a case-insensitive SUBSTRING of any imported module PATH: the vendored CLOB client.
+_AGENT_BOUNDARY_FORBIDDEN_PATH_FRAGMENTS = ("_vendor", "polymarket_clob")
+
+
+def _imported_surface_from_source(source: str) -> set[str]:
+    """Every imported module path + top segment + imported/alias symbol name in ``source`` (AST).
+
+    Code-only (``import`` / ``from ... import`` nodes), so a prose mention in a docstring/comment can
+    never trip the audit. Walks the WHOLE tree, so a lazy in-function import and a ``TYPE_CHECKING``
+    import are both present in the returned surface. Mirrors ``_module_imported_surface`` above but
+    takes a source string, so the same detector covers real modules AND the synthetic controls.
+    """
+    names: set[str] = set()
+    for node in ast.walk(ast.parse(source)):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                names.add(alias.name)
+                names.add(alias.name.split(".")[0])
+                if alias.asname:
+                    names.add(alias.asname)
+        elif isinstance(node, ast.ImportFrom):
+            if node.module:
+                names.add(node.module)
+                names.add(node.module.split(".")[0])
+            for alias in node.names:
+                names.add(alias.name)
+                if alias.asname:
+                    names.add(alias.asname)
+    return names
+
+
+def _agent_boundary_import_offenders(surface: set[str]) -> list[str]:
+    """Forbidden money-network surfaces present in an imported ``surface``.
+
+    Flags an EXACT raw-write / wire-signer / local-key crypto NAME, OR any import PATH carrying a
+    vendored-CLOB-client fragment. Sorted for a readable assert.
+    """
+    offenders = set(surface) & _AGENT_BOUNDARY_FORBIDDEN_NAMES
+    for name in surface:
+        low = name.lower()
+        if any(fragment in low for fragment in _AGENT_BOUNDARY_FORBIDDEN_PATH_FRAGMENTS):
+            offenders.add(name)
+    return sorted(offenders)
+
+
+def test_agent_facing_surface_imports_no_raw_write_signer_or_vendored_clob() -> None:
+    # (1) GREEN on the real agent-facing surface: neither the facade boundary module nor the
+    # tools=[] decision agent imports a raw venue write, a wire-capable/key-export signer, or the
+    # vendored CLOB client. Whole-AST PER MODULE (direct, not transitive — see the SCOPE note): a
+    # lazy/deferred or TYPE_CHECKING import is therefore included in each module's surface.
+    scanned: dict[str, set[str]] = {}
+    for modname in _AGENT_FACING_MODULES:
+        mod = _importlib.import_module(modname)
+        surface = _imported_surface_from_source(_inspect.getsource(mod))
+        assert surface, f"agent-facing module {modname} yielded an empty import surface (anti-inert)"
+        scanned[modname] = surface
+
+    offenders = {
+        m: _agent_boundary_import_offenders(s)
+        for m, s in scanned.items()
+        if _agent_boundary_import_offenders(s)
+    }
+    assert not offenders, (
+        "agent-facing tool surface must not import raw venue writes / a wire-capable signer / the "
+        f"vendored CLOB client (money-network reach lives ONLY behind the boundary): {offenders}"
+    )
+
+    # Anti-inert: the facade's LEGITIMATE type-only ``VenueAdapter`` / ``Signer`` imports (under
+    # ``if TYPE_CHECKING``) ARE in the scanned surface — proving the whole-AST walk really sees those
+    # imports — yet they are correctly NOT flagged, because the bar keys on the raw WRITE / key-export
+    # names, never on the provider-neutral Protocol TYPES the boundary is built from.
+    facade_surface = scanned["veridex.dust_execution.facade"]
+    assert "VenueAdapter" in facade_surface, "whole-AST walk must see the TYPE_CHECKING VenueAdapter"
+    assert "Signer" in facade_surface, "whole-AST walk must see the TYPE_CHECKING Signer type import"
+
+    # (2) Positive control (teeth): a synthetic agent-facing module that REALLY imports a raw
+    # submit_order/cancel_order, the vendored CLOB client, a wire-capable signer seam, and a local-key
+    # signer IS caught by the SAME detector — a bar that can catch nothing is worthless.
+    leak_src = (
+        "from veridex.venues.base import submit_order, cancel_order\n"
+        "from veridex.venues._vendor.polymarket_clob.client import Polymarket\n"
+        "from veridex.dust_execution.signer import SignerBackedWriteSeam\n"
+        "from eth_account import Account\n"
+    )
+    caught = _agent_boundary_import_offenders(_imported_surface_from_source(leak_src))
+    assert {"submit_order", "cancel_order", "SignerBackedWriteSeam", "Account"} <= set(caught), (
+        f"detector must flag raw writes + a wire signer + local-key crypto used as real imports: {caught}"
+    )
+    assert any(
+        fragment in c.lower() for c in caught for fragment in _AGENT_BOUNDARY_FORBIDDEN_PATH_FRAGMENTS
+    ), "the vendored CLOB client import path must be caught by a forbidden-fragment match"
+
+    # (3) Negative control (no prose false-positive): the forbidden surfaces named ONLY inside a
+    # docstring/comment are invisible to the AST detector (mirrors the real lane's prose disclaimers).
+    prose_src = (
+        '"""submit_order / cancel_order / the _vendor polymarket_clob client / eth_account /\n'
+        'SignerBackedWriteSeam are reachable ONLY behind the boundary — never imported here."""\n'
+        "# submit_order cancel_order _vendor polymarket_clob eth_account SignerBackedWriteSeam\n"
+        "SAFE = 1\n"
+    )
+    assert not _agent_boundary_import_offenders(_imported_surface_from_source(prose_src)), (
+        "the import audit must ignore forbidden surfaces named only in prose (docstring/comment)"
+    )
+
+
+def _admitted_request_with_metadata(
+    manifest: object, envelope: object, *, reason: str, confidence: float
+) -> MMExecutionToolRequest:
+    """A sanctioned, hash-matched agent intent carrying UNTRUSTED ``reason`` / ``confidence`` metadata.
+
+    Identical pinned hashes + identical intent for every call; only the untrusted metadata varies — so
+    two such requests differ ONLY in the fields the boundary must ignore.
+    """
+    return MMExecutionToolRequest.build(
+        intent_kind="make_quote",
+        intent_params=MMIntentParams(
+            token_id="0xtokenYES", side="BUY", price=0.49, size=1.0, tif="GTC", client_order_id="coid-1"
+        ),
+        strategy_id=manifest.strategy_id,  # type: ignore[attr-defined]
+        strategy_config_hash=manifest.strategy_config_hash,  # type: ignore[attr-defined]
+        policy_hash=envelope.policy_hash(),  # type: ignore[attr-defined]
+        session_id="sess-mm-sec006",
+        manifest_hash=manifest.manifest_hash(),  # type: ignore[attr-defined]
+        evidence_class="EXPERIMENTAL_DUST",
+        mode="dry_run",
+        admitted_manifest_hash=manifest.manifest_hash(),  # type: ignore[attr-defined]
+        admitted_policy_hash=envelope.policy_hash(),  # type: ignore[attr-defined]
+        admitted_strategy_config_hash=manifest.strategy_config_hash,  # type: ignore[attr-defined]
+        reason=reason,
+        confidence=confidence,
+    )
+
+
+async def test_agent_metadata_cannot_move_admission_identical_verdict_reason_codes_policy_hash() -> None:
+    # SEC-006/AC-022 behavioral half: identical request state + identical pinned hashes but DIFFERENT
+    # untrusted agent confidence/reason drive the runner to an IDENTICAL admission (verdict +
+    # reason_codes + policy_hash). The agent metadata is UX narration with NO gate effect; it can
+    # never move the deterministic admission. Distinct from E6-T4's wire-SIZE binding — this is the
+    # admission VERDICT. Teeth: making the admission path read confidence flips this RED.
+    manifest = _mm_manifest()
+    envelope = _mm_env()
+
+    low = _admitted_request_with_metadata(
+        manifest, envelope, reason="looks marginal, keep it tiny", confidence=0.01
+    )
+    high = _admitted_request_with_metadata(
+        manifest, envelope, reason="SURE THING — size this up now", confidence=0.99
+    )
+
+    # Non-vacuity: the two requests differ in the UNTRUSTED metadata yet share every pinned hash.
+    assert low.confidence != high.confidence and low.reason != high.reason
+    assert (low.manifest_hash, low.policy_hash, low.strategy_config_hash) == (
+        high.manifest_hash,
+        high.policy_hash,
+        high.strategy_config_hash,
+    )
+
+    res_low = await _drive_facade(
+        manifest, envelope, low,
+        adapter=FakeVenueAdapter(fill=True), signer=LocalFakeWalletControlPlane(), sink=None,
+    )
+    res_high = await _drive_facade(
+        manifest, envelope, high,
+        adapter=FakeVenueAdapter(fill=True), signer=LocalFakeWalletControlPlane(), sink=None,
+    )
+
+    # IDENTICAL admission across the metadata delta: verdict + reason_codes + policy_hash.
+    assert res_low.admission == res_high.admission == "APPROVED"
+    assert res_low.reason_codes == res_high.reason_codes
+    assert res_low.policy_hash == res_high.policy_hash
+
+
+def test_agent_request_cannot_even_carry_an_analysis_field() -> None:
+    # Structural corollary (AC-022): ``analysis`` is not a modelled field, so an agent cannot even
+    # SUPPLY free-form analysis across the boundary — extra="forbid" rejects it at construction.
+    # ``reason`` / ``confidence`` are the ONLY untrusted metadata, and (above) they cannot move
+    # admission — so no agent narration of any spelling reaches a policy/law/rank/execution outcome.
+    manifest = _mm_manifest()
+    envelope = _mm_env()
+    base: dict[str, object] = {
+        "intent_kind": "make_quote",
+        "intent_params": MMIntentParams(
+            token_id="0xtokenYES", side="BUY", price=0.49, size=1.0, tif="GTC", client_order_id="coid-1"
+        ),
+        "strategy_id": manifest.strategy_id,
+        "strategy_config_hash": manifest.strategy_config_hash,
+        "policy_hash": envelope.policy_hash(),
+        "session_id": "sess-mm-sec006",
+        "manifest_hash": manifest.manifest_hash(),
+        "evidence_class": "EXPERIMENTAL_DUST",
+        "mode": "dry_run",
+    }
+    # A fully-modelled construction succeeds (the fields ARE the boundary's typed surface)...
+    MMExecutionToolRequest(**base)  # type: ignore[arg-type]
+    # ...but an unmodelled ``analysis`` field is rejected — the boundary cannot carry it at all.
+    with pytest.raises(_ValidationError):
+        MMExecutionToolRequest(**{**base, "analysis": "the agent's private thesis"})  # type: ignore[arg-type]
