@@ -190,7 +190,11 @@ async def stream_marketstates(
     if client is None:
         import httpx  # noqa: PLC0415
 
-        _client = httpx.AsyncClient()
+        # SSE is a long-lived idle-tolerant stream: keep a connect/write timeout but
+        # DISABLE the read timeout (read=None), else httpx's default 5s read timeout
+        # fires on any gap >5s between odds ticks (guaranteed pre-match, and common in a
+        # live match's slow phases) → spurious disconnect/reconnect and lost FV data.
+        _client = httpx.AsyncClient(timeout=httpx.Timeout(30.0, read=None))
         _own_client = True
     else:
         _client = client
@@ -202,6 +206,12 @@ async def stream_marketstates(
 
     try:
         async with _client.stream("GET", resolved_url, headers=headers) as resp:
+            # Production only (real httpx client): surface the connect status so an operator
+            # sees the stream opened (HTTP 200) vs an auth failure (401/403), instead of
+            # inferring it from a silent "0 points received". Guarded by _own_client so
+            # injected test clients (which may lack status_code) skip it.
+            if _own_client:
+                print(f"[fv] TxLINE stream connected: HTTP {resp.status_code}")
             async for line in resp.aiter_lines():
                 record = parse_sse_line(line)
                 if record is None:
