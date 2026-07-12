@@ -515,3 +515,85 @@ def test_score_run_untouched_after_dust_execution_session():
     assert hashlib.sha256(on_disk).hexdigest() == hashlib.sha256(committed).hexdigest(), (
         "sealed maker-arena-result.json must be byte-identical to its committed content"
     )
+
+
+# =====================================================================================
+# E3-T7 (SEC / REQ-018, §6 group 19): the NO-LOCAL-KEY AST bar — the WHOLE Mode-B dust
+# lane (the compile→sign→post process, Fable-m4) must import NO local-key crypto library.
+# The control plane can custody-sign ONLY through the injected Privy client (recording-fake
+# in tests); a local-key constructor anywhere in the lane would let it sign with a local key,
+# defeating the entire money-network boundary. This AST bar closes over EVERY dust_execution
+# module (not one file) and is teeth-checked with a positive control.
+# =====================================================================================
+import importlib as _importlib  # noqa: E402
+import inspect as _inspect  # noqa: E402
+
+# Local-key crypto surfaces forbidden anywhere in the Mode-B lane: module paths + signer symbols.
+_NO_LOCAL_KEY_BANNED = {"eth_account", "eth_keys", "coincurve", "web3", "UtilsSigner", "Account"}
+
+
+def _module_imported_surface(modname: str) -> set[str]:
+    """Every imported module path AND imported/alias symbol name in ``modname`` (AST — code only).
+
+    Inspects only ``import`` / ``from ... import`` nodes, so a prose mention of ``eth_account`` in a
+    docstring or comment (the lane files carry such disclaimers) can never false-trip the bar.
+    """
+    mod = _importlib.import_module(modname)
+    tree = ast.parse(_inspect.getsource(mod))
+    names: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                names.add(alias.name)
+                names.add(alias.name.split(".")[0])
+                if alias.asname:
+                    names.add(alias.asname)
+        elif isinstance(node, ast.ImportFrom):
+            if node.module:
+                names.add(node.module)
+                names.add(node.module.split(".")[0])
+            for alias in node.names:
+                names.add(alias.name)
+                if alias.asname:
+                    names.add(alias.asname)
+    return names
+
+
+def test_no_local_key_crypto_anywhere_in_dust_execution_lane() -> None:
+    # (1) GREEN on the real lane: no dust_execution module imports a local-key crypto library.
+    modnames = _walk_modnames(veridex.dust_execution, "veridex.dust_execution.")
+    # The load-bearing Mode-B modules must actually be in the scanned set (anti-inert).
+    for required in (
+        "veridex.dust_execution.privy_control_plane",
+        "veridex.dust_execution.wallet_binding",
+        "veridex.dust_execution.keyless_read_client",
+        "veridex.dust_execution.signing_compiler",
+        "veridex.dust_execution.order_commitment",
+    ):
+        assert required in modnames, f"Mode-B module set is missing {required}"
+    offenders = {
+        m: sorted(_module_imported_surface(m) & _NO_LOCAL_KEY_BANNED)
+        for m in modnames
+        if _module_imported_surface(m) & _NO_LOCAL_KEY_BANNED
+    }
+    assert not offenders, f"dust_execution lane must import NO local-key crypto library: {offenders}"
+
+    # (2) Positive control (teeth): a synthetic module that REALLY imports a banned surface IS caught
+    # by the same AST detector — a bar that can catch nothing is worthless.
+    surface = _NO_LOCAL_KEY_BANNED
+    fake_source = "from eth_account import Account\nimport web3\nVALUE = 1\n"
+    fake_tree = ast.parse(fake_source)
+    caught: set[str] = set()
+    for node in ast.walk(fake_tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                caught.add(alias.name)
+                caught.add(alias.name.split(".")[0])
+        elif isinstance(node, ast.ImportFrom):
+            if node.module:
+                caught.add(node.module)
+            for alias in node.names:
+                caught.add(alias.name)
+    assert caught & surface == {"eth_account", "Account", "web3"}, (
+        "no-local-key detector must flag banned local-key surfaces used as real imports"
+    )
