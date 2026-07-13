@@ -55,6 +55,7 @@ from datetime import UTC, datetime
 from typing import Literal, Protocol, runtime_checkable
 
 from veridex.dust_execution.risk import RealizedFillRecord, RiskAccumulator
+from veridex.policy.envelope import cap_breached
 
 # The closed vocabulary the idempotent reserve-OR-load (:meth:`DurableSessionStateProvider.reserve`)
 # returns for a derived ``attempt_id`` (Gate#3 R5-MAJOR-1):
@@ -85,6 +86,15 @@ ReservationOutcome = Literal["RESERVED", "PENDING_RECONCILE", "COMMITTED"]
 #                             SEPARATE critical section, which two concurrent callers could both observe as
 #                             0 and both submit past the cap. Distinct from ``SCOPE_FROZEN``: a RESOLVED
 #                             first order STOPS freezing (no SCOPE_FROZEN) yet STAYS COUNTED (still caps).
+#   * ``LOSS_CAP_EXCEEDED_SESSION`` / ``LOSS_CAP_EXCEEDED_DAY`` (Gate#3 loss-cap TOCTOU) — the REALIZED-
+#                             LOSS twin of the order-cap gate: a FRESH attempt_id whose session/UTC-day
+#                             CURRENT durable realized loss already breaches the (manifest) loss cap: the
+#                             caller must FAIL CLOSED (DENIED, ``session_loss_over_max`` /
+#                             ``daily_loss_over_max``, no new wire). No new row is appended. The loss is
+#                             summed from the SAME ``_fills`` ledger in the SAME critical section as the
+#                             slot claim (never from a stale ``load()`` snapshot in a SEPARATE critical
+#                             section, which two concurrent callers could both observe below the cap and
+#                             both submit past it while the durable loss ledger advanced concurrently).
 ScopedReservationOutcome = Literal[
     "RESERVED",
     "PENDING_RECONCILE",
@@ -92,6 +102,8 @@ ScopedReservationOutcome = Literal[
     "SCOPE_FROZEN",
     "CAP_EXCEEDED_SESSION",
     "CAP_EXCEEDED_DAY",
+    "LOSS_CAP_EXCEEDED_SESSION",
+    "LOSS_CAP_EXCEEDED_DAY",
 ]
 
 # The RECONCILIATION disposition of a reservation row (Gate#3 R5-MAJOR-1 / IDM-002) — the axis the
@@ -202,10 +214,12 @@ class DurableSessionStateProvider(Protocol):
         attempt_id: str,
         max_orders_per_session: int = 0,
         max_orders_per_day: int = 0,
+        max_session_loss: float = 0.0,
+        max_daily_loss: float = 0.0,
         venue_order_key: str | None = None,
     ) -> ScopedReservationOutcome:
-        """Atomically reserve-or-load an attempt AND enforce BOTH the session freeze scope and the
-        session/UTC-day order caps (Gate#3 R6-MAJOR-2 + R8-MAJOR-1).
+        """Atomically reserve-or-load an attempt AND enforce the session freeze scope, the session/UTC-day
+        order caps, AND the session/UTC-day realized-LOSS caps (Gate#3 R6-MAJOR-2 + R8-MAJOR-1 + loss-cap TOCTOU).
 
         The SINGLE critical-section op the facade money path calls instead of a separate
         :meth:`has_unresolved_reservation` / ``load()``-count read followed by :meth:`reserve`. Fusing the
@@ -218,11 +232,17 @@ class DurableSessionStateProvider(Protocol):
         the only durable fix: a second caller MUST observe the first COUNTED reservation — EVEN when it is
         already RESOLVED (RESOLVED stops freezing but STAYS COUNTED) — and refuse at the cap.
 
-        ``max_orders_per_session`` / ``max_orders_per_day`` are the authoritative caps the facade threads
-        in from the policy envelope; a cap ``<= 0`` is DISABLED-transparent (no ceiling — matches
-        :func:`veridex.dust_execution.runner._cap_reached` / the E2 policy gate). The reservation that
-        consumes a slot is EVERY persisted (non-released) row — ``RESERVED`` / ``PENDING`` / ``AMBIGUOUS``
-        / ``COMMITTED`` / ``RESOLVED`` all count; only a released (``DEFINITIVELY_ABSENT``) row is gone.
+        ``max_orders_per_session`` / ``max_orders_per_day`` are the authoritative order caps the facade
+        threads in from the policy envelope; ``max_session_loss`` / ``max_daily_loss`` are the authoritative
+        realized-LOSS caps it threads in from the MANIFEST (the ceiling the runner's pre-wire admission
+        enforces via :func:`veridex.policy.envelope.cap_breached`). A cap ``<= 0`` is DISABLED-transparent
+        (no ceiling — matches :func:`veridex.dust_execution.runner._cap_reached` / the E2 policy gate /
+        ``cap_breached``). The reservation that consumes an order slot is EVERY persisted (non-released) row
+        — ``RESERVED`` / ``PENDING`` / ``AMBIGUOUS`` / ``COMMITTED`` / ``RESOLVED`` all count; only a
+        released (``DEFINITIVELY_ABSENT``) row is gone. The realized loss is the CURRENT durable
+        fee-inclusive loss summed from the ``_fills`` ledger (the SAME summation :meth:`load` /
+        :func:`veridex.dust_execution.ledger.reconstruct_risk` use), applied through the SAME single
+        ``cap_breached`` boundary — never a re-implemented breach predicate.
 
         The outcome DISCRIMINATES (see :data:`ScopedReservationOutcome`):
 
@@ -234,11 +254,19 @@ class DurableSessionStateProvider(Protocol):
           must FREEZE — no new wire around an unresolved first order, regardless of spare cap, pending
           the production venue-truth reconcile. No new row is appended.
         * ``CAP_EXCEEDED_SESSION`` / ``CAP_EXCEEDED_DAY`` — a FRESH ``attempt_id`` with nothing unresolved
-          in scope but whose insert would breach the session / UTC-day cap: FAIL CLOSED (the facade denies
-          ``order_cap_session`` / ``order_cap_day``, no new wire). No new row is appended. Session cap is
-          checked before day (mirrors the runner's run→session→day precedence).
-        * ``RESERVED`` — a FRESH ``attempt_id`` with nothing unresolved in scope AND spare cap: a fresh
-          possibly-live slot is appended (it counts toward the caps immediately and durably); proceed.
+          in scope but whose insert would breach the session / UTC-day ORDER cap: FAIL CLOSED (the facade
+          denies ``order_cap_session`` / ``order_cap_day``, no new wire). No new row is appended. Session cap
+          is checked before day (mirrors the runner's run→session→day precedence).
+        * ``LOSS_CAP_EXCEEDED_SESSION`` / ``LOSS_CAP_EXCEEDED_DAY`` — a FRESH ``attempt_id`` with nothing
+          unresolved in scope and spare ORDER cap but whose session / UTC-day CURRENT durable realized loss
+          already breaches the (manifest) loss cap: FAIL CLOSED (the facade denies ``session_loss_over_max``
+          / ``daily_loss_over_max``, no new wire). No new row is appended. The loss is summed from the
+          ``_fills`` ledger and tested via ``cap_breached`` in the SAME critical section as the slot claim —
+          NOT from a stale ``load()`` snapshot that a concurrent caller could observe below the cap while the
+          durable loss ledger advances. Session is checked before day; the loss caps are checked AFTER the
+          order caps.
+        * ``RESERVED`` — a FRESH ``attempt_id`` with nothing unresolved in scope AND spare order+loss cap: a
+          fresh possibly-live slot is appended (it counts toward the caps immediately and durably); proceed.
 
         A raise (durable-store outage) signals the facade to FAIL CLOSED (no wire I/O). This method MUST
         execute the scope check, the cap count, AND the reserve/insert in ONE critical section spanning
@@ -356,9 +384,7 @@ class InMemoryDurableSessionStateProvider:
     def load(self, *, session_id: str, now: datetime) -> DurableSessionState:
         with self._lock:
             today = now.astimezone(UTC).replace(hour=0, minute=0, second=0, microsecond=0)
-            fills = self._fills.get(session_id, [])
-            net_session = sum(fill.net_pnl() for fill in fills)
-            net_day = sum(fill.net_pnl() for fill in fills if _utc_day(fill.fill_ts_ms) == today)
+            net_session, net_day = self._net_pnl(session_id, now)
             risk = RiskAccumulator.seeded(
                 session_id=session_id,
                 net_session=net_session,
@@ -422,12 +448,15 @@ class InMemoryDurableSessionStateProvider:
         attempt_id: str,
         max_orders_per_session: int = 0,
         max_orders_per_day: int = 0,
+        max_session_loss: float = 0.0,
+        max_daily_loss: float = 0.0,
         venue_order_key: str | None = None,
     ) -> ScopedReservationOutcome:
-        # Gate#3 R6-MAJOR-2 + R8-MAJOR-1: the ATOMIC reserve-or-freeze — the SINGLE critical section that
-        # fuses the session-scope freeze check AND the session/day cap admission with the reserve-or-load,
-        # so two requests can NEVER both observe an empty scope OR a stale (pre-reservation) cap count and
-        # both reserve+wire (the split check-then-reserve / load-then-reserve TOCTOUs).
+        # Gate#3 R6-MAJOR-2 + R8-MAJOR-1 + loss-cap TOCTOU: the ATOMIC reserve-or-freeze — the SINGLE
+        # critical section that fuses the session-scope freeze check, the session/day ORDER-cap admission,
+        # AND the session/day realized-LOSS-cap admission with the reserve-or-load, so two requests can
+        # NEVER both observe an empty scope OR a stale (pre-reservation) order count OR a stale (pre-fill)
+        # loss snapshot and both reserve+wire (the split check-then-reserve / load-then-reserve TOCTOUs).
         #
         # R7-MAJOR-1: a bare synchronous method is NOT that critical section across worker threads — the
         # GIL switches threads at bytecode boundaries, so two concurrent callers can BOTH run the scope
@@ -445,15 +474,24 @@ class InMemoryDurableSessionStateProvider:
         #   * a FRESH id while an UNRESOLVED possibly-live reservation occupies the session scope →
         #     ``SCOPE_FROZEN`` (no row appended): a genuinely distinct attempt must NOT submit AROUND an
         #     unresolved first order, regardless of spare cap, pending venue-truth reconcile;
-        #   * a FRESH id with nothing unresolved in scope but whose insert would breach the session/day cap
-        #     → ``CAP_EXCEEDED_SESSION`` / ``CAP_EXCEEDED_DAY`` (no row appended): the atomic cap gate. The
-        #     count is EVERY persisted (non-released) row for the session — a RESOLVED first order STOPS
-        #     freezing (so it is not SCOPE_FROZEN) yet STAYS COUNTED, so the second caller is denied here
-        #     even though the scope is clear. Offline the fixed clock keeps a test's attempts within one
-        #     UTC day, so the session count doubles as the day count (mirrors :meth:`load`); a real
-        #     provider buckets the day count by ``now``'s UTC day. Session is checked before day (the
+        #   * a FRESH id with nothing unresolved in scope but whose insert would breach the session/day
+        #     ORDER cap → ``CAP_EXCEEDED_SESSION`` / ``CAP_EXCEEDED_DAY`` (no row appended): the atomic
+        #     order-cap gate. The count is EVERY persisted (non-released) row for the session — a RESOLVED
+        #     first order STOPS freezing (so it is not SCOPE_FROZEN) yet STAYS COUNTED, so the second caller
+        #     is denied here even though the scope is clear. Offline the fixed clock keeps a test's attempts
+        #     within one UTC day, so the session count doubles as the day count (mirrors :meth:`load`); a
+        #     real provider buckets the day count by ``now``'s UTC day. Session is checked before day (the
         #     runner's run→session→day precedence);
-        #   * a FRESH id with nothing unresolved AND spare cap → ``RESERVED`` (a fresh possibly-live slot).
+        #   * a FRESH id with nothing unresolved AND spare order cap but whose session/day CURRENT durable
+        #     realized loss already breaches the (manifest) loss cap → ``LOSS_CAP_EXCEEDED_SESSION`` /
+        #     ``LOSS_CAP_EXCEEDED_DAY`` (no row appended): the REALIZED-LOSS twin of the order-cap gate. The
+        #     loss is summed from the ``_fills`` ledger by the SAME ``_net_pnl`` helper :meth:`load` uses and
+        #     tested via the SAME ``cap_breached`` boundary the runner's pre-wire admission uses — IN THIS
+        #     held lock, so a concurrent caller can never observe a below-cap ``load()`` snapshot and submit
+        #     while the durable loss ledger (``record_reconciled_fills``) advances past the cap. Session is
+        #     checked before day; the loss caps are checked AFTER the order caps. A cap ``<= 0`` is
+        #     disabled-transparent (``cap_breached`` returns False);
+        #   * a FRESH id with nothing unresolved AND spare order+loss cap → ``RESERVED`` (a fresh slot).
         with self._lock:
             if attempt_id not in self._reservations:
                 if self._has_unresolved(session_identity):
@@ -463,6 +501,16 @@ class InMemoryDurableSessionStateProvider:
                     return "CAP_EXCEEDED_SESSION"
                 if max_orders_per_day > 0 and count >= max_orders_per_day:
                     return "CAP_EXCEEDED_DAY"
+                if max_session_loss > 0.0 or max_daily_loss > 0.0:
+                    # The CURRENT durable fee-inclusive realized loss, summed under THIS held lock via the
+                    # SAME ``_net_pnl`` helper :meth:`load` uses (net over all session fills / over ``now``'s
+                    # UTC-day fills), converted to a non-negative loss magnitude and tested through the SINGLE
+                    # ``cap_breached`` boundary — never a re-implemented breach predicate.
+                    net_session, net_day = self._net_pnl(session_identity, now)
+                    if cap_breached(max_session_loss, max(0.0, -net_session)):
+                        return "LOSS_CAP_EXCEEDED_SESSION"
+                    if cap_breached(max_daily_loss, max(0.0, -net_day)):
+                        return "LOSS_CAP_EXCEEDED_DAY"
             return self._reserve_or_load(
                 session_identity=session_identity,
                 attempt_id=attempt_id,
@@ -509,6 +557,21 @@ class InMemoryDurableSessionStateProvider:
         return sum(
             1 for res in self._reservations.values() if res.session_identity == session_id
         )
+
+    def _net_pnl(self, session_id: str, now: datetime) -> tuple[float, float]:
+        # Lock-free primitive: ONLY called from public methods already holding ``self._lock`` (``load`` and
+        # the atomic ``reserve_or_freeze``), so the loss sum stays inside the caller's held-lock critical
+        # section (no re-entry, no extra lock, no deadlock). The SINGLE source of the fee-inclusive realized
+        # net-PnL summation the durable state exposes — the SAME filter
+        # :func:`veridex.dust_execution.ledger.reconstruct_risk` uses: ``net_pnl`` over ALL session fills
+        # (session), and over ONLY ``now``'s-UTC-day fills (day) — so the reconstructed accumulator and the
+        # atomic loss-cap admission can never drift on the summation. Returns SIGNED nets (a loss is
+        # negative); the caller converts to a non-negative loss magnitude via ``max(0.0, -net)``.
+        today = now.astimezone(UTC).replace(hour=0, minute=0, second=0, microsecond=0)
+        fills = self._fills.get(session_id, [])
+        net_session = sum(fill.net_pnl() for fill in fills)
+        net_day = sum(fill.net_pnl() for fill in fills if _utc_day(fill.fill_ts_ms) == today)
+        return net_session, net_day
 
     def has_unresolved_reservation(self, session_identity: str) -> bool:
         # IDM-002 session-scope freeze (RECONCILIATION axis): True iff ANY possibly-live row whose

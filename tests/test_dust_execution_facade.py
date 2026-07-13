@@ -1370,12 +1370,14 @@ class _EchoRiskProvider:
         attempt_id: str,
         max_orders_per_session: int = 0,
         max_orders_per_day: int = 0,
+        max_session_loss: float = 0.0,
+        max_daily_loss: float = 0.0,
         venue_order_key: str | None = None,
     ) -> ScopedReservationOutcome:
-        # The ATOMIC reserve path (R6-MAJOR-2 + R8-MAJOR-1: now also accepts the threaded session/day
-        # caps). Reached only by the honest-echo positive control (the mismatch cases fail closed at the
-        # identity assertion first): a fresh slot with nothing unresolved in scope AND spare cap →
-        # RESERVED, so the honest run proceeds to the wire.
+        # The ATOMIC reserve path (R6-MAJOR-2 + R8-MAJOR-1 + loss-cap TOCTOU: now also accepts the threaded
+        # session/day ORDER caps AND the manifest realized-LOSS caps). Reached only by the honest-echo
+        # positive control (the mismatch cases fail closed at the identity assertion first): a fresh slot
+        # with nothing unresolved in scope AND spare cap → RESERVED, so the honest run proceeds to the wire.
         return "RESERVED"
 
     def settle(
@@ -1552,6 +1554,8 @@ class _ReserveOutageProvider(InMemoryDurableSessionStateProvider):
         attempt_id: str,
         max_orders_per_session: int = 0,
         max_orders_per_day: int = 0,
+        max_session_loss: float = 0.0,
+        max_daily_loss: float = 0.0,
         venue_order_key: str | None = None,
     ) -> ScopedReservationOutcome:
         raise _DurableStoreOutage("durable store unavailable before wire")
@@ -2281,6 +2285,8 @@ class _ReserveSpyProvider(InMemoryDurableSessionStateProvider):
         attempt_id: str,
         max_orders_per_session: int = 0,
         max_orders_per_day: int = 0,
+        max_session_loss: float = 0.0,
+        max_daily_loss: float = 0.0,
         venue_order_key: str | None = None,
     ) -> ScopedReservationOutcome:
         self.reserve_or_freeze_calls += 1
@@ -2290,6 +2296,8 @@ class _ReserveSpyProvider(InMemoryDurableSessionStateProvider):
             attempt_id=attempt_id,
             max_orders_per_session=max_orders_per_session,
             max_orders_per_day=max_orders_per_day,
+            max_session_loss=max_session_loss,
+            max_daily_loss=max_daily_loss,
             venue_order_key=venue_order_key,
         )
 
@@ -2595,3 +2603,173 @@ def test_concurrent_calls_at_cap_one_submits_the_other_is_cap_denied_atomically(
         "order_cap_session" in denied.execution_reason_codes
         or "order_cap_day" in denied.execution_reason_codes
     ), f"the cap-denied call must carry an order_cap_* reason (got {denied.execution_reason_codes})"
+
+
+# ---------------------------------------------------------------------------
+# Gate#3 loss-cap TOCTOU — realized-LOSS cap admission is ATOMIC with the
+# reservation (the REALIZED-LOSS twin of the R8 order-cap fix). The R8 fold made
+# the ORDER-count cap atomic inside ``reserve_or_freeze``, but the SAF-002
+# realized-loss cap still had the identical stale-read hole: ``load()``
+# reconstructs the loss snapshot under the lock and RELEASES it, and the runner's
+# only pre-wire loss gate consumed that STALE snapshot — while the durable loss
+# ledger (``record_reconciled_fills``) advances CONCURRENTLY. So two calls both
+# snapshot a pre-loss accumulator BELOW the cap; T1 wires + settles RESOLVED and
+# its fill lands (loss → over cap); T2 reserves (scope clear, order count fine)
+# and the runner admits it on its STALE below-cap snapshot → T2 also wires. The
+# fix computes the CURRENT durable realized loss in the SAME held-lock critical
+# section as the slot claim (via the shared ``cap_breached`` boundary) and refuses
+# with a discriminated ``LOSS_CAP_EXCEEDED_*`` the facade fails closed on. The
+# authoritative pre-wire ceiling is the MANIFEST cap (``max_session_loss`` /
+# ``max_daily_loss``), the one the runner's pre-wire admission enforces.
+#
+# This drives TWO REAL facade calls through the runner sharing ONE recording write
+# port: a load barrier so BOTH snapshot the pre-loss (1.5 < 2.0) accumulator, then
+# a gate holding T2's reserve until T1 has settled RESOLVED AND its -1.0 fill is
+# recorded (durable loss 1.5 → 2.5 ≥ the 2.0 cap). Exactly ONE SUBMITTED / one
+# write-port call; the other DENIED with the loss-cap reason.
+# ---------------------------------------------------------------------------
+
+
+class _ConcurrentLossCapProbeProvider(InMemoryDurableSessionStateProvider):
+    """Drives the realized-loss-cap TOCTOU schedule against the REAL facade money path.
+
+    * ``load`` holds BOTH callers at a barrier AFTER reconstructing the durable loss snapshot, so both
+      observe the SAME pre-loss accumulator (session loss 1.5, below the 2.0 cap) before EITHER reserves
+      — the exact stale-loss window.
+    * ``reserve_or_freeze`` lets the FIRST arriving caller through and HOLDS the second until the first
+      has ``settle``-d RESOLVED AND its venue-reconciled fill has landed in the durable ledger (loss
+      1.5 → 2.5, now over the 2.0 cap), so the second reserves atop a session whose CURRENT durable loss
+      already breaches the cap — the atomic loss check, not the stale ``load()`` snapshot, must stop it.
+      ``**kwargs`` forwards whatever the facade threads in (the loss caps once the fix lands), so the
+      probe drives the RED (pre-fix, no loss caps threaded) and GREEN (post-fix) money path unchanged.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._load_barrier = threading.Barrier(2, timeout=5.0)
+        self._first_settled = threading.Event()
+        self._arrival_lock = threading.Lock()
+        self._arrivals = 0
+        self._t1_fill_recorded = False
+
+    def load(self, *, session_id: str, now: datetime) -> DurableSessionState:
+        state = super().load(session_id=session_id, now=now)
+        # Both callers observe the pre-loss snapshot BEFORE either reserves (the stale-loss window).
+        with contextlib.suppress(threading.BrokenBarrierError):
+            self._load_barrier.wait()
+        return state
+
+    def reserve_or_freeze(
+        self, *, session_identity: str, now: datetime, attempt_id: str, **kwargs: object
+    ) -> ScopedReservationOutcome:
+        with self._arrival_lock:
+            self._arrivals += 1
+            is_second = self._arrivals == 2
+        if is_second:
+            # Hold the second caller until the FIRST has settled RESOLVED and its loss has landed: it
+            # then reserves atop a session whose CURRENT durable loss is already over the cap, so ONLY
+            # an atomic loss check (not the stale below-cap load snapshot) can stop it.
+            self._first_settled.wait(timeout=5.0)
+        return super().reserve_or_freeze(
+            session_identity=session_identity, now=now, attempt_id=attempt_id, **kwargs  # type: ignore[arg-type]
+        )
+
+    def settle(
+        self, *, attempt_id: str, recon_state: ReconciliationState, venue_order_key: str | None = None
+    ) -> None:
+        super().settle(attempt_id=attempt_id, recon_state=recon_state, venue_order_key=venue_order_key)
+        # The first order's venue-reconciled fill lands in the durable ledger the instant it RESOLVES —
+        # pushing the session realized loss from 1.5 to 2.5 (over the 2.0 cap) BEFORE the held second
+        # caller reserves. Recorded exactly once (the first RESOLVED settle) via the SAME durable seam
+        # the production reconciler feeds — never fabricated from the sealed facade events (SEC-002).
+        if recon_state == "RESOLVED" and not self._t1_fill_recorded:
+            self._t1_fill_recorded = True
+            self.record_reconciled_fills(
+                session_identity="sess-mm-b",
+                fills=(
+                    RealizedFillRecord(
+                        realized_pnl=-1.0, fee=0.0, session_id="sess-mm-b", fill_ts_ms=_MM_NOW_S * 1000
+                    ),
+                ),
+            )
+        # The first caller's RESOLVED settle (with its fill recorded) releases the held second caller.
+        self._first_settled.set()
+
+
+def test_concurrent_calls_loss_cap_one_submits_the_other_is_loss_denied_atomically() -> None:
+    """Loss-cap TOCTOU (RED against the stale-loss cap bypass): two CONCURRENT ``propose_mm_execution``
+    calls, SAME session, ``manifest.max_session_loss == 2.0`` with a prior recorded loss of 1.5 (below
+    it) and order caps with ROOM, sharing ONE provider + ONE recording write port. A barrier makes BOTH
+    snapshot the pre-loss (1.5) accumulator; a gate holds the 2nd reservation until the 1st has settled
+    RESOLVED and its -1.0 fill has landed (durable loss 2.5, over the cap). The realized-loss admission
+    MUST be atomic with the reservation: EXACTLY ONE SUBMITTED / one write-port submit; the other DENIED
+    with the loss-cap reason.
+
+    RED today (loss gated only from the stale ``load()`` snapshot, not the atomic reservation): both
+    snapshot loss 1.5 and BOTH submit (``submit_calls == 2``, two writes). The RED is the stale-loss cap
+    bypass — the barrier + gate reproduce the exact schedule against the real facade money path."""
+    binding = _mm_binding()
+    write_port = _default_write_port(binding)  # SHARED money-moving surface — counts TOTAL submits
+    provider = _ConcurrentLossCapProbeProvider()  # SHARED durable session state
+    # Prior realized loss of 1.5, seeded through the provider's own durable venue-reconciliation ledger
+    # (never fabricated from sealed events), BELOW the manifest's 2.0 session-loss cap so both callers
+    # snapshot an under-cap accumulator at load. Order caps stay at the roomy defaults so the LOSS cap —
+    # not the order cap — is the only thing that can deny the second call.
+    provider.record_reconciled_fills(
+        session_identity="sess-mm-b",
+        fills=(
+            RealizedFillRecord(
+                realized_pnl=-1.5, fee=0.0, session_id="sess-mm-b", fill_ts_ms=_MM_NOW_S * 1000
+            ),
+        ),
+    )
+
+    results: dict[str, MMExecutionToolResult] = {}
+    errors: list[BaseException] = []
+
+    def _worker(client_order_id: str) -> None:
+        # ``fill_history_matches=True`` → the run's E4 reconcile RESOLVES (definite fill), so the first
+        # order settles RESOLVED and its loss lands — the CURRENT durable loss (not the stale snapshot)
+        # is the ONLY thing that can deny the second. A FRESH adapter per call (the SHARED surface under
+        # test is the write port).
+        adapter = RecordingFakeAdapter(fill=True, fill_history_matches=True, open_orders=[])
+        try:
+            results[client_order_id] = asyncio.run(
+                _drive_mode_b(
+                    interlock=_full_interlock(),
+                    arming=_mm_arming(binding, write_port=write_port),
+                    binding=binding,
+                    adapter=adapter,
+                    interlock_store=InMemoryOperatorInterlockStore(),
+                    provider=provider,
+                    client_order_id=client_order_id,
+                )
+            )
+        except BaseException as exc:  # surface a worker crash to the main thread
+            errors.append(exc)
+
+    threads = [
+        threading.Thread(target=_worker, args=("coid-1",)),
+        threading.Thread(target=_worker, args=("coid-2",)),
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=30.0)
+        assert not thread.is_alive(), "the concurrent loss-cap schedule must not deadlock"
+
+    assert not errors, f"a worker raised under the concurrent schedule: {errors}"
+    statuses = sorted(result.execution_status for result in results.values())
+    assert statuses == ["DENIED", "SUBMITTED"], (
+        "exactly one concurrent call may reach the wire; the other must be loss-cap-DENIED "
+        f"(got {statuses} — two SUBMITTED means both consumed the stale below-cap loss snapshot)"
+    )
+    assert write_port.submit_calls == 1, (
+        "exactly ONE write-port submit under the concurrent schedule "
+        f"(got {write_port.submit_calls} — two means the loss cap was not atomic with the reservation)"
+    )
+    denied = next(result for result in results.values() if result.execution_status != "SUBMITTED")
+    assert (
+        "session_loss_over_max" in denied.execution_reason_codes
+        or "daily_loss_over_max" in denied.execution_reason_codes
+    ), f"the loss-denied call must carry a loss-cap reason (got {denied.execution_reason_codes})"

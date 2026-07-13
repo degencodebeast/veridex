@@ -105,6 +105,13 @@ ExecutionStatus = Literal["SUBMITTED", "ABSTAINED", "NOT_ARMED", "DENIED"]
 # ``CAP_EXCEEDED_DAY`` and the facade maps each to its reason here.
 OrderCapReason = Literal["order_cap_session", "order_cap_day"]
 
+# Gate#3 loss-cap TOCTOU: the durable realized-LOSS-cap reasons the facade's ATOMIC loss gate denies with
+# — the SAME closed-vocab ``session_loss_over_max`` / ``daily_loss_over_max`` literals the E2 policy gate
+# (``veridex.policy.engine``) uses (never a minted synonym). The atomic ``reserve_or_freeze`` returns a
+# discriminated ``LOSS_CAP_EXCEEDED_SESSION`` / ``LOSS_CAP_EXCEEDED_DAY`` and the facade maps each to its
+# reason here — the realized-loss twin of ``OrderCapReason``.
+LossCapReason = Literal["session_loss_over_max", "daily_loss_over_max"]
+
 # The abstain reasons that mean "Mode B could not ARM" (execution WITHHELD for want of arming/interlock
 # proof), as opposed to a strategy/gate/intent abstention. Mirrors the runner's ``AbstainReason``
 # closed vocab; membership drives the ``NOT_ARMED`` disposition. A closed set — never an id or secret.
@@ -849,6 +856,62 @@ def _deny_order_cap(
     return tool_result
 
 
+def _deny_loss_cap(
+    request: MMExecutionToolRequest,
+    *,
+    envelope: PolicyEnvelope,
+    emit: Callable[..., None],
+    reason: LossCapReason,
+) -> MMExecutionToolResult:
+    """Return the Gate#3 loss-cap-TOCTOU fail-closed result when the ATOMIC reservation refuses at a
+    realized-loss cap (the REALIZED-LOSS twin of :func:`_deny_order_cap`).
+
+    The atomic ``reserve_or_freeze`` bound the session/UTC-day realized-loss decision to the slot claim in
+    ONE critical section and refused (``LOSS_CAP_EXCEEDED_SESSION`` / ``LOSS_CAP_EXCEEDED_DAY``): the
+    CURRENT durable fee-inclusive realized loss (summed from the provider's ``_fills`` ledger under the
+    held lock via the SAME ``cap_breached`` boundary the runner's pre-wire admission uses) already breaches
+    the authoritative MANIFEST loss cap. Unlike the pre-fix path, this go/no-go never reads ``load()``'s
+    stale below-cap loss snapshot, so two concurrent callers can no longer both submit past the cap while
+    the durable loss ledger advances. The money path is NOT entered: the runner is never reached and no
+    write port is called. Denies with the existing closed-vocab ``*_loss_over_max`` reason family
+    (``reason`` — SEC-005, never a minted synonym and never a PnL VALUE), on BOTH the admission and
+    execution axes, and emits the honest terminal OPS telemetry. Carries only the pinned honest labels +
+    closed-vocab reason codes, never a live handle. The runner's own loss gate stays for direct-runner
+    callers / defense-in-depth, but the facade money path's authoritative loss gate is now this atomic
+    reservation, not the stale ``load()`` snapshot.
+    """
+    tool_result = MMExecutionToolResult(
+        admission="DENIED",
+        reason_codes=(reason,),
+        execution_status="DENIED",
+        execution_reason_codes=(reason,),
+        lifecycle_receipt_ref=f"dust-lifecycle:{request.session_id}:{reason}",
+        run_label=_DEFAULT_RUN_LABEL,
+        calibration_label=_DEFAULT_CALIBRATION_LABEL,
+        edge_label=_DEFAULT_EDGE_LABEL,
+        evidence_class=_DEFAULT_EVIDENCE_CLASS,
+        policy_hash=envelope.policy_hash(),
+    )
+    emit(
+        RuntimeEventType.ACTION_EMITTED,
+        admission=tool_result.admission,
+        execution_status=tool_result.execution_status,
+        intent_kind=request.intent_kind,
+    )
+    emit(
+        RuntimeEventType.RUN_COMPLETED,
+        status=RuntimeStatus.COMPLETED.value,
+        admission=tool_result.admission,
+        reason_codes=list(tool_result.reason_codes),
+        execution_status=tool_result.execution_status,
+        execution_reason_codes=list(tool_result.execution_reason_codes),
+        lifecycle_receipt_ref=tool_result.lifecycle_receipt_ref,
+        session_status="FAILED",
+        submitted_count=0,
+    )
+    return tool_result
+
+
 def _idempotent_committed_result(
     request: MMExecutionToolRequest,
     *,
@@ -1089,12 +1152,23 @@ async def propose_mm_execution(
             # (two concurrent callers could both observe that count as 0 and both submit past a ``== 1``
             # cap). The money path's go/no-go on the cap is now this atomic reservation, not
             # ``durable_state``'s pre-reservation count.
+            #
+            # Gate#3 loss-cap TOCTOU: ALSO thread the AUTHORITATIVE realized-LOSS caps — the MANIFEST
+            # ``max_session_loss`` / ``max_daily_loss``, the ceiling the runner's pre-wire admission
+            # enforces via ``cap_breached`` (NOT the inert envelope loss caps on this path) — so the
+            # realized-loss admission is likewise made in the SAME critical section as the slot claim,
+            # against the CURRENT durable loss ledger, never from the stale below-cap ``load()`` snapshot
+            # (two concurrent callers could both observe a below-cap snapshot and both submit while the
+            # durable loss ledger advanced past the cap). The money path's go/no-go on the loss is now this
+            # atomic reservation, not ``durable_state.risk``'s pre-fill snapshot.
             reservation_outcome = provider.reserve_or_freeze(
                 session_identity=session_identity,
                 now=now_dt,
                 attempt_id=attempt_id,
                 max_orders_per_session=envelope.max_orders_per_session,
                 max_orders_per_day=envelope.max_orders_per_day,
+                max_session_loss=manifest.max_session_loss,
+                max_daily_loss=manifest.max_daily_loss,
             )
         except Exception:
             return _fail_closed_reservation_failed(request, envelope=envelope, emit=_emit)
@@ -1116,6 +1190,20 @@ async def propose_mm_execution(
                 else "order_cap_day"
             )
             return _deny_order_cap(request, envelope=envelope, emit=_emit, reason=cap_reason)
+        if reservation_outcome in ("LOSS_CAP_EXCEEDED_SESSION", "LOSS_CAP_EXCEEDED_DAY"):
+            # Gate#3 loss-cap TOCTOU: the atomic realized-loss gate refused — the CURRENT durable
+            # fee-inclusive realized loss (summed under the held lock via ``cap_breached``) already breaches
+            # the manifest session / UTC-day loss cap, observed against the concurrently-advanced loss
+            # ledger rather than the stale below-cap ``load()`` snapshot. FAIL CLOSED with the existing
+            # ``*_loss_over_max`` reason family: DENIED, the runner is never reached and no write port is
+            # called. The runner's own pre-wire loss gate stays for direct-runner callers / defense-in-depth,
+            # but the facade money path's authoritative loss gate is now this atomic reservation.
+            loss_reason: LossCapReason = (
+                "session_loss_over_max"
+                if reservation_outcome == "LOSS_CAP_EXCEEDED_SESSION"
+                else "daily_loss_over_max"
+            )
+            return _deny_loss_cap(request, envelope=envelope, emit=_emit, reason=loss_reason)
         if reservation_outcome == "COMMITTED":
             # An identical retry atop a committed first order: idempotent replay, no new wire.
             return _idempotent_committed_result(request, envelope=envelope, emit=_emit)
