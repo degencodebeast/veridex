@@ -45,6 +45,7 @@ from veridex.dust_execution.contracts import (
     DustExecutionSessionMeta,
     DustRunLabelEvent,
     ExecutionMode,
+    OperatorInterlockEvent,
     OrderAckEvent,
     OrderCancelEvent,
     OrderStatusEvent,
@@ -54,7 +55,11 @@ from veridex.dust_execution.contracts import (
     SessionRiskSnapshot,
 )
 from veridex.dust_execution.emergency import DustSafetySession, SafetyController
-from veridex.dust_execution.facade import MMExecutionToolRequest, MMIntentParams
+from veridex.dust_execution.facade import (
+    OPERATOR_PRECONDITIONS,
+    MMExecutionToolRequest,
+    MMIntentParams,
+)
 from veridex.dust_execution.l2_transport import (
     InMemoryPreSubmitStore,
     KeylessL2Transport,
@@ -66,6 +71,10 @@ from veridex.dust_execution.manifest import (
 )
 from veridex.dust_execution.mode_b_write_port import KeylessModeBWritePort, ModeBWritePort
 from veridex.dust_execution.noncrossing import LegKind, OwnOrderLeg
+from veridex.dust_execution.operator_interlock_store import (
+    InMemoryOperatorInterlockStore,
+    OperatorInterlockStore,
+)
 from veridex.dust_execution.privy_control_plane import (
     L2ApiCredentials,
     PrivyAuthContext,
@@ -87,6 +96,7 @@ from veridex.dust_execution.runner import (
     ShutdownPolicy,
     StaleVenueBook,
     SubmitDecision,
+    provisional_session_id,
     run_dust_execution,
 )
 from veridex.dust_execution.signer import (
@@ -392,9 +402,57 @@ def _mode_b_manifest(binding: ExecutionWalletBinding | None = None, **kw: object
     return _manifest(**fields)
 
 
-#: A RECORDED-satisfied human-operator interlock proof (Gate#3 MAJOR-1). Stands in for the facade's
-#: minted proof so the runner-level E6-T4 arming positive controls still ARM offline.
-_RECORDED_INTERLOCK_PROOF = OperatorInterlockProof(satisfied=True, recording_receipt="operator-interlock:test:recorded")
+#: The operator-authorization ref bound into every recorded interlock (a non-secret ref, SEC-005).
+_INTERLOCK_OPERATOR_AUTH_REF = "op-ref-1"
+
+
+def _interlock_events(
+    *, operator_authorization_ref: str = _INTERLOCK_OPERATOR_AUTH_REF
+) -> tuple[OperatorInterlockEvent, ...]:
+    """The five fully-satisfied REQ-005 audit-trail events, in the fixed precondition order.
+
+    Mirrors what the facade's ``evaluate_operator_interlock`` records for a fully-satisfied interlock,
+    so a store-issued receipt over these events verifies exactly as the facade path would.
+    """
+    return tuple(
+        OperatorInterlockEvent(
+            sequence_no=index,
+            event_type="OperatorInterlockEvent",
+            source_ts=None,
+            recv_ts=_NOW_S * 1000,
+            precondition=name,
+            satisfied=True,
+            operator_authorization_ref=operator_authorization_ref,
+            first_order_authorized=True,
+        )
+        for index, name in enumerate(OPERATOR_PRECONDITIONS, start=1)
+    )
+
+
+#: The provisional session id the runner runs a live-guarded dust pass under (``strategy_id:mode``);
+#: the store-issued receipt below is bound to EXACTLY this identity, matching the runner's verify.
+_MODE_B_SESSION_ID = provisional_session_id(_manifest(), "live_guarded")
+
+#: The durable store the runner-level positive controls inject; it has DURABLY recorded the canonical
+#: interlock (Gate#3 M-1), so the store-ISSUED receipt below VERIFIES against the actual run.
+_INTERLOCK_STORE = InMemoryOperatorInterlockStore()
+_INTERLOCK_EVENTS = _interlock_events()
+_RECORDED_RECEIPT = _INTERLOCK_STORE.record(
+    session_id=_MODE_B_SESSION_ID,
+    events=_INTERLOCK_EVENTS,
+    operator_authorization_ref=_INTERLOCK_OPERATOR_AUTH_REF,
+    arming_attempt_ref=_ORDER_AUTH.idempotency_key,
+)
+
+#: A STORE-ISSUED, store-verifiable human-operator interlock proof (Gate#3 MAJOR-1 + M-1). Stands in
+#: for the facade's minted proof so the runner-level E6-T4 arming positive controls still ARM offline
+#: — the receipt is one the injected ``_INTERLOCK_STORE`` actually issued, not a caller-forged string.
+_RECORDED_INTERLOCK_PROOF = OperatorInterlockProof(
+    satisfied=True,
+    recording_receipt=_RECORDED_RECEIPT,
+    events=_INTERLOCK_EVENTS,
+    operator_authorization_ref=_INTERLOCK_OPERATOR_AUTH_REF,
+)
 
 #: Sentinel so ``_arming`` can distinguish "write_port not overridden" (build a fresh DEFAULT working
 #: port, keyed to the resolved binding) from an explicit ``write_port=None`` (the missing-port
@@ -488,6 +546,7 @@ async def _run(
         wallet_equity_at_decision=_WALLET_EQUITY,
         fixed_fraction=_FIXED_FRACTION,
         arming=_arming(binding, write_port=write_port) if mode == "live_guarded" else None,
+        operator_interlock_store=_INTERLOCK_STORE,
     )
 
 
@@ -808,6 +867,7 @@ async def _run_guarded(
     signer: SignerMode | None = None,  # None => default non-FAKE_LOCAL Mode-B signer
     write_port: object = _ARMING_DEFAULT_WRITE_PORT,  # override JUST the write port (ignored if `arming` given)
     order_auth: PrivyAuthContext | None = _ORDER_AUTH,  # ignored if `arming` given
+    operator_interlock_store: OperatorInterlockStore | None = _INTERLOCK_STORE,
     wallet_equity_at_decision: float = _WALLET_EQUITY,
     fixed_fraction: float = _FIXED_FRACTION,
     shutdown_policy: ShutdownPolicy = "leave_open",
@@ -836,6 +896,7 @@ async def _run_guarded(
         wallet_equity_at_decision=wallet_equity_at_decision,
         fixed_fraction=fixed_fraction,
         arming=effective_arming,  # type: ignore[arg-type]
+        operator_interlock_store=operator_interlock_store,
         request=request,
         safety=safety,
         session=session,
@@ -1139,6 +1200,7 @@ async def test_signed_payload_tick_is_single_sourced_from_runner_tick_size() -> 
         wallet_equity_at_decision=_WALLET_EQUITY,
         fixed_fraction=_FIXED_FRACTION,
         arming=_arming(binding, write_port=write_port),
+        operator_interlock_store=_INTERLOCK_STORE,
         tick_size=0.001,  # NON-default (but a pinned venue tick): exposes a hardcoded "0.01"
     )
 
@@ -1261,6 +1323,202 @@ async def test_direct_runner_call_with_technical_only_bundle_stays_unarmed() -> 
     assert adapter.submit_calls == 0, (
         "a technical-only bundle (no recorded interlock proof) must NOT arm/submit — REQ-005"
     )
+    (decision,) = result.decisions
+    assert decision.submitted is False
+    assert decision.abstain_reason == "operator_interlock_unproven"
+
+
+# --- Gate#3 M-1: the operator-interlock proof must be STORE-ISSUED + STORE-VERIFIED, not forgeable -
+#
+# The runner is public/exported; the proof it consumes must correspond to an interlock a durable
+# store ACTUALLY recorded for exactly THIS run's (session, ordered events, operator auth, arming
+# attempt). A caller-fabricated receipt, a receipt for a different session/attempt, an altered event
+# set, or a receipt the store never issued must ALL fail to arm — verified against a REAL store (NOT
+# an attacker-controlled one; the store is a trusted operator dependency, injected like the signer).
+
+
+class _NoOpInterlockStore:
+    """A store that LOOKS present but never durably persists — ``record`` returns a receipt-shaped
+    string yet ``verify`` NEVER confirms a row (models the "no-op ``lambda event: None`` sink" the
+    M-1 finding calls out: callback presence is NOT durability)."""
+
+    def record(
+        self,
+        *,
+        session_id: str,
+        events: tuple[OperatorInterlockEvent, ...],
+        operator_authorization_ref: str | None,
+        arming_attempt_ref: str,
+    ) -> str:
+        return f"operator-interlock:{session_id}:noop000000000000000000000000000000"
+
+    def verify(
+        self,
+        *,
+        session_id: str,
+        events: tuple[OperatorInterlockEvent, ...],
+        operator_authorization_ref: str | None,
+        arming_attempt_ref: str,
+        receipt: str,
+    ) -> bool:
+        return False
+
+
+def _store_issued_proof(
+    store: InMemoryOperatorInterlockStore,
+    *,
+    session_id: str,
+    events: tuple[OperatorInterlockEvent, ...] = _INTERLOCK_EVENTS,
+    operator_authorization_ref: str = _INTERLOCK_OPERATOR_AUTH_REF,
+    arming_attempt_ref: str = _ORDER_AUTH.idempotency_key,
+    proof_events: tuple[OperatorInterlockEvent, ...] | None = None,
+) -> OperatorInterlockProof:
+    """Record an interlock into ``store`` and return a proof carrying the STORE-ISSUED receipt.
+
+    ``proof_events`` overrides the events the PROOF carries (leaving the RECORDED events as ``events``)
+    so a test can present a receipt bound to events E while the proof claims a DIFFERENT set E'.
+    """
+    receipt = store.record(
+        session_id=session_id,
+        events=events,
+        operator_authorization_ref=operator_authorization_ref,
+        arming_attempt_ref=arming_attempt_ref,
+    )
+    return OperatorInterlockProof(
+        satisfied=True,
+        recording_receipt=receipt,
+        events=proof_events if proof_events is not None else events,
+        operator_authorization_ref=operator_authorization_ref,
+    )
+
+
+async def test_direct_runner_call_with_store_verified_proof_arms() -> None:
+    """POSITIVE CONTROL: a proof carrying a receipt the injected store ACTUALLY issued for THIS run's
+    session/events/auth/attempt VERIFIES → Mode B arms (offline; the keyless write port fires, never a
+    real wire). Makes the four adversarial cases below meaningful (not vacuously green)."""
+    binding = _binding()
+    adapter = RecordingFakeAdapter(fill=True)
+    write_port = _default_write_port(binding)
+    store = InMemoryOperatorInterlockStore()
+    proof = _store_issued_proof(store, session_id=_MODE_B_SESSION_ID)
+
+    result = await _run_guarded(
+        adapter=adapter,
+        arming=_arming(binding, write_port=write_port, operator_interlock=proof),
+        operator_interlock_store=store,
+    )
+
+    assert write_port.submit_calls == 1, "a store-VERIFIED interlock proof must let Mode B arm"
+    (decision,) = result.decisions
+    assert decision.submitted is True and decision.abstain_reason is None
+
+
+async def test_direct_runner_call_with_forged_proof_stays_unarmed() -> None:
+    """FORGED PROOF: a direct caller fabricates ``OperatorInterlockProof(True, "forged:anything")``
+    (even copying the real events) against a REAL store that never recorded it. The store cannot
+    verify a receipt it never issued → ``operator_interlock_unproven`` → no wire.
+
+    This is the exact M-1 exploit: before the fix the runner checked only non-emptiness of the
+    receipt, so a forged non-empty string armed real money."""
+    binding = _binding()
+    adapter = RecordingFakeAdapter(fill=True)
+    forged = OperatorInterlockProof(
+        satisfied=True,
+        recording_receipt="forged:anything",
+        events=_INTERLOCK_EVENTS,
+        operator_authorization_ref=_INTERLOCK_OPERATOR_AUTH_REF,
+    )
+
+    result = await _run_guarded(
+        adapter=adapter,
+        arming=_arming(binding, operator_interlock=forged),
+        operator_interlock_store=InMemoryOperatorInterlockStore(),  # a REAL store that never recorded it
+    )
+
+    assert adapter.submit_calls == 0, "a forged, never-issued receipt must NOT arm — M-1"
+    (decision,) = result.decisions
+    assert decision.submitted is False
+    assert decision.abstain_reason == "operator_interlock_unproven"
+
+
+async def test_direct_runner_call_with_wrong_session_receipt_stays_unarmed() -> None:
+    """WRONG SESSION: a receipt the store issued for session A, presented to a run of session B, must
+    NOT verify — the receipt is bound to the session, and the runner verifies against the session it is
+    ACTUALLY about to run (never the session the proof claims)."""
+    binding = _binding()
+    adapter = RecordingFakeAdapter(fill=True)
+    store = InMemoryOperatorInterlockStore()
+    proof = _store_issued_proof(store, session_id="dust-maker-v0:session-A")
+
+    result = await _run_guarded(
+        adapter=adapter,
+        arming=_arming(binding, operator_interlock=proof),
+        operator_interlock_store=store,
+        session=DustSafetySession(session_id="dust-maker-v0:session-B"),  # a DIFFERENT run session
+    )
+
+    assert adapter.submit_calls == 0, "a receipt issued for another session must NOT arm — M-1"
+    (decision,) = result.decisions
+    assert decision.submitted is False
+    assert decision.abstain_reason == "operator_interlock_unproven"
+
+
+async def test_direct_runner_call_with_altered_event_content_stays_unarmed() -> None:
+    """ALTERED EVENT: the store issued a receipt bound to events E, but the proof presents a DIFFERENT
+    event set E' (one precondition flipped) with that same receipt. The runner re-derives the binding
+    from the proof's events, so an altered set no longer matches the issued receipt → unarmed."""
+    binding = _binding()
+    adapter = RecordingFakeAdapter(fill=True)
+    store = InMemoryOperatorInterlockStore()
+    # Recorded (and issued a receipt) over the genuine all-satisfied events...
+    # ...but the PROOF claims a tampered set where the first-order authorization was flipped off.
+    tampered = tuple(
+        event.model_copy(update={"satisfied": False}) if index == 0 else event
+        for index, event in enumerate(_INTERLOCK_EVENTS)
+    )
+    proof = _store_issued_proof(store, session_id=_MODE_B_SESSION_ID, proof_events=tampered)
+
+    result = await _run_guarded(
+        adapter=adapter,
+        arming=_arming(binding, operator_interlock=proof),
+        operator_interlock_store=store,
+    )
+
+    assert adapter.submit_calls == 0, "a receipt whose bound events were altered must NOT arm — M-1"
+    (decision,) = result.decisions
+    assert decision.submitted is False
+    assert decision.abstain_reason == "operator_interlock_unproven"
+
+
+async def test_direct_runner_call_with_missing_record_receipt_stays_unarmed() -> None:
+    """MISSING RECORD: a well-formed, receipt-SHAPED string the store has NO row for (the store did
+    record a DIFFERENT arming attempt) must NOT verify — a plausible-looking receipt is not evidence of
+    a write; only an ACTUAL issued row is."""
+    binding = _binding()
+    adapter = RecordingFakeAdapter(fill=True)
+    store = InMemoryOperatorInterlockStore()
+    # The store recorded a DIFFERENT arming attempt (another idempotency key), so it is non-empty —
+    # but has no row for the receipt the proof presents.
+    store.record(
+        session_id=_MODE_B_SESSION_ID,
+        events=_INTERLOCK_EVENTS,
+        operator_authorization_ref=_INTERLOCK_OPERATOR_AUTH_REF,
+        arming_attempt_ref="idem-some-other-attempt",
+    )
+    proof = OperatorInterlockProof(
+        satisfied=True,
+        recording_receipt=f"operator-interlock:{_MODE_B_SESSION_ID}:0123456789abcdef0123456789abcdef",
+        events=_INTERLOCK_EVENTS,
+        operator_authorization_ref=_INTERLOCK_OPERATOR_AUTH_REF,
+    )
+
+    result = await _run_guarded(
+        adapter=adapter,
+        arming=_arming(binding, operator_interlock=proof),
+        operator_interlock_store=store,
+    )
+
+    assert adapter.submit_calls == 0, "a receipt-shaped string the store never issued must NOT arm — M-1"
     (decision,) = result.decisions
     assert decision.submitted is False
     assert decision.abstain_reason == "operator_interlock_unproven"

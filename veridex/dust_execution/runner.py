@@ -72,6 +72,7 @@ from veridex.dust_execution.contracts import (
     DustExecutionSessionMeta,
     DustRunLabelEvent,
     ExecutionMode,
+    OperatorInterlockEvent,
     OrderAckEvent,
     OrderCancelEvent,
     OrderStatus,
@@ -98,6 +99,7 @@ from veridex.dust_execution.manifest import (
 )
 from veridex.dust_execution.mode_b_write_port import ModeBWritePort
 from veridex.dust_execution.noncrossing import LegKind, OwnOrderLeg, Side, check_non_crossing
+from veridex.dust_execution.operator_interlock_store import OperatorInterlockStore
 from veridex.dust_execution.privy_control_plane import (
     PrivyAuthContext,
     PrivyPreflightResult,
@@ -297,25 +299,40 @@ class SubmitDecision:
 
 @dataclass(frozen=True)
 class OperatorInterlockProof:
-    """The RECORDED-satisfied human-operator interlock proof BOUND into the arming bundle (REQ-005).
+    """The STORE-ISSUED human-operator interlock proof BOUND into the arming bundle (REQ-005, M-1).
 
-    Gate#3 MAJOR-1: the five REQ-005/006 human preconditions are enforced in the facade, but the
-    runner is public/exported, so the arming ARTIFACT the runner consumes must itself carry proof
-    that the human interlock was satisfied AND durably RECORDED — otherwise a direct
-    :func:`run_dust_execution` with only the six TECHNICAL conditions would arm real money and
-    bypass the human gate. The facade is the ONLY sanctioned minter: it constructs this proof solely
-    after :func:`~veridex.dust_execution.facade.evaluate_operator_interlock` reports ``armed`` AND
-    every :class:`~veridex.dust_execution.contracts.OperatorInterlockEvent` was pushed to a durable
-    recording sink, deriving ``recording_receipt`` from those recorded events.
+    Gate#3 MAJOR-1 (+ M-1 follow-up): the five REQ-005/006 human preconditions are enforced in the
+    facade, but the runner is public/exported, so the arming ARTIFACT the runner consumes must itself
+    carry proof that the human interlock was satisfied AND durably PERSISTED — otherwise a direct
+    :func:`run_dust_execution` with only the six TECHNICAL conditions would arm real money and bypass
+    the human gate. The original fix carried a bool + a SELF-computed ``recording_receipt``, which was
+    caller-FORGEABLE: a direct caller could construct ``OperatorInterlockProof(True, "forged")`` and
+    arm. The M-1 fix makes the receipt STORE-VERIFIABLE — ``recording_receipt`` must be a receipt an
+    injected :class:`~veridex.dust_execution.operator_interlock_store.OperatorInterlockStore` ACTUALLY
+    ISSUED for exactly this run's ``(session_id, ordered event content, operator authorization, arming
+    attempt)``. The facade is the ONLY sanctioned minter: it constructs this proof solely after
+    :func:`~veridex.dust_execution.facade.evaluate_operator_interlock` reports ``armed`` AND the store
+    durably RECORDED the events and issued the receipt.
+
+    ``events`` (the recorded REQ-005 audit trail) and ``operator_authorization_ref`` are the
+    proof-carried binding CONTENT the runner re-presents to ``store.verify`` (the runner has no other
+    source for them); the session identity and arming attempt come from the LIVE run, never the proof.
 
     Fail-closed by construction: :func:`_mode_b_arming_block_reason` arms ONLY when ``satisfied is
-    True`` AND ``recording_receipt`` is a non-empty ref; a defaulted/absent proof (``None``), an
-    unsatisfied one, or one with no receipt keeps Mode B UNARMED. Carries ONLY a bool + a non-secret
-    ref (SEC-005), never a live handle.
+    True`` AND the injected store VERIFIES ``recording_receipt`` against the ACTUAL run session /
+    events / operator-auth / arming-attempt; a defaulted/absent proof (``None``), an unsatisfied one,
+    a forged/never-issued receipt, or a wrong-session/altered-event/wrong-attempt binding keeps Mode B
+    UNARMED. Carries ONLY bools / ids / non-secret refs (SEC-005), never a live handle.
     """
 
     satisfied: bool
     recording_receipt: str
+    #: The recorded REQ-005 audit-trail events this receipt was issued over (ordered content). The
+    #: runner re-presents them to ``store.verify`` — an altered/absent set fails to verify. Non-secret
+    #: (refs/bools only, SEC-005). Defaults empty so a technical-only/forged bundle carries none.
+    events: tuple[OperatorInterlockEvent, ...] = ()
+    #: The non-secret operator-authorization ref bound into the receipt (SEC-005); ``None`` when absent.
+    operator_authorization_ref: str | None = None
 
 
 @dataclass(frozen=True)
@@ -604,6 +621,17 @@ class _SeqCounter:
 # ---------------------------------------------------------------------------
 
 
+def provisional_session_id(manifest: StrategyExperimentManifest, mode: ExecutionMode) -> str:
+    """The PROVISIONAL session identity the runner runs under — derived from ``(strategy_id, mode)``.
+
+    The single source of the derived session id: both the session-meta preamble AND the facade's
+    operator-interlock recording bind to THIS value, so the receipt the store issues at record time
+    is bound to exactly the ``session.session_id`` the runner verifies against (a durable,
+    operator-assigned identity replaces this seam in a later task).
+    """
+    return f"{manifest.strategy_id}:{mode}"
+
+
 def _build_session_meta(
     *,
     manifest: StrategyExperimentManifest,
@@ -620,7 +648,7 @@ def _build_session_meta(
     ``manifest`` / ``envelope``.
     """
     return DustExecutionSessionMeta(
-        session_id=f"{manifest.strategy_id}:{mode}",  # PROVISIONAL — real session identity: later task
+        session_id=provisional_session_id(manifest, mode),  # PROVISIONAL — real session identity: later task
         mode=mode,
         wallet_ref=signer.mode,
         manifest_hash=manifest.manifest_hash(),
@@ -1069,8 +1097,26 @@ def _authorization_block_reason(
     return None
 
 
+def _arming_attempt_ref(arming: ModeBArming) -> str:
+    """The non-secret 'current arming attempt' ref bound into the interlock receipt.
+
+    Bound to the REAL per-attempt identity that already exists on the bundle: the signed
+    :class:`~veridex.dust_execution.privy_control_plane.PrivyAuthContext`'s ``idempotency_key`` (the
+    de-dup key for THIS run's authorized mutation). Read from the LIVE arming bundle on both the
+    facade (record) and runner (verify) sides — never invented, never from the proof — so a receipt
+    issued for a DIFFERENT authorization attempt does not verify against this bundle. ``""`` when the
+    bundle carries no ``order_auth`` (an armed run without it is already blocked upstream).
+    """
+    return arming.order_auth.idempotency_key if arming.order_auth is not None else ""
+
+
 def _mode_b_arming_block_reason(
-    arming: ModeBArming | None, *, manifest: StrategyExperimentManifest, signer: Signer
+    arming: ModeBArming | None,
+    *,
+    manifest: StrategyExperimentManifest,
+    signer: Signer,
+    session_id: str,
+    store: OperatorInterlockStore | None,
 ) -> AbstainReason | None:
     """Return ``"mode_b_not_armed"`` unless EVERY Mode-B arming precondition positively passes.
 
@@ -1137,14 +1183,25 @@ def _mode_b_arming_block_reason(
     # surface ONLY and is never eligible to substitute for either.
     if arming.write_port is None or arming.order_auth is None:
         return "mode_b_write_port_missing"
-    # Gate#3 MAJOR-1 (REQ-005): the technical conditions above are necessary but NOT sufficient —
-    # the runner is public/exported, so a technical-only bundle must NOT arm real money. The arming
-    # artifact must ALSO carry a RECORDED-satisfied human-operator interlock proof (minted only by the
-    # facade after the five human preconditions were satisfied AND durably recorded). Checked LAST so
-    # a technical-precondition failure still surfaces its own reason; a missing/unsatisfied/unrecorded
-    # proof fails closed as ``operator_interlock_unproven``.
+    # Gate#3 MAJOR-1 (REQ-005) + M-1: the technical conditions above are necessary but NOT sufficient —
+    # the runner is public/exported, so a technical-only or FORGED-receipt bundle must NOT arm real
+    # money. The arming artifact must ALSO carry an UNFORGEABLE, STORE-ISSUED human-operator interlock
+    # proof: a receipt the injected durable ``store`` ACTUALLY issued for exactly THIS run's session
+    # identity, ordered event content, operator authorization, and arming attempt. Presence of a
+    # receipt STRING is NOT proof (the M-1 forge) — the store must VERIFY it against its actual rows.
+    # Checked LAST so a technical-precondition failure still surfaces its own reason; a missing /
+    # unsatisfied / forged / never-issued / wrong-session / altered-event / wrong-attempt proof (or a
+    # missing store to verify against) fails closed as ``operator_interlock_unproven``.
     proof = arming.operator_interlock
-    if proof is None or proof.satisfied is not True or not proof.recording_receipt:
+    if proof is None or proof.satisfied is not True or store is None:
+        return "operator_interlock_unproven"
+    if not store.verify(
+        session_id=session_id,
+        events=proof.events,
+        operator_authorization_ref=proof.operator_authorization_ref,
+        arming_attempt_ref=_arming_attempt_ref(arming),
+        receipt=proof.recording_receipt,
+    ):
         return "operator_interlock_unproven"
     return None
 
@@ -1279,6 +1336,7 @@ async def run_dust_execution(
     fixed_fraction: float,
     request: MMExecutionToolRequest | None = None,
     arming: ModeBArming | None = None,
+    operator_interlock_store: OperatorInterlockStore | None = None,
     safety: SafetyController | None = None,
     session: DustSafetySession | None = None,
     risk: RiskAccumulator | None = None,
@@ -1452,7 +1510,13 @@ async def run_dust_execution(
 
     # Mode A→B HARD GATE + fail-closed arming: computed once; Mode A never arms (reason is None).
     arming_block_reason = (
-        _mode_b_arming_block_reason(arming, manifest=manifest, signer=signer)
+        _mode_b_arming_block_reason(
+            arming,
+            manifest=manifest,
+            signer=signer,
+            session_id=session.session_id,
+            store=operator_interlock_store,
+        )
         if mode == "live_guarded"
         else None
     )
@@ -2374,5 +2438,6 @@ __all__ = [
     "ShutdownPolicy",
     "StaleVenueBook",
     "SubmitDecision",
+    "provisional_session_id",
     "run_dust_execution",
 ]

@@ -49,6 +49,7 @@ from veridex.dust_execution.contracts import (
     _FrozenModel,
     _reject_price_out_of_unit_interval,
 )
+from veridex.dust_execution.operator_interlock_store import OperatorInterlockStore
 from veridex.runtime.runtime_events import RuntimeEventType, RuntimeStatus, runtime_event
 
 if TYPE_CHECKING:
@@ -465,28 +466,6 @@ def evaluate_operator_interlock(
     return OperatorInterlockGate(armed=not missing, missing=missing, events=events)
 
 
-def _interlock_recording_receipt(
-    session_id: str, events: tuple[OperatorInterlockEvent, ...]
-) -> str:
-    """Derive an OPAQUE, deterministic receipt REF proving the interlock events were DURABLY recorded.
-
-    Gate#3 MAJOR-1 (REQ-005): the arming path binds this receipt into the runner's
-    :class:`~veridex.dust_execution.runner.OperatorInterlockProof` ONLY after every
-    :class:`OperatorInterlockEvent` was pushed to the (mandatory) recording sink, so a satisfied but
-    UNRECORDED interlock cannot arm. The ref pins the session identity + the recorded preconditions
-    via a sha256 digest — a REFERENCE STRING only, never a secret or live handle (SEC-005).
-    """
-    canonical = json.dumps(
-        {
-            "session_id": session_id,
-            "recorded": [(event.sequence_no, event.precondition, event.satisfied) for event in events],
-        },
-        sort_keys=True,
-    )
-    digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
-    return f"operator-interlock:{session_id}:{digest[:16]}"
-
-
 async def propose_mm_execution(
     request: MMExecutionToolRequest,
     *,
@@ -501,7 +480,7 @@ async def propose_mm_execution(
     fixed_fraction: float,
     arming: ModeBArming | None = None,
     operator_interlock: OperatorInterlock | None = None,
-    interlock_sink: Callable[[OperatorInterlockEvent], None] | None = None,
+    interlock_store: OperatorInterlockStore | None = None,
     event_sink: RuntimeEventSink | None = None,
     agent_id: str = _FACADE_AGENT_ID,
     run_id: str | None = None,
@@ -540,11 +519,15 @@ async def propose_mm_execution(
             When Mode B is being armed (``arming`` is supplied), ALL FIVE operator preconditions must
             be positively satisfied; a missing one is an explicit no-go that WITHHOLDS the arming
             bundle so Mode B stays UNARMED. ``None`` is treated fail-closed (all-unsatisfied).
-        interlock_sink: Sink recording each :class:`OperatorInterlockEvent` (the REQ-005 audit
-            trail). MANDATORY to arm Mode B (Gate#3 MAJOR-1): REQ-005 requires the interlock be
-            satisfied AND durably RECORDED, so when Mode B is being armed a ``None`` sink FAILS CLOSED
-            (the arming bundle is withheld — no arm, no submit). An offline test injects a recording
-            sink; the production arming path refuses to arm without one.
+        interlock_store: The durable :class:`~veridex.dust_execution.operator_interlock_store.
+            OperatorInterlockStore` that ISSUES and STORE-VERIFIES the interlock receipt (the REQ-005
+            audit trail). MANDATORY to arm Mode B (Gate#3 MAJOR-1 + M-1): REQ-005 requires the
+            interlock be satisfied AND durably PERSISTED, and the receipt must be UNFORGEABLE — the
+            store must actually ISSUE it. When Mode B is being armed a ``None`` store (or one that does
+            not durably persist) FAILS CLOSED (the arming bundle is withheld — no arm, no submit); the
+            SAME store is threaded into the runner, which re-VERIFIES the receipt against the actual
+            session/events/auth/attempt before arming. An offline test injects an in-memory store; the
+            production arming path refuses to arm without a real one.
         event_sink: Optional OPS ``RuntimeEvent`` sink; when ``None`` the proposer emits nothing.
         agent_id: Non-secret OPS ``agent_id`` label stamped on emitted telemetry.
         run_id: Optional OPS correlation id for the emitted lifecycle events.
@@ -555,6 +538,8 @@ async def propose_mm_execution(
     """
     from veridex.dust_execution.runner import (  # lazy: breaks the runner<->facade import cycle
         OperatorInterlockProof,
+        _arming_attempt_ref,
+        provisional_session_id,
         run_dust_execution,
     )
 
@@ -574,39 +559,51 @@ async def propose_mm_execution(
     _emit(RuntimeEventType.RUN_STARTED, intent_kind=request.intent_kind, mode=request.mode)
     _emit(RuntimeEventType.STATUS_CHANGED, status=RuntimeStatus.RUNNING.value)
 
-    # E7-T3 human operator precondition interlock (REQ-005/006, AC-002) + Gate#3 MAJOR-1: Mode B cannot
-    # ARM unless ALL FIVE operator preconditions are positively satisfied AND durably RECORDED. This is
-    # enforced on BOTH legs:
-    #   (1) MANDATORY RECORDING (fail-closed sink) — REQ-005 requires "satisfied AND recorded", so a
-    #       ``None`` sink (nowhere to durably record) WITHHOLDS the arming bundle: no arm, no submit.
-    #       An offline test injects a recording sink; the production arming path refuses without one.
-    #   (2) UNBYPASSABLE BINDING — on a fully-satisfied+recorded interlock the facade BINDS an
-    #       ``OperatorInterlockProof`` (carrying the durable-recording receipt) INTO the arming
-    #       artifact the runner consumes, so a DIRECT ``run_dust_execution`` with a technical-only
-    #       bundle (no proof) stays UNARMED. A missing precondition WITHHOLDS the bundle (explicit
-    #       no-go). Never a parallel arming path — the runner's EXISTING gate is the single enforcer.
+    # E7-T3 human operator precondition interlock (REQ-005/006, AC-002) + Gate#3 MAJOR-1 & M-1: Mode B
+    # cannot ARM unless ALL FIVE operator preconditions are positively satisfied AND durably PERSISTED
+    # via an UNFORGEABLE, STORE-ISSUED receipt. This is enforced on BOTH legs:
+    #   (1) DURABLE, STORE-ISSUED RECEIPT — REQ-005 requires "satisfied AND recorded", and M-1 requires
+    #       the recording be UNFORGEABLE: callback presence and a self-computed digest are NOT evidence
+    #       of a write. The facade records the events into the injected durable
+    #       :class:`OperatorInterlockStore` and takes the receipt the STORE ISSUES. A ``None`` store
+    #       (nowhere to persist) yields NO receipt -> the arming bundle is WITHHELD (no arm, no submit).
+    #   (2) UNBYPASSABLE, STORE-VERIFIABLE BINDING — on a fully-satisfied+recorded interlock the facade
+    #       BINDS an ``OperatorInterlockProof`` (carrying the STORE-ISSUED receipt + the recorded events
+    #       + operator-auth ref) INTO the arming artifact, AND threads the SAME store into the runner,
+    #       which re-VERIFIES the receipt against the ACTUAL session/events/auth/attempt. So a DIRECT
+    #       ``run_dust_execution`` with a technical-only or FORGED-receipt bundle stays UNARMED. A
+    #       missing precondition WITHHOLDS the bundle. Never a parallel arming path — the runner's
+    #       EXISTING gate (now store-verified) is the single enforcer.
     effective_arming = arming
     if request.mode == "live_guarded" and arming is not None:
         interlock_gate = evaluate_operator_interlock(operator_interlock, recv_ts_ms=now_fn() * 1000)
-        # REQ-005 requires the interlock be RECORDED: a ``None`` sink has nowhere to durably record,
-        # so the interlock is NOT recorded. We only push events (and can only claim a durable receipt)
-        # when a real sink is present.
-        recorded = interlock_sink is not None
-        if interlock_sink is not None:
-            for interlock_event in interlock_gate.events:
-                interlock_sink(interlock_event)
-        # Arm ONLY when every precondition is satisfied AND the interlock was durably recorded; then
-        # BIND the proof (with its recording receipt) into the arming artifact the runner consumes.
-        # Otherwise WITHHOLD the bundle — a missing precondition OR a missing recording sink is an
-        # explicit no-go — so the runner's existing gate keeps Mode B UNARMED (fail closed).
-        if interlock_gate.armed and recorded:
+        operator_auth_ref = (
+            interlock_gate.events[0].operator_authorization_ref if interlock_gate.events else None
+        )
+        # Only a durable store can ISSUE a receipt; a ``None`` store cannot record -> no receipt. The
+        # receipt is NEVER self-computed here — the store issues it, bound to the SAME session identity
+        # the runner will run under (its provisional session id), the ordered events, the operator-auth
+        # ref, and this run's arming-attempt ref.
+        receipt: str | None = None
+        if interlock_gate.armed and interlock_store is not None:
+            receipt = interlock_store.record(
+                session_id=provisional_session_id(manifest, request.mode),
+                events=interlock_gate.events,
+                operator_authorization_ref=operator_auth_ref,
+                arming_attempt_ref=_arming_attempt_ref(arming),
+            )
+        # Arm ONLY when every precondition is satisfied AND the store durably ISSUED a receipt; then
+        # BIND the store-issued proof into the arming artifact the runner consumes. Otherwise WITHHOLD
+        # the bundle — a missing precondition OR a missing/None store is an explicit no-go — so the
+        # runner's existing (store-verified) gate keeps Mode B UNARMED (fail closed).
+        if interlock_gate.armed and receipt is not None:
             effective_arming = replace(
                 arming,
                 operator_interlock=OperatorInterlockProof(
                     satisfied=True,
-                    recording_receipt=_interlock_recording_receipt(
-                        request.session_id, interlock_gate.events
-                    ),
+                    recording_receipt=receipt,
+                    events=interlock_gate.events,
+                    operator_authorization_ref=operator_auth_ref,
                 ),
             )
         else:
@@ -625,6 +622,7 @@ async def propose_mm_execution(
         fixed_fraction=fixed_fraction,
         request=request,
         arming=effective_arming,
+        operator_interlock_store=interlock_store,
     )
 
     tool_result = _to_tool_result(result, request)

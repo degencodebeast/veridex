@@ -30,7 +30,12 @@ from pydantic import BaseModel, ValidationError
 # already built for this in ``tests/test_dust_execution_runner.py`` (which itself reuses the E3-T8
 # fakes) rather than re-deriving them a third time.
 from tests.test_dust_execution_privy_signer import _WALLET_ADDRESS
-from tests.test_dust_execution_runner import _ORDER_AUTH, _default_write_port, _mode_b_signer
+from tests.test_dust_execution_runner import (
+    _ORDER_AUTH,
+    _default_write_port,
+    _mode_b_signer,
+    _NoOpInterlockStore,
+)
 from veridex.dust_execution import facade  # module handle: proposer looked up dynamically (RED-clean)
 from veridex.dust_execution.clobv2_gate import Clobv2GateResult
 from veridex.dust_execution.contracts import DustRunLabelEvent, OperatorInterlockEvent
@@ -41,6 +46,10 @@ from veridex.dust_execution.facade import (
     OperatorInterlock,
 )
 from veridex.dust_execution.manifest import StrategyExperimentManifest
+from veridex.dust_execution.operator_interlock_store import (
+    InMemoryOperatorInterlockStore,
+    OperatorInterlockStore,
+)
 from veridex.dust_execution.privy_control_plane import PrivyPreflightResult, ProvisioningResult
 from veridex.dust_execution.risk import RiskAccumulator
 from veridex.dust_execution.runner import (
@@ -628,7 +637,7 @@ async def _drive_mode_b(
     arming: ModeBArming | None,
     binding: ExecutionWalletBinding,
     adapter: FakeVenueAdapter,
-    interlock_sink: list[OperatorInterlockEvent] | None = None,
+    interlock_store: OperatorInterlockStore | None = None,
 ) -> MMExecutionToolResult:
     manifest = _mode_b_mm_manifest(binding)
     envelope = _mm_env()
@@ -647,7 +656,7 @@ async def _drive_mode_b(
         fixed_fraction=0.01,
         arming=arming,
         operator_interlock=interlock,
-        interlock_sink=(interlock_sink.append if interlock_sink is not None else None),
+        interlock_store=interlock_store,
     )
 
 
@@ -720,22 +729,26 @@ def test_model_makes_no_legal_conclusion_only_records_operator_jurisdiction_asse
 @pytest.mark.parametrize("missing", _EXPECTED_PRECONDITIONS)
 async def test_mode_b_stays_unarmed_when_any_operator_precondition_is_missing(missing: str) -> None:
     """WIRING: even with a fully-passing E6-T4 arming bundle, a single missing operator precondition
-    keeps Mode B UNARMED — NO order reaches the wire, and the interlock is recorded (REQ-005/AC-002)."""
+    keeps Mode B UNARMED — NO order reaches the wire, and NO durable arming receipt is issued.
+
+    Gate#3 M-1: a no-go interlock is never durably CERTIFIED — the store records (and issues a
+    receipt for) an arming attempt ONLY when the interlock is fully satisfied, so a missing
+    precondition leaves the store empty (the per-precondition no-go event recording is covered by
+    ``test_interlock_is_a_no_go_when_any_single_precondition_is_missing`` at the gate level)."""
     binding = _mm_binding()
     adapter = FakeVenueAdapter(fill=True)
-    recorded: list[OperatorInterlockEvent] = []
+    store = InMemoryOperatorInterlockStore()
 
     await _drive_mode_b(
         interlock=_full_interlock(**_MISSING_OVERRIDE[missing]),
         arming=_mm_arming(binding),  # a fully-passing E6-T4 arming bundle
         binding=binding,
         adapter=adapter,
-        interlock_sink=recorded,
+        interlock_store=store,
     )
 
     assert adapter.submit_calls == 0, f"a missing '{missing}' precondition must keep Mode B UNARMED"
-    by_name = {event.precondition: event for event in recorded}
-    assert by_name[missing].satisfied is False, "the no-go precondition is RECORDED unsatisfied"
+    assert store.rows() == (), "a no-go interlock must issue NO durable arming receipt (fail closed)"
 
 
 async def test_mode_b_arms_and_records_when_all_operator_preconditions_are_satisfied() -> None:
@@ -745,32 +758,35 @@ async def test_mode_b_arms_and_records_when_all_operator_preconditions_are_satis
     binding = _mm_binding()
     adapter = FakeVenueAdapter(fill=True)
     write_port = _default_write_port(binding)
-    recorded: list[OperatorInterlockEvent] = []
+    store = InMemoryOperatorInterlockStore()
 
     result = await _drive_mode_b(
         interlock=_full_interlock(),
         arming=_mm_arming(binding, write_port=write_port),
         binding=binding,
         adapter=adapter,
-        interlock_sink=recorded,
+        interlock_store=store,
     )
 
     assert write_port.submit_calls == 1, "a fully-satisfied interlock + armed bundle must reach the wire"
     assert adapter.submit_calls == 0, "Mode B must NEVER reach the generic adapter submit surface"
     assert result.admission == "APPROVED"
-    assert tuple(event.precondition for event in recorded) == _EXPECTED_PRECONDITIONS
-    assert all(event.satisfied is True for event in recorded)
+    # The store durably recorded exactly one arming attempt, over all five satisfied preconditions.
+    (row,) = store.rows()
+    assert tuple(event.precondition for event in row.events) == _EXPECTED_PRECONDITIONS
+    assert all(event.satisfied is True for event in row.events)
 
 
-async def test_mode_b_fails_closed_when_no_recording_sink_even_if_interlock_satisfied() -> None:
+async def test_mode_b_fails_closed_when_no_recording_store_even_if_interlock_satisfied() -> None:
     """Gate#3 MAJOR-1 (REQ-005): a satisfied interlock is only "satisfied" if it was durably
-    RECORDED. With ``interlock_sink=None`` there is NOWHERE to record the five
-    ``OperatorInterlockEvent``s, so Mode B must FAIL CLOSED — no arm, no submit — EVEN when all five
-    preconditions are asserted True. REQ-005 is absolute: satisfied AND recorded.
+    RECORDED. With ``interlock_store=None`` there is NOWHERE to durably persist the five
+    ``OperatorInterlockEvent``s (and no store to ISSUE a receipt), so Mode B must FAIL CLOSED — no
+    arm, no submit — EVEN when all five preconditions are asserted True. REQ-005 is absolute:
+    satisfied AND recorded.
 
-    RED before the fix: the facade evaluates the armed interlock, records NOTHING (sink None), yet
-    passes the arming bundle through and submits an UNRECORDED real order (``submit_calls == 1``).
-    GREEN after: no sink → withhold the arming bundle → ``submit_calls == 0``.
+    RED before the fix: the facade evaluated the armed interlock, treated CALLBACK PRESENCE as
+    durability, and submitted an UNRECORDED real order (``submit_calls == 1``). GREEN after: no store
+    → no store-issued receipt → withhold the arming bundle → ``submit_calls == 0``.
     """
     binding = _mm_binding()
     adapter = FakeVenueAdapter(fill=True)
@@ -780,12 +796,38 @@ async def test_mode_b_fails_closed_when_no_recording_sink_even_if_interlock_sati
         arming=_mm_arming(binding),  # a fully-passing E6-T4 technical arming bundle
         binding=binding,
         adapter=adapter,
-        interlock_sink=None,  # nowhere to durably record → REQ-005 fails closed
+        interlock_store=None,  # nowhere to durably record / issue a receipt → REQ-005 fails closed
     )
 
     assert adapter.submit_calls == 0, (
-        "a satisfied interlock with NO recording sink must FAIL CLOSED — REQ-005 requires recorded"
+        "a satisfied interlock with NO durable store must FAIL CLOSED — REQ-005 requires recorded"
     )
+
+
+async def test_mode_b_fails_closed_when_store_does_not_durably_persist() -> None:
+    """Gate#3 M-1: callback/store PRESENCE is NOT durability. A no-op store that RETURNS a
+    receipt-shaped string but never durably persists (its ``verify`` never confirms a row) must FAIL
+    CLOSED — even with all five preconditions satisfied. The SAME store is threaded into the runner,
+    which cannot verify the receipt → the arming bundle is withheld → no arm, no submit.
+
+    RED before the fix: the facade treated ``interlock_sink is not None`` (mere presence) as durable
+    and armed on a no-op sink, submitting a real order (``execution_status == "SUBMITTED"``). GREEN
+    after: a non-persisting store yields an unverifiable receipt → withheld.
+    """
+    binding = _mm_binding()
+    adapter = FakeVenueAdapter(fill=True)
+
+    result = await _drive_mode_b(
+        interlock=_full_interlock(),  # all five human preconditions asserted True
+        arming=_mm_arming(binding),  # a fully-passing E6-T4 technical arming bundle
+        binding=binding,
+        adapter=adapter,
+        interlock_store=_NoOpInterlockStore(),  # present, but never durably persists → verify False
+    )
+
+    assert adapter.submit_calls == 0, "a no-op (non-persisting) store must FAIL CLOSED — M-1"
+    assert result.execution_status != "SUBMITTED", "presence-as-durability must never report SUBMITTED"
+    assert result.execution_status == "NOT_ARMED"
 
 
 def test_facade_proposer_is_not_registered_as_a_tool_on_the_tools_empty_agent() -> None:
@@ -849,7 +891,7 @@ async def _drive_mode_b_kind(
     interlock: OperatorInterlock | None,
     binding: ExecutionWalletBinding,
     adapter: FakeVenueAdapter,
-    interlock_sink: list[OperatorInterlockEvent] | None = None,
+    interlock_store: OperatorInterlockStore | None = None,
 ) -> MMExecutionToolResult:
     """Drive a Mode-B run for an arbitrary admitted intent kind (hashes built to MATCH the manifest)."""
     manifest = _mode_b_mm_manifest(binding)
@@ -882,7 +924,7 @@ async def _drive_mode_b_kind(
         fixed_fraction=0.01,
         arming=arming,
         operator_interlock=interlock,
-        interlock_sink=(interlock_sink.append if interlock_sink is not None else None),
+        interlock_store=interlock_store,
     )
 
 
@@ -900,7 +942,6 @@ async def test_result_reports_not_armed_when_interlock_withholds_execution() -> 
     a bare ``('APPROVED', ())`` that reads as approved-AND-executed (Gate#3 MAJOR-3)."""
     binding = _mm_binding()
     adapter = FakeVenueAdapter(fill=True)
-    recorded: list[OperatorInterlockEvent] = []
 
     result = await _drive_mode_b_kind(
         intent_kind="take",
@@ -909,7 +950,7 @@ async def test_result_reports_not_armed_when_interlock_withholds_execution() -> 
         interlock=_full_interlock(first_order_authorized=False),  # the human interlock FAILS
         binding=binding,
         adapter=adapter,
-        interlock_sink=recorded,
+        interlock_store=InMemoryOperatorInterlockStore(),
     )
 
     # NO order reached the wire — execution was WITHHELD.
@@ -929,7 +970,6 @@ async def test_result_reports_abstained_for_an_armed_no_quote_intent() -> None:
     ABSTAINED`` with the ``intent_no_quote`` reason, NOT an executed approval (Gate#3 MAJOR-3)."""
     binding = _mm_binding()
     adapter = FakeVenueAdapter(fill=True)
-    recorded: list[OperatorInterlockEvent] = []
 
     result = await _drive_mode_b_kind(
         intent_kind="no_quote",
@@ -938,7 +978,7 @@ async def test_result_reports_abstained_for_an_armed_no_quote_intent() -> None:
         interlock=_full_interlock(),  # fully armed — arming is NOT the reason for the abstain
         binding=binding,
         adapter=adapter,
-        interlock_sink=recorded,
+        interlock_store=InMemoryOperatorInterlockStore(),
     )
 
     assert adapter.submit_calls == 0
@@ -955,7 +995,6 @@ async def test_result_reports_submitted_for_a_clean_armed_take() -> None:
     binding = _mm_binding()
     adapter = FakeVenueAdapter(fill=True)
     write_port = _default_write_port(binding)
-    recorded: list[OperatorInterlockEvent] = []
 
     result = await _drive_mode_b_kind(
         intent_kind="take",
@@ -964,7 +1003,7 @@ async def test_result_reports_submitted_for_a_clean_armed_take() -> None:
         interlock=_full_interlock(),
         binding=binding,
         adapter=adapter,
-        interlock_sink=recorded,
+        interlock_store=InMemoryOperatorInterlockStore(),
     )
 
     assert write_port.submit_calls == 1
