@@ -32,6 +32,7 @@ invariant). R4-A ships safety-complete WITHOUT R4-B: the proposer functions with
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 from collections.abc import Awaitable, Callable
@@ -558,6 +559,82 @@ def _fail_closed_session_identity_mismatch(
     return tool_result
 
 
+def _reservation_attempt_id(
+    request: MMExecutionToolRequest, *, prior_attempt_index: int
+) -> str:
+    """Derive a STABLE, deterministic per-attempt idempotency identity for the durable reservation.
+
+    Gate#3 R4-MAJOR-1: the attempt_id binds the possibly-live attempt to (the operator-assigned
+    ``session_id``, this request's admission fingerprint, and its position in the durable attempt
+    sequence — the monotonic ``prior_attempt_index`` taken from the durable count BEFORE the reserve).
+    Identical inputs → identical id, so a RETRY at the same durable position reconciles to the existing
+    reservation rather than double-reserving; two distinct calls (whose prior index advanced because the
+    earlier attempt is durably counted) get DISTINCT ids so each reserves its own possibly-live slot. A
+    reference string only — never a secret or a live handle (SEC-005).
+    """
+    fingerprint = json.dumps(
+        {
+            "session_id": request.session_id,
+            "intent_kind": request.intent_kind,
+            "manifest_hash": request.manifest_hash,
+            "policy_hash": request.policy_hash,
+            "strategy_config_hash": request.strategy_config_hash,
+            "mode": request.mode,
+            "attempt_index": prior_attempt_index,
+        },
+        sort_keys=True,
+    )
+    digest = hashlib.sha256(fingerprint.encode("utf-8")).hexdigest()
+    return f"dust-attempt:{request.session_id}:{digest[:16]}"
+
+
+def _fail_closed_reservation_failed(
+    request: MMExecutionToolRequest,
+    *,
+    envelope: PolicyEnvelope,
+    emit: Callable[..., None],
+) -> MMExecutionToolResult:
+    """Return the Gate#3 R4-MAJOR-1 fail-closed result when the durable BEFORE-wire reservation fails.
+
+    The possibly-live attempt must be durably RESERVED before the runner reaches the write port. When
+    the reserve call raises (a durable-store outage), the money path must NOT be entered: the runner is
+    never reached and no write port is called, so no possibly-live order can exist without a durable cap
+    consumption. This returns a typed NOT_ARMED/denied result and emits the honest terminal OPS
+    telemetry, carrying only the pinned honest labels + closed-vocab reason codes (SEC-005), never a
+    live handle.
+    """
+    tool_result = MMExecutionToolResult(
+        admission="DENIED",
+        reason_codes=("durable_reservation_failed",),
+        execution_status="NOT_ARMED",
+        execution_reason_codes=("mode_b_not_armed",),
+        lifecycle_receipt_ref=f"dust-lifecycle:{request.session_id}:reservation-failed",
+        run_label=_DEFAULT_RUN_LABEL,
+        calibration_label=_DEFAULT_CALIBRATION_LABEL,
+        edge_label=_DEFAULT_EDGE_LABEL,
+        evidence_class=_DEFAULT_EVIDENCE_CLASS,
+        policy_hash=envelope.policy_hash(),
+    )
+    emit(
+        RuntimeEventType.ACTION_EMITTED,
+        admission=tool_result.admission,
+        execution_status=tool_result.execution_status,
+        intent_kind=request.intent_kind,
+    )
+    emit(
+        RuntimeEventType.RUN_COMPLETED,
+        status=RuntimeStatus.COMPLETED.value,
+        admission=tool_result.admission,
+        reason_codes=list(tool_result.reason_codes),
+        execution_status=tool_result.execution_status,
+        execution_reason_codes=list(tool_result.execution_reason_codes),
+        lifecycle_receipt_ref=tool_result.lifecycle_receipt_ref,
+        session_status="FAILED",
+        submitted_count=0,
+    )
+    return tool_result
+
+
 async def propose_mm_execution(
     request: MMExecutionToolRequest,
     *,
@@ -668,10 +745,9 @@ async def propose_mm_execution(
     # run/session/day order caps and realized-loss caps from HONEST durable inputs, never a fresh/zero
     # default that resets on every call (the MAJOR-2 hole: two same-session calls both reaching the
     # write port, and a prior realized loss never reconstructed before the next arming — SAF-002).
+    now_dt = datetime.fromtimestamp(now_fn(), tz=UTC)
     durable_state = (
-        provider.load(session_id=request.session_id, now=datetime.fromtimestamp(now_fn(), tz=UTC))
-        if provider is not None
-        else None
+        provider.load(session_id=request.session_id, now=now_dt) if provider is not None else None
     )
 
     # Live mode (``live_guarded``) FAILS CLOSED when the durable source is absent: a real-money run must
@@ -703,6 +779,27 @@ async def propose_mm_execution(
         if durable_state is not None
         else provisional_session_id(manifest, request.mode)
     )
+
+    # Gate#3 R4-MAJOR-1: durably RESERVE a possibly-live attempt BEFORE the runner reaches the write
+    # port — the durable-cap analog of the lane's persist-BEFORE-sign discipline. The reservation counts
+    # toward the session/UTC-day caps IMMEDIATELY and durably (``load`` counts reserved-but-unsettled
+    # rows), so a durable-store failure or a process crash AFTER the wire cannot reset the cap: the
+    # reserved row stands and the NEXT call sees it. If the reserve RAISES (store outage) the money path
+    # is NOT entered — the runner is never reached and no write port is called (fail closed). The
+    # ``attempt_id`` is a STABLE idempotency identity keyed to this attempt's position in the durable
+    # sequence, so a retry reconciles rather than double-reserving. Only on the durable-provider path
+    # (fresh/zero Mode-A dry-runs place no orders, so there is nothing to reserve).
+    attempt_id: str | None = None
+    if provider is not None and durable_state is not None:
+        attempt_id = _reservation_attempt_id(
+            request, prior_attempt_index=durable_state.prior_session_order_count
+        )
+        try:
+            provider.reserve(
+                session_identity=session_identity, now=now_dt, attempt_id=attempt_id
+            )
+        except Exception:
+            return _fail_closed_reservation_failed(request, envelope=envelope, emit=_emit)
 
     # E7-T3 human operator precondition interlock (REQ-005/006, AC-002) + Gate#3 MAJOR-1 & M-1: Mode B
     # cannot ARM unless ALL FIVE operator preconditions are positively satisfied AND durably PERSISTED
@@ -792,13 +889,18 @@ async def propose_mm_execution(
         ),
     )
 
-    # Gate#3 MAJOR-2 persist-back: record this run's possibly-live attempts (accepted OR uncertain-ACK
-    # — ``submitted_count``) back THROUGH the SAME identity, so the NEXT call reads them as the durable
-    # prior session/day counts. R4-A's sealed lifecycle carries no ``realized_pnl`` (SEC-002), so
-    # realized-fill LOSS is reconstructed by the provider's own durable venue-reconciliation ledger
-    # (fed where PnL is computed), never fabricated from the sealed events here.
-    if provider is not None and durable_state is not None:
-        provider.record_run(session_identity=session_identity, attempts=result.submitted_count)
+    # Gate#3 R4-MAJOR-1 settle: record the reserved attempt's outcome AFTER the run. ``committed`` is
+    # True iff a possibly-live order actually reached the wire (``submitted_count`` — accepted OR
+    # uncertain-ACK), which KEEPS the reservation counted so the NEXT call reads it as the durable prior
+    # session/day count; else the reservation is RELEASED so an abstain does not wrongly consume a slot.
+    # A ``settle`` failure AFTER a fired wire must NOT reset the reservation — the reserved row is
+    # already durable — so any settle exception is swallowed: the standing reservation is the
+    # crash-consistent, fail-safe outcome (over-counting a possibly-live attempt, never under-counting).
+    # R4-A's sealed lifecycle carries no ``realized_pnl`` (SEC-002), so realized-fill LOSS is
+    # reconstructed by the provider's own durable venue-reconciliation ledger, never fabricated here.
+    if provider is not None and durable_state is not None and attempt_id is not None:
+        with contextlib.suppress(Exception):
+            provider.settle(attempt_id=attempt_id, committed=result.submitted_count > 0)
 
     tool_result = _to_tool_result(result, request)
 

@@ -19,9 +19,10 @@ Trust boundaries proven here:
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import typing
-from datetime import datetime
+from datetime import UTC, datetime
 
 import pytest
 from pydantic import BaseModel, ValidationError
@@ -309,6 +310,11 @@ class _MMScriptedSource:
 
 def _mm_clock() -> int:
     return _MM_NOW_S
+
+
+def _mm_now_dt() -> datetime:
+    """The fixed offline UTC clock the provider buckets its durable state by (mirrors ``_mm_clock``)."""
+    return datetime.fromtimestamp(_MM_NOW_S, tz=UTC)
 
 
 async def _mm_noop_sleep(_seconds: float) -> None:  # injected sleep seam — never a real wall-clock wait
@@ -1177,7 +1183,10 @@ async def test_restart_provider_seeded_at_cap_denies_before_any_write_port_call(
     adapter = RecordingFakeAdapter(fill=True, open_orders=[])
     write_port = _default_write_port(binding)
     provider = InMemoryDurableSessionStateProvider()
-    provider.record_run(session_identity="sess-mm-b", attempts=1)  # persisted count already AT the cap
+    # A persisted possibly-live attempt already AT the cap: reserve it and settle it COMMITTED so it
+    # is a durable prior attempt (the migrated reserve/settle analog of the old record_run seed).
+    provider.reserve(session_identity="sess-mm-b", now=_mm_now_dt(), attempt_id="seed-attempt-1")
+    provider.settle(attempt_id="seed-attempt-1", committed=True)
     envelope = _mm_env(max_orders_per_session=1)
 
     result = await _drive_mode_b(
@@ -1203,9 +1212,11 @@ async def test_prior_realized_loss_at_cap_denies_next_live_arming_before_write_p
     adapter = RecordingFakeAdapter(fill=True, open_orders=[])
     write_port = _default_write_port(binding)
     provider = InMemoryDurableSessionStateProvider()
-    provider.record_run(
+    # The realized-fill LOSS is fed by the provider's own durable venue-reconciliation ledger (never
+    # fabricated from the facade's sealed events), so it is seeded through that seam — not through the
+    # attempt reserve/settle contract.
+    provider.record_reconciled_fills(
         session_identity="sess-mm-b",
-        attempts=0,
         fills=(
             RealizedFillRecord(
                 realized_pnl=-2.5, fee=0.0, session_id="sess-mm-b", fill_ts_ms=_MM_NOW_S * 1000
@@ -1310,7 +1321,12 @@ class _EchoRiskProvider:
             prior_day_order_count=0,
         )
 
-    def record_run(self, *, session_identity: str, attempts: int, fills: object = ()) -> None:
+    def reserve(self, *, session_identity: str, now: datetime, attempt_id: str) -> None:
+        # Never reached in the identity-mismatch tests: the facade fails closed at the identity
+        # assertion, BEFORE the before-wire reservation.
+        return None
+
+    def settle(self, *, attempt_id: str, committed: bool) -> None:
         return None
 
 
@@ -1413,3 +1429,224 @@ async def test_live_guarded_arms_when_provider_echoes_request_session_and_binds_
     assert adapter.submit_calls == 0, "Mode B must NEVER reach the generic adapter submit surface"
     assert result.execution_status == "SUBMITTED"
     assert len(store.rows()) == 1, "an honest armed run records exactly one interlock receipt"
+
+
+# ---------------------------------------------------------------------------
+# Gate#3 R4-MAJOR-1 — the possibly-live attempt is durably RESERVED BEFORE the
+# wire (fail-closed on reserve failure), so the cap is CRASH-CONSISTENT.
+#
+# Before this fold the facade ran the complete fund-touching runner FIRST and only
+# recorded ``result.submitted_count`` AFTER it returned (the vulnerable
+# ``load -> run -> record_run`` order). A durable-store failure / process crash
+# AFTER the wire therefore never landed the cap consumption: the possibly-live
+# attempt existed at the venue but the durable count reset, so the NEXT call
+# submitted a SECOND order despite ``max_orders_per_session == 1`` (Codex repro:
+# ``postwire_failure 1 ... wire_calls 1`` / ``postwire_failure 2 ... wire_calls 2``).
+#
+# The facade now RESERVES a possibly-live attempt durably BEFORE the runner reaches
+# the write port (``load -> reserve -> run -> settle``): the reservation counts toward
+# the session/day caps immediately and durably. A reserve failure FAILS CLOSED (no
+# runner entry, zero write-port I/O). A post-wire ``settle`` failure or a crash after
+# POST leaves the reservation STANDING (it is not rolled back / not lost), so the next
+# call cannot exceed the cap — the durable-cap analog of the lane's persist-BEFORE-sign
+# discipline. Each test asserts the WRITE-PORT (the money-moving surface).
+# ---------------------------------------------------------------------------
+
+
+class _DurableStoreOutage(RuntimeError):
+    """A simulated durable-store OUTAGE raised by a test provider's recording port."""
+
+
+class _PostWireSettleOutageProvider(InMemoryDurableSessionStateProvider):
+    """``reserve`` durably records the possibly-live attempt (inherited); the AFTER-wire recording
+    (``settle``, or the legacy ``record_run``) simulates a durable-store OUTAGE by raising — Codex's
+    object: the write reaches the recording port AFTER the wire has already fired."""
+
+    def settle(self, *, attempt_id: str, committed: bool) -> None:
+        raise _DurableStoreOutage("durable store unavailable after wire")
+
+    def record_run(self, *, session_identity: str, attempts: int, fills: object = ()) -> None:
+        raise _DurableStoreOutage("durable store unavailable after wire")
+
+
+class _ReserveOutageProvider(InMemoryDurableSessionStateProvider):
+    """``reserve`` raises a durable-store OUTAGE BEFORE the wire; ``load`` returns valid zero state.
+    The facade must FAIL CLOSED — the runner is never entered on the money path (zero write-port I/O),
+    NOT_ARMED/denied."""
+
+    def reserve(self, *, session_identity: str, now: datetime, attempt_id: str) -> None:
+        raise _DurableStoreOutage("durable store unavailable before wire")
+
+
+class _CrashBeforeSettleProvider(InMemoryDurableSessionStateProvider):
+    """Models a process crash AFTER POST but BEFORE the durable count lands: ``reserve`` records the
+    possibly-live attempt durably (inherited); the AFTER-wire recording (``settle`` / legacy
+    ``record_run``) is a LOST WRITE (no-op), as if the process died before it landed. The reserved,
+    unsettled row stays durable and counted (conservative — a possibly-live attempt stays counted)."""
+
+    def settle(self, *, attempt_id: str, committed: bool) -> None:
+        return None  # the settle write never lands (crash)
+
+    def record_run(self, *, session_identity: str, attempts: int, fills: object = ()) -> None:
+        return None  # the legacy after-wire write never lands (crash)
+
+
+async def test_post_wire_settle_failure_does_not_reset_the_durable_reservation() -> None:
+    """Codex's object: a provider whose ``reserve`` SUCCEEDS but whose AFTER-wire recording raises a
+    store outage. Two same-session calls at ``max_orders_per_session == 1``: the 1st fires the wire,
+    the durable BEFORE-wire reservation survives the post-wire outage, and the 2nd is DENIED by the
+    per-session cap — ``write_port.submit_calls == 1`` TOTAL. RED today: after-run counting never
+    lands on the outage, the cap resets, and BOTH submit (``submit_calls == 2``)."""
+    binding = _mm_binding()
+    adapter = RecordingFakeAdapter(fill=True, open_orders=[])
+    write_port = _default_write_port(binding)  # SHARED — counts total submits across both calls
+    provider = _PostWireSettleOutageProvider()
+    envelope = _mm_env(max_orders_per_session=1)
+
+    # The AFTER-wire recording raises a store outage each call; the caller tolerates it (the
+    # possibly-live attempt has already fired). GREEN swallows the settle outage inside the facade —
+    # the durable reservation is what carries the cap across the two calls.
+    for _ in range(2):
+        # RED today: the legacy after-wire record raises and the count never lands. GREEN swallows the
+        # settle outage inside the facade, so this suppress simply does not trigger.
+        with contextlib.suppress(_DurableStoreOutage):
+            await _drive_mode_b(
+                interlock=_full_interlock(),
+                arming=_mm_arming(binding, write_port=write_port),
+                binding=binding,
+                adapter=adapter,
+                interlock_store=InMemoryOperatorInterlockStore(),
+                envelope=envelope,
+                provider=provider,
+            )
+
+    assert write_port.submit_calls == 1, (
+        "the durable BEFORE-wire reservation must survive a post-wire store outage so the 2nd "
+        "same-session call is denied by the per-session cap (RED today: both submit)"
+    )
+
+
+async def test_reserve_failure_before_wire_fails_closed_with_zero_write_port_calls() -> None:
+    """A before-wire reservation FAILURE (store outage) must FAIL CLOSED: the runner is never entered
+    on the money path, ``write_port.submit_calls == 0``, NOT_ARMED/denied. RED today: with only
+    after-run counting there is no before-wire reservation gate, so the armed run submits."""
+    binding = _mm_binding()
+    adapter = RecordingFakeAdapter(fill=True, open_orders=[])
+    write_port = _default_write_port(binding)
+
+    result = await _drive_mode_b(
+        interlock=_full_interlock(),
+        arming=_mm_arming(binding, write_port=write_port),
+        binding=binding,
+        adapter=adapter,
+        interlock_store=InMemoryOperatorInterlockStore(),
+        envelope=_mm_env(max_orders_per_session=1),
+        provider=_ReserveOutageProvider(),
+    )
+
+    assert write_port.submit_calls == 0, (
+        "a before-wire reservation failure must FAIL CLOSED — the runner is never entered, zero "
+        "write-port I/O (RED today: the armed run submits with only after-run counting)"
+    )
+    assert result.execution_status == "NOT_ARMED"
+    assert result.admission == "DENIED"
+
+
+async def test_crash_after_post_leaves_reservation_standing_denies_next_call_at_cap() -> None:
+    """Crash-after-POST: ``reserve`` lands + the wire fires, but no ``settle`` write lands (the process
+    crashes). A fresh facade invocation loading the SAME durable provider must see the reserved
+    possibly-live attempt and DENY the next call at ``max_orders_per_session == 1``. RED today: the
+    after-wire count is lost to the crash, the cap resets, and BOTH submit (``submit_calls == 2``)."""
+    binding = _mm_binding()
+    adapter = RecordingFakeAdapter(fill=True, open_orders=[])
+    write_port = _default_write_port(binding)  # SHARED — counts total submits across the crash
+    provider = _CrashBeforeSettleProvider()  # the SAME durable provider survives the simulated crash
+    envelope = _mm_env(max_orders_per_session=1)
+
+    # Call 1: reserve lands, the wire fires, then the process "crashes" before the settle write lands.
+    await _drive_mode_b(
+        interlock=_full_interlock(),
+        arming=_mm_arming(binding, write_port=write_port),
+        binding=binding,
+        adapter=adapter,
+        interlock_store=InMemoryOperatorInterlockStore(),
+        envelope=envelope,
+        provider=provider,
+    )
+    # Call 2: a fresh facade invocation on the SAME durable provider sees the standing reservation.
+    second = await _drive_mode_b(
+        interlock=_full_interlock(),
+        arming=_mm_arming(binding, write_port=write_port),
+        binding=binding,
+        adapter=adapter,
+        interlock_store=InMemoryOperatorInterlockStore(),
+        envelope=envelope,
+        provider=provider,
+    )
+
+    assert write_port.submit_calls == 1, (
+        "a crash after POST (no settle) must leave the reservation standing so the next call is "
+        "denied at the cap (RED today: the after-wire count is lost, the cap resets, both submit)"
+    )
+    assert second.execution_status != "SUBMITTED"
+    assert "order_cap_session" in second.execution_reason_codes
+
+
+async def test_reserved_slot_released_on_abstain_does_not_consume_cap() -> None:
+    """Positive control: a fully-armed ``no_quote`` abstains (no wire), so ``settle(committed=False)``
+    RELEASES the reservation — it must NOT wrongly consume a cap slot (``attempts`` back to 0)."""
+    binding = _mm_binding()
+    adapter = FakeVenueAdapter(fill=True)
+    provider = InMemoryDurableSessionStateProvider()
+
+    result = await _drive_mode_b_kind(
+        intent_kind="no_quote",
+        intent_params=MMIntentParams(),  # an explicit abstention — no order reaches the wire
+        arming=_mm_arming(binding),
+        interlock=_full_interlock(),  # fully armed, so the abstain is the INTENT's, not want of arming
+        binding=binding,
+        adapter=adapter,
+        interlock_store=InMemoryOperatorInterlockStore(),
+        provider=provider,
+    )
+
+    assert result.execution_status == "ABSTAINED"
+    assert adapter.submit_calls == 0
+    assert provider.attempts("sess-mm-b") == 0, (
+        "an abstain (no wire) must RELEASE the reservation so it does not wrongly consume a cap slot"
+    )
+
+
+async def test_committed_reservation_allows_next_call_within_cap() -> None:
+    """Positive control: reserve -> wire -> ``settle(committed=True)`` keeps the attempt counted; a 2nd
+    call still WITHIN the cap is allowed. Two committed possibly-live attempts persist under a cap of
+    two — the reservation contract does not over-block an honest within-cap sequence."""
+    binding = _mm_binding()
+    adapter = RecordingFakeAdapter(fill=True, open_orders=[])
+    write_port = _default_write_port(binding)  # SHARED across both calls
+    provider = InMemoryDurableSessionStateProvider()
+    envelope = _mm_env(max_orders_per_session=2)  # room for two committed attempts
+
+    first = await _drive_mode_b(
+        interlock=_full_interlock(),
+        arming=_mm_arming(binding, write_port=write_port),
+        binding=binding,
+        adapter=adapter,
+        interlock_store=InMemoryOperatorInterlockStore(),
+        envelope=envelope,
+        provider=provider,
+    )
+    second = await _drive_mode_b(
+        interlock=_full_interlock(),
+        arming=_mm_arming(binding, write_port=write_port),
+        binding=binding,
+        adapter=adapter,
+        interlock_store=InMemoryOperatorInterlockStore(),
+        envelope=envelope,
+        provider=provider,
+    )
+
+    assert first.execution_status == "SUBMITTED"
+    assert second.execution_status == "SUBMITTED", "a 2nd call still within the cap must be allowed"
+    assert write_port.submit_calls == 2
+    assert provider.attempts("sess-mm-b") == 2, "both committed reservations persist under the cap"
