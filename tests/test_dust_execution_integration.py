@@ -421,16 +421,24 @@ def _enumerate_sealed_json() -> list[str]:
     Runs the task's canonical enumeration — ``git ls-files`` over the two sealed roots filtered to
     the maker/arena/leaderboard/clv/score family — so the byte-identity assertion tracks the actual
     committed set rather than a hardcoded wildcard.
+
+    NOTE: the roots are passed as DIRECTORY pathspecs (``git ls-files`` expands them recursively),
+    NOT ``**/*.json`` globs. A ``dir/**/*.json`` pathspec requires an intermediate directory segment
+    and so DROPS direct children — e.g. ``contracts/fixtures/leaderboard.json`` — silently shrinking
+    the sealed set to a subset (the sealed directional leaderboard + maker fixtures AC-016/SEC-004
+    name would go unverified). Enumerate the directories and filter by suffix + family instead.
     """
     listed = subprocess.run(
-        ["git", "ls-files", "scripts/txline_live/**/*.json", "contracts/fixtures/**/*.json"],
+        ["git", "ls-files", "scripts/txline_live/", "contracts/fixtures/"],
         cwd=_REPO_ROOT,
         capture_output=True,
         text=True,
         check=True,
     ).stdout.splitlines()
     keywords = ("maker", "arena", "leaderboard", "clv", "score")
-    return sorted(p for p in listed if any(k in p.lower() for k in keywords))
+    return sorted(
+        p for p in listed if p.lower().endswith(".json") and any(k in p.lower() for k in keywords)
+    )
 
 
 def _representative_directional_run() -> RunResult:
@@ -476,10 +484,17 @@ async def test_sealed_json_byte_identical_after_whole_lane_session() -> None:
     The enumerated list is COMPUTED from the real committed tree (never a hardcoded wildcard).
     """
     sealed_files = _enumerate_sealed_json()
-    # Anti-inert: the enumeration must be non-empty and must include the known E0-T1 sealed result.
-    assert sealed_files, "the enumerated sealed-JSON set must be non-empty"
-    assert "scripts/txline_live/cp1/maker-arena-result.json" in sealed_files, (
-        f"the known sealed maker-arena result must be in the enumerated set: {sealed_files}"
+    # Anti-inert: the enumeration must include EVERY known E0-T1 sealed output — the sealed maker
+    # AND directional-leaderboard fixtures AC-016 ("sealed maker and directional outputs") /
+    # SEC-004 name — so a future glob/relocation regression cannot silently shrink the set.
+    required_sealed = {
+        "scripts/txline_live/cp1/maker-arena-result.json",
+        "contracts/fixtures/leaderboard.json",
+        "contracts/fixtures/maker_arena_result.json",
+    }
+    missing = required_sealed - set(sealed_files)
+    assert not missing, (
+        f"enumerated sealed set is missing required sealed outputs {sorted(missing)}; got {sealed_files}"
     )
 
     run = _representative_directional_run()
