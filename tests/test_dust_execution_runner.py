@@ -1509,6 +1509,68 @@ async def test_direct_runner_reconstructed_loss_below_effective_cap_still_submit
     assert decision.submitted is True and decision.abstain_reason is None
 
 
+async def test_direct_runner_reconstructed_daily_loss_exactly_at_effective_cap_blocks_submit() -> None:
+    """DAILY-AXIS EQUALITY-AT-CAP (INFO-c): a reconstructed UTC-day loss EXACTLY equal to the effective
+    daily cap (0.5 == 0.5) must block — ``cap_breached`` is the ``>=`` fail-closed boundary
+    (veridex/policy/envelope.py:18). Twin of the session-axis equality test above; the session cap is
+    left loose (5.0, effective 2.0) so ONLY the daily axis trips AT equality (``loss_cap_day``)."""
+    adapter = RecordingFakeAdapter(fill=True, open_orders=[])
+    write_port = _default_write_port()
+    risk = RiskAccumulator.seeded(
+        session_id=_SESSION_ID, net_session=-0.5, net_day=-0.5, current_day=None
+    )
+
+    result = await _run_guarded(
+        adapter=adapter,
+        write_port=write_port,
+        risk=risk,
+        # Effective session = min(5.0, 2.0) = 2.0 (0.5 below); effective daily = min(0.5, 4.0) = 0.5.
+        envelope=_env(max_session_loss=5.0, max_daily_loss=0.5),
+    )
+
+    assert write_port.submit_calls == 0, (
+        "daily loss exactly AT the effective cap must block (>= boundary)"
+    )
+    assert adapter.submit_calls == 0
+    (decision,) = result.decisions
+    assert decision.submitted is False
+    assert decision.abstain_reason == "loss_cap_day"
+
+
+async def test_direct_runner_reconstructed_nonfinite_seed_fails_closed_no_submit() -> None:
+    """FAIL-CLOSED UNIFORMITY (MINOR-1): a non-finite reconstructed net (nan/inf/-inf) must fail closed
+    AT ``RiskAccumulator.seeded`` — raising ``FailClosed`` BEFORE the runner touches the keyless write
+    port. Without the guard a nan seed silently constructs an accumulator whose
+    ``realized_loss = max(0.0, -nan) = 0.0``: every loss cap goes transparent and the run re-arms
+    (``submit_calls == 1``). This mirrors the existing fail-closed posture (``RealizedFillRecord``
+    rejects non-finite pnl/fee; ``authorize_mode_b`` rejects non-finite caps).
+
+    RED before the fix: ``seeded`` does NOT validate finiteness, so no ``FailClosed`` is raised and the
+    nan-seeded run reaches the write port. GREEN after: ``seeded`` fails closed, the arming path aborts
+    before ANY keyless write-port I/O, so the wire is never touched (``submit_calls == 0``).
+    """
+    adapter = RecordingFakeAdapter(fill=True, open_orders=[])
+    write_port = _default_write_port()
+
+    for bad in (float("nan"), float("inf"), float("-inf")):
+        with pytest.raises(FailClosed, match="must be finite"):
+            # The seed raises fail-closed here; the runner (below) must therefore never run.
+            risk = RiskAccumulator.seeded(
+                session_id=_SESSION_ID, net_session=bad, net_day=bad, current_day=None
+            )
+            await _run_guarded(
+                adapter=adapter,
+                write_port=write_port,
+                risk=risk,
+                envelope=_env(max_session_loss=0.5, max_daily_loss=0.5),
+            )
+
+    assert write_port.submit_calls == 0, (
+        "a non-finite reconstructed seed must fail closed before ANY keyless write-port I/O"
+    )
+    assert adapter.submit_calls == 0
+
+
 async def test_direct_runner_call_with_technical_only_bundle_stays_unarmed() -> None:
     """Gate#3 MAJOR-1 (REQ-005): the operator-interlock is UNBYPASSABLE via the public runner.
 

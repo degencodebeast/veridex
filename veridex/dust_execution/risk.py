@@ -149,6 +149,18 @@ class RiskAccumulator:
         Returns:
             A fresh :class:`RiskAccumulator` with session + daily nets and the current UTC day set.
         """
+        # Fail-closed uniformity (Gate#3 MINOR-1): reject a non-finite reconstructed net at the
+        # seam. A nan/inf seed would make ``realized_loss = max(0.0, -nan) = 0.0`` — silently
+        # transparent to EVERY loss cap — so refuse rather than proceed, matching the posture
+        # ``RealizedFillRecord`` (non-finite pnl/fee) and ``authorize_mode_b`` (non-finite cap)
+        # already enforce. Both production callers (ledger.reconstruct_risk, session_state.load)
+        # sum only finite-validated fills, so this never trips in normal operation.
+        for name, net in (("net_session", net_session), ("net_day", net_day)):
+            if not math.isfinite(net):
+                raise FailClosed(
+                    f"reconstructed {name} must be finite, got {net!r} "
+                    "(a non-finite seed makes every realized-loss cap transparent)"
+                )
         acc = cls(session_id)
         acc._net_session = net_session
         acc._net_day = net_day
