@@ -74,6 +74,7 @@ from veridex.dust_execution.session_state import (
     InMemoryDurableSessionStateProvider,
     ReconciliationState,
     ReservationOutcome,
+    ScopedReservationOutcome,
 )
 from veridex.dust_execution.signer import LocalFakeWalletControlPlane
 from veridex.dust_execution.wallet_binding import (
@@ -1359,6 +1360,19 @@ class _EchoRiskProvider:
         # assertion, BEFORE the before-wire reserve-or-load.
         return "RESERVED"
 
+    def reserve_or_freeze(
+        self,
+        *,
+        session_identity: str,
+        now: datetime,
+        attempt_id: str,
+        venue_order_key: str | None = None,
+    ) -> ScopedReservationOutcome:
+        # The ATOMIC reserve path (R6-MAJOR-2). Reached only by the honest-echo positive control (the
+        # mismatch cases fail closed at the identity assertion first): a fresh slot with nothing
+        # unresolved in scope → RESERVED, so the honest run proceeds to the wire.
+        return "RESERVED"
+
     def settle(
         self,
         *,
@@ -1369,8 +1383,8 @@ class _EchoRiskProvider:
         return None
 
     def has_unresolved_reservation(self, session_identity: str) -> bool:
-        # No reservations in the identity-assertion tests: the honest-echo positive control reaches
-        # this scope check (no unresolved row → not frozen), the mismatch cases fail closed before it.
+        # No reservations in the identity-assertion tests. The facade money path no longer calls this
+        # separately (it uses the atomic ``reserve_or_freeze``); retained for Protocol completeness.
         return False
 
 
@@ -1520,18 +1534,19 @@ class _PostWireSettleOutageProvider(InMemoryDurableSessionStateProvider):
 
 
 class _ReserveOutageProvider(InMemoryDurableSessionStateProvider):
-    """``reserve`` raises a durable-store OUTAGE BEFORE the wire; ``load`` returns valid zero state.
-    The facade must FAIL CLOSED — the runner is never entered on the money path (zero write-port I/O),
-    NOT_ARMED/denied."""
+    """The ATOMIC before-wire ``reserve_or_freeze`` raises a durable-store OUTAGE; ``load`` returns valid
+    zero state. The facade must FAIL CLOSED — the runner is never entered on the money path (zero
+    write-port I/O), NOT_ARMED/denied. (R6-MAJOR-2 migrated the reserve path onto the single atomic op, so
+    the outage is injected there.)"""
 
-    def reserve(
+    def reserve_or_freeze(
         self,
         *,
         session_identity: str,
         now: datetime,
         attempt_id: str,
         venue_order_key: str | None = None,
-    ) -> ReservationOutcome:
+    ) -> ScopedReservationOutcome:
         raise _DurableStoreOutage("durable store unavailable before wire")
 
 
@@ -1997,13 +2012,17 @@ def _recon_events(
     recon_key: str | None,
     recon_state: str = "RESOLVED",
     duplicate: bool = False,
+    recon_decision_id: str = "D1",
 ) -> tuple[object, ...]:
     """Build a minimal submitted-decision lifecycle stream for the reducer negative test.
 
-    A submitted ``OrderAckEvent`` + its ``OrderSubmitAttempt`` (pre-submit ``venue_order_key == submit_key``)
-    and, unless ``recon_key`` is ``None`` (MISSING), a ``RealFillReconciliation`` keyed on ``recon_key``
-    (``duplicate`` emits two so the reducer sees a DUPLICATE). A ``recon_key != submit_key`` is a
-    MISMATCH. The reducer must FAIL CLOSED (``AMBIGUOUS``) on any of these, never pick a stray RESOLVED row.
+    A submitted ``OrderAckEvent`` + its ``OrderSubmitAttempt`` (decision ``D1``, pre-submit
+    ``venue_order_key == submit_key``) and, unless ``recon_key`` is ``None`` (MISSING), a
+    ``RealFillReconciliation`` for ``recon_decision_id`` keyed on ``recon_key`` (``duplicate`` emits two
+    so the reducer sees a DUPLICATE PAIR). A ``recon_key != submit_key`` is a MISMATCHED key; a
+    ``recon_decision_id != "D1"`` is a FOREIGN decision (R6-MAJOR-1). The reducer must join on the exact
+    PAIR ``(decision_id, venue_order_key)`` and FAIL CLOSED (``AMBIGUOUS``) on any of these, never pick a
+    stray RESOLVED row belonging to a different decision.
     """
     events: list[object] = [
         OrderSubmitAttempt(
@@ -2038,7 +2057,7 @@ def _recon_events(
                     event_type="RealFillReconciliation",
                     source_ts=None,
                     recv_ts=0,
-                    decision_id="D1",
+                    decision_id=recon_decision_id,
                     venue_order_key=recon_key,
                     reconciled_state=recon_state,  # type: ignore[arg-type]
                     reconciled_fill_size=1.0,
@@ -2113,3 +2132,234 @@ async def test_distinct_attempt_frozen_by_an_unresolved_reservation_in_scope() -
     assert result.execution_status == "NOT_ARMED"
     assert result.admission == "DENIED"
     assert "attempt_pending_reconciliation" in result.reason_codes
+
+
+# ---------------------------------------------------------------------------
+# Gate#3 R6-MAJOR-1 — the reconciliation reducer joins on the exact PAIR
+# ``(decision_id, venue_order_key)``, not on ``venue_order_key`` ALONE. A
+# reconciliation row for a FOREIGN decision that merely carries THIS decision's
+# key is NOT positive terminal proof and must NOT clear the freeze.
+# ---------------------------------------------------------------------------
+
+
+def test_reconciliation_reducer_fails_closed_on_foreign_decision_sharing_the_key() -> None:
+    """R6-MAJOR-1 (RED against a key-ONLY join): the reducer must join reconciliation on the exact PAIR
+    ``(decision_id, venue_order_key)``. A ``RealFillReconciliation`` belonging to a DIFFERENT decision
+    (``D2``) that merely carries THIS submitted decision's key (``K1``) is NOT positive terminal proof
+    for ``D1`` — the disposition FAILS CLOSED to ``AMBIGUOUS`` (possibly-live / frozen). A key-only join
+    returns ``('RESOLVED', 'K1')`` and wrongly clears ``D1``'s freeze (Codex's D2/K1 repro)."""
+    # FOREIGN decision: a RESOLVED row for D2 carrying D1's key K1 must NOT resolve D1.
+    foreign = _EventsOnlyResult(
+        _recon_events(
+            submit_key="K1", recon_key="K1", recon_state="RESOLVED", recon_decision_id="D2"
+        )
+    )
+    assert facade._reconciliation_outcome(foreign)[0] == "AMBIGUOUS"  # type: ignore[arg-type]
+
+    # DUPLICATE PAIR: two rows with the SAME decision AND key is ambiguous, not a clean resolution.
+    duplicate_pair = _EventsOnlyResult(
+        _recon_events(
+            submit_key="K1",
+            recon_key="K1",
+            recon_state="RESOLVED",
+            recon_decision_id="D1",
+            duplicate=True,
+        )
+    )
+    assert facade._reconciliation_outcome(duplicate_pair)[0] == "AMBIGUOUS"  # type: ignore[arg-type]
+
+    # Control: exactly ONE row whose (decision_id, venue_order_key) PAIR matches and is RESOLVED resolves.
+    matched = _EventsOnlyResult(
+        _recon_events(
+            submit_key="K1", recon_key="K1", recon_state="RESOLVED", recon_decision_id="D1"
+        )
+    )
+    assert facade._reconciliation_outcome(matched)[0] == "RESOLVED"  # type: ignore[arg-type]
+
+    # State-machine consequence: a reservation SETTLED from the FOREIGN (AMBIGUOUS) disposition stays
+    # possibly-live / FROZEN — an unmatched foreign row can never clear it.
+    provider = InMemoryDurableSessionStateProvider()
+    provider.reserve(session_identity="sess-mm-b", now=_mm_now_dt(), attempt_id="stuck-attempt")
+    frozen_state, _ = facade._reconciliation_outcome(foreign)  # type: ignore[arg-type]
+    provider.settle(attempt_id="stuck-attempt", recon_state=frozen_state)
+    assert provider.has_unresolved_reservation("sess-mm-b"), (
+        "a foreign-decision reconciliation must leave the reservation possibly-live / FROZEN"
+    )
+
+
+async def test_foreign_decision_disposition_keeps_a_distinct_attempt_frozen() -> None:
+    """R6-MAJOR-1 state-machine tie-in (RED against a key-ONLY join): a reservation settled from a
+    FOREIGN-decision reconciliation disposition stays possibly-live, so a genuinely DISTINCT authorized
+    attempt in the same session is FROZEN — ZERO new wire — until it resolves. RED today: the key-only
+    join returns ``RESOLVED`` for the foreign D2/K1 row, the reservation is settled RESOLVED (unfrozen),
+    and the distinct 2nd attempt reserves + submits a SECOND order (``submit_calls == 1``)."""
+    binding = _mm_binding()
+    adapter = RecordingFakeAdapter(fill=True, open_orders=[])
+    write_port = _default_write_port(binding)
+    provider = InMemoryDurableSessionStateProvider()
+    # Seed a possibly-live reservation and settle it from the FOREIGN-decision reducer disposition (D2/K1).
+    foreign = _EventsOnlyResult(
+        _recon_events(
+            submit_key="K1", recon_key="K1", recon_state="RESOLVED", recon_decision_id="D2"
+        )
+    )
+    provider.reserve(session_identity="sess-mm-b", now=_mm_now_dt(), attempt_id="stuck-attempt")
+    frozen_state, _ = facade._reconciliation_outcome(foreign)  # type: ignore[arg-type]
+    provider.settle(attempt_id="stuck-attempt", recon_state=frozen_state)
+
+    result = await _drive_mode_b(
+        interlock=_full_interlock(),
+        arming=_mm_arming(binding, write_port=write_port),
+        binding=binding,
+        adapter=adapter,
+        interlock_store=InMemoryOperatorInterlockStore(),
+        envelope=_mm_env(max_orders_per_session=2, max_orders_per_day=2),  # SPARE cap — the freeze, not the cap
+        provider=provider,
+        client_order_id="coid-distinct",  # a genuinely distinct attempt — must STILL be frozen
+    )
+
+    assert write_port.submit_calls == 0, (
+        "a foreign-decision row must NOT clear the freeze — a distinct attempt stays frozen (RED today: "
+        "the key-only join resolves the foreign row and the 2nd order submits)"
+    )
+    assert result.execution_status == "NOT_ARMED"
+    assert result.admission == "DENIED"
+    assert "attempt_pending_reconciliation" in result.reason_codes
+
+
+# ---------------------------------------------------------------------------
+# Gate#3 R6-MAJOR-2 — the scope-freeze check and the reserve are ONE atomic
+# provider op (``reserve_or_freeze``), NOT a separate ``has_unresolved_reservation``
+# followed by ``reserve`` (a TOCTOU where two concurrent requests both observe an
+# empty scope and both reserve). The fused op admits EXACTLY ONE fresh reservation
+# and returns ``SCOPE_FROZEN`` for a different id while the scope is occupied.
+# ---------------------------------------------------------------------------
+
+
+class _ReserveSpyProvider(InMemoryDurableSessionStateProvider):
+    """Records which reservation ops the facade invokes, to prove the reserve path uses the SINGLE
+    atomic ``reserve_or_freeze`` and NOT a separate ``has_unresolved_reservation`` + ``reserve`` pair."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.has_unresolved_calls = 0
+        self.reserve_calls = 0
+        self.reserve_or_freeze_calls = 0
+
+    def has_unresolved_reservation(self, session_identity: str) -> bool:
+        self.has_unresolved_calls += 1
+        return super().has_unresolved_reservation(session_identity)
+
+    def reserve(
+        self,
+        *,
+        session_identity: str,
+        now: datetime,
+        attempt_id: str,
+        venue_order_key: str | None = None,
+    ) -> ReservationOutcome:
+        self.reserve_calls += 1
+        return super().reserve(
+            session_identity=session_identity,
+            now=now,
+            attempt_id=attempt_id,
+            venue_order_key=venue_order_key,
+        )
+
+    def reserve_or_freeze(
+        self,
+        *,
+        session_identity: str,
+        now: datetime,
+        attempt_id: str,
+        venue_order_key: str | None = None,
+    ) -> ScopedReservationOutcome:
+        self.reserve_or_freeze_calls += 1
+        return super().reserve_or_freeze(
+            session_identity=session_identity,
+            now=now,
+            attempt_id=attempt_id,
+            venue_order_key=venue_order_key,
+        )
+
+
+async def test_facade_reserve_path_uses_a_single_atomic_op_not_a_separate_scope_check() -> None:
+    """R6-MAJOR-2 (RED against the split check-then-reserve): the facade must make the reservation
+    decision via ONE atomic provider op (``reserve_or_freeze``) that FUSES the scope-freeze check and the
+    reserve-or-load — NOT a separate ``has_unresolved_reservation`` followed by ``reserve`` (the TOCTOU
+    where two concurrent requests both observe an empty scope and both reserve). The spy proves the
+    separate scope check is GONE from the reserve path. RED today: the facade calls
+    ``has_unresolved_reservation`` (count 1) then ``reserve`` (count 1) and never the atomic op."""
+    binding = _mm_binding()
+    adapter = RecordingFakeAdapter(fill=True, open_orders=[])
+    write_port = _default_write_port(binding)
+    spy = _ReserveSpyProvider()
+
+    result = await _drive_mode_b(
+        interlock=_full_interlock(),
+        arming=_mm_arming(binding, write_port=write_port),
+        binding=binding,
+        adapter=adapter,
+        interlock_store=InMemoryOperatorInterlockStore(),
+        provider=spy,
+    )
+
+    assert result.execution_status == "SUBMITTED"
+    assert write_port.submit_calls == 1
+    assert spy.reserve_or_freeze_calls == 1, "the reserve path must use the single atomic op exactly once"
+    assert spy.has_unresolved_calls == 0, (
+        "the separate scope check must be GONE from the reserve path (a split re-introduces the TOCTOU)"
+    )
+    assert spy.reserve_calls == 0, "the split reserve must be GONE from the reserve path"
+
+
+def test_atomic_reserve_or_freeze_admits_one_where_split_check_then_reserve_admits_both() -> None:
+    """R6-MAJOR-2 (RED: ``reserve_or_freeze`` missing): the SPLIT check-then-reserve is the TOCTOU — two
+    requests that BOTH observe an empty scope then BOTH reserve, standing up TWO possibly-live rows even
+    with spare cap. The FUSED atomic op admits EXACTLY ONE (fresh ``RESERVED``) and returns
+    ``SCOPE_FROZEN`` for the second — one critical section, no interleaving window."""
+    now = _mm_now_dt()
+    # SPLIT (the defect): both interleave their scope check (empty) BEFORE either reserves → both reserve.
+    split = InMemoryDurableSessionStateProvider()
+    assert split.has_unresolved_reservation("sess-mm-b") is False
+    assert split.has_unresolved_reservation("sess-mm-b") is False
+    assert split.reserve(session_identity="sess-mm-b", now=now, attempt_id="A") == "RESERVED"
+    assert split.reserve(session_identity="sess-mm-b", now=now, attempt_id="B") == "RESERVED"
+    assert split.attempts("sess-mm-b") == 2, "the split admits BOTH — two possibly-live rows (the TOCTOU)"
+
+    # ATOMIC: the fused scope-check-and-reserve admits exactly one; the second is SCOPE_FROZEN, uninserted.
+    atomic = InMemoryDurableSessionStateProvider()
+    assert (
+        atomic.reserve_or_freeze(session_identity="sess-mm-b", now=now, attempt_id="A") == "RESERVED"
+    )
+    assert (
+        atomic.reserve_or_freeze(session_identity="sess-mm-b", now=now, attempt_id="B")
+        == "SCOPE_FROZEN"
+    )
+    assert atomic.attempts("sess-mm-b") == 1, "the atomic op admits EXACTLY ONE — no interleaving window"
+
+
+def test_reserve_or_freeze_discriminates_same_id_replay_from_a_different_id_scope_freeze() -> None:
+    """R6-MAJOR-2 (RED: ``reserve_or_freeze`` missing): the atomic op's outcome DISCRIMINATES same-id
+    idempotent replay from a different-id scope freeze — a same-id retry atop an unsettled row is
+    ``PENDING_RECONCILE``; atop a resolved row is ``COMMITTED``; a DIFFERENT id while an unresolved row
+    occupies the scope is ``SCOPE_FROZEN`` (uninserted); a fresh id with nothing unresolved is
+    ``RESERVED``."""
+    now = _mm_now_dt()
+    p = InMemoryDurableSessionStateProvider()
+    assert p.reserve_or_freeze(session_identity="sess-mm-b", now=now, attempt_id="A") == "RESERVED"
+    # same-id retry atop the unsettled (PENDING) possibly-live row → idempotent PENDING_RECONCILE.
+    assert (
+        p.reserve_or_freeze(session_identity="sess-mm-b", now=now, attempt_id="A")
+        == "PENDING_RECONCILE"
+    )
+    # a DIFFERENT id while A is unresolved → SCOPE_FROZEN (the scope is occupied); no row appended.
+    assert (
+        p.reserve_or_freeze(session_identity="sess-mm-b", now=now, attempt_id="B") == "SCOPE_FROZEN"
+    )
+    assert p.attempts("sess-mm-b") == 1, "a scope-frozen different id must NOT append a row"
+    # settle A resolved → it stops freezing (stays counted); the same-id A retry now replays COMMITTED.
+    p.settle(attempt_id="A", recon_state="RESOLVED")
+    assert p.reserve_or_freeze(session_identity="sess-mm-b", now=now, attempt_id="A") == "COMMITTED"
+    # a fresh distinct id with nothing unresolved (A is resolved, not freezing) → a fresh RESERVED.
+    assert p.reserve_or_freeze(session_identity="sess-mm-b", now=now, attempt_id="C") == "RESERVED"

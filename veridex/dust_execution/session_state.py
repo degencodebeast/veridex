@@ -66,6 +66,19 @@ from veridex.dust_execution.risk import RealizedFillRecord, RiskAccumulator
 #                             venue truth): the caller replays that outcome idempotently — no new wire.
 ReservationOutcome = Literal["RESERVED", "PENDING_RECONCILE", "COMMITTED"]
 
+# The closed vocabulary the ATOMIC reserve-or-freeze (:meth:`DurableSessionStateProvider.reserve_or_freeze`)
+# returns (Gate#3 R6-MAJOR-2). It fuses the session-scope freeze check with the reserve-or-load into ONE
+# critical section, so it adds ``SCOPE_FROZEN`` to :data:`ReservationOutcome`:
+#   * ``RESERVED`` / ``PENDING_RECONCILE`` / ``COMMITTED`` — as in :data:`ReservationOutcome` (a fresh
+#                             possibly-live slot, a same-id retry atop an unsettled row, or a same-id
+#                             replay atop a resolved row);
+#   * ``SCOPE_FROZEN``      — a DIFFERENT attempt_id while an UNRESOLVED possibly-live reservation already
+#                             occupies the session freeze scope: the caller must FREEZE (no new wire),
+#                             pending venue-truth reconcile. No new row is appended.
+ScopedReservationOutcome = Literal[
+    "RESERVED", "PENDING_RECONCILE", "COMMITTED", "SCOPE_FROZEN"
+]
+
 # The RECONCILIATION disposition of a reservation row (Gate#3 R5-MAJOR-1 / IDM-002) — the axis the
 # FREEZE keys on, DISTINCT from the wire/cap axis (a slot is consumed the instant it is reserved and
 # stays counted thereafter). Mirrors the E4 tri-state (:data:`veridex.dust_execution.contracts.
@@ -163,6 +176,38 @@ class DurableSessionStateProvider(Protocol):
         the reservation row WHEN AVAILABLE, so the production reconcile-to-resolve can later resolve a
         possibly-live attempt's terminal state (offline it is ``None`` — SEC-002 carries no venue truth).
         A raise (durable-store outage) signals the facade to FAIL CLOSED (no wire I/O).
+        """
+        ...
+
+    def reserve_or_freeze(
+        self,
+        *,
+        session_identity: str,
+        now: datetime,
+        attempt_id: str,
+        venue_order_key: str | None = None,
+    ) -> ScopedReservationOutcome:
+        """Atomically reserve-or-load an attempt AND enforce the session freeze scope (Gate#3 R6-MAJOR-2).
+
+        The SINGLE critical-section op the facade money path calls instead of a separate
+        :meth:`has_unresolved_reservation` followed by :meth:`reserve`. Fusing the scope-freeze check and
+        the reserve-or-load closes the TOCTOU where two concurrent requests both observe an empty scope
+        and both reserve — standing up two possibly-live orders. The outcome DISCRIMINATES (see
+        :data:`ScopedReservationOutcome`):
+
+        * ``PENDING_RECONCILE`` / ``COMMITTED`` — a SAME-``attempt_id`` row already exists: an idempotent
+          replay of THIS attempt's own possibly-live/committed outcome (same-id takes priority over the
+          scope — an identical retry is never a foreign conflict). No new row is appended.
+        * ``SCOPE_FROZEN`` — a FRESH ``attempt_id`` while an UNRESOLVED possibly-live reservation
+          (``recon_state`` ``PENDING`` or ``AMBIGUOUS``) already occupies the session scope: the caller
+          must FREEZE — no new wire around an unresolved first order, regardless of spare cap, pending
+          the production venue-truth reconcile. No new row is appended.
+        * ``RESERVED`` — a FRESH ``attempt_id`` with nothing unresolved in scope: a fresh possibly-live
+          slot is appended (it counts toward the caps immediately and durably); the caller may proceed.
+
+        A raise (durable-store outage) signals the facade to FAIL CLOSED (no wire I/O). For a durable
+        provider this method must execute the scope check AND the reserve/insert in ONE transaction /
+        critical section (for the in-memory provider a single synchronous method already is).
         """
         ...
 
@@ -289,7 +334,18 @@ class InMemoryDurableSessionStateProvider:
         # Reserve-OR-load (Gate#3 R5-MAJOR-1): a retry with the SAME stable attempt_id reconciles to the
         # existing reservation rather than minting a new id and double-reserving. The return value tells
         # the facade how to proceed; only a FRESH slot (no prior row / a prior RELEASED attempt) appends
-        # a new possibly-live row and returns RESERVED.
+        # a new possibly-live row and returns RESERVED. This is the STANDALONE reserve-or-load (no session
+        # scope check); the facade money path uses the ATOMIC :meth:`reserve_or_freeze` instead.
+        return self._reserve_or_load(
+            session_identity=session_identity, attempt_id=attempt_id, venue_order_key=venue_order_key
+        )
+
+    def _reserve_or_load(
+        self, *, session_identity: str, attempt_id: str, venue_order_key: str | None = None
+    ) -> ReservationOutcome:
+        # The reserve-or-load primitive shared by :meth:`reserve` and :meth:`reserve_or_freeze`, so the
+        # atomic op never round-trips through the PUBLIC ``reserve`` (a recording spy can then prove the
+        # facade calls only the single atomic op on the money path).
         existing = self._reservations.get(attempt_id)
         if existing is not None:
             if existing.recon_state == "RESOLVED":
@@ -302,6 +358,33 @@ class InMemoryDurableSessionStateProvider:
             session_identity=session_identity, recon_state="PENDING", venue_order_key=venue_order_key
         )
         return "RESERVED"
+
+    def reserve_or_freeze(
+        self,
+        *,
+        session_identity: str,
+        now: datetime,
+        attempt_id: str,
+        venue_order_key: str | None = None,
+    ) -> ScopedReservationOutcome:
+        # Gate#3 R6-MAJOR-2: the ATOMIC reserve-or-freeze — the SINGLE critical section that fuses the
+        # session-scope freeze check with the reserve-or-load, so two requests can NEVER both observe an
+        # empty scope and both reserve (the split check-then-reserve TOCTOU). For an in-memory provider a
+        # single synchronous method IS the critical section (no lock needed).
+        #
+        # The outcome DISCRIMINATES (SEC-005 closed vocab — no id/secret leaked):
+        #   * a SAME-id row already exists → idempotent replay of THIS attempt's own outcome
+        #     (``PENDING_RECONCILE`` atop an unsettled row, ``COMMITTED`` atop a resolved row) — an
+        #     identical retry is never a foreign scope conflict, so same-id takes priority over the scope;
+        #   * a FRESH id while an UNRESOLVED possibly-live reservation occupies the session scope →
+        #     ``SCOPE_FROZEN`` (no row appended): a genuinely distinct attempt must NOT submit AROUND an
+        #     unresolved first order, regardless of spare cap, pending venue-truth reconcile;
+        #   * a FRESH id with nothing unresolved in scope → ``RESERVED`` (a fresh possibly-live slot).
+        if attempt_id not in self._reservations and self._has_unresolved(session_identity):
+            return "SCOPE_FROZEN"
+        return self._reserve_or_load(
+            session_identity=session_identity, attempt_id=attempt_id, venue_order_key=venue_order_key
+        )
 
     def settle(
         self,
@@ -345,7 +428,14 @@ class InMemoryDurableSessionStateProvider:
         # IDM-002 session-scope freeze (RECONCILIATION axis): True iff ANY possibly-live row whose
         # reconciliation is UNRESOLVED (``PENDING`` or ``AMBIGUOUS``) exists for this session. A RESOLVED
         # row (definite fill) does NOT freeze though it stays counted; a released row is gone. Wire-fired
-        # / ``submitted`` alone never clears this — only a reconciliation RESOLUTION does.
+        # / ``submitted`` alone never clears this — only a reconciliation RESOLUTION does. The facade money
+        # path no longer calls this separately — it uses the ATOMIC :meth:`reserve_or_freeze` — but it
+        # remains a standalone predicate for provider introspection / tests.
+        return self._has_unresolved(session_identity)
+
+    def _has_unresolved(self, session_identity: str) -> bool:
+        # The unresolved-scope predicate shared by :meth:`has_unresolved_reservation` and the atomic
+        # :meth:`reserve_or_freeze`, so the atomic op never round-trips through the PUBLIC scope check.
         return any(
             res.session_identity == session_identity and res.recon_state in ("PENDING", "AMBIGUOUS")
             for res in self._reservations.values()
@@ -362,4 +452,5 @@ __all__ = [
     "InMemoryDurableSessionStateProvider",
     "ReconciliationState",
     "ReservationOutcome",
+    "ScopedReservationOutcome",
 ]

@@ -615,20 +615,23 @@ def _reconciliation_outcome(
 
     IDM-002 fail-closed reducer. The FREEZE keys on the reconciliation axis, NOT on wire-fired /
     ``submitted`` — a submitted order with AMBIGUOUS reconciliation is possibly-live and must FREEZE. The
-    disposition is selected from the EXACT attempted decision(s) of THIS run, MATCHED to their official
-    ``venue_order_key`` (the pre-submit record's key the reconciliation is keyed on), NEVER "any RESOLVED
-    row anywhere in the result": a multi-decision result could carry a benign RESOLVED row from a
-    DIFFERENT decision, and picking it would wrongly clear the freeze for an order that is still
-    possibly-live. So for EACH decision that actually reached the wire (a non-``dry_run_not_submitted``
-    :class:`~veridex.dust_execution.contracts.OrderAckEvent`) the reducer joins the
-    :class:`~veridex.dust_execution.contracts.OrderSubmitAttempt`'s ``presubmit_record.venue_order_key``
-    to the matching :class:`~veridex.dust_execution.contracts.RealFillReconciliation`:
+    disposition is selected from the EXACT attempted decision(s) of THIS run, MATCHED on the EXACT PAIR
+    ``(decision_id, venue_order_key)`` (Gate#3 R6-MAJOR-1), NEVER "any RESOLVED row anywhere in the
+    result" and NEVER the ``venue_order_key`` ALONE: a multi-decision result could carry a benign RESOLVED
+    row from a DIFFERENT decision that reuses the SAME key, and picking it by key alone would wrongly clear
+    the freeze for an order that is still possibly-live. So for EACH decision that actually reached the
+    wire (a non-``dry_run_not_submitted`` :class:`~veridex.dust_execution.contracts.OrderAckEvent`) the
+    reducer joins the :class:`~veridex.dust_execution.contracts.OrderSubmitAttempt`'s
+    ``(decision_id, presubmit_record.venue_order_key)`` to the
+    :class:`~veridex.dust_execution.contracts.RealFillReconciliation` whose ``decision_id`` AND
+    ``venue_order_key`` BOTH equal it:
 
       * NO decision reached the wire (a POSITIVELY-PROVEN no-wire abstention / dry-run) -> the only fast
         release: ``DEFINITIVELY_ABSENT``;
-      * a submitted decision with NO pre-submit key, or NO matching reconciliation row (MISSING), or
-        MISMATCHED / DUPLICATE / MULTIPLE candidate rows for its key -> FAIL CLOSED: ``AMBIGUOUS`` (the
-        reservation stays possibly-live / FROZEN — never released or resolved on ambiguity);
+      * a submitted decision with NO pre-submit key, or NO row matching its exact ``(decision_id,
+        venue_order_key)`` PAIR (MISSING / FOREIGN decision / MISMATCHED key), or DUPLICATE / MULTIPLE
+        pair matches -> FAIL CLOSED: ``AMBIGUOUS`` (the reservation stays possibly-live / FROZEN — never
+        released or resolved on ambiguity);
       * any matched row ``AMBIGUOUS`` -> ``AMBIGUOUS`` (FREEZE, counted);
       * every matched row venue-confirmed absent (``DEFINITIVELY-ABSENT``) -> ``DEFINITIVELY_ABSENT``
         (release);
@@ -660,14 +663,21 @@ def _reconciliation_outcome(
         # A submitted decision with NO pre-submit record → cannot be keyed → FAIL CLOSED.
         return "AMBIGUOUS", None
     states: list[str] = []
-    for key in submit_keys.values():
+    for decision_id, key in submit_keys.items():
+        # Gate#3 R6-MAJOR-1: join reconciliation on the EXACT PAIR (decision_id, venue_order_key), NOT on
+        # the key ALONE. A row matches ONLY when BOTH its ``decision_id`` and ``venue_order_key`` equal
+        # THIS submitted decision's — so a FOREIGN decision's row that merely reuses this key (a
+        # multi-decision result carrying a benign RESOLVED row for a DIFFERENT decision under the SAME
+        # key) is NOT positive terminal proof for this order and can never clear its freeze.
         matches = [
             event
             for event in result.events
-            if isinstance(event, RealFillReconciliation) and event.venue_order_key == key
+            if isinstance(event, RealFillReconciliation)
+            and event.decision_id == decision_id
+            and event.venue_order_key == key
         ]
         if len(matches) != 1:
-            # MISSING / MISMATCHED / DUPLICATE / MULTIPLE reconciliation rows for THIS key → FAIL CLOSED.
+            # MISSING / FOREIGN-decision / MISMATCHED-key / DUPLICATE / MULTIPLE pair rows → FAIL CLOSED.
             return "AMBIGUOUS", None
         states.append(matches[0].reconciled_state)
     join_key = next(iter(submit_keys.values())) if len(submit_keys) == 1 else None
@@ -991,31 +1001,40 @@ async def propose_mm_execution(
     #   * a fresh RESERVED slot (or a prior RELEASED attempt, now absent) -> proceed to the runner.
     # Only on the durable-provider path (fresh/zero Mode-A dry-runs place no orders, nothing to reserve).
     #
-    # IDM-002 adds a SECOND, session-SCOPED layer before the id-dedup: stable-id dedup alone is
-    # insufficient because a caller could change ``client_order_id`` / token / any intent field to derive
-    # a DISTINCT ``attempt_id`` and submit AROUND an unresolved first order (still double exposure). So
-    # BEFORE reserving this attempt's id, ask the provider whether ANY UNSETTLED (possibly-live,
-    # not-committed, not-released) reservation already occupies the session freeze scope, and FREEZE
-    # EVERY new submit — INCLUDING a genuinely distinct id — until it resolves (venue-truth reconcile, the
-    # production hook) or an operator clears it. Only an UNSETTLED reservation freezes; a COMMITTED or
+    # IDM-002 adds a SECOND, session-SCOPED layer to the id-dedup: stable-id dedup alone is insufficient
+    # because a caller could change ``client_order_id`` / token / any intent field to derive a DISTINCT
+    # ``attempt_id`` and submit AROUND an unresolved first order (still double exposure). So a possibly-live
+    # reservation whose reconciliation is UNRESOLVED (PENDING / AMBIGUOUS) anywhere in the session must
+    # FREEZE EVERY new submit — INCLUDING a genuinely distinct id — until it resolves (venue-truth reconcile,
+    # the production hook) or an operator clears it. Only an UNSETTLED reservation freezes; a COMMITTED or
     # RELEASED one does not, so an honest reserve->wire->settle(committed=True) sequence never self-blocks.
+    #
+    # Gate#3 R6-MAJOR-2: the scope-freeze check and the reserve are ONE ATOMIC provider op
+    # (``reserve_or_freeze``), NOT a separate ``has_unresolved_reservation`` followed by ``reserve``. The
+    # split was a TOCTOU: no transaction spanned the pair, so two concurrent requests could BOTH observe an
+    # empty scope and BOTH reserve+wire. The single op fuses the scope check with the reserve-or-load in one
+    # critical section and DISCRIMINATES its outcome:
+    #   * SCOPE_FROZEN       -> a DIFFERENT id while an unresolved possibly-live reservation occupies the
+    #                           scope: FREEZE (no new wire, no spurious row), pending venue-truth reconcile;
+    #   * PENDING_RECONCILE  -> an identical retry atop THIS attempt's own possibly-live first order: FREEZE;
+    #   * COMMITTED          -> an identical retry atop THIS attempt's committed first order: idempotent
+    #                           replay (no new wire);
+    #   * RESERVED           -> a fresh slot (or a prior RELEASED attempt, now absent) -> proceed to the runner.
+    # A raise (durable-store outage) FAILS CLOSED — the runner is never reached and no write port is called.
+    # Only on the durable-provider path (fresh/zero Mode-A dry-runs place no orders, nothing to reserve).
     attempt_id: str | None = None
     if provider is not None and durable_state is not None:
         attempt_id = _reservation_attempt_id(request)
         try:
-            # IDM-002 session-scope freeze (checked BEFORE reserving this id, so a frozen distinct
-            # attempt never appends a spurious row): a possibly-live reservation whose reconciliation is
-            # UNRESOLVED (PENDING / AMBIGUOUS) anywhere in the session refuses every new wire — a
-            # wire-fired / submitted first order does NOT clear it, only a venue-truth RESOLUTION does.
-            if provider.has_unresolved_reservation(session_identity):
-                return _freeze_pending_reconciliation(request, envelope=envelope, emit=_emit)
-            reservation_outcome = provider.reserve(
+            reservation_outcome = provider.reserve_or_freeze(
                 session_identity=session_identity, now=now_dt, attempt_id=attempt_id
             )
         except Exception:
             return _fail_closed_reservation_failed(request, envelope=envelope, emit=_emit)
-        if reservation_outcome == "PENDING_RECONCILE":
-            # An identical retry atop a possibly-live first order: FREEZE — no new wire, pending reconcile.
+        if reservation_outcome in ("SCOPE_FROZEN", "PENDING_RECONCILE"):
+            # SCOPE_FROZEN: a DISTINCT id blocked by an unresolved possibly-live reservation in the session
+            # scope. PENDING_RECONCILE: an identical retry atop this attempt's own possibly-live first order.
+            # Either way FREEZE — no new wire atop a possibly-live order, pending the venue-truth reconcile.
             return _freeze_pending_reconciliation(request, envelope=envelope, emit=_emit)
         if reservation_outcome == "COMMITTED":
             # An identical retry atop a committed first order: idempotent replay, no new wire.
