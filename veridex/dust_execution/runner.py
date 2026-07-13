@@ -1908,6 +1908,18 @@ def _status_for(state: UncertainSubmitState, matched_fill_size: float) -> OrderS
     return "filled" if matched_fill_size > 0.0 else "expired"
 
 
+def _ack_fields_from_submit_result(submit_result: L2SubmitResult) -> tuple[str | None, bool]:
+    """The single source for ``(venue_order_id, accepted)`` from a keyless-transport submit result.
+
+    ``L2SubmitResult.response`` is typed ``dict[str, Any]``, so the venue ACK is read directly with
+    no runtime type guard. ``venue_order_id`` is the venue's order id (``None`` when absent) and
+    ``accepted`` reflects the venue ``success`` flag, defaulting to whether an order id was returned.
+    """
+    response = submit_result.response
+    order_id = str(response.get("orderID") or response.get("id") or "")
+    return (order_id or None), bool(response.get("success", bool(order_id)))
+
+
 async def _emit_order_lifecycle(
     quote: DustQuote,
     *,
@@ -2038,17 +2050,8 @@ async def _emit_order_lifecycle(
     venue_order_id: str | None = None
     submitted = False
     if submit_result is not None:
-        response = submit_result.response
-        order_id = (
-            str(response.get("orderID") or response.get("id") or "")
-            if isinstance(response, dict)
-            else ""
-        )
-        venue_order_id = order_id or None
+        venue_order_id, accepted = _ack_fields_from_submit_result(submit_result)
         submitted = True
-        accepted = (
-            bool(response.get("success", bool(order_id))) if isinstance(response, dict) else bool(order_id)
-        )
         ack_event: OrderAckEvent = OrderAckEvent(
             sequence_no=seqc.next(),
             event_type="OrderAckEvent",
@@ -2264,17 +2267,8 @@ async def _emit_resting_lifecycle(
     venue_order_id: str | None = None
     submitted = False
     if submit_result is not None:
-        response = submit_result.response
-        order_id = (
-            str(response.get("orderID") or response.get("id") or "")
-            if isinstance(response, dict)
-            else ""
-        )
-        venue_order_id = order_id or None
+        venue_order_id, accepted = _ack_fields_from_submit_result(submit_result)
         submitted = True
-        accepted = (
-            bool(response.get("success", bool(order_id))) if isinstance(response, dict) else bool(order_id)
-        )
         ack_event: OrderAckEvent = OrderAckEvent(
             sequence_no=seqc.next(),
             event_type="OrderAckEvent",
