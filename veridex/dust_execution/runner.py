@@ -845,14 +845,18 @@ async def _startup_open_order_sweep(
     orders": doing so would be fail-OPEN (treating unknown exposure as PROOF of no exposure). No order
     payload is logged (SEC-005).
 
-    CANCEL / BLOCK (armed Mode B only — the "on arm" moment, ``enforce`` True). BOTH a ≥1-order read
-    AND an UNKNOWN read DELEGATE to the E2-T3 single idempotent
+    CANCEL / BLOCK (armed Mode B only — the "on arm" moment, ``enforce`` True). A ≥1-order read
+    DELEGATES to the E2-T3 single idempotent
     :meth:`~veridex.dust_execution.emergency.SafetyController.cancel_all_and_block` (it does NOT
-    reimplement cancel): the venue ``cancel_all_orders`` wire is FIRED and submits are BLOCKED, so the
-    token loop's :meth:`SafetyController.check_can_submit` gate then abstains every token
-    ``"safety_blocked"`` — nothing lands atop pre-existing OR possibly-existing exposure. An adapter
-    that cannot sweep fails closed (:func:`_require_cancel_all_adapter`) rather than block-without-
-    sweeping. Only a SUCCESSFUL read returning ZERO orders leaves submit permitted.
+    reimplement cancel): the venue ``cancel_all_orders`` wire is FIRED and submits are BLOCKED. An
+    UNKNOWN read ALWAYS blocks too (Gate#3 M-2), INDEPENDENT of any cancel-all surface: a sweep-capable
+    (:class:`~veridex.dust_execution.emergency.CancelAllAdapter`) adapter sweeps + blocks via the SAME
+    primitive; a NON-sweep-capable adapter has no wire to fire, so the session submit-block is set
+    DIRECTLY (fail closed — operator intervention required, never a test-only permit path). Either way
+    the token loop's :meth:`SafetyController.check_can_submit` gate then abstains every token
+    ``"safety_blocked"`` — nothing lands atop pre-existing OR possibly-existing exposure. Only a
+    SUCCESSFUL read returning ZERO orders leaves submit permitted. (The ≥1-order path still requires a
+    sweepable adapter via :func:`_require_cancel_all_adapter`.)
 
     The sweep is labelled ``"manual"`` — the closest honest cause in the closed
     :data:`~veridex.dust_execution.contracts.CancelAllCause` vocab (an operator-initiated ARM-time
@@ -870,28 +874,47 @@ async def _startup_open_order_sweep(
     """
     read_ok, open_orders = await _read_startup_open_orders(adapter)
     if not read_ok:
-        # UNKNOWN exposure (Gate#3 MAJOR-2). Fail CLOSED for the submit decision — BUT only a
-        # RECONCILIATION-CAPABLE (sweep-able) adapter represents a real armed Mode-B venue for which
-        # unknown open-order truth is a fund hazard. In ARMED Mode B such an adapter conservatively
-        # sweeps + BLOCKS so nothing lands atop possibly-existing exposure. A MINIMAL adapter that
-        # exposes NEITHER an open-order read NOR a cancel-all sweep surface carries no reconciliation
-        # contract to protect: in a real armed Mode B the E3-T5 CLOB-V2 gate's ``get_orders_verified``
-        # GUARANTEES the read surface exists, so an absent surface is only reachable in a unit fixture
-        # that never armed for real — it keeps the pre-existing minimal-adapter permit path. Mode A
-        # (``enforce`` False) records the unavailable read but touches NO wire (dry-run has no submit
-        # to protect, AC-017) — an unavailable read never causes money I/O or a crash.
-        if enforce and isinstance(adapter, CancelAllAdapter):
-            await safety.cancel_all_and_block("manual", adapter=adapter, session=session)
-            logger.warning(
-                "dust_execution.startup_sweep",
-                extra={"open_order_truth": "unknown", "swept": True, "blocked": True},
-            )
+        # UNKNOWN exposure (Gate#3 MAJOR-2 / M-2). A fund-touching runner must FAIL CLOSED itself: in
+        # an ARMED run (``enforce`` True) unknown startup open-order truth ALWAYS blocks submit,
+        # INDEPENDENT of any cancel-all surface — never retain a test-only permit path. Two armed
+        # sub-cases:
+        #   * SWEEP-CAPABLE adapter — sweep + block: DELEGATE to the single idempotent
+        #     ``cancel_all_and_block`` primitive (fires the ``cancel_all_orders`` wire AND blocks).
+        #   * NON-sweep-capable adapter — block WITHOUT a wire: there is no cancel-all surface to fire,
+        #     but unknown exposure is still a fund hazard, so set the session submit-block DIRECTLY
+        #     (operator intervention required) rather than submit atop possibly-existing exposure.
+        # Either way the token loop's ``check_can_submit`` gate then abstains every token
+        # ``"safety_blocked"``. Mode A (``enforce`` False) records the unavailable read but touches NO
+        # wire and does NOT block (dry-run has no submit to protect, AC-017) — an unavailable read
+        # never causes money I/O or a crash. No order payload is logged (SEC-005): boolean truth only.
+        if enforce:
+            if isinstance(adapter, CancelAllAdapter):
+                await safety.cancel_all_and_block("manual", adapter=adapter, session=session)
+                logger.warning(
+                    "dust_execution.startup_sweep",
+                    extra={"open_order_truth": "unknown", "swept": True, "blocked": True},
+                )
+            else:
+                # No wire to fire — fail closed by setting the submit-block directly (idempotent; a
+                # prior trigger may already have blocked). "manual" is the honest ARM-time cause.
+                session.submit_blocked = True
+                session.block_cause = "manual"
+                logger.warning(
+                    "dust_execution.startup_sweep",
+                    extra={
+                        "open_order_truth": "unknown",
+                        "swept": False,
+                        "blocked": True,
+                        "sweep_capable": False,
+                    },
+                )
         else:
             logger.info(
                 "dust_execution.startup_sweep",
                 extra={
                     "open_order_truth": "unknown",
                     "swept": False,
+                    "blocked": False,
                     "sweep_capable": isinstance(adapter, CancelAllAdapter),
                 },
             )

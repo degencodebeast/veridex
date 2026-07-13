@@ -32,6 +32,7 @@ from pydantic import BaseModel, ValidationError
 from tests.test_dust_execution_privy_signer import _WALLET_ADDRESS
 from tests.test_dust_execution_runner import (
     _ORDER_AUTH,
+    RecordingFakeAdapter,
     _default_write_port,
     _mode_b_signer,
     _NoOpInterlockStore,
@@ -756,7 +757,9 @@ async def test_mode_b_arms_and_records_when_all_operator_preconditions_are_satis
     (the order reaches the wire) AND records all five preconditions satisfied. This makes the
     per-precondition no-go MUTATION meaningful (not vacuously green)."""
     binding = _mm_binding()
-    adapter = FakeVenueAdapter(fill=True)
+    # Trustworthy zero-orders startup read so the armed run reaches the wire (an absent open-order
+    # read is UNKNOWN exposure and now fails closed under the M-2 startup-sweep fix).
+    adapter = RecordingFakeAdapter(fill=True, open_orders=[])
     write_port = _default_write_port(binding)
     store = InMemoryOperatorInterlockStore()
 
@@ -993,7 +996,9 @@ async def test_result_reports_submitted_for_a_clean_armed_take() -> None:
     ``execution_status == SUBMITTED`` (an order actually reached the wire) — the positive control that
     makes the withheld/abstained cases meaningful (Gate#3 MAJOR-3)."""
     binding = _mm_binding()
-    adapter = FakeVenueAdapter(fill=True)
+    # Trustworthy zero-orders startup read so the armed run reaches the wire (an absent open-order
+    # read is UNKNOWN exposure and now fails closed under the M-2 startup-sweep fix).
+    adapter = RecordingFakeAdapter(fill=True, open_orders=[])
     write_port = _default_write_port(binding)
 
     result = await _drive_mode_b_kind(

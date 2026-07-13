@@ -579,7 +579,10 @@ async def test_mode_b_clear_quote_submits() -> None:
     :class:`ModeBWritePort` — never the generic ``adapter.submit_order`` — so this asserts on the
     write port's call count, not the adapter's.
     """
-    adapter = FakeVenueAdapter(fill=True)
+    # A TRUSTWORTHY zero-orders startup read (RecordingFakeAdapter with an empty book) so the M-2
+    # fail-closed startup sweep PERMITS submit — an absent read surface is UNKNOWN exposure and now
+    # blocks, which is not what this clean-quote positive control exercises.
+    adapter = RecordingFakeAdapter(fill=True, open_orders=[])
     source = _ScriptedSource(quote=_fresh_quote())
     write_port = _default_write_port()
 
@@ -715,8 +718,12 @@ async def test_mode_a_and_mode_b_emit_identical_lifecycle_contract_shape() -> No
     result_a = await _run(
         adapter=FakeVenueAdapter(fill=True), source=_ScriptedSource(quote=quote), mode="dry_run"
     )
+    # Mode B needs a TRUSTWORTHY zero-orders startup read to reach the submit path (an absent read is
+    # UNKNOWN exposure and now fails closed under the M-2 fix); Mode A never blocks (no submit to protect).
     result_b = await _run(
-        adapter=FakeVenueAdapter(fill=True), source=_ScriptedSource(quote=quote), mode="live_guarded"
+        adapter=RecordingFakeAdapter(fill=True, open_orders=[]),
+        source=_ScriptedSource(quote=quote),
+        mode="live_guarded",
     )
 
     assert isinstance(result_a.session_meta, DustExecutionSessionMeta)
@@ -765,8 +772,12 @@ async def test_mode_a_and_mode_b_emit_identical_lifecycle_contract_shape() -> No
 
 async def test_sequence_no_unique_append_only_monotonic() -> None:
     """``sequence_no`` is append-only, unique, and gap-free across the whole event stream."""
+    # Trustworthy zero-orders startup read so the armed run reaches the full submit lifecycle (an
+    # absent read is UNKNOWN exposure and now fails closed under the M-2 fix).
     result = await _run(
-        adapter=FakeVenueAdapter(fill=True), source=_ScriptedSource(quote=_fresh_quote()), mode="live_guarded"
+        adapter=RecordingFakeAdapter(fill=True, open_orders=[]),
+        source=_ScriptedSource(quote=_fresh_quote()),
+        mode="live_guarded",
     )
 
     seqs = [e.sequence_no for e in result.events]
@@ -1870,6 +1881,77 @@ async def test_startup_sweep_unknown_read_in_mode_a_records_no_wire_no_crash() -
     assert adapter.submit_calls == 0, "Mode A places no orders (AC-017)"
     (decision,) = result.decisions
     assert decision.submitted is False and decision.abstain_reason == "mode_a_no_orders"
+
+
+# --- Gate#3 M-2: UNKNOWN startup truth blocks an armed run even WITHOUT a cancel-all surface -------
+#
+# The E6-T5 / MAJOR-2 fail-closed tests above all use adapters that CAN sweep (``cancel_all_orders``
+# present). The remaining fail-OPEN hole (Gate#3 M-2): an armed Mode-B adapter that exposes NEITHER a
+# working open-order read NOR a cancel-all surface still SUBMITTED on unknown exposure, because the
+# runner blocked only for a ``CancelAllAdapter`` and merely LOGGED-and-permitted otherwise. A
+# fund-touching runner must FAIL CLOSED itself: unknown startup truth in an armed run must ALWAYS
+# block submit, INDEPENDENT of any sweep surface. When the adapter CANNOT sweep there is no wire to
+# fire, so the runner sets the session submit-block directly (operator intervention required) rather
+# than submit atop possibly-existing exposure. Mutation: restore the ``CancelAllAdapter``-gated permit
+# -> these two tests fail (a submit proceeds, ``write_port.submit_calls == 1``).
+
+
+class _RaisingGetOrdersNoSweepAdapter(FakeVenueAdapter):
+    """An armed adapter whose ``get_orders`` RAISES (UNKNOWN truth) and that CANNOT sweep (no
+    ``cancel_all_orders``) — neither reconciliation surface is usable, so the run must fail closed
+    WITHOUT firing any wire.
+    """
+
+    def __init__(self, *, fill: bool = True) -> None:
+        super().__init__(fill=fill)
+        self.get_orders_calls = 0
+
+    async def get_orders(self, **kwargs: object) -> list[dict[str, object]]:
+        self.get_orders_calls += 1
+        raise RuntimeError("startup read unavailable")
+
+
+async def test_startup_sweep_unknown_read_without_sweep_surface_blocks_submit() -> None:
+    """Gate#3 M-2: an armed adapter that can NEITHER read open orders NOR sweep must fail CLOSED.
+
+    The plain :class:`FakeVenueAdapter` exposes neither ``get_orders`` (open-order truth is UNKNOWN)
+    nor ``cancel_all_orders`` (it cannot sweep). Unknown startup exposure in an armed run must block
+    submit INDEPENDENT of any cancel-all surface: there is no wire to fire, so the runner sets the
+    session submit-block directly so the token loop's ``check_can_submit`` gate abstains every token
+    ``"safety_blocked"`` — never submit atop possibly-existing exposure. Today the non-sweepable branch
+    merely LOGS and permits, so the clean quote submits (``write_port.submit_calls == 1``): fails RED.
+    """
+    adapter = FakeVenueAdapter(fill=True)
+    safety, session = _make_safety()
+    write_port = _default_write_port()
+
+    result = await _run_guarded(adapter=adapter, safety=safety, session=session, write_port=write_port)
+
+    assert session.submit_blocked is True, "UNKNOWN open-order truth must block submits even without a sweep surface"
+    assert write_port.submit_calls == 0, "no order may be submitted atop UNKNOWN exposure when the adapter cannot sweep"
+    assert adapter.submit_calls == 0, "Mode B never reaches the generic adapter submit surface"
+    (decision,) = result.decisions
+    assert decision.submitted is False and decision.abstain_reason == "safety_blocked"
+
+
+async def test_startup_sweep_raising_read_without_sweep_surface_blocks_submit() -> None:
+    """Gate#3 M-2: a RAISING open-order read on a NON-sweepable armed adapter also fails closed.
+
+    A ``get_orders`` that raises is UNKNOWN exposure; the adapter also lacks ``cancel_all_orders``, so
+    there is no wire to fire. The runner must STILL block submit (set the session block directly) rather
+    than fail open. Today the non-``CancelAllAdapter`` branch logs-and-permits -> the quote submits.
+    """
+    adapter = _RaisingGetOrdersNoSweepAdapter(fill=True)
+    safety, session = _make_safety()
+    write_port = _default_write_port()
+
+    result = await _run_guarded(adapter=adapter, safety=safety, session=session, write_port=write_port)
+
+    assert adapter.get_orders_calls >= 1, "the runner must ATTEMPT the open-order read on arm"
+    assert session.submit_blocked is True, "a RAISING read on a non-sweepable adapter must block submits"
+    assert write_port.submit_calls == 0, "a raised startup read must NOT fail-open to a submit"
+    (decision,) = result.decisions
+    assert decision.submitted is False and decision.abstain_reason == "safety_blocked"
 
 
 # --- E6-T6: shutdown cancel-all or explicit leave-open decision (SAF-006, AC-009) -------------
