@@ -340,6 +340,38 @@ async def test_each_safety_trigger_fires_exactly_one_cancel_all_with_honest_caus
     assert "venue_order_id" not in session.last_cancel_all_ack.model_dump()
 
 
+async def test_two_composed_safety_triggers_fire_exactly_one_idempotent_cancel_all() -> None:
+    """Whole-lane idempotency — two triggers in one run -> one sweep, honest FIRST cause.
+
+    Drives ONE Mode-A (dry_run) run with TWO safety triggers BOTH active in the SAME run: a
+    breaker OPEN and ``kill_switch=True``. ``_apply_safety_triggers`` order is
+    fills(loss) -> breaker -> kill_switch, so the breaker fires the sweep FIRST (honest first
+    cause ``"breaker"``) and the kill-switch is an idempotent no-op — EXACTLY ONE
+    ``cancel_all_orders`` reaches the wire. Closes the whole-lane teeth gap Gate#4 Fable review
+    found: the prior integration coverage only ever drove ONE trigger per run, so a mutant that
+    removes the idempotent early-return in ``emergency.py`` (``if session.submit_blocked: ...
+    return session.last_cancel_all_ack``) survived here and was caught only by the emergency
+    UNIT tests.
+    """
+    result, adapter, session = await _run_mode_a_with_trigger(
+        breaker=CircuitBreaker(state=CircuitState.OPEN, opened_at=0.0, consecutive_failures=5),
+        envelope_kwargs={"kill_switch": True},
+    )
+    assert adapter.cancel_all_calls == 1, (
+        "two composed triggers in ONE run must still fire the cancel-all WIRE exactly once"
+    )
+    assert session.submit_blocked is True
+    assert adapter.submit_calls == 0
+    assert result.decisions[0].abstain_reason == "safety_blocked"
+    assert session.last_cancel_all_ack is not None
+    assert session.last_cancel_all_ack.trigger_cause == "breaker", (
+        "the FIRST trigger to fire (breaker, per _apply_safety_triggers order "
+        "fills->breaker->kill_switch) must be the recorded cause — never overwritten by the "
+        "second trigger in the same run"
+    )
+    assert "venue_order_id" not in session.last_cancel_all_ack.model_dump()
+
+
 async def test_facade_kill_switch_fires_the_one_cancel_all_on_the_wire_and_ends_flat() -> None:
     """Assertion #2 (through the SANCTIONED facade entry): a simulated kill-switch in the hash-pinned
     envelope fires EXACTLY ONE ``cancel_all_orders`` on the wire, denies the run for the honest
