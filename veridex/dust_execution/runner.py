@@ -112,7 +112,12 @@ from veridex.dust_execution.privy_control_plane import (
 )
 from veridex.dust_execution.reconcile import UncertainSubmitState, assess_uncertain_submit
 from veridex.dust_execution.resting_order import RestingOrder
-from veridex.dust_execution.risk import FailClosed, RealizedFillRecord, RiskAccumulator
+from veridex.dust_execution.risk import (
+    FailClosed,
+    RealizedFillRecord,
+    RiskAccumulator,
+    authorize_mode_b,
+)
 from veridex.dust_execution.signer import Signer, SigningPayload
 from veridex.dust_execution.signing_compiler import WireSide
 from veridex.dust_execution.sizing import resolve_dust_size
@@ -1145,6 +1150,7 @@ def _mode_b_arming_block_reason(
     arming: ModeBArming | None,
     *,
     manifest: StrategyExperimentManifest,
+    envelope: PolicyEnvelope,
     signer: Signer,
     session_id: str,
     store: OperatorInterlockStore | None,
@@ -1158,6 +1164,12 @@ def _mode_b_arming_block_reason(
     #. the E3-T5 CLOB-V2 gate ``mode_b_admitted`` (machine + operator smoke);
     #. the E3-T8 Privy signing preflight ``ok is True``;
     #. the E3-T8 pUSD/approvals/gas provisioning ``ok is True``;
+    #. Gate#3 runner-gate (SAF-002a/AC-032): the operator ``envelope`` passes
+       :func:`~veridex.dust_execution.risk.authorize_mode_b` — Mode B REQUIRES a finite POSITIVE
+       ``max_session_loss`` AND ``max_daily_loss``; a disabled / non-finite / non-positive cap gives
+       no real max-loss protection, so its :class:`FailClosed` blocks. The runner-side TWIN of the
+       facade's live-Mode-B envelope-loss-cap gate (defense-in-depth for a facade-bypassing caller);
+       maps to the generic ``mode_b_not_armed`` (SEC-005: no cap value in the reason);
     #. the binding ``binding_hash`` verifies against the pinned manifest field
        (:func:`execute_with`) AND the LIVE policy/quorum verify against the binding
        (:func:`arm_mode_b`) — a :class:`FailClosed` from either (reroute / weakened policy content
@@ -1191,6 +1203,20 @@ def _mode_b_arming_block_reason(
     if arming.privy_preflight.ok is not True:
         return "mode_b_not_armed"
     if arming.provisioning.ok is not True:
+        return "mode_b_not_armed"
+    # Gate#3 runner-gate (SAF-002a/AC-032): the runner-side TWIN of the facade's live-Mode-B
+    # envelope-loss-cap gate — defense-in-depth for a DIRECT, facade-bypassing arming call. Mode B
+    # REQUIRES a finite POSITIVE ``max_session_loss`` AND ``max_daily_loss``; a disabled / non-finite
+    # (nan/inf) / non-positive cap gives NO real max-loss protection (``RiskAccumulator.breaches_caps``
+    # — the SAF-002d sweep trigger — can never fire), so it must NOT arm real money. Reuses the SAME
+    # ``risk.authorize_mode_b`` authority as the facade (its ``FailClosed`` is the single fail-closed
+    # check — never re-implemented here) and maps it to the generic ``mode_b_not_armed`` (SEC-005: no
+    # cap value in the reason). Ordered with the other generic-reason preconditions so the
+    # specific-reason technical checks below (legacy signer / missing write port / unproven interlock)
+    # still surface their own reasons.
+    try:
+        authorize_mode_b(envelope)
+    except FailClosed:
         return "mode_b_not_armed"
     try:
         # Binding-hash vs the pinned manifest field (reroute guard), THEN live policy/quorum content
@@ -1564,6 +1590,7 @@ async def run_dust_execution(
         _mode_b_arming_block_reason(
             arming,
             manifest=manifest,
+            envelope=envelope,
             signer=signer,
             session_id=session.session_id,
             store=operator_interlock_store,

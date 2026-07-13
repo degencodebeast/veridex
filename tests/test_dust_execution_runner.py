@@ -181,6 +181,13 @@ def _env(**kw: object) -> PolicyEnvelope:
         "max_quote_age_s": 10,
         "cooldown_s": 0,
         "human_approval_threshold": 1000.0,
+        # SAF-002a / AC-032 (Gate#3 runner-gate): FINITE POSITIVE envelope loss caps so a Mode-B
+        # positive control ARMS (a disabled cap now fails closed under ``authorize_mode_b``, mirroring
+        # the facade migration). Deliberately LOOSER than the manifest caps (2.0 / 4.0) so the effective
+        # (stricter positive) ceiling stays the manifest cap for the existing manifest-cap tests; a test
+        # that exercises the disabled/non-finite envelope path overrides these with a bad value.
+        "max_session_loss": 5.0,
+        "max_daily_loss": 10.0,
         "kill_switch": False,
     }
     base.update(kw)
@@ -1311,6 +1318,78 @@ async def test_mode_b_arms_and_submits_when_all_preconditions_pass() -> None:
     result = await _run_guarded(adapter=adapter, write_port=write_port)
 
     assert write_port.submit_calls == 1, "a fully-armed Mode B must reach the keyless write-port wire"
+    assert adapter.submit_calls == 0, "Mode B must NEVER reach the generic adapter submit surface"
+    (decision,) = result.decisions
+    assert decision.submitted is True and decision.abstain_reason is None
+
+
+# --- SAF-002a / AC-032 (Gate#3 runner-gate): the runner-side TWIN of the facade envelope-loss-cap
+# gate. A DIRECT (facade-bypassing) ``run_dust_execution`` with a FULL valid arming bundle (genuine
+# store-issued interlock receipt, real write port, every technical prerequisite satisfied) but a
+# DISABLED / NON-FINITE / NON-POSITIVE operator PolicyEnvelope loss cap must NOT arm real money: such
+# a cap gives NO max-loss protection (``RiskAccumulator.breaches_caps`` — the SAF-002d sweep trigger —
+# can never fire), exactly the state SAF-002(a) forbids. Enforced runner-side as defense-in-depth even
+# though the facade already gates it, because the runner is public/exported. SEC-005: the fail-closed
+# reason carries NO cap value.
+
+
+@pytest.mark.parametrize(
+    "loss_caps",
+    [
+        pytest.param({"max_session_loss": 0.0, "max_daily_loss": 10.0}, id="session_disabled"),
+        pytest.param({"max_session_loss": 5.0, "max_daily_loss": 0.0}, id="day_disabled"),
+        pytest.param({"max_session_loss": -1.0, "max_daily_loss": 10.0}, id="session_non_positive"),
+        pytest.param(
+            {"max_session_loss": float("inf"), "max_daily_loss": 10.0}, id="session_non_finite_inf"
+        ),
+        pytest.param(
+            {"max_session_loss": float("nan"), "max_daily_loss": 10.0}, id="session_nan"
+        ),
+    ],
+)
+async def test_direct_runner_arming_blocks_disabled_or_nonfinite_envelope_loss_cap(
+    loss_caps: dict[str, float],
+) -> None:
+    """A direct Mode-B arming with a disabled / non-finite / non-positive envelope loss cap stays UNARMED.
+
+    Every OTHER arming precondition positively passes (full valid bundle) — the ONLY defect is the
+    operator envelope loss cap. RED before the runner-side gate: the runner arms and the keyless write
+    port fires (``submit_calls == 1``). GREEN after: ``authorize_mode_b`` fails closed → the decision
+    abstains with ``mode_b_not_armed`` and NOTHING reaches the wire.
+    """
+    adapter = RecordingFakeAdapter(fill=True, open_orders=[])
+    write_port = _default_write_port()
+
+    result = await _run_guarded(
+        adapter=adapter, write_port=write_port, envelope=_env(**loss_caps)
+    )
+
+    assert write_port.submit_calls == 0, (
+        "a disabled / non-finite / non-positive envelope loss cap must NOT arm the keyless write port"
+    )
+    assert adapter.submit_calls == 0, "Mode B must NEVER reach the generic adapter submit surface"
+    (decision,) = result.decisions
+    assert decision.submitted is False
+    assert decision.abstain_reason == "mode_b_not_armed"
+
+
+async def test_direct_runner_arming_submits_with_finite_positive_envelope_loss_caps() -> None:
+    """POSITIVE CONTROL: a full valid bundle WITH finite POSITIVE envelope loss caps still arms/submits.
+
+    Keeps the disabled/non-finite MUTATION meaningful: with the SAME bundle and finite positive caps
+    (loss below), Mode B reaches the keyless write-port wire exactly once — so a green block-test is
+    the gate firing, not the bundle being inert.
+    """
+    adapter = RecordingFakeAdapter(fill=True, open_orders=[])
+    write_port = _default_write_port()
+
+    result = await _run_guarded(
+        adapter=adapter,
+        write_port=write_port,
+        envelope=_env(max_session_loss=5.0, max_daily_loss=10.0),
+    )
+
+    assert write_port.submit_calls == 1, "finite positive envelope loss caps must still arm Mode B"
     assert adapter.submit_calls == 0, "Mode B must NEVER reach the generic adapter submit surface"
     (decision,) = result.decisions
     assert decision.submitted is True and decision.abstain_reason is None

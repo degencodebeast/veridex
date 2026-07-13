@@ -1223,10 +1223,14 @@ async def propose_mm_execution(
             # callers could both observe a below-cap snapshot and both submit while the durable loss ledger
             # advanced past the cap). BOTH loss authorities are threaded: the MANIFEST ``max_session_loss``
             # / ``max_daily_loss`` AND the operator ENVELOPE ``max_session_loss`` / ``max_daily_loss``
-            # (hash-pinned into ``policy_hash``). The atomic admission enforces the STRICTER positive of
-            # the two per axis (``_effective_loss_cap``), so NEITHER the operator envelope cap NOR the
-            # manifest cap can be exceeded — the money path's go/no-go on the loss is now this atomic
-            # reservation, not ``durable_state.risk``'s pre-fill snapshot. (The envelope↔manifest
+            # (hash-pinned into ``policy_hash``). The atomic admission enforces the EFFECTIVE loss cap —
+            # the STRICTER positive of the two per axis (``_effective_loss_cap``) — so the go/no-go is
+            # made against that effective ceiling, not either raw cap alone. This is an ADMISSION-TIME
+            # guarantee: it holds at admission (a fresh reservation is refused once the CURRENT durable
+            # loss already reaches the effective cap); it does NOT retroactively cap losses from orders
+            # already RESTING mid-run — the SAF-002d envelope-cap sweep covers that mid-run surface. The
+            # money path's admission go/no-go on the loss is now this atomic reservation, not
+            # ``durable_state.risk``'s pre-fill snapshot. (The envelope↔manifest
             # relationship: both are committed caps; the envelope is the operator's hash-pinned ceiling
             # and the manifest is the strategy-experiment ceiling; the tighter enabled one wins.)
             reservation_outcome = provider.reserve_or_freeze(
@@ -1263,8 +1267,11 @@ async def propose_mm_execution(
         if reservation_outcome in ("LOSS_CAP_EXCEEDED_SESSION", "LOSS_CAP_EXCEEDED_DAY"):
             # Gate#3 loss-cap TOCTOU: the atomic realized-loss gate refused — the CURRENT durable
             # fee-inclusive realized loss (summed under the held lock via ``cap_breached``) already breaches
-            # the manifest session / UTC-day loss cap, observed against the concurrently-advanced loss
-            # ledger rather than the stale below-cap ``load()`` snapshot. FAIL CLOSED with the existing
+            # the EFFECTIVE (stricter positive of envelope / manifest) session / UTC-day loss cap, observed
+            # against the concurrently-advanced loss ledger rather than the stale below-cap ``load()``
+            # snapshot. This is an ADMISSION-TIME guarantee (a fresh reservation is refused once the current
+            # loss reaches the effective cap); mid-run losses from already-RESTING fills are covered by the
+            # SAF-002d envelope-cap sweep, not this admission gate. FAIL CLOSED with the existing
             # ``*_loss_over_max`` reason family: DENIED, the runner is never reached and no write port is
             # called. The runner's own pre-wire loss gate stays for direct-runner callers / defense-in-depth,
             # but the facade money path's authoritative loss gate is now this atomic reservation.
