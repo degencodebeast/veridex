@@ -58,6 +58,7 @@ from veridex.dust_execution.runner import (
     DustQuote,
     ModeBArming,
     OperatorInterlockProof,
+    QuoteSource,
     SessionOutcome,
     ShutdownDecision,
     ShutdownPolicy,
@@ -646,13 +647,15 @@ async def _run_guarded(
     realized_fills: tuple[RealizedFillRecord, ...] = (),
     own_legs: tuple[OwnOrderLeg, ...] = (),
     envelope: PolicyEnvelope | None = None,
-    source: _ScriptedSource | None = None,
+    source: QuoteSource | None = None,
     arming: object = _ARMING_DEFAULT,
     manifest: StrategyExperimentManifest | None = None,
     request: MMExecutionToolRequest | None = None,
     wallet_equity_at_decision: float = _WALLET_EQUITY,
     fixed_fraction: float = _FIXED_FRACTION,
     shutdown_policy: ShutdownPolicy = "leave_open",
+    prior_session_order_count: int = 0,
+    prior_day_order_count: int = 0,
 ) -> DustExecutionResult:
     binding = _binding()
     effective_manifest = manifest if manifest is not None else _mode_b_manifest(binding)
@@ -677,6 +680,8 @@ async def _run_guarded(
         realized_fills=realized_fills,
         own_legs=own_legs,
         shutdown_policy=shutdown_policy,
+        prior_session_order_count=prior_session_order_count,
+        prior_day_order_count=prior_day_order_count,
     )
 
 
@@ -2202,3 +2207,182 @@ async def test_singular_make_quote_token_not_in_universe_fails_closed() -> None:
     assert adapter.submit_calls == 0
     assert all(not d.submitted for d in result.decisions)
     assert all(d.abstain_reason == "intent_token_mismatch" for d in result.decisions)
+
+
+# =====================================================================================
+# Gate#3 M-3 (MAJOR): the live runner MUST enforce run / session / UTC-day + manifest.max_orders
+# order-count caps in the PRE-SUBMIT admission path. Before this fix the token loop has NO
+# submitted-order counter and NO cap check: ``manifest.max_orders`` is recorded only as metadata,
+# and the E2 policy order caps (``max_orders_per_run/session/day``) are never threaded — so a single
+# run submits past ``manifest.max_orders`` and repeated runs exceed the session/day caps.
+#
+# THE FUND-TOUCHING PROPERTY: with a cap of 1 and TWO eligible order-placing decisions, EXACTLY ONE
+# order reaches the wire; the (N+1)th abstains with the closed-vocab ``order_cap_*`` reason. The
+# session/day caps hold across a restart/reconstruction seeded with a durable prior count.
+#
+# MUTATION: drop the cap check / stop incrementing the counter -> the (N+1)th order submits
+# (``submit_calls == 2``), so these tests FAIL. That proves the caps are under test.
+
+
+class _PerTokenSource:
+    """A gate-passing quote source returning a FRESH, age-0, two-sided quote keyed to each token.
+
+    Unlike ``_ScriptedSource`` (one pinned quote) this yields a distinct quote per token so a
+    multi-token SELF-DRIVEN (no agent request → default taker, no C-4 token-targeting) run drives ONE
+    eligible taker decision per universe token — the fixture needed to prove the per-run cap denies
+    the SECOND eligible decision within a single run.
+    """
+
+    def __init__(self) -> None:
+        self.reads: list[str] = []
+
+    async def read_quote(self, token_id: str) -> DustQuote:
+        self.reads.append(token_id)
+        return _fresh_quote(token_id=token_id)
+
+
+async def test_per_run_order_cap_denies_second_eligible_token() -> None:
+    """``max_orders_per_run == 1`` with TWO eligible tokens: exactly ONE submits, the 2nd order_cap_run.
+
+    RED before the fix: the token loop has no submitted-order counter and never checks the cap, so a
+    two-token self-driven Mode-B run submits BOTH takers (``submit_calls == 2``). After the fix the
+    per-run counter admits the first order and the second abstains ``order_cap_run`` — one wire order.
+    """
+    manifest = _mode_b_manifest(universe=(_TOKEN, _TOKEN_NO), max_orders=5)
+    env = _env(max_orders_per_run=1)
+    adapter = _MakerRecordingAdapter(fill=True)
+
+    result = await _run_guarded(adapter=adapter, manifest=manifest, envelope=env, source=_PerTokenSource())
+
+    assert adapter.submit_calls == 1, "the per-run cap must let EXACTLY ONE order reach the wire"
+    assert result.submitted_count == 1
+    by_token = {d.token_id: d for d in result.decisions}
+    assert by_token[_TOKEN].submitted is True and by_token[_TOKEN].abstain_reason is None
+    assert by_token[_TOKEN_NO].submitted is False
+    assert by_token[_TOKEN_NO].abstain_reason == "order_cap_run"
+
+
+async def test_manifest_max_orders_enforced_as_ceiling_independent_of_policy() -> None:
+    """``manifest.max_orders`` is an enforced ceiling, NOT metadata — even when the policy caps are high.
+
+    RED before the fix: ``manifest.max_orders`` is recorded only in ``caps_snapshot`` and never gates
+    the loop, so a two-token run with a permissive policy submits BOTH takers (``submit_calls == 2``).
+    After the fix the manifest ceiling of 1 denies the second order ``order_cap_run`` even though every
+    policy order cap is generously above 1.
+    """
+    manifest = _mode_b_manifest(universe=(_TOKEN, _TOKEN_NO), max_orders=1)
+    env = _env(max_orders_per_run=5, max_orders_per_session=20, max_orders_per_day=50)
+    adapter = _MakerRecordingAdapter(fill=True)
+
+    result = await _run_guarded(adapter=adapter, manifest=manifest, envelope=env, source=_PerTokenSource())
+
+    assert adapter.submit_calls == 1, "the manifest.max_orders ceiling must cap the wire independently"
+    by_token = {d.token_id: d for d in result.decisions}
+    assert by_token[_TOKEN].submitted is True
+    assert by_token[_TOKEN_NO].submitted is False
+    assert by_token[_TOKEN_NO].abstain_reason == "order_cap_run"
+
+
+async def test_session_order_cap_denies_across_restart() -> None:
+    """A durable prior SESSION order count is honored across a restart: at-cap denies, one-below admits one.
+
+    RED before the fix: the runner threads no durable session count, so a reconstructed run that is
+    already at (or one below) the session cap ignores it and submits on the wire. After the fix the
+    prior count seeds the session admission: AT the cap the very first order abstains
+    ``order_cap_session``; one below the cap admits EXACTLY one more then denies.
+    """
+    # (a) started ALREADY AT the session cap → the very first order abstains order_cap_session.
+    manifest = _mode_b_manifest(universe=(_TOKEN,), max_orders=5)
+    env = _env(max_orders_per_session=1, max_orders_per_run=5, max_orders_per_day=50)
+    adapter = _MakerRecordingAdapter(fill=True)
+
+    result = await _run_guarded(
+        adapter=adapter, manifest=manifest, envelope=env, source=_PerTokenSource(), prior_session_order_count=1
+    )
+
+    assert adapter.submit_calls == 0, "a session already at its cap must place NO order after restart"
+    (decision,) = result.decisions
+    assert decision.submitted is False
+    assert decision.abstain_reason == "order_cap_session"
+
+    # (b) started ONE BELOW the session cap → exactly one more order, then the next denies.
+    manifest2 = _mode_b_manifest(universe=(_TOKEN, _TOKEN_NO), max_orders=5)
+    env2 = _env(max_orders_per_session=2, max_orders_per_run=5, max_orders_per_day=50)
+    adapter2 = _MakerRecordingAdapter(fill=True)
+
+    result2 = await _run_guarded(
+        adapter=adapter2, manifest=manifest2, envelope=env2, source=_PerTokenSource(), prior_session_order_count=1
+    )
+
+    assert adapter2.submit_calls == 1, "one below the session cap admits EXACTLY one more order"
+    by_token = {d.token_id: d for d in result2.decisions}
+    assert by_token[_TOKEN].submitted is True
+    assert by_token[_TOKEN_NO].submitted is False
+    assert by_token[_TOKEN_NO].abstain_reason == "order_cap_session"
+
+
+async def test_day_order_cap_denies_across_restart() -> None:
+    """A durable prior UTC-DAY order count is honored across a restart: at-cap denies, one-below admits one.
+
+    RED before the fix: the runner threads no durable day count, so a reconstructed run at/one-below the
+    daily cap ignores it and submits. After the fix the prior day count seeds admission the same way as
+    the session cap, with the ``order_cap_day`` closed-vocab reason.
+    """
+    # (a) started ALREADY AT the daily cap → the very first order abstains order_cap_day.
+    manifest = _mode_b_manifest(universe=(_TOKEN,), max_orders=5)
+    env = _env(max_orders_per_day=1, max_orders_per_run=5, max_orders_per_session=20)
+    adapter = _MakerRecordingAdapter(fill=True)
+
+    result = await _run_guarded(
+        adapter=adapter, manifest=manifest, envelope=env, source=_PerTokenSource(), prior_day_order_count=1
+    )
+
+    assert adapter.submit_calls == 0, "a day already at its cap must place NO order after restart"
+    (decision,) = result.decisions
+    assert decision.submitted is False
+    assert decision.abstain_reason == "order_cap_day"
+
+    # (b) started ONE BELOW the daily cap → exactly one more order, then the next denies.
+    manifest2 = _mode_b_manifest(universe=(_TOKEN, _TOKEN_NO), max_orders=5)
+    env2 = _env(max_orders_per_day=2, max_orders_per_run=5, max_orders_per_session=20)
+    adapter2 = _MakerRecordingAdapter(fill=True)
+
+    result2 = await _run_guarded(
+        adapter=adapter2, manifest=manifest2, envelope=env2, source=_PerTokenSource(), prior_day_order_count=1
+    )
+
+    assert adapter2.submit_calls == 1, "one below the daily cap admits EXACTLY one more order"
+    by_token = {d.token_id: d for d in result2.decisions}
+    assert by_token[_TOKEN].submitted is True
+    assert by_token[_TOKEN_NO].submitted is False
+    assert by_token[_TOKEN_NO].abstain_reason == "order_cap_day"
+
+
+async def test_mode_a_would_submit_counts_toward_run_cap() -> None:
+    """Mode A gates the DECISION to place identically: a would-be (N+1)th decision abstains order_cap_run.
+
+    The order cap governs the DECISION to place, so it gates identically in Mode A and Mode B: Mode A
+    still touches NO wire (AC-017), but its first would-submit consumes the single per-run slot and the
+    second token's would-be decision abstains ``order_cap_run`` instead of the benign ``mode_a_no_orders``.
+    """
+    manifest = _manifest(universe=(_TOKEN, _TOKEN_NO), max_orders=5, mode="dry_run")
+    env = _env(max_orders_per_run=1)
+    adapter = _MakerRecordingAdapter(fill=True)
+
+    result = await run_dust_execution(
+        adapter=adapter,
+        signer=LocalFakeWalletControlPlane(),
+        sources=_PerTokenSource(),
+        now_fn=_clock,
+        sleep_fn=_noop_sleep,
+        envelope=env,
+        manifest=manifest,
+        mode="dry_run",
+        wallet_equity_at_decision=_WALLET_EQUITY,
+        fixed_fraction=_FIXED_FRACTION,
+    )
+
+    assert adapter.submit_calls == 0, "Mode A must place NO order on the wire (AC-017)"
+    by_token = {d.token_id: d for d in result.decisions}
+    assert by_token[_TOKEN].abstain_reason == "mode_a_no_orders", "the first would-submit rehearses a place"
+    assert by_token[_TOKEN_NO].abstain_reason == "order_cap_run", "the 2nd would-be decision hits the cap"

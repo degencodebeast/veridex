@@ -204,6 +204,11 @@ class QuoteSource(Protocol):
 #: and ``intent_token_mismatch`` (Gate#3 C-4: a SINGULAR order-placing intent whose admitted
 #: ``intent_params.token_id`` is not THIS loop token — a singular intent moves ONE admitted token, so
 #: every other universe token abstains; a missing / out-of-universe target fails closed, all abstain).
+#: Gate#3 M-3 additions — the PRE-SUBMIT order-count cap refusals. ``order_cap_run`` /
+#: ``order_cap_session`` / ``order_cap_day`` are the SAME closed-vocab literals the E2 policy gate
+#: (:func:`veridex.policy.gate.evaluate_pre_quote`) and engine (``_REASON_ORDER_CAP_*``) emit — the
+#: runner reuses them so the durable run/session/UTC-day + ``manifest.max_orders`` caps it now
+#: enforces speak one vocabulary end to end (no minted synonyms).
 AbstainReason = Literal[
     "stale_quote_age",
     "stale_source",
@@ -223,6 +228,9 @@ AbstainReason = Literal[
     "intent_not_permitted",
     "intent_params_invalid",
     "intent_token_mismatch",
+    "order_cap_run",
+    "order_cap_session",
+    "order_cap_day",
 ]
 
 #: Tuple form of :data:`AbstainReason` for membership checks / iteration.
@@ -245,6 +253,9 @@ ABSTAIN_REASONS: tuple[AbstainReason, ...] = (
     "intent_not_permitted",
     "intent_params_invalid",
     "intent_token_mismatch",
+    "order_cap_run",
+    "order_cap_session",
+    "order_cap_day",
 )
 
 #: The venue minimum price increment the non-crossing check rounds/compares against (Polymarket
@@ -1166,6 +1177,63 @@ def _intent_block_reason(
     return None
 
 
+def _cap_reached(count: int, cap: int) -> bool:
+    """Whether an ENABLED order-count ``cap`` is reached by ``count`` (conservative, fail-closed).
+
+    Mirrors the loss-cap boundary predicate (:func:`veridex.policy.envelope.cap_breached`): a cap
+    ``<= 0`` is DISABLED (transparent — no ceiling to reach), and an ENABLED cap (``> 0``) is reached
+    once ``count >= cap`` — so the moment the count equals the ceiling, one MORE order is denied
+    rather than admitted at exactly the maximum. Matches the ``>=`` the E2 policy gate uses for
+    ``max_orders_per_run/session/day`` (:func:`veridex.policy.gate.evaluate_pre_quote`).
+    """
+    return cap > 0 and count >= cap
+
+
+def _order_cap_block_reason(
+    *,
+    orders_this_run: int,
+    orders_this_session: int,
+    orders_this_day: int,
+    envelope: PolicyEnvelope,
+    manifest: StrategyExperimentManifest,
+) -> AbstainReason | None:
+    """Return the order-cap abstain reason if placing ONE more order would breach a cap (Gate#3 M-3).
+
+    A PRE-SUBMIT admission gate binding the durable run/session/UTC-day order counts to the SAME
+    envelope/manifest cap fields the E2 policy and admission surfaces read, so ``manifest.max_orders``
+    is an ENFORCED ceiling — not the metadata it was before. Order of precedence (run → session →
+    day) mirrors :func:`veridex.policy.gate.evaluate_pre_quote`. The per-run count is capped by BOTH
+    the policy ``max_orders_per_run`` AND the manifest ceiling ``manifest.max_orders`` (either
+    reached denies ``order_cap_run``); the session/day counts fold the durable prior counts threaded
+    into the runner. Every cap is DISABLED-transparent at ``<= 0`` (:func:`_cap_reached`).
+
+    Reasons reuse the closed-vocab ``order_cap_*`` literals (identical to engine ``_REASON_ORDER_CAP_*``
+    / the policy gate) — never a minted synonym.
+    """
+    if _cap_reached(orders_this_run, envelope.max_orders_per_run) or _cap_reached(
+        orders_this_run, manifest.max_orders
+    ):
+        return "order_cap_run"
+    if _cap_reached(orders_this_session, envelope.max_orders_per_session):
+        return "order_cap_session"
+    if _cap_reached(orders_this_day, envelope.max_orders_per_day):
+        return "order_cap_day"
+    return None
+
+
+def _decision_placed(decision: SubmitDecision) -> bool:
+    """Whether a decision consumed an order-cap slot — an accepted/possibly-live place, conservatively.
+
+    Increments the order counters ONLY for a decision that ACTUALLY placed (or would place): a Mode B
+    submit (``submitted`` — set for an accepted OR possibly-live/uncertain-ACK attempt alike, so an
+    unconfirmed attempt still counts), or a Mode A ``mode_a_no_orders`` would-submit (the cap governs
+    the DECISION to place, so Mode A rehearses the SAME admission — it touches no wire but consumes a
+    slot). Every OTHER abstain (stale, safety_blocked, self_cross, admission_denied, an order_cap_*
+    denial itself, …) is a CLEAN abstain that never placed and must NOT consume a slot.
+    """
+    return decision.submitted or decision.abstain_reason == "mode_a_no_orders"
+
+
 # ---------------------------------------------------------------------------
 # The runner
 # ---------------------------------------------------------------------------
@@ -1193,6 +1261,8 @@ async def run_dust_execution(
     own_legs: Sequence[OwnOrderLeg] = (),
     tick_size: float = _DEFAULT_TICK_SIZE,
     shutdown_policy: ShutdownPolicy = "leave_open",
+    prior_session_order_count: int = 0,
+    prior_day_order_count: int = 0,
 ) -> DustExecutionResult:
     """Run one dust-execution pass over the manifest universe, applying the submit gates.
 
@@ -1412,8 +1482,21 @@ async def run_dust_execution(
             "manual", adapter=_require_cancel_all_adapter(adapter), session=session
         )
 
+    # Gate#3 M-3: the PRE-SUBMIT order-count admission. A per-RUN counter increments each time an order
+    # is actually placed (Mode B) or would be placed (Mode A rehearsal); the durable prior session/day
+    # counts (threaded across a restart/reconstruction) fold into the session/day counts so
+    # ``manifest.max_orders`` and the policy run/session/day caps are ENFORCED ceilings — never metadata.
+    orders_this_run = 0
+
     decisions: list[SubmitDecision] = []
     for token_id in manifest.universe:
+        order_cap_block_reason = _order_cap_block_reason(
+            orders_this_run=orders_this_run,
+            orders_this_session=prior_session_order_count + orders_this_run,
+            orders_this_day=prior_day_order_count + orders_this_run,
+            envelope=envelope,
+            manifest=manifest,
+        )
         decision, token_events = await _decide_and_submit(
             token_id,
             adapter=adapter,
@@ -1431,6 +1514,7 @@ async def run_dust_execution(
             wire_size=wire_size,
             arming_block_reason=arming_block_reason,
             authorization_block_reason=authorization_block_reason,
+            order_cap_block_reason=order_cap_block_reason,
             intent=intent,
             intent_params=intent_params,
             intent_block_reason=intent_block_reason,
@@ -1439,6 +1523,10 @@ async def run_dust_execution(
         )
         decisions.append(decision)
         events.extend(token_events)
+        # Increment conservatively AFTER the decision: only an actual/would-be place consumes a slot
+        # (a clean abstain — including an order_cap_* denial — never does).
+        if _decision_placed(decision):
+            orders_this_run += 1
 
     events.append(_build_label_event(seq=seqc.next(), now_ms=now_fn() * 1000, manifest=manifest))
 
@@ -1487,6 +1575,7 @@ async def _decide_and_submit(
     wire_size: float,
     arming_block_reason: AbstainReason | None,
     authorization_block_reason: AbstainReason | None,
+    order_cap_block_reason: AbstainReason | None,
     intent: IntentKind,
     intent_params: MMIntentParams,
     intent_block_reason: AbstainReason | None,
@@ -1518,6 +1607,12 @@ async def _decide_and_submit(
     (``"manifest_hash_mismatch"`` / ``"admission_denied"``). All abstain with no per-decision events.
     The executable size is the PINNED-input ``wire_size`` (:func:`resolve_dust_size`), never the agent
     request.
+
+    Gate#3 M-3 adds the PRE-SUBMIT order-count admission as the LAST gate before the placing dispatch:
+    ``order_cap_block_reason`` (a run/session/UTC-day or ``manifest.max_orders`` breach) abstains
+    ``"order_cap_run"`` / ``"order_cap_session"`` / ``"order_cap_day"`` mode-independently — the cap
+    governs the DECISION to place, so a Mode A would-be (N+1)th decision abstains too (touching no wire).
+    It is checked AFTER safety/authorization so a swept/unauthorized run keeps its own honest reason.
     """
     # Gate#3 CRITICAL-1: a non-order-placing / non-permitted intent NEVER submits — abstain on its own
     # honest terms BEFORE any quote I/O (refuse-before-I/O), regardless of arming.
@@ -1556,6 +1651,15 @@ async def _decide_and_submit(
     # (mode-independent — an unauthorized run submits in neither mode).
     if authorization_block_reason is not None:
         return _abstain(token_id, authorization_block_reason), ()
+
+    # Gate#3 M-3: PRE-SUBMIT order-count admission — the LAST gate before the order-placing dispatch.
+    # If placing one more order would breach the durable run/session/UTC-day or ``manifest.max_orders``
+    # cap, abstain on the closed-vocab ``order_cap_*`` reason (mode-independent: the cap governs the
+    # DECISION to place, so it denies identically in Mode A and Mode B). Checked AFTER the (also-
+    # blocking) safety and authorization gates so a swept/unauthorized run keeps its own honest reason;
+    # a swept run places nothing, so the counter is 0 and this gate stays transparent there.
+    if order_cap_block_reason is not None:
+        return _abstain(token_id, order_cap_block_reason), ()
 
     # Gate#3 CRITICAL-1 + C-2: dispatch the ADMITTED order-placing intent (never a hardcoded BUY/FOK),
     # and gate the EXACT proposed typed order — its real token_id/side/native price — through the E5
