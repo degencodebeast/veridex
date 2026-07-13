@@ -36,6 +36,7 @@ import hashlib
 import json
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, replace
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Literal
 
 from pydantic import field_validator
@@ -64,6 +65,7 @@ from veridex.runtime.runtime_events import RuntimeEventType, RuntimeStatus, runt
 if TYPE_CHECKING:
     from veridex.dust_execution.manifest import StrategyExperimentManifest
     from veridex.dust_execution.runner import DustExecutionResult, ModeBArming, QuoteSource
+    from veridex.dust_execution.session_state import DurableSessionStateProvider
     from veridex.dust_execution.signer import Signer
     from veridex.policy.envelope import PolicyEnvelope
     from veridex.runtime.runtime_events import RuntimeEventSink
@@ -460,6 +462,52 @@ def evaluate_operator_interlock(
     return OperatorInterlockGate(armed=not missing, missing=missing, events=events)
 
 
+def _fail_closed_no_durable_state(
+    request: MMExecutionToolRequest,
+    *,
+    envelope: PolicyEnvelope,
+    emit: Callable[..., None],
+) -> MMExecutionToolResult:
+    """Return the Gate#3 MAJOR-2 fail-closed result for a live run with NO durable session-state source.
+
+    Live mode must NOT proceed on a fresh/zero default: without a provider there is no authoritative
+    session identity, no reconstructed realized loss, and no durable order counts, so the money path
+    cannot be entered. This returns a typed NOT_ARMED/denied result WITHOUT calling the runner or the
+    write port, and emits the honest terminal OPS telemetry. Carries only the pinned honest labels +
+    closed-vocab reason codes (SEC-005), never a live handle.
+    """
+    tool_result = MMExecutionToolResult(
+        admission="DENIED",
+        reason_codes=("durable_session_state_unavailable",),
+        execution_status="NOT_ARMED",
+        execution_reason_codes=("mode_b_not_armed",),
+        lifecycle_receipt_ref=f"dust-lifecycle:{request.session_id}:no-durable-session-state",
+        run_label=_DEFAULT_RUN_LABEL,
+        calibration_label=_DEFAULT_CALIBRATION_LABEL,
+        edge_label=_DEFAULT_EDGE_LABEL,
+        evidence_class=_DEFAULT_EVIDENCE_CLASS,
+        policy_hash=envelope.policy_hash(),
+    )
+    emit(
+        RuntimeEventType.ACTION_EMITTED,
+        admission=tool_result.admission,
+        execution_status=tool_result.execution_status,
+        intent_kind=request.intent_kind,
+    )
+    emit(
+        RuntimeEventType.RUN_COMPLETED,
+        status=RuntimeStatus.COMPLETED.value,
+        admission=tool_result.admission,
+        reason_codes=list(tool_result.reason_codes),
+        execution_status=tool_result.execution_status,
+        execution_reason_codes=list(tool_result.execution_reason_codes),
+        lifecycle_receipt_ref=tool_result.lifecycle_receipt_ref,
+        session_status="FAILED",
+        submitted_count=0,
+    )
+    return tool_result
+
+
 async def propose_mm_execution(
     request: MMExecutionToolRequest,
     *,
@@ -475,6 +523,7 @@ async def propose_mm_execution(
     arming: ModeBArming | None = None,
     operator_interlock: OperatorInterlock | None = None,
     interlock_store: OperatorInterlockStore | None = None,
+    provider: DurableSessionStateProvider | None = None,
     event_sink: RuntimeEventSink | None = None,
     agent_id: str = _FACADE_AGENT_ID,
     run_id: str | None = None,
@@ -522,6 +571,15 @@ async def propose_mm_execution(
             SAME store is threaded into the runner, which re-VERIFIES the receipt against the actual
             session/events/auth/attempt before arming. An offline test injects an in-memory store; the
             production arming path refuses to arm without a real one.
+        provider: The injected :class:`~veridex.dust_execution.session_state.DurableSessionStateProvider`
+            — ONE authoritative durable session-state source (Gate#3 MAJOR-2). BEFORE any live arming it
+            supplies the operator-assigned IMMUTABLE session identity (``request.session_id``, adopted as
+            the safety/ledger join key), the reconstructed realized-loss ``RiskAccumulator``, and the
+            persisted session/UTC-day possibly-live attempt counts; the facade threads them into the
+            runner so its order/loss caps are enforced from HONEST durable inputs (never reset to
+            fresh/zero each call), then persists this run's attempt-count delta back through the SAME
+            identity. ``live_guarded`` with ``provider=None`` FAILS CLOSED (NOT_ARMED/denied, no
+            write-port I/O); a non-live Mode-A dry-run may keep the documented fresh default.
         event_sink: Optional OPS ``RuntimeEvent`` sink; when ``None`` the proposer emits nothing.
         agent_id: Non-secret OPS ``agent_id`` label stamped on emitted telemetry.
         run_id: Optional OPS correlation id for the emitted lifecycle events.
@@ -552,6 +610,34 @@ async def propose_mm_execution(
 
     _emit(RuntimeEventType.RUN_STARTED, intent_kind=request.intent_kind, mode=request.mode)
     _emit(RuntimeEventType.STATUS_CHANGED, status=RuntimeStatus.RUNNING.value)
+
+    # Gate#3 MAJOR-2: compose ONE authoritative durable session-state source BEFORE any live arming.
+    # The injected provider supplies (from durable storage) the operator-assigned IMMUTABLE session
+    # identity, the reconstructed realized-loss :class:`RiskAccumulator` (prior session + UTC-day loss),
+    # and the persisted session/UTC-day possibly-live attempt counts — so the runner enforces its
+    # run/session/day order caps and realized-loss caps from HONEST durable inputs, never a fresh/zero
+    # default that resets on every call (the MAJOR-2 hole: two same-session calls both reaching the
+    # write port, and a prior realized loss never reconstructed before the next arming — SAF-002).
+    durable_state = (
+        provider.load(session_id=request.session_id, now=datetime.fromtimestamp(now_fn(), tz=UTC))
+        if provider is not None
+        else None
+    )
+
+    # Live mode (``live_guarded``) FAILS CLOSED when the durable source is absent: a real-money run must
+    # NEVER proceed on a fresh/zero default. Return a NOT_ARMED/denied typed result WITHOUT reaching the
+    # runner or the write port. A non-live Mode-A dry-run keeps the documented default (it places no
+    # orders, so a fresh accumulator is harmless there).
+    if request.mode == "live_guarded" and durable_state is None:
+        return _fail_closed_no_durable_state(request, envelope=envelope, emit=_emit)
+
+    # The AUTHORITATIVE session identity the runner runs under: the provider's operator-assigned
+    # immutable identity when present, else the provisional ``(strategy_id, mode)`` seam (Mode-A default).
+    session_identity = (
+        durable_state.session_identity
+        if durable_state is not None
+        else provisional_session_id(manifest, request.mode)
+    )
 
     # E7-T3 human operator precondition interlock (REQ-005/006, AC-002) + Gate#3 MAJOR-1 & M-1: Mode B
     # cannot ARM unless ALL FIVE operator preconditions are positively satisfied AND durably PERSISTED
@@ -590,7 +676,10 @@ async def propose_mm_execution(
             and interlock_events_are_canonical(interlock_gate.events)
         ):
             receipt = interlock_store.record(
-                session_id=provisional_session_id(manifest, request.mode),
+                # Gate#3 MAJOR-2: bind the receipt to the AUTHORITATIVE session identity the runner runs
+                # under (the provider's immutable id), so the store-issued receipt verifies against the
+                # SAME ``session.session_id`` the runner threads — not the provisional seam.
+                session_id=session_identity,
                 events=interlock_gate.events,
                 operator_authorization_ref=operator_auth_ref,
                 arming_attempt_ref=_arming_attempt_ref(arming),
@@ -626,7 +715,25 @@ async def propose_mm_execution(
         request=request,
         arming=effective_arming,
         operator_interlock_store=interlock_store,
+        # Gate#3 MAJOR-2: the authoritative identity + the durable risk/counts the runner enforces its
+        # caps against (fresh/zero ONLY on the non-live default path where ``durable_state`` is None).
+        session_identity=session_identity,
+        risk=durable_state.risk if durable_state is not None else None,
+        prior_session_order_count=(
+            durable_state.prior_session_order_count if durable_state is not None else 0
+        ),
+        prior_day_order_count=(
+            durable_state.prior_day_order_count if durable_state is not None else 0
+        ),
     )
+
+    # Gate#3 MAJOR-2 persist-back: record this run's possibly-live attempts (accepted OR uncertain-ACK
+    # — ``submitted_count``) back THROUGH the SAME identity, so the NEXT call reads them as the durable
+    # prior session/day counts. R4-A's sealed lifecycle carries no ``realized_pnl`` (SEC-002), so
+    # realized-fill LOSS is reconstructed by the provider's own durable venue-reconciliation ledger
+    # (fed where PnL is computed), never fabricated from the sealed events here.
+    if provider is not None and durable_state is not None:
+        provider.record_run(session_identity=session_identity, attempts=result.submitted_count)
 
     tool_result = _to_tool_result(result, request)
 

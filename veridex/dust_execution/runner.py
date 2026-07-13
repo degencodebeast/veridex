@@ -641,17 +641,22 @@ def _build_session_meta(
     envelope: PolicyEnvelope,
     signer: Signer,
     mode: ExecutionMode,
+    session_identity: str | None = None,
 ) -> DustExecutionSessionMeta:
     """Session identity/provenance preamble (unnumbered — carries no ``sequence_no``).
 
-    PROVISIONAL SEAM: ``session_id`` is derived from ``(strategy_id, mode)`` — a durable,
-    operator-assigned session identity and the sealed ``content_hash`` are wired by later tasks
-    (E6-T5 startup sweep / E6-T6 shutdown). ``wallet_ref`` is the signer's own non-secret provider
-    label (never a key/address). Every other field is REAL, sourced directly from the pinned
-    ``manifest`` / ``envelope``.
+    ``session_id`` is the AUTHORITATIVE, operator-assigned IMMUTABLE ``session_identity`` when one is
+    threaded in (Gate#3 MAJOR-2 — the facade supplies it from its durable session-state provider so
+    the safety/ledger join is the real identity, not the provisional seam). Absent one (a direct /
+    self-driven runner call), it falls back to the PROVISIONAL ``(strategy_id, mode)`` derivation —
+    the sealed ``content_hash`` is still wired by later tasks (E6-T6 shutdown). ``wallet_ref`` is the
+    signer's own non-secret provider label (never a key/address). Every other field is REAL, sourced
+    directly from the pinned ``manifest`` / ``envelope``.
     """
     return DustExecutionSessionMeta(
-        session_id=provisional_session_id(manifest, mode),  # PROVISIONAL — real session identity: later task
+        session_id=(
+            session_identity if session_identity is not None else provisional_session_id(manifest, mode)
+        ),
         mode=mode,
         wallet_ref=signer.mode,
         manifest_hash=manifest.manifest_hash(),
@@ -1370,6 +1375,7 @@ async def run_dust_execution(
     request: MMExecutionToolRequest | None = None,
     arming: ModeBArming | None = None,
     operator_interlock_store: OperatorInterlockStore | None = None,
+    session_identity: str | None = None,
     safety: SafetyController | None = None,
     session: DustSafetySession | None = None,
     risk: RiskAccumulator | None = None,
@@ -1485,6 +1491,12 @@ async def run_dust_execution(
             mismatch); its ``confidence`` / ``size`` are untrusted metadata that NEVER reach the wire.
         arming: The Mode-B arming bundle; ``None`` (or any failing precondition) keeps Mode B UNARMED
             (fail closed). Ignored in Mode A (dry-run never arms).
+        session_identity: The AUTHORITATIVE, operator-assigned IMMUTABLE session identity the run's
+            safety/ledger join binds to (Gate#3 MAJOR-2). The facade threads its durable
+            provider's identity here so the ``DustExecutionSessionMeta``, the ``DustSafetySession``,
+            the admission, the arming receipt verification, and the default ``RiskAccumulator`` all key
+            off the SAME real identity. ``None`` falls back to the provisional ``(strategy_id, mode)``
+            derivation (a direct / self-driven runner call).
         safety: The E2-T3 emergency orchestrator the runner delegates every trigger to (a fresh
             :class:`SafetyController` when omitted).
         session: The mutable emergency-stop runtime state (a fresh :class:`DustSafetySession` keyed on
@@ -1508,7 +1520,13 @@ async def run_dust_execution(
         :class:`ShutdownDecision`, and the terminal REQ-014 :class:`SessionOutcome`.
     """
     seqc = _SeqCounter()
-    session_meta = _build_session_meta(manifest=manifest, envelope=envelope, signer=signer, mode=mode)
+    session_meta = _build_session_meta(
+        manifest=manifest,
+        envelope=envelope,
+        signer=signer,
+        mode=mode,
+        session_identity=session_identity,
+    )
 
     safety = safety if safety is not None else SafetyController()
     session = session if session is not None else DustSafetySession(session_id=session_meta.session_id)

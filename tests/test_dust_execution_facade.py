@@ -52,12 +52,16 @@ from veridex.dust_execution.operator_interlock_store import (
     OperatorInterlockStore,
 )
 from veridex.dust_execution.privy_control_plane import PrivyPreflightResult, ProvisioningResult
-from veridex.dust_execution.risk import RiskAccumulator
+from veridex.dust_execution.risk import RealizedFillRecord, RiskAccumulator
 from veridex.dust_execution.runner import (
     BookSide,
     DustQuote,
     ModeBArming,
     run_dust_execution,
+)
+from veridex.dust_execution.session_state import (
+    DurableSessionStateProvider,
+    InMemoryDurableSessionStateProvider,
 )
 from veridex.dust_execution.signer import LocalFakeWalletControlPlane
 from veridex.dust_execution.wallet_binding import (
@@ -632,6 +636,11 @@ def _mode_b_request(
     )
 
 
+# Gate#3 MAJOR-2: a sentinel so a test can pass ``provider=None`` EXPLICITLY (the live fail-closed
+# case) distinct from "defaulted" (a fresh in-memory provider, the migrated positive path).
+_PROVIDER_UNSET: object = object()
+
+
 async def _drive_mode_b(
     *,
     interlock: OperatorInterlock | None,
@@ -639,10 +648,18 @@ async def _drive_mode_b(
     binding: ExecutionWalletBinding,
     adapter: FakeVenueAdapter,
     interlock_store: OperatorInterlockStore | None = None,
+    envelope: PolicyEnvelope | None = None,
+    provider: object = _PROVIDER_UNSET,
 ) -> MMExecutionToolResult:
     manifest = _mode_b_mm_manifest(binding)
-    envelope = _mm_env()
+    envelope = envelope if envelope is not None else _mm_env()
     request = _mode_b_request(manifest, envelope)
+    # Gate#3 MAJOR-2: a live run now composes ONE authoritative durable session-state source. The
+    # migrated positives default to a fresh in-memory provider; a test drives the live fail-closed
+    # case by passing ``provider=None`` explicitly.
+    effective_provider = (
+        InMemoryDurableSessionStateProvider() if provider is _PROVIDER_UNSET else provider
+    )
     return await facade.propose_mm_execution(
         request,
         adapter=adapter,
@@ -658,6 +675,7 @@ async def _drive_mode_b(
         arming=arming,
         operator_interlock=interlock,
         interlock_store=interlock_store,
+        provider=effective_provider,  # type: ignore[arg-type]
     )
 
 
@@ -895,10 +913,14 @@ async def _drive_mode_b_kind(
     binding: ExecutionWalletBinding,
     adapter: FakeVenueAdapter,
     interlock_store: OperatorInterlockStore | None = None,
+    provider: object = _PROVIDER_UNSET,
 ) -> MMExecutionToolResult:
     """Drive a Mode-B run for an arbitrary admitted intent kind (hashes built to MATCH the manifest)."""
     manifest = _mode_b_mm_manifest(binding)
     envelope = _mm_env()
+    effective_provider = (
+        InMemoryDurableSessionStateProvider() if provider is _PROVIDER_UNSET else provider
+    )
     request = MMExecutionToolRequest.build(
         intent_kind=intent_kind,  # type: ignore[arg-type]
         intent_params=intent_params,
@@ -928,6 +950,7 @@ async def _drive_mode_b_kind(
         arming=arming,
         operator_interlock=interlock,
         interlock_store=interlock_store,
+        provider=effective_provider,  # type: ignore[arg-type]
     )
 
 
@@ -1049,3 +1072,207 @@ async def test_result_reports_denied_for_a_strategy_admission_deny() -> None:
 
     assert tool_result.admission == "DENIED"
     assert tool_result.execution_status == "DENIED"
+
+
+# ---------------------------------------------------------------------------
+# Gate#3 MAJOR-2 — the agent-facing facade composes ONE authoritative durable
+# session-state source (risk + session/day order counts + immutable identity)
+# and FAILS CLOSED on the money path when it is absent.
+#
+# Before the fix ``propose_mm_execution`` drove ``run_dust_execution`` with a FRESH
+# zero ``RiskAccumulator`` and zero prior order counts on EVERY call, so the runner's
+# durable run/session/UTC-day order caps and realized-loss caps RESET each invocation.
+# Codex repro: two REAL facade calls, same session, ``max_orders_per_session ==
+# max_orders_per_day == 1`` → BOTH reached the keyless write port. The facade now takes
+# an injected ``DurableSessionStateProvider`` that supplies (BEFORE arming) the immutable
+# session identity, the reconstructed realized-loss accumulator, and the persisted
+# session/day attempt counts, threads them into the runner, and persists the run's
+# possibly-live attempts back through the SAME identity. Live mode FAILS CLOSED without a
+# provider (no fresh/zero default on the money path).
+#
+# Each test asserts THE WRITE-PORT (money-moving surface) and the typed result, not a
+# proxy. RED today: the 2nd / over-cap / over-loss / no-provider call SUBMITS.
+# ---------------------------------------------------------------------------
+
+
+async def test_two_facade_calls_same_session_enforce_per_session_order_cap_across_calls() -> None:
+    """Codex's object: two ``propose_mm_execution`` calls, SAME session, sharing ONE in-memory
+    provider, with ``max_orders_per_session == 1`` — the 1st SUBMITTED, the 2nd DENIED by the durable
+    per-session order cap. ``write_port.submit_calls == 1`` TOTAL. RED today: the facade resets the
+    count each call so BOTH submit (``submit_calls == 2``)."""
+    binding = _mm_binding()
+    adapter = RecordingFakeAdapter(fill=True, open_orders=[])
+    write_port = _default_write_port(binding)  # SHARED across both calls — counts total submits
+    store = InMemoryOperatorInterlockStore()
+    provider = InMemoryDurableSessionStateProvider()  # SHARED durable session state
+    envelope = _mm_env(max_orders_per_session=1)
+
+    first = await _drive_mode_b(
+        interlock=_full_interlock(),
+        arming=_mm_arming(binding, write_port=write_port),
+        binding=binding,
+        adapter=adapter,
+        interlock_store=store,
+        envelope=envelope,
+        provider=provider,
+    )
+    second = await _drive_mode_b(
+        interlock=_full_interlock(),
+        arming=_mm_arming(binding, write_port=write_port),
+        binding=binding,
+        adapter=adapter,
+        interlock_store=store,
+        envelope=envelope,
+        provider=provider,
+    )
+
+    assert write_port.submit_calls == 1, (
+        "the SECOND same-session call must be denied by the durable per-session order cap"
+    )
+    assert first.execution_status == "SUBMITTED"
+    assert second.execution_status != "SUBMITTED"
+    assert "order_cap_session" in second.execution_reason_codes
+
+
+async def test_two_facade_calls_same_session_enforce_per_day_order_cap_across_calls() -> None:
+    """The per-UTC-day cap holds across calls too: ``max_orders_per_day == 1`` (session cap open) →
+    the 2nd same-session call is denied ``order_cap_day`` and never reaches the write port."""
+    binding = _mm_binding()
+    adapter = RecordingFakeAdapter(fill=True, open_orders=[])
+    write_port = _default_write_port(binding)
+    store = InMemoryOperatorInterlockStore()
+    provider = InMemoryDurableSessionStateProvider()
+    envelope = _mm_env(max_orders_per_day=1, max_orders_per_session=20)
+
+    await _drive_mode_b(
+        interlock=_full_interlock(),
+        arming=_mm_arming(binding, write_port=write_port),
+        binding=binding,
+        adapter=adapter,
+        interlock_store=store,
+        envelope=envelope,
+        provider=provider,
+    )
+    second = await _drive_mode_b(
+        interlock=_full_interlock(),
+        arming=_mm_arming(binding, write_port=write_port),
+        binding=binding,
+        adapter=adapter,
+        interlock_store=store,
+        envelope=envelope,
+        provider=provider,
+    )
+
+    assert write_port.submit_calls == 1, "the 2nd same-session call must be denied by the durable per-day cap"
+    assert second.execution_status != "SUBMITTED"
+    assert "order_cap_day" in second.execution_reason_codes
+
+
+async def test_restart_provider_seeded_at_cap_denies_before_any_write_port_call() -> None:
+    """Restart: a provider seeded with a prior attempt count already AT the cap → the FIRST call of a
+    NEW facade instance denies before any write-port call (the durable count survives a restart)."""
+    binding = _mm_binding()
+    adapter = RecordingFakeAdapter(fill=True, open_orders=[])
+    write_port = _default_write_port(binding)
+    provider = InMemoryDurableSessionStateProvider()
+    provider.record_run(session_identity="sess-mm-b", attempts=1)  # persisted count already AT the cap
+    envelope = _mm_env(max_orders_per_session=1)
+
+    result = await _drive_mode_b(
+        interlock=_full_interlock(),
+        arming=_mm_arming(binding, write_port=write_port),
+        binding=binding,
+        adapter=adapter,
+        interlock_store=InMemoryOperatorInterlockStore(),
+        envelope=envelope,
+        provider=provider,
+    )
+
+    assert write_port.submit_calls == 0, "a persisted count at the cap must deny before any write-port I/O"
+    assert result.execution_status != "SUBMITTED"
+    assert "order_cap_session" in result.execution_reason_codes
+
+
+async def test_prior_realized_loss_at_cap_denies_next_live_arming_before_write_port() -> None:
+    """SAF-002: a provider carrying a realized loss at/over the enabled session-loss cap
+    (``max_session_loss == 2.0``) → the next live arming call trips the loss cap and DENIES before any
+    write-port I/O. RED today: the facade reconstructs a FRESH zero loss and the call submits."""
+    binding = _mm_binding()
+    adapter = RecordingFakeAdapter(fill=True, open_orders=[])
+    write_port = _default_write_port(binding)
+    provider = InMemoryDurableSessionStateProvider()
+    provider.record_run(
+        session_identity="sess-mm-b",
+        attempts=0,
+        fills=(
+            RealizedFillRecord(
+                realized_pnl=-2.5, fee=0.0, session_id="sess-mm-b", fill_ts_ms=_MM_NOW_S * 1000
+            ),
+        ),
+    )
+
+    result = await _drive_mode_b(
+        interlock=_full_interlock(),
+        arming=_mm_arming(binding, write_port=write_port),
+        binding=binding,
+        adapter=adapter,
+        interlock_store=InMemoryOperatorInterlockStore(),
+        provider=provider,
+    )
+
+    assert write_port.submit_calls == 0, (
+        "a reconstructed prior loss at the cap must DENY before any write-port I/O (SAF-002)"
+    )
+    assert result.admission == "DENIED"
+
+
+async def test_live_guarded_fails_closed_without_a_durable_session_state_provider() -> None:
+    """Fail-closed: ``live_guarded`` with NO provider → NOT_ARMED/denied, ``write_port.submit_calls ==
+    0`` (no fresh/zero default on the money path). RED today: the facade drives the runner with fresh
+    zero state and the armed run SUBMITS."""
+    binding = _mm_binding()
+    adapter = RecordingFakeAdapter(fill=True, open_orders=[])
+    write_port = _default_write_port(binding)
+
+    result = await _drive_mode_b(
+        interlock=_full_interlock(),
+        arming=_mm_arming(binding, write_port=write_port),
+        binding=binding,
+        adapter=adapter,
+        interlock_store=InMemoryOperatorInterlockStore(),
+        provider=None,  # NO durable source on the money path → fail closed
+    )
+
+    assert write_port.submit_calls == 0, (
+        "live_guarded with NO durable session-state provider must FAIL CLOSED — no fresh/zero default"
+    )
+    assert result.execution_status == "NOT_ARMED"
+
+
+async def test_positive_control_first_call_within_caps_with_provider_submits() -> None:
+    """Positive control: the FIRST call within caps + a provider present → SUBMITTED (offline; Mode B
+    UNARMED recording-fakes), and the run's possibly-live attempt persists back to the provider."""
+    binding = _mm_binding()
+    adapter = RecordingFakeAdapter(fill=True, open_orders=[])
+    write_port = _default_write_port(binding)
+    provider = InMemoryDurableSessionStateProvider()
+
+    result = await _drive_mode_b(
+        interlock=_full_interlock(),
+        arming=_mm_arming(binding, write_port=write_port),
+        binding=binding,
+        adapter=adapter,
+        interlock_store=InMemoryOperatorInterlockStore(),
+        provider=provider,
+    )
+
+    assert write_port.submit_calls == 1
+    assert adapter.submit_calls == 0, "Mode B must NEVER reach the generic adapter submit surface"
+    assert result.execution_status == "SUBMITTED"
+    assert provider.attempts("sess-mm-b") == 1, "the run's possibly-live attempt must persist back"
+
+
+def test_durable_session_state_provider_protocol_is_runtime_checkable() -> None:
+    """The in-memory fake structurally satisfies the injected ``DurableSessionStateProvider`` Protocol
+    (the SAME injected-seam idiom as the operator-interlock / pre-submit stores)."""
+    assert isinstance(InMemoryDurableSessionStateProvider(), DurableSessionStateProvider)
