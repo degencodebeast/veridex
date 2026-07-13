@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import dataclasses
 import typing
+from datetime import datetime
 
 import pytest
 from pydantic import BaseModel, ValidationError
@@ -60,6 +61,7 @@ from veridex.dust_execution.runner import (
     run_dust_execution,
 )
 from veridex.dust_execution.session_state import (
+    DurableSessionState,
     DurableSessionStateProvider,
     InMemoryDurableSessionStateProvider,
 )
@@ -1276,3 +1278,138 @@ def test_durable_session_state_provider_protocol_is_runtime_checkable() -> None:
     """The in-memory fake structurally satisfies the injected ``DurableSessionStateProvider`` Protocol
     (the SAME injected-seam idiom as the operator-interlock / pre-submit stores)."""
     assert isinstance(InMemoryDurableSessionStateProvider(), DurableSessionStateProvider)
+
+
+# --- Gate#3 R4-MAJOR-2: the facade must NOT trust a provider-substituted session identity ---------
+#
+# ``MMExecutionToolRequest.session_id`` is the operator-assigned IMMUTABLE identity; the provider is
+# supposed to merely ADOPT/echo it. The facade must REQUIRE, before recording the interlock or
+# entering the runner, that the durable state's ``session_identity`` is non-empty AND equals
+# ``request.session_id``, and that the supplied risk accumulator is bound to that SAME session. A
+# stale / corrupt / mis-keyed provider response that swaps the identity must FAIL CLOSED — no
+# interlock receipt, no runner entry, no write-port I/O — so the requested session's accumulated caps
+# + realized loss can never be bypassed by binding the run to a different safety ledger.
+
+
+class _EchoRiskProvider:
+    """A provider whose ``session_identity`` and risk binding are chosen per-test to exercise the
+    facade's identity-assertion. ``load`` echoes the CONFIGURED (possibly wrong) identity + a risk
+    accumulator bound to the CONFIGURED risk session, so a single class drives all mismatch cases."""
+
+    def __init__(self, *, identity: str, risk_session: str) -> None:
+        self._identity = identity
+        self._risk_session = risk_session
+
+    def load(self, *, session_id: str, now: datetime) -> DurableSessionState:
+        return DurableSessionState(
+            session_identity=self._identity,
+            risk=RiskAccumulator.seeded(
+                session_id=self._risk_session, net_session=0.0, net_day=0.0, current_day=now
+            ),
+            prior_session_order_count=0,
+            prior_day_order_count=0,
+        )
+
+    def record_run(self, *, session_identity: str, attempts: int, fills: object = ()) -> None:
+        return None
+
+
+async def test_live_guarded_fails_closed_when_provider_identity_differs_from_request_session() -> None:
+    """R4-MAJOR-2: a provider whose ``session_identity`` differs from ``request.session_id`` must FAIL
+    CLOSED — no interlock recorded, ``write_port.submit_calls == 0``, NOT_ARMED/denied. RED today: the
+    facade takes the substituted identity as authoritative, ARMS, and submits the possibly-live
+    attempt under the WRONG session ledger (bypassing the requested session's caps + loss)."""
+    binding = _mm_binding()
+    adapter = RecordingFakeAdapter(fill=True, open_orders=[])
+    write_port = _default_write_port(binding)
+    store = InMemoryOperatorInterlockStore()
+
+    result = await _drive_mode_b(
+        interlock=_full_interlock(),
+        arming=_mm_arming(binding, write_port=write_port),
+        binding=binding,
+        adapter=adapter,
+        interlock_store=store,
+        provider=_EchoRiskProvider(identity="other-session", risk_session="other-session"),
+    )
+
+    assert write_port.submit_calls == 0, (
+        "a provider identity != request.session_id must FAIL CLOSED before any write-port I/O"
+    )
+    assert store.rows() == (), "a mismatched provider identity must record NO interlock receipt"
+    assert result.execution_status == "NOT_ARMED"
+    assert result.admission == "DENIED"
+
+
+async def test_live_guarded_fails_closed_when_risk_accumulator_bound_to_a_different_session() -> None:
+    """R4-MAJOR-2: even when the provider echoes ``request.session_id``, a supplied ``RiskAccumulator``
+    bound to a DIFFERENT session must FAIL CLOSED — the run's loss caps would be enforced against the
+    wrong ledger. ``write_port.submit_calls == 0``, no interlock recorded, NOT_ARMED/denied."""
+    binding = _mm_binding()
+    adapter = RecordingFakeAdapter(fill=True, open_orders=[])
+    write_port = _default_write_port(binding)
+    store = InMemoryOperatorInterlockStore()
+
+    result = await _drive_mode_b(
+        interlock=_full_interlock(),
+        arming=_mm_arming(binding, write_port=write_port),
+        binding=binding,
+        adapter=adapter,
+        interlock_store=store,
+        provider=_EchoRiskProvider(identity="sess-mm-b", risk_session="other-session"),
+    )
+
+    assert write_port.submit_calls == 0, (
+        "a risk accumulator bound to a different session must FAIL CLOSED before any write-port I/O"
+    )
+    assert store.rows() == (), "a mis-bound risk accumulator must record NO interlock receipt"
+    assert result.execution_status == "NOT_ARMED"
+    assert result.admission == "DENIED"
+
+
+async def test_live_guarded_fails_closed_when_provider_identity_is_empty() -> None:
+    """R4-MAJOR-2: an empty ``session_identity`` is not a valid adopted identity — FAIL CLOSED. A
+    substituted empty/None identity can never be asserted equal to the operator-assigned
+    ``request.session_id``, so the money path must not be entered."""
+    binding = _mm_binding()
+    adapter = RecordingFakeAdapter(fill=True, open_orders=[])
+    write_port = _default_write_port(binding)
+    store = InMemoryOperatorInterlockStore()
+
+    result = await _drive_mode_b(
+        interlock=_full_interlock(),
+        arming=_mm_arming(binding, write_port=write_port),
+        binding=binding,
+        adapter=adapter,
+        interlock_store=store,
+        provider=_EchoRiskProvider(identity="", risk_session="sess-mm-b"),
+    )
+
+    assert write_port.submit_calls == 0, "an empty provider identity must FAIL CLOSED before write-port I/O"
+    assert store.rows() == (), "an empty provider identity must record NO interlock receipt"
+    assert result.execution_status == "NOT_ARMED"
+    assert result.admission == "DENIED"
+
+
+async def test_live_guarded_arms_when_provider_echoes_request_session_and_binds_risk_to_it() -> None:
+    """Positive control: a provider that echoes ``request.session_id`` AND binds the risk accumulator
+    to the SAME session arms/submits as before (offline; Mode B UNARMED recording-fakes). This proves
+    the identity assertion does NOT over-block an honest, correctly-adopting provider."""
+    binding = _mm_binding()
+    adapter = RecordingFakeAdapter(fill=True, open_orders=[])
+    write_port = _default_write_port(binding)
+    store = InMemoryOperatorInterlockStore()
+
+    result = await _drive_mode_b(
+        interlock=_full_interlock(),
+        arming=_mm_arming(binding, write_port=write_port),
+        binding=binding,
+        adapter=adapter,
+        interlock_store=store,
+        provider=_EchoRiskProvider(identity="sess-mm-b", risk_session="sess-mm-b"),
+    )
+
+    assert write_port.submit_calls == 1, "an honest identity-echoing provider must arm + reach the wire"
+    assert adapter.submit_calls == 0, "Mode B must NEVER reach the generic adapter submit surface"
+    assert result.execution_status == "SUBMITTED"
+    assert len(store.rows()) == 1, "an honest armed run records exactly one interlock receipt"

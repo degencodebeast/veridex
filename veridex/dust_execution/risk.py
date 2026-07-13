@@ -191,6 +191,13 @@ class RiskAccumulator:
         self._net_day += net
 
     @property
+    def session_id(self) -> str:
+        """The immutable session identity this accumulator's loss is bound to (the safety/ledger join
+        key). Exposed so a caller can ASSERT the accumulator is bound to the SAME session it is about
+        to arm under — a mis-bound accumulator would enforce loss caps against the wrong ledger."""
+        return self._session_id
+
+    @property
     def realized_loss_session(self) -> float:
         """Non-negative fee-inclusive realized loss for the session (``0`` when net-positive)."""
         return max(0.0, -self._net_session)

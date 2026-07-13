@@ -508,6 +508,56 @@ def _fail_closed_no_durable_state(
     return tool_result
 
 
+def _fail_closed_session_identity_mismatch(
+    request: MMExecutionToolRequest,
+    *,
+    envelope: PolicyEnvelope,
+    emit: Callable[..., None],
+) -> MMExecutionToolResult:
+    """Return the Gate#3 R4-MAJOR-2 fail-closed result when the provider's durable state does NOT
+    adopt the operator-assigned request identity.
+
+    ``MMExecutionToolRequest.session_id`` is the immutable operator-assigned safety/ledger join key;
+    the provider must merely ADOPT/echo it. When the durable state's ``session_identity`` is
+    empty/absent or differs from ``request.session_id`` — or the supplied risk accumulator is bound to
+    a different session — a stale/corrupt/mis-keyed provider response would swap the safety ledger and
+    bypass the requested session's accumulated caps + realized loss. The money path must NOT be
+    entered: no interlock is recorded, the runner is never reached, and no write port is called. This
+    returns a typed NOT_ARMED/denied result and emits the honest terminal OPS telemetry, carrying only
+    the pinned honest labels + closed-vocab reason codes (SEC-005), never a live handle.
+    """
+    tool_result = MMExecutionToolResult(
+        admission="DENIED",
+        reason_codes=("durable_session_identity_mismatch",),
+        execution_status="NOT_ARMED",
+        execution_reason_codes=("mode_b_not_armed",),
+        lifecycle_receipt_ref=f"dust-lifecycle:{request.session_id}:session-identity-mismatch",
+        run_label=_DEFAULT_RUN_LABEL,
+        calibration_label=_DEFAULT_CALIBRATION_LABEL,
+        edge_label=_DEFAULT_EDGE_LABEL,
+        evidence_class=_DEFAULT_EVIDENCE_CLASS,
+        policy_hash=envelope.policy_hash(),
+    )
+    emit(
+        RuntimeEventType.ACTION_EMITTED,
+        admission=tool_result.admission,
+        execution_status=tool_result.execution_status,
+        intent_kind=request.intent_kind,
+    )
+    emit(
+        RuntimeEventType.RUN_COMPLETED,
+        status=RuntimeStatus.COMPLETED.value,
+        admission=tool_result.admission,
+        reason_codes=list(tool_result.reason_codes),
+        execution_status=tool_result.execution_status,
+        execution_reason_codes=list(tool_result.execution_reason_codes),
+        lifecycle_receipt_ref=tool_result.lifecycle_receipt_ref,
+        session_status="FAILED",
+        submitted_count=0,
+    )
+    return tool_result
+
+
 async def propose_mm_execution(
     request: MMExecutionToolRequest,
     *,
@@ -630,6 +680,21 @@ async def propose_mm_execution(
     # orders, so a fresh accumulator is harmless there).
     if request.mode == "live_guarded" and durable_state is None:
         return _fail_closed_no_durable_state(request, envelope=envelope, emit=_emit)
+
+    # Gate#3 R4-MAJOR-2: the provider is trusted to ADOPT/echo the operator-assigned IMMUTABLE identity,
+    # never to SUBSTITUTE its own. Before the substituted identity can bind the interlock receipt or
+    # supply the runner's risk/count namespace, REQUIRE that the durable state actually adopted this
+    # request's identity: a non-empty ``session_identity`` that EQUALS ``request.session_id``, AND a
+    # risk accumulator bound to that SAME session. A stale/corrupt/mis-keyed provider response that
+    # swaps the identity would bind the run to a DIFFERENT safety ledger and bypass the requested
+    # session's accumulated caps + realized loss — so any mismatch FAILS CLOSED here, before recording
+    # the interlock or entering the runner (no write-port I/O).
+    if durable_state is not None and (
+        not durable_state.session_identity
+        or durable_state.session_identity != request.session_id
+        or durable_state.risk.session_id != request.session_id
+    ):
+        return _fail_closed_session_identity_mismatch(request, envelope=envelope, emit=_emit)
 
     # The AUTHORITATIVE session identity the runner runs under: the provider's operator-assigned
     # immutable identity when present, else the provisional ``(strategy_id, mode)`` seam (Mode-A default).
