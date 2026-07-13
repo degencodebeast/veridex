@@ -68,16 +68,30 @@ from veridex.dust_execution.risk import RealizedFillRecord, RiskAccumulator
 ReservationOutcome = Literal["RESERVED", "PENDING_RECONCILE", "COMMITTED"]
 
 # The closed vocabulary the ATOMIC reserve-or-freeze (:meth:`DurableSessionStateProvider.reserve_or_freeze`)
-# returns (Gate#3 R6-MAJOR-2). It fuses the session-scope freeze check with the reserve-or-load into ONE
-# critical section, so it adds ``SCOPE_FROZEN`` to :data:`ReservationOutcome`:
+# returns (Gate#3 R6-MAJOR-2 + R8-MAJOR-1). It fuses the session-scope freeze check AND the session/day
+# cap admission with the reserve-or-load into ONE critical section, so it adds ``SCOPE_FROZEN`` and the
+# ``CAP_EXCEEDED_*`` family to :data:`ReservationOutcome`:
 #   * ``RESERVED`` / ``PENDING_RECONCILE`` / ``COMMITTED`` — as in :data:`ReservationOutcome` (a fresh
 #                             possibly-live slot, a same-id retry atop an unsettled row, or a same-id
 #                             replay atop a resolved row);
 #   * ``SCOPE_FROZEN``      — a DIFFERENT attempt_id while an UNRESOLVED possibly-live reservation already
 #                             occupies the session freeze scope: the caller must FREEZE (no new wire),
 #                             pending venue-truth reconcile. No new row is appended.
+#   * ``CAP_EXCEEDED_SESSION`` / ``CAP_EXCEEDED_DAY`` (Gate#3 R8-MAJOR-1) — a FRESH attempt_id whose
+#                             insert would exceed the session/UTC-day order cap: the caller must FAIL
+#                             CLOSED (DENIED, ``order_cap_session`` / ``order_cap_day``, no new wire). No
+#                             new row is appended. The cap decision is thus made ATOMICALLY with the slot
+#                             claim (SAME critical section) — never from a stale ``load()`` count read in a
+#                             SEPARATE critical section, which two concurrent callers could both observe as
+#                             0 and both submit past the cap. Distinct from ``SCOPE_FROZEN``: a RESOLVED
+#                             first order STOPS freezing (no SCOPE_FROZEN) yet STAYS COUNTED (still caps).
 ScopedReservationOutcome = Literal[
-    "RESERVED", "PENDING_RECONCILE", "COMMITTED", "SCOPE_FROZEN"
+    "RESERVED",
+    "PENDING_RECONCILE",
+    "COMMITTED",
+    "SCOPE_FROZEN",
+    "CAP_EXCEEDED_SESSION",
+    "CAP_EXCEEDED_DAY",
 ]
 
 # The RECONCILIATION disposition of a reservation row (Gate#3 R5-MAJOR-1 / IDM-002) — the axis the
@@ -186,32 +200,53 @@ class DurableSessionStateProvider(Protocol):
         session_identity: str,
         now: datetime,
         attempt_id: str,
+        max_orders_per_session: int = 0,
+        max_orders_per_day: int = 0,
         venue_order_key: str | None = None,
     ) -> ScopedReservationOutcome:
-        """Atomically reserve-or-load an attempt AND enforce the session freeze scope (Gate#3 R6-MAJOR-2).
+        """Atomically reserve-or-load an attempt AND enforce BOTH the session freeze scope and the
+        session/UTC-day order caps (Gate#3 R6-MAJOR-2 + R8-MAJOR-1).
 
         The SINGLE critical-section op the facade money path calls instead of a separate
-        :meth:`has_unresolved_reservation` followed by :meth:`reserve`. Fusing the scope-freeze check and
-        the reserve-or-load closes the TOCTOU where two concurrent requests both observe an empty scope
-        and both reserve — standing up two possibly-live orders. The outcome DISCRIMINATES (see
-        :data:`ScopedReservationOutcome`):
+        :meth:`has_unresolved_reservation` / ``load()``-count read followed by :meth:`reserve`. Fusing the
+        scope-freeze check, the CAP admission, and the reserve-or-load closes TWO TOCTOUs at once: (1) two
+        concurrent requests both observing an empty scope and both reserving; and (2) — Gate#3 R8-MAJOR-1 —
+        two concurrent requests both reading the pre-reservation session/day cap COUNT (from an earlier
+        ``load()``, a SEPARATE critical section) as 0 and both inserting past a ``== 1`` cap. The R7 lock
+        serializes each provider method, but a cap decided from ``load()``'s count is still stale by the
+        time the reserve runs. Binding the cap check into the SAME critical section as the slot claim is
+        the only durable fix: a second caller MUST observe the first COUNTED reservation — EVEN when it is
+        already RESOLVED (RESOLVED stops freezing but STAYS COUNTED) — and refuse at the cap.
+
+        ``max_orders_per_session`` / ``max_orders_per_day`` are the authoritative caps the facade threads
+        in from the policy envelope; a cap ``<= 0`` is DISABLED-transparent (no ceiling — matches
+        :func:`veridex.dust_execution.runner._cap_reached` / the E2 policy gate). The reservation that
+        consumes a slot is EVERY persisted (non-released) row — ``RESERVED`` / ``PENDING`` / ``AMBIGUOUS``
+        / ``COMMITTED`` / ``RESOLVED`` all count; only a released (``DEFINITIVELY_ABSENT``) row is gone.
+
+        The outcome DISCRIMINATES (see :data:`ScopedReservationOutcome`):
 
         * ``PENDING_RECONCILE`` / ``COMMITTED`` — a SAME-``attempt_id`` row already exists: an idempotent
           replay of THIS attempt's own possibly-live/committed outcome (same-id takes priority over the
-          scope — an identical retry is never a foreign conflict). No new row is appended.
+          scope AND the cap — an identical retry is never a foreign conflict). No new row is appended.
         * ``SCOPE_FROZEN`` — a FRESH ``attempt_id`` while an UNRESOLVED possibly-live reservation
           (``recon_state`` ``PENDING`` or ``AMBIGUOUS``) already occupies the session scope: the caller
           must FREEZE — no new wire around an unresolved first order, regardless of spare cap, pending
           the production venue-truth reconcile. No new row is appended.
-        * ``RESERVED`` — a FRESH ``attempt_id`` with nothing unresolved in scope: a fresh possibly-live
-          slot is appended (it counts toward the caps immediately and durably); the caller may proceed.
+        * ``CAP_EXCEEDED_SESSION`` / ``CAP_EXCEEDED_DAY`` — a FRESH ``attempt_id`` with nothing unresolved
+          in scope but whose insert would breach the session / UTC-day cap: FAIL CLOSED (the facade denies
+          ``order_cap_session`` / ``order_cap_day``, no new wire). No new row is appended. Session cap is
+          checked before day (mirrors the runner's run→session→day precedence).
+        * ``RESERVED`` — a FRESH ``attempt_id`` with nothing unresolved in scope AND spare cap: a fresh
+          possibly-live slot is appended (it counts toward the caps immediately and durably); proceed.
 
         A raise (durable-store outage) signals the facade to FAIL CLOSED (no wire I/O). This method MUST
-        execute the scope check AND the reserve/insert in ONE critical section spanning BOTH: a durable
-        provider uses a single serializable transaction / row lock / advisory lock; the in-memory provider
-        holds a per-provider lock across the whole check-and-insert. A bare synchronous method is NOT
-        sufficient — the GIL switches threads at bytecode boundaries, so an unlocked check-then-insert lets
-        two concurrent callers both observe the empty scope before either inserts and both reserve.
+        execute the scope check, the cap count, AND the reserve/insert in ONE critical section spanning
+        ALL THREE: a durable provider uses a single serializable transaction / row lock / advisory lock;
+        the in-memory provider holds a per-provider lock across the whole check-count-and-insert. A bare
+        synchronous method is NOT sufficient — the GIL switches threads at bytecode boundaries, so an
+        unlocked check-then-insert lets two concurrent callers both observe the empty scope / stale count
+        before either inserts and both reserve.
         """
         ...
 
@@ -385,30 +420,49 @@ class InMemoryDurableSessionStateProvider:
         session_identity: str,
         now: datetime,
         attempt_id: str,
+        max_orders_per_session: int = 0,
+        max_orders_per_day: int = 0,
         venue_order_key: str | None = None,
     ) -> ScopedReservationOutcome:
-        # Gate#3 R6-MAJOR-2: the ATOMIC reserve-or-freeze — the SINGLE critical section that fuses the
-        # session-scope freeze check with the reserve-or-load, so two requests can NEVER both observe an
-        # empty scope and both reserve (the split check-then-reserve TOCTOU).
+        # Gate#3 R6-MAJOR-2 + R8-MAJOR-1: the ATOMIC reserve-or-freeze — the SINGLE critical section that
+        # fuses the session-scope freeze check AND the session/day cap admission with the reserve-or-load,
+        # so two requests can NEVER both observe an empty scope OR a stale (pre-reservation) cap count and
+        # both reserve+wire (the split check-then-reserve / load-then-reserve TOCTOUs).
         #
         # R7-MAJOR-1: a bare synchronous method is NOT that critical section across worker threads — the
         # GIL switches threads at bytecode boundaries, so two concurrent callers can BOTH run the scope
-        # check (observe the empty scope) before EITHER inserts, and both reserve. The whole scope-check
-        # AND insert therefore run under the per-provider ``_lock``, so the check-and-insert is indivisible
-        # (the ``_has_unresolved`` / ``_reserve_or_load`` helpers are lock-free and run under this held
-        # lock — no re-entry, no self-deadlock).
+        # check / cap count (observe the empty scope / count 0) before EITHER inserts, and both reserve.
+        # The whole scope-check, cap-count, AND insert therefore run under the per-provider ``_lock``, so
+        # the check-count-and-insert is indivisible (the ``_has_unresolved`` / ``_count`` /
+        # ``_reserve_or_load`` helpers are lock-free and run under this held lock — no re-entry, no
+        # self-deadlock; the cap ``_count`` reuses the SAME held lock as the insert, so no extra lock and
+        # no deadlock).
         #
         # The outcome DISCRIMINATES (SEC-005 closed vocab — no id/secret leaked):
         #   * a SAME-id row already exists → idempotent replay of THIS attempt's own outcome
         #     (``PENDING_RECONCILE`` atop an unsettled row, ``COMMITTED`` atop a resolved row) — an
-        #     identical retry is never a foreign scope conflict, so same-id takes priority over the scope;
+        #     identical retry is never a foreign scope/cap conflict, so same-id takes priority over both;
         #   * a FRESH id while an UNRESOLVED possibly-live reservation occupies the session scope →
         #     ``SCOPE_FROZEN`` (no row appended): a genuinely distinct attempt must NOT submit AROUND an
         #     unresolved first order, regardless of spare cap, pending venue-truth reconcile;
-        #   * a FRESH id with nothing unresolved in scope → ``RESERVED`` (a fresh possibly-live slot).
+        #   * a FRESH id with nothing unresolved in scope but whose insert would breach the session/day cap
+        #     → ``CAP_EXCEEDED_SESSION`` / ``CAP_EXCEEDED_DAY`` (no row appended): the atomic cap gate. The
+        #     count is EVERY persisted (non-released) row for the session — a RESOLVED first order STOPS
+        #     freezing (so it is not SCOPE_FROZEN) yet STAYS COUNTED, so the second caller is denied here
+        #     even though the scope is clear. Offline the fixed clock keeps a test's attempts within one
+        #     UTC day, so the session count doubles as the day count (mirrors :meth:`load`); a real
+        #     provider buckets the day count by ``now``'s UTC day. Session is checked before day (the
+        #     runner's run→session→day precedence);
+        #   * a FRESH id with nothing unresolved AND spare cap → ``RESERVED`` (a fresh possibly-live slot).
         with self._lock:
-            if attempt_id not in self._reservations and self._has_unresolved(session_identity):
-                return "SCOPE_FROZEN"
+            if attempt_id not in self._reservations:
+                if self._has_unresolved(session_identity):
+                    return "SCOPE_FROZEN"
+                count = self._count(session_identity)
+                if max_orders_per_session > 0 and count >= max_orders_per_session:
+                    return "CAP_EXCEEDED_SESSION"
+                if max_orders_per_day > 0 and count >= max_orders_per_day:
+                    return "CAP_EXCEEDED_DAY"
             return self._reserve_or_load(
                 session_identity=session_identity,
                 attempt_id=attempt_id,

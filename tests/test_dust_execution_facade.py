@@ -19,6 +19,7 @@ Trust boundaries proven here:
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import dataclasses
 import threading
@@ -1367,11 +1368,14 @@ class _EchoRiskProvider:
         session_identity: str,
         now: datetime,
         attempt_id: str,
+        max_orders_per_session: int = 0,
+        max_orders_per_day: int = 0,
         venue_order_key: str | None = None,
     ) -> ScopedReservationOutcome:
-        # The ATOMIC reserve path (R6-MAJOR-2). Reached only by the honest-echo positive control (the
-        # mismatch cases fail closed at the identity assertion first): a fresh slot with nothing
-        # unresolved in scope → RESERVED, so the honest run proceeds to the wire.
+        # The ATOMIC reserve path (R6-MAJOR-2 + R8-MAJOR-1: now also accepts the threaded session/day
+        # caps). Reached only by the honest-echo positive control (the mismatch cases fail closed at the
+        # identity assertion first): a fresh slot with nothing unresolved in scope AND spare cap →
+        # RESERVED, so the honest run proceeds to the wire.
         return "RESERVED"
 
     def settle(
@@ -1546,6 +1550,8 @@ class _ReserveOutageProvider(InMemoryDurableSessionStateProvider):
         session_identity: str,
         now: datetime,
         attempt_id: str,
+        max_orders_per_session: int = 0,
+        max_orders_per_day: int = 0,
         venue_order_key: str | None = None,
     ) -> ScopedReservationOutcome:
         raise _DurableStoreOutage("durable store unavailable before wire")
@@ -2273,6 +2279,8 @@ class _ReserveSpyProvider(InMemoryDurableSessionStateProvider):
         session_identity: str,
         now: datetime,
         attempt_id: str,
+        max_orders_per_session: int = 0,
+        max_orders_per_day: int = 0,
         venue_order_key: str | None = None,
     ) -> ScopedReservationOutcome:
         self.reserve_or_freeze_calls += 1
@@ -2280,6 +2288,8 @@ class _ReserveSpyProvider(InMemoryDurableSessionStateProvider):
             session_identity=session_identity,
             now=now,
             attempt_id=attempt_id,
+            max_orders_per_session=max_orders_per_session,
+            max_orders_per_day=max_orders_per_day,
             venue_order_key=venue_order_key,
         )
 
@@ -2446,3 +2456,142 @@ def test_reserve_or_freeze_is_a_real_critical_section_under_concurrent_distinct_
         "exactly ONE write-port submit under the concurrent schedule "
         f"(got {len(submitted)} — two submits means two possibly-live orders bypassed the freeze)"
     )
+
+
+# ---------------------------------------------------------------------------
+# Gate#3 R8-MAJOR-1 — cap admission is ATOMIC with the reservation. The R7 lock
+# serializes each provider method, but the money path read the durable cap
+# counts in ``load()`` and only LATER reserved as a SEPARATE critical section —
+# so two CONCURRENT calls both consumed the STALE pre-reservation count (0) and
+# BOTH submitted beyond ``max_orders_per_session == max_orders_per_day == 1``.
+# The unresolved-scope freeze is NOT a cap substitute: a RESOLVED first order
+# STOPS freezing while STAYING COUNTED. The fix binds the cap decision to the
+# reservation atomically (a discriminated ``CAP_EXCEEDED_*`` outcome), so the
+# second caller sees the first COUNTED slot and refuses at the cap.
+#
+# This drives TWO REAL facade calls through the runner sharing ONE recording
+# write port (NOT a ``list.append`` write model — the R7 test's list.append is
+# exactly why it missed this): a barrier so BOTH observe prior counts 0, then a
+# gate holding the 2nd reservation until the 1st has settled RESOLVED (counted,
+# no longer freezing). Exactly ONE SUBMITTED / one write-port call / one counted
+# slot; the other DENIED ``order_cap_*``.
+# ---------------------------------------------------------------------------
+
+
+class _ConcurrentCapProbeProvider(InMemoryDurableSessionStateProvider):
+    """Drives Codex's R8-MAJOR-1 schedule against the REAL facade money path.
+
+    * ``load`` holds BOTH callers at a barrier AFTER reading the durable count, so both observe the
+      SAME pre-reservation count (0) before EITHER reserves — the exact stale-count window.
+    * ``reserve_or_freeze`` lets the FIRST arriving caller through and HOLDS the second until the first
+      has ``settle``-d RESOLVED, so the second reserves atop a first order that is COUNTED but NO LONGER
+      FREEZING (a RESOLVED row) — the atomic cap, not the scope freeze, must stop it. ``**kwargs``
+      forwards whatever the facade threads in (the caps once the fix lands), so the probe drives the
+      RED (pre-fix, no caps) and GREEN (post-fix, caps) money path unchanged.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._load_barrier = threading.Barrier(2, timeout=5.0)
+        self._first_settled = threading.Event()
+        self._arrival_lock = threading.Lock()
+        self._arrivals = 0
+
+    def load(self, *, session_id: str, now: datetime) -> DurableSessionState:
+        state = super().load(session_id=session_id, now=now)
+        # Both callers observe the pre-reservation count BEFORE either reserves (the stale-count window).
+        with contextlib.suppress(threading.BrokenBarrierError):
+            self._load_barrier.wait()
+        return state
+
+    def reserve_or_freeze(
+        self, *, session_identity: str, now: datetime, attempt_id: str, **kwargs: object
+    ) -> ScopedReservationOutcome:
+        with self._arrival_lock:
+            self._arrivals += 1
+            is_second = self._arrivals == 2
+        if is_second:
+            # Hold the second caller until the FIRST has settled RESOLVED: it then reserves atop a
+            # COUNTED-but-unfrozen (RESOLVED) first order, so ONLY an atomic cap can stop it.
+            self._first_settled.wait(timeout=5.0)
+        return super().reserve_or_freeze(
+            session_identity=session_identity, now=now, attempt_id=attempt_id, **kwargs  # type: ignore[arg-type]
+        )
+
+    def settle(
+        self, *, attempt_id: str, recon_state: ReconciliationState, venue_order_key: str | None = None
+    ) -> None:
+        super().settle(attempt_id=attempt_id, recon_state=recon_state, venue_order_key=venue_order_key)
+        # The first caller's RESOLVED settle releases the held second caller.
+        self._first_settled.set()
+
+
+def test_concurrent_calls_at_cap_one_submits_the_other_is_cap_denied_atomically() -> None:
+    """R8-MAJOR-1 (RED against the stale-count cap bypass): two CONCURRENT ``propose_mm_execution`` calls,
+    SAME session, ``max_orders_per_session == max_orders_per_day == 1``, sharing ONE provider + ONE
+    recording write port. A barrier makes BOTH observe prior counts 0; a gate holds the 2nd reservation
+    until the 1st has settled RESOLVED (COUNTED but no longer freezing). The cap decision MUST be atomic
+    with the reservation: EXACTLY ONE SUBMITTED / one write-port submit / one counted slot; the other
+    DENIED ``order_cap_*``.
+
+    RED today (cap decided from the stale ``load()`` count, not the atomic reservation): both read count 0
+    and BOTH submit (``submit_calls == 2``, two counted rows). The RED is the stale-count cap bypass, not
+    an import/typo — the barrier+gate reproduce Codex's exact schedule against the real facade."""
+    binding = _mm_binding()
+    write_port = _default_write_port(binding)  # SHARED money-moving surface — counts TOTAL submits
+    provider = _ConcurrentCapProbeProvider()  # SHARED durable session state
+    envelope = _mm_env(max_orders_per_session=1, max_orders_per_day=1)
+
+    results: dict[str, MMExecutionToolResult] = {}
+    errors: list[BaseException] = []
+
+    def _worker(client_order_id: str) -> None:
+        # ``fill_history_matches=True`` → the run's E4 reconcile RESOLVES (definite fill), so the first
+        # order STOPS freezing the scope but STAYS COUNTED — the cap is the ONLY thing that can deny the
+        # second. A FRESH adapter per call (the SHARED surface under test is the write port, not the
+        # Mode-B-bypassed adapter).
+        adapter = RecordingFakeAdapter(fill=True, fill_history_matches=True, open_orders=[])
+        try:
+            results[client_order_id] = asyncio.run(
+                _drive_mode_b(
+                    interlock=_full_interlock(),
+                    arming=_mm_arming(binding, write_port=write_port),
+                    binding=binding,
+                    adapter=adapter,
+                    interlock_store=InMemoryOperatorInterlockStore(),
+                    envelope=envelope,
+                    provider=provider,
+                    client_order_id=client_order_id,
+                )
+            )
+        except BaseException as exc:  # surface a worker crash to the main thread
+            errors.append(exc)
+
+    threads = [
+        threading.Thread(target=_worker, args=("coid-1",)),
+        threading.Thread(target=_worker, args=("coid-2",)),
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=30.0)
+        assert not thread.is_alive(), "the concurrent cap schedule must not deadlock"
+
+    assert not errors, f"a worker raised under the concurrent schedule: {errors}"
+    statuses = sorted(result.execution_status for result in results.values())
+    assert statuses == ["DENIED", "SUBMITTED"], (
+        "exactly one concurrent call may reach the wire; the other must be cap-DENIED "
+        f"(got {statuses} — two SUBMITTED means both consumed the stale pre-reservation count)"
+    )
+    assert write_port.submit_calls == 1, (
+        "exactly ONE write-port submit under the concurrent schedule "
+        f"(got {write_port.submit_calls} — two means the cap decision was not atomic with the reservation)"
+    )
+    assert provider.attempts("sess-mm-b") == 1, (
+        "exactly ONE counted reservation slot — a second row means the cap admission interleaved"
+    )
+    denied = next(result for result in results.values() if result.execution_status != "SUBMITTED")
+    assert (
+        "order_cap_session" in denied.execution_reason_codes
+        or "order_cap_day" in denied.execution_reason_codes
+    ), f"the cap-denied call must carry an order_cap_* reason (got {denied.execution_reason_codes})"

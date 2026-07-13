@@ -99,6 +99,12 @@ Admission = Literal["APPROVED", "DENIED", "REQUIRES_HUMAN"]
 #   * ``DENIED``     — the strategy admission itself was DENIED, so no execution was authorized.
 ExecutionStatus = Literal["SUBMITTED", "ABSTAINED", "NOT_ARMED", "DENIED"]
 
+# Gate#3 R8-MAJOR-1: the durable order-cap reasons the facade's ATOMIC cap gate denies with — the SAME
+# closed-vocab ``order_cap_*`` literals the runner's M-3 gate / the E2 policy gate use (never a minted
+# synonym). The atomic ``reserve_or_freeze`` returns a discriminated ``CAP_EXCEEDED_SESSION`` /
+# ``CAP_EXCEEDED_DAY`` and the facade maps each to its reason here.
+OrderCapReason = Literal["order_cap_session", "order_cap_day"]
+
 # The abstain reasons that mean "Mode B could not ARM" (execution WITHHELD for want of arming/interlock
 # proof), as opposed to a strategy/gate/intent abstention. Mirrors the runner's ``AbstainReason``
 # closed vocab; membership drives the ``NOT_ARMED`` disposition. A closed set — never an id or secret.
@@ -792,6 +798,57 @@ def _freeze_pending_reconciliation(
     return tool_result
 
 
+def _deny_order_cap(
+    request: MMExecutionToolRequest,
+    *,
+    envelope: PolicyEnvelope,
+    emit: Callable[..., None],
+    reason: OrderCapReason,
+) -> MMExecutionToolResult:
+    """Return the Gate#3 R8-MAJOR-1 fail-closed result when the ATOMIC reservation refuses at a cap.
+
+    The atomic ``reserve_or_freeze`` bound the session/UTC-day cap decision to the slot claim in ONE
+    critical section and refused (``CAP_EXCEEDED_SESSION`` / ``CAP_EXCEEDED_DAY``): inserting this fresh
+    reservation would breach the cap, observed against the first COUNTED reservation even when it is
+    already RESOLVED. Unlike the pre-fix path, this go/no-go never reads ``load()``'s stale
+    pre-reservation count, so two concurrent callers can no longer both submit past a ``== 1`` cap. The
+    money path is NOT entered: the runner is never reached and no write port is called. Denies with the
+    existing closed-vocab ``order_cap_*`` reason family (``reason`` — SEC-005, never a minted synonym),
+    on BOTH the admission and execution axes, and emits the honest terminal OPS telemetry. Carries only
+    the pinned honest labels + closed-vocab reason codes, never a live handle.
+    """
+    tool_result = MMExecutionToolResult(
+        admission="DENIED",
+        reason_codes=(reason,),
+        execution_status="DENIED",
+        execution_reason_codes=(reason,),
+        lifecycle_receipt_ref=f"dust-lifecycle:{request.session_id}:{reason}",
+        run_label=_DEFAULT_RUN_LABEL,
+        calibration_label=_DEFAULT_CALIBRATION_LABEL,
+        edge_label=_DEFAULT_EDGE_LABEL,
+        evidence_class=_DEFAULT_EVIDENCE_CLASS,
+        policy_hash=envelope.policy_hash(),
+    )
+    emit(
+        RuntimeEventType.ACTION_EMITTED,
+        admission=tool_result.admission,
+        execution_status=tool_result.execution_status,
+        intent_kind=request.intent_kind,
+    )
+    emit(
+        RuntimeEventType.RUN_COMPLETED,
+        status=RuntimeStatus.COMPLETED.value,
+        admission=tool_result.admission,
+        reason_codes=list(tool_result.reason_codes),
+        execution_status=tool_result.execution_status,
+        execution_reason_codes=list(tool_result.execution_reason_codes),
+        lifecycle_receipt_ref=tool_result.lifecycle_receipt_ref,
+        session_status="FAILED",
+        submitted_count=0,
+    )
+    return tool_result
+
+
 def _idempotent_committed_result(
     request: MMExecutionToolRequest,
     *,
@@ -1026,8 +1083,18 @@ async def propose_mm_execution(
     if provider is not None and durable_state is not None:
         attempt_id = _reservation_attempt_id(request)
         try:
+            # Gate#3 R8-MAJOR-1: thread the AUTHORITATIVE session/day order caps into the atomic
+            # reserve-or-freeze so the cap admission is made in the SAME critical section as the slot
+            # claim — never from the stale ``load()`` count read earlier in a SEPARATE critical section
+            # (two concurrent callers could both observe that count as 0 and both submit past a ``== 1``
+            # cap). The money path's go/no-go on the cap is now this atomic reservation, not
+            # ``durable_state``'s pre-reservation count.
             reservation_outcome = provider.reserve_or_freeze(
-                session_identity=session_identity, now=now_dt, attempt_id=attempt_id
+                session_identity=session_identity,
+                now=now_dt,
+                attempt_id=attempt_id,
+                max_orders_per_session=envelope.max_orders_per_session,
+                max_orders_per_day=envelope.max_orders_per_day,
             )
         except Exception:
             return _fail_closed_reservation_failed(request, envelope=envelope, emit=_emit)
@@ -1036,6 +1103,19 @@ async def propose_mm_execution(
             # scope. PENDING_RECONCILE: an identical retry atop this attempt's own possibly-live first order.
             # Either way FREEZE — no new wire atop a possibly-live order, pending the venue-truth reconcile.
             return _freeze_pending_reconciliation(request, envelope=envelope, emit=_emit)
+        if reservation_outcome in ("CAP_EXCEEDED_SESSION", "CAP_EXCEEDED_DAY"):
+            # Gate#3 R8-MAJOR-1: the atomic cap gate refused — inserting this fresh reservation would breach
+            # the session / UTC-day order cap (the first COUNTED reservation is observed even when it is
+            # already RESOLVED). FAIL CLOSED with the existing ``order_cap_*`` reason family: DENIED, the
+            # runner is never reached and no write port is called. The runner's own M-3 cap gate stays for
+            # direct-runner callers / defense-in-depth, but the facade money path's authoritative cap gate
+            # is now this atomic reservation.
+            cap_reason: OrderCapReason = (
+                "order_cap_session"
+                if reservation_outcome == "CAP_EXCEEDED_SESSION"
+                else "order_cap_day"
+            )
+            return _deny_order_cap(request, envelope=envelope, emit=_emit, reason=cap_reason)
         if reservation_outcome == "COMMITTED":
             # An identical retry atop a committed first order: idempotent replay, no new wire.
             return _idempotent_committed_result(request, envelope=envelope, emit=_emit)
