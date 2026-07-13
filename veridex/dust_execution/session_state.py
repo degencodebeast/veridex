@@ -131,6 +131,23 @@ def _utc_day(ts_ms: int) -> datetime:
     )
 
 
+def _effective_loss_cap(envelope_cap: float, manifest_cap: float) -> float:
+    """The STRICTER of the two POSITIVE loss caps — the effective ceiling enforced per axis (SAF-002a).
+
+    The operator ENVELOPE cap (``max_session_loss`` / ``max_daily_loss``, hash-pinned into
+    :meth:`veridex.policy.envelope.PolicyEnvelope.policy_hash`) and the MANIFEST cap are BOTH
+    authoritative: NEITHER may be exceeded, so the effective ceiling is the tighter POSITIVE value —
+    thus a durable loss at/above EITHER the operator envelope cap OR the manifest cap denies. A cap
+    ``<= 0`` is DISABLED (no ceiling on that side) and is ignored — the other positive cap stands; when
+    BOTH are disabled the result is ``0.0`` (disabled-transparent through :func:`cap_breached`). On the
+    live Mode-B path the envelope cap is always finite positive (``authorize_mode_b`` fails closed
+    otherwise, so it can never silently drop out of the ``min``); a non-money Mode A run may leave it
+    disabled, in which case the manifest cap alone applies.
+    """
+    positives = [cap for cap in (envelope_cap, manifest_cap) if cap > 0.0]
+    return min(positives) if positives else 0.0
+
+
 @dataclass(frozen=True)
 class DurableSessionState:
     """The authoritative durable session-state the provider hands the facade BEFORE live arming.
@@ -216,6 +233,8 @@ class DurableSessionStateProvider(Protocol):
         max_orders_per_day: int = 0,
         max_session_loss: float = 0.0,
         max_daily_loss: float = 0.0,
+        envelope_max_session_loss: float = 0.0,
+        envelope_max_daily_loss: float = 0.0,
         venue_order_key: str | None = None,
     ) -> ScopedReservationOutcome:
         """Atomically reserve-or-load an attempt AND enforce the session freeze scope, the session/UTC-day
@@ -233,9 +252,13 @@ class DurableSessionStateProvider(Protocol):
         already RESOLVED (RESOLVED stops freezing but STAYS COUNTED) — and refuse at the cap.
 
         ``max_orders_per_session`` / ``max_orders_per_day`` are the authoritative order caps the facade
-        threads in from the policy envelope; ``max_session_loss`` / ``max_daily_loss`` are the authoritative
-        realized-LOSS caps it threads in from the MANIFEST (the ceiling the runner's pre-wire admission
-        enforces via :func:`veridex.policy.envelope.cap_breached`). A cap ``<= 0`` is DISABLED-transparent
+        threads in from the policy envelope; ``max_session_loss`` / ``max_daily_loss`` are the MANIFEST
+        realized-LOSS caps and ``envelope_max_session_loss`` / ``envelope_max_daily_loss`` are the
+        operator ENVELOPE realized-LOSS caps (hash-pinned into ``policy_hash``). BOTH loss authorities
+        bind: per axis the EFFECTIVE ceiling is the STRICTER positive of the two (SAF-002a), computed via
+        :func:`_effective_loss_cap`, so NEITHER the operator envelope cap NOR the manifest cap can be
+        exceeded — the runner's pre-wire admission enforces the SAME ceiling via
+        :func:`veridex.policy.envelope.cap_breached`. A cap ``<= 0`` is DISABLED-transparent
         (no ceiling — matches :func:`veridex.dust_execution.runner._cap_reached` / the E2 policy gate /
         ``cap_breached``). The reservation that consumes an order slot is EVERY persisted (non-released) row
         — ``RESERVED`` / ``PENDING`` / ``AMBIGUOUS`` / ``COMMITTED`` / ``RESOLVED`` all count; only a
@@ -259,7 +282,8 @@ class DurableSessionStateProvider(Protocol):
           is checked before day (mirrors the runner's run→session→day precedence).
         * ``LOSS_CAP_EXCEEDED_SESSION`` / ``LOSS_CAP_EXCEEDED_DAY`` — a FRESH ``attempt_id`` with nothing
           unresolved in scope and spare ORDER cap but whose session / UTC-day CURRENT durable realized loss
-          already breaches the (manifest) loss cap: FAIL CLOSED (the facade denies ``session_loss_over_max``
+          already breaches the EFFECTIVE (stricter of the operator envelope and manifest) loss cap: FAIL
+          CLOSED (the facade denies ``session_loss_over_max``
           / ``daily_loss_over_max``, no new wire). No new row is appended. The loss is summed from the
           ``_fills`` ledger and tested via ``cap_breached`` in the SAME critical section as the slot claim —
           NOT from a stale ``load()`` snapshot that a concurrent caller could observe below the cap while the
@@ -450,6 +474,8 @@ class InMemoryDurableSessionStateProvider:
         max_orders_per_day: int = 0,
         max_session_loss: float = 0.0,
         max_daily_loss: float = 0.0,
+        envelope_max_session_loss: float = 0.0,
+        envelope_max_daily_loss: float = 0.0,
         venue_order_key: str | None = None,
     ) -> ScopedReservationOutcome:
         # Gate#3 R6-MAJOR-2 + R8-MAJOR-1 + loss-cap TOCTOU: the ATOMIC reserve-or-freeze — the SINGLE
@@ -501,15 +527,27 @@ class InMemoryDurableSessionStateProvider:
                     return "CAP_EXCEEDED_SESSION"
                 if max_orders_per_day > 0 and count >= max_orders_per_day:
                     return "CAP_EXCEEDED_DAY"
-                if max_session_loss > 0.0 or max_daily_loss > 0.0:
+                # SAF-002a: BOTH the operator ENVELOPE loss caps (hash-pinned into ``policy_hash``) and the
+                # MANIFEST loss caps bind — per axis the EFFECTIVE ceiling is the STRICTER positive of the
+                # two (:func:`_effective_loss_cap`), so a durable loss at/above EITHER authority denies
+                # here. Threading the envelope caps IN ADDITION to the manifest caps closes the hole where
+                # the money path enforced only the (looser) manifest cap and armed PAST the operator's
+                # hash-pinned envelope cap (Gate#3 CRITICAL-1). The effective cap is computed under THIS
+                # held lock alongside the loss sum, so the whole loss admission stays in the SAME atomic
+                # critical section as the slot claim (never a stale ``load()`` snapshot).
+                effective_session_loss = _effective_loss_cap(
+                    envelope_max_session_loss, max_session_loss
+                )
+                effective_daily_loss = _effective_loss_cap(envelope_max_daily_loss, max_daily_loss)
+                if effective_session_loss > 0.0 or effective_daily_loss > 0.0:
                     # The CURRENT durable fee-inclusive realized loss, summed under THIS held lock via the
                     # SAME ``_net_pnl`` helper :meth:`load` uses (net over all session fills / over ``now``'s
                     # UTC-day fills), converted to a non-negative loss magnitude and tested through the SINGLE
                     # ``cap_breached`` boundary — never a re-implemented breach predicate.
                     net_session, net_day = self._net_pnl(session_identity, now)
-                    if cap_breached(max_session_loss, max(0.0, -net_session)):
+                    if cap_breached(effective_session_loss, max(0.0, -net_session)):
                         return "LOSS_CAP_EXCEEDED_SESSION"
-                    if cap_breached(max_daily_loss, max(0.0, -net_day)):
+                    if cap_breached(effective_daily_loss, max(0.0, -net_day)):
                         return "LOSS_CAP_EXCEEDED_DAY"
             return self._reserve_or_load(
                 session_identity=session_identity,

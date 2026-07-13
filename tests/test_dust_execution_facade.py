@@ -291,6 +291,13 @@ def _mm_env(**kw: object) -> PolicyEnvelope:
         "max_quote_age_s": 10,
         "cooldown_s": 0,
         "human_approval_threshold": 1000.0,
+        # SAF-002a / AC-032: FINITE POSITIVE envelope loss caps so a Mode-B positive control ARMS (a
+        # disabled cap now fails closed under ``authorize_mode_b``). Deliberately LOOSER than the
+        # manifest caps (2.0 / 4.0) so the effective (stricter positive) ceiling stays the manifest cap
+        # for the existing manifest-cap tests; a test that exercises the ENVELOPE authority overrides
+        # these with a tighter value.
+        "max_session_loss": 5.0,
+        "max_daily_loss": 10.0,
         "kill_switch": False,
     }
     base.update(kw)
@@ -1314,6 +1321,161 @@ async def test_positive_control_first_call_within_caps_with_provider_submits() -
     assert provider.attempts("sess-mm-b") == 1, "the run's possibly-live attempt must persist back"
 
 
+# --- SAF-002a / AC-032: the LIVE Mode-B path enforces the hash-pinned PolicyEnvelope loss caps -----
+#
+# The operator's ENVELOPE ``max_session_loss`` / ``max_daily_loss`` are the hash-pinned committed caps
+# (folded into ``policy_hash``). Before this fold the live money path enforced ONLY the (looser)
+# MANIFEST loss caps in the atomic admission and never called ``authorize_mode_b`` — so a Mode-B run
+# could arm + submit PAST the operator's envelope cap, and a disabled/non-finite envelope cap armed at
+# all. These tests pin BOTH corrections: (1) the atomic admission enforces the STRICTER of the positive
+# envelope and manifest caps per axis; (2) Mode-B admission fails closed on a non-finite/non-positive/
+# disabled envelope cap (permitted only in non-money Mode A).
+
+
+async def test_mode_b_denied_when_durable_loss_crosses_envelope_cap_below_manifest_cap() -> None:
+    """Codex's object (SAF-002a/AC-032): envelope caps (session=0.5, day=1.0), manifest caps (2.0,
+    4.0), a durable reconciled loss of 0.6. The 0.6 crosses the 0.5 operator ENVELOPE session cap even
+    though it is BELOW the 2.0 manifest cap, so live Mode B must be DENIED before any write-port I/O.
+    RED today: the atomic admission threads ONLY the manifest cap, so 0.6 < 2.0 admits and SUBMITS."""
+    binding = _mm_binding()
+    adapter = RecordingFakeAdapter(fill=True, open_orders=[])
+    write_port = _default_write_port(binding)
+    provider = InMemoryDurableSessionStateProvider()
+    provider.record_reconciled_fills(
+        session_identity="sess-mm-b",
+        fills=(
+            RealizedFillRecord(
+                realized_pnl=-0.6, fee=0.0, session_id="sess-mm-b", fill_ts_ms=_MM_NOW_S * 1000
+            ),
+        ),
+    )
+    envelope = _mm_env(max_session_loss=0.5, max_daily_loss=1.0)  # manifest stays 2.0 / 4.0
+
+    result = await _drive_mode_b(
+        interlock=_full_interlock(),
+        arming=_mm_arming(binding, write_port=write_port),
+        binding=binding,
+        adapter=adapter,
+        interlock_store=InMemoryOperatorInterlockStore(),
+        envelope=envelope,
+        provider=provider,
+    )
+
+    assert write_port.submit_calls == 0, (
+        "durable loss 0.6 crosses the 0.5 envelope session cap (< the 2.0 manifest cap) — DENY pre-wire"
+    )
+    assert result.execution_status != "SUBMITTED"
+    assert "session_loss_over_max" in result.reason_codes
+
+
+@pytest.mark.parametrize(
+    "caps",
+    [
+        {"max_session_loss": 0.0, "max_daily_loss": 1.0},  # session disabled
+        {"max_session_loss": 0.5, "max_daily_loss": 0.0},  # day disabled
+        {"max_session_loss": -1.0, "max_daily_loss": 1.0},  # session non-positive
+    ],
+)
+async def test_mode_b_fails_closed_when_envelope_loss_cap_disabled(caps: dict[str, float]) -> None:
+    """SAF-002a/AC-032: Mode-B admission REQUIRES a finite POSITIVE envelope ``max_session_loss`` AND
+    ``max_daily_loss``. A disabled (``<= 0``) / non-positive envelope cap on EITHER axis fails closed
+    for Mode B (``authorize_mode_b``) — no arm, no write. RED today: the live path never calls
+    ``authorize_mode_b``, so a disabled envelope cap still arms and submits."""
+    binding = _mm_binding()
+    adapter = RecordingFakeAdapter(fill=True, open_orders=[])
+    write_port = _default_write_port(binding)
+
+    result = await _drive_mode_b(
+        interlock=_full_interlock(),
+        arming=_mm_arming(binding, write_port=write_port),
+        binding=binding,
+        adapter=adapter,
+        interlock_store=InMemoryOperatorInterlockStore(),
+        envelope=_mm_env(**caps),
+        provider=InMemoryDurableSessionStateProvider(),
+    )
+
+    assert write_port.submit_calls == 0, "a disabled envelope loss cap must fail closed for Mode B"
+    assert result.execution_status == "NOT_ARMED"
+
+
+@pytest.mark.parametrize("bad", [float("inf"), float("nan")])
+async def test_mode_b_fails_closed_when_envelope_loss_cap_non_finite(bad: float) -> None:
+    """SAF-002a/AC-032: a non-finite (``nan``/``inf``) envelope loss cap gives no real max-loss
+    protection and fails closed for Mode B. RED today: the live path never calls ``authorize_mode_b``,
+    so a non-finite envelope cap still arms and submits."""
+    binding = _mm_binding()
+    adapter = RecordingFakeAdapter(fill=True, open_orders=[])
+    write_port = _default_write_port(binding)
+
+    result = await _drive_mode_b(
+        interlock=_full_interlock(),
+        arming=_mm_arming(binding, write_port=write_port),
+        binding=binding,
+        adapter=adapter,
+        interlock_store=InMemoryOperatorInterlockStore(),
+        envelope=_mm_env(max_session_loss=bad, max_daily_loss=1.0),
+        provider=InMemoryDurableSessionStateProvider(),
+    )
+
+    assert write_port.submit_calls == 0, "a non-finite envelope loss cap must fail closed for Mode B"
+    assert result.execution_status == "NOT_ARMED"
+
+
+async def test_mode_a_dry_run_allowed_with_disabled_envelope_loss_caps() -> None:
+    """SAF-002a positive control: disabled envelope loss caps are permitted in NON-money modes. A
+    Mode-A dry-run with BOTH envelope loss caps disabled (``<= 0``) still admits — ``authorize_mode_b``
+    gates ONLY ``live_guarded``, never Mode A (this keeps A working after the gate is added)."""
+    manifest = _mm_manifest()
+    envelope = _mm_env(max_session_loss=0.0, max_daily_loss=0.0)
+    request = _admitted_request(manifest, envelope)
+    adapter = FakeVenueAdapter(fill=True)
+
+    result = await _drive_facade(
+        manifest,
+        envelope,
+        request,
+        adapter=adapter,
+        signer=LocalFakeWalletControlPlane(),
+        sink=None,
+    )
+
+    assert result.admission == "APPROVED", "disabled caps are allowed in Mode A (non-money)"
+    assert adapter.submit_calls == 0  # a dry-run places no order
+
+
+async def test_mode_b_submits_with_finite_positive_envelope_loss_caps_below() -> None:
+    """Positive control: finite POSITIVE envelope loss caps (session=0.5, day=1.0) with a durable loss
+    (0.3) BELOW them → Mode B arms and submits. The new gate + effective-cap must NOT over-block a
+    compliant envelope whose loss is under the cap (offline; Mode B UNARMED recording-fakes)."""
+    binding = _mm_binding()
+    adapter = RecordingFakeAdapter(fill=True, open_orders=[])
+    write_port = _default_write_port(binding)
+    provider = InMemoryDurableSessionStateProvider()
+    provider.record_reconciled_fills(
+        session_identity="sess-mm-b",
+        fills=(
+            RealizedFillRecord(
+                realized_pnl=-0.3, fee=0.0, session_id="sess-mm-b", fill_ts_ms=_MM_NOW_S * 1000
+            ),
+        ),
+    )
+    envelope = _mm_env(max_session_loss=0.5, max_daily_loss=1.0)
+
+    result = await _drive_mode_b(
+        interlock=_full_interlock(),
+        arming=_mm_arming(binding, write_port=write_port),
+        binding=binding,
+        adapter=adapter,
+        interlock_store=InMemoryOperatorInterlockStore(),
+        envelope=envelope,
+        provider=provider,
+    )
+
+    assert write_port.submit_calls == 1, "loss 0.3 is below both envelope caps — must still arm/submit"
+    assert result.execution_status == "SUBMITTED"
+
+
 def test_durable_session_state_provider_protocol_is_runtime_checkable() -> None:
     """The in-memory fake structurally satisfies the injected ``DurableSessionStateProvider`` Protocol
     (the SAME injected-seam idiom as the operator-interlock / pre-submit stores)."""
@@ -1372,12 +1534,15 @@ class _EchoRiskProvider:
         max_orders_per_day: int = 0,
         max_session_loss: float = 0.0,
         max_daily_loss: float = 0.0,
+        envelope_max_session_loss: float = 0.0,
+        envelope_max_daily_loss: float = 0.0,
         venue_order_key: str | None = None,
     ) -> ScopedReservationOutcome:
-        # The ATOMIC reserve path (R6-MAJOR-2 + R8-MAJOR-1 + loss-cap TOCTOU: now also accepts the threaded
-        # session/day ORDER caps AND the manifest realized-LOSS caps). Reached only by the honest-echo
-        # positive control (the mismatch cases fail closed at the identity assertion first): a fresh slot
-        # with nothing unresolved in scope AND spare cap → RESERVED, so the honest run proceeds to the wire.
+        # The ATOMIC reserve path (R6-MAJOR-2 + R8-MAJOR-1 + loss-cap TOCTOU + CRITICAL-1: now also accepts
+        # the threaded session/day ORDER caps AND both the manifest + operator-ENVELOPE realized-LOSS caps).
+        # Reached only by the honest-echo positive control (the mismatch cases fail closed at the identity
+        # assertion first): a fresh slot with nothing unresolved in scope AND spare cap → RESERVED, so the
+        # honest run proceeds to the wire.
         return "RESERVED"
 
     def settle(
@@ -1556,6 +1721,8 @@ class _ReserveOutageProvider(InMemoryDurableSessionStateProvider):
         max_orders_per_day: int = 0,
         max_session_loss: float = 0.0,
         max_daily_loss: float = 0.0,
+        envelope_max_session_loss: float = 0.0,
+        envelope_max_daily_loss: float = 0.0,
         venue_order_key: str | None = None,
     ) -> ScopedReservationOutcome:
         raise _DurableStoreOutage("durable store unavailable before wire")
@@ -2287,6 +2454,8 @@ class _ReserveSpyProvider(InMemoryDurableSessionStateProvider):
         max_orders_per_day: int = 0,
         max_session_loss: float = 0.0,
         max_daily_loss: float = 0.0,
+        envelope_max_session_loss: float = 0.0,
+        envelope_max_daily_loss: float = 0.0,
         venue_order_key: str | None = None,
     ) -> ScopedReservationOutcome:
         self.reserve_or_freeze_calls += 1
@@ -2298,6 +2467,8 @@ class _ReserveSpyProvider(InMemoryDurableSessionStateProvider):
             max_orders_per_day=max_orders_per_day,
             max_session_loss=max_session_loss,
             max_daily_loss=max_daily_loss,
+            envelope_max_session_loss=envelope_max_session_loss,
+            envelope_max_daily_loss=envelope_max_daily_loss,
             venue_order_key=venue_order_key,
         )
 

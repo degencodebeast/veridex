@@ -64,6 +64,7 @@ from veridex.dust_execution.operator_interlock_store import (
     OperatorInterlockStore,
     interlock_events_are_canonical,
 )
+from veridex.dust_execution.risk import FailClosed, authorize_mode_b
 from veridex.runtime.runtime_events import RuntimeEventType, RuntimeStatus, runtime_event
 
 if TYPE_CHECKING:
@@ -552,6 +553,55 @@ def _fail_closed_session_identity_mismatch(
         execution_status="NOT_ARMED",
         execution_reason_codes=("mode_b_not_armed",),
         lifecycle_receipt_ref=f"dust-lifecycle:{request.session_id}:session-identity-mismatch",
+        run_label=_DEFAULT_RUN_LABEL,
+        calibration_label=_DEFAULT_CALIBRATION_LABEL,
+        edge_label=_DEFAULT_EDGE_LABEL,
+        evidence_class=_DEFAULT_EVIDENCE_CLASS,
+        policy_hash=envelope.policy_hash(),
+    )
+    emit(
+        RuntimeEventType.ACTION_EMITTED,
+        admission=tool_result.admission,
+        execution_status=tool_result.execution_status,
+        intent_kind=request.intent_kind,
+    )
+    emit(
+        RuntimeEventType.RUN_COMPLETED,
+        status=RuntimeStatus.COMPLETED.value,
+        admission=tool_result.admission,
+        reason_codes=list(tool_result.reason_codes),
+        execution_status=tool_result.execution_status,
+        execution_reason_codes=list(tool_result.execution_reason_codes),
+        lifecycle_receipt_ref=tool_result.lifecycle_receipt_ref,
+        session_status="FAILED",
+        submitted_count=0,
+    )
+    return tool_result
+
+
+def _fail_closed_envelope_loss_cap(
+    request: MMExecutionToolRequest,
+    *,
+    envelope: PolicyEnvelope,
+    emit: Callable[..., None],
+) -> MMExecutionToolResult:
+    """Return the SAF-002a / AC-032 fail-closed result when Mode-B admission fails ``authorize_mode_b``.
+
+    Gate#3 CRITICAL-1: live Mode B (``live_guarded``) REQUIRES a finite POSITIVE hash-pinned
+    ``PolicyEnvelope.max_session_loss`` AND ``max_daily_loss`` (the operator's committed max-loss
+    protection). A non-finite (``nan``/``inf``), non-positive, or disabled (``<= 0``) envelope cap gives
+    no real protection and FAILS CLOSED for Mode B — disabled caps are permitted ONLY in non-money
+    modes (Mode A dry-run/fake, which never reach this gate). The money path is NOT entered: the runner
+    is never reached and no write port is called. Returns a typed DENIED / NOT_ARMED result and emits
+    the honest terminal OPS telemetry, carrying only the pinned honest labels + closed-vocab reason
+    codes (SEC-005 — never a live handle or a cap VALUE).
+    """
+    tool_result = MMExecutionToolResult(
+        admission="DENIED",
+        reason_codes=("mode_b_loss_cap_unset",),
+        execution_status="NOT_ARMED",
+        execution_reason_codes=("mode_b_not_armed",),
+        lifecycle_receipt_ref=f"dust-lifecycle:{request.session_id}:mode-b-loss-cap-unset",
         run_label=_DEFAULT_RUN_LABEL,
         calibration_label=_DEFAULT_CALIBRATION_LABEL,
         edge_label=_DEFAULT_EDGE_LABEL,
@@ -1105,6 +1155,20 @@ async def propose_mm_execution(
         else provisional_session_id(manifest, request.mode)
     )
 
+    # SAF-002a / AC-032 (Gate#3 CRITICAL-1): the live Mode-B ARMING precondition on the hash-pinned
+    # operator PolicyEnvelope loss caps, enforced BEFORE any reservation or wire I/O. ``authorize_mode_b``
+    # FAILS CLOSED unless BOTH ``envelope.max_session_loss`` and ``max_daily_loss`` are FINITE and
+    # POSITIVE — a non-finite (nan/inf), non-positive, or disabled (<= 0) cap gives no real max-loss
+    # protection, so a ``live_guarded`` run with such a cap must NOT arm. Disabled caps are permitted
+    # ONLY in non-money modes (Mode A dry-run/fake never reach this gate). Reuses the existing
+    # ``risk.authorize_mode_b`` (its ``FailClosed`` is the single fail-closed authority) and maps it to
+    # the DENIED / NOT_ARMED disposition: the reservation, the runner, and the write port are all skipped.
+    if request.mode == "live_guarded":
+        try:
+            authorize_mode_b(envelope)
+        except FailClosed:
+            return _fail_closed_envelope_loss_cap(request, envelope=envelope, emit=_emit)
+
     # Gate#3 R4-MAJOR-1 + R5-MAJOR-1: durably RESERVE-OR-LOAD a possibly-live attempt BEFORE the runner
     # reaches the write port — the durable-cap analog of the lane's persist-BEFORE-sign discipline. The
     # reservation counts toward the session/UTC-day caps IMMEDIATELY and durably (``load`` counts
@@ -1153,14 +1217,18 @@ async def propose_mm_execution(
             # cap). The money path's go/no-go on the cap is now this atomic reservation, not
             # ``durable_state``'s pre-reservation count.
             #
-            # Gate#3 loss-cap TOCTOU: ALSO thread the AUTHORITATIVE realized-LOSS caps — the MANIFEST
-            # ``max_session_loss`` / ``max_daily_loss``, the ceiling the runner's pre-wire admission
-            # enforces via ``cap_breached`` (NOT the inert envelope loss caps on this path) — so the
-            # realized-loss admission is likewise made in the SAME critical section as the slot claim,
-            # against the CURRENT durable loss ledger, never from the stale below-cap ``load()`` snapshot
-            # (two concurrent callers could both observe a below-cap snapshot and both submit while the
-            # durable loss ledger advanced past the cap). The money path's go/no-go on the loss is now this
-            # atomic reservation, not ``durable_state.risk``'s pre-fill snapshot.
+            # Gate#3 loss-cap TOCTOU + CRITICAL-1: ALSO thread the AUTHORITATIVE realized-LOSS caps so the
+            # loss admission is made in the SAME critical section as the slot claim, against the CURRENT
+            # durable loss ledger, never from the stale below-cap ``load()`` snapshot (two concurrent
+            # callers could both observe a below-cap snapshot and both submit while the durable loss ledger
+            # advanced past the cap). BOTH loss authorities are threaded: the MANIFEST ``max_session_loss``
+            # / ``max_daily_loss`` AND the operator ENVELOPE ``max_session_loss`` / ``max_daily_loss``
+            # (hash-pinned into ``policy_hash``). The atomic admission enforces the STRICTER positive of
+            # the two per axis (``_effective_loss_cap``), so NEITHER the operator envelope cap NOR the
+            # manifest cap can be exceeded — the money path's go/no-go on the loss is now this atomic
+            # reservation, not ``durable_state.risk``'s pre-fill snapshot. (The envelope↔manifest
+            # relationship: both are committed caps; the envelope is the operator's hash-pinned ceiling
+            # and the manifest is the strategy-experiment ceiling; the tighter enabled one wins.)
             reservation_outcome = provider.reserve_or_freeze(
                 session_identity=session_identity,
                 now=now_dt,
@@ -1169,6 +1237,8 @@ async def propose_mm_execution(
                 max_orders_per_day=envelope.max_orders_per_day,
                 max_session_loss=manifest.max_session_loss,
                 max_daily_loss=manifest.max_daily_loss,
+                envelope_max_session_loss=envelope.max_session_loss,
+                envelope_max_daily_loss=envelope.max_daily_loss,
             )
         except Exception:
             return _fail_closed_reservation_failed(request, envelope=envelope, emit=_emit)
