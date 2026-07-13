@@ -228,6 +228,7 @@ AbstainReason = Literal[
     "intent_not_permitted",
     "intent_params_invalid",
     "intent_token_mismatch",
+    "cancel_replace_old_order_live",
     "order_cap_run",
     "order_cap_session",
     "order_cap_day",
@@ -253,6 +254,7 @@ ABSTAIN_REASONS: tuple[AbstainReason, ...] = (
     "intent_not_permitted",
     "intent_params_invalid",
     "intent_token_mismatch",
+    "cancel_replace_old_order_live",
     "order_cap_run",
     "order_cap_session",
     "order_cap_day",
@@ -2152,6 +2154,35 @@ async def _emit_resting_lifecycle(
     return decision, events
 
 
+async def _old_order_terminal_withdrawn(order_id: str, *, adapter: VenueAdapter) -> bool:
+    """``True`` iff COMPLETE venue truth proves the NAMED order terminal-WITHDRAWN (gone AND not filled).
+
+    REQ-009: a single-order cancel ACK is NON-TERMINAL — the possibly-live old order stays exposure
+    until open-order/status RECONCILIATION establishes withdrawal. This reconciles the named order
+    through the SAME E4 three-surface truth the submit path uses (:func:`_reconcile_after_submit` →
+    :func:`~veridex.dust_execution.reconcile.assess_uncertain_submit`: ``get_orders`` ∪
+    ``get_order``-by-id ∪ ``get_fill_history``, keyed by the official order id) — no new truth read is
+    invented.
+
+    Mirrors the E4 tri-state semantics WITHOUT fabricating ``DEFINITIVELY_ABSENT`` (which E4-T6 proves
+    is unreachable via the real venue surfaces): the old order is WITHDRAWN only on a ``RESOLVED``
+    verdict carrying NO matching fill — positive terminal evidence of a NON-FILL terminal status
+    (canceled / killed / expired), i.e. gone AND not filled. Every other outcome is possibly-live and
+    fails closed to NOT-withdrawn:
+
+    * ``AMBIGUOUS`` — still resting, a bare-zero open-order read (never proof of absence), or an
+      unavailable/raising reconcile surface — the old order may still be live.
+    * ``RESOLVED`` WITH a matched fill — the old order FILLED; it was not withdrawn.
+    """
+    presubmit = PreSubmitRecord(
+        integrity_commitment_hash="",  # no private digest for a pre-existing order; reconcile keys on the id
+        venue_order_key=order_id,
+        captured_id=None,
+    )
+    state, matched_fill_size = await _reconcile_after_submit(presubmit, adapter=adapter)
+    return state == "RESOLVED" and matched_fill_size <= 0.0
+
+
 async def _emit_cancel_replace_lifecycle(
     quote: DustQuote,
     *,
@@ -2164,21 +2195,34 @@ async def _emit_cancel_replace_lifecycle(
     replaces_client_order_id: str,
     tick_size: float,
 ) -> tuple[SubmitDecision, tuple[LifecycleEvent, ...]]:
-    """Honest cancel-replace: cancel the NAMED order (E3-T4 ``DELETE /order``) then rest the replacement.
+    """Honest cancel-replace: cancel the NAMED order (E3-T4 ``DELETE /order``), then rest the replacement
+    ONLY after complete venue truth proves the old order terminal-WITHDRAWN.
 
     NOT a blind BUY/FOK: it first cancels EXACTLY the named order via the single-order cancel wire
-    (fail closed if the adapter cannot), records an :class:`~veridex.dust_execution.contracts.OrderCancelEvent`
-    (honest ``canceled`` flag; a phantom cancel is never reported as success), THEN rests the
-    replacement maker through :func:`_emit_resting_lifecycle`. Mode A touches NO wire (AC-017).
+    (fail closed if the adapter cannot) and records an
+    :class:`~veridex.dust_execution.contracts.OrderCancelEvent` (honest ``canceled`` flag; a phantom
+    cancel is never reported as success). REQ-009: the cancel ACK is NON-TERMINAL, so the replacement is
+    rested through :func:`_emit_resting_lifecycle` ONLY once :func:`_old_order_terminal_withdrawn`
+    reconciles the named order to a terminal-WITHDRAWN state (gone AND not filled). A failed / still-
+    resting / ambiguous / filled cancel places ZERO replacement wire calls — resting a replacement atop
+    a possibly-live old order would create DOUBLE exposure (old + new both live) — and abstains honestly.
+    Mode A touches NO wire (AC-017): it never reconciles-to-abstain here, so both modes still emit the
+    identical cancel + resting lifecycle shape.
     """
     now_ms = now_s * 1000
     source_ts = quote.quote_ts_s
     canceled = False
+    old_order_withdrawn = False
     if mode == "live_guarded":
         cancel_client = _require_single_cancel_venue(adapter)
         response = await cancel_client.cancel_single_order(replaces_client_order_id)
         canceled_ids = response.get("canceled") if isinstance(response, dict) else None
         canceled = isinstance(canceled_ids, list) and replaces_client_order_id in canceled_ids
+        # REQ-009: the ACK is non-terminal — the old order stays exposure until venue truth proves it
+        # withdrawn. Reconcile the NAMED order BEFORE resting any replacement.
+        old_order_withdrawn = await _old_order_terminal_withdrawn(
+            replaces_client_order_id, adapter=adapter
+        )
     cancel_event = OrderCancelEvent(
         sequence_no=seqc.next(),
         event_type="OrderCancelEvent",
@@ -2189,6 +2233,11 @@ async def _emit_cancel_replace_lifecycle(
         venue_order_id=None,
         canceled=canceled,
     )
+    if mode == "live_guarded" and not old_order_withdrawn:
+        # The named old order is NOT proven terminal-withdrawn (failed / still-resting / ambiguous /
+        # filled cancel): resting a replacement now risks DOUBLE exposure. Place NOTHING on the resting
+        # wire and abstain honestly (REQ-009) — the possibly-live old order remains the only exposure.
+        return _abstain(resting.token_id, "cancel_replace_old_order_live"), (cancel_event,)
     decision, resting_events = await _emit_resting_lifecycle(
         quote,
         adapter=adapter,

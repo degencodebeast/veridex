@@ -1787,12 +1787,24 @@ class _MakerRecordingAdapter(RecordingFakeAdapter):
         fill: bool = True,
         fill_history_matches: bool = False,
         open_orders: list[dict[str, object]] | None = None,
+        cancel_response: dict[str, object] | None = None,
+        get_order_records: dict[str, dict[str, object]] | None = None,
     ) -> None:
         super().__init__(fill=fill, fill_history_matches=fill_history_matches, open_orders=open_orders)
         self.resting_calls = 0
         self.resting_wire_kwargs: list[dict[str, object]] = []
         self.cancel_single_calls = 0
         self.cancelled_ids: list[str] = []
+        #: Override the ``cancel_single_order`` return shape (parametrize the failed/ambiguous
+        #: ``{"canceled": [], "not_canceled": {...}}`` cases); ``None`` → the default success ACK.
+        self._cancel_response = cancel_response
+        #: The E3-T2 ``get_order``-by-id records the tri-state reconcile reads to establish the NAMED
+        #: old order's terminal-WITHDRAWN truth (REQ-009). Keyed by order id; an id NOT present returns
+        #: ``{}`` (no terminal proof → the fail-closed AMBIGUOUS default), so a default fake reconciles
+        #: to AMBIGUOUS exactly as before this surface existed.
+        self._get_order_records: dict[str, dict[str, object]] = (
+            dict(get_order_records) if get_order_records else {}
+        )
 
     async def submit_resting_order(self, **kwargs: object) -> dict[str, object]:
         self.resting_calls += 1
@@ -1802,7 +1814,14 @@ class _MakerRecordingAdapter(RecordingFakeAdapter):
     async def cancel_single_order(self, order_id: str) -> dict[str, object]:
         self.cancel_single_calls += 1
         self.cancelled_ids.append(order_id)
+        if self._cancel_response is not None:
+            return dict(self._cancel_response)
         return {"canceled": [order_id], "not_canceled": {}}
+
+    async def get_order(self, order_id: str, **kwargs: object) -> dict[str, object]:
+        # A single-order-by-id read (E3-T2 §5). Returns the injected record for the named order, else
+        # an empty record (no terminal status → the reconcile stays fail-closed AMBIGUOUS).
+        return dict(self._get_order_records.get(order_id, {}))
 
 
 def _intent_request(
@@ -1949,16 +1968,24 @@ async def test_cancel_all_intent_fires_cancel_wire_and_submits_no_new_order() ->
 
 
 async def test_cancel_replace_intent_cancels_named_order_then_places_replacement() -> None:
-    """``cancel_replace`` cancels the NAMED order then rests its replacement (honest cancel semantics).
+    """``cancel_replace`` cancels the NAMED order, RECONCILES it terminal-withdrawn, THEN rests its replacement.
 
     RED before the fix: the runner ignores the intent and submits a BUY/FOK taker — the named order is
     never cancelled (``cancel_single_calls == 0``). After the fix the E3-T4 single-order cancel wire
-    fires for the named order AND the resting replacement is placed; no FOK taker is submitted.
+    fires for the named order; because COMPLETE venue truth proves the old order terminal-WITHDRAWN
+    (``get_order`` reports a terminal ``canceled`` status, no matching fill) the resting replacement is
+    placed; no FOK taker is submitted. (REQ-009: the repost is gated on RECONCILED withdrawal, not on
+    the bare non-terminal ACK — see the Gate#3 C-3 tests below.)
     """
     binding = _binding()
     manifest = _mode_b_manifest(binding)
     env = _env()
-    adapter = _MakerRecordingAdapter(fill=True)
+    # The named old order reconciles terminal-WITHDRAWN: absent from open orders (default empty) and a
+    # terminal ``canceled`` get_order status with NO matching fill → RESOLVED, no fill → repost permitted.
+    adapter = _MakerRecordingAdapter(
+        fill=True,
+        get_order_records={"0xnamed-order-to-cancel": {"status": "canceled"}},
+    )
     params = MMIntentParams(
         token_id=_TOKEN,
         side="BUY",
@@ -1979,6 +2006,149 @@ async def test_cancel_replace_intent_cancels_named_order_then_places_replacement
     assert adapter.submit_calls == 0, "cancel_replace is not a blind FOK taker submit"
     cancel_event = next(e for e in result.events if isinstance(e, OrderCancelEvent))
     assert cancel_event.canceled is True, "the named-order cancel must be honestly recorded"
+    (decision,) = result.decisions
+    assert decision.submitted is True and decision.abstain_reason is None
+
+
+# =====================================================================================
+# Gate#3 C-3 (CRITICAL): cancel_replace must NOT repost the replacement until COMPLETE venue
+# truth proves the OLD order terminal-WITHDRAWN. REQ-009: a cancel ACK is NON-TERMINAL — the
+# possibly-live old order stays exposure until open-order/status reconciliation establishes
+# withdrawal. A failed, ambiguous, or ACK-but-not-yet-reconciled cancel must produce ZERO
+# replacement wire calls (honest abstain), or the old + new order both live = DOUBLE exposure.
+#
+# MUTATION: restore the unconditional ``_emit_resting_lifecycle`` repost (drop the terminal-truth
+# gate) → the failed-cancel and ambiguous-cancel tests both FAIL (a replacement reposts atop a
+# non-terminal cancel). That proves the GATE, not merely the presence of new code, is under test.
+# =====================================================================================
+
+
+async def test_cancel_replace_failed_cancel_does_not_repost_replacement() -> None:
+    """A FAILED single-order cancel (``canceled=False``) must place NO replacement (Gate#3 C-3).
+
+    The venue returns ``{"canceled": [], "not_canceled": {old: "still live / unknown"}}`` — the cancel
+    did NOT succeed, so the old order is possibly-live. Reposting a replacement now would create DOUBLE
+    exposure. The runner records the honest ``canceled=False`` cancel event, rests NOTHING
+    (``resting_calls == 0``), and abstains with a closed-vocab reason — it never bridges a
+    non-terminal cancel with a live replacement.
+    """
+    binding = _binding()
+    manifest = _mode_b_manifest(binding)
+    env = _env()
+    old_id = "0xnamed-order-to-cancel"
+    adapter = _MakerRecordingAdapter(
+        fill=True,
+        # The cancel FAILED: the named order is NOT in ``canceled`` and is still live/unknown.
+        cancel_response={"canceled": [], "not_canceled": {old_id: "still live / unknown"}},
+        # The reconcile finds no terminal proof (no terminal ``get_order`` status, no matching fill,
+        # bare-zero open orders) → AMBIGUOUS = possibly-live (E4: bare absence is NEVER proof of
+        # withdrawal). Bare-zero is used (not a listed open order) so the SAF-005 startup sweep — which
+        # also reads ``get_orders`` — does not pre-block this run.
+    )
+    params = MMIntentParams(
+        token_id=_TOKEN,
+        side="BUY",
+        price=0.49,
+        tif="GTC",
+        client_order_id="coid-new",
+        replaces_client_order_id=old_id,
+    )
+    request = _intent_request("cancel_replace", manifest=manifest, envelope=env, params=params)
+
+    result = await _run_guarded(
+        adapter=adapter, manifest=manifest, envelope=env, arming=_arming(binding), request=request
+    )
+
+    assert adapter.cancel_single_calls == 1, "the named-order cancel is still attempted"
+    cancel_event = next(e for e in result.events if isinstance(e, OrderCancelEvent))
+    assert cancel_event.canceled is False, "a failed cancel must be honestly recorded, never a phantom success"
+    assert adapter.resting_calls == 0, "a failed (non-terminal) cancel must NOT repost a replacement"
+    assert adapter.submit_calls == 0, "no taker order is submitted either"
+    (decision,) = result.decisions
+    assert decision.submitted is False, "no replacement was placed"
+    assert decision.abstain_reason == "cancel_replace_old_order_live"
+    assert decision.venue_order_id is None
+
+
+async def test_cancel_replace_ack_but_ambiguous_reconcile_does_not_repost() -> None:
+    """A cancel ACK whose old order stays AMBIGUOUS on reconcile must place NO replacement (Gate#3 C-3).
+
+    The venue ACKs the cancel (``canceled=True``), but COMPLETE venue truth does NOT yet prove the old
+    order terminal: it is still present in open orders (and no terminal ``get_order`` status, no fill) →
+    AMBIGUOUS = possibly-live. REQ-009: a bare cancel ACK is non-terminal, so the runner must NOT bridge
+    it with a live replacement — ``resting_calls == 0`` (honest abstain) even though the ACK succeeded.
+    """
+    binding = _binding()
+    manifest = _mode_b_manifest(binding)
+    env = _env()
+    old_id = "0xnamed-order-to-cancel"
+    adapter = _MakerRecordingAdapter(
+        fill=True,
+        # The venue ACKs the cancel...
+        cancel_response={"canceled": [old_id], "not_canceled": {}},
+        # ...but the reconcile finds NO terminal proof of withdrawal (no terminal ``get_order`` status,
+        # no matching fill, bare-zero open orders) → AMBIGUOUS = possibly-live. A bare cancel ACK is
+        # NON-TERMINAL. Bare-zero (not a listed open order) keeps the SAF-005 startup sweep from
+        # pre-blocking the run, so this exercises the cancel_replace repost gate specifically.
+    )
+    params = MMIntentParams(
+        token_id=_TOKEN,
+        side="BUY",
+        price=0.49,
+        tif="GTC",
+        client_order_id="coid-new",
+        replaces_client_order_id=old_id,
+    )
+    request = _intent_request("cancel_replace", manifest=manifest, envelope=env, params=params)
+
+    result = await _run_guarded(
+        adapter=adapter, manifest=manifest, envelope=env, arming=_arming(binding), request=request
+    )
+
+    cancel_event = next(e for e in result.events if isinstance(e, OrderCancelEvent))
+    assert cancel_event.canceled is True, "the ACK is honestly recorded as a success"
+    assert adapter.resting_calls == 0, "an ACK-but-not-yet-reconciled cancel must NOT repost a replacement"
+    (decision,) = result.decisions
+    assert decision.submitted is False
+    assert decision.abstain_reason == "cancel_replace_old_order_live"
+
+
+async def test_cancel_replace_reconciled_terminal_withdrawn_reposts_once() -> None:
+    """POSITIVE CONTROL: a cancel ACK + a RECONCILED terminal-withdrawn old order DOES repost once.
+
+    The venue ACKs the cancel AND complete venue truth proves the old order terminal-WITHDRAWN: it is
+    absent from open orders and its ``get_order`` record carries a terminal ``canceled`` status with NO
+    matching fill → RESOLVED, no fill = gone AND not filled. This is the only case that permits the
+    repost, so EXACTLY ONE resting replacement is placed (a genuinely terminal cancel DOES replace).
+    """
+    binding = _binding()
+    manifest = _mode_b_manifest(binding)
+    env = _env()
+    old_id = "0xnamed-order-to-cancel"
+    adapter = _MakerRecordingAdapter(
+        fill=True,
+        cancel_response={"canceled": [old_id], "not_canceled": {}},
+        # Absent from open orders (default empty) AND a terminal canceled status, no matching fill.
+        get_order_records={old_id: {"status": "canceled"}},
+    )
+    params = MMIntentParams(
+        token_id=_TOKEN,
+        side="BUY",
+        price=0.49,
+        tif="GTC",
+        client_order_id="coid-new",
+        replaces_client_order_id=old_id,
+    )
+    request = _intent_request("cancel_replace", manifest=manifest, envelope=env, params=params)
+
+    result = await _run_guarded(
+        adapter=adapter, manifest=manifest, envelope=env, arming=_arming(binding), request=request
+    )
+
+    cancel_event = next(e for e in result.events if isinstance(e, OrderCancelEvent))
+    assert cancel_event.canceled is True
+    assert adapter.resting_calls == 1, "a reconciled terminal-withdrawn cancel DOES permit exactly one repost"
+    assert adapter.submit_calls == 0, "cancel_replace is not a blind FOK taker submit"
     (decision,) = result.decisions
     assert decision.submitted is True and decision.abstain_reason is None
 
