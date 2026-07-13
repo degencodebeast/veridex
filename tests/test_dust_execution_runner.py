@@ -1395,6 +1395,120 @@ async def test_direct_runner_arming_submits_with_finite_positive_envelope_loss_c
     assert decision.submitted is True and decision.abstain_reason is None
 
 
+# --- SAF-002a/AC-033: the exported runner enforces the EFFECTIVE PolicyEnvelope loss cap on the
+# RECONSTRUCTED (seeded-baseline) realized loss BEFORE the write port fires -------------------------
+#
+# The confirmed hole: a RECONSTRUCTED loss (seeded via ``RiskAccumulator.seeded`` per the durable
+# reconstructed-risk-before-arming path) that breaches the operator's HASH-PINNED envelope loss cap
+# but is still below the looser MANIFEST cap used to SUBMIT — because ``_apply_safety_triggers`` only
+# re-checks NEW fills (none here) and the pre-submit admission compared realized loss against the
+# MANIFEST caps ONLY. The runner must enforce the SAME effective per-axis ceiling as the facade
+# (``_effective_loss_cap`` = stricter POSITIVE of envelope vs manifest, tested via ``cap_breached``),
+# failing closed BEFORE any keyless write-port I/O. The envelope caps below are TIGHTER than the
+# manifest default (2.0 / 4.0), so the effective ceiling is the ENVELOPE cap.
+
+
+async def test_direct_runner_reconstructed_session_loss_over_effective_envelope_cap_blocks_submit() -> None:
+    """SESSION axis: a reconstructed session loss (0.6) at/above the tighter ENVELOPE cap (0.5 < the
+    manifest 2.0) must BLOCK before the keyless write port — never submit real money."""
+    adapter = RecordingFakeAdapter(fill=True, open_orders=[])
+    write_port = _default_write_port()
+    risk = RiskAccumulator.seeded(
+        session_id=_SESSION_ID, net_session=-0.6, net_day=-0.6, current_day=None
+    )
+
+    result = await _run_guarded(
+        adapter=adapter,
+        write_port=write_port,
+        risk=risk,
+        # Tighter session cap than the manifest (2.0); daily left loose so ONLY the session axis trips.
+        envelope=_env(max_session_loss=0.5, max_daily_loss=10.0),
+    )
+
+    assert write_port.submit_calls == 0, (
+        "a reconstructed loss past the effective ENVELOPE session cap must NOT reach the write port"
+    )
+    assert adapter.submit_calls == 0, "Mode B must NEVER reach the generic adapter submit surface"
+    (decision,) = result.decisions
+    assert decision.submitted is False
+    assert decision.abstain_reason == "loss_cap_session"
+
+
+async def test_direct_runner_reconstructed_daily_loss_over_effective_envelope_cap_blocks_submit() -> None:
+    """DAILY axis twin: a reconstructed UTC-day loss (0.6) at/above the tighter ENVELOPE daily cap
+    (0.5 < the manifest 4.0) must BLOCK before the write port. Session cap left loose so ONLY the
+    daily axis trips."""
+    adapter = RecordingFakeAdapter(fill=True, open_orders=[])
+    write_port = _default_write_port()
+    risk = RiskAccumulator.seeded(
+        session_id=_SESSION_ID, net_session=-0.6, net_day=-0.6, current_day=None
+    )
+
+    result = await _run_guarded(
+        adapter=adapter,
+        write_port=write_port,
+        risk=risk,
+        # Session effective cap = min(5.0, 2.0) = 2.0 (0.6 below); daily effective = min(0.5, 4.0) = 0.5.
+        envelope=_env(max_session_loss=5.0, max_daily_loss=0.5),
+    )
+
+    assert write_port.submit_calls == 0, (
+        "a reconstructed loss past the effective ENVELOPE daily cap must NOT reach the write port"
+    )
+    assert adapter.submit_calls == 0
+    (decision,) = result.decisions
+    assert decision.submitted is False
+    assert decision.abstain_reason == "loss_cap_day"
+
+
+async def test_direct_runner_reconstructed_loss_exactly_at_effective_cap_blocks_submit() -> None:
+    """EQUALITY-AT-CAP: a reconstructed loss EXACTLY equal to the effective cap (0.5 == 0.5) must
+    block — ``cap_breached`` is the ``>=`` fail-closed boundary (veridex/policy/envelope.py:18)."""
+    adapter = RecordingFakeAdapter(fill=True, open_orders=[])
+    write_port = _default_write_port()
+    risk = RiskAccumulator.seeded(
+        session_id=_SESSION_ID, net_session=-0.5, net_day=-0.5, current_day=None
+    )
+
+    result = await _run_guarded(
+        adapter=adapter,
+        write_port=write_port,
+        risk=risk,
+        envelope=_env(max_session_loss=0.5, max_daily_loss=10.0),
+    )
+
+    assert write_port.submit_calls == 0, "loss exactly AT the effective cap must block (>= boundary)"
+    assert adapter.submit_calls == 0
+    (decision,) = result.decisions
+    assert decision.submitted is False
+    assert decision.abstain_reason == "loss_cap_session"
+
+
+async def test_direct_runner_reconstructed_loss_below_effective_cap_still_submits() -> None:
+    """POSITIVE CONTROL (keeps the mutation meaningful): a reconstructed loss BELOW the effective cap
+    (0.3 < 0.5) with an otherwise-full valid bundle STILL submits exactly once — so a green block-test
+    is the new gate firing, not the arming bundle being inert."""
+    adapter = RecordingFakeAdapter(fill=True, open_orders=[])
+    write_port = _default_write_port()
+    risk = RiskAccumulator.seeded(
+        session_id=_SESSION_ID, net_session=-0.3, net_day=-0.3, current_day=None
+    )
+
+    result = await _run_guarded(
+        adapter=adapter,
+        write_port=write_port,
+        risk=risk,
+        envelope=_env(max_session_loss=0.5, max_daily_loss=10.0),
+    )
+
+    assert write_port.submit_calls == 1, (
+        "a reconstructed loss BELOW the effective cap must STILL arm/submit (positive control)"
+    )
+    assert adapter.submit_calls == 0
+    (decision,) = result.decisions
+    assert decision.submitted is True and decision.abstain_reason is None
+
+
 async def test_direct_runner_call_with_technical_only_bundle_stays_unarmed() -> None:
     """Gate#3 MAJOR-1 (REQ-005): the operator-interlock is UNBYPASSABLE via the public runner.
 

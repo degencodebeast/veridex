@@ -118,6 +118,7 @@ from veridex.dust_execution.risk import (
     RiskAccumulator,
     authorize_mode_b,
 )
+from veridex.dust_execution.session_state import _effective_loss_cap
 from veridex.dust_execution.signer import Signer, SigningPayload
 from veridex.dust_execution.signing_compiler import WireSide
 from veridex.dust_execution.sizing import resolve_dust_size
@@ -127,7 +128,7 @@ from veridex.dust_execution.wallet_binding import (
     PrivyWalletPolicy,
 )
 from veridex.policy.circuit_breaker import CircuitBreaker, CircuitState
-from veridex.policy.envelope import PolicyEnvelope
+from veridex.policy.envelope import PolicyEnvelope, cap_breached
 from veridex.venues.base import (
     SingleOrderCancelVenue,
     VenueAdapter,
@@ -246,6 +247,8 @@ AbstainReason = Literal[
     "order_cap_run",
     "order_cap_session",
     "order_cap_day",
+    "loss_cap_session",
+    "loss_cap_day",
 ]
 
 #: Tuple form of :data:`AbstainReason` for membership checks / iteration.
@@ -274,6 +277,8 @@ ABSTAIN_REASONS: tuple[AbstainReason, ...] = (
     "order_cap_run",
     "order_cap_session",
     "order_cap_day",
+    "loss_cap_session",
+    "loss_cap_day",
 )
 
 #: The venue minimum price increment the non-crossing check rounds/compares against (Polymarket
@@ -1104,6 +1109,41 @@ def _build_admission(
     )
 
 
+def _loss_cap_block_reason(
+    *,
+    risk: RiskAccumulator,
+    envelope: PolicyEnvelope,
+    manifest: StrategyExperimentManifest,
+) -> AbstainReason | None:
+    """Return the realized-loss abstain reason when the RECONSTRUCTED loss breaches the EFFECTIVE cap.
+
+    SAF-002a/AC-033: the exported runner enforces the SAME per-axis effective loss ceiling as the
+    facade's :meth:`~veridex.dust_execution.session_state.InMemoryDurableSessionStateProvider.reserve_or_freeze`
+    — the STRICTER positive of the operator ENVELOPE cap (hash-pinned into ``policy_hash``) and the
+    MANIFEST cap (:func:`~veridex.dust_execution.session_state._effective_loss_cap`, the SINGLE source
+    of truth, never re-derived) — tested through the ONE ``cap_breached`` boundary. This closes the
+    hole where :meth:`StrategyAuthorizationDecision.evaluate` (:func:`_build_admission`) compared the
+    realized loss against the MANIFEST caps ONLY, so a RECONSTRUCTED baseline loss (seeded via
+    :meth:`RiskAccumulator.seeded` per the durable reconstructed-risk-before-arming path, arriving
+    with NO new fill for :func:`_apply_safety_triggers` to re-check) that breached the TIGHTER
+    operator envelope cap but sat below the looser manifest cap still SUBMITTED to the keyless write
+    port. Checked per axis — session (:attr:`RiskAccumulator.realized_loss_session`) then daily
+    (:attr:`RiskAccumulator.realized_loss_day`), mirroring the run→session→day precedence.
+
+    This is the value-breach check (does the standing loss REACH the effective ceiling), DISTINCT from
+    the finite-positive-ness gate ``authorize_mode_b`` performs in :func:`_mode_b_arming_block_reason`.
+    A disabled cap (``<= 0``) on either side drops out of the effective ceiling; when BOTH are
+    disabled the axis is transparent. SEC-005: the closed-vocab reason carries NO cap or loss value.
+    """
+    effective_session_cap = _effective_loss_cap(envelope.max_session_loss, manifest.max_session_loss)
+    if cap_breached(effective_session_cap, risk.realized_loss_session):
+        return "loss_cap_session"
+    effective_daily_cap = _effective_loss_cap(envelope.max_daily_loss, manifest.max_daily_loss)
+    if cap_breached(effective_daily_cap, risk.realized_loss_day):
+        return "loss_cap_day"
+    return None
+
+
 def _authorization_block_reason(
     *,
     manifest: StrategyExperimentManifest,
@@ -1585,6 +1625,15 @@ async def run_dust_execution(
         manifest=manifest, envelope=envelope, request=request, admission=admission
     )
 
+    # SAF-002a/AC-033: the runner-side EFFECTIVE loss-cap gate — the STRICTER positive of the operator
+    # ENVELOPE cap (hash-pinned into ``policy_hash``) and the MANIFEST cap, per axis, tested through the
+    # ONE ``cap_breached`` boundary (:func:`_loss_cap_block_reason`). Enforces the SAME ceiling the
+    # facade's ``reserve_or_freeze`` applies, closing the hole where the manifest-only admission let a
+    # RECONSTRUCTED baseline loss past the tighter envelope cap submit real money. Mode-independent (a
+    # loss-cap breach is a fail-closed safety refusal both modes honor identically, like the manifest
+    # admission); Mode A still touches no wire.
+    loss_cap_block_reason = _loss_cap_block_reason(risk=risk, envelope=envelope, manifest=manifest)
+
     # Mode A→B HARD GATE + fail-closed arming: computed once; Mode A never arms (reason is None).
     arming_block_reason = (
         _mode_b_arming_block_reason(
@@ -1686,6 +1735,7 @@ async def run_dust_execution(
             arming=arming,
             arming_block_reason=arming_block_reason,
             authorization_block_reason=authorization_block_reason,
+            loss_cap_block_reason=loss_cap_block_reason,
             order_cap_block_reason=order_cap_block_reason,
             intent=intent,
             intent_params=intent_params,
@@ -1748,6 +1798,7 @@ async def _decide_and_submit(
     arming: ModeBArming | None,
     arming_block_reason: AbstainReason | None,
     authorization_block_reason: AbstainReason | None,
+    loss_cap_block_reason: AbstainReason | None,
     order_cap_block_reason: AbstainReason | None,
     intent: IntentKind,
     intent_params: MMIntentParams,
@@ -1824,6 +1875,15 @@ async def _decide_and_submit(
     # (mode-independent — an unauthorized run submits in neither mode).
     if authorization_block_reason is not None:
         return _abstain(token_id, authorization_block_reason), ()
+
+    # SAF-002a/AC-033: the runner-side EFFECTIVE loss-cap gate. A RECONSTRUCTED (seeded-baseline)
+    # realized loss that REACHES the stricter positive of the operator ENVELOPE cap and the MANIFEST
+    # cap (per axis, via ``cap_breached``) fails closed BEFORE any write-port I/O — the SAME ceiling
+    # the facade's ``reserve_or_freeze`` enforces. Checked AFTER the (also-blocking) safety and
+    # authorization gates so a swept/unauthorized run keeps its own honest reason; mode-independent
+    # (like the manifest admission), so Mode A rehearses the identical refusal while touching no wire.
+    if loss_cap_block_reason is not None:
+        return _abstain(token_id, loss_cap_block_reason), ()
 
     # Gate#3 M-3: PRE-SUBMIT order-count admission — the LAST gate before the order-placing dispatch.
     # If placing one more order would breach the durable run/session/UTC-day or ``manifest.max_orders``
