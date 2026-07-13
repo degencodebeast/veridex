@@ -24,8 +24,22 @@ test fails) is meaningful and not vacuously green.
 
 from __future__ import annotations
 
+import base64
+import inspect
 from typing import cast
 
+import pytest
+
+import veridex.dust_execution.l2_transport as _l2_transport_module
+import veridex.dust_execution.runner as _runner_module
+from tests.test_dust_execution_privy_signer import (
+    _WALLET_ADDRESS,
+    L2FakePrivy,
+    PolicyFakePrivy,
+)
+from tests.test_dust_execution_privy_signer import (
+    _RecordingHttp as _KeylessRecordingHttp,
+)
 from veridex.dust_execution.clobv2_gate import Clobv2GateResult
 from veridex.dust_execution.contracts import (
     DustExecutionSessionMeta,
@@ -41,16 +55,25 @@ from veridex.dust_execution.contracts import (
 )
 from veridex.dust_execution.emergency import DustSafetySession, SafetyController
 from veridex.dust_execution.facade import MMExecutionToolRequest, MMIntentParams
+from veridex.dust_execution.l2_transport import (
+    InMemoryPreSubmitStore,
+    KeylessL2Transport,
+    reconcile_ack_lost,
+)
 from veridex.dust_execution.manifest import (
     StrategyAuthorizationDecision,
     StrategyExperimentManifest,
 )
+from veridex.dust_execution.mode_b_write_port import KeylessModeBWritePort, ModeBWritePort
 from veridex.dust_execution.noncrossing import LegKind, OwnOrderLeg
 from veridex.dust_execution.privy_control_plane import (
+    L2ApiCredentials,
+    PrivyAuthContext,
+    PrivyEvmWalletControlPlane,
     PrivyPreflightResult,
     ProvisioningResult,
 )
-from veridex.dust_execution.risk import RealizedFillRecord, RiskAccumulator
+from veridex.dust_execution.risk import FailClosed, RealizedFillRecord, RiskAccumulator
 from veridex.dust_execution.runner import (
     ABSTAIN_REASONS,
     BookSide,
@@ -104,7 +127,10 @@ _EXPECTED_EVENT_TYPES: tuple[str, ...] = (
 # --- Fixtures --------------------------------------------------------------------------------
 
 _NOW_S = 1_700_000_000  # frozen source clock, integer SECONDS (matches max_quote_age_s units)
-_TOKEN = "0xtokenYES"
+# A DECIMAL-integer-string CLOB token id (Gate#3 C-1 fix): the real V2 signing compiler parses
+# ``tokenId`` via ``int(...)`` (an ERC1155 token id), so an armed Mode-B submit that actually
+# compiles a real order needs a numerically-valid id — never a human-readable "0x..." placeholder.
+_TOKEN = "111111111111111111111111111111"
 
 
 def _manifest(**kw: object) -> StrategyExperimentManifest:
@@ -217,8 +243,14 @@ def _quorum() -> AuthorizationQuorum:
     return AuthorizationQuorum(quorum_ref="q-mode-b", authorization_key_refs=("k1", "k2"), threshold=2)
 
 
-def _binding(*, wallet_address: str = "0xExecWalletModeB") -> ExecutionWalletBinding:
-    """A valid, deterministic custody binding (equal-by-value across calls → identical hash)."""
+def _binding(*, wallet_address: str = _WALLET_ADDRESS) -> ExecutionWalletBinding:
+    """A valid, deterministic custody binding (equal-by-value across calls → identical hash).
+
+    ``wallet_address`` defaults to the pure-stdlib secp256k1 "enclave" address the E3-T8 recording-
+    fake Privy client (:class:`PolicyFakePrivy`, ``tests/test_dust_execution_privy_signer.py``) signs
+    for — so the DEFAULT Mode-B write port (:func:`_default_write_port`) recover-and-requires cleanly
+    for every test that doesn't explicitly override the binding (Gate#3 C-1 fix test migration).
+    """
     policy = _policy()
     quorum = _quorum()
     return ExecutionWalletBinding(
@@ -258,6 +290,100 @@ def _provisioning_ok() -> ProvisioningResult:
     return ProvisioningResult(ok=True, detail="operator-confirmed")
 
 
+# --- Gate#3 C-1 fix: the OFFLINE keyless Mode-B write-port stack (reuses the E3-T8 fakes) -----
+#
+# REUSES the E3-T8 offline fakes (``PolicyFakePrivy``, ``_RecordingHttp``) rather than re-deriving a
+# local-key "enclave" signer a third time — production has NO local signing capability by design, so
+# the pure-stdlib secp256k1 sign/recover round-trip that stands in for Privy's remote enclave lives
+# ONLY in ``tests/test_dust_execution_privy_signer.py`` test scaffolding.
+
+_L2_CREDS = L2ApiCredentials(
+    api_key="runner-test-owner-uuid",
+    api_secret=base64.urlsafe_b64encode(b"runner-test-hmac-secret-32-bytes").decode(),
+    api_passphrase="runner-test-passphrase",
+    derivation_ref="wallet-mode-b:0",
+)
+
+#: A signed Privy authorization wrapper meeting the pinned ``_quorum()`` threshold (2 signatures).
+_ORDER_AUTH = PrivyAuthContext(
+    request_expiry_ms=99_999_999_999_999,
+    quorum_signatures=("sig-A", "sig-B"),
+    quorum_threshold=2,
+    idempotency_key="idem-mode-b-runner-test",
+)
+
+
+class _RecordingWritePort:
+    """Wraps a REAL :class:`KeylessModeBWritePort` and RECORDS every ``submit_order`` call.
+
+    Test-only introspection, never a second implementation of the money path: every call is
+    delegated to ``inner`` unchanged. ``submit_calls``/``calls`` let a test prove the write port (not
+    the generic adapter) is the surface a Mode-B submit actually reached, and inspect the EXACT
+    kwargs sent (adversarial control #7 — the compiled/sent order must equal the admitted order).
+    """
+
+    def __init__(self, inner: KeylessModeBWritePort) -> None:
+        self.inner = inner
+        self.submit_calls = 0
+        self.calls: list[dict[str, object]] = []
+
+    async def submit_order(self, **kwargs: object):
+        self.submit_calls += 1
+        self.calls.append(dict(kwargs))
+        return await self.inner.submit_order(**kwargs)  # type: ignore[arg-type]
+
+
+def _default_write_port(binding: ExecutionWalletBinding | None = None) -> _RecordingWritePort:
+    """A FRESH, call-counting offline write port per call (isolated store/http per test).
+
+    Composes the E3-T8 :class:`PrivyEvmWalletControlPlane` (client=recording-fake
+    :class:`PolicyFakePrivy`) with a fresh :class:`KeylessL2Transport` — the SAME keyless stack
+    the production port uses, exercised entirely offline (no live Privy/venue/network/credential) —
+    wrapped in :class:`_RecordingWritePort` so tests can assert exactly how many times, and with
+    what exact fields, the runner actually reached the money-moving surface.
+    """
+    b = binding if binding is not None else _binding()
+    inner = KeylessModeBWritePort(
+        transport=KeylessL2Transport(
+            control_plane=PrivyEvmWalletControlPlane(client=PolicyFakePrivy(), binding=b),
+            creds=_L2_CREDS,
+            http=_KeylessRecordingHttp(),
+            store=InMemoryPreSubmitStore(),
+            now_s=_clock,
+        ),
+        owner=_L2_CREDS.api_key,
+    )
+    return _RecordingWritePort(inner)
+
+
+class _NonFakeLocalSigner:
+    """A non-``FAKE_LOCAL`` :class:`Signer` stand-in for the ``signer=`` param on an ARMED Mode-B call.
+
+    Gate#3 C-1 fix: the structural guard (``_mode_b_arming_block_reason``) refuses an armed run
+    whose injected ``signer.mode == "FAKE_LOCAL"``. Genuinely implements the ``Signer`` Protocol
+    (unlike reusing :class:`PrivyEvmWalletControlPlane`, which has NO ``sign_order`` method — a
+    distinct interface) so it type-checks cleanly, but :meth:`sign_order` is a MUTATION TRAP: the
+    injected :class:`~veridex.dust_execution.mode_b_write_port.ModeBWritePort` owns ALL real
+    signing for an armed run, so ``sign_order`` must NEVER be reached — if it ever is, that is
+    itself a regression to the pre-fix Mode-A-signer path, so this raises loudly instead of
+    silently succeeding.
+    """
+
+    mode: SignerMode = "PRIVY_EVM"
+
+    async def sign_order(self, payload: SigningPayload) -> SignedArtifact:
+        raise AssertionError(
+            "signer.sign_order was called on an ARMED Mode-B run — the injected ModeBWritePort "
+            "must own ALL real signing; this is the pre-fix Mode-A-signer regression the Gate#3 "
+            "C-1 fix closes"
+        )
+
+
+def _mode_b_signer() -> _NonFakeLocalSigner:
+    """A fresh non-``FAKE_LOCAL`` signer instance for the ``signer=`` param on an ARMED Mode-B call."""
+    return _NonFakeLocalSigner()
+
+
 def _mode_b_manifest(binding: ExecutionWalletBinding | None = None, **kw: object) -> StrategyExperimentManifest:
     """A Mode-B manifest whose explicit ``execution_wallet_binding_hash`` pins the binding."""
     b = binding if binding is not None else _binding()
@@ -270,6 +396,11 @@ def _mode_b_manifest(binding: ExecutionWalletBinding | None = None, **kw: object
 #: minted proof so the runner-level E6-T4 arming positive controls still ARM offline.
 _RECORDED_INTERLOCK_PROOF = OperatorInterlockProof(satisfied=True, recording_receipt="operator-interlock:test:recorded")
 
+#: Sentinel so ``_arming`` can distinguish "write_port not overridden" (build a fresh DEFAULT working
+#: port, keyed to the resolved binding) from an explicit ``write_port=None`` (the missing-port
+#: structural-guard control, Gate#3 C-1 fix).
+_ARMING_DEFAULT_WRITE_PORT: object = object()
+
 
 def _arming(
     binding: ExecutionWalletBinding | None = None,
@@ -281,13 +412,20 @@ def _arming(
     live_policy: PrivyWalletPolicy | None = None,
     live_quorum: AuthorizationQuorum | None = None,
     operator_interlock: OperatorInterlockProof | None = _RECORDED_INTERLOCK_PROOF,
+    write_port: ModeBWritePort | None | object = _ARMING_DEFAULT_WRITE_PORT,
+    order_auth: PrivyAuthContext | None = _ORDER_AUTH,
 ) -> ModeBArming:
     """A fully-passing Mode-B arming bundle, with per-precondition overrides for the failure tests.
 
     Includes the RECORDED-satisfied human-operator interlock proof by default (Gate#3 MAJOR-1) so the
     E6-T4 technical-arming positive controls still ARM; pass ``operator_interlock=None`` to exercise
-    the facade-bypass case (a technical-only bundle must stay UNARMED)."""
+    the facade-bypass case (a technical-only bundle must stay UNARMED). Gate#3 C-1 fix: ``write_port``
+    defaults to a FRESH offline :func:`_default_write_port` (bound to ``b``) so every existing arming
+    positive control still reaches a REAL keyless submit; pass ``write_port=None`` / ``order_auth=None``
+    explicitly to exercise the missing-write-port structural-guard control.
+    """
     b = binding if binding is not None else _binding()
+    resolved_write_port = _default_write_port(b) if write_port is _ARMING_DEFAULT_WRITE_PORT else write_port
     return ModeBArming(
         mode_a_passed=mode_a_passed,
         clobv2_gate=clobv2 if clobv2 is not None else _clobv2_ok(),
@@ -297,14 +435,16 @@ def _arming(
         live_policy=live_policy if live_policy is not None else _policy(),
         live_quorum=live_quorum if live_quorum is not None else _quorum(),
         operator_interlock=operator_interlock,
+        write_port=cast("ModeBWritePort | None", resolved_write_port),
+        order_auth=order_auth,
     )
 
 
 def _technical_only_arming(binding: ExecutionWalletBinding) -> ModeBArming:
-    """A Mode-B arming bundle satisfying ONLY the six E6-T4 TECHNICAL conditions — carrying NO
+    """A Mode-B arming bundle satisfying ONLY the E6-T4 TECHNICAL conditions — carrying NO
     operator-interlock proof (Gate#3 MAJOR-1, REQ-005).
 
-    A DIRECT runner call with this bundle must stay UNARMED: the six technical conditions alone must
+    A DIRECT runner call with this bundle must stay UNARMED: the technical conditions alone must
     never arm real money without a RECORDED human-precondition proof, which only the facade can mint.
     """
     return ModeBArming(
@@ -315,6 +455,8 @@ def _technical_only_arming(binding: ExecutionWalletBinding) -> ModeBArming:
         binding=binding,
         live_policy=_policy(),
         live_quorum=_quorum(),
+        write_port=_default_write_port(binding),
+        order_auth=_ORDER_AUTH,
     )
 
 
@@ -323,12 +465,20 @@ def _technical_only_arming(binding: ExecutionWalletBinding) -> ModeBArming:
 _ARMING_DEFAULT: object = object()
 
 
-async def _run(*, adapter: FakeVenueAdapter, source: _ScriptedSource, mode: ExecutionMode) -> DustExecutionResult:
+async def _run(
+    *,
+    adapter: FakeVenueAdapter,
+    source: _ScriptedSource,
+    mode: ExecutionMode,
+    write_port: object = _ARMING_DEFAULT_WRITE_PORT,
+) -> DustExecutionResult:
     binding = _binding()
     manifest = _mode_b_manifest(binding) if mode == "live_guarded" else _manifest(mode=mode)
     return await run_dust_execution(
         adapter=adapter,
-        signer=LocalFakeWalletControlPlane(),
+        # Gate#3 C-1 fix: an ARMED Mode-B run structurally refuses the Mode-A FAKE_LOCAL signer —
+        # only ``dry_run`` keeps it (Mode A always signs via the injected fake, never submits).
+        signer=_mode_b_signer() if mode == "live_guarded" else LocalFakeWalletControlPlane(),
         sources=source,
         now_fn=_clock,
         sleep_fn=_noop_sleep,
@@ -337,7 +487,7 @@ async def _run(*, adapter: FakeVenueAdapter, source: _ScriptedSource, mode: Exec
         mode=mode,
         wallet_equity_at_decision=_WALLET_EQUITY,
         fixed_fraction=_FIXED_FRACTION,
-        arming=_arming(binding) if mode == "live_guarded" else None,
+        arming=_arming(binding, write_port=write_port) if mode == "live_guarded" else None,
     )
 
 
@@ -363,17 +513,21 @@ async def test_mode_a_places_no_orders() -> None:
 
 
 async def test_mode_b_clear_quote_submits() -> None:
-    """POSITIVE CONTROL: in Mode B a fully clean quote fires the submit wire exactly once.
+    """POSITIVE CONTROL: in Mode B a fully clean quote fires the keyless write-port wire exactly once.
 
     This is what makes the staleness MUTATION meaningful: if a gate is deleted, the gated quote
-    would follow THIS same path onto the wire.
+    would follow THIS same path onto the wire. Gate#3 C-1 fix: the submit surface is the injected
+    :class:`ModeBWritePort` — never the generic ``adapter.submit_order`` — so this asserts on the
+    write port's call count, not the adapter's.
     """
     adapter = FakeVenueAdapter(fill=True)
     source = _ScriptedSource(quote=_fresh_quote())
+    write_port = _default_write_port()
 
-    result = await _run(adapter=adapter, source=source, mode="live_guarded")
+    result = await _run(adapter=adapter, source=source, mode="live_guarded", write_port=write_port)
 
-    assert adapter.submit_calls == 1, "a clean Mode B quote must reach the submit wire"
+    assert write_port.submit_calls == 1, "a clean Mode B quote must reach the keyless write-port wire"
+    assert adapter.submit_calls == 0, "Mode B must NEVER reach the generic adapter submit surface"
     (decision,) = result.decisions
     assert decision.submitted is True
     assert decision.abstain_reason is None
@@ -651,6 +805,9 @@ async def _run_guarded(
     arming: object = _ARMING_DEFAULT,
     manifest: StrategyExperimentManifest | None = None,
     request: MMExecutionToolRequest | None = None,
+    signer: SignerMode | None = None,  # None => default non-FAKE_LOCAL Mode-B signer
+    write_port: object = _ARMING_DEFAULT_WRITE_PORT,  # override JUST the write port (ignored if `arming` given)
+    order_auth: PrivyAuthContext | None = _ORDER_AUTH,  # ignored if `arming` given
     wallet_equity_at_decision: float = _WALLET_EQUITY,
     fixed_fraction: float = _FIXED_FRACTION,
     shutdown_policy: ShutdownPolicy = "leave_open",
@@ -659,10 +816,17 @@ async def _run_guarded(
 ) -> DustExecutionResult:
     binding = _binding()
     effective_manifest = manifest if manifest is not None else _mode_b_manifest(binding)
-    effective_arming = _arming(binding) if arming is _ARMING_DEFAULT else arming
+    effective_arming = (
+        _arming(binding, write_port=write_port, order_auth=order_auth)
+        if arming is _ARMING_DEFAULT
+        else arming
+    )
+    # Gate#3 C-1 fix: default to a non-FAKE_LOCAL signer (an armed run structurally refuses the
+    # Mode-A fake); pass ``signer="FAKE_LOCAL"`` explicitly to exercise the legacy-signer control.
+    effective_signer = LocalFakeWalletControlPlane() if signer == "FAKE_LOCAL" else _mode_b_signer()
     return await run_dust_execution(
         adapter=adapter,
-        signer=LocalFakeWalletControlPlane(),
+        signer=effective_signer,
         sources=source if source is not None else _ScriptedSource(quote=_fresh_quote()),
         now_fn=_clock,
         sleep_fn=_noop_sleep,
@@ -783,10 +947,14 @@ async def test_non_crossing_clear_order_still_submits() -> None:
     adapter = RecordingFakeAdapter(fill=True)
     safety, session = _make_safety()
     own = (OwnOrderLeg(token_id=_TOKEN, side="SELL", price=0.80, kind=LegKind.OPEN),)
+    write_port = _default_write_port()
 
-    result = await _run_guarded(adapter=adapter, safety=safety, session=session, own_legs=own)
+    result = await _run_guarded(
+        adapter=adapter, safety=safety, session=session, own_legs=own, write_port=write_port
+    )
 
-    assert adapter.submit_calls == 1
+    assert write_port.submit_calls == 1
+    assert adapter.submit_calls == 0, "Mode B must NEVER reach the generic adapter submit surface"
     (decision,) = result.decisions
     assert decision.submitted is True and decision.abstain_reason is None
 
@@ -802,10 +970,11 @@ async def test_runner_wires_real_reconcile_resolved_status() -> None:
     """
     adapter = RecordingFakeAdapter(fill=True, fill_history_matches=True)
     safety, session = _make_safety()
+    write_port = _default_write_port()
 
-    result = await _run_guarded(adapter=adapter, safety=safety, session=session)
+    result = await _run_guarded(adapter=adapter, safety=safety, session=session, write_port=write_port)
 
-    assert adapter.submit_calls == 1
+    assert write_port.submit_calls == 1
     status = next(e for e in result.events if isinstance(e, OrderStatusEvent))
     recon = next(e for e in result.events if isinstance(e, RealFillReconciliation))
     assert status.status == "filled", "reconcile against venue truth must resolve the honest status"
@@ -827,9 +996,15 @@ async def test_runner_risk_snapshot_threads_real_realized_loss() -> None:
     fill = RealizedFillRecord(
         realized_pnl=-1.0, fee=0.25, session_id=_SESSION_ID, fill_ts_ms=_NOW_S * 1000
     )
+    write_port = _default_write_port()
 
     result = await _run_guarded(
-        adapter=adapter, safety=safety, session=session, risk=risk, realized_fills=(fill,)
+        adapter=adapter,
+        safety=safety,
+        session=session,
+        risk=risk,
+        realized_fills=(fill,),
+        write_port=write_port,
     )
 
     snap = next(e for e in result.events if isinstance(e, SessionRiskSnapshot))
@@ -838,7 +1013,7 @@ async def test_runner_risk_snapshot_threads_real_realized_loss() -> None:
     assert snap.breaker_open is False
     assert snap.kill_switch_engaged is False
     assert adapter.cancel_all_calls == 0, "a non-breaching fill must NOT fire the cancel-all wire"
-    assert adapter.submit_calls == 1, "a non-breaching fill leaves the submit path open"
+    assert write_port.submit_calls == 1, "a non-breaching fill leaves the submit path open"
 
 
 # --- E6-T4: mechanical size bound to the wire (Codex-M4 / Fable-m3) --------------------------
@@ -902,71 +1077,59 @@ async def test_runner_wire_size_is_mechanical_regardless_of_agent_input() -> Non
     assert expected == 5.0  # min(50.0, 5.0, 100.0)
 
     adapter_hi = RecordingFakeAdapter(fill=True)
+    write_port_hi = _default_write_port(binding)
     await _run_guarded(
         adapter=adapter_hi,
         manifest=manifest,
         envelope=env,
-        arming=_arming(binding),
+        arming=_arming(binding, write_port=write_port_hi),
         request=_mm_request(manifest=manifest, envelope=env, confidence=0.99, requested_size=999.0),
         wallet_equity_at_decision=wallet_equity,
         fixed_fraction=fixed_fraction,
     )
     adapter_lo = RecordingFakeAdapter(fill=True)
+    write_port_lo = _default_write_port(binding)
     await _run_guarded(
         adapter=adapter_lo,
         manifest=manifest,
         envelope=env,
-        arming=_arming(binding),
+        arming=_arming(binding, write_port=write_port_lo),
         request=_mm_request(manifest=manifest, envelope=env, confidence=0.01, requested_size=0.001),
         wallet_equity_at_decision=wallet_equity,
         fixed_fraction=fixed_fraction,
     )
 
-    assert adapter_hi.submitted_orders and adapter_lo.submitted_orders
-    size_hi = adapter_hi.submitted_orders[-1].size
-    size_lo = adapter_lo.submitted_orders[-1].size
+    assert adapter_hi.submitted_orders == [] and adapter_lo.submitted_orders == [], (
+        "Mode B must NEVER reach the generic adapter submit surface"
+    )
+    assert write_port_hi.calls and write_port_lo.calls
+    size_hi = write_port_hi.calls[-1]["size"]
+    size_lo = write_port_lo.calls[-1]["size"]
     assert size_hi == size_lo == expected, "the wire size must be resolve_dust_size(...), identical"
     assert size_hi not in (999.0, 0.001), "the agent-requested size must NEVER reach the wire"
 
 
-class _RecordingSigner:
-    """The Mode-A signer, wrapped to CAPTURE each :class:`SigningPayload` it signs.
-
-    Delegates the actual (offline, deterministic) signing to :class:`LocalFakeWalletControlPlane`, but
-    records every payload so a test can assert the SIGNED order carries the runner's injected
-    ``tick_size`` — the single-source proof for the non-crossing gate ↔ signed-payload tick.
-    """
-
-    mode: SignerMode = "FAKE_LOCAL"
-
-    def __init__(self) -> None:
-        self._inner = LocalFakeWalletControlPlane()
-        self.signed_payloads: list[SigningPayload] = []
-
-    async def sign_order(self, payload: SigningPayload) -> SignedArtifact:
-        self.signed_payloads.append(payload)
-        return await self._inner.sign_order(payload)
-
-
 async def test_signed_payload_tick_is_single_sourced_from_runner_tick_size() -> None:
-    """MINOR-1: the SIGNED payload's ``tick_size`` is the runner's ``tick_size`` param, ONE source.
+    """MINOR-1: the tick_size the write port COMPILES with is the runner's ``tick_size`` param, ONE
+    source.
 
-    The non-crossing gate and the signed order payload must read the tick from a SINGLE source that
-    cannot drift. Drives the Mode-B submit path with a NON-default ``tick_size=0.005``; the recording
-    signer captures the exact payload the runner signs. Its ``tick_size`` MUST be ``"0.005"`` (the
-    injected tick, losslessly stringified) — NOT a hardcoded ``"0.01"`` literal.
+    The non-crossing gate and the compiled/submitted order must read the tick from a SINGLE source
+    that cannot drift. Drives the Mode-B submit path with a NON-default (but still a pinned venue
+    tick, ``0.001``); the recording write port captures the exact ``tick_size`` kwarg the runner
+    submits with. It MUST be ``0.001`` (the injected tick) — NOT a hardcoded ``0.01`` literal.
 
-    MUTATION: re-hardcode ``SigningPayload(tick_size="0.01")`` → the signed tick diverges from the
-    injected non-crossing tick and this test fails; a single change to the runner's tick source now
-    moves BOTH the non-crossing gate AND the signed payload.
+    Gate#3 C-1 fix: the tick now flows to the injected :class:`ModeBWritePort` (which derives the
+    venue-precision amounts from it, SAF-009) rather than a Mode-A ``SigningPayload`` — MUTATION:
+    re-hardcode ``tick_size=0.01`` in the runner's write-port call → the submitted tick diverges from
+    the injected non-crossing tick and this test fails.
     """
     binding = _binding()
     adapter = RecordingFakeAdapter(fill=True)
-    signer = _RecordingSigner()
+    write_port = _default_write_port(binding)
 
     result = await run_dust_execution(
         adapter=adapter,
-        signer=signer,
+        signer=_mode_b_signer(),
         sources=_ScriptedSource(quote=_fresh_quote()),
         now_fn=_clock,
         sleep_fn=_noop_sleep,
@@ -975,15 +1138,15 @@ async def test_signed_payload_tick_is_single_sourced_from_runner_tick_size() -> 
         mode="live_guarded",
         wallet_equity_at_decision=_WALLET_EQUITY,
         fixed_fraction=_FIXED_FRACTION,
-        arming=_arming(binding),
-        tick_size=0.005,  # NON-default: exposes a hardcoded "0.01" in the signed payload
+        arming=_arming(binding, write_port=write_port),
+        tick_size=0.001,  # NON-default (but a pinned venue tick): exposes a hardcoded "0.01"
     )
 
     (decision,) = result.decisions
     assert decision.submitted is True, "positive control: the clean Mode-B order must sign+submit"
-    assert len(signer.signed_payloads) == 1, "the runner must sign exactly one order for one token"
-    assert signer.signed_payloads[-1].tick_size == "0.005", (
-        "the SIGNED payload tick must be the runner's injected tick (single source), not '0.01'"
+    assert write_port.submit_calls == 1, "the runner must submit exactly one order for one token"
+    assert write_port.calls[-1]["tick_size"] == 0.001, (
+        "the SUBMITTED order's tick must be the runner's injected tick (single source), not 0.01"
     )
 
 
@@ -1068,10 +1231,13 @@ async def test_mode_b_arms_and_submits_when_all_preconditions_pass() -> None:
     Makes the hard-gate / blocked-on-precondition MUTATIONS meaningful (not vacuously green).
     """
     adapter = RecordingFakeAdapter(fill=True)
+    write_port = _default_write_port()
 
-    result = await _run_guarded(adapter=adapter)  # default: valid arming + pinned Mode-B manifest
+    # default: valid arming + pinned Mode-B manifest
+    result = await _run_guarded(adapter=adapter, write_port=write_port)
 
-    assert adapter.submit_calls == 1, "a fully-armed Mode B must reach the submit wire"
+    assert write_port.submit_calls == 1, "a fully-armed Mode B must reach the keyless write-port wire"
+    assert adapter.submit_calls == 0, "Mode B must NEVER reach the generic adapter submit surface"
     (decision,) = result.decisions
     assert decision.submitted is True and decision.abstain_reason is None
 
@@ -1135,10 +1301,11 @@ async def test_experimental_dust_admits_without_profitability_but_trips_loss_cap
 
     # (a) admitted at the strictest caps, no profitability flag anywhere.
     adapter_ok = RecordingFakeAdapter(fill=True)
-    result_ok = await _run_guarded(adapter=adapter_ok, manifest=manifest)
+    write_port_ok = _default_write_port(binding)
+    result_ok = await _run_guarded(adapter=adapter_ok, manifest=manifest, write_port=write_port_ok)
     assert result_ok.admission.verdict == "ALLOW"
     assert result_ok.admission.reason_codes == ()
-    assert adapter_ok.submit_calls == 1
+    assert write_port_ok.submit_calls == 1
 
     # (b) the loss cap is still enforced — a session at the cap is DENIED admission.
     adapter_capped = RecordingFakeAdapter(fill=True)
@@ -1166,7 +1333,7 @@ async def test_identical_request_and_hashes_yield_identical_admission_across_mod
         # (mode-independent); the session_id is otherwise mode-tagged by the runner.
         result = await run_dust_execution(
             adapter=RecordingFakeAdapter(fill=True),
-            signer=LocalFakeWalletControlPlane(),
+            signer=_mode_b_signer() if mode == "live_guarded" else LocalFakeWalletControlPlane(),
             sources=_ScriptedSource(quote=_fresh_quote()),
             now_fn=_clock,
             sleep_fn=_noop_sleep,
@@ -1234,12 +1401,13 @@ async def test_startup_sweep_with_no_preexisting_orders_still_submits() -> None:
     """
     adapter = RecordingFakeAdapter(fill=True, open_orders=[])
     safety, session = _make_safety()
+    write_port = _default_write_port()
 
-    result = await _run_guarded(adapter=adapter, safety=safety, session=session)
+    result = await _run_guarded(adapter=adapter, safety=safety, session=session, write_port=write_port)
 
     assert adapter.get_orders_calls >= 1, "the runner must query get_orders on arm even when the book is empty"
     assert adapter.cancel_all_calls == 0, "an empty open-order book must fire NO cancel sweep"
-    assert adapter.submit_calls == 1, "a clean startup (no pre-existing orders) must still reach the submit wire"
+    assert write_port.submit_calls == 1, "a clean startup (no pre-existing orders) must still reach the wire"
     (decision,) = result.decisions
     assert decision.submitted is True and decision.abstain_reason is None
 
@@ -1729,10 +1897,11 @@ async def test_mode_b_real_submit_with_ambiguous_reconciliation_is_failed() -> N
     """
     adapter = RecordingFakeAdapter(fill=True, fill_history_matches=False)
     safety, session = _make_safety()
+    write_port = _default_write_port()
 
-    result = await _run_guarded(adapter=adapter, safety=safety, session=session)
+    result = await _run_guarded(adapter=adapter, safety=safety, session=session, write_port=write_port)
 
-    assert adapter.submit_calls == 1, "a real Mode-B order must reach the wire for this to be a freeze"
+    assert write_port.submit_calls == 1, "a real Mode-B order must reach the wire for this to be a freeze"
     assert result.submitted_count == 1
     recon = next(e for e in result.events if isinstance(e, RealFillReconciliation))
     assert recon.reconciled_state == "AMBIGUOUS", "the venue never confirmed the submitted order's fill"
@@ -1887,22 +2056,28 @@ async def test_make_quote_intent_places_resting_maker_honoring_side_not_taker() 
     manifest = _mode_b_manifest(binding)
     env = _env()
     adapter = _MakerRecordingAdapter(fill=True)
+    write_port = _default_write_port(binding)
     params = MMIntentParams(token_id=_TOKEN, side="SELL", price=0.49, tif="GTC", client_order_id="coid-mk")
     request = _intent_request("make_quote", manifest=manifest, envelope=env, params=params)
 
     result = await _run_guarded(
-        adapter=adapter, manifest=manifest, envelope=env, arming=_arming(binding), request=request
+        adapter=adapter,
+        manifest=manifest,
+        envelope=env,
+        arming=_arming(binding, write_port=write_port),
+        request=request,
     )
 
     assert adapter.submit_calls == 0, "make_quote must NOT fire the FOK taker submit wire"
-    assert adapter.resting_calls == 1, "make_quote must rest exactly one maker order on the E3-T3 wire"
-    (wire,) = adapter.resting_wire_kwargs
-    assert wire["order_type"] == "GTC", "make_quote must rest a GTC/GTD order, never a FOK taker"
+    assert adapter.resting_calls == 0, "Mode B must NEVER reach the generic adapter resting surface"
+    assert write_port.submit_calls == 1, "make_quote must rest exactly one maker order on the write port"
+    (wire,) = write_port.calls
+    assert wire["tif"] == "GTC", "make_quote must rest a GTC/GTD order, never a FOK taker"
     assert wire["post_only"] is True, "a maker rests post-only (add-liquidity-only), never crossing"
-    assert isinstance(wire["amount"], float) and wire["amount"] < 0.0, (
-        "the ADMITTED SELL side must reach the wire (negative signed amount), NOT a hardcoded BUY"
+    assert wire["side"] == "SELL", (
+        "the ADMITTED SELL side must reach the write port, NOT a hardcoded BUY"
     )
-    assert wire["native_price"] == 0.49, "the ADMITTED resting price must reach the wire"
+    assert wire["native_price"] == 0.49, "the ADMITTED resting price must reach the write port"
     (decision,) = result.decisions
     assert decision.submitted is True and decision.abstain_reason is None
     assert decision.venue_order_id is not None
@@ -1918,18 +2093,24 @@ async def test_take_intent_submits_taker_honoring_side_not_hardcoded_buy() -> No
     manifest = _mode_b_manifest(binding)
     env = _env()
     adapter = _MakerRecordingAdapter(fill=True)
+    write_port = _default_write_port(binding)
     params = MMIntentParams(token_id=_TOKEN, side="SELL", tif="FOK", client_order_id="coid-tk")
     request = _intent_request("take", manifest=manifest, envelope=env, params=params)
 
     result = await _run_guarded(
-        adapter=adapter, manifest=manifest, envelope=env, arming=_arming(binding), request=request
+        adapter=adapter,
+        manifest=manifest,
+        envelope=env,
+        arming=_arming(binding, write_port=write_port),
+        request=request,
     )
 
-    assert adapter.submit_calls == 1, "an admitted take intent must fire the taker submit wire once"
+    assert adapter.submit_calls == 0, "Mode B must NEVER reach the generic adapter submit surface"
+    assert write_port.submit_calls == 1, "an admitted take intent must fire the write-port wire once"
     assert adapter.resting_calls == 0, "a taker never rests a maker order"
-    order = adapter.submitted_orders[-1]
-    assert order.side == "SELL", "the ADMITTED SELL side must reach the taker wire, NOT a hardcoded BUY"
-    assert order.tif == "FOK", "a take intent is a FOK/FAK taker"
+    (order,) = write_port.calls
+    assert order["side"] == "SELL", "the ADMITTED SELL side must reach the taker wire, NOT a hardcoded BUY"
+    assert order["tif"] == "FOK", "a take intent is a FOK/FAK taker"
     (decision,) = result.decisions
     assert decision.submitted is True and decision.abstain_reason is None
 
@@ -1995,14 +2176,20 @@ async def test_cancel_replace_intent_cancels_named_order_then_places_replacement
         replaces_client_order_id="0xnamed-order-to-cancel",
     )
     request = _intent_request("cancel_replace", manifest=manifest, envelope=env, params=params)
+    write_port = _default_write_port(binding)
 
     result = await _run_guarded(
-        adapter=adapter, manifest=manifest, envelope=env, arming=_arming(binding), request=request
+        adapter=adapter,
+        manifest=manifest,
+        envelope=env,
+        arming=_arming(binding, write_port=write_port),
+        request=request,
     )
 
     assert adapter.cancel_single_calls == 1, "cancel_replace must cancel the NAMED order via DELETE /order"
     assert adapter.cancelled_ids == ["0xnamed-order-to-cancel"], "exactly the named order is cancelled"
-    assert adapter.resting_calls == 1, "cancel_replace must place the resting replacement"
+    assert adapter.resting_calls == 0, "Mode B must NEVER reach the generic adapter resting surface"
+    assert write_port.submit_calls == 1, "cancel_replace must place the resting replacement"
     assert adapter.submit_calls == 0, "cancel_replace is not a blind FOK taker submit"
     cancel_event = next(e for e in result.events if isinstance(e, OrderCancelEvent))
     assert cancel_event.canceled is True, "the named-order cancel must be honestly recorded"
@@ -2140,14 +2327,20 @@ async def test_cancel_replace_reconciled_terminal_withdrawn_reposts_once() -> No
         replaces_client_order_id=old_id,
     )
     request = _intent_request("cancel_replace", manifest=manifest, envelope=env, params=params)
+    write_port = _default_write_port(binding)
 
     result = await _run_guarded(
-        adapter=adapter, manifest=manifest, envelope=env, arming=_arming(binding), request=request
+        adapter=adapter,
+        manifest=manifest,
+        envelope=env,
+        arming=_arming(binding, write_port=write_port),
+        request=request,
     )
 
     cancel_event = next(e for e in result.events if isinstance(e, OrderCancelEvent))
     assert cancel_event.canceled is True
-    assert adapter.resting_calls == 1, "a reconciled terminal-withdrawn cancel DOES permit exactly one repost"
+    assert adapter.resting_calls == 0, "Mode B must NEVER reach the generic adapter resting surface"
+    assert write_port.submit_calls == 1, "a reconciled terminal-withdrawn cancel DOES permit exactly one repost"
     assert adapter.submit_calls == 0, "cancel_replace is not a blind FOK taker submit"
     (decision,) = result.decisions
     assert decision.submitted is True and decision.abstain_reason is None
@@ -2190,7 +2383,9 @@ async def test_intent_not_in_permitted_kinds_is_denied_fail_closed() -> None:
 # the SELL and rests it (``resting_calls == 1``), so the test FAILS. That proves the gate now reads
 # the REAL proposed order, not a phantom.
 
-_TOKEN_NO = "0xtokenNO"  # the complementary outcome token for the multi-token universe C-4 cases
+#: The complementary outcome token for the multi-token universe C-4 cases — a DISTINCT
+#: decimal-integer-string id (see ``_TOKEN`` above for why it must be numerically valid).
+_TOKEN_NO = "222222222222222222222222222222"
 
 
 async def test_non_crossing_gates_the_real_make_quote_sell_not_phantom_buy() -> None:
@@ -2236,6 +2431,7 @@ async def test_non_crossing_admits_a_make_quote_sell_that_does_not_cross() -> No
     manifest = _mode_b_manifest(binding)
     env = _env()
     adapter = _MakerRecordingAdapter(fill=True)
+    write_port = _default_write_port(binding)
     own = (OwnOrderLeg(token_id=_TOKEN, side="BUY", price=0.50, kind=LegKind.OPEN),)
     params = MMIntentParams(token_id=_TOKEN, side="SELL", price=0.52, tif="GTC", client_order_id="coid-mk2")
     request = _intent_request("make_quote", manifest=manifest, envelope=env, params=params)
@@ -2244,12 +2440,13 @@ async def test_non_crossing_admits_a_make_quote_sell_that_does_not_cross() -> No
         adapter=adapter,
         manifest=manifest,
         envelope=env,
-        arming=_arming(binding),
+        arming=_arming(binding, write_port=write_port),
         request=request,
         own_legs=own,
     )
 
-    assert adapter.resting_calls == 1, "a non-crossing make_quote SELL must rest exactly one order"
+    assert adapter.resting_calls == 0, "Mode B must NEVER reach the generic adapter resting surface"
+    assert write_port.submit_calls == 1, "a non-crossing make_quote SELL must rest exactly one order"
     (decision,) = result.decisions
     assert decision.submitted is True and decision.abstain_reason is None
 
@@ -2296,6 +2493,7 @@ async def test_non_crossing_admits_a_take_buy_that_does_not_cross() -> None:
     manifest = _mode_b_manifest(binding)
     env = _env()
     adapter = _MakerRecordingAdapter(fill=True)
+    write_port = _default_write_port(binding)
     own = (OwnOrderLeg(token_id=_TOKEN, side="SELL", price=0.55, kind=LegKind.OPEN),)
     params = MMIntentParams(token_id=_TOKEN, side="BUY", tif="FOK", client_order_id="coid-tk2")
     request = _intent_request("take", manifest=manifest, envelope=env, params=params)
@@ -2304,12 +2502,13 @@ async def test_non_crossing_admits_a_take_buy_that_does_not_cross() -> None:
         adapter=adapter,
         manifest=manifest,
         envelope=env,
-        arming=_arming(binding),
+        arming=_arming(binding, write_port=write_port),
         request=request,
         own_legs=own,
     )
 
-    assert adapter.submit_calls == 1, "a non-crossing take BUY must submit exactly one taker order"
+    assert adapter.submit_calls == 0, "Mode B must NEVER reach the generic adapter submit surface"
+    assert write_port.submit_calls == 1, "a non-crossing take BUY must submit exactly one taker order"
     (decision,) = result.decisions
     assert decision.submitted is True and decision.abstain_reason is None
 
@@ -2338,14 +2537,20 @@ async def test_singular_make_quote_targets_only_its_admitted_token() -> None:
     manifest = _mode_b_manifest(binding, universe=(_TOKEN, _TOKEN_NO))
     env = _env()
     adapter = _MakerRecordingAdapter(fill=True)
+    write_port = _default_write_port(binding)
     params = MMIntentParams(token_id=_TOKEN, side="SELL", price=0.52, tif="GTC", client_order_id="coid-mk")
     request = _intent_request("make_quote", manifest=manifest, envelope=env, params=params)
 
     result = await _run_guarded(
-        adapter=adapter, manifest=manifest, envelope=env, arming=_arming(binding), request=request
+        adapter=adapter,
+        manifest=manifest,
+        envelope=env,
+        arming=_arming(binding, write_port=write_port),
+        request=request,
     )
 
-    assert adapter.resting_calls == 1, "a singular make_quote must rest EXACTLY one order (its token)"
+    assert adapter.resting_calls == 0, "Mode B must NEVER reach the generic adapter resting surface"
+    assert write_port.submit_calls == 1, "a singular make_quote must rest EXACTLY one order (its token)"
     assert adapter.submit_calls == 0
     by_token = {d.token_id: d for d in result.decisions}
     assert by_token[_TOKEN].submitted is True and by_token[_TOKEN].abstain_reason is None
@@ -2421,10 +2626,13 @@ async def test_per_run_order_cap_denies_second_eligible_token() -> None:
     manifest = _mode_b_manifest(universe=(_TOKEN, _TOKEN_NO), max_orders=5)
     env = _env(max_orders_per_run=1)
     adapter = _MakerRecordingAdapter(fill=True)
+    write_port = _default_write_port()
 
-    result = await _run_guarded(adapter=adapter, manifest=manifest, envelope=env, source=_PerTokenSource())
+    result = await _run_guarded(
+        adapter=adapter, manifest=manifest, envelope=env, source=_PerTokenSource(), write_port=write_port
+    )
 
-    assert adapter.submit_calls == 1, "the per-run cap must let EXACTLY ONE order reach the wire"
+    assert write_port.submit_calls == 1, "the per-run cap must let EXACTLY ONE order reach the wire"
     assert result.submitted_count == 1
     by_token = {d.token_id: d for d in result.decisions}
     assert by_token[_TOKEN].submitted is True and by_token[_TOKEN].abstain_reason is None
@@ -2443,10 +2651,13 @@ async def test_manifest_max_orders_enforced_as_ceiling_independent_of_policy() -
     manifest = _mode_b_manifest(universe=(_TOKEN, _TOKEN_NO), max_orders=1)
     env = _env(max_orders_per_run=5, max_orders_per_session=20, max_orders_per_day=50)
     adapter = _MakerRecordingAdapter(fill=True)
+    write_port = _default_write_port()
 
-    result = await _run_guarded(adapter=adapter, manifest=manifest, envelope=env, source=_PerTokenSource())
+    result = await _run_guarded(
+        adapter=adapter, manifest=manifest, envelope=env, source=_PerTokenSource(), write_port=write_port
+    )
 
-    assert adapter.submit_calls == 1, "the manifest.max_orders ceiling must cap the wire independently"
+    assert write_port.submit_calls == 1, "the manifest.max_orders ceiling must cap the wire independently"
     by_token = {d.token_id: d for d in result.decisions}
     assert by_token[_TOKEN].submitted is True
     assert by_token[_TOKEN_NO].submitted is False
@@ -2479,12 +2690,18 @@ async def test_session_order_cap_denies_across_restart() -> None:
     manifest2 = _mode_b_manifest(universe=(_TOKEN, _TOKEN_NO), max_orders=5)
     env2 = _env(max_orders_per_session=2, max_orders_per_run=5, max_orders_per_day=50)
     adapter2 = _MakerRecordingAdapter(fill=True)
+    write_port2 = _default_write_port()
 
     result2 = await _run_guarded(
-        adapter=adapter2, manifest=manifest2, envelope=env2, source=_PerTokenSource(), prior_session_order_count=1
+        adapter=adapter2,
+        manifest=manifest2,
+        envelope=env2,
+        source=_PerTokenSource(),
+        prior_session_order_count=1,
+        write_port=write_port2,
     )
 
-    assert adapter2.submit_calls == 1, "one below the session cap admits EXACTLY one more order"
+    assert write_port2.submit_calls == 1, "one below the session cap admits EXACTLY one more order"
     by_token = {d.token_id: d for d in result2.decisions}
     assert by_token[_TOKEN].submitted is True
     assert by_token[_TOKEN_NO].submitted is False
@@ -2516,12 +2733,18 @@ async def test_day_order_cap_denies_across_restart() -> None:
     manifest2 = _mode_b_manifest(universe=(_TOKEN, _TOKEN_NO), max_orders=5)
     env2 = _env(max_orders_per_day=2, max_orders_per_run=5, max_orders_per_session=20)
     adapter2 = _MakerRecordingAdapter(fill=True)
+    write_port2 = _default_write_port()
 
     result2 = await _run_guarded(
-        adapter=adapter2, manifest=manifest2, envelope=env2, source=_PerTokenSource(), prior_day_order_count=1
+        adapter=adapter2,
+        manifest=manifest2,
+        envelope=env2,
+        source=_PerTokenSource(),
+        prior_day_order_count=1,
+        write_port=write_port2,
     )
 
-    assert adapter2.submit_calls == 1, "one below the daily cap admits EXACTLY one more order"
+    assert write_port2.submit_calls == 1, "one below the daily cap admits EXACTLY one more order"
     by_token = {d.token_id: d for d in result2.decisions}
     assert by_token[_TOKEN].submitted is True
     assert by_token[_TOKEN_NO].submitted is False
@@ -2556,3 +2779,291 @@ async def test_mode_a_would_submit_counts_toward_run_cap() -> None:
     by_token = {d.token_id: d for d in result.decisions}
     assert by_token[_TOKEN].abstain_reason == "mode_a_no_orders", "the first would-submit rehearses a place"
     assert by_token[_TOKEN_NO].abstain_reason == "order_cap_run", "the 2nd would-be decision hits the cap"
+
+
+# =====================================================================================
+# Gate#3 C-1 FIX — the seven adversarial controls (finding: the Mode-B runner did NOT consume the
+# approved keyless Privy/V2 money path; both submit sites signed via the Mode-A fake signer, built a
+# PROVISIONAL venue_order_key, and submitted through the generic adapter surfaces).
+#
+# Each control below is structural (not string-only): it drives the FULL runner composition (the
+# narrow injected ModeBWritePort -> PolymarketV2SigningCompiler -> KeylessL2Transport, the SAME E3-T8
+# offline stack privy_signer tests already prove persist-before-sign/byte-verify/no-local-key for in
+# isolation) and asserts on OBSERVABLE runner behavior: the abstain reason, the write-port call count,
+# the persisted/reconciled venue_order_key, and the exact compiled order fields.
+# =====================================================================================
+
+
+async def test_control1_fake_local_signer_on_armed_mode_b_refuses_before_io() -> None:
+    """Adversarial control #1: a FAKE_LOCAL signer presented to an ARMED Mode-B run REFUSES before
+    ANY sign/wire I/O — the write port is never touched (structural, not a string check).
+    """
+    binding = _binding()
+    manifest = _mode_b_manifest(binding)
+    adapter = RecordingFakeAdapter(fill=True)
+    write_port = _default_write_port(binding)
+
+    result = await run_dust_execution(
+        adapter=adapter,
+        signer=LocalFakeWalletControlPlane(),  # the Mode-A fake — must be refused for an ARMED run
+        sources=_ScriptedSource(quote=_fresh_quote()),
+        now_fn=_clock,
+        sleep_fn=_noop_sleep,
+        envelope=_env(),
+        manifest=manifest,
+        mode="live_guarded",
+        wallet_equity_at_decision=_WALLET_EQUITY,
+        fixed_fraction=_FIXED_FRACTION,
+        arming=_arming(binding, write_port=write_port),
+    )
+
+    (decision,) = result.decisions
+    assert decision.submitted is False
+    assert decision.abstain_reason == "mode_b_legacy_signer"
+    assert write_port.submit_calls == 0, "the legacy signer must be refused BEFORE any write-port I/O"
+    assert adapter.submit_calls == 0
+
+
+async def test_control2_missing_write_port_on_armed_mode_b_refuses_before_io() -> None:
+    """Adversarial control #2a: an armed Mode-B run with NO injected write port REFUSES before I/O."""
+    binding = _binding()
+    manifest = _mode_b_manifest(binding)
+    adapter = RecordingFakeAdapter(fill=True)
+
+    result = await _run_guarded(
+        adapter=adapter, manifest=manifest, arming=_arming(binding, write_port=None)
+    )
+
+    (decision,) = result.decisions
+    assert decision.submitted is False
+    assert decision.abstain_reason == "mode_b_write_port_missing"
+    assert adapter.submit_calls == 0
+
+
+async def test_control2_missing_order_auth_on_armed_mode_b_refuses_before_io() -> None:
+    """Adversarial control #2b: an armed Mode-B run with a write port but NO authorization context
+    REFUSES before I/O — the write port is present but never invoked.
+    """
+    binding = _binding()
+    manifest = _mode_b_manifest(binding)
+    adapter = RecordingFakeAdapter(fill=True)
+    write_port = _default_write_port(binding)
+
+    result = await _run_guarded(
+        adapter=adapter,
+        manifest=manifest,
+        arming=_arming(binding, write_port=write_port, order_auth=None),
+    )
+
+    (decision,) = result.decisions
+    assert decision.submitted is False
+    assert decision.abstain_reason == "mode_b_write_port_missing"
+    assert write_port.submit_calls == 0, "missing auth must refuse BEFORE any write-port I/O"
+
+
+def test_control3_no_provisional_vok_literal_anywhere_in_runner_source() -> None:
+    """Adversarial control #3 (structural): no code path in the runner constructs a provisional /
+    placeholder venue_order_key on ANY path — Mode A's OWN placeholder digest is also renamed away
+    from the historical ``"provisional-vok:"`` prefix so the string is unambiguously gone.
+    """
+    source = inspect.getsource(_runner_module)
+    assert "provisional-vok:" not in source, (
+        "the runner must never construct a provisional venue_order_key on ANY path"
+    )
+
+
+async def test_control3_armed_submit_persists_the_real_venue_order_key() -> None:
+    """Adversarial control #3 (behavioral): the persisted/reconciled record for an armed Mode-B
+    submit carries the REAL V2 order hash — non-empty, venue-shaped (``0x``-hex), and DISTINCT from
+    a private integrity digest (Codex-M2) — never an empty or non-venue join key.
+    """
+    binding = _binding()
+    manifest = _mode_b_manifest(binding)
+    adapter = RecordingFakeAdapter(fill=True)
+    write_port = _default_write_port(binding)
+
+    result = await _run_guarded(adapter=adapter, manifest=manifest, write_port=write_port)
+
+    (decision,) = result.decisions
+    assert decision.submitted is True
+    recon = next(e for e in result.events if isinstance(e, RealFillReconciliation))
+    assert recon.venue_order_key, "the venue_order_key must be non-empty"
+    assert recon.venue_order_key.startswith("0x"), "the real V2 orderHash is 0x-hex, never a placeholder"
+    assert not recon.venue_order_key.startswith("provisional-vok:")
+    assert not recon.venue_order_key.startswith("mode-a-dry-run-digest:")
+
+
+async def test_control4_runner_persists_before_sign_end_to_end() -> None:
+    """Adversarial control #4: persistence happens BEFORE signing for a REAL runner-driven armed
+    Mode-B submit (observed via the recording-fake persist/sign event order) — proving the RUNNER's
+    composition (not merely the E3-T8 transport unit) preserves the persist-before-sign ordering.
+    """
+    binding = _binding()
+    manifest = _mode_b_manifest(binding)
+    adapter = RecordingFakeAdapter(fill=True)
+    events: list[str] = []
+
+    class _LoggingPreSubmitStore(InMemoryPreSubmitStore):
+        def append_presubmit(self, record: object) -> None:
+            events.append("persist")
+            super().append_presubmit(record)  # type: ignore[arg-type]
+
+    write_port = KeylessModeBWritePort(
+        transport=KeylessL2Transport(
+            control_plane=PrivyEvmWalletControlPlane(
+                client=L2FakePrivy(events=events), binding=binding
+            ),
+            creds=_L2_CREDS,
+            http=_KeylessRecordingHttp(),
+            store=_LoggingPreSubmitStore(),
+            now_s=_clock,
+        ),
+        owner=_L2_CREDS.api_key,
+    )
+
+    result = await _run_guarded(adapter=adapter, manifest=manifest, write_port=write_port)
+
+    (decision,) = result.decisions
+    assert decision.submitted is True
+    assert "persist" in events and "sign" in events, "both the persist and sign steps must fire"
+    assert events.index("persist") < events.index("sign"), "persist must happen BEFORE sign"
+
+
+async def test_control5_byte_mutation_between_commit_and_send_fails_closed_through_runner() -> None:
+    """Adversarial control #5: a byte-verify failure (a covered field mutated between the pre-sign
+    commitment and the outgoing POST) propagates as a hard :class:`FailClosed` all the way through
+    the runner — the composition never catches-and-abstains around a byte-verify failure.
+    """
+    binding = _binding()
+    manifest = _mode_b_manifest(binding)
+    adapter = RecordingFakeAdapter(fill=True)
+    write_port = _default_write_port(binding)
+
+    def _boom(post_body: object, commitment: object) -> None:
+        raise FailClosed(
+            "simulated byte-verify failure: a covered field mutated after the pre-sign commitment"
+        )
+
+    original = _l2_transport_module.verify_post_body_against_commitment
+    _l2_transport_module.verify_post_body_against_commitment = _boom
+    try:
+        with pytest.raises(FailClosed):
+            await _run_guarded(adapter=adapter, manifest=manifest, write_port=write_port)
+    finally:
+        _l2_transport_module.verify_post_body_against_commitment = original
+
+
+async def test_control6_ack_lost_restart_resolves_via_real_venue_order_key() -> None:
+    """Adversarial control #6: a fill-history reader that knows ONLY the REAL returned
+    ``venue_order_key`` resolves an ACK-lost fill after a restart (E4 join), driven end-to-end
+    through the runner's composed write port — not a bare fixture of the transport in isolation.
+    """
+    binding = _binding()
+    manifest = _mode_b_manifest(binding)
+    adapter = RecordingFakeAdapter(fill=True)
+    store = InMemoryPreSubmitStore()
+    write_port = KeylessModeBWritePort(
+        transport=KeylessL2Transport(
+            control_plane=PrivyEvmWalletControlPlane(client=PolicyFakePrivy(), binding=binding),
+            creds=_L2_CREDS,
+            http=_KeylessRecordingHttp(),
+            store=store,
+            now_s=_clock,
+        ),
+        owner=_L2_CREDS.api_key,
+    )
+
+    result = await _run_guarded(adapter=adapter, manifest=manifest, write_port=write_port)
+    (decision,) = result.decisions
+    assert decision.submitted is True
+
+    rows = store.list_presubmit()
+    assert len(rows) == 1
+    real_vok = rows[0].venue_order_key
+
+    async def _fill_reader(key: str) -> dict[str, object]:
+        if key == real_vok:
+            return {"trades": [{"taker_order_id": key, "size": 1.0}]}
+        return {"trades": []}
+
+    reconciled = await reconcile_ack_lost(store, _fill_reader)
+    assert len(reconciled) == 1
+    assert reconciled[0].venue_order_key == real_vok
+    assert reconciled[0].reconciled_state == "RESOLVED", "a reader keyed ONLY on the real vok must resolve"
+    assert reconciled[0].reconciled_fill_size == 1.0
+
+
+async def test_control7_taker_compiled_order_equals_admitted_fields() -> None:
+    """Adversarial control #7 (taker): the EXACT admitted typed order is what gets compiled/sent —
+    no second reconstruction alters token/side/price/size/TIF.
+    """
+    binding = _binding()
+    manifest = _mode_b_manifest(binding)
+    env = _env()
+    adapter = RecordingFakeAdapter(fill=True)
+    write_port = _default_write_port(binding)
+    quote = _fresh_quote()
+    assert quote.ask is not None
+
+    result = await _run_guarded(
+        adapter=adapter,
+        manifest=manifest,
+        envelope=env,
+        source=_ScriptedSource(quote=quote),
+        write_port=write_port,
+    )
+
+    (decision,) = result.decisions
+    assert decision.submitted is True
+    (call,) = write_port.calls
+    expected_size = resolve_dust_size(
+        fixed_fraction=_FIXED_FRACTION,
+        wallet_equity_at_decision=_WALLET_EQUITY,
+        max_notional=manifest.max_notional,
+        max_per_order=env.max_stake,
+    )
+    assert call["token_id"] == _TOKEN
+    assert call["side"] == "BUY"  # the default self-driven taker intent
+    assert call["native_price"] == quote.ask.price
+    assert call["size"] == expected_size
+    assert call["tif"] == "FOK"
+    assert call["post_only"] is False
+
+
+async def test_control7_maker_compiled_order_equals_admitted_fields() -> None:
+    """Adversarial control #7 (maker): the EXACT admitted resting order is what gets compiled/sent —
+    no second reconstruction alters token/side/price/size/TIF/post_only.
+    """
+    binding = _binding()
+    manifest = _mode_b_manifest(binding)
+    env = _env()
+    adapter = _MakerRecordingAdapter(fill=True)
+    write_port = _default_write_port(binding)
+    params = MMIntentParams(
+        token_id=_TOKEN, side="SELL", price=0.47, tif="GTC", client_order_id="coid-control7"
+    )
+    request = _intent_request("make_quote", manifest=manifest, envelope=env, params=params)
+
+    result = await _run_guarded(
+        adapter=adapter,
+        manifest=manifest,
+        envelope=env,
+        arming=_arming(binding, write_port=write_port),
+        request=request,
+    )
+
+    (decision,) = result.decisions
+    assert decision.submitted is True
+    (call,) = write_port.calls
+    expected_size = resolve_dust_size(
+        fixed_fraction=_FIXED_FRACTION,
+        wallet_equity_at_decision=_WALLET_EQUITY,
+        max_notional=manifest.max_notional,
+        max_per_order=env.max_stake,
+    )
+    assert call["token_id"] == _TOKEN
+    assert call["side"] == "SELL"
+    assert call["native_price"] == 0.47
+    assert call["tif"] == "GTC"
+    assert call["post_only"] is True
+    assert call["size"] == expected_size

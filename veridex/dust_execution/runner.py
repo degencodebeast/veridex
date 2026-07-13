@@ -90,22 +90,26 @@ from veridex.dust_execution.emergency import (
     SafetyController,
 )
 from veridex.dust_execution.facade import IntentKind, MMExecutionToolRequest, MMIntentParams
+from veridex.dust_execution.l2_transport import L2SubmitResult
 from veridex.dust_execution.manifest import (
     SessionState,
     StrategyAuthorizationDecision,
     StrategyExperimentManifest,
 )
+from veridex.dust_execution.mode_b_write_port import ModeBWritePort
 from veridex.dust_execution.noncrossing import LegKind, OwnOrderLeg, Side, check_non_crossing
 from veridex.dust_execution.privy_control_plane import (
+    PrivyAuthContext,
     PrivyPreflightResult,
     ProvisioningResult,
     arm_mode_b,
     execute_with,
 )
 from veridex.dust_execution.reconcile import UncertainSubmitState, assess_uncertain_submit
-from veridex.dust_execution.resting_order import RestingOrder, submit_resting_order
+from veridex.dust_execution.resting_order import RestingOrder
 from veridex.dust_execution.risk import FailClosed, RealizedFillRecord, RiskAccumulator
 from veridex.dust_execution.signer import Signer, SigningPayload
+from veridex.dust_execution.signing_compiler import WireSide
 from veridex.dust_execution.sizing import resolve_dust_size
 from veridex.dust_execution.wallet_binding import (
     AuthorizationQuorum,
@@ -115,8 +119,6 @@ from veridex.dust_execution.wallet_binding import (
 from veridex.policy.circuit_breaker import CircuitBreaker, CircuitState
 from veridex.policy.envelope import PolicyEnvelope
 from veridex.venues.base import (
-    Order,
-    RestingOrderVenue,
     SingleOrderCancelVenue,
     VenueAdapter,
     VenueReconciliationReads,
@@ -222,6 +224,8 @@ AbstainReason = Literal[
     "manifest_hash_mismatch",
     "admission_denied",
     "mode_b_not_armed",
+    "mode_b_legacy_signer",
+    "mode_b_write_port_missing",
     "operator_interlock_unproven",
     "intent_no_quote",
     "intent_cancel_all",
@@ -248,6 +252,8 @@ ABSTAIN_REASONS: tuple[AbstainReason, ...] = (
     "manifest_hash_mismatch",
     "admission_denied",
     "mode_b_not_armed",
+    "mode_b_legacy_signer",
+    "mode_b_write_port_missing",
     "operator_interlock_unproven",
     "intent_no_quote",
     "intent_cancel_all",
@@ -346,6 +352,18 @@ class ModeBArming:
     #: runner) keeps Mode B UNARMED. Only the facade mints it, after the five human preconditions are
     #: satisfied AND durably recorded, so the human gate cannot be bypassed via the public runner.
     operator_interlock: OperatorInterlockProof | None = None
+    #: Gate#3 C-1 fix (REQ-016/018): the ONE narrow injected Mode-B write port — no default, no
+    #: legacy implementation. ``None`` (the default) keeps Mode B UNARMED
+    #: (``"mode_b_write_port_missing"``): an armed run may NEVER fall back to the generic
+    #: ``adapter.submit_order`` / ``submit_resting_order`` surfaces. Only the production
+    #: :class:`~veridex.dust_execution.mode_b_write_port.KeylessModeBWritePort` (or an offline fake
+    #: composing the SAME E3-T8 keyless stack) may be injected here.
+    write_port: ModeBWritePort | None = None
+    #: The signed Privy authorization wrapper (replay-guard expiry + quorum signature set +
+    #: idempotency key) threaded to every :meth:`ModeBWritePort.submit_order` call this run makes.
+    #: ``None`` (the default) keeps Mode B UNARMED (``"mode_b_write_port_missing"``) — an armed real-
+    #: money run must carry a genuine authorization context, never an implicit/omitted one.
+    order_auth: PrivyAuthContext | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -683,21 +701,6 @@ def _require_cancel_all_adapter(adapter: VenueAdapter) -> CancelAllAdapter:
         raise TypeError(
             "a safety trigger fired but the venue adapter cannot sweep resting orders "
             "(missing cancel_all_orders); refusing to block-without-sweep"
-        )
-    return adapter
-
-
-def _require_resting_venue(adapter: VenueAdapter) -> RestingOrderVenue:
-    """Return the adapter as a :class:`RestingOrderVenue`, failing closed if it cannot rest a maker.
-
-    A ``make_quote`` / ``cancel_replace`` intent that reached the ARMED submit point but cannot reach
-    the E3-T3 resting-maker wire (``submit_resting_order``) is a fatal wiring error on the real-money
-    path — fail closed (raise) rather than silently drop the maker order.
-    """
-    if not isinstance(adapter, RestingOrderVenue):
-        raise TypeError(
-            "a make_quote/cancel_replace intent was admitted but the venue adapter cannot rest a "
-            "maker order (missing submit_resting_order); refusing to place-without-wire"
         )
     return adapter
 
@@ -1067,7 +1070,7 @@ def _authorization_block_reason(
 
 
 def _mode_b_arming_block_reason(
-    arming: ModeBArming | None, *, manifest: StrategyExperimentManifest
+    arming: ModeBArming | None, *, manifest: StrategyExperimentManifest, signer: Signer
 ) -> AbstainReason | None:
     """Return ``"mode_b_not_armed"`` unless EVERY Mode-B arming precondition positively passes.
 
@@ -1082,14 +1085,24 @@ def _mode_b_arming_block_reason(
        (:func:`execute_with`) AND the LIVE policy/quorum verify against the binding
        (:func:`arm_mode_b`) — a :class:`FailClosed` from either (reroute / weakened policy content
        hash / quorum) blocks;
+    #. Gate#3 C-1 fix (REQ-016/018): the INJECTED ``signer`` must NOT be the Mode-A
+       ``FAKE_LOCAL`` control plane — an armed Mode-B run must consume the REAL keyless Privy/V2
+       write path, never the fake local signer used for offline rehearsal
+       (``"mode_b_legacy_signer"``);
+    #. Gate#3 C-1 fix: the bundle must carry BOTH a non-``None``
+       :class:`~veridex.dust_execution.mode_b_write_port.ModeBWritePort` AND a non-``None``
+       :class:`~veridex.dust_execution.privy_control_plane.PrivyAuthContext` — an armed run with
+       either missing has no real money-moving surface to submit through
+       (``"mode_b_write_port_missing"``);
     #. Gate#3 MAJOR-1 (REQ-005): a RECORDED-satisfied :class:`OperatorInterlockProof` must be BOUND
        into the bundle (``satisfied is True`` AND a non-empty ``recording_receipt``) — a
        missing/unsatisfied/unrecorded human interlock returns ``"operator_interlock_unproven"``, so a
-       direct (facade-bypassing) runner call with only the six technical conditions stays UNARMED.
+       direct (facade-bypassing) runner call with only the technical conditions stays UNARMED.
 
-    The six technical branches return the SAME closed-vocab ``"mode_b_not_armed"`` label; the human
-    interlock branch returns ``"operator_interlock_unproven"`` (both: no secret / no live handle).
-    Removing ANY branch lets Mode B arm when it must not — the mutation each named test trips.
+    The technical branches return closed-vocab ``AbstainReason`` labels distinct enough to diagnose
+    which precondition failed, but every one is a REFUSAL (no secret / no live handle ever crosses
+    into the reason). Removing ANY branch lets Mode B arm when it must not — the mutation each named
+    test trips.
     """
     if arming is None:
         return "mode_b_not_armed"
@@ -1113,12 +1126,23 @@ def _mode_b_arming_block_reason(
         )
     except FailClosed:
         return "mode_b_not_armed"
-    # Gate#3 MAJOR-1 (REQ-005): the six TECHNICAL conditions above are necessary but NOT sufficient —
+    # Gate#3 C-1 fix: structural refuse-before-I/O — the Mode-A FAKE_LOCAL signer (or any legacy
+    # write client presenting the same closed-vocab mode label) must never reach an ARMED Mode-B
+    # run. Checked BEFORE the write-port presence check so a legacy-signer misconfiguration reports
+    # its own specific reason.
+    if signer.mode == "FAKE_LOCAL":
+        return "mode_b_legacy_signer"
+    # Gate#3 C-1 fix: an armed run must carry the ONE real money-moving surface (the injected write
+    # port) AND its signed authorization context — the generic adapter is a read/cancel/reconcile
+    # surface ONLY and is never eligible to substitute for either.
+    if arming.write_port is None or arming.order_auth is None:
+        return "mode_b_write_port_missing"
+    # Gate#3 MAJOR-1 (REQ-005): the technical conditions above are necessary but NOT sufficient —
     # the runner is public/exported, so a technical-only bundle must NOT arm real money. The arming
     # artifact must ALSO carry a RECORDED-satisfied human-operator interlock proof (minted only by the
     # facade after the five human preconditions were satisfied AND durably recorded). Checked LAST so
-    # a technical-precondition failure still surfaces its own ``mode_b_not_armed`` reason; a
-    # missing/unsatisfied/unrecorded proof fails closed as ``operator_interlock_unproven``.
+    # a technical-precondition failure still surfaces its own reason; a missing/unsatisfied/unrecorded
+    # proof fails closed as ``operator_interlock_unproven``.
     proof = arming.operator_interlock
     if proof is None or proof.satisfied is not True or not proof.recording_receipt:
         return "operator_interlock_unproven"
@@ -1303,8 +1327,9 @@ async def run_dust_execution(
       :func:`resolve_dust_size` (via :func:`_resolve_wire_size`) over the PINNED
       ``wallet_equity_at_decision`` / ``fixed_fraction`` and the manifest/policy caps — NEVER from the
       agent ``request``'s ``confidence`` / requested ``size`` (they are untrusted metadata with no gate
-      or size effect). The E6-T1 ``size=1.0`` placeholder and ``1/native`` price placeholder are now
-      real (native probability → decimal odds via :func:`_native_to_decimal_odds`).
+      or size effect). The E6-T1 ``size=1.0`` placeholder is now real; a Mode-B order's wire price is
+      the admitted NATIVE probability (the real V2 order encodes it via ``makerAmount``/``takerAmount``
+      — no decimal-odds conversion, Gate#3 C-1 fix).
     * **Manifest authorization (AC-021/024).** A once-per-run deterministic
       :class:`StrategyAuthorizationDecision` (surfaced on the result): a mismatched declared request
       hash fails closed (``"manifest_hash_mismatch"``); an ``EXPERIMENTAL_DUST`` manifest admits
@@ -1427,7 +1452,9 @@ async def run_dust_execution(
 
     # Mode A→B HARD GATE + fail-closed arming: computed once; Mode A never arms (reason is None).
     arming_block_reason = (
-        _mode_b_arming_block_reason(arming, manifest=manifest) if mode == "live_guarded" else None
+        _mode_b_arming_block_reason(arming, manifest=manifest, signer=signer)
+        if mode == "live_guarded"
+        else None
     )
 
     # Gate#3 CRITICAL-1: dispatch on the ADMITTED typed intent. ``no_quote`` / ``cancel_all`` / a
@@ -1514,6 +1541,7 @@ async def run_dust_execution(
             own_legs=own_legs,
             tick_size=tick_size,
             wire_size=wire_size,
+            arming=arming,
             arming_block_reason=arming_block_reason,
             authorization_block_reason=authorization_block_reason,
             order_cap_block_reason=order_cap_block_reason,
@@ -1575,6 +1603,7 @@ async def _decide_and_submit(
     own_legs: Sequence[OwnOrderLeg],
     tick_size: float,
     wire_size: float,
+    arming: ModeBArming | None,
     arming_block_reason: AbstainReason | None,
     authorization_block_reason: AbstainReason | None,
     order_cap_block_reason: AbstainReason | None,
@@ -1695,6 +1724,7 @@ async def _decide_and_submit(
             seqc=seqc,
             wire_size=wire_size,
             tick_size=tick_size,
+            arming=arming,
             side=side,
             tif=tif,
         )
@@ -1733,6 +1763,7 @@ async def _decide_and_submit(
                 resting=resting,
                 replaces_client_order_id=replaces,
                 tick_size=tick_size,
+                arming=arming,
             )
         else:  # make_quote
             decision, events = await _emit_resting_lifecycle(
@@ -1744,6 +1775,7 @@ async def _decide_and_submit(
                 seqc=seqc,
                 resting=resting,
                 tick_size=tick_size,
+                arming=arming,
             )
     if decision.submitted:
         logger.info(
@@ -1801,6 +1833,7 @@ async def _emit_order_lifecycle(
     seqc: _SeqCounter,
     wire_size: float,
     tick_size: float,
+    arming: ModeBArming | None,
     side: str = "BUY",
     tif: TimeInForce = "FOK",
 ) -> tuple[SubmitDecision, tuple[LifecycleEvent, ...]]:
@@ -1812,7 +1845,7 @@ async def _emit_order_lifecycle(
 
     Emits, in order: ``OrderSubmitIntent -> OrderSubmitAttempt -> OrderAckEvent ->
     OrderStatusEvent -> RealFillReconciliation``. IDENTICAL event TYPES and ORDERING in both
-    modes — Mode A signs the SAME payload but NEVER calls ``adapter.submit_order`` (the E6-T1
+    modes — Mode A signs via the injected Mode-A fake signer but NEVER submits (the E6-T1
     ``adapter.submit_calls == 0`` / AC-017 invariant is unchanged); its ``OrderAckEvent`` honestly
     records ``ack_status="dry_run_not_submitted"`` and a ``None`` venue_order_id instead of
     fabricating a real acknowledgement.
@@ -1823,14 +1856,18 @@ async def _emit_order_lifecycle(
     AMBIGUOUS/``unresolved`` (the honest "no resolved fill" state), identically in both modes.
 
     E6-T4 binds the REAL executable size: ``wire_size`` (the PINNED-input :func:`resolve_dust_size`
-    value — never the agent request's ``confidence`` / requested ``size``) flows into the intent, the
-    signing payload, AND the submitted :class:`Order` identically. The Mode B order's decimal price is
-    the real native→decimal-odds conversion (:func:`_native_to_decimal_odds`), not the E6-T1 ``1/native``
-    placeholder. Mode A signs the SAME real-size payload but still never submits (AC-003 / AC-017).
+    value — never the agent request's ``confidence`` / requested ``size``) flows into the intent AND
+    the compiled Mode-B order identically.
 
-    PROVISIONAL: the presubmit record's ``venue_order_key`` is a placeholder distinct from the private
-    integrity digest — the real EIP-712 V2 order-hash binding
-    (``veridex.dust_execution.signing_compiler``) is wired by a later task.
+    Gate#3 C-1 fix (REQ-016/018): a Mode-B (``live_guarded``) submit NEVER reaches the generic
+    ``adapter.submit_order`` surface or the Mode-A fake signer. The structural guard
+    (:func:`_mode_b_arming_block_reason`) already required ``arming`` to be present, armed, and to
+    carry a non-``None`` ``write_port`` + ``order_auth`` before this function is ever reached in Mode
+    B, so the compiled order is submitted through the injected keyless
+    :class:`~veridex.dust_execution.mode_b_write_port.ModeBWritePort`, which returns the REAL compound
+    :class:`~veridex.dust_execution.contracts.PreSubmitRecord` (``venue_order_key`` is the official V2
+    order hash — never a provisional placeholder). Mode A keeps signing via the injected Mode-A fake
+    ``signer.sign_order`` seam (it never submits, so no real venue join key is needed for it).
     """
     assert quote.bid is not None and quote.ask is not None  # noqa: S101 - gate guaranteed both sides
 
@@ -1857,26 +1894,48 @@ async def _emit_order_lifecycle(
         decision_ts=now_ms,
     )
 
-    payload = SigningPayload(
-        token_id=quote.token_id,
-        side=side,
-        native_price=native_price,
-        size=wire_size,  # REAL mechanical size — resolve_dust_size(...), never the agent request
-        tif=tif,
-        # SINGLE SOURCE: the SAME runner ``tick_size`` the non-crossing gate evaluates against
-        # (_non_crossing_gate), losslessly stringified — never a second hardcoded literal that could
-        # drift from the tick the crossing check used once E6-T4 binds a real per-market tick.
-        tick_size=f"{tick_size}",
-        client_order_id=client_order_id,
-    )
-    signed = await signer.sign_order(payload)
-    presubmit = PreSubmitRecord(
-        integrity_commitment_hash=signed.order_digest,
-        # PROVISIONAL: a placeholder join key distinct from the private integrity digest — the
-        # real EIP-712 V2 order hash (signing_compiler.eip712_digest) is wired by a later task.
-        venue_order_key=f"provisional-vok:{signed.order_digest}",
-        captured_id=None,
-    )
+    submit_result: L2SubmitResult | None = None
+    if mode == "live_guarded":
+        # The structural guard already required: arming present+armed, write_port+order_auth bound,
+        # and signer.mode != "FAKE_LOCAL" — so every value dereferenced below is guaranteed non-None.
+        assert arming is not None  # noqa: S101 - guard required arming present+armed before dispatch
+        write_port = arming.write_port
+        order_auth = arming.order_auth
+        assert write_port is not None and order_auth is not None  # noqa: S101 - guard checked this
+        submit_result = await write_port.submit_order(
+            token_id=quote.token_id,
+            side=cast("WireSide", side),  # narrowed to BUY/SELL by _resolve_taker_side_tif
+            native_price=native_price,
+            size=wire_size,  # REAL mechanical size — resolve_dust_size(...), never the agent request
+            tif=tif,
+            post_only=False,  # a taker is never post-only (that is the resting-maker lane's field)
+            # SINGLE SOURCE: the SAME runner ``tick_size`` the non-crossing gate evaluates against
+            # (_non_crossing_gate) — never a second tick source (Gate#3 Stage-2).
+            tick_size=tick_size,
+            binding=arming.binding,
+            auth=order_auth,
+        )
+        presubmit = submit_result.presubmit_record
+    else:
+        # Mode A (dry_run): the SAME injected Mode-A fake signer as before — Mode A never submits, so
+        # no real venue join key is needed; its own placeholder digest is sufficient for the honest
+        # AC-003 event shape.
+        payload = SigningPayload(
+            token_id=quote.token_id,
+            side=side,
+            native_price=native_price,
+            size=wire_size,
+            tif=tif,
+            tick_size=f"{tick_size}",
+            client_order_id=client_order_id,
+        )
+        signed = await signer.sign_order(payload)
+        presubmit = PreSubmitRecord(
+            integrity_commitment_hash=signed.order_digest,
+            venue_order_key=f"mode-a-dry-run-digest:{signed.order_digest}",
+            captured_id=None,
+        )
+
     attempt = OrderSubmitAttempt(
         sequence_no=seqc.next(),
         event_type="OrderSubmitAttempt",
@@ -1891,21 +1950,18 @@ async def _emit_order_lifecycle(
 
     venue_order_id: str | None = None
     submitted = False
-    if mode == "live_guarded":
-        # Mode B, every gate clear: sign then submit the ONE order the gates protect. Both sides
-        # are present here (missing-side would have abstained above), so this is safe.
-        order = Order(
-            market_ref=manifest.market,
-            side=side,
-            size=wire_size,  # REAL mechanical size — resolve_dust_size(...), never the agent request
-            price=_native_to_decimal_odds(native_price),  # REAL native probability → decimal odds
-            venue=envelope.venue_allowlist[0] if envelope.venue_allowlist else "dust",
-            client_order_id=client_order_id,
-            tif=tif if tif in ("FAK", "FOK") else "FOK",
+    if submit_result is not None:
+        response = submit_result.response
+        order_id = (
+            str(response.get("orderID") or response.get("id") or "")
+            if isinstance(response, dict)
+            else ""
         )
-        ack = await adapter.submit_order(order)
-        venue_order_id = ack.venue_order_id
+        venue_order_id = order_id or None
         submitted = True
+        accepted = (
+            bool(response.get("success", bool(order_id))) if isinstance(response, dict) else bool(order_id)
+        )
         ack_event: OrderAckEvent = OrderAckEvent(
             sequence_no=seqc.next(),
             event_type="OrderAckEvent",
@@ -1914,12 +1970,12 @@ async def _emit_order_lifecycle(
             decision_id=decision_id,
             client_order_id=client_order_id,
             venue_order_id=venue_order_id,
-            ack_status="accepted" if ack.accepted else "not_accepted",
+            ack_status="accepted" if accepted else "not_accepted",
         )
     else:
         # Mode A (dry_run): the SAME typed ack-stage event, honestly recording that NO wire was
-        # touched — AC-003 keeps the contract SHAPE identical while never reaching
-        # adapter.submit_order (AC-017 / the E6-T1 invariant).
+        # touched — AC-003 keeps the contract SHAPE identical while never reaching a real submit
+        # surface (AC-017 / the E6-T1 invariant).
         ack_event = OrderAckEvent(
             sequence_no=seqc.next(),
             event_type="OrderAckEvent",
@@ -2030,13 +2086,20 @@ async def _emit_resting_lifecycle(
     seqc: _SeqCounter,
     resting: RestingOrder,
     tick_size: float,
+    arming: ModeBArming | None,
 ) -> tuple[SubmitDecision, tuple[LifecycleEvent, ...]]:
     """Build the per-decision lifecycle for a ``make_quote`` RESTING maker (GTC/GTD post-only).
 
-    Rests the maker on the E3-T3 :func:`~veridex.dust_execution.resting_order.submit_resting_order`
-    wire — a PHYSICALLY DISTINCT surface from the FAK/FOK taker ``adapter.submit_order`` (which is
-    NEVER called here), so ``submit_calls`` stays 0 for a maker. Mode A signs the SAME payload but
-    NEVER touches the resting wire (AC-017). Same event TYPES/ORDER as the taker lifecycle.
+    Gate#3 C-1 fix (REQ-016/018, AC-031): a Mode-B (``live_guarded``) maker submit NEVER reaches the
+    generic ``adapter``/E3-T3 ``submit_resting_order`` write surface — that surface is Mode-A/legacy
+    read-only territory now. The structural guard already required ``arming`` to be present, armed,
+    and to carry a non-``None`` ``write_port`` + ``order_auth``, so the compiled resting order is
+    submitted through the SAME injected keyless
+    :class:`~veridex.dust_execution.mode_b_write_port.ModeBWritePort` the taker lane uses — a
+    PHYSICALLY DISTINCT resting order type (:class:`RestingOrder` can never represent FAK/FOK) but
+    the SAME real money-moving composition (E3-T6 compile -> E3-T8 persist->sign->byte-verify->HMAC).
+    Mode A signs via the injected Mode-A fake ``signer.sign_order`` seam and NEVER submits (AC-017).
+    Same event TYPES/ORDER as the taker lifecycle.
     """
     now_ms = now_s * 1000
     client_order_id = resting.client_order_id
@@ -2057,21 +2120,48 @@ async def _emit_resting_lifecycle(
         decision_id=decision_id,
         decision_ts=now_ms,
     )
-    payload = SigningPayload(
-        token_id=resting.token_id,
-        side=resting.side,
-        native_price=resting.native_price,
-        size=resting.size,
-        tif=resting.tif,
-        tick_size=f"{tick_size}",
-        client_order_id=client_order_id,
-    )
-    signed = await signer.sign_order(payload)
-    presubmit = PreSubmitRecord(
-        integrity_commitment_hash=signed.order_digest,
-        venue_order_key=f"provisional-vok:{signed.order_digest}",
-        captured_id=None,
-    )
+
+    submit_result: L2SubmitResult | None = None
+    if mode == "live_guarded":
+        # The structural guard already required: arming present+armed, write_port+order_auth bound,
+        # and signer.mode != "FAKE_LOCAL" — so every value dereferenced below is guaranteed non-None.
+        assert arming is not None  # noqa: S101 - guard required arming present+armed before dispatch
+        write_port = arming.write_port
+        order_auth = arming.order_auth
+        assert write_port is not None and order_auth is not None  # noqa: S101 - guard checked this
+        submit_result = await write_port.submit_order(
+            token_id=resting.token_id,
+            side=resting.side,  # RestingOrder.side is already Literal["BUY","SELL"] == WireSide
+            native_price=resting.native_price,
+            size=resting.size,  # PINNED mechanical size — resolve_dust_size(...), never agent-supplied
+            tif=resting.tif,
+            post_only=resting.post_only,  # the §6 ALO post-only wire field — a REAL maker never crosses
+            tick_size=tick_size,
+            binding=arming.binding,
+            auth=order_auth,
+            expiration_s=resting.gtd_expiration_ts or 0,
+        )
+        presubmit = submit_result.presubmit_record
+    else:
+        # Mode A (dry_run): the SAME injected Mode-A fake signer as before — Mode A never rests an
+        # order, so no real venue join key is needed; its own placeholder digest is sufficient for
+        # the honest AC-003 event shape.
+        payload = SigningPayload(
+            token_id=resting.token_id,
+            side=resting.side,
+            native_price=resting.native_price,
+            size=resting.size,
+            tif=resting.tif,
+            tick_size=f"{tick_size}",
+            client_order_id=client_order_id,
+        )
+        signed = await signer.sign_order(payload)
+        presubmit = PreSubmitRecord(
+            integrity_commitment_hash=signed.order_digest,
+            venue_order_key=f"mode-a-dry-run-digest:{signed.order_digest}",
+            captured_id=None,
+        )
+
     attempt = OrderSubmitAttempt(
         sequence_no=seqc.next(),
         event_type="OrderSubmitAttempt",
@@ -2086,12 +2176,18 @@ async def _emit_resting_lifecycle(
 
     venue_order_id: str | None = None
     submitted = False
-    if mode == "live_guarded":
-        # Mode B, every gate clear: rest the ONE maker order the gates protect on the distinct
-        # resting wire (never the taker submit wire); fail closed if the adapter cannot rest.
-        ack = await submit_resting_order(resting, client=_require_resting_venue(adapter))
-        venue_order_id = ack.venue_order_id or None
+    if submit_result is not None:
+        response = submit_result.response
+        order_id = (
+            str(response.get("orderID") or response.get("id") or "")
+            if isinstance(response, dict)
+            else ""
+        )
+        venue_order_id = order_id or None
         submitted = True
+        accepted = (
+            bool(response.get("success", bool(order_id))) if isinstance(response, dict) else bool(order_id)
+        )
         ack_event: OrderAckEvent = OrderAckEvent(
             sequence_no=seqc.next(),
             event_type="OrderAckEvent",
@@ -2100,7 +2196,7 @@ async def _emit_resting_lifecycle(
             decision_id=decision_id,
             client_order_id=client_order_id,
             venue_order_id=venue_order_id,
-            ack_status="accepted" if ack.accepted else "not_accepted",
+            ack_status="accepted" if accepted else "not_accepted",
         )
     else:
         ack_event = OrderAckEvent(
@@ -2194,6 +2290,7 @@ async def _emit_cancel_replace_lifecycle(
     resting: RestingOrder,
     replaces_client_order_id: str,
     tick_size: float,
+    arming: ModeBArming | None,
 ) -> tuple[SubmitDecision, tuple[LifecycleEvent, ...]]:
     """Honest cancel-replace: cancel the NAMED order (E3-T4 ``DELETE /order``), then rest the replacement
     ONLY after complete venue truth proves the old order terminal-WITHDRAWN.
@@ -2247,6 +2344,7 @@ async def _emit_cancel_replace_lifecycle(
         seqc=seqc,
         resting=resting,
         tick_size=tick_size,
+        arming=arming,
     )
     return decision, (cancel_event, *resting_events)
 

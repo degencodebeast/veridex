@@ -25,6 +25,12 @@ import typing
 import pytest
 from pydantic import BaseModel, ValidationError
 
+# Gate#3 C-1 fix: an ARMED Mode-B run now structurally requires a non-FAKE_LOCAL signer + an
+# injected keyless write port + authorization context. REUSE the offline enclave-backed fixtures
+# already built for this in ``tests/test_dust_execution_runner.py`` (which itself reuses the E3-T8
+# fakes) rather than re-deriving them a third time.
+from tests.test_dust_execution_privy_signer import _WALLET_ADDRESS
+from tests.test_dust_execution_runner import _ORDER_AUTH, _default_write_port, _mode_b_signer
 from veridex.dust_execution import facade  # module handle: proposer looked up dynamically (RED-clean)
 from veridex.dust_execution.clobv2_gate import Clobv2GateResult
 from veridex.dust_execution.contracts import DustRunLabelEvent, OperatorInterlockEvent
@@ -212,7 +218,10 @@ def test_facade_result_never_carries_raw_handles_and_hash_mismatch_denies() -> N
 # AC-019/020/026.
 # ---------------------------------------------------------------------------
 
-_MM_TOKEN = "0xtokenYES"
+# A DECIMAL-integer-string CLOB token id (Gate#3 C-1 fix): the real V2 signing compiler parses
+# ``tokenId`` via ``int(...)`` (an ERC1155 token id), so an armed Mode-B submit that actually
+# compiles a real order needs a numerically-valid id — never a human-readable "0x..." placeholder.
+_MM_TOKEN = "111111111111111111111111111111"
 _MM_NOW_S = 1_700_000_000
 
 
@@ -541,7 +550,10 @@ def _mm_binding() -> ExecutionWalletBinding:
     return ExecutionWalletBinding(
         provider="privy",
         wallet_ref="wallet-mode-b",
-        wallet_address="0xExecWalletModeB",
+        # Gate#3 C-1 fix: the pure-stdlib secp256k1 "enclave" address the offline recording-fake
+        # Privy client signs for (see ``tests/test_dust_execution_privy_signer.py``) — so a genuine
+        # armed Mode-B submit's recover-and-require check passes cleanly.
+        wallet_address=_WALLET_ADDRESS,
         chain_id=CHAIN_ID_POLYGON,
         venue="polymarket",
         privy_policy_content_hash=policy.content_hash(),
@@ -551,7 +563,9 @@ def _mm_binding() -> ExecutionWalletBinding:
     )
 
 
-def _mm_arming(binding: ExecutionWalletBinding) -> ModeBArming:
+def _mm_arming(
+    binding: ExecutionWalletBinding, *, write_port: object | None = None
+) -> ModeBArming:
     return ModeBArming(
         mode_a_passed=True,
         clobv2_gate=Clobv2GateResult(
@@ -572,6 +586,11 @@ def _mm_arming(binding: ExecutionWalletBinding) -> ModeBArming:
         binding=binding,
         live_policy=_mm_policy(),
         live_quorum=_mm_quorum(),
+        # Gate#3 C-1 fix: the narrow injected keyless write port + signed authorization context — an
+        # armed Mode-B run has no real money-moving surface without both (REUSES the offline E3-T8
+        # stack via ``tests.test_dust_execution_runner``'s fixtures).
+        write_port=write_port if write_port is not None else _default_write_port(binding),  # type: ignore[arg-type]
+        order_auth=_ORDER_AUTH,
     )
 
 
@@ -617,7 +636,8 @@ async def _drive_mode_b(
     return await facade.propose_mm_execution(
         request,
         adapter=adapter,
-        signer=LocalFakeWalletControlPlane(),
+        # Gate#3 C-1 fix: an ARMED Mode-B run structurally refuses the Mode-A FAKE_LOCAL signer.
+        signer=_mode_b_signer(),
         sources=_MMScriptedSource(_mm_fresh_quote()),
         now_fn=_mm_clock,
         sleep_fn=_mm_noop_sleep,
@@ -724,17 +744,19 @@ async def test_mode_b_arms_and_records_when_all_operator_preconditions_are_satis
     per-precondition no-go MUTATION meaningful (not vacuously green)."""
     binding = _mm_binding()
     adapter = FakeVenueAdapter(fill=True)
+    write_port = _default_write_port(binding)
     recorded: list[OperatorInterlockEvent] = []
 
     result = await _drive_mode_b(
         interlock=_full_interlock(),
-        arming=_mm_arming(binding),
+        arming=_mm_arming(binding, write_port=write_port),
         binding=binding,
         adapter=adapter,
         interlock_sink=recorded,
     )
 
-    assert adapter.submit_calls == 1, "a fully-satisfied interlock + armed bundle must reach the wire"
+    assert write_port.submit_calls == 1, "a fully-satisfied interlock + armed bundle must reach the wire"
+    assert adapter.submit_calls == 0, "Mode B must NEVER reach the generic adapter submit surface"
     assert result.admission == "APPROVED"
     assert tuple(event.precondition for event in recorded) == _EXPECTED_PRECONDITIONS
     assert all(event.satisfied is True for event in recorded)
@@ -849,7 +871,8 @@ async def _drive_mode_b_kind(
     return await facade.propose_mm_execution(
         request,
         adapter=adapter,
-        signer=LocalFakeWalletControlPlane(),
+        # Gate#3 C-1 fix: an ARMED Mode-B run structurally refuses the Mode-A FAKE_LOCAL signer.
+        signer=_mode_b_signer(),
         sources=_MMScriptedSource(_mm_fresh_quote()),
         now_fn=_mm_clock,
         sleep_fn=_mm_noop_sleep,
@@ -931,19 +954,21 @@ async def test_result_reports_submitted_for_a_clean_armed_take() -> None:
     makes the withheld/abstained cases meaningful (Gate#3 MAJOR-3)."""
     binding = _mm_binding()
     adapter = FakeVenueAdapter(fill=True)
+    write_port = _default_write_port(binding)
     recorded: list[OperatorInterlockEvent] = []
 
     result = await _drive_mode_b_kind(
         intent_kind="take",
         intent_params=_taker_params(),
-        arming=_mm_arming(binding),
+        arming=_mm_arming(binding, write_port=write_port),
         interlock=_full_interlock(),
         binding=binding,
         adapter=adapter,
         interlock_sink=recorded,
     )
 
-    assert adapter.submit_calls == 1
+    assert write_port.submit_calls == 1
+    assert adapter.submit_calls == 0, "Mode B must NEVER reach the generic adapter submit surface"
     assert result.admission == "APPROVED"
     assert result.execution_status == "SUBMITTED"
 
