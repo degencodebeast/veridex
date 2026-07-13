@@ -342,9 +342,34 @@ class DustRunLabelEvent(_EventEnvelope):
     edge_label: Literal["NOT_PROVEN_EDGE"]
 
 
+#: The CLOSED VOCABULARY of the five REQ-005/006 human operator preconditions (Gate#3 MAJOR-1). Each
+#: is a non-secret closed-vocab id (SEC-005); the interlock RECORDS the operator's assertion for each
+#: and concludes nothing on their behalf. Defined here (the lowest lane module) so the store validator,
+#: the runner, and the facade share ONE source of truth for the canonical set + order.
+PRECONDITION_ISOLATED_FUNDED_WALLET = "isolated_funded_wallet"
+PRECONDITION_JURISDICTION_COMFORT = "operator_jurisdiction_comfort"
+PRECONDITION_MAX_CAPITAL_AT_RISK = "declared_max_capital_at_risk"
+PRECONDITION_KILL_SWITCH_READY = "kill_switch_ready"
+PRECONDITION_FIRST_ORDER_AUTHORIZED = "first_order_authorized"
+
+#: The five preconditions in the fixed recording order (deterministic REQ-005 audit trail). The armed
+#: interlock emission is EXACTLY one satisfied event per name, in THIS order.
+OPERATOR_PRECONDITIONS: tuple[str, ...] = (
+    PRECONDITION_ISOLATED_FUNDED_WALLET,
+    PRECONDITION_JURISDICTION_COMFORT,
+    PRECONDITION_MAX_CAPITAL_AT_RISK,
+    PRECONDITION_KILL_SWITCH_READY,
+    PRECONDITION_FIRST_ORDER_AUTHORIZED,
+)
+
+
 class OperatorInterlockEvent(_EventEnvelope):
     """Records one human precondition being satisfied + explicit first-order authorization
-    (SAF human gate). ``operator_authorization_ref`` is a non-secret reference."""
+    (SAF human gate). ``operator_authorization_ref`` is a non-secret reference. ``precondition`` is
+    drawn from the closed :data:`OPERATOR_PRECONDITIONS` vocabulary (validated as a SET by
+    :func:`~veridex.dust_execution.operator_interlock_store.interlock_events_are_canonical`, not at
+    the field level, so an adversarial unknown-precondition event is still constructible for a
+    fail-closed test)."""
 
     precondition: str
     satisfied: bool

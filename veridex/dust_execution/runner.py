@@ -99,7 +99,10 @@ from veridex.dust_execution.manifest import (
 )
 from veridex.dust_execution.mode_b_write_port import ModeBWritePort
 from veridex.dust_execution.noncrossing import LegKind, OwnOrderLeg, Side, check_non_crossing
-from veridex.dust_execution.operator_interlock_store import OperatorInterlockStore
+from veridex.dust_execution.operator_interlock_store import (
+    OperatorInterlockStore,
+    interlock_events_are_canonical,
+)
 from veridex.dust_execution.privy_control_plane import (
     PrivyAuthContext,
     PrivyPreflightResult,
@@ -1215,8 +1218,15 @@ def _mode_b_arming_block_reason(
     # Checked LAST so a technical-precondition failure still surfaces its own reason; a missing /
     # unsatisfied / forged / never-issued / wrong-session / altered-event / wrong-attempt proof (or a
     # missing store to verify against) fails closed as ``operator_interlock_unproven``.
+    # Gate#3 MAJOR-1: the verdict is DERIVED FROM THE EVENTS, never from the caller-controlled
+    # ``proof.satisfied`` bool. Receipt authenticity (``store.verify`` below) only proves "these bytes
+    # were stored", NOT "all five human gates passed" — so the runner INDEPENDENTLY re-validates that
+    # ``proof.events`` ARE the canonical five REQ-005/006 preconditions (all satisfied + first-order
+    # authorized, consistent non-empty operator-auth ref, canonical order) BEFORE any write-port I/O.
+    # SEMANTICS first (this run's proof events), THEN AUTHENTICITY (a receipt the store actually issued
+    # for THIS run's session/events/auth/attempt); either failing keeps Mode B UNARMED (fail closed).
     proof = arming.operator_interlock
-    if proof is None or proof.satisfied is not True or store is None:
+    if proof is None or store is None or not interlock_events_are_canonical(proof.events):
         return "operator_interlock_unproven"
     if not store.verify(
         session_id=session_id,

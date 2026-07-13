@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import base64
 import inspect
+from collections.abc import Callable
 from typing import cast
 
 import pytest
@@ -1530,6 +1531,231 @@ async def test_direct_runner_call_with_missing_record_receipt_stays_unarmed() ->
     )
 
     assert adapter.submit_calls == 0, "a receipt-shaped string the store never issued must NOT arm — M-1"
+    (decision,) = result.decisions
+    assert decision.submitted is False
+    assert decision.abstain_reason == "operator_interlock_unproven"
+
+
+# --- Gate#3 MAJOR-1: the runner must verify the canonical-5 event SEMANTICS, not just authenticity ---
+#
+# M-1 closed the AUTHENTICITY axis (forged / wrong-session / altered / never-issued receipts fail to
+# verify). But a store-issued receipt only proves "these bytes were durably stored" — NOT "all five
+# human gates passed". A genuinely-issued/verifying receipt over SEMANTICALLY-FALSE or MALFORMED events
+# (all satisfied=False, a missing/duplicate/reordered/unknown precondition, a False first-order
+# authorization, or an empty/inconsistent operator-auth ref) must STILL fail closed. The runner is the
+# single public enforcer, so it must INDEPENDENTLY re-validate ``proof.events`` against the canonical
+# five REQ-005/006 preconditions and DERIVE the arming verdict from the EVENTS — never from the
+# caller-controlled ``proof.satisfied`` bool. These tests inject a store whose ``verify`` ALWAYS returns
+# True (authenticity satisfied) so the ONLY thing that can block the arm is the runner's semantic
+# validation; a validation removal (mutation) re-arms them.
+
+
+class _SemanticBlindInterlockStore:
+    """A store that issues + verifies a receipt over ANY events with NO semantic check.
+
+    Models an AUTHENTIC persistence layer — exactly the pre-fix ``InMemoryOperatorInterlockStore``
+    behaviour, and the guarantee the MAJOR-1 finding says persistence actually gives you: "these bytes
+    were stored", NOT "the five human gates passed". ``verify`` returns True unconditionally so these
+    runner tests isolate the runner's INDEPENDENT event-semantics validation: authenticity is always
+    satisfied, so the sole remaining gate is the canonical-5 validator. If that validator is removed,
+    every adversarial case below re-arms (mutation teeth).
+    """
+
+    def record(
+        self,
+        *,
+        session_id: str,
+        events: tuple[OperatorInterlockEvent, ...],
+        operator_authorization_ref: str | None,
+        arming_attempt_ref: str,
+    ) -> str:
+        return f"operator-interlock:{session_id}:blindissued00000000000000000000000000"
+
+    def verify(
+        self,
+        *,
+        session_id: str,
+        events: tuple[OperatorInterlockEvent, ...],
+        operator_authorization_ref: str | None,
+        arming_attempt_ref: str,
+        receipt: str,
+    ) -> bool:
+        return True  # AUTHENTICITY always satisfied — SEMANTICS are the runner's job
+
+
+def _canonical_false_events() -> tuple[OperatorInterlockEvent, ...]:
+    """Codex's exact object: the five canonical preconditions, all ``satisfied=False`` AND
+    ``first_order_authorized=False`` (no human gate passed) but with the canonical names/order."""
+    return tuple(
+        event.model_copy(update={"satisfied": False, "first_order_authorized": False})
+        for event in _INTERLOCK_EVENTS
+    )
+
+
+def _events_missing_one() -> tuple[OperatorInterlockEvent, ...]:
+    """Only four of the five canonical events (the last precondition dropped)."""
+    return _INTERLOCK_EVENTS[:-1]
+
+
+def _events_with_duplicate() -> tuple[OperatorInterlockEvent, ...]:
+    """Five events, but the second precondition is a DUPLICATE of the first (one canonical name absent)."""
+    return (_INTERLOCK_EVENTS[0], _INTERLOCK_EVENTS[0]) + _INTERLOCK_EVENTS[2:]
+
+
+def _events_reordered() -> tuple[OperatorInterlockEvent, ...]:
+    """The five canonical events with the first two swapped (out of canonical order)."""
+    return (_INTERLOCK_EVENTS[1], _INTERLOCK_EVENTS[0]) + _INTERLOCK_EVENTS[2:]
+
+
+def _events_with_unknown_precondition() -> tuple[OperatorInterlockEvent, ...]:
+    """Five satisfied events, but the first carries a precondition name NOT in the canonical set."""
+    return (
+        _INTERLOCK_EVENTS[0].model_copy(update={"precondition": "totally_unknown_precondition"}),
+    ) + _INTERLOCK_EVENTS[1:]
+
+
+def _events_first_order_unauthorized() -> tuple[OperatorInterlockEvent, ...]:
+    """Five canonical events, all ``satisfied=True`` but ``first_order_authorized=False`` on every one
+    (REQ-005/006 requires the explicit first-order authorization the armed emission carries)."""
+    return tuple(
+        event.model_copy(update={"first_order_authorized": False}) for event in _INTERLOCK_EVENTS
+    )
+
+
+def _events_with_empty_auth_ref() -> tuple[OperatorInterlockEvent, ...]:
+    """Five canonical satisfied events, but with an EMPTY operator-authorization ref on every one."""
+    return tuple(
+        event.model_copy(update={"operator_authorization_ref": ""}) for event in _INTERLOCK_EVENTS
+    )
+
+
+def _events_with_inconsistent_auth_ref() -> tuple[OperatorInterlockEvent, ...]:
+    """Five canonical satisfied events whose operator-authorization ref is INCONSISTENT across events."""
+    return (
+        _INTERLOCK_EVENTS[0].model_copy(update={"operator_authorization_ref": "op-ref-DIFFERENT"}),
+    ) + _INTERLOCK_EVENTS[1:]
+
+
+async def test_direct_runner_call_with_all_false_events_over_verifying_receipt_stays_unarmed() -> None:
+    """CODEX REPRODUCTION: a receipt that AUTHENTICALLY verifies, presented over the five canonical
+    events all ``satisfied=False`` / ``first_order_authorized=False`` with ``proof.satisfied=True``,
+    must NOT arm. Persistence integrity proves "these bytes were stored", never "all five gates passed";
+    the runner must derive the verdict from the EVENTS, not the caller's ``proof.satisfied`` bool.
+
+    RED before the fix: the runner trusts ``proof.satisfied`` + ``store.verify`` (both True here) and
+    submits real money over five FALSE operator-interlock events. GREEN after: the runner independently
+    re-validates the events, they are all-false → ``operator_interlock_unproven`` → no wire.
+    """
+    binding = _binding()
+    adapter = RecordingFakeAdapter(fill=True)
+    store = _SemanticBlindInterlockStore()
+    false_events = _canonical_false_events()
+    receipt = store.record(
+        session_id=_MODE_B_SESSION_ID,
+        events=false_events,
+        operator_authorization_ref=_INTERLOCK_OPERATOR_AUTH_REF,
+        arming_attempt_ref=_ORDER_AUTH.idempotency_key,
+    )
+    proof = OperatorInterlockProof(
+        satisfied=True,  # caller-controlled honesty claim — must NOT be trusted
+        recording_receipt=receipt,
+        events=false_events,
+        operator_authorization_ref=_INTERLOCK_OPERATOR_AUTH_REF,
+    )
+
+    result = await _run_guarded(
+        adapter=adapter,
+        arming=_arming(binding, operator_interlock=proof),
+        operator_interlock_store=store,
+    )
+
+    assert adapter.submit_calls == 0, (
+        "a verifying receipt over five satisfied=False events must NOT arm — MAJOR-1"
+    )
+    (decision,) = result.decisions
+    assert decision.submitted is False
+    assert decision.abstain_reason == "operator_interlock_unproven"
+
+
+async def test_direct_runner_call_with_blind_store_and_canonical_events_arms() -> None:
+    """POSITIVE CONTROL for the semantic-validation cases: with the SAME always-verifying store but the
+    genuine canonical-5 events (all satisfied, first-order authorized, consistent non-empty auth ref),
+    Mode B ARMS. Proves the adversarial cases below fail on their MALFORMATION, not on the store."""
+    binding = _binding()
+    adapter = RecordingFakeAdapter(fill=True)
+    write_port = _default_write_port(binding)
+    store = _SemanticBlindInterlockStore()
+    receipt = store.record(
+        session_id=_MODE_B_SESSION_ID,
+        events=_INTERLOCK_EVENTS,
+        operator_authorization_ref=_INTERLOCK_OPERATOR_AUTH_REF,
+        arming_attempt_ref=_ORDER_AUTH.idempotency_key,
+    )
+    proof = OperatorInterlockProof(
+        satisfied=True,
+        recording_receipt=receipt,
+        events=_INTERLOCK_EVENTS,
+        operator_authorization_ref=_INTERLOCK_OPERATOR_AUTH_REF,
+    )
+
+    result = await _run_guarded(
+        adapter=adapter,
+        arming=_arming(binding, write_port=write_port, operator_interlock=proof),
+        operator_interlock_store=store,
+    )
+
+    assert write_port.submit_calls == 1, "canonical-5 satisfied events must let Mode B arm"
+    (decision,) = result.decisions
+    assert decision.submitted is True and decision.abstain_reason is None
+
+
+@pytest.mark.parametrize(
+    "events_builder",
+    [
+        pytest.param(_events_missing_one, id="missing_precondition"),
+        pytest.param(_events_with_duplicate, id="duplicate_precondition"),
+        pytest.param(_events_reordered, id="reordered_preconditions"),
+        pytest.param(_events_with_unknown_precondition, id="unknown_precondition"),
+        pytest.param(_events_first_order_unauthorized, id="first_order_unauthorized"),
+        pytest.param(_events_with_empty_auth_ref, id="empty_operator_auth_ref"),
+        pytest.param(_events_with_inconsistent_auth_ref, id="inconsistent_operator_auth_ref"),
+    ],
+)
+async def test_direct_runner_call_with_non_canonical_events_over_verifying_receipt_stays_unarmed(
+    events_builder: Callable[[], tuple[OperatorInterlockEvent, ...]],
+) -> None:
+    """Each MALFORMED interlock-event set — a missing / duplicate / reordered / unknown precondition, a
+    withheld first-order authorization, or an empty / inconsistent operator-auth ref — presented over an
+    AUTHENTICALLY-verifying receipt with ``proof.satisfied=True`` must fail closed BEFORE any write-port
+    I/O → ``operator_interlock_unproven``. Only the exact canonical-5 emission may arm.
+
+    RED before the fix: the runner never inspects event semantics, so every malformed set arms real
+    money. GREEN after: the canonical-5 validator rejects each one → no wire.
+    """
+    binding = _binding()
+    adapter = RecordingFakeAdapter(fill=True)
+    store = _SemanticBlindInterlockStore()
+    events = events_builder()
+    receipt = store.record(
+        session_id=_MODE_B_SESSION_ID,
+        events=events,
+        operator_authorization_ref=_INTERLOCK_OPERATOR_AUTH_REF,
+        arming_attempt_ref=_ORDER_AUTH.idempotency_key,
+    )
+    proof = OperatorInterlockProof(
+        satisfied=True,
+        recording_receipt=receipt,
+        events=events,
+        operator_authorization_ref=_INTERLOCK_OPERATOR_AUTH_REF,
+    )
+
+    result = await _run_guarded(
+        adapter=adapter,
+        arming=_arming(binding, operator_interlock=proof),
+        operator_interlock_store=store,
+    )
+
+    assert adapter.submit_calls == 0, "a non-canonical interlock event set must NOT arm — MAJOR-1"
     (decision,) = result.decisions
     assert decision.submitted is False
     assert decision.abstain_reason == "operator_interlock_unproven"

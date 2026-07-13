@@ -41,6 +41,12 @@ from typing import TYPE_CHECKING, Literal
 from pydantic import field_validator
 
 from veridex.dust_execution.contracts import (
+    OPERATOR_PRECONDITIONS,
+    PRECONDITION_FIRST_ORDER_AUTHORIZED,
+    PRECONDITION_ISOLATED_FUNDED_WALLET,
+    PRECONDITION_JURISDICTION_COMFORT,
+    PRECONDITION_KILL_SWITCH_READY,
+    PRECONDITION_MAX_CAPITAL_AT_RISK,
     DustRunLabelEvent,
     EvidenceClass,
     ExecutionMode,
@@ -49,7 +55,10 @@ from veridex.dust_execution.contracts import (
     _FrozenModel,
     _reject_price_out_of_unit_interval,
 )
-from veridex.dust_execution.operator_interlock_store import OperatorInterlockStore
+from veridex.dust_execution.operator_interlock_store import (
+    OperatorInterlockStore,
+    interlock_events_are_canonical,
+)
 from veridex.runtime.runtime_events import RuntimeEventType, RuntimeStatus, runtime_event
 
 if TYPE_CHECKING:
@@ -363,26 +372,11 @@ def _to_tool_result(
 # ``"mode_b_not_armed"`` outcome, never a parallel arming path.
 # ---------------------------------------------------------------------------
 
-#: Precondition (a): an isolated FUNDED execution wallet is provisioned (SAF human gate).
-PRECONDITION_ISOLATED_FUNDED_WALLET = "isolated_funded_wallet"
-#: Precondition (b): the OPERATOR asserts their own jurisdiction/legal comfort. The model RECORDS
-#: this assertion and makes NO jurisdiction/legal conclusion on the operator's behalf (REQ-006).
-PRECONDITION_JURISDICTION_COMFORT = "operator_jurisdiction_comfort"
-#: Precondition (c): a positive max capital-at-risk is DECLARED by the operator.
-PRECONDITION_MAX_CAPITAL_AT_RISK = "declared_max_capital_at_risk"
-#: Precondition (d): the operator confirms kill-switch readiness.
-PRECONDITION_KILL_SWITCH_READY = "kill_switch_ready"
-#: Precondition (e): the operator EXPLICITLY authorizes the first order.
-PRECONDITION_FIRST_ORDER_AUTHORIZED = "first_order_authorized"
-
-#: The five human operator preconditions, in the fixed recording order (deterministic audit trail).
-OPERATOR_PRECONDITIONS: tuple[str, ...] = (
-    PRECONDITION_ISOLATED_FUNDED_WALLET,
-    PRECONDITION_JURISDICTION_COMFORT,
-    PRECONDITION_MAX_CAPITAL_AT_RISK,
-    PRECONDITION_KILL_SWITCH_READY,
-    PRECONDITION_FIRST_ORDER_AUTHORIZED,
-)
+#: The five human operator preconditions + their fixed recording order are the closed vocabulary shared
+#: lane-wide; they now live in ``contracts`` (the lowest module) so the store validator, the runner,
+#: and this facade agree on ONE canonical set. They are IMPORTED above (not redefined here) and used by
+#: :meth:`OperatorInterlock.satisfied_by_precondition` / :func:`evaluate_operator_interlock` below; the
+#: import keeps ``from veridex.dust_execution.facade import OPERATOR_PRECONDITIONS`` working (back-compat).
 
 
 class OperatorInterlock(_FrozenModel):
@@ -585,7 +579,16 @@ async def propose_mm_execution(
         # the runner will run under (its provisional session id), the ordered events, the operator-auth
         # ref, and this run's arming-attempt ref.
         receipt: str | None = None
-        if interlock_gate.armed and interlock_store is not None:
+        # Gate#3 MAJOR-1: only record (and thus arm) when the events are the canonical-5 SEMANTICS the
+        # store + runner both enforce — the SAME shared validator. ``armed`` already requires all five
+        # satisfied, but the validator additionally requires a consistent NON-EMPTY operator-auth ref
+        # (and canonical order/sequence), so an armed-but-refless interlock withholds the bundle here
+        # rather than tripping the store's fail-closed refusal.
+        if (
+            interlock_gate.armed
+            and interlock_store is not None
+            and interlock_events_are_canonical(interlock_gate.events)
+        ):
             receipt = interlock_store.record(
                 session_id=provisional_session_id(manifest, request.mode),
                 events=interlock_gate.events,

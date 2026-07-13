@@ -27,7 +27,49 @@ import json
 from dataclasses import dataclass
 from typing import Protocol, runtime_checkable
 
-from veridex.dust_execution.contracts import OperatorInterlockEvent
+from veridex.dust_execution.contracts import OPERATOR_PRECONDITIONS, OperatorInterlockEvent
+
+
+def interlock_events_are_canonical(events: tuple[OperatorInterlockEvent, ...]) -> bool:
+    """Whether ``events`` are the canonical five REQ-005/006 human-precondition SEMANTICS (MAJOR-1).
+
+    The SHARED semantic validator applied at BOTH the store's ``record`` (defence in depth) AND the
+    runner's arming check (the single public enforcer). It accepts EXACTLY the armed emission of
+    :func:`~veridex.dust_execution.facade.evaluate_operator_interlock` — one event per canonical
+    precondition, in :data:`~veridex.dust_execution.contracts.OPERATOR_PRECONDITIONS` order, every one
+    ``satisfied`` with ``first_order_authorized`` and a consistent non-empty ``operator_authorization_ref``
+    — and REJECTS everything else. Receipt authenticity proves only "these bytes were stored"; this
+    proves "all five human gates passed". Requires:
+
+    * EXACTLY the five canonical precondition names, in the canonical order (no missing, duplicate,
+      reordered, or unknown-precondition event) with the matching 1-based ``sequence_no``;
+    * every event ``satisfied is True`` AND ``first_order_authorized is True`` (the armed emission
+      stamps the operator's explicit first-order authorization on every recorded event);
+    * a single, consistent, non-empty ``operator_authorization_ref`` across all events.
+
+    Pure and side-effect-free — carries no secret and returns a bool only (SEC-005).
+    """
+    if len(events) != len(OPERATOR_PRECONDITIONS):
+        return False
+    refs = {event.operator_authorization_ref for event in events}
+    if len(refs) != 1:
+        return False
+    (ref,) = refs
+    if not ref:  # None or empty string — a non-empty operator-authorization ref is REQUIRED
+        return False
+    for sequence_no, (event, expected_precondition) in enumerate(
+        zip(events, OPERATOR_PRECONDITIONS, strict=True),  # lengths equal-checked above
+        start=1,
+    ):
+        if event.precondition != expected_precondition:
+            return False
+        if event.sequence_no != sequence_no:
+            return False
+        if event.satisfied is not True:
+            return False
+        if event.first_order_authorized is not True:
+            return False
+    return True
 
 
 @dataclass(frozen=True)
@@ -136,6 +178,16 @@ class InMemoryOperatorInterlockStore:
         operator_authorization_ref: str | None,
         arming_attempt_ref: str,
     ) -> str:
+        # Gate#3 MAJOR-1 defence-in-depth: a receipt commits to "these bytes were stored", so REFUSE to
+        # issue one over events that are not the canonical five satisfied preconditions — a stored row
+        # must never be able to certify a semantically-false / malformed human interlock. The runner
+        # re-validates independently (it is the single public enforcer); this fails closed at the source.
+        if not interlock_events_are_canonical(events):
+            raise ValueError(
+                "refusing to issue an operator-interlock receipt over non-canonical events: the five "
+                "REQ-005/006 human preconditions must each be satisfied, first-order authorized, and "
+                "carry a consistent non-empty operator_authorization_ref (Gate#3 MAJOR-1)"
+            )
         digest = interlock_binding_digest(
             session_id=session_id,
             events=events,
@@ -184,4 +236,5 @@ __all__ = [
     "OperatorInterlockRow",
     "OperatorInterlockStore",
     "interlock_binding_digest",
+    "interlock_events_are_canonical",
 ]
