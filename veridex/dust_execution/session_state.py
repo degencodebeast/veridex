@@ -48,6 +48,7 @@ never an operator secret, a key, or a live handle.
 
 from __future__ import annotations
 
+import threading
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -205,9 +206,12 @@ class DurableSessionStateProvider(Protocol):
         * ``RESERVED`` — a FRESH ``attempt_id`` with nothing unresolved in scope: a fresh possibly-live
           slot is appended (it counts toward the caps immediately and durably); the caller may proceed.
 
-        A raise (durable-store outage) signals the facade to FAIL CLOSED (no wire I/O). For a durable
-        provider this method must execute the scope check AND the reserve/insert in ONE transaction /
-        critical section (for the in-memory provider a single synchronous method already is).
+        A raise (durable-store outage) signals the facade to FAIL CLOSED (no wire I/O). This method MUST
+        execute the scope check AND the reserve/insert in ONE critical section spanning BOTH: a durable
+        provider uses a single serializable transaction / row lock / advisory lock; the in-memory provider
+        holds a per-provider lock across the whole check-and-insert. A bare synchronous method is NOT
+        sufficient — the GIL switches threads at bytecode boundaries, so an unlocked check-then-insert lets
+        two concurrent callers both observe the empty scope before either inserts and both reserve.
         """
         ...
 
@@ -303,25 +307,36 @@ class InMemoryDurableSessionStateProvider:
     def __init__(self) -> None:
         self._reservations: dict[str, _Reservation] = {}
         self._fills: dict[str, list[RealizedFillRecord]] = {}
+        # R7-MAJOR-1: ONE per-provider state lock guarding EVERY access to the shared ``_reservations`` /
+        # ``_fills`` state. A single synchronous Python method is NOT a critical section across worker
+        # threads — the GIL switches at bytecode boundaries, so an unlocked ``reserve_or_freeze``
+        # (scope-check THEN insert) lets two concurrent callers both observe the empty scope before either
+        # inserts and BOTH reserve, standing up two possibly-live orders. This lock makes the whole
+        # scope-check-and-insert (and every other mutation/consistent read) a REAL critical section. It is
+        # a NON-REENTRANT :class:`threading.Lock`: every PUBLIC method acquires it exactly once and calls
+        # ONLY the lock-free private helpers (``_reserve_or_load`` / ``_has_unresolved`` / ``_count``)
+        # while holding it, so it can never be re-entered under itself (no self-deadlock).
+        self._lock = threading.Lock()
 
     def load(self, *, session_id: str, now: datetime) -> DurableSessionState:
-        today = now.astimezone(UTC).replace(hour=0, minute=0, second=0, microsecond=0)
-        fills = self._fills.get(session_id, [])
-        net_session = sum(fill.net_pnl() for fill in fills)
-        net_day = sum(fill.net_pnl() for fill in fills if _utc_day(fill.fill_ts_ms) == today)
-        risk = RiskAccumulator.seeded(
-            session_id=session_id,
-            net_session=net_session,
-            net_day=net_day,
-            current_day=today,
-        )
-        count = self._count(session_id)
-        return DurableSessionState(
-            session_identity=session_id,
-            risk=risk,
-            prior_session_order_count=count,
-            prior_day_order_count=count,
-        )
+        with self._lock:
+            today = now.astimezone(UTC).replace(hour=0, minute=0, second=0, microsecond=0)
+            fills = self._fills.get(session_id, [])
+            net_session = sum(fill.net_pnl() for fill in fills)
+            net_day = sum(fill.net_pnl() for fill in fills if _utc_day(fill.fill_ts_ms) == today)
+            risk = RiskAccumulator.seeded(
+                session_id=session_id,
+                net_session=net_session,
+                net_day=net_day,
+                current_day=today,
+            )
+            count = self._count(session_id)
+            return DurableSessionState(
+                session_identity=session_id,
+                risk=risk,
+                prior_session_order_count=count,
+                prior_day_order_count=count,
+            )
 
     def reserve(
         self,
@@ -336,16 +351,21 @@ class InMemoryDurableSessionStateProvider:
         # the facade how to proceed; only a FRESH slot (no prior row / a prior RELEASED attempt) appends
         # a new possibly-live row and returns RESERVED. This is the STANDALONE reserve-or-load (no session
         # scope check); the facade money path uses the ATOMIC :meth:`reserve_or_freeze` instead.
-        return self._reserve_or_load(
-            session_identity=session_identity, attempt_id=attempt_id, venue_order_key=venue_order_key
-        )
+        with self._lock:
+            return self._reserve_or_load(
+                session_identity=session_identity,
+                attempt_id=attempt_id,
+                venue_order_key=venue_order_key,
+            )
 
     def _reserve_or_load(
         self, *, session_identity: str, attempt_id: str, venue_order_key: str | None = None
     ) -> ReservationOutcome:
         # The reserve-or-load primitive shared by :meth:`reserve` and :meth:`reserve_or_freeze`, so the
         # atomic op never round-trips through the PUBLIC ``reserve`` (a recording spy can then prove the
-        # facade calls only the single atomic op on the money path).
+        # facade calls only the single atomic op on the money path). Lock-free primitive: ONLY called from
+        # public methods already holding ``self._lock`` — so its read-then-insert stays inside the caller's
+        # held-lock critical section (no re-entry, no self-deadlock).
         existing = self._reservations.get(attempt_id)
         if existing is not None:
             if existing.recon_state == "RESOLVED":
@@ -369,8 +389,14 @@ class InMemoryDurableSessionStateProvider:
     ) -> ScopedReservationOutcome:
         # Gate#3 R6-MAJOR-2: the ATOMIC reserve-or-freeze — the SINGLE critical section that fuses the
         # session-scope freeze check with the reserve-or-load, so two requests can NEVER both observe an
-        # empty scope and both reserve (the split check-then-reserve TOCTOU). For an in-memory provider a
-        # single synchronous method IS the critical section (no lock needed).
+        # empty scope and both reserve (the split check-then-reserve TOCTOU).
+        #
+        # R7-MAJOR-1: a bare synchronous method is NOT that critical section across worker threads — the
+        # GIL switches threads at bytecode boundaries, so two concurrent callers can BOTH run the scope
+        # check (observe the empty scope) before EITHER inserts, and both reserve. The whole scope-check
+        # AND insert therefore run under the per-provider ``_lock``, so the check-and-insert is indivisible
+        # (the ``_has_unresolved`` / ``_reserve_or_load`` helpers are lock-free and run under this held
+        # lock — no re-entry, no self-deadlock).
         #
         # The outcome DISCRIMINATES (SEC-005 closed vocab — no id/secret leaked):
         #   * a SAME-id row already exists → idempotent replay of THIS attempt's own outcome
@@ -380,11 +406,14 @@ class InMemoryDurableSessionStateProvider:
         #     ``SCOPE_FROZEN`` (no row appended): a genuinely distinct attempt must NOT submit AROUND an
         #     unresolved first order, regardless of spare cap, pending venue-truth reconcile;
         #   * a FRESH id with nothing unresolved in scope → ``RESERVED`` (a fresh possibly-live slot).
-        if attempt_id not in self._reservations and self._has_unresolved(session_identity):
-            return "SCOPE_FROZEN"
-        return self._reserve_or_load(
-            session_identity=session_identity, attempt_id=attempt_id, venue_order_key=venue_order_key
-        )
+        with self._lock:
+            if attempt_id not in self._reservations and self._has_unresolved(session_identity):
+                return "SCOPE_FROZEN"
+            return self._reserve_or_load(
+                session_identity=session_identity,
+                attempt_id=attempt_id,
+                venue_order_key=venue_order_key,
+            )
 
     def settle(
         self,
@@ -393,19 +422,20 @@ class InMemoryDurableSessionStateProvider:
         recon_state: ReconciliationState,
         venue_order_key: str | None = None,
     ) -> None:
-        reservation = self._reservations.get(attempt_id)
-        if reservation is None:
-            return
-        if recon_state == "DEFINITIVELY_ABSENT":
-            # No live order (abstain-no-wire OR venue-confirmed absent): RELEASE — uncounted, unfrozen.
-            del self._reservations[attempt_id]
-            return
-        # RESOLVED or AMBIGUOUS: the possibly-live attempt STAYS COUNTED (the cap slot is consumed). Only
-        # RESOLVED stops freezing; AMBIGUOUS keeps freezing (wire-fired does NOT clear the freeze).
-        reservation.recon_state = recon_state
-        if venue_order_key is not None:
-            # Bind the official venue-order join key WHEN AVAILABLE (production reconcile hook).
-            reservation.venue_order_key = venue_order_key
+        with self._lock:
+            reservation = self._reservations.get(attempt_id)
+            if reservation is None:
+                return
+            if recon_state == "DEFINITIVELY_ABSENT":
+                # No live order (abstain-no-wire OR venue-confirmed absent): RELEASE — uncounted, unfrozen.
+                del self._reservations[attempt_id]
+                return
+            # RESOLVED or AMBIGUOUS: the possibly-live attempt STAYS COUNTED (the cap slot is consumed).
+            # Only RESOLVED stops freezing; AMBIGUOUS keeps freezing (wire-fired does NOT clear the freeze).
+            reservation.recon_state = recon_state
+            if venue_order_key is not None:
+                # Bind the official venue-order join key WHEN AVAILABLE (production reconcile hook).
+                reservation.venue_order_key = venue_order_key
 
     def record_reconciled_fills(
         self, *, session_identity: str, fills: Sequence[RealizedFillRecord]
@@ -417,9 +447,11 @@ class InMemoryDurableSessionStateProvider:
         sealed R4-A events (SEC-002).
         """
         if fills:
-            self._fills.setdefault(session_identity, []).extend(fills)
+            with self._lock:
+                self._fills.setdefault(session_identity, []).extend(fills)
 
     def _count(self, session_id: str) -> int:
+        # Lock-free primitive: ONLY called from public methods already holding ``self._lock``.
         return sum(
             1 for res in self._reservations.values() if res.session_identity == session_id
         )
@@ -431,11 +463,15 @@ class InMemoryDurableSessionStateProvider:
         # / ``submitted`` alone never clears this — only a reconciliation RESOLUTION does. The facade money
         # path no longer calls this separately — it uses the ATOMIC :meth:`reserve_or_freeze` — but it
         # remains a standalone predicate for provider introspection / tests.
-        return self._has_unresolved(session_identity)
+        with self._lock:
+            return self._has_unresolved(session_identity)
 
     def _has_unresolved(self, session_identity: str) -> bool:
         # The unresolved-scope predicate shared by :meth:`has_unresolved_reservation` and the atomic
         # :meth:`reserve_or_freeze`, so the atomic op never round-trips through the PUBLIC scope check.
+        # Lock-free primitive: ONLY called from public methods already holding ``self._lock`` — so the
+        # scope check and the insert in :meth:`reserve_or_freeze` stay inside ONE held-lock critical
+        # section (no re-entry).
         return any(
             res.session_identity == session_identity and res.recon_state in ("PENDING", "AMBIGUOUS")
             for res in self._reservations.values()
@@ -443,7 +479,8 @@ class InMemoryDurableSessionStateProvider:
 
     def attempts(self, session_id: str) -> int:
         """The durably-reserved (unreleased) possibly-live attempt count for ``session_id`` (test introspection)."""
-        return self._count(session_id)
+        with self._lock:
+            return self._count(session_id)
 
 
 __all__ = [

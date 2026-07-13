@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import contextlib
 import dataclasses
+import threading
 import typing
 from datetime import UTC, datetime
 
@@ -2363,3 +2364,85 @@ def test_reserve_or_freeze_discriminates_same_id_replay_from_a_different_id_scop
     assert p.reserve_or_freeze(session_identity="sess-mm-b", now=now, attempt_id="A") == "COMMITTED"
     # a fresh distinct id with nothing unresolved (A is resolved, not freezing) → a fresh RESERVED.
     assert p.reserve_or_freeze(session_identity="sess-mm-b", now=now, attempt_id="C") == "RESERVED"
+
+
+def test_reserve_or_freeze_is_a_real_critical_section_under_concurrent_distinct_ids() -> None:
+    """R7-MAJOR-1 (RED against the UNLOCKED check-then-insert): ``reserve_or_freeze`` must be a REAL
+    critical section, not merely "a synchronous method". The prior sequential regression called caller A
+    to completion THEN B — proving nothing about atomicity. Here TWO threads with DISTINCT ``attempt_id``s
+    and spare cap (session=day=2) are synchronized (a :class:`threading.Barrier` injected at the scope
+    check, mirroring Codex's reproduction) so BOTH reach the scope check before EITHER inserts.
+
+    The GIL switches threads at bytecode boundaries, so a single synchronous method is NOT atomic across
+    threads: without a lock spanning the scope-check AND the insert, both callers observe the empty scope
+    (``_has_unresolved`` False) before either row lands, and BOTH reserve — two standing possibly-live
+    orders authorized toward the write port despite the session freeze.
+
+    Contract: EXACTLY ONE thread returns ``RESERVED``, the other ``SCOPE_FROZEN``; EXACTLY ONE standing
+    reservation; and — modelling the facade gate (RESERVED proceeds to the wire, SCOPE_FROZEN freezes) —
+    EXACTLY ONE recording write-port submit under the concurrent schedule.
+
+    RED today (no lock): the barrier lets both threads through the scope check together → both ``RESERVED``
+    → 2 rows → 2 write-port submits. The RED is the MISSING LOCK (both reserve), not an import/typo."""
+    now = _mm_now_dt()
+    provider = InMemoryDurableSessionStateProvider()
+    session_identity = "sess-mm-b"
+
+    # A test-only seam: block BOTH threads at the scope check (``_has_unresolved``) with a barrier so they
+    # interleave there before either inserts — the exact schedule the GIL permits under production load.
+    # The barrier carries a timeout so a REAL lock (which must serialize the whole method) does NOT
+    # deadlock: under the lock only one thread can hold it and reach the barrier, the barrier times out
+    # and BREAKS, that thread proceeds, and the second thread — released when the lock frees — then sees
+    # the standing row and freezes. Under the DEFECT (no lock) both threads reach the barrier together, it
+    # releases cleanly, and both proceed to double-reserve.
+    barrier = threading.Barrier(2, timeout=2.0)
+    original_has_unresolved = provider._has_unresolved
+
+    def _barriered_has_unresolved(session_id: str) -> bool:
+        # Read the scope FIRST, THEN hold at the barrier: both threads must have OBSERVED the (empty)
+        # scope before either inserts, so an unlocked check-then-insert double-reserves. (Blocking BEFORE
+        # the read would merely let the GIL serialize the two calls — the second read would then see the
+        # first's row and the defect would hide.) A real lock serializes the whole method, so only one
+        # thread reaches the barrier; it times out, breaks, and that thread proceeds.
+        result = original_has_unresolved(session_id)
+        with contextlib.suppress(threading.BrokenBarrierError):
+            barrier.wait()
+        return result
+
+    provider._has_unresolved = _barriered_has_unresolved  # type: ignore[assignment]
+
+    outcomes: dict[str, ScopedReservationOutcome] = {}
+    submitted: list[str] = []
+    submit_lock = threading.Lock()
+
+    def _worker(attempt_id: str) -> None:
+        outcome = provider.reserve_or_freeze(
+            session_identity=session_identity, now=now, attempt_id=attempt_id
+        )
+        outcomes[attempt_id] = outcome
+        # Model the facade gate: ONLY a RESERVED outcome proceeds to the recording write port.
+        if outcome == "RESERVED":
+            with submit_lock:
+                submitted.append(attempt_id)
+
+    threads = [
+        threading.Thread(target=_worker, args=("attempt-A",)),
+        threading.Thread(target=_worker, args=("attempt-B",)),
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=10.0)
+        assert not thread.is_alive(), "a lock must not deadlock the concurrent reserve_or_freeze schedule"
+
+    assert sorted(outcomes.values()) == ["RESERVED", "SCOPE_FROZEN"], (
+        "exactly one concurrent caller may RESERVE; the other must be SCOPE_FROZEN "
+        f"(got {sorted(outcomes.values())} — both RESERVED means the check+insert was not atomic)"
+    )
+    assert provider.attempts(session_identity) == 1, (
+        "exactly ONE standing reservation — a second row means the scope-check+insert interleaved"
+    )
+    assert len(submitted) == 1, (
+        "exactly ONE write-port submit under the concurrent schedule "
+        f"(got {len(submitted)} — two submits means two possibly-live orders bypassed the freeze)"
+    )
