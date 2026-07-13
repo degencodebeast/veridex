@@ -476,8 +476,10 @@ def _enumerate_sealed_json() -> list[str]:
 def _representative_directional_run() -> RunResult:
     """A representative directional run the byte-identity capture scores (mirrors sec005/sec_isolation)."""
 
-    def _row(agent_id: str, tick_seq: int, clv_bps: int, confidence: float | None = None) -> dict:
-        params: dict = {"market_key": "OU_2_5", "side": "over"}
+    def _row(
+        agent_id: str, tick_seq: int, clv_bps: int, confidence: float | None = None
+    ) -> dict[str, object]:
+        params: dict[str, object] = {"market_key": "OU_2_5", "side": "over"}
         if confidence is not None:
             params["confidence"] = confidence
         return {
