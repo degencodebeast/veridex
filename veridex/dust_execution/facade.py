@@ -53,6 +53,9 @@ from veridex.dust_execution.contracts import (
     EvidenceClass,
     ExecutionMode,
     OperatorInterlockEvent,
+    OrderAckEvent,
+    OrderSubmitAttempt,
+    RealFillReconciliation,
     TimeInForce,
     _FrozenModel,
     _reject_price_out_of_unit_interval,
@@ -66,7 +69,10 @@ from veridex.runtime.runtime_events import RuntimeEventType, RuntimeStatus, runt
 if TYPE_CHECKING:
     from veridex.dust_execution.manifest import StrategyExperimentManifest
     from veridex.dust_execution.runner import DustExecutionResult, ModeBArming, QuoteSource
-    from veridex.dust_execution.session_state import DurableSessionStateProvider
+    from veridex.dust_execution.session_state import (
+        DurableSessionStateProvider,
+        ReconciliationState,
+    )
     from veridex.dust_execution.signer import Signer
     from veridex.policy.envelope import PolicyEnvelope
     from veridex.runtime.runtime_events import RuntimeEventSink
@@ -559,33 +565,121 @@ def _fail_closed_session_identity_mismatch(
     return tool_result
 
 
-def _reservation_attempt_id(
-    request: MMExecutionToolRequest, *, prior_attempt_index: int
-) -> str:
+def _reservation_attempt_id(request: MMExecutionToolRequest) -> str:
     """Derive a STABLE, deterministic per-attempt idempotency identity for the durable reservation.
 
-    Gate#3 R4-MAJOR-1: the attempt_id binds the possibly-live attempt to (the operator-assigned
-    ``session_id``, this request's admission fingerprint, and its position in the durable attempt
-    sequence — the monotonic ``prior_attempt_index`` taken from the durable count BEFORE the reserve).
-    Identical inputs → identical id, so a RETRY at the same durable position reconciles to the existing
-    reservation rather than double-reserving; two distinct calls (whose prior index advanced because the
-    earlier attempt is durably counted) get DISTINCT ids so each reserves its own possibly-live slot. A
-    reference string only — never a secret or a live handle (SEC-005).
+    Gate#3 R5-MAJOR-1: the attempt_id binds the possibly-live attempt to the COMPLETE admitted-order
+    fingerprint — the operator-assigned ``session_id``, the ``intent_kind``, the FULL ``intent_params``
+    (token_id, side, price, size, tif, client_order_id, replaces_client_order_id), and the admission
+    pins (``manifest_hash`` / ``policy_hash`` / ``strategy_config_hash`` / ``mode``), serialized
+    deterministically — and is INDEPENDENT of any mutable durable count/index. So an IDENTICAL retry
+    derives the SAME id (it reconciles to the existing reservation instead of minting a new id and
+    double-submitting), while a genuinely DISTINCT authorized attempt (a different ``client_order_id`` /
+    ``intent_params``) derives a DISTINCT id and reserves its own possibly-live slot.
+
+    This replaces the earlier count-derived id (R4-MAJOR-1), whose monotonic ``attempt_index`` advanced
+    the instant the first reservation was counted — so the SAME request derived a DIFFERENT id on retry
+    and double-reserved/double-submitted whenever any spare session/day capacity existed. A reference
+    string only — the fields are HASHED (never stored raw), and none is a secret or a live handle
+    (SEC-005; the sizing ``intent_params`` are non-secret order parameters).
     """
+    params = request.intent_params
     fingerprint = json.dumps(
         {
             "session_id": request.session_id,
             "intent_kind": request.intent_kind,
+            "intent_params": {
+                "token_id": params.token_id,
+                "side": params.side,
+                "price": params.price,
+                "size": params.size,
+                "tif": params.tif,
+                "client_order_id": params.client_order_id,
+                "replaces_client_order_id": params.replaces_client_order_id,
+            },
             "manifest_hash": request.manifest_hash,
             "policy_hash": request.policy_hash,
             "strategy_config_hash": request.strategy_config_hash,
             "mode": request.mode,
-            "attempt_index": prior_attempt_index,
         },
         sort_keys=True,
     )
     digest = hashlib.sha256(fingerprint.encode("utf-8")).hexdigest()
     return f"dust-attempt:{request.session_id}:{digest[:16]}"
+
+
+def _reconciliation_outcome(
+    result: DustExecutionResult,
+) -> tuple[ReconciliationState, str | None]:
+    """Reduce the runner's REAL run to (reservation reconciliation disposition, venue_order_key join).
+
+    IDM-002 fail-closed reducer. The FREEZE keys on the reconciliation axis, NOT on wire-fired /
+    ``submitted`` — a submitted order with AMBIGUOUS reconciliation is possibly-live and must FREEZE. The
+    disposition is selected from the EXACT attempted decision(s) of THIS run, MATCHED to their official
+    ``venue_order_key`` (the pre-submit record's key the reconciliation is keyed on), NEVER "any RESOLVED
+    row anywhere in the result": a multi-decision result could carry a benign RESOLVED row from a
+    DIFFERENT decision, and picking it would wrongly clear the freeze for an order that is still
+    possibly-live. So for EACH decision that actually reached the wire (a non-``dry_run_not_submitted``
+    :class:`~veridex.dust_execution.contracts.OrderAckEvent`) the reducer joins the
+    :class:`~veridex.dust_execution.contracts.OrderSubmitAttempt`'s ``presubmit_record.venue_order_key``
+    to the matching :class:`~veridex.dust_execution.contracts.RealFillReconciliation`:
+
+      * NO decision reached the wire (a POSITIVELY-PROVEN no-wire abstention / dry-run) -> the only fast
+        release: ``DEFINITIVELY_ABSENT``;
+      * a submitted decision with NO pre-submit key, or NO matching reconciliation row (MISSING), or
+        MISMATCHED / DUPLICATE / MULTIPLE candidate rows for its key -> FAIL CLOSED: ``AMBIGUOUS`` (the
+        reservation stays possibly-live / FROZEN — never released or resolved on ambiguity);
+      * any matched row ``AMBIGUOUS`` -> ``AMBIGUOUS`` (FREEZE, counted);
+      * every matched row venue-confirmed absent (``DEFINITIVELY-ABSENT``) -> ``DEFINITIVELY_ABSENT``
+        (release);
+      * else at least one matched row ``RESOLVED`` (definite fill) and none ambiguous -> ``RESOLVED``
+        (counted, no longer freezing).
+
+    Returns the disposition plus the single submitted decision's ``venue_order_key`` (or ``None`` when
+    zero/multiple) so the caller can bind it to the reservation row (the production reconcile join). A
+    closed-vocab, id-free disposition (SEC-005) — never a fill/PnL/rankable value.
+    """
+    submitted_decision_ids = {
+        event.decision_id
+        for event in result.events
+        if isinstance(event, OrderAckEvent) and event.ack_status != "dry_run_not_submitted"
+    }
+    if not submitted_decision_ids:
+        # A positively-proven no-wire abstention/dry-run: nothing possibly-live → release.
+        return "DEFINITIVELY_ABSENT", None
+    # Each submitted decision's OFFICIAL venue_order_key from its durable pre-submit record. A duplicate
+    # attempt row for one decision, or a submitted decision with no/empty pre-submit key, FAILS CLOSED.
+    submit_keys: dict[str, str] = {}
+    for event in result.events:
+        if isinstance(event, OrderSubmitAttempt) and event.decision_id in submitted_decision_ids:
+            key = event.presubmit_record.venue_order_key
+            if event.decision_id in submit_keys or not key:
+                return "AMBIGUOUS", None
+            submit_keys[event.decision_id] = key
+    if set(submit_keys) != submitted_decision_ids:
+        # A submitted decision with NO pre-submit record → cannot be keyed → FAIL CLOSED.
+        return "AMBIGUOUS", None
+    states: list[str] = []
+    for key in submit_keys.values():
+        matches = [
+            event
+            for event in result.events
+            if isinstance(event, RealFillReconciliation) and event.venue_order_key == key
+        ]
+        if len(matches) != 1:
+            # MISSING / MISMATCHED / DUPLICATE / MULTIPLE reconciliation rows for THIS key → FAIL CLOSED.
+            return "AMBIGUOUS", None
+        states.append(matches[0].reconciled_state)
+    join_key = next(iter(submit_keys.values())) if len(submit_keys) == 1 else None
+    if any(state == "AMBIGUOUS" for state in states):
+        return "AMBIGUOUS", join_key
+    if all(state == "DEFINITIVELY-ABSENT" for state in states):
+        # Every matched order is venue-confirmed ABSENT (never placed) → release (the E4 event spells it
+        # hyphenated; the reservation axis uses the underscore form).
+        return "DEFINITIVELY_ABSENT", join_key
+    # At least one matched order reconciled RESOLVED (definite fill) and none is ambiguous: counted, no
+    # longer freezing.
+    return "RESOLVED", join_key
 
 
 def _fail_closed_reservation_failed(
@@ -631,6 +725,107 @@ def _fail_closed_reservation_failed(
         lifecycle_receipt_ref=tool_result.lifecycle_receipt_ref,
         session_status="FAILED",
         submitted_count=0,
+    )
+    return tool_result
+
+
+def _freeze_pending_reconciliation(
+    request: MMExecutionToolRequest,
+    *,
+    envelope: PolicyEnvelope,
+    emit: Callable[..., None],
+) -> MMExecutionToolResult:
+    """Return the Gate#3 R5-MAJOR-1 FREEZE result for an identical retry atop an UNSETTLED reservation.
+
+    A prior possibly-live (reserved-but-unsettled) attempt already exists for this stable ``attempt_id``
+    — an identical retry after a crash/outage. The retry must NOT re-fire the wire atop the possibly-live
+    first order, REGARDLESS of spare session/day capacity: the money path is NOT entered (the runner is
+    never reached, no write port is called), pending the production venue-truth reconcile.
+
+    The disposition is an EXPLICIT pending-reconciliation / NOT_ARMED / DENIED terminal — NEVER a
+    SUBMITTED/success "recovered" status. The offline freeze is a SAFE pending terminal, not a
+    resolution: a future live-armed path must not read the frozen retry as resolved/complete until the
+    production venue-truth resolver runs. Carries only the pinned honest labels + closed-vocab reason
+    codes (SEC-005), never a live handle.
+    """
+    tool_result = MMExecutionToolResult(
+        admission="DENIED",
+        reason_codes=("attempt_pending_reconciliation",),
+        execution_status="NOT_ARMED",
+        execution_reason_codes=("mode_b_not_armed",),
+        lifecycle_receipt_ref=(
+            f"dust-lifecycle:{request.session_id}:attempt-pending-reconciliation"
+        ),
+        run_label=_DEFAULT_RUN_LABEL,
+        calibration_label=_DEFAULT_CALIBRATION_LABEL,
+        edge_label=_DEFAULT_EDGE_LABEL,
+        evidence_class=_DEFAULT_EVIDENCE_CLASS,
+        policy_hash=envelope.policy_hash(),
+    )
+    emit(
+        RuntimeEventType.ACTION_EMITTED,
+        admission=tool_result.admission,
+        execution_status=tool_result.execution_status,
+        intent_kind=request.intent_kind,
+    )
+    emit(
+        RuntimeEventType.RUN_COMPLETED,
+        status=RuntimeStatus.COMPLETED.value,
+        admission=tool_result.admission,
+        reason_codes=list(tool_result.reason_codes),
+        execution_status=tool_result.execution_status,
+        execution_reason_codes=list(tool_result.execution_reason_codes),
+        lifecycle_receipt_ref=tool_result.lifecycle_receipt_ref,
+        session_status="FAILED",
+        submitted_count=0,
+    )
+    return tool_result
+
+
+def _idempotent_committed_result(
+    request: MMExecutionToolRequest,
+    *,
+    envelope: PolicyEnvelope,
+    emit: Callable[..., None],
+) -> MMExecutionToolResult:
+    """Return the Gate#3 R5-MAJOR-1 IDEMPOTENT result for an identical retry atop a COMMITTED reservation.
+
+    A prior attempt for this stable ``attempt_id`` already SETTLED committed (the first order reached the
+    wire and was durably recorded). An identical retry replays that KNOWN-GOOD outcome WITHOUT re-firing
+    the wire — a resolved terminal (distinct from the possibly-live FREEZE): the money path is NOT
+    re-entered (the runner is never reached, no write port is called). Carries only the pinned honest
+    labels + closed-vocab reason codes (SEC-005), never a live handle.
+    """
+    tool_result = MMExecutionToolResult(
+        admission="APPROVED",
+        reason_codes=("idempotent_committed_replay",),
+        execution_status="SUBMITTED",
+        execution_reason_codes=(),
+        lifecycle_receipt_ref=(
+            f"dust-lifecycle:{request.session_id}:idempotent-committed-replay"
+        ),
+        run_label=_DEFAULT_RUN_LABEL,
+        calibration_label=_DEFAULT_CALIBRATION_LABEL,
+        edge_label=_DEFAULT_EDGE_LABEL,
+        evidence_class=_DEFAULT_EVIDENCE_CLASS,
+        policy_hash=envelope.policy_hash(),
+    )
+    emit(
+        RuntimeEventType.ACTION_EMITTED,
+        admission=tool_result.admission,
+        execution_status=tool_result.execution_status,
+        intent_kind=request.intent_kind,
+    )
+    emit(
+        RuntimeEventType.RUN_COMPLETED,
+        status=RuntimeStatus.COMPLETED.value,
+        admission=tool_result.admission,
+        reason_codes=list(tool_result.reason_codes),
+        execution_status=tool_result.execution_status,
+        execution_reason_codes=list(tool_result.execution_reason_codes),
+        lifecycle_receipt_ref=tool_result.lifecycle_receipt_ref,
+        session_status="COMPLETED",
+        submitted_count=1,
     )
     return tool_result
 
@@ -780,26 +975,51 @@ async def propose_mm_execution(
         else provisional_session_id(manifest, request.mode)
     )
 
-    # Gate#3 R4-MAJOR-1: durably RESERVE a possibly-live attempt BEFORE the runner reaches the write
-    # port — the durable-cap analog of the lane's persist-BEFORE-sign discipline. The reservation counts
-    # toward the session/UTC-day caps IMMEDIATELY and durably (``load`` counts reserved-but-unsettled
-    # rows), so a durable-store failure or a process crash AFTER the wire cannot reset the cap: the
-    # reserved row stands and the NEXT call sees it. If the reserve RAISES (store outage) the money path
-    # is NOT entered — the runner is never reached and no write port is called (fail closed). The
-    # ``attempt_id`` is a STABLE idempotency identity keyed to this attempt's position in the durable
-    # sequence, so a retry reconciles rather than double-reserving. Only on the durable-provider path
-    # (fresh/zero Mode-A dry-runs place no orders, so there is nothing to reserve).
+    # Gate#3 R4-MAJOR-1 + R5-MAJOR-1: durably RESERVE-OR-LOAD a possibly-live attempt BEFORE the runner
+    # reaches the write port — the durable-cap analog of the lane's persist-BEFORE-sign discipline. The
+    # reservation counts toward the session/UTC-day caps IMMEDIATELY and durably (``load`` counts
+    # reserved-but-unsettled rows), so a durable-store failure or a process crash AFTER the wire cannot
+    # reset the cap: the reserved row stands and the NEXT call sees it. If the reserve RAISES (store
+    # outage) the money path is NOT entered — the runner is never reached and no write port is called
+    # (fail closed). The ``attempt_id`` is a STABLE idempotency identity derived from the COMPLETE
+    # request fingerprint (R5-MAJOR-1), INDEPENDENT of any mutable durable count — so an IDENTICAL retry
+    # derives the SAME id and RECONCILES instead of minting a new id and double-submitting:
+    #   * an existing UNSETTLED (possibly-live) row  -> FREEZE unconditionally (no new wire atop a
+    #     possibly-live first order, regardless of spare cap), pending the production venue-truth
+    #     reconcile — an EXPLICIT pending-reconciliation/denied terminal, never a success;
+    #   * an existing COMMITTED row                  -> idempotent replay of the first outcome (no wire);
+    #   * a fresh RESERVED slot (or a prior RELEASED attempt, now absent) -> proceed to the runner.
+    # Only on the durable-provider path (fresh/zero Mode-A dry-runs place no orders, nothing to reserve).
+    #
+    # IDM-002 adds a SECOND, session-SCOPED layer before the id-dedup: stable-id dedup alone is
+    # insufficient because a caller could change ``client_order_id`` / token / any intent field to derive
+    # a DISTINCT ``attempt_id`` and submit AROUND an unresolved first order (still double exposure). So
+    # BEFORE reserving this attempt's id, ask the provider whether ANY UNSETTLED (possibly-live,
+    # not-committed, not-released) reservation already occupies the session freeze scope, and FREEZE
+    # EVERY new submit — INCLUDING a genuinely distinct id — until it resolves (venue-truth reconcile, the
+    # production hook) or an operator clears it. Only an UNSETTLED reservation freezes; a COMMITTED or
+    # RELEASED one does not, so an honest reserve->wire->settle(committed=True) sequence never self-blocks.
     attempt_id: str | None = None
     if provider is not None and durable_state is not None:
-        attempt_id = _reservation_attempt_id(
-            request, prior_attempt_index=durable_state.prior_session_order_count
-        )
+        attempt_id = _reservation_attempt_id(request)
         try:
-            provider.reserve(
+            # IDM-002 session-scope freeze (checked BEFORE reserving this id, so a frozen distinct
+            # attempt never appends a spurious row): a possibly-live reservation whose reconciliation is
+            # UNRESOLVED (PENDING / AMBIGUOUS) anywhere in the session refuses every new wire — a
+            # wire-fired / submitted first order does NOT clear it, only a venue-truth RESOLUTION does.
+            if provider.has_unresolved_reservation(session_identity):
+                return _freeze_pending_reconciliation(request, envelope=envelope, emit=_emit)
+            reservation_outcome = provider.reserve(
                 session_identity=session_identity, now=now_dt, attempt_id=attempt_id
             )
         except Exception:
             return _fail_closed_reservation_failed(request, envelope=envelope, emit=_emit)
+        if reservation_outcome == "PENDING_RECONCILE":
+            # An identical retry atop a possibly-live first order: FREEZE — no new wire, pending reconcile.
+            return _freeze_pending_reconciliation(request, envelope=envelope, emit=_emit)
+        if reservation_outcome == "COMMITTED":
+            # An identical retry atop a committed first order: idempotent replay, no new wire.
+            return _idempotent_committed_result(request, envelope=envelope, emit=_emit)
 
     # E7-T3 human operator precondition interlock (REQ-005/006, AC-002) + Gate#3 MAJOR-1 & M-1: Mode B
     # cannot ARM unless ALL FIVE operator preconditions are positively satisfied AND durably PERSISTED
@@ -889,18 +1109,25 @@ async def propose_mm_execution(
         ),
     )
 
-    # Gate#3 R4-MAJOR-1 settle: record the reserved attempt's outcome AFTER the run. ``committed`` is
-    # True iff a possibly-live order actually reached the wire (``submitted_count`` — accepted OR
-    # uncertain-ACK), which KEEPS the reservation counted so the NEXT call reads it as the durable prior
-    # session/day count; else the reservation is RELEASED so an abstain does not wrongly consume a slot.
-    # A ``settle`` failure AFTER a fired wire must NOT reset the reservation — the reserved row is
-    # already durable — so any settle exception is swallowed: the standing reservation is the
-    # crash-consistent, fail-safe outcome (over-counting a possibly-live attempt, never under-counting).
-    # R4-A's sealed lifecycle carries no ``realized_pnl`` (SEC-002), so realized-fill LOSS is
-    # reconstructed by the provider's own durable venue-reconciliation ledger, never fabricated here.
+    # Gate#3 R4-MAJOR-1 + R5-MAJOR-1 / IDM-002 settle: record the reserved attempt's RECONCILIATION
+    # outcome AFTER the run — the E4 tri-state derived from the runner's REAL run, NEVER a mere
+    # wire/``submitted`` flag. A submitted order whose reconciliation is AMBIGUOUS stays possibly-live and
+    # KEEPS FREEZING the session scope; only a RESOLVED (definite fill) reconciliation stops the freeze
+    # (the slot stays counted); a DEFINITIVELY_ABSENT (abstain-no-wire / venue-confirmed absent) RELEASES
+    # it. A ``settle`` failure AFTER a fired wire must NOT reset the reservation — the reserved row is
+    # already durable and stays ``PENDING`` (possibly-live, freezing, counted) — so any settle exception
+    # is swallowed: the standing reservation is the crash-consistent, fail-safe outcome (over-freezing a
+    # possibly-live attempt, never under-freezing). R4-A's sealed lifecycle carries no ``realized_pnl``
+    # (SEC-002), so realized-fill LOSS is reconstructed by the provider's own durable
+    # venue-reconciliation ledger, never fabricated here.
     if provider is not None and durable_state is not None and attempt_id is not None:
+        recon_state, recon_venue_order_key = _reconciliation_outcome(result)
         with contextlib.suppress(Exception):
-            provider.settle(attempt_id=attempt_id, committed=result.submitted_count > 0)
+            provider.settle(
+                attempt_id=attempt_id,
+                recon_state=recon_state,
+                venue_order_key=recon_venue_order_key,
+            )
 
     tool_result = _to_tool_result(result, request)
 

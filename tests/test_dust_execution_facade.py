@@ -41,7 +41,14 @@ from tests.test_dust_execution_runner import (
 )
 from veridex.dust_execution import facade  # module handle: proposer looked up dynamically (RED-clean)
 from veridex.dust_execution.clobv2_gate import Clobv2GateResult
-from veridex.dust_execution.contracts import DustRunLabelEvent, OperatorInterlockEvent
+from veridex.dust_execution.contracts import (
+    DustRunLabelEvent,
+    OperatorInterlockEvent,
+    OrderAckEvent,
+    OrderSubmitAttempt,
+    PreSubmitRecord,
+    RealFillReconciliation,
+)
 from veridex.dust_execution.facade import (
     MMExecutionToolRequest,
     MMExecutionToolResult,
@@ -65,6 +72,8 @@ from veridex.dust_execution.session_state import (
     DurableSessionState,
     DurableSessionStateProvider,
     InMemoryDurableSessionStateProvider,
+    ReconciliationState,
+    ReservationOutcome,
 )
 from veridex.dust_execution.signer import LocalFakeWalletControlPlane
 from veridex.dust_execution.wallet_binding import (
@@ -621,15 +630,20 @@ def _mode_b_mm_manifest(binding: ExecutionWalletBinding) -> StrategyExperimentMa
 
 
 def _mode_b_request(
-    manifest: StrategyExperimentManifest, envelope: PolicyEnvelope
+    manifest: StrategyExperimentManifest,
+    envelope: PolicyEnvelope,
+    *,
+    client_order_id: str = "coid-1",
 ) -> MMExecutionToolRequest:
     # A ``take`` (taker FOK) intent so the Mode-B arming positive control exercises the taker submit
     # wire (``FakeVenueAdapter.submit_order``); ``make_quote`` now dispatches to the distinct resting
     # wire and would not reach ``submit_order`` here (see the runner's per-intent dispatch tests).
+    # R5-MAJOR-1: ``client_order_id`` distinguishes a genuinely DISTINCT authorized attempt (a distinct
+    # coid → a DISTINCT stable ``attempt_id``) from an IDENTICAL retry (the same coid → the SAME id).
     return MMExecutionToolRequest.build(
         intent_kind="take",
         intent_params=MMIntentParams(
-            token_id=_MM_TOKEN, side="BUY", size=1.0, tif="FOK", client_order_id="coid-1"
+            token_id=_MM_TOKEN, side="BUY", size=1.0, tif="FOK", client_order_id=client_order_id
         ),
         strategy_id=manifest.strategy_id,
         strategy_config_hash=manifest.strategy_config_hash,
@@ -658,10 +672,11 @@ async def _drive_mode_b(
     interlock_store: OperatorInterlockStore | None = None,
     envelope: PolicyEnvelope | None = None,
     provider: object = _PROVIDER_UNSET,
+    client_order_id: str = "coid-1",
 ) -> MMExecutionToolResult:
     manifest = _mode_b_mm_manifest(binding)
     envelope = envelope if envelope is not None else _mm_env()
-    request = _mode_b_request(manifest, envelope)
+    request = _mode_b_request(manifest, envelope, client_order_id=client_order_id)
     # Gate#3 MAJOR-2: a live run now composes ONE authoritative durable session-state source. The
     # migrated positives default to a fresh in-memory provider; a test drives the live fail-closed
     # case by passing ``provider=None`` explicitly.
@@ -1105,11 +1120,16 @@ async def test_result_reports_denied_for_a_strategy_admission_deny() -> None:
 
 async def test_two_facade_calls_same_session_enforce_per_session_order_cap_across_calls() -> None:
     """Codex's object: two ``propose_mm_execution`` calls, SAME session, sharing ONE in-memory
-    provider, with ``max_orders_per_session == 1`` — the 1st SUBMITTED, the 2nd DENIED by the durable
-    per-session order cap. ``write_port.submit_calls == 1`` TOTAL. RED today: the facade resets the
-    count each call so BOTH submit (``submit_calls == 2``)."""
+    provider, with ``max_orders_per_session == 1`` — the 1st SUBMITTED, the 2nd (a genuinely DISTINCT
+    authorized attempt) DENIED by the durable per-session order cap. ``write_port.submit_calls == 1``
+    TOTAL. RED today: the facade resets the count each call so BOTH submit (``submit_calls == 2``).
+
+    R5-MAJOR-1 migration: the 2nd call is a DISTINCT attempt (a distinct ``client_order_id``), so the
+    cap — not idempotency — is what denies it; an IDENTICAL retry is covered separately (freeze)."""
     binding = _mm_binding()
-    adapter = RecordingFakeAdapter(fill=True, open_orders=[])
+    # ``fill_history_matches=True`` → the 1st call's E4 reconcile RESOLVES (definite fill), so it does
+    # NOT freeze the session scope — the CAP is what denies the distinct 2nd call (IDM-002).
+    adapter = RecordingFakeAdapter(fill=True, fill_history_matches=True, open_orders=[])
     write_port = _default_write_port(binding)  # SHARED across both calls — counts total submits
     store = InMemoryOperatorInterlockStore()
     provider = InMemoryDurableSessionStateProvider()  # SHARED durable session state
@@ -1132,6 +1152,7 @@ async def test_two_facade_calls_same_session_enforce_per_session_order_cap_acros
         interlock_store=store,
         envelope=envelope,
         provider=provider,
+        client_order_id="coid-2",  # a DISTINCT authorized attempt — denied by the cap, not idempotency
     )
 
     assert write_port.submit_calls == 1, (
@@ -1144,9 +1165,13 @@ async def test_two_facade_calls_same_session_enforce_per_session_order_cap_acros
 
 async def test_two_facade_calls_same_session_enforce_per_day_order_cap_across_calls() -> None:
     """The per-UTC-day cap holds across calls too: ``max_orders_per_day == 1`` (session cap open) →
-    the 2nd same-session call is denied ``order_cap_day`` and never reaches the write port."""
+    the 2nd same-session call (a genuinely DISTINCT authorized attempt) is denied ``order_cap_day`` and
+    never reaches the write port. R5-MAJOR-1 migration: the 2nd call carries a DISTINCT
+    ``client_order_id`` so the cap — not idempotency — denies it."""
     binding = _mm_binding()
-    adapter = RecordingFakeAdapter(fill=True, open_orders=[])
+    # ``fill_history_matches=True`` → the 1st call RESOLVES (definite fill), so it does not freeze the
+    # session scope — the per-day CAP is what denies the distinct 2nd call (IDM-002).
+    adapter = RecordingFakeAdapter(fill=True, fill_history_matches=True, open_orders=[])
     write_port = _default_write_port(binding)
     store = InMemoryOperatorInterlockStore()
     provider = InMemoryDurableSessionStateProvider()
@@ -1169,6 +1194,7 @@ async def test_two_facade_calls_same_session_enforce_per_day_order_cap_across_ca
         interlock_store=store,
         envelope=envelope,
         provider=provider,
+        client_order_id="coid-2",  # a DISTINCT authorized attempt — denied by the day cap, not idempotency
     )
 
     assert write_port.submit_calls == 1, "the 2nd same-session call must be denied by the durable per-day cap"
@@ -1183,10 +1209,10 @@ async def test_restart_provider_seeded_at_cap_denies_before_any_write_port_call(
     adapter = RecordingFakeAdapter(fill=True, open_orders=[])
     write_port = _default_write_port(binding)
     provider = InMemoryDurableSessionStateProvider()
-    # A persisted possibly-live attempt already AT the cap: reserve it and settle it COMMITTED so it
-    # is a durable prior attempt (the migrated reserve/settle analog of the old record_run seed).
+    # A persisted possibly-live attempt already AT the cap: reserve it and settle it RESOLVED so it is a
+    # durable prior attempt that COUNTS toward the cap but does NOT freeze the scope (a resolved fill).
     provider.reserve(session_identity="sess-mm-b", now=_mm_now_dt(), attempt_id="seed-attempt-1")
-    provider.settle(attempt_id="seed-attempt-1", committed=True)
+    provider.settle(attempt_id="seed-attempt-1", recon_state="RESOLVED")
     envelope = _mm_env(max_orders_per_session=1)
 
     result = await _drive_mode_b(
@@ -1321,13 +1347,31 @@ class _EchoRiskProvider:
             prior_day_order_count=0,
         )
 
-    def reserve(self, *, session_identity: str, now: datetime, attempt_id: str) -> None:
+    def reserve(
+        self,
+        *,
+        session_identity: str,
+        now: datetime,
+        attempt_id: str,
+        venue_order_key: str | None = None,
+    ) -> ReservationOutcome:
         # Never reached in the identity-mismatch tests: the facade fails closed at the identity
-        # assertion, BEFORE the before-wire reservation.
+        # assertion, BEFORE the before-wire reserve-or-load.
+        return "RESERVED"
+
+    def settle(
+        self,
+        *,
+        attempt_id: str,
+        recon_state: ReconciliationState,
+        venue_order_key: str | None = None,
+    ) -> None:
         return None
 
-    def settle(self, *, attempt_id: str, committed: bool) -> None:
-        return None
+    def has_unresolved_reservation(self, session_identity: str) -> bool:
+        # No reservations in the identity-assertion tests: the honest-echo positive control reaches
+        # this scope check (no unresolved row → not frozen), the mismatch cases fail closed before it.
+        return False
 
 
 async def test_live_guarded_fails_closed_when_provider_identity_differs_from_request_session() -> None:
@@ -1462,7 +1506,13 @@ class _PostWireSettleOutageProvider(InMemoryDurableSessionStateProvider):
     (``settle``, or the legacy ``record_run``) simulates a durable-store OUTAGE by raising — Codex's
     object: the write reaches the recording port AFTER the wire has already fired."""
 
-    def settle(self, *, attempt_id: str, committed: bool) -> None:
+    def settle(
+        self,
+        *,
+        attempt_id: str,
+        recon_state: ReconciliationState,
+        venue_order_key: str | None = None,
+    ) -> None:
         raise _DurableStoreOutage("durable store unavailable after wire")
 
     def record_run(self, *, session_identity: str, attempts: int, fills: object = ()) -> None:
@@ -1474,7 +1524,14 @@ class _ReserveOutageProvider(InMemoryDurableSessionStateProvider):
     The facade must FAIL CLOSED — the runner is never entered on the money path (zero write-port I/O),
     NOT_ARMED/denied."""
 
-    def reserve(self, *, session_identity: str, now: datetime, attempt_id: str) -> None:
+    def reserve(
+        self,
+        *,
+        session_identity: str,
+        now: datetime,
+        attempt_id: str,
+        venue_order_key: str | None = None,
+    ) -> ReservationOutcome:
         raise _DurableStoreOutage("durable store unavailable before wire")
 
 
@@ -1484,8 +1541,14 @@ class _CrashBeforeSettleProvider(InMemoryDurableSessionStateProvider):
     ``record_run``) is a LOST WRITE (no-op), as if the process died before it landed. The reserved,
     unsettled row stays durable and counted (conservative — a possibly-live attempt stays counted)."""
 
-    def settle(self, *, attempt_id: str, committed: bool) -> None:
-        return None  # the settle write never lands (crash)
+    def settle(
+        self,
+        *,
+        attempt_id: str,
+        recon_state: ReconciliationState,
+        venue_order_key: str | None = None,
+    ) -> None:
+        return None  # the settle write never lands (crash) — the row stays PENDING (possibly-live)
 
     def record_run(self, *, session_identity: str, attempts: int, fills: object = ()) -> None:
         return None  # the legacy after-wire write never lands (crash)
@@ -1552,16 +1615,21 @@ async def test_reserve_failure_before_wire_fails_closed_with_zero_write_port_cal
     assert result.admission == "DENIED"
 
 
-async def test_crash_after_post_leaves_reservation_standing_denies_next_call_at_cap() -> None:
-    """Crash-after-POST: ``reserve`` lands + the wire fires, but no ``settle`` write lands (the process
-    crashes). A fresh facade invocation loading the SAME durable provider must see the reserved
-    possibly-live attempt and DENY the next call at ``max_orders_per_session == 1``. RED today: the
-    after-wire count is lost to the crash, the cap resets, and BOTH submit (``submit_calls == 2``)."""
+async def test_crash_after_post_freezes_a_distinct_attempt_via_session_scope() -> None:
+    """R5-MAJOR-1 / IDM-002 (Codex's exact object, RED today): a crash-after-POST leaves the first
+    reservation UNSETTLED (possibly-live). A second call that changes the ``client_order_id`` (a
+    genuinely DISTINCT ``attempt_id``) must NOT submit AROUND the unresolved first order — the session
+    freeze scope refuses EVERY new wire while a possibly-live reservation stands, INCLUDING a distinct
+    id, at ``max_orders_per_session == max_orders_per_day == 2`` (SPARE capacity, so the CAP cannot mask
+    it — the freeze is driven by the possibly-live reservation, not the cap). ``submit_calls == 1``
+    TOTAL, and the frozen distinct attempt is an EXPLICIT pending-reconciliation / NOT_ARMED / DENIED
+    terminal, never SUBMITTED. RED today: stable-id dedup alone lets the distinct id reserve+submit a
+    SECOND order (``submit_calls == 2``)."""
     binding = _mm_binding()
     adapter = RecordingFakeAdapter(fill=True, open_orders=[])
     write_port = _default_write_port(binding)  # SHARED — counts total submits across the crash
     provider = _CrashBeforeSettleProvider()  # the SAME durable provider survives the simulated crash
-    envelope = _mm_env(max_orders_per_session=1)
+    envelope = _mm_env(max_orders_per_session=2, max_orders_per_day=2)  # SPARE capacity — the cap masks nothing
 
     # Call 1: reserve lands, the wire fires, then the process "crashes" before the settle write lands.
     await _drive_mode_b(
@@ -1573,7 +1641,8 @@ async def test_crash_after_post_leaves_reservation_standing_denies_next_call_at_
         envelope=envelope,
         provider=provider,
     )
-    # Call 2: a fresh facade invocation on the SAME durable provider sees the standing reservation.
+    # Call 2: a DISTINCT authorized attempt (a distinct client_order_id → a distinct attempt_id) that
+    # tries to submit AROUND the unresolved first order on the SAME durable provider.
     second = await _drive_mode_b(
         interlock=_full_interlock(),
         arming=_mm_arming(binding, write_port=write_port),
@@ -1582,14 +1651,19 @@ async def test_crash_after_post_leaves_reservation_standing_denies_next_call_at_
         interlock_store=InMemoryOperatorInterlockStore(),
         envelope=envelope,
         provider=provider,
+        client_order_id="coid-2",  # a DISTINCT attempt_id — must STILL be frozen by the session scope
     )
 
     assert write_port.submit_calls == 1, (
-        "a crash after POST (no settle) must leave the reservation standing so the next call is "
-        "denied at the cap (RED today: the after-wire count is lost, the cap resets, both submit)"
+        "a distinct attempt must NOT submit around an unresolved possibly-live reservation — the session "
+        "freeze scope refuses every new wire (RED today: the distinct id reserves+submits a 2nd order)"
     )
+    assert provider.attempts("sess-mm-b") == 1, "the frozen distinct attempt must NOT append a second row"
+    # The frozen distinct attempt is an EXPLICIT pending/denied terminal — never a success/executed one.
     assert second.execution_status != "SUBMITTED"
-    assert "order_cap_session" in second.execution_reason_codes
+    assert second.execution_status == "NOT_ARMED"
+    assert second.admission == "DENIED"
+    assert "attempt_pending_reconciliation" in second.reason_codes
 
 
 async def test_reserved_slot_released_on_abstain_does_not_consume_cap() -> None:
@@ -1617,15 +1691,18 @@ async def test_reserved_slot_released_on_abstain_does_not_consume_cap() -> None:
     )
 
 
-async def test_committed_reservation_allows_next_call_within_cap() -> None:
-    """Positive control: reserve -> wire -> ``settle(committed=True)`` keeps the attempt counted; a 2nd
-    call still WITHIN the cap is allowed. Two committed possibly-live attempts persist under a cap of
-    two — the reservation contract does not over-block an honest within-cap sequence."""
+async def test_distinct_authorized_attempt_within_cap_allows_second_wire() -> None:
+    """R5-MAJOR-1 (over-block guard): a genuinely DISTINCT authorized attempt (a DISTINCT
+    ``client_order_id`` → a DISTINCT stable ``attempt_id``) within ``max_orders_per_session == 2`` is a
+    fresh reserve + a second wire — the reserve-or-load idempotency must NOT over-block a legitimate
+    second attempt. Two distinct committed possibly-live attempts persist under a cap of two."""
     binding = _mm_binding()
-    adapter = RecordingFakeAdapter(fill=True, open_orders=[])
+    # ``fill_history_matches=True`` → each call's E4 reconcile RESOLVES (definite fill), so a resolved
+    # first attempt does NOT freeze the session scope — a distinct 2nd attempt is legitimately allowed.
+    adapter = RecordingFakeAdapter(fill=True, fill_history_matches=True, open_orders=[])
     write_port = _default_write_port(binding)  # SHARED across both calls
     provider = InMemoryDurableSessionStateProvider()
-    envelope = _mm_env(max_orders_per_session=2)  # room for two committed attempts
+    envelope = _mm_env(max_orders_per_session=2, max_orders_per_day=2)  # room for two distinct attempts
 
     first = await _drive_mode_b(
         interlock=_full_interlock(),
@@ -1644,9 +1721,395 @@ async def test_committed_reservation_allows_next_call_within_cap() -> None:
         interlock_store=InMemoryOperatorInterlockStore(),
         envelope=envelope,
         provider=provider,
+        client_order_id="coid-2",  # a DISTINCT authorized attempt → a DISTINCT stable attempt_id
     )
 
     assert first.execution_status == "SUBMITTED"
-    assert second.execution_status == "SUBMITTED", "a 2nd call still within the cap must be allowed"
+    assert second.execution_status == "SUBMITTED", "a DISTINCT attempt within the cap must be allowed"
     assert write_port.submit_calls == 2
-    assert provider.attempts("sess-mm-b") == 2, "both committed reservations persist under the cap"
+    assert provider.attempts("sess-mm-b") == 2, "both distinct committed reservations persist under the cap"
+
+
+# ---------------------------------------------------------------------------
+# Gate#3 R5-MAJOR-1 — the reservation ``attempt_id`` is derived from a STABLE
+# request fingerprint (independent of any mutable durable count/index), and the
+# provider ``reserve`` is idempotent (reserve-OR-load): an IDENTICAL retry
+# reconciles to the existing reservation instead of minting a new id and
+# double-submitting.
+#
+# Before this fold the ``attempt_id`` bound the MONOTONIC durable count
+# (``prior_attempt_index``): once the first reservation existed, the next ``load``
+# incremented the count, so the SAME request derived a DIFFERENT id on retry — a
+# crash-after-POST retry minted a SECOND reservation and submitted a SECOND order
+# whenever any spare session/day capacity existed (cap >= 2). The cap-one tests
+# only PASSED because the cap incidentally blocked every next call — NOT
+# idempotency. The id now binds the COMPLETE admitted-order fingerprint (session +
+# intent_kind + the full intent_params + manifest/policy/strategy hashes + mode),
+# so an identical retry derives the SAME id and reconciles:
+#   * an existing UNSETTLED (possibly-live) row -> FREEZE UNCONDITIONALLY (no new
+#     wire, regardless of spare cap) with an EXPLICIT pending-reconciliation /
+#     NOT_ARMED / DENIED disposition — NEVER a SUBMITTED/success "recovered" status
+#     (a live-armed path must not treat the retry as resolved until the production
+#     venue-truth resolver runs);
+#   * an existing COMMITTED row -> idempotent replay (no new wire);
+#   * a RELEASED row (settle committed=False) -> absent -> a fresh reserve + wire.
+# Each test runs at ``max_orders_per_session == max_orders_per_day == 2`` so the
+# cap masks nothing — the single-wire outcome is driven by the reservation, not the
+# cap. Each asserts the WRITE-PORT (the money-moving surface).
+# ---------------------------------------------------------------------------
+
+
+async def test_identical_retry_after_crash_freezes_no_second_wire_within_spare_cap() -> None:
+    """R5-MAJOR-1 (RED today): a crash-after-POST leaves the first reservation UNSETTLED
+    (possibly-live). An IDENTICAL retry sharing the durable provider derives the SAME stable
+    ``attempt_id``, finds the unsettled row, and FREEZES — ZERO new write-port calls and exactly ONE
+    reservation — EVEN WITH spare session/day capacity (``max_orders_per_session == max_orders_per_day
+    == 2``), because a possibly-live first order exists (NOT because a cap blocked). The frozen retry's
+    disposition is an EXPLICIT pending-reconciliation / NOT_ARMED / DENIED terminal — NEVER
+    SUBMITTED/success. RED today: the count-derived id advances, so the retry mints a SECOND reservation
+    and submits a SECOND order (``submit_calls == 2``, two reservations)."""
+    binding = _mm_binding()
+    adapter = RecordingFakeAdapter(fill=True, open_orders=[])
+    write_port = _default_write_port(binding)  # SHARED — counts total submits across the crash+retry
+    provider = _CrashBeforeSettleProvider()  # reserve lands; the after-wire settle is LOST (crash)
+    envelope = _mm_env(max_orders_per_session=2, max_orders_per_day=2)  # SPARE capacity — the cap masks nothing
+
+    # Call 1: reserve lands, the wire fires, then the settle write is LOST (process crash after POST).
+    await _drive_mode_b(
+        interlock=_full_interlock(),
+        arming=_mm_arming(binding, write_port=write_port),
+        binding=binding,
+        adapter=adapter,
+        interlock_store=InMemoryOperatorInterlockStore(),
+        envelope=envelope,
+        provider=provider,
+    )
+    # Call 2: the IDENTICAL request (same client_order_id) on the SAME durable provider.
+    retry = await _drive_mode_b(
+        interlock=_full_interlock(),
+        arming=_mm_arming(binding, write_port=write_port),
+        binding=binding,
+        adapter=adapter,
+        interlock_store=InMemoryOperatorInterlockStore(),
+        envelope=envelope,
+        provider=provider,
+    )
+
+    # Exactly ONE wire even though the cap left room for a second — the freeze (not the cap) is why.
+    assert write_port.submit_calls == 1, (
+        "an identical retry atop an unsettled possibly-live reservation must FREEZE — exactly ONE wire "
+        "even with spare cap (RED today: the count-derived id advances and a SECOND order submits)"
+    )
+    assert provider.attempts("sess-mm-b") == 1, "the frozen retry must NOT append a second reservation row"
+    # The frozen retry is an EXPLICIT pending/denied terminal — NEVER a success/executed disposition, so
+    # a future live-armed path can never read it as "recovered/complete" before venue-truth reconcile.
+    assert retry.execution_status != "SUBMITTED"
+    assert retry.execution_status == "NOT_ARMED"
+    assert retry.admission == "DENIED"
+    assert "attempt_pending_reconciliation" in retry.reason_codes
+
+
+async def test_committed_then_identical_retry_is_idempotent_no_second_wire() -> None:
+    """R5-MAJOR-1 (RED today): the first attempt SETTLES committed (the wire fired and was recorded). An
+    IDENTICAL retry derives the SAME stable ``attempt_id``, finds the COMMITTED reservation, and is
+    IDEMPOTENT — no new wire; it replays the first attempt's known-good outcome. ``submit_calls == 1``
+    and exactly ONE reservation under a SPARE cap of two. RED today: the count-derived id advances so
+    the identical retry submits a SECOND order (``submit_calls == 2``)."""
+    binding = _mm_binding()
+    # ``fill_history_matches=True`` → the 1st call's E4 reconcile RESOLVES (definite fill), so the
+    # reservation is a COMMITTED/RESOLVED terminal — an identical retry replays it idempotently (not a
+    # possibly-live freeze).
+    adapter = RecordingFakeAdapter(fill=True, fill_history_matches=True, open_orders=[])
+    write_port = _default_write_port(binding)  # SHARED
+    provider = InMemoryDurableSessionStateProvider()
+    envelope = _mm_env(max_orders_per_session=2, max_orders_per_day=2)  # SPARE capacity — the cap masks nothing
+
+    first = await _drive_mode_b(
+        interlock=_full_interlock(),
+        arming=_mm_arming(binding, write_port=write_port),
+        binding=binding,
+        adapter=adapter,
+        interlock_store=InMemoryOperatorInterlockStore(),
+        envelope=envelope,
+        provider=provider,
+    )
+    retry = await _drive_mode_b(
+        interlock=_full_interlock(),
+        arming=_mm_arming(binding, write_port=write_port),
+        binding=binding,
+        adapter=adapter,
+        interlock_store=InMemoryOperatorInterlockStore(),
+        envelope=envelope,
+        provider=provider,
+    )
+
+    assert first.execution_status == "SUBMITTED"
+    assert write_port.submit_calls == 1, (
+        "an identical retry of a COMMITTED attempt must NOT re-fire the wire (RED today: it submits again)"
+    )
+    assert provider.attempts("sess-mm-b") == 1, "an idempotent committed retry must NOT append a second reservation"
+    # Idempotent replay of the first attempt's KNOWN-GOOD (settled-committed) outcome — a resolved
+    # terminal, distinct from the possibly-live FREEZE above.
+    assert retry.execution_status == "SUBMITTED"
+    assert retry.admission == "APPROVED"
+
+
+async def test_abstain_release_then_identical_retry_is_a_fresh_reserve_not_frozen() -> None:
+    """R5-MAJOR-1 (over-block guard): the first attempt ABSTAINS (no wire), so ``settle(committed=False)``
+    RELEASES the reservation. An IDENTICAL retry finds NO row (released == absent) and is a FRESH
+    reserve+run — NOT frozen: it re-enters the runner (``ABSTAINED`` with ``intent_no_quote``), never
+    the pending/denied freeze disposition, and leaves ZERO standing reservations. Guards against a
+    released id wrongly freezing a legitimate later attempt."""
+    binding = _mm_binding()
+    adapter = FakeVenueAdapter(fill=True)
+    provider = InMemoryDurableSessionStateProvider()
+
+    first = await _drive_mode_b_kind(
+        intent_kind="no_quote",
+        intent_params=MMIntentParams(),  # an explicit abstention — no order reaches the wire
+        arming=_mm_arming(binding),
+        interlock=_full_interlock(),  # fully armed, so the abstain is the INTENT's, not want of arming
+        binding=binding,
+        adapter=adapter,
+        interlock_store=InMemoryOperatorInterlockStore(),
+        provider=provider,
+    )
+    retry = await _drive_mode_b_kind(
+        intent_kind="no_quote",
+        intent_params=MMIntentParams(),  # the IDENTICAL request
+        arming=_mm_arming(binding),
+        interlock=_full_interlock(),
+        binding=binding,
+        adapter=adapter,
+        interlock_store=InMemoryOperatorInterlockStore(),
+        provider=provider,
+    )
+
+    assert first.execution_status == "ABSTAINED"
+    # The released id is ABSENT → a FRESH reserve+run, NOT a freeze: the runner is re-entered.
+    assert retry.execution_status == "ABSTAINED", "a released id must permit a FRESH reserve+run, not a freeze"
+    assert "intent_no_quote" in retry.execution_reason_codes
+    assert "attempt_pending_reconciliation" not in retry.reason_codes
+    assert adapter.submit_calls == 0
+    assert provider.attempts("sess-mm-b") == 0, "an abstain-released id must leave ZERO standing reservations"
+
+
+# ---------------------------------------------------------------------------
+# Gate#3 R5-MAJOR-1 / IDM-002 — the FREEZE predicate keys on the RECONCILIATION
+# axis (the E4 tri-state), NOT on wire-fired / ``submitted``. A submitted order
+# whose reconciliation is AMBIGUOUS is possibly-live and must FREEZE the session
+# scope; only a RESOLVED (definite fill) reconciliation stops freezing (the slot
+# stays COUNTED). The result->settle reducer selects the disposition from the EXACT
+# attempted decision, MATCHED to its official ``venue_order_key`` — never "any
+# RESOLVED row anywhere in the result" — and FAILS CLOSED (stays frozen) on a
+# missing / mismatched / duplicate reconciliation row.
+# ---------------------------------------------------------------------------
+
+
+async def test_ambiguous_reconciliation_of_first_freezes_a_distinct_second() -> None:
+    """R5-MAJOR-1 / IDM-002 (RED against a submitted==resolved reducer): the 1st armed take SUBMITS but
+    its E4 reconcile is AMBIGUOUS (the recording-fake's fail-closed default: no matching own trade), so
+    the reservation is possibly-live and FREEZES the session scope. A genuinely DISTINCT 2nd attempt
+    (distinct ``client_order_id``) must NOT submit around it — ``write_port.submit_calls == 1`` TOTAL at
+    ``max_orders_per_session == max_orders_per_day == 2`` (SPARE cap — the freeze is driven by the
+    AMBIGUOUS-pending first, not the cap). The frozen 2nd attempt is an EXPLICIT pending / NOT_ARMED /
+    DENIED terminal. Wire-fired alone must NEVER clear the freeze — only a reconciliation RESOLUTION."""
+    binding = _mm_binding()
+    # Default (no ``fill_history_matches``) → the 1st call's E4 reconcile is AMBIGUOUS (possibly-live).
+    adapter = RecordingFakeAdapter(fill=True, open_orders=[])
+    write_port = _default_write_port(binding)  # SHARED — counts total submits
+    provider = InMemoryDurableSessionStateProvider()  # a NORMAL provider: settle DOES land (AMBIGUOUS)
+    envelope = _mm_env(max_orders_per_session=2, max_orders_per_day=2)  # SPARE capacity — the cap masks nothing
+
+    await _drive_mode_b(
+        interlock=_full_interlock(),
+        arming=_mm_arming(binding, write_port=write_port),
+        binding=binding,
+        adapter=adapter,
+        interlock_store=InMemoryOperatorInterlockStore(),
+        envelope=envelope,
+        provider=provider,
+    )
+    second = await _drive_mode_b(
+        interlock=_full_interlock(),
+        arming=_mm_arming(binding, write_port=write_port),
+        binding=binding,
+        adapter=adapter,
+        interlock_store=InMemoryOperatorInterlockStore(),
+        envelope=envelope,
+        provider=provider,
+        client_order_id="coid-2",  # a DISTINCT attempt — must STILL be frozen by the AMBIGUOUS-pending first
+    )
+
+    assert write_port.submit_calls == 1, (
+        "a submitted-but-AMBIGUOUS first order stays possibly-live and freezes the scope — a distinct "
+        "2nd attempt must NOT submit (wire-fired alone must never clear the freeze)"
+    )
+    assert second.execution_status != "SUBMITTED"
+    assert second.execution_status == "NOT_ARMED"
+    assert second.admission == "DENIED"
+    assert "attempt_pending_reconciliation" in second.reason_codes
+
+
+async def test_resolved_reconciliation_of_first_allows_a_distinct_second_and_first_still_counts() -> None:
+    """R5-MAJOR-1 / IDM-002 (positive control): the 1st armed take SUBMITS and its E4 reconcile RESOLVES
+    (a definite fill via ``fill_history_matches``), so it STOPS freezing the scope while STAYING COUNTED.
+    A genuinely DISTINCT 2nd attempt IS then allowed — ``write_port.submit_calls == 2`` under a cap of
+    two, and BOTH reservations still count (``attempts == 2``). Proves the reconciliation-keyed freeze
+    does not over-block once nothing is unresolved, and that a RESOLVED attempt keeps consuming its cap
+    slot."""
+    binding = _mm_binding()
+    # ``fill_history_matches=True`` → each call's E4 reconcile RESOLVES (definite fill), not AMBIGUOUS.
+    adapter = RecordingFakeAdapter(fill=True, fill_history_matches=True, open_orders=[])
+    write_port = _default_write_port(binding)  # SHARED
+    provider = InMemoryDurableSessionStateProvider()
+    envelope = _mm_env(max_orders_per_session=2, max_orders_per_day=2)
+
+    first = await _drive_mode_b(
+        interlock=_full_interlock(),
+        arming=_mm_arming(binding, write_port=write_port),
+        binding=binding,
+        adapter=adapter,
+        interlock_store=InMemoryOperatorInterlockStore(),
+        envelope=envelope,
+        provider=provider,
+    )
+    second = await _drive_mode_b(
+        interlock=_full_interlock(),
+        arming=_mm_arming(binding, write_port=write_port),
+        binding=binding,
+        adapter=adapter,
+        interlock_store=InMemoryOperatorInterlockStore(),
+        envelope=envelope,
+        provider=provider,
+        client_order_id="coid-2",  # a DISTINCT authorized attempt — allowed once nothing is unresolved
+    )
+
+    assert first.execution_status == "SUBMITTED"
+    assert second.execution_status == "SUBMITTED", "a distinct attempt is allowed once nothing is unresolved"
+    assert write_port.submit_calls == 2
+    assert provider.attempts("sess-mm-b") == 2, "a RESOLVED first attempt still counts toward the cap"
+
+
+def _recon_events(
+    *,
+    submit_key: str,
+    recon_key: str | None,
+    recon_state: str = "RESOLVED",
+    duplicate: bool = False,
+) -> tuple[object, ...]:
+    """Build a minimal submitted-decision lifecycle stream for the reducer negative test.
+
+    A submitted ``OrderAckEvent`` + its ``OrderSubmitAttempt`` (pre-submit ``venue_order_key == submit_key``)
+    and, unless ``recon_key`` is ``None`` (MISSING), a ``RealFillReconciliation`` keyed on ``recon_key``
+    (``duplicate`` emits two so the reducer sees a DUPLICATE). A ``recon_key != submit_key`` is a
+    MISMATCH. The reducer must FAIL CLOSED (``AMBIGUOUS``) on any of these, never pick a stray RESOLVED row.
+    """
+    events: list[object] = [
+        OrderSubmitAttempt(
+            sequence_no=1,
+            event_type="OrderSubmitAttempt",
+            source_ts=None,
+            recv_ts=0,
+            decision_id="D1",
+            client_order_id="coid-1",
+            request_payload_ref="ref",
+            attempt_ts=0,
+            presubmit_record=PreSubmitRecord(
+                integrity_commitment_hash="h", venue_order_key=submit_key, captured_id=None
+            ),
+        ),
+        OrderAckEvent(
+            sequence_no=2,
+            event_type="OrderAckEvent",
+            source_ts=None,
+            recv_ts=0,
+            decision_id="D1",
+            client_order_id="coid-1",
+            venue_order_id="V1",
+            ack_status="accepted",  # a REAL (non-dry-run) submit reached the wire
+        ),
+    ]
+    if recon_key is not None:
+        for _ in range(2 if duplicate else 1):
+            events.append(
+                RealFillReconciliation(
+                    sequence_no=3,
+                    event_type="RealFillReconciliation",
+                    source_ts=None,
+                    recv_ts=0,
+                    decision_id="D1",
+                    venue_order_key=recon_key,
+                    reconciled_state=recon_state,  # type: ignore[arg-type]
+                    reconciled_fill_size=1.0,
+                )
+            )
+    return tuple(events)
+
+
+class _EventsOnlyResult:
+    """A minimal ``DustExecutionResult`` stand-in exposing only ``.events`` (all the reducer reads)."""
+
+    def __init__(self, events: tuple[object, ...]) -> None:
+        self.events = events
+
+
+def test_reconciliation_reducer_fails_closed_on_unmatched_venue_order_key() -> None:
+    """R5-MAJOR-1 / IDM-002 (negative, keyed reducer): the result->settle reducer MUST select the
+    disposition from the reconciliation row MATCHED to THIS decision's official ``venue_order_key`` and
+    FAIL CLOSED (``AMBIGUOUS`` — possibly-live / frozen) on a MISMATCHED, MISSING, or DUPLICATE row —
+    NEVER pick a stray RESOLVED row and wrongly clear the freeze. A mutation that returns the first
+    RESOLVED row regardless of key match turns each of these ``RESOLVED``, failing this test."""
+    # MISMATCH: a RESOLVED reconciliation row keyed on a DIFFERENT venue_order_key must NOT resolve.
+    mismatch = _EventsOnlyResult(_recon_events(submit_key="K1", recon_key="K2", recon_state="RESOLVED"))
+    assert facade._reconciliation_outcome(mismatch)[0] == "AMBIGUOUS"  # type: ignore[arg-type]
+    # MISSING: a submitted decision with NO reconciliation row at all must fail closed.
+    missing = _EventsOnlyResult(_recon_events(submit_key="K1", recon_key=None))
+    assert facade._reconciliation_outcome(missing)[0] == "AMBIGUOUS"  # type: ignore[arg-type]
+    # DUPLICATE: two reconciliation rows for THIS key is ambiguous, not a clean resolution.
+    duplicate = _EventsOnlyResult(
+        _recon_events(submit_key="K1", recon_key="K1", recon_state="RESOLVED", duplicate=True)
+    )
+    assert facade._reconciliation_outcome(duplicate)[0] == "AMBIGUOUS"  # type: ignore[arg-type]
+    # Control: exactly ONE row whose key MATCHES and is RESOLVED does resolve (no over-freezing).
+    matched = _EventsOnlyResult(_recon_events(submit_key="K1", recon_key="K1", recon_state="RESOLVED"))
+    assert facade._reconciliation_outcome(matched)[0] == "RESOLVED"  # type: ignore[arg-type]
+
+    # State-machine consequence: a reservation SETTLED from the unmatched (mismatch) disposition stays
+    # possibly-live / FROZEN, so a subsequent DISTINCT attempt in the session scope is still frozen.
+    provider = InMemoryDurableSessionStateProvider()
+    provider.reserve(session_identity="sess-mm-b", now=_mm_now_dt(), attempt_id="stuck-attempt")
+    frozen_state, _ = facade._reconciliation_outcome(mismatch)  # type: ignore[arg-type]
+    provider.settle(attempt_id="stuck-attempt", recon_state=frozen_state)
+    assert provider.has_unresolved_reservation("sess-mm-b"), (
+        "an unmatched reconciliation must leave the reservation possibly-live / FROZEN (never resolved)"
+    )
+
+
+async def test_distinct_attempt_frozen_by_an_unresolved_reservation_in_scope() -> None:
+    """R5-MAJOR-1 / IDM-002: a session carrying an UNRESOLVED (AMBIGUOUS) reservation FREEZES a fresh
+    DISTINCT authorized attempt — ``write_port.submit_calls == 0`` — until it resolves. Seeds an
+    ambiguous possibly-live reservation, then drives a genuinely distinct attempt in that session."""
+    binding = _mm_binding()
+    adapter = RecordingFakeAdapter(fill=True, open_orders=[])
+    write_port = _default_write_port(binding)
+    provider = InMemoryDurableSessionStateProvider()
+    # A possibly-live, AMBIGUOUS-reconciled reservation already occupies the session freeze scope.
+    provider.reserve(session_identity="sess-mm-b", now=_mm_now_dt(), attempt_id="stuck-attempt")
+    provider.settle(attempt_id="stuck-attempt", recon_state="AMBIGUOUS")
+
+    result = await _drive_mode_b(
+        interlock=_full_interlock(),
+        arming=_mm_arming(binding, write_port=write_port),
+        binding=binding,
+        adapter=adapter,
+        interlock_store=InMemoryOperatorInterlockStore(),
+        envelope=_mm_env(max_orders_per_session=2, max_orders_per_day=2),
+        provider=provider,
+        client_order_id="coid-distinct",  # a genuinely distinct attempt — still frozen by the scope
+    )
+
+    assert write_port.submit_calls == 0, "an unresolved reservation in scope must FREEZE a distinct attempt"
+    assert result.execution_status == "NOT_ARMED"
+    assert result.admission == "DENIED"
+    assert "attempt_pending_reconciliation" in result.reason_codes
