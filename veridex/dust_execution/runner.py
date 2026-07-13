@@ -1460,6 +1460,19 @@ async def run_dust_execution(
     (Mode B) does it build and submit an order; in ``dry_run`` (Mode A) a clean quote still places
     NO order.
 
+    TRUSTED-INPUT BOUNDARY (Gate #3/#4 ruling). This exported primitive TRUSTS its injected inputs —
+    the ``risk`` accumulator, ``session`` / ``session_identity``, and the ``arming`` bundle. The SOLE
+    sanctioned Mode-B (``live_guarded``) entry is
+    :func:`~veridex.dust_execution.facade.propose_mm_execution`, which fails closed without a durable
+    state provider and binds + verifies the durable and risk session identities AND the operator
+    interlock BEFORE delegating here. A caller that invokes this function DIRECTLY in Mode B MUST
+    therefore either go through the facade or assume those same durable-state / session-identity /
+    operator-interlock obligations EXPLICITLY — the runner does not re-derive the facade's guarantees.
+    Do NOT use this as a Mode-B entry point outside the facade. (The runner-side arming gates —
+    ``authorize_mode_b`` envelope caps, the store-verified interlock receipt, the non-``FAKE_LOCAL``
+    signer — still bind a direct caller, but they are defense in depth, not a substitute for the
+    facade's session/identity/durability obligations.)
+
     E6-T2: the runner also assembles the full E1-T2 lifecycle-event stream — a session-identity
     preamble (:class:`DustExecutionSessionMeta`) followed by the numbered stream (session-level
     :class:`SessionRiskSnapshot`, then per GATE-CLEAR token: intent -> attempt -> ack -> status ->
