@@ -32,6 +32,7 @@ import pytest
 
 from veridex.mm_strategy.basis import (
     basis,
+    basis_from_state,
     rolling_depth_reference,
     rolling_spread_reference,
 )
@@ -44,7 +45,7 @@ from veridex.mm_strategy.contracts import (
     StrategyObservation,
     StrategyState,
 )
-from veridex.mm_strategy.core import _classify_row, decide
+from veridex.mm_strategy.core import _admit_basis_updates, _classify_row, decide
 
 
 def _config(*, guard_enabled: bool = False, **overrides: object) -> StrategyConfig:
@@ -312,6 +313,55 @@ def test_fv_epoch_increment_resets_basis_only() -> None:
     # Guard watermark advanced; sequence advanced within the unchanged book epoch.
     assert next_state.guard_watermark == GuardStateWatermark(fv_source_epoch=2)
     assert next_state.last_observation_sequence == 101
+
+
+# --- EWMA basis: bounded sufficient accumulator (Codex Gate#1-R2 MAJOR-1 / REQ-031/070/072) --
+
+
+def _basis_fv(*, fv: float, fv_recv_ts: int) -> GuardFairValue:
+    """A healthy guard FV leg at an ARBITRARY ``fv`` (``_guard_fv`` pins 0.5) so the admitted
+    ``raw_gap = fv − mid`` can be steered exactly, ``fv_recv_ts`` kept ≤ the frame's ``as_of_ts``."""
+    return GuardFairValue(
+        fv=fv,
+        fv_source_ts=1,
+        fv_recv_ts=fv_recv_ts,
+        fv_source_epoch=1,
+        message_id="msg-1",
+        proof_status="proven",
+    )
+
+
+def test_ewma_basis_bounded_state_matches_online_fold() -> None:
+    # Codex Gate#1-R2 MAJOR-1: with ``basis_estimator="halflife_ewma"`` the basis is the spec's
+    # ONLINE time-decayed estimator (REQ-070/072). Truncating the raw sample window to ``basis_window``
+    # would silently degrade it into a finite last-window estimator — dropping the oldest sample loses
+    # the accumulated decayed weight of the discarded prefix. The bounded sufficient accumulator folds
+    # each admitted ``(as_of_ts, raw_gap)`` one sample at a time, so dropping raw history CANNOT change
+    # the online result. Codex's construction: ``basis_window=2``, ``ewma_halflife_ms=1000``, three
+    # admitted gaps ``(0.0, 1.0, 0.0)`` at ``as_of_ts`` 0/1000/2000.
+    config = _config(
+        guard_enabled=True, basis_estimator="halflife_ewma", basis_window=2, ewma_halflife_ms=1000
+    )
+    # (as_of_ts, mid, fv) → gap = fv − mid; bid = ask = mid keeps fv ∈ [0,1] while steering the gap.
+    frames = ((0, 0.5, 0.5), (1_000, 0.0, 1.0), (2_000, 0.5, 0.5))
+    state = StrategyState()
+    for as_of_ts, mid, fv in frames:
+        obs = _obs(
+            as_of_ts=as_of_ts,
+            bid=mid,
+            ask=mid,
+            guard_fv=_basis_fv(fv=fv, fv_recv_ts=as_of_ts - 10),
+        )
+        state = state.model_copy(update=_admit_basis_updates(obs, state, config))
+
+    # Anchor both objects against the REAL estimator (no re-implementation):
+    all_samples = ((0, 0.0), (1_000, 1.0), (2_000, 0.0))
+    assert basis(all_samples, config) == pytest.approx(0.25)  # the ONLINE fold over all three
+    assert basis(all_samples[-2:], config) == pytest.approx(0.5)  # the finite last-2-window result
+    # The reducer's carried EWMA basis is the ONLINE fold (0.25) — NEVER the last-2-window result
+    # (0.5): dropping raw history does not change the online estimate.
+    assert basis_from_state(state, config) == pytest.approx(0.25)
+    assert basis_from_state(state, config) != pytest.approx(0.5)
 
 
 # --- Guard FV-epoch watermark preservation (Codex Gate#1 MAJOR-1 / REQ-031/033) -------------

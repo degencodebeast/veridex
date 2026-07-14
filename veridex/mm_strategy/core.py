@@ -27,7 +27,11 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
-from veridex.mm_strategy.basis import event_smoother_update, reference_is_warm
+from veridex.mm_strategy.basis import (
+    event_smoother_update,
+    halflife_ewma,
+    reference_is_warm,
+)
 from veridex.mm_strategy.config import StrategyConfig
 from veridex.mm_strategy.contracts import (
     DecisionKind,
@@ -110,13 +114,15 @@ def _accept(
     if full_reset:
         update.update(
             basis_samples=(),
+            basis_ewma_value=None,
+            basis_ewma_ts=None,
             smoother_mid=None,
             smoother_mid_ts=None,
             spread_ref_samples=(),
             depth_ref_samples=(),
         )
     elif basis_reset:
-        update["basis_samples"] = ()
+        update.update(basis_samples=(), basis_ewma_value=None, basis_ewma_ts=None)
     return state.model_copy(update=update)
 
 
@@ -318,20 +324,33 @@ def _admit_venue_updates(
 def _admit_basis_updates(
     observation: StrategyObservation, base: StrategyState, config: StrategyConfig
 ) -> dict[str, Any]:
-    """The basis-window training delta for an ADMITTING row — GUARDED arm ONLY (baseline never trains
-    a basis). Appends ``(as_of_ts, raw_gap = fv − mid)`` to ``base.basis_samples``. For a row-F
-    fv-epoch frame ``base.basis_samples`` was already cleared by ``_accept(basis_reset=True)``, so the
-    append yields exactly the current sample — the REQ-070 clear-then-admit (Codex R6 MAJOR-1.2)."""
+    """The basis training delta for an ADMITTING row — GUARDED arm ONLY (baseline never trains a
+    basis). Folds THIS frame's ``raw_gap = fv − mid`` into the config-selected basis state. For a
+    row-F fv-epoch frame both bases were already cleared by ``_accept(basis_reset=True)``, so the
+    fold yields exactly the current sample — the REQ-070 clear-then-admit (Codex R6 MAJOR-1.2).
+
+    * ``halflife_ewma`` — fold into the BOUNDED SUFFICIENT ACCUMULATOR one sample at a time (Codex
+      Gate#1-R2 MAJOR-1). The accumulator IS the online estimate, so it is independent of how much
+      raw history is retained — never a finite last-``basis_window`` window. An unseeded accumulator
+      (fresh / post-reset) takes this ``raw_gap`` as its first sample.
+    * ``rolling_median`` — append to ``base.basis_samples`` and bound to ``basis_window`` ON APPEND
+      (Codex Gate#1 MAJOR-3): the truncation is EXACT here (the estimator already reads
+      ``[-basis_window:]``), so state size + canonical hash never depend on data outside the window.
+    """
     if not (config.guard_enabled and observation.guard_fv is not None):
         return {}
     mid = _mid(observation)
     if mid is None:
         return {}
     raw_gap = observation.guard_fv.fv - mid
-    # Bound the basis window to ``basis_window`` ON APPEND (Codex Gate#1 MAJOR-3): the state retains
-    # only the last window the estimator reduces. For ``rolling_median`` this is exact (the estimator
-    # already reads ``[-basis_window:]``); for ``halflife_ewma`` the fold now runs over the bounded
-    # window (EWMA-over-bounded-window — see NOTE in the report), never an ever-growing raw history.
+    if config.basis_estimator == "halflife_ewma":
+        prev = base.basis_ewma_value
+        prev_ts = base.basis_ewma_ts
+        if prev is None or prev_ts is None:
+            return {"basis_ewma_value": raw_gap, "basis_ewma_ts": observation.as_of_ts}
+        dt_ms = float(observation.as_of_ts - prev_ts)
+        value = halflife_ewma(prev, raw_gap, dt_ms, float(config.ewma_halflife_ms))
+        return {"basis_ewma_value": value, "basis_ewma_ts": observation.as_of_ts}
     samples = base.basis_samples + ((observation.as_of_ts, raw_gap),)
     return {"basis_samples": samples[-config.basis_window :]}
 
@@ -358,6 +377,8 @@ def _apply_reset(
             "spread_ref_samples": (),
             "depth_ref_samples": (),
             "basis_samples": (),
+            "basis_ewma_value": None,
+            "basis_ewma_ts": None,
             "event_cooldown_until_ts": _cooldown_deadline(observation, config),
         }
     )

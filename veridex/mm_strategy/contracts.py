@@ -356,6 +356,16 @@ class StrategyState(_FrozenModel):
     # resets it ALONE — the FV-independent venue accumulators are untouched, Codex-R5 MAJOR-1), and
     # the E2-T4 reducer APPENDS accepted samples. Empty is the post-reset / fresh-state seed.
     basis_samples: tuple[tuple[int, float], ...] = ()
+    # Bounded EWMA sufficient accumulator (REQ-031/070/072; Codex Gate#1-R2 MAJOR-1): the running
+    # time-decayed basis estimate + its last-accepted ``as_of_ts``, folded ONE admitted sample at a
+    # time by the core so ``basis_estimator == "halflife_ewma"`` stays the spec's ONLINE time-decayed
+    # estimator instead of degrading into a finite last-``basis_window`` window when the raw prefix is
+    # dropped. Used ONLY by the EWMA arm (``rolling_median`` reads ``basis_samples``); both are cleared
+    # by every basis reset (full REQ-033 reset, ``fv_source_epoch`` increment, row-R reset) exactly
+    # where ``basis_samples`` is, and both default to ``None`` so a fresh state (and the purity
+    # fixture) constructs unchanged.
+    basis_ewma_value: float | None = None
+    basis_ewma_ts: int | None = None
     # Event-cooldown deadline (REQ-081): the ``as_of_ts`` (observation clock, NEVER wall clock)
     # BEFORE which no (re)placement may occur after a reset/event trigger. The E2-T4 reducer ANCHORS
     # it at ``as_of_ts + book_state_dwell_before_quote_ms`` on a row-R reset / row-E event and reads

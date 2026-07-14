@@ -23,6 +23,7 @@ from __future__ import annotations
 import statistics
 
 from veridex.mm_strategy.config import StrategyConfig
+from veridex.mm_strategy.contracts import StrategyState
 
 # One accepted basis sample: ``(as_of_ts_ms, raw_gap)``. The gap is a native-probability
 # difference (venue mid − TxLINE fair value); the timestamp is the observation clock the
@@ -75,6 +76,28 @@ def basis(raw_gaps: tuple[BasisSample, ...], config: StrategyConfig) -> float:
         acc = halflife_ewma(acc, gap, float(ts - prev_ts), float(config.ewma_halflife_ms))
         prev_ts = ts
     return acc
+
+
+def basis_from_state(state: StrategyState, config: StrategyConfig) -> float:
+    """Config-selected basis read from carry-forward :class:`StrategyState` (REQ-070/072).
+
+    The single READ authority for the persistent gap, so a caller never re-folds raw history and
+    reintroduces the Codex Gate#1-R2 MAJOR-1 truncation defect:
+
+    * ``rolling_median`` — :func:`basis` over ``state.basis_samples`` (the bounded raw window whose
+      ``[-basis_window:]`` truncation is EXACT for a median).
+    * ``halflife_ewma`` — the bounded sufficient accumulator ``state.basis_ewma_value``, folded one
+      admitted sample at a time by the core, so the online result is independent of how much raw
+      history is retained.
+
+    Warmup / sample acceptance is the core's job, so — like :func:`basis` — an unseeded EWMA
+    accumulator is a contract violation, not a silent ``0.0``.
+    """
+    if config.basis_estimator == "halflife_ewma":
+        if state.basis_ewma_value is None:
+            raise ValueError("basis requires at least one accepted sample")
+        return state.basis_ewma_value
+    return basis(state.basis_samples, config)
 
 
 def residual(raw_gap: float, basis: float) -> float:
