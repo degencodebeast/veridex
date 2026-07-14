@@ -84,3 +84,81 @@ def residual(raw_gap: float, basis: float) -> float:
     into the estimate — yields exactly ``0.0`` and can never, by itself, become tradable edge.
     """
     return raw_gap - basis
+
+
+# --- Event smoother + rolling venue references (REQ-036 / REQ-080 / AC-042 / RED-34/44/46) --
+# STATE-carried accumulators the pure core recomputes from RAW venue facts (bid/ask/sizes) held on
+# ``StrategyState`` between frames — a producer-supplied smoother/reference is FORBIDDEN (the Fable
+# F2 defect class, RED-44). Every rolling reference reuses the SAME :func:`rolling_median`
+# (``statistics.median``) authority the basis uses, so the basis and the REQ-080 references can
+# never diverge at one config hash (REQ-072). All pure functions of ``(prior state, raw facts,
+# config)`` — no I/O, no clock, no randomness.
+
+
+def event_smoother_update(
+    prev: float, value: float, config: StrategyConfig, dt_ms: float
+) -> float:
+    """One config-selected event-smoother update: blend ``prev`` toward ``value`` (REQ-036).
+
+    COMPARE-then-UPDATE: the caller reads ``prev`` off the PRIOR state, then folds the new raw
+    ``ok``-book ``value`` (a mid) in. The smoother is re-seeded from a row-R reset frame's own mid
+    by the reducer; this is the between-seed step. ``config.event_smoother`` selects:
+
+    * ``ema_alpha`` (default) — constant-weight blend ``(1 - a) * prev + a * value`` with
+      ``a = config.event_smoother_param`` (independent of ``dt_ms``).
+    * ``halflife_ewma`` — the time-decayed :func:`halflife_ewma` step over the elapsed ``dt_ms`` on
+      ``config.ewma_halflife_ms`` (the SAME halflife authority the basis EWMA uses; §9.1 carries no
+      separate smoother-halflife knob, and adding one would be a config revision).
+
+    Both the smoother KIND and its param are config-hash-bearing (AC-042/RED-34): they enter
+    ``config_hash`` through ``model_dump``, so no smoother behavior change is ever hash-silent.
+    """
+    if config.event_smoother == "ema_alpha":
+        alpha = config.event_smoother_param
+        return (1.0 - alpha) * prev + alpha * value
+    return halflife_ewma(prev, value, dt_ms, float(config.ewma_halflife_ms))
+
+
+def rolling_spread_reference(
+    spread_samples: tuple[float, ...], config: StrategyConfig
+) -> float:
+    """Rolling spread reference: :func:`rolling_median` over the last ``rolling_spread_window``
+    RAW spreads (REQ-080 / REQ-072).
+
+    ``spread_samples`` is the ordered (oldest→newest) tuple of accepted RAW ``ask - bid`` spreads
+    the core has trained since the last reset; only the last ``config.rolling_spread_window`` enter
+    the median (the window is config-hash-bound). Warmup / acceptance is the core's job, so — like
+    :func:`basis` — this reducer assumes at least one sample. Uses the pinned ``statistics.median``
+    authority (never the mean; RED-46).
+    """
+    if not spread_samples:
+        raise ValueError("rolling_spread_reference requires at least one accepted sample")
+    window = spread_samples[-config.rolling_spread_window :]
+    return rolling_median(window)
+
+
+def rolling_depth_reference(
+    depth_samples: tuple[float, ...], config: StrategyConfig
+) -> float:
+    """Rolling depth reference: :func:`rolling_median` over the last ``rolling_depth_window`` RAW
+    top-of-book depths (REQ-080 / REQ-072).
+
+    ``depth_samples`` is the ordered (oldest→newest) tuple of accepted RAW top-depth samples since
+    the last reset; only the last ``config.rolling_depth_window`` enter the median. Shares the
+    ``statistics.median`` authority with the spread reference and the basis (never the mean;
+    RED-46), and — like :func:`basis` — assumes at least one accepted sample.
+    """
+    if not depth_samples:
+        raise ValueError("rolling_depth_reference requires at least one accepted sample")
+    window = depth_samples[-config.rolling_depth_window :]
+    return rolling_median(window)
+
+
+def reference_is_warm(sample_count: int, config: StrategyConfig) -> bool:
+    """True once at least ``config.ref_min_samples`` RAW samples have accumulated post-reset (REQ-080).
+
+    The rolling references are live only after this warmup floor is reached; below it the core
+    withholds quoting (``event_ref_warmup``) so a thin post-reset window is never trusted as a
+    reference. A pure predicate over the state-carried sample count — no clock, no randomness.
+    """
+    return sample_count >= config.ref_min_samples

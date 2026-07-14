@@ -340,6 +340,15 @@ class StrategyState(_FrozenModel):
     outcomes: tuple[OutcomeAccumulator, ...] = ()
     inventory_echo: InventoryProjection | None = None
     quote_lineage: tuple[RestingOrderView, ...] = ()
+    # Event smoother + rolling reference accumulators (E2-T2; REQ-036/080). STATE-carried, updated
+    # by the pure core from RAW venue facts ONLY — never producer-supplied (RED-44). All default to
+    # the empty/None post-reset seed so a fresh state (and the purity fixture) constructs unchanged;
+    # the reducer (E2-T3/E2-T4) seeds ``smoother_mid`` from a row-R reset frame's own ``ok``-book
+    # mid and appends RAW spread/depth samples, warmup-bound by ``config.ref_min_samples``.
+    smoother_mid: float | None = None
+    smoother_mid_ts: int | None = None
+    spread_ref_samples: tuple[float, ...] = ()
+    depth_ref_samples: tuple[float, ...] = ()
 
     def state_hash(self) -> str:
         """``sha256`` hexdigest over the canonical serialization (REQ-031 / REQ-040)."""
