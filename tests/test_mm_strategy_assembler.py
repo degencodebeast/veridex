@@ -14,19 +14,30 @@ from veridex.live_recorder.contracts import LiveRecorderSessionMeta
 from veridex.live_recorder.recorder import LiveRecorder
 from veridex.live_recorder.replay import read_session, read_session_strict
 from veridex.mm_strategy.assembler import (
+    CadenceRun,
+    FvArrival,
+    ObservationTick,
     latest_market_status,
     mint,
+    project_guard_fv,
     read_durable_source_generations,
     record_market_status,
     resume_source_generations,
+    run_cadence,
     sample_fv_into_mint,
 )
+from veridex.mm_strategy.config import StrategyConfig
 from veridex.mm_strategy.contracts import (
+    GuardFairValue,
+    InventoryProjection,
     MarketStatusEvent,
     MintEvent,
     MintSource,
     SourceGenerations,
+    StrategyObservation,
+    StrategyState,
 )
+from veridex.mm_strategy.core import decide
 
 
 def _start_meta() -> LiveRecorderSessionMeta:
@@ -225,3 +236,242 @@ def test_mint_boundary_visible_below_sealed_pair_across_triggers(tmp_path, trigg
     got = eligible_fv_pair([fv_before, fv_after], mint_recv_ts=trig_recv, mint_sequence_no=trig_seq)
     assert got is fv_before  # BEFORE (seq-1) visible; AFTER (seq+1, fresher source) invisible
     assert got.value == 0.5
+
+
+# --- E3-T4: guard-off projection + FV-independent cadence -----------------------------------
+# (REQ-020(d/d2) / AC-049 / AC-051 / AC-056 / RED-43 / RED-45 / RED-52)
+#
+# The load-bearing A/B baseline-arm integrity invariant. With the guard config-disabled the
+# assembler emits ``guard_fv=None`` on EVERY observation regardless of FV feed health, so the
+# baseline observation/decision/state stream is BYTE-IDENTICAL across healthy / stale / absent /
+# reconnecting FV. Observation cadence is minted ONLY by non-FV events — an FV arrival feeds the
+# single-authority latest-value cache alone, never minting an observation nor advancing the
+# ``observation_sequence`` (in EITHER arm).
+
+
+def _config(*, guard_enabled: bool) -> StrategyConfig:
+    """A valid :class:`StrategyConfig` — ``guard_enabled`` is the sole REQUIRED knob."""
+    return StrategyConfig(guard_enabled=guard_enabled)
+
+
+def _observation(
+    *,
+    observation_sequence: int,
+    guard_fv: GuardFairValue | None,
+    book_source_epoch: int = 1,
+    as_of_ts: int = 1_000,
+) -> StrategyObservation:
+    """One healthy per-tick observation; every ``recv_ts`` is ≤ ``as_of_ts`` (REQ-022 guard). The
+    RAW venue / match-state facts are arm-INDEPENDENT — only ``guard_fv`` differs between arms."""
+    recv = as_of_ts - 10
+    return StrategyObservation(
+        fixture_id=1,
+        market_ref="TEAM-A/YES",
+        side="YES",
+        token_id="TOKEN-YES",
+        venue_market_ref="0xmarket",
+        tick_size=0.01,
+        observation_sequence=observation_sequence,
+        book_source_epoch=book_source_epoch,
+        bid=0.49,
+        ask=0.51,
+        bid_size=100.0,
+        ask_size=120.0,
+        book_status="ok",
+        status_reason=None,
+        book_recv_ts=recv,
+        level_count_in_band=5,
+        tick_regime_changed=False,
+        phase=1,
+        suspended=False,
+        match_state_recv_ts=recv,
+        guard_fv=guard_fv,
+        market_status="ACTIVE",
+        market_status_recv_ts=recv,
+        market_status_epoch=1,
+        order_stream_ok=True,
+        projection_fresh=True,
+        inventory=InventoryProjection(
+            net_position=0.0, resting=(), projection_as_of_ts=as_of_ts, fresh=True
+        ),
+        as_of_ts=as_of_ts,
+    )
+
+
+def _tick(source: MintSource, recv_ts: int, *, as_of_ts: int) -> ObservationTick:
+    """A non-FV mint whose ``build`` factory binds the cadence-assigned sequence + projected guard
+    leg onto arm-identical venue facts (``book_source_epoch`` held at 1 — no reset in this stream)."""
+
+    def build(observation_sequence: int, guard_fv: GuardFairValue | None) -> StrategyObservation:
+        return _observation(
+            observation_sequence=observation_sequence, guard_fv=guard_fv, as_of_ts=as_of_ts
+        )
+
+    return ObservationTick(source=source, source_epoch=1, recv_ts=recv_ts, build=build)
+
+
+def _ticks() -> list[ObservationTick]:
+    """The fixed non-FV cadence — book / match-state / projection, IDENTICAL across all scenarios."""
+    return [
+        _tick("book", 900, as_of_ts=1_000),
+        _tick("match_state", 1_090, as_of_ts=1_100),
+        _tick("projection", 1_190, as_of_ts=1_200),
+    ]
+
+
+# FV arrivals of differing feed health — none of which may touch a guard-OFF observation.
+_FV_FRESH = FvArrival(source_ts=500, recv_ts=850, value=0.55, source_epoch=1)
+_FV_FRESH2 = FvArrival(source_ts=600, recv_ts=1_050, value=0.58, source_epoch=1)
+_FV_STALE = FvArrival(source_ts=1, recv_ts=800, value=0.20, source_epoch=1)
+_FV_RECON = FvArrival(source_ts=700, recv_ts=1_050, value=0.62, source_epoch=2)
+
+
+def _healthy_events() -> list[FvArrival | ObservationTick]:
+    t = _ticks()
+    return [_FV_FRESH, t[0], _FV_FRESH2, t[1], t[2]]
+
+
+def _stale_events() -> list[FvArrival | ObservationTick]:
+    t = _ticks()
+    return [_FV_STALE, t[0], t[1], t[2]]
+
+
+def _absent_events() -> list[FvArrival | ObservationTick]:
+    return list(_ticks())
+
+
+def _reconnecting_events() -> list[FvArrival | ObservationTick]:
+    t = _ticks()
+    return [_FV_FRESH, t[0], _FV_RECON, t[1], t[2]]
+
+
+def _cadence(
+    session_dir, events: list[FvArrival | ObservationTick], *, guard_enabled: bool
+) -> CadenceRun:
+    rec = LiveRecorder(session_dir, _start_meta())
+    run = run_cadence(rec, events, guard_enabled=guard_enabled)
+    rec.close()
+    return run
+
+
+def _fold(
+    observations: tuple[StrategyObservation, ...], *, guard_enabled: bool
+) -> tuple[tuple, StrategyState]:
+    """Thread the PURE ``decide`` over the minted observation stream — decisions + final state."""
+    config = _config(guard_enabled=guard_enabled)
+    state = StrategyState()
+    decisions = []
+    for observation in observations:
+        decision, state = decide(observation, state, config)
+        decisions.append(decision)
+    return tuple(decisions), state
+
+
+def test_guard_off_identical_across_fv_health(tmp_path):
+    """Guard-OFF: healthy / stale / absent / reconnecting FV → IDENTICAL counts, sequences, hashes,
+    decisions AND venue-accumulator states (AC-051/056, RED-45/52)."""
+    scenarios = {
+        "absent": _absent_events(),
+        "healthy": _healthy_events(),
+        "stale": _stale_events(),
+        "reconnecting": _reconnecting_events(),
+    }
+    runs = {
+        name: _cadence(tmp_path / name, events, guard_enabled=False)
+        for name, events in scenarios.items()
+    }
+    folds = {name: _fold(run.observations, guard_enabled=False) for name, run in runs.items()}
+
+    base_run, base_fold = runs["absent"], folds["absent"]
+    base_hashes = [o.observation_hash() for o in base_run.observations]
+    # non-vacuous: the baseline stream really minted three observations and trained accumulators.
+    assert len(base_run.observations) == 3
+    assert base_fold[1].smoother_mid is not None
+
+    for name in ("healthy", "stale", "reconnecting"):
+        run, (decisions, state) = runs[name], folds[name]
+        assert len(run.observations) == 3  # FV events minted NO observation
+        assert tuple(o.observation_sequence for o in run.observations) == (1, 2, 3)
+        assert [o.observation_hash() for o in run.observations] == base_hashes
+        assert decisions == base_fold[0]  # identical decision stream (incl. decision_id)
+        assert state.state_hash() == base_fold[1].state_hash()
+        # venue accumulators byte-identical
+        assert (state.smoother_mid, state.spread_ref_samples, state.depth_ref_samples) == (
+            base_fold[1].smoother_mid,
+            base_fold[1].spread_ref_samples,
+            base_fold[1].depth_ref_samples,
+        )
+        # guard-off carries NO fv value / ts / epoch ANYWHERE — observation OR state.
+        assert all(o.guard_fv is None for o in run.observations)
+        assert state.guard_watermark is None
+
+
+def test_baseline_arm_fv_gate_cannot_touch(tmp_path):
+    """Guard-OFF: a STALE FV produces a stream BYTE-IDENTICAL to a healthy FV (AC-049, RED-43)."""
+    healthy = _cadence(tmp_path / "healthy", _healthy_events(), guard_enabled=False)
+    stale = _cadence(tmp_path / "stale", _stale_events(), guard_enabled=False)
+
+    # byte-identical observation payloads (not merely equal hashes).
+    assert [o.model_dump() for o in healthy.observations] == [
+        o.model_dump() for o in stale.observations
+    ]
+    # the stale FV cannot touch the baseline decision / state either.
+    healthy_fold, stale_fold = (
+        _fold(healthy.observations, guard_enabled=False),
+        _fold(stale.observations, guard_enabled=False),
+    )
+    assert healthy_fold[0] == stale_fold[0]
+    assert healthy_fold[1].state_hash() == stale_fold[1].state_hash()
+
+
+@pytest.mark.parametrize("guard_enabled", [False, True])
+def test_fv_events_mint_no_observation(tmp_path, guard_enabled):
+    """An FV mint event does NOT mint an observation nor advance ``observation_sequence`` — in EITHER
+    arm. The FV row IS on the tape (single-authority cache fed through the ONE global recorder)."""
+    t = _ticks()
+    events: list[FvArrival | ObservationTick] = [t[0], _FV_FRESH, t[1]]
+    run = _cadence(tmp_path, events, guard_enabled=guard_enabled)
+
+    # only the TWO non-FV ticks minted observations; the interleaved FV advanced neither.
+    assert len(run.observations) == 2
+    assert tuple(o.observation_sequence for o in run.observations) == (1, 2)
+
+    # the FV nonetheless rode the ONE global recorder — a single fv MintEvent row on the tape.
+    _, tape, _ = read_session(tmp_path)
+    fv_rows = [
+        r for r in tape if r.get("event_type") == "MintEvent" and r.get("source") == "fv"
+    ]
+    assert len(fv_rows) == 1
+    assert len(run.mint_pairs) == 2  # one sealed pair per minted observation, none for the FV
+
+
+def test_guard_on_stream_varies_with_fv(tmp_path):
+    """Non-vacuity: with the guard ON, a fresh vs absent FV yields a DIFFERENT observation stream —
+    so guard-off byte-identity is a real projection, not a stream that ignores FV in both arms."""
+    with_fv = _cadence(tmp_path / "on_fresh", _healthy_events(), guard_enabled=True)
+    without = _cadence(tmp_path / "on_absent", _absent_events(), guard_enabled=True)
+
+    assert [o.observation_hash() for o in with_fv.observations] != [
+        o.observation_hash() for o in without.observations
+    ]
+    assert any(o.guard_fv is not None for o in with_fv.observations)
+    assert all(o.guard_fv is None for o in without.observations)
+
+
+def test_project_guard_fv_off_never_reads_cache():
+    """Guard-OFF projection returns ``None`` WITHOUT consulting the cache — the byte-identity root."""
+    from veridex.mm_strategy.assembler import _CachedFv
+
+    # a fully-visible cache entry: if guard-off consulted it at all, this leg would surface.
+    cache = [
+        _CachedFv(
+            point=FvPoint(source_ts=500, recv_ts=850, value=0.55, sequence_no=1),
+            source_epoch=9,
+            message_id="m",
+            proof_status="proven",
+        )
+    ]
+    assert project_guard_fv(cache, (1_000, 5), guard_enabled=False) is None
+    # guard-ON over the same cache DOES surface the leg (non-vacuous contrast).
+    leg = project_guard_fv(cache, (1_000, 5), guard_enabled=True)
+    assert leg is not None and leg.fv == 0.55 and leg.fv_source_epoch == 9

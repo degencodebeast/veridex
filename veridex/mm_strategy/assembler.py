@@ -15,21 +15,30 @@ load-bearing trust rules pin this module (REQ-020b/027):
 
 Imports (E3-T5 audits this boundary): stdlib + the pure ``mm_strategy.contracts`` types + the
 ``veridex.live_recorder`` READ/resume/alignment surfaces ONLY. NEVER ``veridex.venues.base`` /
-``veridex.venues.sx_bet`` — no submit / cancel / signer surface. (The live venue read seams
-``polymarket_resolver`` / ``market_status`` are wired by the later E3-T4 cadence work.)
+``veridex.venues.sx_bet`` — no submit / cancel / signer surface. The FV-independent cadence engine
+(:func:`run_cadence` / :func:`project_guard_fv`) folds INJECTED observation facts and imports the
+``mm_strategy.contracts`` types + ``veridex.live_recorder`` ONLY — never ``mm_strategy.core`` /
+``mm_strategy.config`` / a venue surface — so decision/state identity is a downstream consequence of
+the identical observation stream (a valid replay reproduces it), not an assembler import.
 """
 
 from __future__ import annotations
 
+from collections.abc import Callable, Iterable
+from dataclasses import dataclass
 from pathlib import Path
 
 from veridex.live_recorder.alignment import FvPoint, eligible_fv_pair
 from veridex.live_recorder.recorder import LiveRecorder
 from veridex.live_recorder.replay import read_session_strict
 from veridex.mm_strategy.contracts import (
+    GuardFairValue,
     MarketStatusEvent,
     MintEvent,
+    MintSource,
+    ProofStatus,
     SourceGenerations,
+    StrategyObservation,
 )
 
 _MINT_EVENT_TYPE = "MintEvent"
@@ -67,6 +76,177 @@ def sample_fv_into_mint(
     mint_pair = mint(recorder, event)
     sampled = eligible_fv_pair(fv_cache, mint_pair[0], mint_pair[1])
     return mint_pair, sampled
+
+
+# --- FV-independent cadence + guard-off projection (REQ-020(d/d2) / AC-049/051/056) ---------
+# The load-bearing A/B baseline-arm integrity seam. Two invariants pin this section:
+#   * GUARD-OFF PROJECTION — with the guard config-disabled the assembler emits ``guard_fv=None`` on
+#     EVERY observation regardless of FV feed health, so no fv value / ts / epoch enters a baseline
+#     observation (or, via ``decide``, its state). The baseline observation/decision/state stream is
+#     therefore BYTE-IDENTICAL across healthy / stale / absent / reconnecting FV — E3-T5/E6 rely on
+#     this ``guard_enabled=False`` byte-identity guarantee.
+#   * FV-INDEPENDENT CADENCE — observations are minted ONLY by book/status/match-state/projection
+#     events. An FV arrival updates the single-authority latest-value cache (minted through the ONE
+#     global recorder so its ``sequence_no`` is comparable to a trigger pair, per E3-T3) but NEVER
+#     mints an observation nor advances ``observation_sequence``, in EITHER arm.
+
+
+ObservationFactory = Callable[[int, GuardFairValue | None], StrategyObservation]
+"""Builds one observation from the cadence-assigned ``observation_sequence`` and the projected guard
+leg (``None`` in the baseline arm). The driver is the SOLE author of both; the caller supplies the RAW
+venue / match-state facts (arm-IDENTICAL), so the guard leg is the ONLY arm-dependent input."""
+
+
+@dataclass(frozen=True)
+class FvArrival:
+    """A raw FV arrival fed into the single-authority latest-value cache (REQ-020(d2) / REQ-027).
+
+    Minting an :class:`FvArrival` updates the cache the GUARDED arm samples but NEVER mints an
+    observation nor advances ``observation_sequence`` — the FV leg has ZERO cadence authority in
+    either arm. ``message_id`` / ``proof_status`` ride into the guard leg only when the guard is on.
+    """
+
+    source_ts: int
+    recv_ts: int
+    value: float
+    source_epoch: int
+    message_id: str | None = None
+    proof_status: ProofStatus = "unavailable_no_message_id"
+
+
+@dataclass(frozen=True)
+class ObservationTick:
+    """A book / market-status / match-state / projection event that MINTS exactly one observation.
+
+    ``source`` MUST be a non-FV mint source — an FV trigger can never mint an observation
+    (REQ-020(d2)); construction fails closed otherwise. ``build`` is invoked with the cadence-assigned
+    ``observation_sequence`` and the projected guard leg to produce the fully-validated observation.
+    """
+
+    source: MintSource
+    source_epoch: int
+    recv_ts: int
+    build: ObservationFactory
+
+    def __post_init__(self) -> None:
+        if self.source == "fv":
+            raise ValueError(
+                "an FV source can never mint an observation (REQ-020(d2)); use FvArrival"
+            )
+
+
+CadenceEvent = FvArrival | ObservationTick
+
+
+@dataclass(frozen=True)
+class _CachedFv:
+    """One raw FV arrival sealed at its global recorder pair — the guard-scoped cache entry. Carries
+    the FV epoch / proof reference the guarded projection folds into a :class:`GuardFairValue`."""
+
+    point: FvPoint
+    source_epoch: int
+    message_id: str | None
+    proof_status: ProofStatus
+
+
+@dataclass(frozen=True)
+class CadenceRun:
+    """The minted observation stream plus each observation's SEALED global ``(recv_ts, sequence_no)``
+    mint pair (audit). ``len(mint_pairs) == len(observations)`` — an FV arrival contributes neither."""
+
+    observations: tuple[StrategyObservation, ...]
+    mint_pairs: tuple[tuple[int, int], ...]
+
+
+def project_guard_fv(
+    fv_cache: list[_CachedFv], mint_pair: tuple[int, int], *, guard_enabled: bool
+) -> GuardFairValue | None:
+    """Project the guard leg for one observation — the canonical guard-off rule (REQ-020(d2)).
+
+    Guard-OFF (``guard_enabled=False``) ALWAYS returns ``None`` WITHOUT reading ``fv_cache``: no fv
+    value / ts / epoch can enter a baseline observation, so the baseline stream is byte-identical
+    across FV feed health BY CONSTRUCTION (the cache is literally unobservable in the baseline arm).
+    Guard-ON samples the single-authority cache at the SEALED global ``mint_pair`` via
+    :func:`~veridex.live_recorder.alignment.eligible_fv_pair` (no look-ahead) and abstains (``None``)
+    when nothing is visible below the boundary — the FV is never imputed.
+    """
+    if not guard_enabled:
+        return None
+    winner = eligible_fv_pair(
+        [entry.point for entry in fv_cache], mint_pair[0], mint_pair[1]
+    )
+    if winner is None:
+        return None
+    cached = next(entry for entry in fv_cache if entry.point is winner)
+    return GuardFairValue(
+        fv=cached.point.value,
+        fv_source_ts=cached.point.source_ts,
+        fv_recv_ts=cached.point.recv_ts,
+        fv_source_epoch=cached.source_epoch,
+        message_id=cached.message_id,
+        proof_status=cached.proof_status,
+    )
+
+
+def run_cadence(
+    recorder: LiveRecorder, events: Iterable[CadenceEvent], *, guard_enabled: bool
+) -> CadenceRun:
+    """Fold a heterogeneous event stream into the minted observation stream (REQ-020(d)/(d2)).
+
+    Every event rides the ONE global ``recorder`` (the single sequence authority), but only a non-FV
+    :class:`ObservationTick` MINTS an observation and advances ``observation_sequence``; an
+    :class:`FvArrival` updates the latest-value cache alone (no observation, no sequence advance — in
+    EITHER arm). Each minted observation binds the cadence-assigned sequence and the
+    :func:`project_guard_fv` leg (``None`` in the baseline arm) onto the tick's arm-IDENTICAL
+    ``build`` facts, so a guard-off run yields a byte-identical observation stream regardless of FV
+    feed health. Decision/state identity follows downstream from feeding that stream to ``decide``.
+    """
+    observation_sequence = 0
+    fv_cache: list[_CachedFv] = []
+    observations: list[StrategyObservation] = []
+    mint_pairs: list[tuple[int, int]] = []
+    for event in events:
+        if isinstance(event, FvArrival):
+            # FV arrival: seal it on the global tape and cache it — but mint NO observation and do
+            # NOT advance observation_sequence (latest-value cache only, both arms).
+            pair = mint(
+                recorder,
+                MintEvent(
+                    sequence_no=0,
+                    source="fv",
+                    source_epoch=event.source_epoch,
+                    recv_ts=event.recv_ts,
+                ),
+            )
+            fv_cache.append(
+                _CachedFv(
+                    point=FvPoint(
+                        source_ts=event.source_ts,
+                        recv_ts=pair[0],
+                        value=event.value,
+                        sequence_no=pair[1],
+                    ),
+                    source_epoch=event.source_epoch,
+                    message_id=event.message_id,
+                    proof_status=event.proof_status,
+                )
+            )
+            continue
+        # Non-FV trigger: MINT one observation. The cadence sequence advances here (never on FV).
+        observation_sequence += 1
+        mint_pair = mint(
+            recorder,
+            MintEvent(
+                sequence_no=0,
+                source=event.source,
+                source_epoch=event.source_epoch,
+                recv_ts=event.recv_ts,
+            ),
+        )
+        guard_fv = project_guard_fv(fv_cache, mint_pair, guard_enabled=guard_enabled)
+        observations.append(event.build(observation_sequence, guard_fv))
+        mint_pairs.append(mint_pair)
+    return CadenceRun(observations=tuple(observations), mint_pairs=tuple(mint_pairs))
 
 
 def record_market_status(
