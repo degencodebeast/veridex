@@ -63,6 +63,53 @@ def eligible_fv(fv_history: list[FvPoint], decision_recv_ts: int) -> FvPoint | N
     return best
 
 
+def eligible_fv_pair(
+    fv_history: list[FvPoint], mint_recv_ts: int, mint_sequence_no: int
+) -> FvPoint | None:
+    """The aligned FV visible at a TYPED GLOBAL mint boundary, or ``None`` to abstain (REQ-020(d2)).
+
+    The pair-aware sibling of :func:`eligible_fv`. Where the scalar gates VISIBILITY on ``recv_ts``
+    alone — which admits an equal-``recv_ts`` point that had only arrived AFTER the decision — this
+    gates on the FULL global ``(recv_ts, sequence_no)`` pair, so no point at or after the trigger is
+    ever visible, including one that arrived in the SAME millisecond. ORDER MATTERS (as in
+    :func:`eligible_fv`):
+
+    1. **VISIBILITY (the pair):** keep only points whose global ``(recv_ts, sequence_no)`` is
+       lexicographically BELOW ``(mint_recv_ts, mint_sequence_no)``. At an equal ``recv_ts`` the
+       recorder-global ``sequence_no`` decides — a same-millisecond arrival with a greater (or equal)
+       ``sequence_no`` is NOT visible. This closes the equal-recv_ts/later-seq hole in the scalar.
+    2. **SELECTION (freshness):** among visible points, the SAME reviewed rule as
+       :func:`eligible_fv` — the greatest ``(source_ts, sequence_no)``. A late-arriving OLDER-source
+       correction therefore never overrides newer source data.
+
+    The RAW arrival history is scanned unmodified (corrections retained); if nothing is visible below
+    the boundary, abstain — the value is NEVER imputed.
+
+    Args:
+        fv_history: RAW FV arrival history (all arrivals, corrections included — NOT pre-deduped), as
+            for :func:`eligible_fv`.
+        mint_recv_ts: The minting event's global arrival time (integer **milliseconds**).
+        mint_sequence_no: The minting event's global ``sequence_no`` — the recorder-ASSIGNED sealed
+            authority (:meth:`~veridex.live_recorder.recorder.LiveRecorder.record_and_return_pair`),
+            NEVER a locally-minted counter.
+
+    Returns:
+        The visible point with the greatest ``(source_ts, sequence_no)``, or ``None`` when no point's
+        global pair is below the mint boundary. Never imputes.
+    """
+    boundary = (mint_recv_ts, mint_sequence_no)
+    best: FvPoint | None = None
+    for point in fv_history:
+        # VISIBILITY FIRST: only points whose global pair is strictly BELOW the mint boundary; a
+        # same-ms arrival at/after the trigger (>= boundary) is NOT visible (no look-ahead).
+        if (point.recv_ts, point.sequence_no) >= boundary:
+            continue
+        # SELECTION SECOND: greatest source_ts, tie-break greatest sequence_no (same as eligible_fv).
+        if best is None or (point.source_ts, point.sequence_no) > (best.source_ts, best.sequence_no):
+            best = point
+    return best
+
+
 def assert_append_order(history: list[FvPoint]) -> None:
     """Assert ``sequence_no`` is a true append order: greater ``sequence_no`` never arrives earlier.
 

@@ -14,15 +14,16 @@ load-bearing trust rules pin this module (REQ-020b/027):
   :func:`resume_source_generations` typed-increments it on an assembler restart.
 
 Imports (E3-T5 audits this boundary): stdlib + the pure ``mm_strategy.contracts`` types + the
-``veridex.live_recorder`` READ/resume surfaces ONLY. NEVER ``veridex.venues.base`` /
+``veridex.live_recorder`` READ/resume/alignment surfaces ONLY. NEVER ``veridex.venues.base`` /
 ``veridex.venues.sx_bet`` — no submit / cancel / signer surface. (The live venue read seams
-``polymarket_resolver`` / ``market_status`` are wired by the later E3-T3/T4 cadence work.)
+``polymarket_resolver`` / ``market_status`` are wired by the later E3-T4 cadence work.)
 """
 
 from __future__ import annotations
 
 from pathlib import Path
 
+from veridex.live_recorder.alignment import FvPoint, eligible_fv_pair
 from veridex.live_recorder.recorder import LiveRecorder
 from veridex.live_recorder.replay import read_session_strict
 from veridex.mm_strategy.contracts import (
@@ -44,6 +45,28 @@ def mint(recorder: LiveRecorder, event: MintEvent) -> tuple[int, int]:
     counter. The placeholder ``event.sequence_no`` is overridden by the recorder authority.
     """
     return recorder.record_and_return_pair(event.model_dump())
+
+
+def sample_fv_into_mint(
+    recorder: LiveRecorder, event: MintEvent, fv_cache: list[FvPoint]
+) -> tuple[tuple[int, int], FvPoint | None]:
+    """Mint one non-FV trigger and sample the FV cache at its SEALED global boundary (REQ-020(d2)).
+
+    The single seam where a book/status/match/projection trigger pulls the aligned FV into its next
+    observation WITHOUT look-ahead (AC-058 / RED-54). The trigger is minted through the ONE global
+    recorder (:func:`mint`), which SEALS its global ``(recv_ts, sequence_no)`` to the tape; that
+    recorder-assigned pair — never a locally-minted counter — is the visibility boundary handed to
+    :func:`~veridex.live_recorder.alignment.eligible_fv_pair`. ``fv_cache`` is the RAW FV arrival
+    history (corrections retained); sampling abstains (``None``) when nothing is visible below the
+    boundary — the FV is never imputed.
+
+    Returns the sealed ``(recv_ts, sequence_no)`` boundary AND the sampled ``FvPoint | None`` so the
+    caller binds both into the next observation. The returned pair is EXACTLY the persisted tape pair
+    — the live decision boundary IS the sealed replay boundary (the 3-way persist↔decide control).
+    """
+    mint_pair = mint(recorder, event)
+    sampled = eligible_fv_pair(fv_cache, mint_pair[0], mint_pair[1])
+    return mint_pair, sampled
 
 
 def record_market_status(
