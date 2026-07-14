@@ -215,17 +215,56 @@ def test_book_epoch_increment_resets_and_rebaselines_sequence() -> None:
     decision, next_state = decide(
         _obs(observation_sequence=5, book_source_epoch=2, as_of_ts=1_100), state, _config()
     )
-    assert decision.kind == "HOLD"
+    # A reconnect is a REQ-033/row-R RESET: NO_QUOTE with the reset reason (Codex Gate#1 MAJOR-2 —
+    # the pre-fix path returned a bare HOLD that cleared the smoother to None and anchored NO
+    # cooldown, so quoting could resume mid-dwell; corrected here to the row-R transition).
+    assert decision.kind == "NO_QUOTE"
+    assert decision.reason_codes == ("tick_regime_changed",)
     # Watermark re-baselines to the reconnect frame.
     assert next_state.last_book_source_epoch == 2
     assert next_state.last_observation_sequence == 5
     assert next_state.last_as_of_ts == 1_100
-    # Full REQ-033 reset: basis window AND venue accumulators are cleared.
+    # Full REQ-033 reset: basis window AND rolling refs are cleared; the smoother RE-SEEDS from this
+    # frame's own ok-book mid (0.5) and an event cooldown is anchored at its ``as_of_ts`` (row R).
     assert next_state.basis_samples == ()
-    assert next_state.smoother_mid is None
-    assert next_state.smoother_mid_ts is None
+    assert next_state.smoother_mid == 0.5
+    assert next_state.smoother_mid_ts == 1_100
     assert next_state.spread_ref_samples == ()
     assert next_state.depth_ref_samples == ()
+    assert next_state.event_cooldown_until_ts == 1_100 + 5_000
+
+
+def test_book_epoch_increment_anchors_cooldown_no_early_quote() -> None:
+    # Codex Gate#1 MAJOR-2: a ``book_source_epoch`` INCREMENT (reconnect) is a row-R RESET — it must
+    # re-seed the smoother from THIS frame's own ok-book mid, ANCHOR an event cooldown at its
+    # ``as_of_ts``, and produce NO_QUOTE (row R) — never a bare HOLD that lets quoting resume with
+    # dwell still owed. A tiny ``ref_min_samples`` makes the pre-fix "~2 ms after reset it quoted"
+    # bug reachable (REQ-036/070 row R/081).
+    config = _config(ref_min_samples=1, book_state_dwell_before_quote_ms=5_000)
+    dwell = config.book_state_dwell_before_quote_ms
+    state = _seeded_state(
+        last_observation_sequence=100, last_book_source_epoch=1, last_as_of_ts=1_000
+    )
+
+    # The epoch-increment frame: NO_QUOTE, cooldown anchored at ``as_of_ts``, smoother re-seeded to
+    # this frame's ok-book mid (0.5) — the full REQ-033 epoch/sequence re-baseline still occurs.
+    reset_obs = _obs(observation_sequence=5, book_source_epoch=2, as_of_ts=2_000)
+    reset_decision, state = decide(reset_obs, state, config)
+    assert reset_decision.kind == "NO_QUOTE"
+    assert state.last_book_source_epoch == 2
+    assert state.last_observation_sequence == 5
+    assert state.event_cooldown_until_ts == 2_000 + dwell
+    assert state.smoother_mid == 0.5  # re-seeded from this frame's ok mid, never cleared to None
+    assert state.spread_ref_samples == ()  # rolling refs cleared by the reset
+
+    # Every frame inside the dwell window is row C (cooldown) — NONE may place, even with
+    # ``ref_min_samples=1`` (the pre-fix path resumed ``QUOTE_TWO_SIDED`` ~2 ms after the reset).
+    for offset in (1, 2, 3):
+        obs = _obs(observation_sequence=5 + offset, book_source_epoch=2, as_of_ts=2_000 + offset)
+        assert _classify_row(obs, state, config) == "C"
+        decision, state = decide(obs, state, config)
+        assert decision.kind == "NO_QUOTE"
+        assert decision.reason_codes == ("event_cooldown",)
 
 
 # --- fv_source_epoch increment: basis-only reset (AC-040 / Codex-R5 MAJOR-1) ----------------

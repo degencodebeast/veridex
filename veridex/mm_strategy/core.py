@@ -461,11 +461,15 @@ def decide(
     if observation.book_source_epoch < state.last_book_source_epoch or guard_delta < 0:
         return _hold(("epoch_regression",)), state
 
-    # (3) book_source_epoch INCREMENT — evaluated BEFORE sequence-staleness (load-bearing).
+    # (3) book_source_epoch INCREMENT — evaluated BEFORE sequence-staleness (load-bearing). A
+    # reconnect is a REQ-033 RESET: first ``_accept(full_reset=True)`` re-baselines the epoch/
+    # sequence watermark and clears accumulators, THEN the SAME row-R transition ``_classify_row``→R
+    # uses (``_apply_reset``) re-seeds the smoother from this frame's own ok-book mid, anchors the
+    # event cooldown at its ``as_of_ts``, and produces NO_QUOTE (Codex Gate#1 MAJOR-2; REQ-070 row R
+    # / REQ-081). A bare HOLD here would leave quoting to resume with dwell still owed.
     if observation.book_source_epoch > state.last_book_source_epoch:
-        return _hold(), _accept(
-            observation, state, config, full_reset=True, basis_reset=False
-        )
+        base = _accept(observation, state, config, full_reset=True, basis_reset=False)
+        return _apply_reset(observation, base, config)
 
     # (4) fv_source_epoch INCREMENT (guarded arm, book epoch unchanged) → basis-only reset. The
     # sequence is book-epoch-scoped, so its staleness check below still applies to this frame.
