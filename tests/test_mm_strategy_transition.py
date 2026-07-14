@@ -30,6 +30,11 @@ from __future__ import annotations
 
 import pytest
 
+from veridex.mm_strategy.basis import (
+    basis,
+    rolling_depth_reference,
+    rolling_spread_reference,
+)
 from veridex.mm_strategy.config import StrategyConfig
 from veridex.mm_strategy.contracts import (
     GuardFairValue,
@@ -400,6 +405,90 @@ def test_clean_healthy_warmup_frame_admits_venue_accumulators() -> None:
     assert next_state.basis_samples == ((900, 0.01), (950, 0.011))
     # WARMUP never anchors a cooldown (liveness — E2-T5).
     assert next_state.event_cooldown_until_ts is None
+
+
+# --- Bounded rolling + basis windows (Codex Gate#1 MAJOR-3 / REQ-031/072/080) ---------------
+
+
+def test_rolling_windows_bounded_to_config() -> None:
+    # Codex Gate#1 MAJOR-3: the rolling spread/depth and basis accumulators must be BOUNDED to their
+    # configured windows ON APPEND — never grow without bound — so ``StrategyState`` size + canonical
+    # hash stay window-scoped (REQ-031 bounded/hash-bound state; REQ-072/080 configured windows).
+    # Each stored tuple length must equal its window and hold the LAST window of the admitted history,
+    # and the estimator must equal the estimator over that same window (median/EWMA parity).
+
+    # --- spread + depth windows (guard off) ---
+    config = _config(rolling_spread_window=2, rolling_depth_window=2)
+    state = _warm_state(ref_samples=1)  # seeds one 0.02 spread + one 100.0 depth sample
+    fed_spreads = [0.02]
+    fed_depths = [100.0]
+    seq, as_of = 100, 1_000
+    for spread, depth in ((0.03, 110.0), (0.04, 120.0), (0.05, 130.0), (0.06, 140.0)):
+        seq += 1
+        as_of += 1
+        # bid fixed at 0.40; ask sets the raw spread; the thinner size sets the top depth.
+        _, state = decide(
+            _obs(
+                observation_sequence=seq,
+                as_of_ts=as_of,
+                bid=0.40,
+                ask=0.40 + spread,
+                bid_size=depth,
+                ask_size=depth + 10.0,
+            ),
+            state,
+            config,
+        )
+        fed_spreads.append(spread)
+        fed_depths.append(depth)
+    # Four admitting frames were fed past a window of 2, yet each stored tuple is bounded to its
+    # window and holds exactly the LAST window of the admitted history.
+    assert len(state.spread_ref_samples) == config.rolling_spread_window
+    assert len(state.depth_ref_samples) == config.rolling_depth_window
+    assert state.spread_ref_samples == pytest.approx(tuple(fed_spreads[-2:]))
+    assert state.depth_ref_samples == pytest.approx(tuple(fed_depths[-2:]))
+    # Estimator parity: the reference over the bounded state equals it over the last-window history.
+    assert rolling_spread_reference(state.spread_ref_samples, config) == pytest.approx(
+        rolling_spread_reference(tuple(fed_spreads[-2:]), config)
+    )
+    assert rolling_depth_reference(state.depth_ref_samples, config) == pytest.approx(
+        rolling_depth_reference(tuple(fed_depths[-2:]), config)
+    )
+
+    # --- basis window (guarded arm) ---
+    gconfig = _config(guard_enabled=True, basis_window=2)
+    gstate = _warm_state(guard_watermark=GuardStateWatermark(fv_source_epoch=1))
+    fed_gaps = list(gstate.basis_samples)  # ((900, 0.01), (950, 0.011))
+    gseq, gas_of = 100, 1_000
+    for fv in (0.55, 0.60, 0.65):
+        gseq += 1
+        gas_of += 1
+        # Same FV epoch (1) as the watermark ⇒ no row-F reset: the guarded frame simply ADMITS a
+        # basis sample ``(as_of, fv - mid)`` (mid = (0.49 + 0.51) / 2 = 0.5).
+        _, gstate = decide(
+            _obs(
+                observation_sequence=gseq,
+                as_of_ts=gas_of,
+                guard_fv=GuardFairValue(
+                    fv=fv,
+                    fv_source_ts=1,
+                    fv_recv_ts=gas_of - 5,
+                    fv_source_epoch=1,
+                    message_id="msg-1",
+                    proof_status="proven",
+                ),
+            ),
+            gstate,
+            gconfig,
+        )
+        fed_gaps.append((gas_of, fv - 0.5))
+    # Three admitting guarded frames past a window of 2: the basis window is bounded and keeps the
+    # LAST window (timestamps prove it kept the newest, not the oldest, samples).
+    assert len(gstate.basis_samples) == gconfig.basis_window
+    assert [ts for ts, _ in gstate.basis_samples] == [fed_gaps[-2][0], fed_gaps[-1][0]]
+    assert basis(gstate.basis_samples, gconfig) == pytest.approx(
+        basis(tuple(fed_gaps[-2:]), gconfig)
+    )
 
 
 # --- E2-T4: the total S/R/E/D/C/F/W/H transition reducer (REQ-070/081/AC-045/050/052/057) -----

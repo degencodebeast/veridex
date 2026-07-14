@@ -301,10 +301,17 @@ def _admit_venue_updates(
         updates["smoother_mid_ts"] = observation.as_of_ts
     spread = _spread(observation)
     if spread is not None:
-        updates["spread_ref_samples"] = base.spread_ref_samples + (spread,)
+        # Bound the stored series to its configured window ON APPEND (Codex Gate#1 MAJOR-3): only the
+        # last ``rolling_spread_window`` samples the estimator reads are retained, so ``StrategyState``
+        # size + canonical hash never depend on data outside the declared window (REQ-031/072/080).
+        updates["spread_ref_samples"] = (base.spread_ref_samples + (spread,))[
+            -config.rolling_spread_window :
+        ]
     depth = _top_depth(observation)
     if depth is not None:
-        updates["depth_ref_samples"] = base.depth_ref_samples + (depth,)
+        updates["depth_ref_samples"] = (base.depth_ref_samples + (depth,))[
+            -config.rolling_depth_window :
+        ]
     return updates
 
 
@@ -321,7 +328,12 @@ def _admit_basis_updates(
     if mid is None:
         return {}
     raw_gap = observation.guard_fv.fv - mid
-    return {"basis_samples": base.basis_samples + ((observation.as_of_ts, raw_gap),)}
+    # Bound the basis window to ``basis_window`` ON APPEND (Codex Gate#1 MAJOR-3): the state retains
+    # only the last window the estimator reduces. For ``rolling_median`` this is exact (the estimator
+    # already reads ``[-basis_window:]``); for ``halflife_ewma`` the fold now runs over the bounded
+    # window (EWMA-over-bounded-window — see NOTE in the report), never an ever-growing raw history.
+    samples = base.basis_samples + ((observation.as_of_ts, raw_gap),)
+    return {"basis_samples": samples[-config.basis_window :]}
 
 
 def _cooldown_deadline(observation: StrategyObservation, config: StrategyConfig) -> int:
