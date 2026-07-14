@@ -63,14 +63,22 @@ def _status_watermark(
 
 
 def _guard_watermark(
-    observation: StrategyObservation, config: StrategyConfig
+    observation: StrategyObservation, state: StrategyState, config: StrategyConfig
 ) -> GuardStateWatermark | None:
-    """The guard-scoped watermark to seed/carry on an accepted frame — present ONLY when the guard
-    is config-enabled AND the observation carries an FV leg (Codex-R5 MAJOR-1: a guard-off or
-    FV-absent frame keeps no FV element anywhere in state)."""
-    if config.guard_enabled and observation.guard_fv is not None:
+    """The guard-scoped watermark to seed/carry on an accepted frame.
+
+    - Guard OFF (config): no FV element exists anywhere in state (Codex-R5 MAJOR-1) → ``None``.
+    - Guard ON + FV present: (re)seed the watermark at this observation's FV generation.
+    - Guard ON + FV ABSENT: CARRY THE PRIOR ``state.guard_watermark`` FORWARD UNCHANGED (Codex
+      Gate#1 MAJOR-1). A frame that merely lacks an FV leg while the guard is enabled must NOT erase
+      the last-seen generation, or a later OLDER FV epoch would slip past ``epoch_regression``
+      (REQ-031 guarded last-seen epoch / REQ-033 regression).
+    """
+    if not config.guard_enabled:
+        return None
+    if observation.guard_fv is not None:
         return GuardStateWatermark(fv_source_epoch=observation.guard_fv.fv_source_epoch)
-    return None
+    return state.guard_watermark
 
 
 def _accept(
@@ -97,7 +105,7 @@ def _accept(
         "last_as_of_ts": observation.as_of_ts,
         "last_market_status_epoch": status_epoch,
         "last_market_status_recv_ts": status_recv_ts,
-        "guard_watermark": _guard_watermark(observation, config),
+        "guard_watermark": _guard_watermark(observation, state, config),
     }
     if full_reset:
         update.update(

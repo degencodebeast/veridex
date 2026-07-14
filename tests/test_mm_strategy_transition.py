@@ -270,6 +270,35 @@ def test_fv_epoch_increment_resets_basis_only() -> None:
     assert next_state.last_observation_sequence == 101
 
 
+# --- Guard FV-epoch watermark preservation (Codex Gate#1 MAJOR-1 / REQ-031/033) -------------
+
+
+def test_fv_absent_frame_preserves_epoch_then_older_fv_regresses() -> None:
+    # Codex Gate#1 MAJOR-1: while the guard is ENABLED, an accepted frame that merely LACKS an FV
+    # leg (``guard_fv=None``) must PRESERVE the prior guard FV-epoch watermark — never erase it — so
+    # a later frame carrying an OLDER FV generation is still caught by ``epoch_regression``.
+    config = _config(guard_enabled=True)
+    state = _warm_state(guard_watermark=GuardStateWatermark(fv_source_epoch=5))
+
+    # (1) An accepted, FV-absent frame while the guard is on carries the watermark forward UNCHANGED
+    # (the prior epoch-5 watermark survives; only a guard-OFF projection drops FV state).
+    fv_absent = _obs(observation_sequence=101, as_of_ts=1_010, guard_fv=None)
+    _, after_absent = decide(fv_absent, state, config)
+    assert after_absent.guard_watermark == GuardStateWatermark(fv_source_epoch=5)
+
+    # (2) A guarded frame at an OLDER FV epoch (4 < 5) is now HELD for ``epoch_regression`` with the
+    # state unchanged — only reachable because the FV-absent frame preserved the epoch-5 watermark.
+    older_fv = _obs(
+        observation_sequence=102,
+        as_of_ts=1_020,
+        guard_fv=_guard_fv(fv_source_epoch=4, fv_recv_ts=1_010),
+    )
+    decision, after_older = decide(older_fv, after_absent, config)
+    assert decision.kind == "HOLD"
+    assert decision.reason_codes == ("epoch_regression",)
+    assert after_older == after_absent
+
+
 # --- Restart / snapshot (REQ-035 / AC-013 / RED-07) ----------------------------------------
 
 
