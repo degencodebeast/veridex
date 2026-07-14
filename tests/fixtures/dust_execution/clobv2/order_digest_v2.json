@@ -1,0 +1,23 @@
+{
+  "_comment": "OFFICIAL cross-validation fixture captured from the REAL py_clob_client_v2 ExchangeOrderBuilderV2.build_order_hash (V2, version='2'). Local EIP-712 keccak op: keccak(0x1901 || domainSeparator || structHash). NO network, NO real key. Regenerate with scripts equivalent to scratchpad/capture_digest.py against py-clob-client-v2. E3-T0 \u00a713#1 dependency RESOLVED.",
+  "domain": {
+    "name": "Polymarket CTF Exchange",
+    "version": "2",
+    "chainId": 137,
+    "verifyingContract": "0xE111180000d2663C0091e4f400237545B87B996B"
+  },
+  "order_value": {
+    "salt": "479249096354",
+    "maker": "0x1111111111111111111111111111111111111111",
+    "signer": "0x1111111111111111111111111111111111111111",
+    "tokenId": "1029364920843200000000000000000000000000000000000000000000000000000",
+    "makerAmount": "1000000",
+    "takerAmount": "2000000",
+    "side": 0,
+    "signatureType": 0,
+    "timestamp": "1713398400000",
+    "metadata": "0x0000000000000000000000000000000000000000000000000000000000000000",
+    "builder": "0x0000000000000000000000000000000000000000000000000000000000000000"
+  },
+  "expected_order_hash": "0x032e933fb0624f679245db449ce7a014516c90709b1d84202f2b68699dcc7254"
+}

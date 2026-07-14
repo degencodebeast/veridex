@@ -25,13 +25,17 @@ from veridex.policy.engine import (
     _REASON_AGENT_NOT_ELIGIBLE,
     _REASON_CIRCUIT_OPEN,
     _REASON_COOLDOWN_ACTIVE,
+    _REASON_DAILY_LOSS_OVER_MAX,
     _REASON_EDGE_BELOW_MIN,
     _REASON_INSUFFICIENT_LIQUIDITY,
     _REASON_KILL_SWITCH_ON,
     _REASON_MARKET_NOT_ALLOWED,
+    _REASON_ORDER_CAP_DAY,
     _REASON_ORDER_CAP_RUN,
+    _REASON_ORDER_CAP_SESSION,
     _REASON_PRICE_OVER_MAX,
     _REASON_QUOTE_STALE,
+    _REASON_SESSION_LOSS_OVER_MAX,
     _REASON_SLIPPAGE_OVER_MAX,
     _REASON_STAKE_OVER_LIVE_GUARDED,
     _REASON_STAKE_OVER_MAX,
@@ -39,7 +43,7 @@ from veridex.policy.engine import (
     PolicyDecision,
     PolicyResult,
 )
-from veridex.policy.envelope import PolicyEnvelope
+from veridex.policy.envelope import PolicyEnvelope, cap_breached
 
 
 class PreQuoteContext(BaseModel):
@@ -58,6 +62,15 @@ class PreQuoteContext(BaseModel):
             transparent (never contributes ``circuit_open``).
         live_guarded: Whether this action is on the live-money path; enables the tighter
             ``max_stake_live_guarded`` cap. Defaults ``False`` (paper/dry-run are unaffected).
+        realized_loss_session: Fee-inclusive realized loss accumulated this session (SAF-002),
+            sourced from the real-fill ``RiskAccumulator``. Defaults ``0.0`` so a caller that
+            does not thread risk state is transparent (never trips a loss cap).
+        realized_loss_day: Fee-inclusive realized loss accumulated this UTC day. Defaults
+            ``0.0`` (same transparency contract as ``realized_loss_session``).
+        orders_this_session: Orders already placed this session; enforced against the
+            (formerly-dead) ``max_orders_per_session`` cap. Defaults ``0`` (transparent).
+        orders_this_day: Orders already placed this UTC day; enforced against the
+            (formerly-dead) ``max_orders_per_day`` cap. Defaults ``0`` (transparent).
     """
 
     recomputed_edge_bps: int
@@ -69,6 +82,10 @@ class PreQuoteContext(BaseModel):
     agent_eligible: bool
     breaker: CircuitBreaker = Field(default_factory=CircuitBreaker)
     live_guarded: bool = False
+    realized_loss_session: float = 0.0
+    realized_loss_day: float = 0.0
+    orders_this_session: int = 0
+    orders_this_day: int = 0
 
 
 class PostQuoteContext(BaseModel):
@@ -117,6 +134,21 @@ def evaluate_pre_quote(ctx: PreQuoteContext, envelope: PolicyEnvelope) -> Policy
         reasons.append(_REASON_MARKET_NOT_ALLOWED)
     if ctx.orders_this_run >= envelope.max_orders_per_run:
         reasons.append(_REASON_ORDER_CAP_RUN)
+    # Formerly-dead order caps, now WIRED (SAF-002 / §4.4): mirror the per-run cap for the
+    # per-session and per-day counts threaded through the context.
+    if ctx.orders_this_session >= envelope.max_orders_per_session:
+        reasons.append(_REASON_ORDER_CAP_SESSION)
+    if ctx.orders_this_day >= envelope.max_orders_per_day:
+        reasons.append(_REASON_ORDER_CAP_DAY)
+    # Fee-inclusive realized-loss ceilings (SAF-002): a standing loss that REACHES an ENABLED
+    # (``> 0``) cap denies BEFORE submit. The breach boundary lives in ONE place —
+    # ``cap_breached`` (veridex.policy.envelope) — shared with the atomic breach-sweep
+    # (risk.breaches_caps) and admission (manifest.evaluate) so it cannot drift. Disabled
+    # (``<= 0``) caps are transparent — no reason emitted.
+    if cap_breached(envelope.max_session_loss, ctx.realized_loss_session):
+        reasons.append(_REASON_SESSION_LOSS_OVER_MAX)
+    if cap_breached(envelope.max_daily_loss, ctx.realized_loss_day):
+        reasons.append(_REASON_DAILY_LOSS_OVER_MAX)
     if ctx.seconds_since_last_order is not None and ctx.seconds_since_last_order < envelope.cooldown_s:
         reasons.append(_REASON_COOLDOWN_ACTIVE)
     if not ctx.agent_eligible:

@@ -1,0 +1,22 @@
+{
+  "_comment": "Order signed against the V1 exchange domain (version \"1\") + V1 verifyingContract. The V2 gate must fail closed: a V1-signed order yields a different order hash and is rejected on prod (v2-migration, effective 2025-04-28).",
+  "domain": {
+    "name": "Polymarket CTF Exchange",
+    "version": "1",
+    "chainId": 137,
+    "verifyingContract": "0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E"
+  },
+  "order_value": {
+    "salt": "479249096354",
+    "maker": "0x1111111111111111111111111111111111111111",
+    "signer": "0x1111111111111111111111111111111111111111",
+    "tokenId": "1029364920843200000000000000000000000000000000000000000000000000000",
+    "makerAmount": "1000000",
+    "takerAmount": "2000000",
+    "side": 0,
+    "signatureType": 0,
+    "timestamp": "1713398400000",
+    "metadata": "0x0000000000000000000000000000000000000000000000000000000000000000",
+    "builder": "0x0000000000000000000000000000000000000000000000000000000000000000"
+  }
+}

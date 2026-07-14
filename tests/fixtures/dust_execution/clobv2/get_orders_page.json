@@ -1,0 +1,23 @@
+{
+  "data": [
+    {
+      "id": "0xaaaabbbbccccddddeeeeffff00001111222233334444555566667777888899990",
+      "status": "live",
+      "market": "0xcondition00000000000000000000000000000000000000000000000000000000",
+      "asset_id": "1029364920843200000000000000000000000000000000000000000000000000000",
+      "side": "BUY",
+      "original_size": "100",
+      "size_matched": "0",
+      "price": "0.4",
+      "outcome": "yes",
+      "order_type": "GTC",
+      "maker_address": "0x1111111111111111111111111111111111111111",
+      "owner": "00000000-0000-0000-0000-000000000000",
+      "expiration": "0",
+      "associate_trades": [],
+      "created_at": "1713398400"
+    }
+  ],
+  "count": 1,
+  "next_cursor": "LTE="
+}

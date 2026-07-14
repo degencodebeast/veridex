@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Awaitable, Callable
-from typing import Literal, Protocol, runtime_checkable
+from typing import Any, Literal, Protocol, runtime_checkable
 
 from pydantic import BaseModel
 
@@ -350,5 +350,105 @@ class VenueAdapter(Protocol):
 
         Returns:
             An :class:`ExecutionReceipt` with no credentials attached.
+        """
+        ...
+
+
+@runtime_checkable
+class VenueReconciliationReads(Protocol):
+    """Additive READ / reconciliation surface for own-order status, own-fill history, and fee info.
+
+    Deliberately SEPARATE from :class:`VenueAdapter` (IDM-005/DAT-004, E3-T2): exposing these reads
+    must never alter the sealed four-method adapter contract, so they live in their own structural
+    Protocol. A venue adapter (or a CLOB write client) MAY also implement these without affecting its
+    :class:`VenueAdapter` conformance.
+
+    Every method returns RAW venue records (dicts) — the E3-T0 pinned CLOB-V2 shapes — for the E4
+    own-fill reconciliation path to consume. All four are read-only and non-fund-touching:
+
+    * :meth:`get_orders` — paginated open-order list (E3-T0 §5 OpenOrder shape).
+    * :meth:`get_order` — a single open-order record by id/hash (§5).
+    * :meth:`get_market` — per-market info incl. the ``fd`` fee descriptor (§8).
+    * :meth:`get_fill_history` — own-fill / trade history (§3 ``get_trades`` shape). NET-NEW surface
+      (no single vendored endpoint — G9); it maps to the §3 ``get_trades`` wire in the live wiring.
+    """
+
+    async def get_orders(self, **kwargs: Any) -> list[dict[str, Any]]:
+        """Return the paginated list of open orders (E3-T0 §5 OpenOrder shape)."""
+        ...
+
+    async def get_order(self, order_id: str) -> dict[str, Any]:
+        """Return one open-order record by id/hash (E3-T0 §5)."""
+        ...
+
+    async def get_market(self, condition_id: str) -> dict[str, Any]:
+        """Return per-market info incl. the ``fd`` fee descriptor (E3-T0 §8)."""
+        ...
+
+    async def get_fill_history(self, **kwargs: Any) -> list[dict[str, Any]]:
+        """Return own-fill / trade history (E3-T0 §3 ``get_trades`` shape); net-new surface."""
+        ...
+
+
+@runtime_checkable
+class RestingOrderVenue(Protocol):
+    """Additive resting-maker WRITE surface (E3-T3, REQ-016, §6 group 16).
+
+    Deliberately SEPARATE from :class:`VenueAdapter`'s sealed FAK/FOK ``submit_order``: a resting order
+    (GTC/GTD, post-only) RESTS on the book and later appears in ``get_orders``, whereas a FAK/FOK taker
+    order fills-and-kills and NEVER rests. Keeping the resting write on its own Protocol leaves the
+    sealed four-method taker adapter contract — and its GTC-ban test — untouched (REQ-016: a single
+    order type MUST NOT be overloaded for both maker and taker).
+
+    Method kwargs are the E3-T0 §6 pinned resting-maker wire fields; the value contract that produces
+    them (``RestingOrder.to_wire_kwargs``) lives in :mod:`veridex.dust_execution.resting_order`, so this
+    Protocol carries NO dependency on the dust-execution lane (structural typing only).
+    """
+
+    async def submit_resting_order(
+        self,
+        *,
+        token_id: str,
+        amount: float,
+        native_price: float,
+        order_type: str,
+        post_only: bool,
+        expiration: int,
+        tick_size: str | None = None,
+    ) -> dict[str, Any]:
+        """Rest a GTC/GTD post-only order; return a §2c ``SendOrderResponse`` dict."""
+        ...
+
+
+@runtime_checkable
+class SingleOrderCancelVenue(Protocol):
+    """Additive single-order cancel surface (E3-T4, REQ-007/008/009, AC-029, §6 group 4).
+
+    PHYSICALLY DISTINCT from the cancel-all sweep (``cancel_all_orders``, modelled by the cause-only
+    :class:`~veridex.dust_execution.contracts.CancelAllTriggeredEvent` /
+    :class:`~veridex.dust_execution.contracts.CancelAllAck` — those carry only a ``trigger_cause`` +
+    swept count and NEVER a single order id, SAF-003). This method hits the authenticated REAL
+    ``DELETE /order`` route with body ``{"orderID": ...}`` (E3-T0 §4, CONFIRMED against
+    ``py-clob-client-v2`` — NOT a nonexistent ``/cancel`` route) for EXACTLY the one named order and
+    returns the venue ``{"canceled": [...], "not_canceled": {...}}`` shape verbatim (``not_canceled``
+    is a map ``orderId -> reason``; a phantom cancel is never reported as success — fail-closed).
+
+    NET-NEW (G5): the vendored V1 client exposes only ``cancel_all_orders`` (``DELETE /cancel-all``);
+    the single-order ``DELETE /order`` is added for R4-A/CLOB-V2. Keeping it on its OWN structural
+    Protocol leaves the sealed four-method :class:`VenueAdapter` contract untouched (additive).
+
+    NON-TERMINAL ACK: a ``canceled`` ACK does NOT mark the order definitively absent — only E4
+    reconciliation against complete venue truth may resolve that. Callers must not treat the bare
+    cancel ACK as terminal.
+    """
+
+    async def cancel_single_order(self, order_id: str) -> dict[str, Any]:
+        """Cancel EXACTLY one named order via ``DELETE /order`` (E3-T0 §4).
+
+        Args:
+            order_id: The venue order hash/id to cancel (the ``{"orderID": ...}`` body).
+
+        Returns:
+            The venue ``{"canceled": [...], "not_canceled": {...}}`` response verbatim.
         """
         ...

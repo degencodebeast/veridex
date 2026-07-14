@@ -33,13 +33,18 @@ Offline-safe import: no vendored/httpx/aiohttp imports here — the injected cli
 
 from __future__ import annotations
 
-from typing import Any, Protocol
+from typing import TYPE_CHECKING, Any, Protocol
 
 from pydantic import BaseModel
 
 from veridex.policy.envelope import PolicyEnvelope
 from veridex.venues.base import Quote
 from veridex.venues.polymarket_resolver import ResolvedMarket
+
+if TYPE_CHECKING:
+    # Type-only import: the preflight consumes an ALREADY-CONSTRUCTED CLOB-V2 gate verdict
+    # (attributes only), so ``veridex.venues`` never imports the dust-execution lane at runtime.
+    from veridex.dust_execution.clobv2_gate import Clobv2GateResult
 
 # Polymarket USDC collateral is 6-decimal; the balance-allowance endpoint returns raw values in the
 # same unit the caller states ``required_usdc`` in, so comparisons are unit-consistent by contract.
@@ -110,11 +115,27 @@ class PreflightReport(BaseModel):
             the 1-share FAK smoke). It is NOT ``ok`` alone: ``ok`` EXCLUDES the ``ok=None``
             operator-verify items, so ``ok=True`` does NOT mean the operator confirmed neg-risk / FAK.
             The live submit path arms ONLY when this is ``True`` (fail-closed: default ``False``).
+        mode_b_ready: The MODE-B (live_guarded real-money dust-execution) arm gate (REQ-017). ``True``
+            ONLY when ``live_ready`` is True AND the CLOB-V2 write-contract gate FULLY admits — i.e.
+            the ``clobv2_write_contract`` check is EXPLICITLY ``True`` (fixtures match the pinned V2
+            schemas by machine AND an operator ran the real production smoke). Additive to and
+            STRICTER than ``live_ready``: the vendored V1 path is not production-ready until this
+            passes, so Mode B cannot arm while the gate is failing/pending (fail-closed default
+            ``False``). It NEVER arms from the offline fake fixtures alone.
+        mode_b_armable: The STRICTEST arm gate (REQ-018): Mode B is blocked until ALL THREE
+            operator-gated gates pass — the CLOB-V2 write-contract gate (via ``mode_b_ready``), the
+            operator-run Privy signing preflight (``privy_preflight``), AND the operator-run
+            pUSD/approvals/gas provisioning (``pusd_provisioning``). ``True`` ONLY when
+            ``mode_b_ready`` is True AND both operator checks are EXPLICITLY ``True``. Additive to and
+            STRICTER than ``mode_b_ready`` (fail-closed default ``False``); the operator-pending
+            (``ok=None``) preflight/provisioning checks keep it blocked.
         checks: The ordered list of named checks.
     """
 
     ok: bool
     live_ready: bool
+    mode_b_ready: bool
+    mode_b_armable: bool = False
     checks: list[PreflightCheck]
 
 
@@ -189,6 +210,9 @@ async def run_preflight(
     dry_run: bool = True,
     neg_risk_approved: bool | None = None,
     fak_smoke_passed: bool | None = None,
+    clobv2_gate: Clobv2GateResult | None = None,
+    privy_preflight_ok: bool | None = None,
+    provisioning_ok: bool | None = None,
 ) -> PreflightReport:
     """Run every REQ-2D-403 precondition over the injected clients and return a named report.
 
@@ -216,6 +240,15 @@ async def run_preflight(
             gates ``live_ready`` — it is NOT offline-verifiable, so it must be operator-supplied.
         fak_smoke_passed: OPERATOR confirmation that the live 1-share FAK smoke passed. Same
             tri-state semantics; also mandatory for ``live_ready``. NEVER auto-run here.
+        clobv2_gate: The CLOB-V2 write-contract compatibility verdict (REQ-017,
+            :mod:`veridex.dust_execution.clobv2_gate`) — an ALREADY-CONSTRUCTED result, not run here.
+            Gates ``mode_b_ready`` (the Mode-B / live_guarded real-money arm gate). ``None`` (default)
+            → the ``clobv2_write_contract`` check is operator-pending (``ok=None``) and Mode B is
+            fail-closed BLOCKED. A machine incompatibility (stale fixtures / unsupported client / a
+            failed operator smoke) → the check fails ``False``; a machine match with the operator
+            smoke still pending stays ``ok=None`` (Mode B blocked). Only a FULL admission (machine
+            match AND operator-confirmed production smoke) makes the check ``True``. This never arms
+            Mode B from the offline fake fixtures.
 
     Returns:
         A :class:`PreflightReport` whose ``ok`` is the AND of every boolean-verdict check and whose
@@ -360,11 +393,114 @@ async def run_preflight(
         ),
     )
 
-    checks = [*cheap, liquidity, dry_run_state, operator_smoke]
+    # --- CLOB-V2 write-contract compatibility gate (REQ-017): the pre-Mode-B blocker ---
+    # Tri-state, fail-closed. The offline machine fixture-match and the operator-run production smoke
+    # are DISTINCT signals: a machine match alone is NOT enough — Mode B needs the operator smoke too.
+    # This NEVER infers success from the offline fakes: the ``ok=True`` branch requires the gate's
+    # ``operator_smoke_ok`` to be EXPLICITLY True (an operator ran the real check, out of CI).
+    if clobv2_gate is None:
+        clobv2_check = PreflightCheck(
+            name="clobv2_write_contract",
+            ok=None,
+            detail=(
+                "CLOB-V2 write-contract gate not run — Mode B BLOCKED (operator must run the fixture "
+                "gate + the real production smoke; the vendored V1 path is not production-ready)"
+            ),
+        )
+    elif not clobv2_gate.machine_ok:
+        clobv2_check = PreflightCheck(
+            name="clobv2_write_contract",
+            ok=False,
+            detail=(
+                "CLOB-V2 write-contract INCOMPATIBLE (fail-closed): "
+                + ("; ".join(clobv2_gate.reasons) or "machine fixture/client checks failed")
+            ),
+        )
+    elif clobv2_gate.operator_smoke_ok is None:
+        clobv2_check = PreflightCheck(
+            name="clobv2_write_contract",
+            ok=None,
+            detail=(
+                "CLOB-V2 fixtures match the pinned V2 schemas (machine); the real production smoke is "
+                "PENDING operator (OPERATOR-RUN, out of CI) — Mode B BLOCKED until it is run"
+            ),
+        )
+    elif clobv2_gate.operator_smoke_ok is False:
+        clobv2_check = PreflightCheck(
+            name="clobv2_write_contract",
+            ok=False,
+            detail="operator-run CLOB-V2 production smoke FAILED — Mode B BLOCKED",
+        )
+    else:
+        clobv2_check = PreflightCheck(
+            name="clobv2_write_contract",
+            ok=True,
+            detail=(
+                "CLOB-V2 write-contract compatible: fixtures match the pinned V2 schemas (machine) "
+                "AND an operator confirmed the real production smoke"
+            ),
+        )
+
+    # --- operator-gated Privy signing preflight (REQ-018): ok=None until an operator runs it ---
+    # The real signing preflight (sign the allowed-domain, signed-field-INVALID fixture; exercise the
+    # ClobAuth + V2-order rules; verify recovery; NEVER submit/persist) is OPERATOR-RUN and OUT of CI
+    # (veridex.dust_execution.privy_control_plane.operator_privy_preflight). Its tri-state verdict is
+    # supplied here — never inferred from the offline fakes.
+    privy_preflight_check = PreflightCheck(
+        name="privy_preflight",
+        ok=privy_preflight_ok,
+        detail=(
+            "operator-pending: the Privy signing preflight is OPERATOR-RUN and OUT of CI — Mode B "
+            "BLOCKED until it is run (signs a signed-field-invalid fixture only, never submits)"
+            if privy_preflight_ok is None
+            else f"operator-confirmed Privy signing preflight={privy_preflight_ok}"
+        ),
+    )
+
+    # --- operator-gated pUSD/approvals/gas provisioning (REQ-018): ok=None until an operator runs it ---
+    provisioning_check = PreflightCheck(
+        name="pusd_provisioning",
+        ok=provisioning_ok,
+        detail=(
+            "operator-pending: the one-time pUSD/approvals/gas provisioning (balance ≥ session need, "
+            "approvals present, default-deny restored + content hash re-pinned) is OPERATOR-RUN and "
+            "OUT of CI — Mode B BLOCKED until it passes"
+            if provisioning_ok is None
+            else f"operator-confirmed pUSD/approvals/gas provisioning={provisioning_ok}"
+        ),
+    )
+
+    checks = [
+        *cheap,
+        liquidity,
+        dry_run_state,
+        operator_smoke,
+        clobv2_check,
+        privy_preflight_check,
+        provisioning_check,
+    ]
     overall_ok = all(check.ok for check in checks if check.ok is not None)
     # LIVE-READINESS (gate 2): arm the live submit ONLY when every boolean check passes AND both
     # MANDATORY operator-verify checks are EXPLICITLY True — never on ``ok`` alone (which excludes
     # the ok=None operator items). Fail-closed: any unverified / failed operator check → not ready.
     neg_risk_check = next(c for c in checks if c.name == "ctf_approval_neg_risk")
     live_ready = overall_ok and neg_risk_check.ok is True and operator_smoke.ok is True
-    return PreflightReport(ok=overall_ok, live_ready=live_ready, checks=checks)
+    # MODE-B (REQ-017): additive, STRICTER than live_ready — also requires the CLOB-V2 write-contract
+    # gate to FULLY admit (clobv2 check EXPLICITLY True: machine fixture-match AND operator smoke).
+    # Fail-closed: a None (pending) / False clobv2 check keeps Mode B blocked, so the fake fixtures
+    # passing can never arm Mode B on their own.
+    mode_b_ready = live_ready and clobv2_check.ok is True
+    # MODE-B ARMABLE (REQ-018): the STRICTEST gate — blocked until ALL THREE operator-gated gates pass:
+    # the CLOB-V2 write-contract gate (mode_b_ready) AND the operator-run Privy signing preflight AND
+    # the operator-run pUSD/approvals/gas provisioning, each EXPLICITLY True. Fail-closed: any
+    # None (pending) / False keeps Mode B un-armable.
+    mode_b_armable = (
+        mode_b_ready and privy_preflight_check.ok is True and provisioning_check.ok is True
+    )
+    return PreflightReport(
+        ok=overall_ok,
+        live_ready=live_ready,
+        mode_b_ready=mode_b_ready,
+        mode_b_armable=mode_b_armable,
+        checks=checks,
+    )

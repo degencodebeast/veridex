@@ -154,6 +154,66 @@ def test_wrong_owner_killswitch_403_no_mutation(client: TestClient, op_headers: 
 
 
 # ---------------------------------------------------------------------------
+# Engage-only kill-switch + SEPARATE fail-closed re-arm (SAF-004, AC-007/038)
+# ---------------------------------------------------------------------------
+
+
+def test_kill_switch_engage_is_idempotent_and_never_re_enables(
+    client: TestClient, op_headers: dict[str, str]
+) -> None:  # SAF-004, AC-007/038
+    """The kill-switch endpoint ENGAGES (sets True), it does NOT toggle — and re-arm is separate.
+
+    A duplicate engage (a client retry after an uncertain ACK) must KEEP the stop engaged, never
+    flip it OFF. The stop endpoint can NEVER re-arm; only the SEPARATE ``/re-arm`` op can, and it
+    FAILS CLOSED here (open-order reconciliation + risk-state reload are not satisfiable on a
+    control-plane competition until E4), so the kill-switch stays engaged.
+    """
+    comp_id = _make_dry_run(client, operator_id=_OP_ID)
+
+    # FIRST engage → kill_switch True (engaged).
+    r1 = client.post(f"/competitions/{comp_id}/kill-switch", headers=op_headers)
+    assert r1.status_code == 200, r1.text
+    assert r1.json()["kill_switch"] is True
+    assert r1.json()["status"] == "kill_switch_on"
+
+    # DUPLICATE engage (retry after an uncertain ACK) → STILL True, never toggled off.
+    r2 = client.post(f"/competitions/{comp_id}/kill-switch", headers=op_headers)
+    assert r2.status_code == 200, r2.text
+    assert r2.json()["kill_switch"] is True  # engage-only: a repeat NEVER re-enables trading
+    assert r2.json()["status"] == "kill_switch_on"
+    state = client.get(f"/competitions/{comp_id}").json()
+    assert state["config"]["policy_envelope"]["kill_switch"] is True
+
+    # The SEPARATE re-arm endpoint FAILS CLOSED (preconditions unmet) → kill_switch STAYS engaged.
+    rearm = client.post(
+        f"/competitions/{comp_id}/re-arm",
+        headers=op_headers,
+        json={"authorize": True},
+    )
+    assert rearm.status_code == 409, rearm.text  # fail-closed: cannot clear the stop
+    state_after = client.get(f"/competitions/{comp_id}").json()
+    assert state_after["config"]["policy_envelope"]["kill_switch"] is True  # still engaged
+
+
+def test_re_arm_requires_auth(client: TestClient) -> None:  # SAF-004
+    """The re-arm endpoint is a control-plane WRITE — fail closed without an operator token."""
+    assert client.post("/competitions/c/re-arm").status_code in (401, 403)
+
+
+def test_re_arm_requires_explicit_operator_authorization(
+    client: TestClient, op_headers: dict[str, str]
+) -> None:  # SAF-004
+    """Re-arm demands EXPLICIT operator authorization in the body — an authed call alone is not it."""
+    comp_id = _make_dry_run(client, operator_id=_OP_ID)
+    client.post(f"/competitions/{comp_id}/kill-switch", headers=op_headers)
+    # No explicit authorization flag → refused, stop stays engaged.
+    resp = client.post(f"/competitions/{comp_id}/re-arm", headers=op_headers, json={})
+    assert resp.status_code in (400, 409, 422, 403)
+    state = client.get(f"/competitions/{comp_id}").json()
+    assert state["config"]["policy_envelope"]["kill_switch"] is True
+
+
+# ---------------------------------------------------------------------------
 # Paper start + reads stay public
 # ---------------------------------------------------------------------------
 

@@ -55,6 +55,7 @@ from veridex.venues.polymarket_resolver import ResolvedMarket, side_to_token
 
 if TYPE_CHECKING:
     from veridex.config import Settings
+    from veridex.dust_execution.resting_order import RestingOrder
 
 # Timestamps above this bound are Unix milliseconds (Polymarket CLOB) rather than seconds; used to
 # normalise the book timestamp to the seconds unit :attr:`Quote.ts` documents. ~Sat Mar 2033 in ms.
@@ -105,8 +106,51 @@ class WriteClient(Protocol):
         """Return the raw order record (carries ``size_matched`` and the matched native ``price``)."""
         ...
 
+    # -- ADDITIVE resting-maker WRITE surface (E3-T3, REQ-016, §6 group 16) ---------------------
+    # DISTINCT from the taker FAK/FOK ``limit_order`` path: a resting order (GTC/GTD, post-only) RESTS
+    # on the book and later appears in ``get_orders``. Adding it leaves the sealed FAK/FOK write
+    # behavior unchanged. Mirrors :class:`~veridex.venues.base.RestingOrderVenue`.
+    async def submit_resting_order(
+        self,
+        *,
+        token_id: str,
+        amount: float,
+        native_price: float,
+        order_type: str,
+        post_only: bool,
+        expiration: int,
+        tick_size: str | None = ...,
+    ) -> dict[str, Any]:
+        """Rest a GTC/GTD post-only order (§6 wire); ``native_price`` is the NATIVE tick-unit price."""
+        ...
+
     async def cancel_all_orders(self) -> dict[str, Any]:
         """Cancel resting orders (FAK orders never rest, so this is a defensive cleanup)."""
+        ...
+
+    # -- ADDITIVE single-order cancel (E3-T4, REQ-007/008, §6 group 4) --------------------------
+    # NET-NEW (G5): the vendored V1 client has ONLY cancel-all; the single-order authenticated
+    # ``DELETE /order`` (``{"orderID": ...}`` -> ``canceled``/``not_canceled``, E3-T0 §4) is added
+    # here. PHYSICALLY DISTINCT from ``cancel_all_orders`` (the sweep): it cancels ONE named order.
+    async def cancel_single_order(self, order_id: str) -> dict[str, Any]:
+        """Cancel ONE named order via authenticated ``DELETE /order`` (``{"orderID": ...}``) →
+        ``{"canceled": [...], "not_canceled": {...}}`` (E3-T0 §4). NOT a ``/cancel`` route."""
+        ...
+
+    # -- ADDITIVE read / reconciliation surface (E3-T2, IDM-005/DAT-004) -----------------------
+    # These expose the vendored CLOB reads upward for E4 own-fill reconciliation + fee lookup. They
+    # are read-only and non-fund-touching; adding them does not change the sealed write behavior.
+
+    async def get_orders(self, **kwargs: Any) -> list[dict[str, Any]]:
+        """Return the paginated list of open orders (E3-T0 §5; vendored ``get_orders(**kwargs)``)."""
+        ...
+
+    async def get_market(self, condition_id: str) -> dict[str, Any]:
+        """Return per-market info incl. the ``fd`` fee descriptor (E3-T0 §8; vendored ``get_market``)."""
+        ...
+
+    async def get_fill_history(self, **kwargs: Any) -> list[dict[str, Any]]:
+        """Return own-fill / trade history (E3-T0 §3 ``get_trades`` shape). NET-NEW surface (G9)."""
         ...
 
 
@@ -571,13 +615,25 @@ class PolymarketAdapter:
         return _order_status_from_raw(venue_order_id, raw)
 
     async def cancel_order(self, venue_order_id: str) -> CancelAck:
-        """Cancel via the vendored client — gated identically to a real submit.
+        """The cancel-all SWEEP (``cancel_all_orders``) — gated identically to a real submit.
 
-        FAK orders are fill-and-kill (they never rest), so a post-submit cancel is a defensive
-        cleanup; the vendored write surface exposes only ``cancel_all_orders`` (single-order lane).
+        This is EXPLICITLY the cancel-all primitive, NOT a single-order cancel: it fires the
+        vendored ``cancel_all_orders`` sweep (``DELETE /cancel-all``) which removes EVERY resting
+        order. FAK orders are fill-and-kill (they never rest), so a post-submit cancel is a defensive
+        cleanup. The cancel-all lifecycle is modelled by the cause-only
+        :class:`~veridex.dust_execution.contracts.CancelAllTriggeredEvent` /
+        :class:`~veridex.dust_execution.contracts.CancelAllAck` (emitted by the sealed
+        ``SafetyController`` primitive) which carry only a ``trigger_cause`` + swept count and NEVER a
+        single order id (SAF-003). ``venue_order_id`` is echoed on the returned ack ONLY to satisfy
+        the sealed :class:`~veridex.venues.base.VenueAdapter` contract; it is NOT a claim that this
+        one order (and only it) was cancelled — the sweep is all-or-nothing.
+
+        To cancel EXACTLY one named order, use :meth:`cancel_single_order` (the ``DELETE /order``
+        route). ``cancel_replace`` is modelled as cancel-all-then-repost until ``DELETE /order``
+        passes the E3-T5/REQ-017 gate — NO atomic replace is implemented here.
 
         Args:
-            venue_order_id: Opaque order reference (echoed on the ack).
+            venue_order_id: Opaque order reference (echoed on the ack; see caveat above).
 
         Returns:
             A :class:`~veridex.venues.base.CancelAck`.
@@ -589,6 +645,155 @@ class PolymarketAdapter:
         response = await client.cancel_all_orders()
         cancelled = bool(response.get("success", True)) if isinstance(response, dict) else False
         return CancelAck(venue_order_id=venue_order_id, cancelled=cancelled)
+
+    async def cancel_single_order(self, venue_order_id: str) -> dict[str, Any]:
+        """Cancel EXACTLY one named order via authenticated ``DELETE /order`` (E3-T4, REQ-007/008).
+
+        PHYSICALLY DISTINCT from :meth:`cancel_order` (the cancel-all SWEEP): this hits the REAL
+        ``DELETE /order`` route with body ``{"orderID": ...}`` (E3-T0 §4, CONFIRMED against
+        ``py-clob-client-v2`` — NOT a nonexistent ``/cancel`` route) for the ONE named order and
+        returns the venue ``{"canceled": [...], "not_canceled": {...}}`` shape verbatim
+        (``not_canceled`` maps ``orderId -> reason``; an unknown/already-gone id is reported there,
+        never as a phantom cancel — fail-closed). NET-NEW (G5): the vendored V1 client exposes only
+        ``cancel_all_orders``; the single-order ``DELETE /order`` is added for R4-A/CLOB-V2.
+
+        NON-TERMINAL ACK: a ``canceled`` ACK does NOT mark the order definitively absent — only E4
+        reconciliation against complete venue truth may resolve that. The caller must not treat the
+        bare cancel ACK as terminal.
+
+        Gated identically to a real submit (armed = write-enabled AND not DRY_RUN AND client present):
+        cancelling a live order is fund-touching.
+
+        Args:
+            venue_order_id: The venue order hash/id to cancel (the ``{"orderID": ...}`` body).
+
+        Returns:
+            The venue ``{"canceled": [...], "not_canceled": {...}}`` response verbatim.
+
+        Raises:
+            PolymarketWriteDisabled: Unless armed (write-enabled AND not DRY_RUN AND client present).
+        """
+        client = self._require_armed("cancel_single_order")
+        return await client.cancel_single_order(venue_order_id)
+
+    async def submit_resting_order(self, resting_order: RestingOrder) -> SubmitAck:
+        """Submit a DISTINCT :class:`~veridex.dust_execution.resting_order.RestingOrder` — GTC/GTD,
+        post-only, RESTS on the book (E3-T3, REQ-016, §6 group 16).
+
+        Physically distinct from :meth:`submit_order` (which only takes the FAK/FOK taker
+        :class:`~veridex.venues.base.Order` and NEVER rests): the parameter type is a ``RestingOrder``,
+        so a taker order can never travel this path and a resting order can never travel the taker
+        path. Armed identically to a real submit (:meth:`_require_armed`: ``polymarket_write_enabled``
+        true AND ``dry_run=False`` AND a write client present), then delegates the §6 resting-maker
+        wire kwargs to the venue client. ``resting_order.native_price`` is ALREADY a native tick-unit
+        share price (validated on the contract), so no decimal-odds value ever reaches the wire (§4.3).
+
+        Args:
+            resting_order: The GTC/GTD post-only resting order to rest on the book.
+
+        Returns:
+            A :class:`~veridex.venues.base.SubmitAck` parsed from the venue response.
+
+        Raises:
+            PolymarketWriteDisabled: Unless armed (write-enabled AND not DRY_RUN AND client present).
+        """
+        client = self._require_armed("submit_resting_order")
+        # Defense-in-depth (real money): a valid native share price is strictly inside (0, 1). The
+        # RestingOrder contract already enforces this, but the money path never trusts the wire to
+        # catch a pathological price — fail CLOSED before any I/O.
+        if not 0.0 < resting_order.native_price < 1.0:
+            raise PolymarketWriteDisabled(
+                f"refusing to rest order: native price {resting_order.native_price!r} outside (0, 1) "
+                "— fail-closed on the money path"
+            )
+        response = await client.submit_resting_order(**resting_order.to_wire_kwargs())
+        return _submit_ack_from_response(response)
+
+    # -- read / reconciliation surface (ADDITIVE, E3-T2, IDM-005/DAT-004) ----------------------
+    #
+    # Exposes the vendored CLOB reads upward for E4 own-fill reconciliation + fee lookup. These are
+    # RAW passthroughs (the venue's own record dicts, E3-T0 §3/§5/§8 shapes) — no reconciliation
+    # logic here; E4 owns that. Own-order/own-fill reads need L2 auth (SEC-004 honest reconciliation),
+    # so they are gated behind ``polymarket_write_enabled`` AND an injected write client (like
+    # :meth:`get_order_status`). They never touch money, so — unlike a real submit — they do NOT
+    # require ``dry_run=False``. The write path stays sealed and unchanged.
+
+    async def get_orders(self, **kwargs: Any) -> list[dict[str, Any]]:
+        """Return the paginated list of open orders (E3-T0 §5), for E4 reconciliation.
+
+        Args:
+            **kwargs: Filter/pagination params passed through to the vendored
+                ``get_orders(**kwargs)`` (e.g. ``market``, ``asset_id``).
+
+        Returns:
+            The raw open-order records (paginated, flattened) as returned by the venue.
+
+        Raises:
+            PolymarketWriteDisabled: Unless write-enabled AND a write client is injected.
+        """
+        self._require_write_enabled()
+        client = self._require_write_client()
+        return await client.get_orders(**kwargs)
+
+    async def get_order(self, order_id: str) -> dict[str, Any]:
+        """Return one raw open-order record by id/hash (E3-T0 §5), for E4 reconciliation.
+
+        This is the RAW record (unlike :meth:`get_order_status`, which reconciles it into an honest
+        :class:`~veridex.venues.base.OrderStatus`). E4 consumes the raw shape directly.
+
+        Args:
+            order_id: The venue order id / EIP-712 order hash.
+
+        Returns:
+            The raw open-order record dict.
+
+        Raises:
+            PolymarketWriteDisabled: Unless write-enabled AND a write client is injected.
+        """
+        self._require_write_enabled()
+        client = self._require_write_client()
+        return await client.get_order(order_id)
+
+    async def get_market(self, condition_id: str) -> dict[str, Any]:
+        """Return per-market info incl. the ``fd`` fee descriptor (E3-T0 §8).
+
+        Fee/market info is a PUBLIC data endpoint (auth: none), so — unlike the own-order reads — it
+        does NOT require ``polymarket_write_enabled``; it only needs an injected client to reach the
+        wire (fail-closed when the live path is not wired). This is the fee source
+        :func:`veridex.dust_execution.feesnapshot.pin_fee_snapshot` reads to pin a hashed snapshot.
+
+        Args:
+            condition_id: The market condition id.
+
+        Returns:
+            The raw market-info record dict (carries ``fd`` = fee descriptor).
+
+        Raises:
+            PolymarketWriteDisabled: When no write client is injected (live path not wired).
+        """
+        client = self._require_write_client()
+        return await client.get_market(condition_id)
+
+    async def get_fill_history(self, **kwargs: Any) -> list[dict[str, Any]]:
+        """Return own-fill / trade history (E3-T0 §3 ``get_trades`` shape), for E4 reconciliation.
+
+        NET-NEW surface (no single vendored endpoint — G9): it maps to the §3 ``get_trades`` wire in
+        the live wiring. A trade's ``taker_order_id`` (or ``maker_orders[].order_id``) equals the
+        locally-computed EIP-712 order hash — the durable pre-submit join key E4 reconciles on (§3d).
+
+        Args:
+            **kwargs: Filter params passed through (e.g. ``market``, ``asset_id``, ``maker_address``,
+                ``before``, ``after``) — the §3 ``TradeParams`` fields.
+
+        Returns:
+            The raw trade / fill records as returned by the venue.
+
+        Raises:
+            PolymarketWriteDisabled: Unless write-enabled AND a write client is injected.
+        """
+        self._require_write_enabled()
+        client = self._require_write_client()
+        return await client.get_fill_history(**kwargs)
 
     def normalize_receipt(
         self,

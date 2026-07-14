@@ -33,6 +33,13 @@ _REASON_MISSING_FIELD = "missing_field"
 _REASON_CIRCUIT_OPEN = "circuit_open"
 _REASON_INSUFFICIENT_LIQUIDITY = "insufficient_liquidity"
 _REASON_STAKE_OVER_LIVE_GUARDED = "stake_over_live_guarded"
+# R4-A dust-execution safety (SAF-002): fee-inclusive realized-loss ceilings (session/day) and
+# the now-WIRED per-session/per-day order caps (previously declared-but-dead on PolicyEnvelope).
+# All are ordinary deny reasons inside the ONE policy gate — never a second authority.
+_REASON_SESSION_LOSS_OVER_MAX = "session_loss_over_max"
+_REASON_DAILY_LOSS_OVER_MAX = "daily_loss_over_max"
+_REASON_ORDER_CAP_SESSION = "order_cap_session"
+_REASON_ORDER_CAP_DAY = "order_cap_day"
 
 
 class PolicyDecision(str, Enum):
