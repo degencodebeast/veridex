@@ -110,7 +110,9 @@ def _purity_decide_fixture() -> tuple[StrategyObservation, StrategyState, Strate
     return (
         observation,
         StrategyState(),
-        StrategyConfig(strategy_id="mm-skeleton", enabled=True),
+        # ``guard_enabled`` is REQUIRED (no default) on the full StrategyConfig; supply it so the
+        # fixture keeps constructing a valid config for the real ``decide()`` path.
+        StrategyConfig(guard_enabled=True),
     )
 
 
