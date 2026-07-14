@@ -14,7 +14,18 @@ from typing import get_args
 import pytest
 from pydantic import ValidationError
 
+from veridex.dust_execution.analysis import (
+    ScopedNegativeRelabelError,
+    reject_scoped_negative_relabel,
+)
+from veridex.mm_strategy.config import StrategyConfig
 from veridex.mm_strategy.contracts import (
+    CALIBRATION_LABEL,
+    EDGE_LABEL,
+    EVIDENCE_CLASS,
+    RUN_LABEL,
+    STRATEGY_ID,
+    STRATEGY_REVISION,
     DecisionKind,
     GuardFairValue,
     InventoryProjection,
@@ -224,3 +235,46 @@ def test_future_timestamp_is_construction_error() -> None:
 def test_market_status_image_is_closed() -> None:
     # Defensive: the status alphabet is exactly the four spec values.
     assert frozenset(get_args(MarketStatus)) == {"ACTIVE", "HALTED", "CLOSED", "UNKNOWN"}
+
+
+# --- Honest labels + pinned strategy identity (HON-001 / HON-003 / REQ-044) ----------------
+
+
+def test_labels_are_pinned_literals() -> None:
+    # HON-001/003: the four honesty-label VALUES are pinned VERBATIM to the R4-A dust surface, so
+    # a softened label ("CALIBRATED", "PROVEN_EDGE", "DUST_BACKTEST", ...) is a spec revision — it
+    # can never slip in as an incidental code edit. These are the values narrated onto every run.
+    assert EVIDENCE_CLASS == "EXPERIMENTAL_DUST"
+    assert RUN_LABEL == "DUST_LIVE"
+    assert CALIBRATION_LABEL == "UNCALIBRATED"
+    assert EDGE_LABEL == "NOT_PROVEN_EDGE"
+
+
+def test_no_promotion_path() -> None:
+    # R4-B proves SAFETY, not alpha: the pinned evidence class is EXPERIMENTAL_DUST and is NEVER
+    # one of the promoted classes, and the shared relabel guard fails closed on any promotion
+    # attempt (a bare token OR a metadata blob). Promotion is a Gate B concern, out of R4-B scope.
+    assert EVIDENCE_CLASS not in {"EVIDENCE_GATED", "PROMOTED"}
+    reject_scoped_negative_relabel(None)  # a non-promotion input is a NO-OP
+    for promoted in ("EVIDENCE_GATED", "PROMOTED"):
+        with pytest.raises(ScopedNegativeRelabelError):
+            reject_scoped_negative_relabel(promoted)
+        with pytest.raises(ScopedNegativeRelabelError):
+            reject_scoped_negative_relabel({"evidence_class": promoted})
+
+
+def test_strategy_id_pinned_and_distinct_from_historical() -> None:
+    # REQ-044: the R4-B strategy identity is pinned AND distinct from the historical raw-FV agent
+    # id, so the two strategies never collide in the decision-identity namespace. Reusing the
+    # historical `TxLineFairMarketMakerAgent` id would fail this assertion.
+    assert STRATEGY_ID == "venue-anchored-txline-guarded-maker"
+    assert STRATEGY_ID != "TxLineFairMarketMakerAgent"
+    assert STRATEGY_REVISION  # a non-empty pinned revision string feeds decision_id provenance
+
+
+def test_strategy_id_matches_config_default() -> None:
+    # config <-> contracts consistency: the two pure modules cannot cross-import (config is a leaf,
+    # contracts is the base), so this test is the SOLE guard that the config `strategy_id` DEFAULT
+    # and the pinned STRATEGY_ID never drift apart.
+    config_default = StrategyConfig.model_fields["strategy_id"].default
+    assert config_default == STRATEGY_ID

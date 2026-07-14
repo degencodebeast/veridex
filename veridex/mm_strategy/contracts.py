@@ -32,7 +32,7 @@ Design invariants worth stating once:
 from __future__ import annotations
 
 import hashlib
-from typing import Literal, Protocol
+from typing import Final, Literal, Protocol
 
 from pydantic import BaseModel, ConfigDict, field_validator, model_validator
 
@@ -479,3 +479,26 @@ def client_order_id(decision_id: str, leg_role: str) -> str:
     """
     canonical = serialize_payload({"decision_id": decision_id, "leg_role": leg_role})
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+# --- Honest evidence labels + pinned strategy identity (HON-001 / HON-003 / REQ-044) -------
+# The four mandatory honesty-label VALUES an R4-B run carries, reused VERBATIM from the R4-A dust
+# surface (``dust_execution.analysis.REQUIRED_DUST_RUN_LABELS`` + the ``EvidenceClass`` Literal).
+# They are RE-DECLARED here as pinned module constants — deliberately NOT imported — because the
+# pure tier may not depend on ``dust_execution`` (the E1-T1 four-module import whitelist). The
+# working honesty surface is these constants + the shared relabel guard + the rank denylist;
+# ``manifest.forbidden_claims`` is INERT prose. R4-B proves SAFETY, not alpha: there is NO code
+# path that promotes this evidence class to ``EVIDENCE_GATED`` / ``PROMOTED`` — promotion is a
+# Gate B concern, out of R4-B scope (Codex-plan-review MAJOR-5 / AC-003).
+EVIDENCE_CLASS: Final[str] = "EXPERIMENTAL_DUST"
+RUN_LABEL: Final[str] = "DUST_LIVE"
+CALIBRATION_LABEL: Final[str] = "UNCALIBRATED"
+EDGE_LABEL: Final[str] = "NOT_PROVEN_EDGE"
+
+# The pinned strategy identity fed as ``strategy_id`` / ``strategy_revision`` into ``decision_id``
+# (REQ-044). DISTINCT from the historical raw-FV ``TxLineFairMarketMakerAgent`` agent id so the two
+# strategies never share a decision-identity namespace (Codex-plan-review MAJOR-5 attack 1).
+# ``config.StrategyConfig.strategy_id`` pins the SAME literal; the two pure modules cannot
+# cross-import, so a drift is caught by ``test_strategy_id_matches_config_default`` in the test tier.
+STRATEGY_ID: Final[str] = "venue-anchored-txline-guarded-maker"
+STRATEGY_REVISION: Final[str] = "r4b-v0"
