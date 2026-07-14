@@ -36,6 +36,7 @@ from veridex.mm_strategy.config import StrategyConfig
 from veridex.mm_strategy.contracts import (
     DecisionKind,
     GuardStateWatermark,
+    MarketStatus,
     ReasonCode,
     StrategyDecision,
     StrategyObservation,
@@ -53,15 +54,66 @@ def _hold(reason_codes: tuple[ReasonCode, ...] = ()) -> StrategyDecision:
     return StrategyDecision(kind="HOLD", reason_codes=reason_codes)
 
 
+def _status_is_stale(observation: StrategyObservation, config: StrategyConfig) -> bool:
+    """REQ-026 upper bound: a non-``UNKNOWN`` status older than ``market_status_max_age_ms`` is
+    temporally invalid — provenance authenticates WHO said ``ACTIVE``, not that it is STILL current
+    (Codex R2 MAJOR-2). The lower bound (``recv_ts > as_of_ts`` future-dating) is a REQ-022
+    construction guard, so a constructed observation only needs this upper-bound check. ``UNKNOWN``
+    carries no ``recv_ts`` to age (typed ``None`` sentinel) — it is handled directly as ``UNKNOWN``."""
+    if observation.market_status_recv_ts is None:
+        return False
+    age = observation.as_of_ts - observation.market_status_recv_ts
+    return age > config.market_status_max_age_ms
+
+
+def _status_regressed(observation: StrategyObservation, state: StrategyState) -> bool:
+    """REQ-026 regression: a non-``UNKNOWN`` status whose epoch OR recv_ts is below the DURABLE
+    ``StrategyState`` watermark (``last_market_status_epoch`` / ``last_market_status_recv_ts``) is a
+    rolled-back generation and is never accepted as fresher truth. Comparing against the state
+    watermark — not just prior-frame history — makes the check durable across an assembler restart
+    that replays an older ``ACTIVE`` generation (AC-048). ``UNKNOWN`` (typed ``None`` sentinels) has
+    no generation to compare and is handled directly as ``UNKNOWN``."""
+    if observation.market_status_epoch is None or observation.market_status_recv_ts is None:
+        return False
+    if (
+        state.last_market_status_epoch is not None
+        and observation.market_status_epoch < state.last_market_status_epoch
+    ):
+        return True
+    return (
+        state.last_market_status_recv_ts is not None
+        and observation.market_status_recv_ts < state.last_market_status_recv_ts
+    )
+
+
+def _effective_market_status(
+    observation: StrategyObservation, state: StrategyState, config: StrategyConfig
+) -> MarketStatus:
+    """The market status AFTER the core's OWN freshness + regression re-check (REQ-026) — the single
+    source of truth both the watermark advance and the quote-blocker reason read from.
+
+    A ``UNKNOWN`` status stays ``UNKNOWN``; a non-``UNKNOWN`` status (``ACTIVE`` / ``HALTED`` /
+    ``CLOSED``) that is over-age or regressed below the durable watermark is DOWNGRADED to ``UNKNOWN``
+    (fail closed — a stale/rolled-back status is never trusted as current). This is what makes the
+    watermark advance ONLY on an accepted-current non-``UNKNOWN`` status, so a stale or regressed
+    generation can never overwrite it."""
+    if observation.market_status == "UNKNOWN":
+        return "UNKNOWN"
+    if _status_is_stale(observation, config) or _status_regressed(observation, state):
+        return "UNKNOWN"
+    return observation.market_status
+
+
 def _status_watermark(
-    observation: StrategyObservation, state: StrategyState
+    observation: StrategyObservation, state: StrategyState, config: StrategyConfig
 ) -> tuple[int | None, int | None]:
     """The ``(market_status_epoch, market_status_recv_ts)`` to carry forward on an ACCEPTED frame.
 
     REQ-026/027 (Fable n-m6): the status watermark advances ONLY on an accepted observation whose
-    status is not ``UNKNOWN``; an ``UNKNOWN`` status never advances it (the prior watermark stands).
-    """
-    if observation.market_status == "UNKNOWN":
+    EFFECTIVE status is not ``UNKNOWN`` — a raw ``UNKNOWN``, a stale non-``UNKNOWN``, or one regressed
+    below the durable watermark all leave the prior watermark standing, so a rolled-back generation
+    can never overwrite it (durable across an assembler restart, AC-048)."""
+    if _effective_market_status(observation, state, config) == "UNKNOWN":
         return state.last_market_status_epoch, state.last_market_status_recv_ts
     return observation.market_status_epoch, observation.market_status_recv_ts
 
@@ -102,7 +154,7 @@ def _accept(
     - A plain clean frame advances the watermark only — the watermark layer never TRAINS the
       accumulators (that admission is the E2-T4 reducer's job).
     """
-    status_epoch, status_recv_ts = _status_watermark(observation, state)
+    status_epoch, status_recv_ts = _status_watermark(observation, state, config)
     update: dict[str, Any] = {
         "last_observation_sequence": observation.observation_sequence,
         "last_book_source_epoch": observation.book_source_epoch,
@@ -258,18 +310,26 @@ def _decide(kind: DecisionKind, reason_codes: tuple[ReasonCode, ...]) -> Strateg
     return StrategyDecision(kind=kind, reason_codes=reason_codes)
 
 
-def _status_stream_reason(observation: StrategyObservation) -> ReasonCode | None:
+def _status_stream_reason(
+    observation: StrategyObservation, state: StrategyState, config: StrategyConfig
+) -> ReasonCode | None:
     """The QUOTE-ONLY status/stream blocker reason, or ``None`` when the frame may quote (REQ-026/097).
 
-    ``market_status ≠ ACTIVE`` and projection/stream degradation block a fresh WRITE but NEVER
-    admission or cooldown (REQ-070) — this reason only downgrades an otherwise quote-eligible row-H
-    disposition to ``NO_QUOTE``; the accumulator training already folded into the next state stands.
-    """
-    if observation.market_status == "UNKNOWN":
+    The status arm reads the EFFECTIVE status (:func:`_effective_market_status`), so a stale ``ACTIVE``
+    or a status regressed below the durable watermark is blocked as ``market_status_unknown`` — never
+    as a fresh write. ``market_status ≠ ACTIVE`` and projection/stream degradation block a fresh WRITE
+    but NEVER admission or cooldown (REQ-070): this reason only downgrades an otherwise quote-eligible
+    row-H disposition to ``NO_QUOTE``; the accumulator training already folded into the next state
+    stands. The regression re-check reads ``state`` (the watermark-advanced base) — equivalent to the
+    prior watermark, since :func:`_status_watermark` advances ONLY on an accepted-current status, so a
+    just-accepted status equals its own generation (never below it) and a downgraded one leaves the
+    prior watermark in place (the value this re-check compares against)."""
+    effective = _effective_market_status(observation, state, config)
+    if effective == "UNKNOWN":
         return "market_status_unknown"
-    if observation.market_status == "HALTED":
+    if effective == "HALTED":
         return "market_halted"
-    if observation.market_status == "CLOSED":
+    if effective == "CLOSED":
         return "market_closed"
     if not observation.order_stream_ok:
         return "stream_degraded"
@@ -451,7 +511,7 @@ def _apply_healthy(
         return _decide("NO_QUOTE", ("basis_warmup",)), next_state
     if row == "W":
         return _decide("NO_QUOTE", ("event_ref_warmup",)), next_state
-    blocker = _status_stream_reason(observation)
+    blocker = _status_stream_reason(observation, base, config)
     if blocker is not None:
         return _decide("NO_QUOTE", (blocker,)), next_state
     return _decide("QUOTE_TWO_SIDED", ()), next_state
