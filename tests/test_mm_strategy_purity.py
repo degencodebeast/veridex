@@ -1,18 +1,20 @@
 """Pure-tier purity guard (REQ-002 / AC-031 / RED-20 / RED-47, §6.3(1),(3)).
 
 The MM-R4-B strategy tier ``veridex.mm_strategy.{contracts,config,basis,core}`` MUST stay
-DETERMINISTIC and dependency-isolated: it may import ONLY stdlib + pydantic +
-``veridex.mm_strategy.contracts`` + ``veridex.runtime.evidence`` (the shared canonical
-serializer). Nothing else from ``veridex.*`` — no ``dust_execution`` / ``live_recorder`` /
-``venues`` / ``maker`` / ``scoring`` / ``research`` — and no LLM SDK.
+DETERMINISTIC and dependency-isolated: it may import ONLY stdlib + pydantic + its OWN pure
+siblings (``veridex.mm_strategy.{contracts,config,basis,core}`` — REQ-002/spec:69 permits the
+pure tier to import each other) + ``veridex.runtime.evidence`` (the shared canonical serializer).
+Nothing else from ``veridex.*`` — no ``dust_execution`` / ``live_recorder`` / ``venues`` /
+``maker`` / ``scoring`` / ``research`` — and no LLM SDK.
 
 This guard enforces that exact whitelist two ways, mirroring the fresh-subprocess technique in
 ``tests/test_dust_execution_sec_isolation.py`` and the AST import-walk in
 ``tests/test_no_r3_r4_code.py``:
 
 1. ``test_pure_tier_ast_imports_only_whitelist`` — a STATIC AST scan of each pure module's
-   source: every imported module path must be ⊆ {stdlib, ``pydantic``,
-   ``veridex.mm_strategy.contracts``, ``veridex.runtime.evidence``}.
+   source: every imported module path must be ⊆ {stdlib, ``pydantic``, the four pure
+   ``veridex.mm_strategy`` siblings, ``veridex.runtime.evidence``}. A companion predicate test
+   pins the positive control (a non-sibling ``veridex.*`` path still fails).
 2. ``test_pure_tier_fresh_process_exact_whitelist`` — a FRESH-SUBPROCESS runtime audit: in a
    clean interpreter, importing the four pure modules AND running the real ``core.decide()``
    over a fixture must leave ``sys.modules ∩ veridex.*`` ⊆ the allowed runtime set, checked
@@ -46,10 +48,12 @@ _PURE_MODULES = (
     "veridex.mm_strategy.core",
 )
 
-# STATIC-AST whitelist: the only ``veridex.*`` module PATHS a pure module may import FROM.
-_AST_ALLOWED_VERIDEX_IMPORTS = frozenset(
-    {"veridex.mm_strategy.contracts", "veridex.runtime.evidence"}
-)
+# STATIC-AST whitelist: the only ``veridex.*`` module PATHS a pure module may import FROM. The
+# four pure siblings may import EACH OTHER (REQ-002, spec:69 — e.g. ``basis`` imports ``config``
+# for the estimator selection), plus the shared ``veridex.runtime.evidence`` serializer. Nothing
+# ELSE from ``veridex.*`` (no ``dust_execution`` / ``live_recorder`` / ``venues`` / …) — the
+# positive control below pins that a non-sibling path still fails this predicate.
+_AST_ALLOWED_VERIDEX_IMPORTS = frozenset({*_PURE_MODULES, "veridex.runtime.evidence"})
 
 # RUNTIME whitelist: the only ``veridex.*`` entries allowed resident in ``sys.modules`` after a
 # fresh-interpreter import of the pure tier + a ``decide()`` — the four pure modules, the
@@ -170,9 +174,27 @@ def test_pure_tier_ast_imports_only_whitelist() -> None:
         if bad:
             offenders[modname] = bad
     assert not offenders, (
-        "pure-tier modules may import ONLY stdlib + pydantic + veridex.mm_strategy.contracts "
-        f"+ veridex.runtime.evidence; found non-whitelisted imports: {offenders}"
+        "pure-tier modules may import ONLY stdlib + pydantic + their own pure "
+        "veridex.mm_strategy siblings + veridex.runtime.evidence; found non-whitelisted "
+        f"imports: {offenders}"
     )
+
+
+def test_ast_whitelist_admits_pure_siblings_rejects_non_siblings() -> None:
+    # Positive control for the widened whitelist: the predicate ADMITS every pure sibling and the
+    # shared serializer, yet still REJECTS any other veridex.* path — so widening for the
+    # sibling-import allowance (REQ-002) did NOT defeat the isolation guard. This is the static
+    # counterpart to the basis.py mutation (temporarily importing veridex.live_recorder.* must
+    # fail test_pure_tier_ast_imports_only_whitelist).
+    for allowed in (*_PURE_MODULES, "veridex.runtime.evidence", "hashlib", "pydantic"):
+        assert _is_whitelisted_import(allowed), f"{allowed} should be whitelisted"
+    for forbidden in (
+        "veridex.live_recorder.contracts",
+        "veridex.dust_execution.analysis",
+        "veridex.venues.polymarket_resolver",
+        "veridex.runtime.something_else",
+    ):
+        assert not _is_whitelisted_import(forbidden), f"{forbidden} must NOT be whitelisted"
 
 
 # --- (2) Fresh-subprocess exact-whitelist runtime audit -----------------------------------
