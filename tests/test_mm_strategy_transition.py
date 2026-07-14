@@ -223,9 +223,11 @@ def test_book_epoch_increment_resets_and_rebaselines_sequence() -> None:
     )
     # A reconnect is a REQ-033/row-R RESET: NO_QUOTE with the reset reason (Codex Gate#1 MAJOR-2 —
     # the pre-fix path returned a bare HOLD that cleared the smoother to None and anchored NO
-    # cooldown, so quoting could resume mid-dwell; corrected here to the row-R transition).
+    # cooldown, so quoting could resume mid-dwell; corrected here to the row-R transition). The
+    # reason is the truthful ``event_ref_warmup`` (Codex Gate#1-R2 MAJOR-2): this observation carries
+    # ``tick_regime_changed=False``, so recording a tick-regime reason would be false provenance.
     assert decision.kind == "NO_QUOTE"
-    assert decision.reason_codes == ("tick_regime_changed",)
+    assert decision.reason_codes == ("event_ref_warmup",)
     # Watermark re-baselines to the reconnect frame.
     assert next_state.last_book_source_epoch == 2
     assert next_state.last_observation_sequence == 5
@@ -271,6 +273,36 @@ def test_book_epoch_increment_anchors_cooldown_no_early_quote() -> None:
         decision, state = decide(obs, state, config)
         assert decision.kind == "NO_QUOTE"
         assert decision.reason_codes == ("event_cooldown",)
+
+
+def test_reconnect_reset_reason_is_not_tick_regime_changed() -> None:
+    # Codex Gate#1-R2 MAJOR-2: a book-epoch reconnect whose observation carries
+    # ``tick_regime_changed=False`` must NOT record the tick-regime reset reason — that is FALSE
+    # decision provenance bound into ``decision_id`` (REQ-033). It records the truthful closed-vocab
+    # reset/warmup reason ``event_ref_warmup`` (REQ-036). A GENUINE in-stream tick-regime frame STILL
+    # reports ``tick_regime_changed`` — only the reconnect provenance is corrected.
+    state = _seeded_state(
+        last_observation_sequence=100, last_book_source_epoch=1, last_as_of_ts=1_000
+    )
+
+    # (a) Reconnect: ``book_source_epoch`` increments and the raw observation says no tick regime
+    #     change happened. The reset reason is the truthful ``event_ref_warmup``, never a tick claim.
+    reconnect_obs = _obs(
+        observation_sequence=5, book_source_epoch=2, as_of_ts=1_100, tick_regime_changed=False
+    )
+    reconnect_decision, _ = decide(reconnect_obs, state, _config())
+    assert reconnect_decision.kind == "NO_QUOTE"
+    assert "tick_regime_changed" not in reconnect_decision.reason_codes
+    assert reconnect_decision.reason_codes == ("event_ref_warmup",)
+
+    # (b) A genuine in-stream tick-regime frame (book epoch UNCHANGED, ``tick_regime_changed=True``)
+    #     is row R and STILL reports ``tick_regime_changed`` — the truthful in-stream provenance.
+    tick_obs = _obs(
+        observation_sequence=101, book_source_epoch=1, as_of_ts=1_100, tick_regime_changed=True
+    )
+    tick_decision, _ = decide(tick_obs, state, _config())
+    assert tick_decision.kind == "NO_QUOTE"
+    assert tick_decision.reason_codes == ("tick_regime_changed",)
 
 
 # --- fv_source_epoch increment: basis-only reset (AC-040 / Codex-R5 MAJOR-1) ----------------

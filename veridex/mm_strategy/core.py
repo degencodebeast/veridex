@@ -362,12 +362,20 @@ def _cooldown_deadline(observation: StrategyObservation, config: StrategyConfig)
 
 
 def _apply_reset(
-    observation: StrategyObservation, base: StrategyState, config: StrategyConfig
+    observation: StrategyObservation,
+    base: StrategyState,
+    config: StrategyConfig,
+    *,
+    reason: ReasonCode,
 ) -> tuple[StrategyDecision, StrategyState]:
     """Row R (RESET-class): clear the basis window + rolling refs; RE-SEED the smoother from THIS
     frame's mid IFF the book is ``ok`` (the ONLY re-seed row); anchor an event cooldown at this frame;
-    NO_QUOTE (a cancel plan on exposure + the specific reset reason are E4's). The E2-T4 in-stream
-    reset signal is ``tick_regime_changed``."""
+    NO_QUOTE (a cancel plan on exposure is E4's). The reset STATE transition is shared by two
+    triggers, but the recorded ``reason`` is provenance-truthful per trigger (Codex Gate#1-R2
+    MAJOR-2, REQ-033): the in-stream ``tick_regime_changed`` signal passes ``tick_regime_changed``,
+    while a book-epoch RECONNECT (whose observation did NOT see a tick regime change) passes the
+    truthful ``event_ref_warmup`` reset/warmup reason (REQ-036) — never a false tick-regime claim
+    bound into ``decision_id``."""
     reseed_mid = _mid(observation) if observation.book_status == "ok" else None
     reseed_ts = observation.as_of_ts if reseed_mid is not None else None
     next_state = base.model_copy(
@@ -382,7 +390,7 @@ def _apply_reset(
             "event_cooldown_until_ts": _cooldown_deadline(observation, config),
         }
     )
-    return _decide("NO_QUOTE", ("tick_regime_changed",)), next_state
+    return _decide("NO_QUOTE", (reason,)), next_state
 
 
 def _apply_event(
@@ -499,10 +507,12 @@ def decide(
     # sequence watermark and clears accumulators, THEN the SAME row-R transition ``_classify_row``→R
     # uses (``_apply_reset``) re-seeds the smoother from this frame's own ok-book mid, anchors the
     # event cooldown at its ``as_of_ts``, and produces NO_QUOTE (Codex Gate#1 MAJOR-2; REQ-070 row R
-    # / REQ-081). A bare HOLD here would leave quoting to resume with dwell still owed.
+    # / REQ-081). A bare HOLD here would leave quoting to resume with dwell still owed. The recorded
+    # reason is the truthful ``event_ref_warmup`` (REQ-036), NOT ``tick_regime_changed`` — this
+    # observation never signalled a tick regime change (Codex Gate#1-R2 MAJOR-2).
     if observation.book_source_epoch > state.last_book_source_epoch:
         base = _accept(observation, state, config, full_reset=True, basis_reset=False)
-        return _apply_reset(observation, base, config)
+        return _apply_reset(observation, base, config, reason="event_ref_warmup")
 
     # (4) fv_source_epoch INCREMENT (guarded arm, book epoch unchanged) → basis-only reset. The
     # sequence is book-epoch-scoped, so its staleness check below still applies to this frame.
@@ -522,7 +532,7 @@ def decide(
     base = _accept(observation, state, config, full_reset=False, basis_reset=basis_reset)
     row = _classify_row(observation, state, config)
     if row == "R":
-        return _apply_reset(observation, base, config)
+        return _apply_reset(observation, base, config, reason="tick_regime_changed")
     if row == "E":
         return _apply_event(observation, base, config)
     if row == "D":
