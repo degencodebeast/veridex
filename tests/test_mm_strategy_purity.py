@@ -32,7 +32,11 @@ import sys
 from pathlib import Path
 
 from veridex.mm_strategy.config import StrategyConfig
-from veridex.mm_strategy.contracts import StrategyObservation, StrategyState
+from veridex.mm_strategy.contracts import (
+    InventoryProjection,
+    StrategyObservation,
+    StrategyState,
+)
 
 # The four PURE modules under guard (the package ``__init__`` is empty and not decision code).
 _PURE_MODULES = (
@@ -71,9 +75,41 @@ def _purity_decide_fixture() -> tuple[StrategyObservation, StrategyState, Strate
     fresh-subprocess audit drive ``decide()`` with, so the purity guard keeps exercising the
     REAL decision path, not a re-implementation.
     """
+    observation = StrategyObservation(
+        fixture_id=1,
+        market_ref="TEAM-A/YES",
+        side="YES",
+        token_id="TOKEN-YES",
+        venue_market_ref="0xmarket",
+        tick_size=0.01,
+        observation_sequence=1,
+        book_source_epoch=1,
+        bid=0.49,
+        ask=0.51,
+        bid_size=100.0,
+        ask_size=120.0,
+        book_status="ok",
+        status_reason=None,
+        book_recv_ts=1_000,
+        level_count_in_band=5,
+        tick_regime_changed=False,
+        phase=1,
+        suspended=False,
+        match_state_recv_ts=990,
+        guard_fv=None,
+        market_status="ACTIVE",
+        market_status_recv_ts=995,
+        market_status_epoch=1,
+        order_stream_ok=True,
+        projection_fresh=True,
+        inventory=InventoryProjection(
+            net_position=0.0, resting=(), projection_as_of_ts=1_000, fresh=True
+        ),
+        as_of_ts=1_000,
+    )
     return (
-        StrategyObservation(token_id="TOKEN-YES", ts=1_000),
-        StrategyState(tick_seq=0),
+        observation,
+        StrategyState(),
         StrategyConfig(strategy_id="mm-skeleton", enabled=True),
     )
 
