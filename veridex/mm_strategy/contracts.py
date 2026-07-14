@@ -430,3 +430,52 @@ class MarketStatusAuthority(Protocol):
     def read(
         self, venue_market_ref: str
     ) -> tuple[MarketStatus, int | None, int | None]: ...
+
+
+# --- Deterministic decision / client-order identity ---------------------------------------
+# Pure identity helpers (REQ-025 / REQ-095 / AC-022): a decision's identity is a ``sha256`` over
+# the SHARED canonical serializer of its provenance inputs, and a leg's client-order id is a
+# ``sha256`` over the decision id + leg role. Both are pure functions of their arguments ONLY — NO
+# module-level counter, NO wall clock, NO randomness — so an authorized retry with identical inputs
+# reproduces a byte-identical id while a distinct observation yields a distinct id. E5-T1 wires
+# these into every ``StrategyDecision``; kept as module-level functions so the identity byte
+# contract lives with the ``serialize_payload`` authority the rest of this module already uses.
+
+
+def decision_id(
+    strategy_id: str,
+    strategy_revision: str,
+    config_hash: str,
+    session_id: str,
+    observation_hash: str,
+    prior_state_hash: str,
+) -> str:
+    """``sha256`` hexdigest binding the six provenance fields into one deterministic id (REQ-025).
+
+    Hashes ``serialize_payload`` of the ordered mapping of these exact inputs (the shared canonical
+    serializer sorts keys, so the wire bytes are process-stable). Identity is a pure function of its
+    causes — strategy identity, config, session, observation, and prior state — with no counter,
+    clock, or randomness, so the same authorized inputs always reproduce the same id (REQ-095).
+    """
+    canonical = serialize_payload(
+        {
+            "strategy_id": strategy_id,
+            "strategy_revision": strategy_revision,
+            "config_hash": config_hash,
+            "session_id": session_id,
+            "observation_hash": observation_hash,
+            "prior_state_hash": prior_state_hash,
+        }
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def client_order_id(decision_id: str, leg_role: str) -> str:
+    """``sha256`` hexdigest binding a decision id + leg role into one per-leg id (REQ-095).
+
+    Hashes ``serialize_payload`` of ``{"decision_id": …, "leg_role": …}``. Pure and deterministic:
+    the same ``(decision_id, leg_role)`` always yields the same client-order id (enabling a stable
+    replacement lineage), while a distinct leg role yields a distinct id — no counter or wall clock.
+    """
+    canonical = serialize_payload({"decision_id": decision_id, "leg_role": leg_role})
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
