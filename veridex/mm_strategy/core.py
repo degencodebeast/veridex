@@ -486,6 +486,104 @@ def _apply_cooldown(base: StrategyState) -> tuple[StrategyDecision, StrategyStat
     return _decide("NO_QUOTE", ("event_cooldown",)), base
 
 
+# --- The row-H quote-policy spine: venue-mid anchor + zones (E4-T1; REQ-050..054/060/082) ---
+# Everything below is the HEALTHY-row disposition — the ordered precedence spine the rest of E4
+# slots into. The upstream reducer already resolves data-validity / event / cooldown / warmup
+# (rows S/R/E/D/C/W/F) and the QUOTE-ONLY status+stream blocker is applied by the caller BEFORE
+# this spine, so here the frame is venue-healthy, in-window, warm, and status/stream-clean. The
+# spine order is REQ-060 (highest first): anchor-validity / boundary zone → INVENTORY (E4-T6 slot)
+# → two-sided band → GUARD (E4-T3/T4/T5 slot) → QUOTE math (E4-T7 slot) → QUOTE_TWO_SIDED.
+
+
+def _venue_anchor(
+    observation: StrategyObservation, config: StrategyConfig
+) -> float | None:
+    """The venue-MID anchor ``(bid + ask) / 2`` — the ONLY anchor mode (``anchor_mode == "mid"``;
+    REQ-050/051). ``None`` (no anchor → NO_QUOTE class) unless ALL admissibility floors hold:
+
+    * ``book_status == "ok"`` (two-sided, non-crossed — a ``gap`` / ``excluded`` book is row E and
+      never reaches here, but the gate is defended locally too);
+    * BOTH top touches present, so the mid is computed from real two-sided liquidity — an absent
+      side yields ``None`` and the mid is NEVER imputed from the single present side (REQ-023);
+    * the absolute depth floor ``min_top_depth`` holds (a thin two-sided book passes ``ok`` while
+      its mid is fiction — REQ-082);
+    * the in-band level count meets ``min_level_count``.
+
+    The guard FV leg is NEVER read — raw TxLINE FV can never center a quote (RED-01/AC-004). There
+    is NO alternate anchor branch (no Stoikov cross-weighted size mode, no EMA/median smoothed-mid
+    mode): the venue mid is the SOLE v0 anchor mode (REQ-051). The absence of a config branch here
+    is load-bearing — adding one is a spec revision, never task discretion.
+    """
+    if observation.book_status != "ok":
+        return None
+    mid = _mid(observation)
+    depth = _top_depth(observation)
+    if mid is None or depth is None:
+        return None
+    if depth < config.min_top_depth:
+        return None
+    if observation.level_count_in_band < config.min_level_count:
+        return None
+    return mid
+
+
+def _no_anchor_reason(
+    observation: StrategyObservation, config: StrategyConfig
+) -> ReasonCode:
+    """The closed-vocabulary reason for an inadmissible anchor, mirroring :func:`_venue_anchor`'s
+    gate order so the FIRST failed floor names the block. An absent side, a non-``ok`` book, or a
+    sub-floor depth is ``book_thin`` (insufficient real two-sided liquidity to anchor — the mid is
+    never imputed); a two-sided book below the in-band level floor is ``level_count_low``."""
+    depth = _top_depth(observation)
+    if (
+        observation.book_status != "ok"
+        or _mid(observation) is None
+        or depth is None
+        or depth < config.min_top_depth
+    ):
+        return "book_thin"
+    return "level_count_low"
+
+
+def _quote_disposition(
+    observation: StrategyObservation, base: StrategyState, config: StrategyConfig
+) -> StrategyDecision:
+    """The row-H quote disposition over the venue-mid anchor (REQ-050..054/060/082).
+
+    Precedence spine (later E4 tasks fill the marked slots WITHOUT reshaping this order):
+
+    1. anchor validity — no admissible venue mid → NO_QUOTE class (:func:`_no_anchor_reason`).
+    2. boundary zone — an anchor outside ``config.boundary_zone`` → NO_QUOTE ``boundary_zone``.
+    3. **INVENTORY slot (E4-T6):** ``|net_position| ≥ inventory_soft_limit`` → ``ONE_SIDED_REDUCE``
+       (the inventory-reducing side). Not wired here.
+    4. two-sided band — an anchor outside ``config.two_sided_band`` (but inside the boundary) is at
+       most one-sided (REQ-054): net-flat is the pinned ``two_sided_zone_exit`` abstention here; the
+       ``ONE_SIDED_REDUCE`` branch for ``net_position != 0`` is E4-T6's inventory slot above.
+    5. **GUARD slot (E4-T3/T4/T5):** the TxLINE side guard → ``QUOTE_ONE_SIDED`` / escalation.
+    6. **QUOTE math slot (E4-T7):** ``anchor ± half_spread`` legs, join-or-behind, directional tick
+       rounding, post-clamp boundary/cardinality — which can DOWNGRADE the class below.
+
+    Until the guard/quote-math slots are filled a fully-admissible in-band anchor is the eligible
+    ``QUOTE_TWO_SIDED`` CLASS (the taxonomy floor; REQ-060).
+    """
+    anchor = _venue_anchor(observation, config)
+    if anchor is None:
+        return _decide("NO_QUOTE", (_no_anchor_reason(observation, config),))
+    boundary_low, boundary_high = config.boundary_zone
+    if not (boundary_low <= anchor <= boundary_high):
+        return _decide("NO_QUOTE", ("boundary_zone",))
+    # --- INVENTORY slot (E4-T6): |net_position| >= inventory_soft_limit -> ONE_SIDED_REDUCE ---
+    two_sided_low, two_sided_high = config.two_sided_band
+    if not (two_sided_low <= anchor <= two_sided_high):
+        # Outside the two-sided band, inside the boundary: at most one-sided (REQ-054). The pinned
+        # net-flat abstention is recorded here; the net_position != 0 -> ONE_SIDED_REDUCE reducing
+        # side is E4-T6's inventory slot above (it pre-empts this branch when wired).
+        return _decide("NO_QUOTE", ("two_sided_zone_exit",))
+    # --- GUARD slot (E4-T3/T4/T5): TxLINE side guard -> QUOTE_ONE_SIDED / escalation ---
+    # --- QUOTE math slot (E4-T7): anchor +/- half_spread legs, post-clamp cardinality ---
+    return _decide("QUOTE_TWO_SIDED", ())
+
+
 def _apply_healthy(
     observation: StrategyObservation,
     base: StrategyState,
@@ -499,8 +597,9 @@ def _apply_healthy(
 
     * F (fv-epoch): guard inert until the basis re-warms → NO_QUOTE ``basis_warmup``.
     * W (warmup): references below floor → NO_QUOTE ``event_ref_warmup``.
-    * H (healthy): the eligible quote CLASS (``QUOTE_TWO_SIDED``; E4 refines zones/prices), unless a
-      QUOTE-ONLY status/stream blocker downgrades it to ``NO_QUOTE`` — admission is unaffected.
+    * H (healthy): a QUOTE-ONLY status/stream blocker downgrades to ``NO_QUOTE`` first (admission
+      unaffected); otherwise the venue-mid anchor + zone spine (:func:`_quote_disposition`) resolves
+      the eligible quote class (E4-T1; the guard + quote-math slots refine it in later E4 tasks).
     """
     updates = _admit_venue_updates(observation, base, config)
     updates.update(_admit_basis_updates(observation, base, config))
@@ -514,7 +613,7 @@ def _apply_healthy(
     blocker = _status_stream_reason(observation, base, config)
     if blocker is not None:
         return _decide("NO_QUOTE", (blocker,)), next_state
-    return _decide("QUOTE_TWO_SIDED", ()), next_state
+    return _quote_disposition(observation, base, config), next_state
 
 
 def decide(
