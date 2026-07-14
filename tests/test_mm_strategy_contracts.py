@@ -9,15 +9,16 @@ a missing-symbol collection error.
 
 from __future__ import annotations
 
-from typing import get_args
+from typing import get_args, get_origin
 
 import pytest
-from pydantic import ValidationError
+from pydantic import BaseModel, ValidationError
 
 from veridex.dust_execution.analysis import (
     ScopedNegativeRelabelError,
     reject_scoped_negative_relabel,
 )
+from veridex.mm_strategy import contracts as _contracts_module
 from veridex.mm_strategy.config import StrategyConfig
 from veridex.mm_strategy.contracts import (
     CALIBRATION_LABEL,
@@ -32,8 +33,10 @@ from veridex.mm_strategy.contracts import (
     MarketStatus,
     NeutralIntent,
     ReasonCode,
+    StrategyDecision,
     StrategyObservation,
 )
+from veridex.runtime.evidence import serialize_payload
 
 # The §4.4 closed reason-code vocabulary, VERBATIM and in declared order (35 codes). Pinned here
 # as the independent authority so any add/remove/rename in the contract fails the exact-image
@@ -278,3 +281,75 @@ def test_strategy_id_matches_config_default() -> None:
     # and the pinned STRATEGY_ID never drift apart.
     config_default = StrategyConfig.model_fields["strategy_id"].default
     assert config_default == STRATEGY_ID
+
+
+# --- Immutable-nested + hash-stability defense (RED-32) ------------------------------------
+
+
+def _frozen_contract_classes() -> tuple[type[BaseModel], ...]:
+    """Every frozen contract model declared in `contracts.py` (scanned, not hand-maintained, so a
+    new frozen model added later is picked up automatically instead of silently going unchecked)."""
+    found: list[type[BaseModel]] = []
+    for name in dir(_contracts_module):
+        obj = getattr(_contracts_module, name)
+        if (
+            isinstance(obj, type)
+            and issubclass(obj, BaseModel)
+            and obj.model_config.get("frozen") is True
+        ):
+            found.append(obj)
+    return tuple(found)
+
+
+def _contains_bare_list(annotation: object) -> bool:
+    """True if a bare `list[...]` appears anywhere in the annotation's generic tree (incl. nested
+    inside `X | None`), so an `Optional[list[...]]` escape hatch is caught too, not just a top-level
+    `list[...]` field."""
+    if get_origin(annotation) is list:
+        return True
+    return any(_contains_bare_list(arg) for arg in get_args(annotation))
+
+
+def test_all_sequence_fields_are_tuples() -> None:
+    # Every sequence field on every frozen contract must be `tuple[...]`, never bare `list[...]` —
+    # a `list` field is a nested-mutable escape hatch: two hashes taken over "equal" content could
+    # diverge after an in-place `.append()` the frozen top-level model_config can't see or block.
+    offenders = [
+        f"{model_cls.__name__}.{field_name}"
+        for model_cls in _frozen_contract_classes()
+        for field_name, field_info in model_cls.model_fields.items()
+        if _contains_bare_list(field_info.annotation)
+    ]
+    assert not offenders, f"bare list[...] sequence field(s) (must be tuple[...]): {offenders}"
+
+    # Explicit pin on the two decision-identity-bearing sequences called out by REQ-025/063.
+    assert get_origin(StrategyDecision.model_fields["intent_plan"].annotation) is tuple
+    assert get_origin(StrategyDecision.model_fields["reason_codes"].annotation) is tuple
+
+
+def test_hash_stable_under_unicode_and_float() -> None:
+    # `serialize_payload` (evidence.py) is the SOLE byte authority every observation/decision hash
+    # is taken over (REQ-040). It must canonicalize identically every time — not "usually equal" —
+    # across a non-ASCII provenance string and a repeated-arithmetic float edge (`0.1 + 0.2`, the
+    # classic base-2 rounding artifact), or two honest replays of the same content would silently
+    # diverge into two different hashes.
+    float_edge = 0.1 + 0.2  # 0.30000000000000004, not 0.3
+    obs = _make_observation(token_id="café-üñíçødé-mañana", bid=float_edge)
+
+    assert serialize_payload(obs.model_dump()) == serialize_payload(obs.model_dump())
+    assert obs.observation_hash() == obs.observation_hash()
+
+    decision = StrategyDecision(
+        decision_id="café-decision",
+        kind="QUOTE_ONE_SIDED",
+        reason_codes=("boundary_zone",),
+        intent_plan=(
+            NeutralIntent(
+                kind="place_quote",
+                leg_role="café-léğ",
+                price=float_edge - 0.29,  # another repeated-arithmetic edge, still in [0, 1]
+            ),
+        ),
+        observation_hash=obs.observation_hash(),
+    )
+    assert serialize_payload(decision.model_dump()) == serialize_payload(decision.model_dump())
