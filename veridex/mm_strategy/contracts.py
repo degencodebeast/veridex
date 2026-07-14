@@ -356,6 +356,13 @@ class StrategyState(_FrozenModel):
     # resets it ALONE — the FV-independent venue accumulators are untouched, Codex-R5 MAJOR-1), and
     # the E2-T4 reducer APPENDS accepted samples. Empty is the post-reset / fresh-state seed.
     basis_samples: tuple[tuple[int, float], ...] = ()
+    # Event-cooldown deadline (REQ-081): the ``as_of_ts`` (observation clock, NEVER wall clock)
+    # BEFORE which no (re)placement may occur after a reset/event trigger. The E2-T4 reducer ANCHORS
+    # it at ``as_of_ts + book_state_dwell_before_quote_ms`` on a row-R reset / row-E event and reads
+    # it back to classify a row-C frame (``as_of_ts < event_cooldown_until_ts``); an admitting row
+    # (F/W/H) whose frame has passed the deadline clears it to ``None`` (warmup NEVER anchors one —
+    # the liveness guarantee E2-T5 proves). ``None`` is the no-cooldown / fresh-state seed.
+    event_cooldown_until_ts: int | None = None
 
     def state_hash(self) -> str:
         """``sha256`` hexdigest over the canonical serialization (REQ-031 / REQ-040)."""

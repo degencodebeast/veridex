@@ -28,6 +28,8 @@ Pinned invariants:
 
 from __future__ import annotations
 
+import pytest
+
 from veridex.mm_strategy.config import StrategyConfig
 from veridex.mm_strategy.contracts import (
     GuardFairValue,
@@ -36,7 +38,7 @@ from veridex.mm_strategy.contracts import (
     StrategyObservation,
     StrategyState,
 )
-from veridex.mm_strategy.core import decide
+from veridex.mm_strategy.core import _classify_row, decide
 
 
 def _config(*, guard_enabled: bool = False, **overrides: object) -> StrategyConfig:
@@ -64,10 +66,26 @@ def _obs(
     guard_fv: GuardFairValue | None = None,
     market_status: str = "ACTIVE",
     market_status_epoch: int | None = 1,
+    book_status: str = "ok",
+    tick_regime_changed: bool = False,
+    level_count_in_band: int = 5,
+    book_recv_ts: int | None = None,
+    match_state_recv_ts: int | None = None,
+    order_stream_ok: bool = True,
+    projection_fresh: bool = True,
+    bid: float | None = 0.49,
+    ask: float | None = 0.51,
+    bid_size: float | None = 100.0,
+    ask_size: float | None = 120.0,
+    net_position: float = 0.0,
 ) -> StrategyObservation:
     """A healthy per-tick observation; every ``recv_ts`` is derived ≤ ``as_of_ts`` so construction
-    never trips the REQ-022 future-dating guard. Ordering/epoch/clock fields are the knobs."""
+    never trips the REQ-022 future-dating guard. Ordering/epoch/clock fields are the knobs, plus the
+    reducer-classification knobs (E2-T4): ``book_status`` / ``tick_regime_changed`` / freshness +
+    skew clocks / stream flags / raw top-of-book so each S/R/E/D/C/F/W/H row is constructible."""
     recv = as_of_ts - 10
+    book_recv = recv if book_recv_ts is None else book_recv_ts
+    match_recv = recv if match_state_recv_ts is None else match_state_recv_ts
     status_recv = None if market_status == "UNKNOWN" else recv
     status_epoch = None if market_status == "UNKNOWN" else market_status_epoch
     return StrategyObservation(
@@ -79,26 +97,26 @@ def _obs(
         tick_size=0.01,
         observation_sequence=observation_sequence,
         book_source_epoch=book_source_epoch,
-        bid=0.49,
-        ask=0.51,
-        bid_size=100.0,
-        ask_size=120.0,
-        book_status="ok",
+        bid=bid,
+        ask=ask,
+        bid_size=bid_size,
+        ask_size=ask_size,
+        book_status=book_status,  # type: ignore[arg-type]
         status_reason=None,
-        book_recv_ts=recv,
-        level_count_in_band=5,
-        tick_regime_changed=False,
+        book_recv_ts=book_recv,
+        level_count_in_band=level_count_in_band,
+        tick_regime_changed=tick_regime_changed,
         phase=1,
         suspended=False,
-        match_state_recv_ts=recv,
+        match_state_recv_ts=match_recv,
         guard_fv=guard_fv,
         market_status=market_status,  # type: ignore[arg-type]
         market_status_recv_ts=status_recv,
         market_status_epoch=status_epoch,
-        order_stream_ok=True,
-        projection_fresh=True,
+        order_stream_ok=order_stream_ok,
+        projection_fresh=projection_fresh,
         inventory=InventoryProjection(
-            net_position=0.0, resting=(), projection_as_of_ts=as_of_ts, fresh=True
+            net_position=net_position, resting=(), projection_as_of_ts=as_of_ts, fresh=True
         ),
         as_of_ts=as_of_ts,
     )
@@ -231,14 +249,21 @@ def test_fv_epoch_increment_resets_basis_only() -> None:
         state,
         _config(guard_enabled=True),
     )
-    assert decision.kind == "HOLD"
-    # Basis window reset...
-    assert next_state.basis_samples == ()
-    # ...but the FV-independent venue accumulators are byte-identical (UNTOUCHED).
-    assert next_state.smoother_mid == 0.5
-    assert next_state.smoother_mid_ts == 1_000
-    assert next_state.spread_ref_samples == (0.02, 0.02)
-    assert next_state.depth_ref_samples == (100.0, 120.0)
+    # E2-T4 row F (fv-epoch increment; frame otherwise W/H): the guard is inert until the basis
+    # re-warms, so the disposition is NO_QUOTE(basis_warmup).
+    assert decision.kind == "NO_QUOTE"
+    assert decision.reason_codes == ("basis_warmup",)
+    # Basis window CLEARED-then-ADMIT (Codex R6 MAJOR-1.2): exactly the current valid FV sample is
+    # re-admitted as the first sample (raw_gap = fv 0.5 − mid 0.5 = 0.0 at this frame's as_of_ts).
+    assert next_state.basis_samples == ((1_100, 0.0),)
+    # The FV-INDEPENDENT venue accumulators are NOT cleared by the fv-epoch reset (Codex-R5 MAJOR-1):
+    # the prior samples survive as a prefix AND this healthy frame ADMITS per the underlying W/H row
+    # (row F trains the venue accumulators), so the spread/depth series grow rather than reset.
+    assert next_state.spread_ref_samples[:2] == (0.02, 0.02)
+    assert next_state.spread_ref_samples == pytest.approx((0.02, 0.02, 0.02))
+    assert next_state.depth_ref_samples == (100.0, 120.0, 100.0)
+    assert next_state.smoother_mid == 0.5  # ema of 0.5 toward mid 0.5 stays 0.5
+    assert next_state.smoother_mid_ts == 1_100  # admission advances the smoother clock
     # Guard watermark advanced; sequence advanced within the unchanged book epoch.
     assert next_state.guard_watermark == GuardStateWatermark(fv_source_epoch=2)
     assert next_state.last_observation_sequence == 101
@@ -274,21 +299,302 @@ def test_restart_from_snapshot_reproduces_or_fail_closed() -> None:
     assert seeded.last_book_source_epoch == 3
 
 
-# --- Clean frame pass-through (REQ-030 — the E2-T4 reducer seam) ----------------------------
+# --- Clean healthy frame → the E2-T4 reducer (row W admission) ------------------------------
 
 
-def test_clean_frame_advances_watermark_without_training_accumulators() -> None:
+def test_clean_healthy_warmup_frame_admits_venue_accumulators() -> None:
+    # E2-T4 fills the E2-T3 seam: a clean, healthy, non-trigger frame whose rolling references are
+    # still below ``ref_min_samples`` (here 2 < 20) is row W (WARMUP) — it ADMITS (trains the venue
+    # accumulators, liveness) yet withholds the quote with ``event_ref_warmup``.
     state = _seeded_state(
         last_observation_sequence=10, last_book_source_epoch=1, last_as_of_ts=1_000
     )
     decision, next_state = decide(
         _obs(observation_sequence=11, book_source_epoch=1, as_of_ts=1_010), state, _config()
     )
-    assert decision.kind == "HOLD"
+    assert _classify_row(
+        _obs(observation_sequence=11, book_source_epoch=1, as_of_ts=1_010), state, _config()
+    ) == "W"
+    assert decision.kind == "NO_QUOTE"
+    assert decision.reason_codes == ("event_ref_warmup",)
     # Watermark advances...
     assert next_state.last_observation_sequence == 11
     assert next_state.last_as_of_ts == 1_010
-    # ...but the watermark layer does NOT train accumulators (that is the E2-T4 reducer's job).
+    # ...and the venue accumulators now TRAIN (row W admits): the raw spread (0.02) and top depth
+    # (min(100, 120) = 100) append, and the smoother folds mid 0.5 toward mid 0.5 (unchanged value,
+    # advanced clock).
+    assert next_state.spread_ref_samples == pytest.approx((0.02, 0.02, 0.02))
+    assert next_state.depth_ref_samples == (100.0, 120.0, 100.0)
     assert next_state.smoother_mid == 0.5
-    assert next_state.spread_ref_samples == (0.02, 0.02)
+    assert next_state.smoother_mid_ts == 1_010
+    # Baseline arm (guard off) never trains the basis window.
     assert next_state.basis_samples == ((900, 0.01), (950, 0.011))
+    # WARMUP never anchors a cooldown (liveness — E2-T5).
+    assert next_state.event_cooldown_until_ts is None
+
+
+# --- E2-T4: the total S/R/E/D/C/F/W/H transition reducer (REQ-070/081/AC-045/050/052/057) -----
+
+
+def _warm_state(
+    *,
+    last_observation_sequence: int = 100,
+    last_book_source_epoch: int = 1,
+    last_as_of_ts: int = 1_000,
+    guard_watermark: GuardStateWatermark | None = None,
+    event_cooldown_until_ts: int | None = None,
+    ref_samples: int = 24,
+) -> StrategyState:
+    """A mid-stream state carrying a seeded smoother + ``ref_samples`` rolling reference samples
+    (≥ ``ref_min_samples`` default 20 ⇒ references WARM) and a basis window. ``ref_samples`` and the
+    optional ``event_cooldown_until_ts`` are the knobs that separate rows W/H/C."""
+    return StrategyState(
+        last_observation_sequence=last_observation_sequence,
+        last_book_source_epoch=last_book_source_epoch,
+        last_as_of_ts=last_as_of_ts,
+        last_market_status_epoch=1,
+        last_market_status_recv_ts=last_as_of_ts - 10,
+        guard_watermark=guard_watermark,
+        event_cooldown_until_ts=event_cooldown_until_ts,
+        smoother_mid=0.5,
+        smoother_mid_ts=last_as_of_ts,
+        spread_ref_samples=tuple(0.02 for _ in range(ref_samples)),
+        depth_ref_samples=tuple(100.0 for _ in range(ref_samples)),
+        basis_samples=((900, 0.01), (950, 0.011)),
+    )
+
+
+# One case per spec REQ-070 row (glossary VERBATIM, :143-152). ``classify`` is the label
+# ``core._classify_row`` must return for the ACCEPTED-frame rows R/E/D/C/F/W/H; row S is rejected
+# UPSTREAM at the watermark layer (HOLD), so its classify label is None and only ``decide`` is
+# asserted. ``dwell`` is ``config.book_state_dwell_before_quote_ms`` default (5_000).
+def _row_cases() -> list[tuple[str, StrategyObservation, StrategyState, StrategyConfig, str | None, str, tuple[str, ...]]]:
+    guarded = _config(guard_enabled=True)
+    baseline = _config()
+    return [
+        # S — STALE: clock regression is rejected at the watermark layer → HOLD (row S).
+        (
+            "S",
+            _obs(observation_sequence=11, as_of_ts=999),
+            _seeded_state(
+                last_observation_sequence=10, last_book_source_epoch=1, last_as_of_ts=1_000
+            ),
+            baseline,
+            None,
+            "HOLD",
+            ("clock_regression",),
+        ),
+        # R — RESET-class: a ``tick_regime_changed`` frame (self-contained reset signal).
+        (
+            "R",
+            _obs(observation_sequence=101, as_of_ts=2_000, tick_regime_changed=True),
+            _warm_state(),
+            baseline,
+            "R",
+            "NO_QUOTE",
+            ("tick_regime_changed",),
+        ),
+        # E — EVENT-TRIGGER: a newly-entered ``gap`` book (RED-53 canonical object; AC-057:342).
+        (
+            "E",
+            _obs(
+                observation_sequence=101,
+                as_of_ts=2_000,
+                book_status="gap",
+                bid=None,
+                ask=None,
+                bid_size=None,
+                ask_size=None,
+            ),
+            _warm_state(),
+            baseline,
+            "E",
+            "NO_QUOTE",
+            ("book_gap",),
+        ),
+        # D — DATA-DEGRADED: book read too old (as_of − book_recv = 10_000 > book_freshness_ms 5_000).
+        (
+            "D",
+            _obs(
+                observation_sequence=101,
+                as_of_ts=20_000,
+                book_recv_ts=10_000,
+                match_state_recv_ts=10_000,
+            ),
+            _warm_state(last_as_of_ts=15_000),
+            baseline,
+            "D",
+            "NO_QUOTE",
+            ("book_stale",),
+        ),
+        # C — COOLDOWN-active: prior-state cooldown deadline not yet elapsed (as_of 50_000 < 60_000).
+        (
+            "C",
+            _obs(observation_sequence=101, as_of_ts=50_000),
+            _warm_state(last_as_of_ts=49_000, event_cooldown_until_ts=60_000),
+            baseline,
+            "C",
+            "NO_QUOTE",
+            ("event_cooldown",),
+        ),
+        # F — FV-EPOCH increment (guarded arm): basis cleared-then-admit, guard inert (basis_warmup).
+        (
+            "F",
+            _obs(
+                observation_sequence=101,
+                as_of_ts=1_100,
+                guard_fv=_guard_fv(fv_source_epoch=2, fv_recv_ts=1_090),
+            ),
+            _warm_state(guard_watermark=GuardStateWatermark(fv_source_epoch=1)),
+            guarded,
+            "F",
+            "NO_QUOTE",
+            ("basis_warmup",),
+        ),
+        # W — WARMUP: healthy non-trigger frame with references below ref_min_samples (2 < 20).
+        (
+            "W",
+            _obs(observation_sequence=101, as_of_ts=1_010),
+            _warm_state(ref_samples=2),
+            baseline,
+            "W",
+            "NO_QUOTE",
+            ("event_ref_warmup",),
+        ),
+        # H — HEALTHY: warm references, ACTIVE status, guard off → quote-eligible disposition.
+        (
+            "H",
+            _obs(observation_sequence=101, as_of_ts=1_010),
+            _warm_state(),
+            baseline,
+            "H",
+            "QUOTE_TWO_SIDED",
+            (),
+        ),
+    ]
+
+
+@pytest.mark.parametrize(
+    "label, observation, state, config, classify, kind, reason",
+    _row_cases(),
+    ids=[case[0] for case in _row_cases()],
+)
+def test_every_frame_class_matches_exactly_one_row(
+    label: str,
+    observation: StrategyObservation,
+    state: StrategyState,
+    config: StrategyConfig,
+    classify: str | None,
+    kind: str,
+    reason: tuple[str, ...],
+) -> None:
+    # Each constructed observation matches EXACTLY ONE spec row → one (kind, reason) transition
+    # (AC-057/RED-53). For the seven accepted-frame rows the pure classifier returns the row's label;
+    # row S is rejected upstream (HOLD), so only its decision is asserted.
+    if classify is not None:
+        assert _classify_row(observation, state, config) == classify, (
+            f"row {label} must classify as {classify!r}"
+        )
+    decision, _ = decide(observation, state, config)
+    assert decision.kind == kind, f"row {label}: kind"
+    assert decision.reason_codes == reason, f"row {label}: reason"
+
+
+def test_event_trigger_frame_updates_nothing_except_row_R_reseed() -> None:
+    # AC-050/052: a row-E event frame and a row-C cooldown frame ADMIT NOTHING — every venue
+    # accumulator is byte-identical to the prior state; only a row-R RESET re-seeds the smoother.
+    warm = _warm_state()
+
+    e_obs = _obs(
+        observation_sequence=101,
+        as_of_ts=2_000,
+        book_status="gap",
+        bid=None,
+        ask=None,
+        bid_size=None,
+        ask_size=None,
+    )
+    assert _classify_row(e_obs, warm, _config()) == "E"
+    _, e_state = decide(e_obs, warm, _config())
+    assert e_state.smoother_mid == warm.smoother_mid
+    assert e_state.smoother_mid_ts == warm.smoother_mid_ts
+    assert e_state.spread_ref_samples == warm.spread_ref_samples
+    assert e_state.depth_ref_samples == warm.depth_ref_samples
+    assert e_state.basis_samples == warm.basis_samples
+    # ...the watermark still advances and the event anchors a cooldown at this frame.
+    assert e_state.last_observation_sequence == 101
+    assert e_state.event_cooldown_until_ts == 2_000 + 5_000
+
+    cd = _warm_state(event_cooldown_until_ts=9_000)
+    c_obs = _obs(observation_sequence=101, as_of_ts=2_000)
+    assert _classify_row(c_obs, cd, _config()) == "C"
+    _, c_state = decide(c_obs, cd, _config())
+    assert c_state.smoother_mid == cd.smoother_mid
+    assert c_state.spread_ref_samples == cd.spread_ref_samples
+    assert c_state.depth_ref_samples == cd.depth_ref_samples
+    assert c_state.basis_samples == cd.basis_samples
+    assert c_state.event_cooldown_until_ts == 9_000  # C never re-anchors the cooldown
+
+    # Row R is the ONLY re-seed row: the smoother RE-SEEDS from THIS frame's ok-book mid
+    # ((0.30 + 0.40) / 2 = 0.35) and the rolling refs + basis window are CLEARED.
+    r_obs = _obs(
+        observation_sequence=101,
+        as_of_ts=2_000,
+        tick_regime_changed=True,
+        bid=0.30,
+        ask=0.40,
+    )
+    assert _classify_row(r_obs, warm, _config()) == "R"
+    _, r_state = decide(r_obs, warm, _config())
+    assert r_state.smoother_mid == pytest.approx(0.35)
+    assert r_state.smoother_mid_ts == 2_000
+    assert r_state.spread_ref_samples == ()
+    assert r_state.depth_ref_samples == ()
+    assert r_state.basis_samples == ()
+    assert r_state.event_cooldown_until_ts == 2_000 + 5_000
+
+
+def test_row_R_preempts_req080_book_trigger() -> None:
+    # A frame that is BOTH a reset (``tick_regime_changed``) AND a REQ-080/row-E book trigger
+    # (``book_status == "gap"``): rows evaluate IN ORDER, so row R PRE-EMPTS row E — exactly one row,
+    # one transition (row R wins). It must NOT ALSO run the row-E cancel-cooldown path twice.
+    warm = _warm_state()
+    obs = _obs(
+        observation_sequence=101,
+        as_of_ts=2_000,
+        tick_regime_changed=True,
+        book_status="gap",
+        bid=None,
+        ask=None,
+        bid_size=None,
+        ask_size=None,
+    )
+    assert _classify_row(obs, warm, _config()) == "R"
+    decision, next_state = decide(obs, warm, _config())
+    # The row-R reset reason, NOT the row-E book trigger reason.
+    assert decision.kind == "NO_QUOTE"
+    assert decision.reason_codes == ("tick_regime_changed",)
+    assert "book_gap" not in decision.reason_codes
+    # ONLY the row-R transition: refs+basis cleared, cooldown anchored once. The book is NOT ``ok``
+    # (it is gap), so the smoother RE-SEED is withheld — cleared to None, never seeded from a bad book.
+    assert next_state.smoother_mid is None
+    assert next_state.spread_ref_samples == ()
+    assert next_state.basis_samples == ()
+    assert next_state.event_cooldown_until_ts == 2_000 + 5_000
+
+
+def test_status_unknown_blocks_quote_not_admission() -> None:
+    # Status is a QUOTE-ONLY blocker in every row (never an admission or cooldown gate): a healthy,
+    # warm frame under UNKNOWN status classifies row H, the quote is blocked (market_status_unknown),
+    # yet the venue accumulators STILL TRAIN — one exact post-recovery accumulator state (REQ-070).
+    warm = _warm_state()
+    obs = _obs(observation_sequence=101, as_of_ts=1_010, market_status="UNKNOWN")
+    assert _classify_row(obs, warm, _config()) == "H"
+    decision, next_state = decide(obs, warm, _config())
+    assert decision.kind == "NO_QUOTE"
+    assert decision.reason_codes == ("market_status_unknown",)
+    # Admission is NOT gated by status: the spread/depth series each grew by one admitted sample and
+    # the smoother clock advanced.
+    assert len(next_state.spread_ref_samples) == len(warm.spread_ref_samples) + 1
+    assert len(next_state.depth_ref_samples) == len(warm.depth_ref_samples) + 1
+    assert next_state.smoother_mid_ts == 1_010

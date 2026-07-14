@@ -111,9 +111,24 @@ def _purity_decide_fixture() -> tuple[StrategyObservation, StrategyState, Strate
         ),
         as_of_ts=1_000,
     )
+    # A SEEDED mid-stream state (not a fresh/cold-start one), so ``decide()`` runs the COMPLETE
+    # E2-T4 S/R/E/D/C/F/W/H reducer body — not just the cold-start baseline seed. This clean, healthy
+    # frame classifies row W (references below ``ref_min_samples``), so the audit exercises the real
+    # admission path (the ``basis`` smoother/reference reducers) in the fresh subprocess.
+    state = StrategyState(
+        last_observation_sequence=0,
+        last_book_source_epoch=1,
+        last_as_of_ts=999,
+        last_market_status_epoch=1,
+        last_market_status_recv_ts=990,
+        smoother_mid=0.5,
+        smoother_mid_ts=999,
+        spread_ref_samples=(0.02,),
+        depth_ref_samples=(100.0,),
+    )
     return (
         observation,
-        StrategyState(),
+        state,
         # ``guard_enabled`` is REQUIRED (no default) on the full StrategyConfig; supply it so the
         # fixture keeps constructing a valid config for the real ``decide()`` path.
         StrategyConfig(guard_enabled=True),
