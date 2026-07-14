@@ -349,6 +349,13 @@ class StrategyState(_FrozenModel):
     smoother_mid_ts: int | None = None
     spread_ref_samples: tuple[float, ...] = ()
     depth_ref_samples: tuple[float, ...] = ()
+    # Bounded basis sample window (REQ-031/072): the ordered (oldest→newest) accepted
+    # ``(as_of_ts_ms, raw_gap)`` samples the config-selected estimator reduces (``basis.basis``).
+    # STATE-carried like the venue accumulators; the watermark layer (E2-T3) RESETS it (a full
+    # REQ-033 reset clears it alongside the venue accumulators; an ``fv_source_epoch`` increment
+    # resets it ALONE — the FV-independent venue accumulators are untouched, Codex-R5 MAJOR-1), and
+    # the E2-T4 reducer APPENDS accepted samples. Empty is the post-reset / fresh-state seed.
+    basis_samples: tuple[tuple[int, float], ...] = ()
 
     def state_hash(self) -> str:
         """``sha256`` hexdigest over the canonical serialization (REQ-031 / REQ-040)."""
