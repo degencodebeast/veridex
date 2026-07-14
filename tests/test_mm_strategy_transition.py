@@ -35,6 +35,7 @@ from veridex.mm_strategy.contracts import (
     GuardFairValue,
     GuardStateWatermark,
     InventoryProjection,
+    StrategyDecision,
     StrategyObservation,
     StrategyState,
 )
@@ -598,3 +599,143 @@ def test_status_unknown_blocks_quote_not_admission() -> None:
     assert len(next_state.spread_ref_samples) == len(warm.spread_ref_samples) + 1
     assert len(next_state.depth_ref_samples) == len(warm.depth_ref_samples) + 1
     assert next_state.smoother_mid_ts == 1_010
+
+
+# --- E2-T5: WARMUP liveness + status quote-only recovery (REQ-070/AC-055/RED-39/RED-51) --------
+
+
+def test_warmup_reaches_ref_min_samples_and_resumes() -> None:
+    # RED-51 (LIVENESS): after a reset zeroes the rolling references and anchors a BOUNDED cooldown,
+    # a stream of healthy frames drives the reference counts back up to ``ref_min_samples`` and
+    # quoting RESUMES. WARMUP (row W) admits every frame and NEVER re-anchors a cooldown, so the
+    # strategy can never deadlock in a perpetual warmup/cooldown re-trigger loop. A small
+    # ``ref_min_samples`` keeps the proof bounded (the property is independent of the floor's value).
+    config = _config(ref_min_samples=3)
+    dwell = config.book_state_dwell_before_quote_ms  # 5_000
+    reset_ts = 2_000
+
+    # A tick-regime RESET (row R): references cleared, smoother re-seeded from this ok-book mid,
+    # cooldown anchored at the reset frame — NO_QUOTE.
+    reset_decision, state = decide(
+        _obs(observation_sequence=101, as_of_ts=reset_ts, tick_regime_changed=True),
+        _warm_state(last_observation_sequence=100, last_as_of_ts=1_000),
+        config,
+    )
+    assert reset_decision.kind == "NO_QUOTE"
+    assert reset_decision.reason_codes == ("tick_regime_changed",)
+    assert state.spread_ref_samples == ()
+    assert state.depth_ref_samples == ()
+    assert state.smoother_mid == 0.5  # re-seeded from the ok book, so references can re-warm
+    assert state.event_cooldown_until_ts == reset_ts + dwell
+
+    # A frame DURING the cooldown is row C — it holds and admits nothing, but the cooldown is a
+    # bounded deadline (never re-anchored by a passive frame), so it MUST elapse (no deadlock).
+    seq = 102
+    during = _obs(observation_sequence=seq, as_of_ts=reset_ts + dwell - 1)
+    assert _classify_row(during, state, config) == "C"
+    _, state = decide(during, state, config)
+    assert state.spread_ref_samples == ()  # cooldown admits nothing
+    assert state.event_cooldown_until_ts == reset_ts + dwell  # C never re-anchors
+
+    # Post-cooldown healthy frames now ADMIT and climb toward the floor. Feed a BOUNDED stream and
+    # assert quoting resumes exactly once the references warm — the first frame sits at the cooldown
+    # deadline itself (``as_of_ts < until`` is strict, so the deadline frame already admits).
+    resumed_at: int | None = None
+    as_of = reset_ts + dwell - 1
+    for step in range(config.ref_min_samples + 5):
+        seq += 1
+        as_of += 1
+        decision, state = decide(_obs(observation_sequence=seq, as_of_ts=as_of), state, config)
+        # WARMUP admits every frame and NEVER anchors a cooldown — the liveness guarantee.
+        assert state.event_cooldown_until_ts is None
+        if decision.kind == "QUOTE_TWO_SIDED":
+            resumed_at = step
+            break
+        assert decision.reason_codes == ("event_ref_warmup",)
+
+    assert resumed_at is not None, "quoting must resume once references warm — no warmup deadlock"
+    # The references reached the floor: at least ``ref_min_samples`` admitted warmup frames stand.
+    assert len(state.spread_ref_samples) >= config.ref_min_samples
+    assert len(state.depth_ref_samples) >= config.ref_min_samples
+
+
+def test_seed_and_1ms_post_seed_do_not_place() -> None:
+    # RED-39: a smoother RE-SEED (row R reset) never quotes on the seed frame itself — it seeds the
+    # smoother into the NEXT state ONLY and anchors a cooldown at the reset ``as_of_ts`` — and a
+    # frame just 1ms later still sits INSIDE that cooldown (row C), so neither the seed frame nor its
+    # immediate successor places an order.
+    config = _config()
+    dwell = config.book_state_dwell_before_quote_ms
+    seed_ts = 2_000
+    warm = _warm_state()
+
+    # The seed frame is a tick-regime reset over an ok book: it RE-SEEDS the smoother from this
+    # frame's mid ((0.30 + 0.40) / 2 = 0.35) into the next state and anchors the cooldown — no quote.
+    seed_obs = _obs(
+        observation_sequence=101, as_of_ts=seed_ts, tick_regime_changed=True, bid=0.30, ask=0.40
+    )
+    assert _classify_row(seed_obs, warm, config) == "R"
+    seed_decision, seeded = decide(seed_obs, warm, config)
+    assert seed_decision.kind == "NO_QUOTE"
+    assert seed_decision.reason_codes == ("tick_regime_changed",)
+    # The re-seed lands in the NEXT state ONLY — ``decide`` is pure, so the prior state is untouched.
+    assert warm.smoother_mid == 0.5
+    assert seeded.smoother_mid == pytest.approx(0.35)
+    assert seeded.smoother_mid_ts == seed_ts
+    assert seeded.event_cooldown_until_ts == seed_ts + dwell
+
+    # A frame 1ms after the seed is still INSIDE the cooldown (row C): it does NOT place, it trains
+    # no accumulator, and it does NOT re-anchor the cooldown.
+    post_obs = _obs(observation_sequence=102, as_of_ts=seed_ts + 1)
+    assert _classify_row(post_obs, seeded, config) == "C"
+    post_decision, post_state = decide(post_obs, seeded, config)
+    assert post_decision.kind == "NO_QUOTE"
+    assert post_decision.reason_codes == ("event_cooldown",)
+    assert post_state.smoother_mid == pytest.approx(0.35)  # seed untouched — no admission
+    assert post_state.spread_ref_samples == ()
+    assert post_state.event_cooldown_until_ts == seed_ts + dwell  # C never re-anchors
+
+
+def test_unknown_status_healthy_book_one_recovery_state() -> None:
+    # AC-055: a venue-healthy STRETCH under UNKNOWN market status keeps TRAINING the venue
+    # accumulators (status is a QUOTE-ONLY blocker, never an admission or cooldown gate), so the
+    # references never fall out of warm — and the FIRST ACTIVE recovery frame yields EXACTLY ONE
+    # quote-eligible post-recovery state that is deterministically reproducible.
+    config = _config()
+    warm = _warm_state(last_observation_sequence=100, last_as_of_ts=1_000)
+
+    def run() -> tuple[StrategyState, StrategyDecision]:
+        state = warm
+        seq, as_of = 100, 1_000
+        # A stretch of healthy frames under UNKNOWN status: each is row H, quote-BLOCKED yet
+        # ADMITTING — no cooldown is ever anchored and the references stay warm.
+        for _ in range(5):
+            seq += 1
+            as_of += 1
+            obs = _obs(observation_sequence=seq, as_of_ts=as_of, market_status="UNKNOWN")
+            assert _classify_row(obs, state, config) == "H"
+            decision, state = decide(obs, state, config)
+            assert decision.kind == "NO_QUOTE"
+            assert decision.reason_codes == ("market_status_unknown",)
+            assert state.event_cooldown_until_ts is None
+        # Status RECOVERS to ACTIVE: the very next frame quotes (the references never left warm).
+        seq += 1
+        as_of += 1
+        recovery = _obs(observation_sequence=seq, as_of_ts=as_of, market_status="ACTIVE")
+        assert _classify_row(recovery, state, config) == "H"
+        rec_decision, rec_state = decide(recovery, state, config)
+        return rec_state, rec_decision
+
+    rec_state, rec_decision = run()
+    assert rec_decision.kind == "QUOTE_TWO_SIDED"
+    assert rec_decision.reason_codes == ()
+    # The UNKNOWN stretch trained 5 samples + the recovery frame = 6 admitted samples on top of the
+    # 24 warm-state samples — status never gated admission.
+    assert len(rec_state.spread_ref_samples) == 24 + 6
+    assert len(rec_state.depth_ref_samples) == 24 + 6
+
+    # EXACTLY ONE post-recovery state: the whole UNKNOWN→ACTIVE sequence is deterministic — a re-run
+    # yields a byte-identical recovered state (same ``state_hash``).
+    rec_state2, _ = run()
+    assert rec_state2 == rec_state
+    assert rec_state2.state_hash() == rec_state.state_hash()
