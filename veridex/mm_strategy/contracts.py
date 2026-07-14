@@ -381,7 +381,7 @@ class NeutralIntent(_FrozenModel):
     """
 
     kind: NeutralIntentKind
-    leg_role: str
+    leg_role: Literal["bid", "ask", "reduce"] | None
     price: float | None = None
     post_only: bool = True
     client_order_id: str | None = None

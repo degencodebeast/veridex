@@ -169,6 +169,19 @@ def test_neutral_intent_has_no_size_field() -> None:
     assert "size" not in NeutralIntent.model_fields
 
 
+def test_neutral_intent_leg_role_is_closed_literal() -> None:
+    # REQ-095 closes leg_role to {bid, ask, reduce} — an open `str` lets a typo'd role slip into
+    # `client_order_id` identity unnoticed (Gate #1 Stage-1 finding). cancel_all/abstain legs
+    # still carry `leg_role=None`, so the closed set stays `Literal[...] | None`, never bare `str`.
+    with pytest.raises(ValidationError):
+        NeutralIntent(kind="place_quote", leg_role="bogus")
+
+    annotation = NeutralIntent.model_fields["leg_role"].annotation
+    non_none_args = [arg for arg in get_args(annotation) if arg is not type(None)]
+    assert len(non_none_args) == 1, f"expected exactly one non-None arm, got {non_none_args}"
+    assert frozenset(get_args(non_none_args[0])) == {"bid", "ask", "reduce"}
+
+
 def test_guard_off_observation_has_no_fv_element() -> None:
     # Codex-R5 MAJOR-1: the whole FV leg is one optional nested field, so a guard-off observation
     # carries NO fv / fv_source_ts / fv_source_epoch (nor fv_recv_ts) anywhere at the top level —
@@ -346,8 +359,11 @@ def test_hash_stable_under_unicode_and_float() -> None:
         intent_plan=(
             NeutralIntent(
                 kind="place_quote",
-                leg_role="café-léğ",
+                leg_role="bid",
                 price=float_edge - 0.29,  # another repeated-arithmetic edge, still in [0, 1]
+                # leg_role is now a closed Literal (REQ-095), so the unicode probe moves onto
+                # this genuinely free-text field instead.
+                client_order_id="café-léğ",
             ),
         ),
         observation_hash=obs.observation_hash(),
