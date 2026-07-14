@@ -1,11 +1,15 @@
-"""Pure-tier strategy core — the watermark precondition layer (MM-R4-B).
+"""Pure-tier strategy core — the watermark precondition layer + transition reducer (MM-R4-B).
 
-``decide()`` is the deterministic, total decision function. This task (E2-T3) implements the
-NO-LOOKAHEAD WATERMARK PRECONDITION LAYER that runs BEFORE any quoting logic: clock/epoch
-monotonicity vs the carried state, sequence-staleness, the epoch-driven resets, and the
-fail-closed restart guarantee. On a frame that passes every watermark it returns ``HOLD`` and
-threads the advanced state through; E2-T4 replaces that pass-through with the full
-S/R/E/D/C/F/W/H transition reducer.
+``decide()`` is the deterministic, total decision function. It layers two pieces:
+
+1. The NO-LOOKAHEAD WATERMARK PRECONDITION LAYER (E2-T3) that runs BEFORE any quoting logic:
+   clock/epoch monotonicity vs the carried state, sequence-staleness, the epoch-driven resets, and
+   the fail-closed restart guarantee. This is spec row S (STALE → HOLD).
+2. The complete S/R/E/D/C/F/W/H transition reducer (E2-T4) over that precondition layer: every
+   frame that passes the watermark is classified into exactly one of rows R/E/D/C/F/W/H
+   (:func:`_classify_row`) and that row's ``(smoother, refs, basis, cooldown, quote)`` transition
+   is applied. See the reducer scope comment above :func:`_mid` for what's wired here vs deferred
+   to E4.
 
 Load-bearing ordering (REQ-033/034, AC-040, RED-06/37): the ``book_source_epoch`` INCREMENT is
 evaluated BEFORE sequence-staleness, so a healthy first frame after a reconnect — whose re-baselined
@@ -14,13 +18,14 @@ being wrongly rejected as stale.
 
 Import whitelist (load-bearing): stdlib + pydantic + the pure ``mm_strategy`` siblings
 (``config`` for the ``StrategyConfig`` type + ``guard_enabled`` / ``restart_policy`` knobs,
-``contracts`` for the models) + ``veridex.runtime.evidence`` (transitively) ONLY. No network, no
-I/O, no wall clock, no randomness, no module-level mutable state, no process-local cache.
+``contracts`` for the models, ``basis`` for the smoother/reference helpers) +
+``veridex.runtime.evidence`` (transitively) ONLY. No network, no I/O, no wall clock, no randomness,
+no module-level mutable state, no process-local cache.
 """
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Literal
 
 from veridex.mm_strategy.basis import event_smoother_update, reference_is_warm
 from veridex.mm_strategy.config import StrategyConfig
@@ -146,6 +151,12 @@ def _guard_epoch_delta(
 # this reducer. The row-H quote here is the eligible DecisionKind CLASS only — E4 fills anchor/zones/
 # prices and the intent plan.
 
+# The seven ACCEPTED-frame rows (row S/STALE is the watermark layer's reject rows, upstream — it
+# never reaches ``_classify_row``). Pinning this as a `Literal`, like every other closed vocabulary
+# in this tier, makes `_classify_row`'s return and the `decide()` dispatch a mypy-checked
+# discriminant instead of an open `str`.
+Row = Literal["R", "E", "D", "C", "F", "W", "H"]
+
 
 def _mid(observation: StrategyObservation) -> float | None:
     """The raw venue mid ``(bid + ask) / 2`` — ``None`` when either touch is absent (degraded book)."""
@@ -203,7 +214,7 @@ def _references_warm(state: StrategyState, config: StrategyConfig) -> bool:
 
 def _classify_row(
     observation: StrategyObservation, state: StrategyState, config: StrategyConfig
-) -> str:
+) -> Row:
     """Classify an ACCEPTED observation into EXACTLY ONE of the reducer rows R/E/D/C/F/W/H.
 
     Rows are evaluated in spec REQ-070 order, so an earlier row PRE-EMPTS a later one — most notably
@@ -270,7 +281,12 @@ def _admit_venue_updates(
         if base.smoother_mid is None:
             updates["smoother_mid"] = mid
         else:
-            dt_ms = float(observation.as_of_ts - (base.smoother_mid_ts or observation.as_of_ts))
+            prior_ts = (
+                base.smoother_mid_ts
+                if base.smoother_mid_ts is not None
+                else observation.as_of_ts
+            )
+            dt_ms = float(observation.as_of_ts - prior_ts)
             updates["smoother_mid"] = event_smoother_update(
                 base.smoother_mid, mid, config, dt_ms
             )
@@ -300,6 +316,12 @@ def _admit_basis_updates(
     return {"basis_samples": base.basis_samples + ((observation.as_of_ts, raw_gap),)}
 
 
+def _cooldown_deadline(observation: StrategyObservation, config: StrategyConfig) -> int:
+    """The event-cooldown expiry anchored at ``observation.as_of_ts`` — the common deadline
+    computed by both reset-anchoring rows (R and E)."""
+    return observation.as_of_ts + config.book_state_dwell_before_quote_ms
+
+
 def _apply_reset(
     observation: StrategyObservation, base: StrategyState, config: StrategyConfig
 ) -> tuple[StrategyDecision, StrategyState]:
@@ -316,9 +338,7 @@ def _apply_reset(
             "spread_ref_samples": (),
             "depth_ref_samples": (),
             "basis_samples": (),
-            "event_cooldown_until_ts": (
-                observation.as_of_ts + config.book_state_dwell_before_quote_ms
-            ),
+            "event_cooldown_until_ts": _cooldown_deadline(observation, config),
         }
     )
     return _decide("NO_QUOTE", ("tick_regime_changed",)), next_state
@@ -332,11 +352,7 @@ def _apply_event(
     ``gap`` / ``excluded`` book (RED-53); the ratio/jump triggers slot in here in E4."""
     reason: ReasonCode = "book_gap" if observation.book_status == "gap" else "book_excluded"
     next_state = base.model_copy(
-        update={
-            "event_cooldown_until_ts": (
-                observation.as_of_ts + config.book_state_dwell_before_quote_ms
-            )
-        }
+        update={"event_cooldown_until_ts": _cooldown_deadline(observation, config)}
     )
     return _decide("NO_QUOTE", (reason,)), next_state
 
@@ -366,7 +382,7 @@ def _apply_healthy(
     base: StrategyState,
     config: StrategyConfig,
     *,
-    row: str,
+    row: Row,
 ) -> tuple[StrategyDecision, StrategyState]:
     """Rows F / W / H — the ADMITTING tier. Venue accumulators train (both arms, universal gates);
     the guarded basis trains (row F = clear-then-admit via the pre-cleared ``base``); any elapsed
