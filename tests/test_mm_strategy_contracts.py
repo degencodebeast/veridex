@@ -35,6 +35,7 @@ from veridex.mm_strategy.contracts import (
     ReasonCode,
     StrategyDecision,
     StrategyObservation,
+    StrategyState,
 )
 from veridex.runtime.evidence import serialize_payload
 
@@ -251,6 +252,30 @@ def test_future_timestamp_is_construction_error() -> None:
 def test_market_status_image_is_closed() -> None:
     # Defensive: the status alphabet is exactly the four spec values.
     assert frozenset(get_args(MarketStatus)) == {"ACTIVE", "HALTED", "CLOSED", "UNKNOWN"}
+
+
+# --- StrategyState EWMA accumulator pair invariant (REQ-031/035) ---------------------------
+
+
+def test_partial_ewma_accumulator_rejected() -> None:
+    # Codex Gate#1-R3 MAJOR-1: basis_ewma_value/basis_ewma_ts are a semantic pair — a partial
+    # snapshot (one set, one None) must never construct. Left unconstrained it survives Pydantic
+    # construction, canonical hashing, and model_validate_json(), then silently loses EWMA
+    # history on the next admitted sample instead of failing closed (REQ-031/035 state-integrity).
+    with pytest.raises(ValidationError):
+        StrategyState(basis_ewma_value=0.25, basis_ewma_ts=None)
+    with pytest.raises(ValidationError):
+        StrategyState(basis_ewma_value=None, basis_ewma_ts=1_000)
+
+    # A valid pair constructs AND survives a canonical JSON round trip unchanged.
+    state = StrategyState(basis_ewma_value=0.25, basis_ewma_ts=1_000)
+    restored = StrategyState.model_validate_json(state.model_dump_json())
+    assert restored == state
+
+    # Both-None is the default, fresh-state seed — stays backward-compatible with old snapshots.
+    fresh = StrategyState()
+    assert fresh.basis_ewma_value is None
+    assert fresh.basis_ewma_ts is None
 
 
 # --- Honest labels + pinned strategy identity (HON-001 / HON-003 / REQ-044) ----------------

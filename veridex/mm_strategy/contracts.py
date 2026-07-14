@@ -374,6 +374,19 @@ class StrategyState(_FrozenModel):
     # the liveness guarantee E2-T5 proves). ``None`` is the no-cooldown / fresh-state seed.
     event_cooldown_until_ts: int | None = None
 
+    @model_validator(mode="after")
+    def _ewma_accumulator_pair(self) -> StrategyState:
+        # Codex Gate#1-R3 MAJOR-1: basis_ewma_value/basis_ewma_ts are a semantic pair — both
+        # absent (fresh/reset state) or both present (a folded sample). A partial pair would
+        # otherwise survive construction and silently lose EWMA history on the next admitted
+        # sample instead of failing closed (REQ-031/035).
+        if (self.basis_ewma_value is None) != (self.basis_ewma_ts is None):
+            raise ValueError(
+                "basis_ewma_value and basis_ewma_ts must both be None or both be set, got "
+                f"basis_ewma_value={self.basis_ewma_value!r}, basis_ewma_ts={self.basis_ewma_ts!r}"
+            )
+        return self
+
     def state_hash(self) -> str:
         """``sha256`` hexdigest over the canonical serialization (REQ-031 / REQ-040)."""
         return self._canonical_hash()
