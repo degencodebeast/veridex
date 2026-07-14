@@ -20,6 +20,7 @@ NO network, NO LLM import; imports nothing from ``veridex.scoring`` or ``veridex
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -89,6 +90,20 @@ class LiveRecorder:
         self._write_line(payload)
         self._events.append(payload)
 
+    def record_and_return_pair(self, event_line: dict[str, Any]) -> tuple[int, int]:
+        """Append one event line exactly as :meth:`record` does, returning the PERSISTED
+        ``(recv_ts, sequence_no)`` (REQ-020b/027).
+
+        APPEND-ONLY R4-B wrapper over the UNCHANGED :meth:`record`: the returned pair is read back
+        from the appended in-memory row (``self._events[-1]``), so it is the EXACT
+        ``(recv_ts, sequence_no)`` written to ``records.jsonl`` — the live-mint decision boundary
+        binds to the sealed tape pair, never a parallel guess. ``sequence_no`` is the recorder-minted
+        GLOBAL sequence (the sole authority), NOT any placeholder carried on ``event_line``.
+        """
+        self.record(event_line)
+        persisted = self._events[-1]
+        return int(persisted["recv_ts"]), int(persisted["sequence_no"])
+
     def record_gap(self, from_ts: int, to_ts: int, source: str, reason: str) -> None:
         """Write an explicit, labeled gap marker line (never a silent splice).
 
@@ -147,3 +162,103 @@ class LiveRecorder:
 
     def __exit__(self, *exc: object) -> None:
         self.close()
+
+
+def resume_recorder(
+    session_dir: str | Path, meta: LiveRecorderSessionMeta
+) -> LiveRecorder:
+    """Reopen a crash-partial session as an append-only writer, continuing the global sequence.
+
+    APPEND-ONLY R4-B writer-resume opener (the legacy :class:`LiveRecorder` ``__init__`` /
+    :meth:`record` / :meth:`_next_seq` / :meth:`finalize` are UNCHANGED — R3 tapes stay
+    byte-identical). Implements EXACTLY the operator-approved NARROW crash model (REQ-020b/027 —
+    "durable per session across process restarts"): the SAME crash-safe boundary as the R3 reader,
+    NOT a general recovery system. A naive ``LiveRecorder(session_dir, meta)`` restart would reset
+    ``_seq=0`` / ``_events=[]`` and reseal an INCOMPLETE stream (the on-disk duplicate ``[1, 1]``
+    surfaces only at :func:`~veridex.live_recorder.replay.replay_reproduces`); this opener instead:
+
+    (iv) FAILS CLOSED FIRST — before ANY truncation / writer-open / append / meta-write — on a
+        FINALIZED or partially-finalized session. Resume recovers a process killed BEFORE
+        ``finalize()``; a completed seal is TERMINAL evidence and must never be reopened/resealed.
+        Only crash-partial START metadata is resumable: ``ended_ts`` / ``event_count`` /
+        ``content_hash`` ALL absent (the start-meta shape). Also raises on any malformed NON-final
+        row, missing / duplicate / regressed ``sequence_no``, so a corrupted middle never resumes.
+    (ii) VALIDATES the durable prefix (every ``sequence_no`` present, unique, strictly increasing)
+        in one raw pass BEFORE any append.
+    (iii) if the ONLY defect is a crash-truncated FINAL JSON line, PHYSICALLY truncates that
+        incomplete tail (to the last complete ``\\n``) before appending — never appends onto
+        malformed bytes (that would merge the next row onto the partial and make the tape unreadable).
+    (i) HYDRATES ``_events`` with the COMPLETE valid durable prefix (events AND gap rows) via
+        :func:`~veridex.live_recorder.replay.read_session_strict`, so ``finalize()`` seals the full
+        pre+post-restart stream and ``replay_reproduces()`` stays True.
+    (v) SEEDS ``_seq`` from the validated durable max (over ALL rows incl. a gap-at-tail) so the
+        next appended row is ``max + 1``.
+
+    The recorder owns ONLY the global sequence + stream state — NO epoch responsibility (the
+    assembler is the sole author of per-source epochs). Reopening uses append mode and does NOT
+    clobber ``meta.json`` or any valid row. **Out of scope (operator-pinned):** arbitrary-corruption
+    repair, concurrent writers, multi-host recovery — the boundary is exactly R3's crash-safe model.
+    """
+    # Deferred import avoids a recorder<->replay import cycle (replay imports from recorder).
+    from veridex.live_recorder.replay import max_sequence_no, read_session_strict
+
+    session_dir = Path(session_dir)
+    records_path = session_dir / RECORDS_FILENAME
+
+    # (iv) FAIL CLOSED FIRST — only crash-partial START metadata is resumable.
+    if not (
+        meta.ended_ts is None
+        and meta.event_count is None
+        and meta.content_hash is None
+    ):
+        raise ValueError(
+            "resume_recorder refuses a finalized or partially-finalized session (terminal "
+            f"evidence): ended_ts={meta.ended_ts!r}, event_count={meta.event_count!r}, "
+            f"content_hash={'<set>' if meta.content_hash is not None else None!r}"
+        )
+
+    # (ii)+(iii) Validate the durable prefix and detect a crash-truncated FINAL line in ONE raw pass,
+    # before opening the writer or appending anything.
+    raw = records_path.read_bytes() if records_path.exists() else b""
+    lines = raw.decode("utf-8").splitlines()
+    last_index = len(lines) - 1
+    truncated_tail = False
+    prev_seq: int | None = None
+    for i, line in enumerate(lines):
+        if not line:
+            continue
+        try:
+            entry = json.loads(line)
+        except json.JSONDecodeError:
+            if i != last_index:
+                raise ValueError(
+                    "resume_recorder: malformed NON-final durable row — only the final line may be "
+                    "a crash-truncated partial write (arbitrary-corruption repair is out of scope)"
+                ) from None
+            truncated_tail = True
+            continue
+        if "sequence_no" not in entry:
+            raise ValueError("resume_recorder: durable row is missing 'sequence_no'")
+        seq = entry["sequence_no"]
+        if prev_seq is not None and seq <= prev_seq:
+            raise ValueError(
+                "resume_recorder: durable sequence_no is not strictly increasing "
+                f"(saw {seq!r} after {prev_seq!r}) — duplicate or regression"
+            )
+        prev_seq = seq
+
+    # (iii) Physically truncate the crash-truncated final line to the last complete newline BEFORE
+    # appending — never append onto malformed bytes.
+    if truncated_tail:
+        cut = raw.rfind(b"\n")
+        records_path.write_bytes(raw[: cut + 1] if cut != -1 else b"")
+
+    # All fail-closed checks passed. Construct in append mode (does NOT clobber records.jsonl or
+    # valid rows; rewrites meta.json with the SAME crash-partial START bytes).
+    recorder = LiveRecorder(session_dir, meta)
+    # (i) Hydrate the full valid durable prefix — events AND gap rows — in sequence order.
+    _, events, gaps = read_session_strict(session_dir)
+    recorder._events = sorted((*events, *gaps), key=lambda row: row["sequence_no"])
+    # (v) Seed the global sequence from the durable max over ALL rows (incl. a gap-at-tail).
+    recorder._seq = max_sequence_no(session_dir)
+    return recorder

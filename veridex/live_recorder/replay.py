@@ -31,7 +31,14 @@ from veridex.live_recorder.recorder import (
     session_content_hash,
 )
 
-__all__ = ["read_session", "iter_change_series", "replay_reproduces", "session_content_hash"]
+__all__ = [
+    "read_session",
+    "read_session_strict",
+    "max_sequence_no",
+    "iter_change_series",
+    "replay_reproduces",
+    "session_content_hash",
+]
 
 
 def read_session(
@@ -68,6 +75,64 @@ def read_session(
             events.append(entry)
 
     return meta, events, gaps
+
+
+def read_session_strict(
+    session_dir: str | Path,
+) -> tuple[LiveRecorderSessionMeta, list[dict[str, Any]], list[dict[str, Any]]]:
+    """Strict R4-B reader: like :func:`read_session` but FAILS CLOSED on a missing ``sequence_no``.
+
+    APPEND-ONLY R4-B addition (existing :func:`read_session` UNCHANGED for R3 back-compat). Same
+    crash-safe line loop — a truncated FINAL line is dropped, a malformed NON-final line RAISES —
+    but any NON-gap event row lacking ``sequence_no`` RAISES ``ValueError`` instead of being
+    returned. The R4-B mint boundary reads through the single global ``sequence_no`` authority, so a
+    row that cannot carry the global pair must never enter the replay stream (gap rows always carry
+    their own ``sequence_no`` from :meth:`LiveRecorder.record_gap`, so they stay permitted).
+    """
+    session_dir = Path(session_dir)
+    meta = LiveRecorderSessionMeta.model_validate_json(
+        (session_dir / META_FILENAME).read_text()
+    )
+
+    events: list[dict[str, Any]] = []
+    gaps: list[dict[str, Any]] = []
+    lines = (session_dir / RECORDS_FILENAME).read_text().splitlines()
+    for i, line in enumerate(lines):
+        if not line:
+            continue
+        try:
+            entry = json.loads(line)
+        except json.JSONDecodeError:
+            if i != len(lines) - 1:
+                raise  # only the final line may be a crash-truncated partial write
+            continue
+        if entry.get("event_type") == "RecorderGapEvent":
+            gaps.append(entry)
+        else:
+            if "sequence_no" not in entry:
+                raise ValueError(
+                    "read_session_strict: non-gap event row is missing 'sequence_no' — the R4-B "
+                    "mint boundary requires the global sequence on every recorded event row"
+                )
+            events.append(entry)
+
+    return meta, events, gaps
+
+
+def max_sequence_no(session_dir: str | Path) -> int:
+    """The durable-maximum ``sequence_no`` over ALL rows — EVENTS AND GAP MARKERS.
+
+    APPEND-ONLY R4-B durable-tail helper used by :func:`~veridex.live_recorder.recorder.resume_recorder`
+    to seed the next global sequence. Reuses :func:`read_session`'s crash-safe loop so a truncated
+    FINAL line is tolerated (dropped) while a malformed NON-final line RAISES — distinguishing the
+    recoverable tail from a fatal middle corruption. Because :meth:`LiveRecorder.record_gap` draws
+    its ``sequence_no`` from the SAME global ``_next_seq()``, a tape whose highest-sequence row is a
+    gap must still seed correctly; scanning events ONLY would seed BELOW a gap-at-tail and collide.
+    Returns ``0`` for an empty tape (no rows recorded before the crash).
+    """
+    _, events, gaps = read_session(session_dir)
+    seqs = [row["sequence_no"] for row in (*events, *gaps) if "sequence_no" in row]
+    return max(seqs) if seqs else 0
 
 
 def _crosses_gap(prev_ts: int, curr_ts: int, gaps: list[dict[str, Any]]) -> bool:

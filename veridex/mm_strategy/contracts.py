@@ -466,6 +466,49 @@ class MarketStatusEvent(_FrozenModel):
         return self
 
 
+# --- Global mint envelope + per-source epoch state (REQ-020b/027) --------------------------
+# The single global sequence authority is the R3 ``LiveRecorder._next_seq()`` — the assembler
+# never mints its own sequence. Every source (book/FV/status/match-state/projection) is recorded
+# through ONE recorder and inherits ONE monotonic ``sequence_no``. The per-source GENERATION epoch
+# lives on the tape (a ``MintEvent`` row's ``source_epoch``), never in ``meta.json`` — adding a meta
+# field would change ``LiveRecorderSessionMeta`` and break R3 meta byte-identity, so the assembler
+# reads durable-max per-source epochs back from these rows (Fable-plan-review-R4 Minor-1).
+
+# The five mint sources whose events flow through the single global recorder authority.
+MintSource = Literal["book", "fv", "market_status", "match_state", "projection"]
+
+
+class MintEvent(_FrozenModel):
+    """A typed global-envelope tape row for one minted source observation (REQ-020b/027).
+
+    Carries the recorder-assigned GLOBAL ``(recv_ts, sequence_no)`` pair (the ``sequence_no`` is
+    reassigned by :meth:`LiveRecorder.record`, the sole authority) plus the ``source`` and its
+    per-source generation ``source_epoch``. The durable tape of these rows is the SOLE channel for
+    per-source epochs — the assembler reads the durable max per source back from here, never from
+    ``meta.json``.
+    """
+
+    sequence_no: int
+    event_type: Literal["MintEvent"] = "MintEvent"
+    source: MintSource
+    source_epoch: int
+    recv_ts: int
+
+
+class SourceGenerations(_FrozenModel):
+    """Frozen typed per-source generation state — the assembler is the SOLE author (REQ-020b/(d2)/(e)).
+
+    One field per epoch-bearing source; NOT a single untyped scalar epoch. ``fv_source_epoch is
+    None`` IFF the guard is off (guard-off ⇒ no FV epoch anywhere — REQ-020(d2)); ``market_status_epoch
+    is None`` IFF no market-status generation exists yet (mirrors the ``UNKNOWN`` sentinel). ``book`` is
+    the universal generation and is always an ``int``.
+    """
+
+    book_source_epoch: int
+    fv_source_epoch: int | None
+    market_status_epoch: int | None
+
+
 class MarketStatusAuthority(Protocol):
     """Read-only typed authority the (non-ranked) orchestration/adapter layer reads market status
     from (REQ-027). ``read`` returns ``(status, recv_ts, epoch)`` with the SAME iff-invariant:
