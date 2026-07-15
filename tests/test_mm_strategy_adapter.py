@@ -40,7 +40,6 @@ from veridex.mm_strategy.contracts import (
 from veridex.mm_strategy.core import projection_startup_gate
 from veridex.mm_strategy.execution_adapter import (
     NEUTRAL_TO_R4A,
-    AdmittedPins,
     PlanExecutionResult,
     R4ARequestConfig,
     build_r4a_request,
@@ -48,6 +47,7 @@ from veridex.mm_strategy.execution_adapter import (
     freezes_fresh_writes,
     is_possibly_unresolved,
 )
+from veridex.policy.envelope import PolicyEnvelope
 
 # --- builders ---------------------------------------------------------------------------------
 
@@ -111,34 +111,25 @@ class _RecordingFakeFacade:
         return len(self.calls)
 
 
-def _admitted_pins() -> AdmittedPins:
-    """The INDEPENDENT admitted-pin authority (Gate #4 C-CRITICAL-1), sourced SEPARATELY from
-    ``_pinned_config``. It carries the SAME reviewed manifest/policy/config hashes (the adapter is the
-    pinned strategy, not an attacker), but as a DISTINCT object the request config is never read back
-    from — so the declared/admitted cross-check is a real independence check, not a self-comparison."""
-    return AdmittedPins(
-        manifest_hash="manifest-hash", policy_hash="policy-hash", strategy_config_hash="cfg-hash"
-    )
-
-
 def _run_reviewed_plan(
     *legs: NeutralIntent,
     facade: _RecordingFakeFacade,
     config: R4ARequestConfig | None = None,
-    admitted: AdmittedPins | None = None,
     strategy_config: StrategyConfig | None = None,
 ) -> PlanExecutionResult:
     """Build the reviewed (observation, decision) pair for ``legs`` and drive the UNIFIED
     build→execute path (Gate #4 C-CRITICAL-1): ``execute_plan`` builds each actionable leg's bound
-    typed request (independent admitted authority) and hands THAT request to ``facade``. This is the
-    ONE composed path the freeze boundary now wraps — the facade never sees a raw ``NeutralIntent``."""
+    typed request (the declared ``config`` cross-checked against the admitted pins DERIVED from the
+    TRUSTED ``_pinned_manifest`` / ``_pinned_envelope``) and hands THAT request to ``facade``. This is
+    the ONE composed path the freeze boundary now wraps — the facade never sees a raw ``NeutralIntent``."""
     observation, decision = _reviewed_pair(*legs)
     return execute_plan(
         decision,
         facade,
         observation=observation,
         config=config if config is not None else _pinned_config(),
-        admitted=admitted if admitted is not None else _admitted_pins(),
+        manifest=_pinned_manifest(),
+        envelope=_pinned_envelope(),
         strategy_config=(
             strategy_config if strategy_config is not None else _pinned_strategy_config()
         ),
@@ -355,13 +346,21 @@ def test_uncertain_first_leg_freezes_subsequent() -> None:
 def _pinned_config() -> R4ARequestConfig:
     """The ONE pinned request config — every hash/id/mode/sizing input is pinned session config,
     NEVER agent-supplied (REQ-058). ``wallet_equity``/``fixed_fraction`` are the pinned sizing
-    inputs the adapter threads to R4-A's proposer; the adapter itself never sizes."""
+    inputs the adapter threads to R4-A's proposer; the adapter itself never sizes.
+
+    The DECLARED hashes are DERIVED from the SAME reviewed ``_pinned_manifest`` / ``_pinned_envelope``
+    the adapter cross-checks against (Gate #4 C-CRITICAL-1): this is the HONEST pinned strategy declaring
+    the pins it genuinely operates under, so declared == the manifest/envelope-DERIVED admitted and the
+    build succeeds. An attacker's unreviewed declaration (a free-form hash) mismatches the real manifest
+    derivation and fails closed."""
+    manifest = _pinned_manifest()
+    envelope = _pinned_envelope()
     return R4ARequestConfig(
         strategy_id="mm-dust",
-        strategy_config_hash="cfg-hash",
-        policy_hash="policy-hash",
+        strategy_config_hash=manifest.strategy_config_hash,
+        policy_hash=envelope.policy_hash(),
         session_id="sess-1",
-        manifest_hash="manifest-hash",
+        manifest_hash=manifest.manifest_hash(),
         mode="dry_run",
         wallet_equity_at_decision=1000.0,
         fixed_fraction=0.001,
@@ -477,7 +476,7 @@ def test_adapter_pins_evidence_class_not_caller_param() -> None:
     leg = _fresh_write("A")
     obs, decision = _reviewed_pair(leg)
     request = build_r4a_request(
-        leg, config, observation=obs, decision=decision, admitted=_admitted_pins()
+        leg, config, observation=obs, decision=decision, manifest=_pinned_manifest(), envelope=_pinned_envelope()
     )
 
     assert request.evidence_class == "EXPERIMENTAL_DUST"
@@ -499,7 +498,7 @@ def test_adapter_sets_no_size() -> None:
     make_leg = _fresh_write("A")
     make_obs, make_decision = _reviewed_pair(make_leg)
     make_request = build_r4a_request(
-        make_leg, config, observation=make_obs, decision=make_decision, admitted=_admitted_pins()
+        make_leg, config, observation=make_obs, decision=make_decision, manifest=_pinned_manifest(), envelope=_pinned_envelope()
     )
     assert make_request.intent_params.size is None
 
@@ -519,7 +518,7 @@ def test_adapter_sets_no_size() -> None:
         obs, decision = _reviewed_pair(leg)
         assert (
             build_r4a_request(
-                leg, config, observation=obs, decision=decision, admitted=_admitted_pins()
+                leg, config, observation=obs, decision=decision, manifest=_pinned_manifest(), envelope=_pinned_envelope()
             ).intent_params.size
             is None
         )
@@ -541,7 +540,7 @@ def test_valid_replacement_lineage_reaches_r4a_request() -> None:
 
     obs, decision = _reviewed_pair(leg)
     request = build_r4a_request(
-        leg, config, observation=obs, decision=decision, admitted=_admitted_pins()
+        leg, config, observation=obs, decision=decision, manifest=_pinned_manifest(), envelope=_pinned_envelope()
     )
 
     # The lineage the decision named survives the neutral→R4-A translation byte-for-byte.
@@ -560,7 +559,7 @@ def test_reason_confidence_cannot_move_decision() -> None:
 
     # The adapter never forwards untrusted agent metadata: the request carries no reason/confidence.
     request = build_r4a_request(
-        leg, config, observation=obs, decision=decision, admitted=_admitted_pins()
+        leg, config, observation=obs, decision=decision, manifest=_pinned_manifest(), envelope=_pinned_envelope()
     )
     assert request.reason is None
     assert request.confidence is None
@@ -570,7 +569,7 @@ def test_reason_confidence_cannot_move_decision() -> None:
     # DERIVED from ``observation.stream_identity().token_id`` and BOUND to the stamped decision
     # (Gate#3 C-4 / CRITICAL-1 residual), never a caller-supplied bare string.
     builder_params = set(inspect.signature(build_r4a_request).parameters)
-    assert builder_params == {"leg", "config", "observation", "decision", "admitted"}
+    assert builder_params == {"leg", "config", "observation", "decision", "manifest", "envelope"}
     assert "token_id" not in builder_params  # no bare caller channel for the target token
     assert not (builder_params & {"reason", "confidence", "proof_status", "fv_message_id"})
 
@@ -592,9 +591,9 @@ def test_reason_confidence_cannot_move_decision() -> None:
         fv_proof_status="absent",
     )
     assert build_r4a_request(
-        hot.intent_plan[0], config, observation=obs, decision=hot, admitted=_admitted_pins()
+        hot.intent_plan[0], config, observation=obs, decision=hot, manifest=_pinned_manifest(), envelope=_pinned_envelope()
     ) == build_r4a_request(
-        cold.intent_plan[0], config, observation=obs, decision=cold, admitted=_admitted_pins()
+        cold.intent_plan[0], config, observation=obs, decision=cold, manifest=_pinned_manifest(), envelope=_pinned_envelope()
     )
 
     # The intent kind is a pure function of the TRUSTED leg.kind — nothing else moves it.
@@ -628,6 +627,37 @@ def _boundary_manifest() -> StrategyExperimentManifest:
     )
 
 
+def _pinned_manifest() -> StrategyExperimentManifest:
+    """The REVIEWED session manifest — the TRUSTED admitted authority the declared ``R4ARequestConfig``
+    is cross-checked against (Gate #4 C-CRITICAL-1 residual; mirrors R4-A
+    ``runner._authorization_block_reason``, runner.py:1149). The admitted pins the adapter DERIVES —
+    ``manifest.manifest_hash()`` (a sha256 over every field) and ``manifest.strategy_config_hash`` —
+    come from THIS object, supplied by the session/composed layer, NEVER a free-form value the request
+    caller can set. Reuses ``_boundary_manifest`` (universe == (``_R4A_TOKEN``,)) so the SAME reviewed
+    manifest anchors the wireability proofs and the admitted-pin authority."""
+    return _boundary_manifest()
+
+
+def _pinned_envelope() -> PolicyEnvelope:
+    """The REVIEWED policy envelope — its ``policy_hash()`` is the admitted policy pin (runner.py:1150),
+    the SAME trusted authority R4-A's runner sources the admitted policy hash from. OFFLINE: a pure
+    pydantic value; no venue, signer, or wire."""
+    return PolicyEnvelope(
+        max_stake=5.0,
+        max_orders_per_run=3,
+        max_orders_per_session=10,
+        max_orders_per_day=20,
+        venue_allowlist=["poly"],
+        market_allowlist=["0xcondition"],
+        min_edge_bps=10,
+        max_slippage_bps=50,
+        max_price=0.99,
+        max_quote_age_s=5,
+        cooldown_s=1,
+        human_approval_threshold=100.0,
+    )
+
+
 def test_normal_bid_and_ask_build_valid_r4a_resting_order() -> None:
     """Gate #3 CRITICAL-1 (RED at the REAL boundary): a normal ``place_quote(bid, 0.49)`` and
     ``place_quote(ask, 0.51)`` — the adapter's NORMAL output for a core-produced quote — must EACH
@@ -649,10 +679,10 @@ def test_normal_bid_and_ask_build_valid_r4a_resting_order() -> None:
     ask_obs, ask_decision = _reviewed_pair(ask_leg)
 
     bid_params = build_r4a_request(
-        bid_leg, config, observation=bid_obs, decision=bid_decision, admitted=_admitted_pins()
+        bid_leg, config, observation=bid_obs, decision=bid_decision, manifest=_pinned_manifest(), envelope=_pinned_envelope()
     ).intent_params
     ask_params = build_r4a_request(
-        ask_leg, config, observation=ask_obs, decision=ask_decision, admitted=_admitted_pins()
+        ask_leg, config, observation=ask_obs, decision=ask_decision, manifest=_pinned_manifest(), envelope=_pinned_envelope()
     ).intent_params
 
     # The adapter set NO size — sizing stays R4-A-owned (REQ-058/RED-22).
@@ -718,19 +748,19 @@ def test_token_substitution_two_admitted_tokens_fails_closed() -> None:
     assert obs_b.observation_hash() != decision.observation_hash
     with pytest.raises(ValueError):
         build_r4a_request(
-            leg, config, observation=obs_b, decision=decision, admitted=_admitted_pins()
+            leg, config, observation=obs_b, decision=decision, manifest=_pinned_manifest(), envelope=_pinned_envelope()
         )
 
     # Adversary lever #2 — a leg the reviewed decision never committed to also fails closed.
     foreign_leg = _fresh_write("foreign", leg_role="ask", price=0.51)
     with pytest.raises(ValueError):
         build_r4a_request(
-            foreign_leg, config, observation=obs_a, decision=decision, admitted=_admitted_pins()
+            foreign_leg, config, observation=obs_a, decision=decision, manifest=_pinned_manifest(), envelope=_pinned_envelope()
         )
 
     # The ONLY buildable request derives the reviewed token A — token B is unrepresentable here.
     request = build_r4a_request(
-        leg, config, observation=obs_a, decision=decision, admitted=_admitted_pins()
+        leg, config, observation=obs_a, decision=decision, manifest=_pinned_manifest(), envelope=_pinned_envelope()
     )
     assert request.intent_params.token_id == _R4A_TOKEN
     assert request.intent_params.token_id != _OTHER_ADMITTED_TOKEN
@@ -821,7 +851,8 @@ def test_facade_receives_typed_request_not_raw_intent() -> None:
     request-requiring facade raised ``TypeError`` and no whole-lane path proved the facade consumed the
     bound request whose result controls freezing (Codex CRITICAL-1)."""
     config = _pinned_config()
-    admitted = _admitted_pins()
+    manifest = _pinned_manifest()
+    envelope = _pinned_envelope()
     bid = _fresh_write("bid-1", leg_role="bid", price=0.49)
     ask = _fresh_write("ask-1", leg_role="ask", price=0.51)
     observation, decision = _reviewed_pair(bid, ask)
@@ -832,7 +863,8 @@ def test_facade_receives_typed_request_not_raw_intent() -> None:
         facade,
         observation=observation,
         config=config,
-        admitted=admitted,
+        manifest=manifest,
+        envelope=envelope,
         strategy_config=_pinned_strategy_config(),
     )
 
@@ -843,10 +875,10 @@ def test_facade_receives_typed_request_not_raw_intent() -> None:
     # Each received request is byte-identical to the standalone build for the SAME reviewed pair —
     # the facade consumes exactly the bound, pin-cross-checked request, not a detached side artifact.
     assert facade.calls[0] == build_r4a_request(
-        bid, config, observation=observation, decision=decision, admitted=admitted
+        bid, config, observation=observation, decision=decision, manifest=manifest, envelope=envelope
     )
     assert facade.calls[1] == build_r4a_request(
-        ask, config, observation=observation, decision=decision, admitted=admitted
+        ask, config, observation=observation, decision=decision, manifest=manifest, envelope=envelope
     )
 
     # The bound wire fields the facade actually consumes are exactly the reviewed values.
@@ -855,75 +887,6 @@ def test_facade_receives_typed_request_not_raw_intent() -> None:
     assert facade.calls[0].intent_params.tif == "GTC"
     assert facade.calls[1].intent_params.side == "SELL"
     assert result.frozen is False
-
-
-def test_declared_pin_cannot_self_select_admitted_pin() -> None:
-    """Gate #4 C-CRITICAL-1 (control 2): a caller-selected DECLARED config (unreviewed
-    manifest/policy/config + ``mode="live_guarded"``) is cross-checked against the INDEPENDENT admitted
-    authority and FAILS CLOSED — no request built, no order, no facade call. The declared pin can never
-    ALSO select the admitted pin, because the admitted authority is a SEPARATE object the caller does
-    not supply (mirrors R4-A ``runner._authorization_block_reason``'s declared-vs-admitted check).
-
-    Before the fix ``build_r4a_request`` passed the SAME ``R4ARequestConfig`` hashes to BOTH the declared
-    and admitted sides of ``MMExecutionToolRequest.build``, so the unreviewed declaration self-approved
-    (Codex CRITICAL-1)."""
-    admitted = _admitted_pins()  # the INDEPENDENT reviewed authority — NOT derived from the request
-    leg = _fresh_write("A", leg_role="bid", price=0.49)
-    observation, decision = _reviewed_pair(leg)
-
-    evil = R4ARequestConfig(
-        strategy_id="mm-dust",
-        strategy_config_hash="unreviewed-cfg",
-        policy_hash="unreviewed-policy",
-        session_id="sess-1",
-        manifest_hash="unreviewed-manifest",
-        mode="live_guarded",
-        wallet_equity_at_decision=1000.0,
-        fixed_fraction=0.001,
-        tif="GTC",
-    )
-
-    # Direct build: the declared pins are cross-checked against the INDEPENDENT admitted authority and
-    # FAIL CLOSED — the config cannot select its own admitted pin (self-selection is impossible).
-    with pytest.raises(ValueError):
-        build_r4a_request(
-            leg, evil, observation=observation, decision=decision, admitted=admitted
-        )
-
-    # Whole unified path: no request is built, so no facade call is ever issued (fail closed).
-    facade = _RecordingFakeFacade(results=[_result()])
-    with pytest.raises(ValueError):
-        execute_plan(
-            decision,
-            facade,
-            observation=observation,
-            config=evil,
-            admitted=admitted,
-            strategy_config=_pinned_strategy_config(),
-        )
-    assert facade.call_count == 0
-
-    # Corrected-not-weakened: the HONEST path (the pinned strategy declaring the REVIEWED pins) still
-    # builds against the same independent authority — independence bars a MISMATCH, not the honest run.
-    request = build_r4a_request(
-        leg, _pinned_config(), observation=observation, decision=decision, admitted=admitted
-    )
-    assert request.manifest_hash == admitted.manifest_hash
-    assert request.mode == "dry_run"
-
-    # Mutation witness: the ONLY way the unreviewed declaration builds is if the admitted authority is
-    # ALSO the caller's unreviewed pins — the pre-fix SELF-FEED. With independent sourcing the caller
-    # never supplies the admitted authority, so this self-consistency path is unreachable in the adapter.
-    self_fed = AdmittedPins(
-        manifest_hash="unreviewed-manifest",
-        policy_hash="unreviewed-policy",
-        strategy_config_hash="unreviewed-cfg",
-    )
-    smuggled = build_r4a_request(
-        leg, evil, observation=observation, decision=decision, admitted=self_fed
-    )
-    assert smuggled.mode == "live_guarded"  # self-feed accepts it — exactly the bug independence removes
-    assert self_fed != admitted
 
 
 def test_request_tif_must_equal_pinned_strategy_tif() -> None:
@@ -959,7 +922,7 @@ def test_request_tif_must_equal_pinned_strategy_tif() -> None:
             facade,
             observation=observation,
             config=drifted,
-            admitted=_admitted_pins(),
+            manifest=_pinned_manifest(), envelope=_pinned_envelope(),
             strategy_config=pinned,
         )
     # Fail closed BEFORE any facade call — no order, no wire tif divergence.
@@ -973,7 +936,7 @@ def test_request_tif_must_equal_pinned_strategy_tif() -> None:
         ok_facade,
         observation=observation,
         config=_pinned_config(),  # tif == "GTC" == pinned.tif
-        admitted=_admitted_pins(),
+        manifest=_pinned_manifest(), envelope=_pinned_envelope(),
         strategy_config=pinned,
     )
     assert ok_facade.call_count == 1
@@ -1000,3 +963,127 @@ def test_freeze_preserved_around_request_level_call() -> None:
     assert result.outcomes[2].frozen is True  # third fresh write frozen
     assert result.can_resume_within_plan is False
     assert result.book_treated_flat is False
+
+
+# =====================================================================================
+# Gate #4 C-CRITICAL-1 RESIDUAL — the admitted-pin authority is SOURCED from the trusted
+# manifest/envelope (a sha256 derivation), NEVER a caller-forgeable AdmittedPins parameter.
+# =====================================================================================
+
+
+def test_unreviewed_config_cannot_reach_facade_via_forged_admission() -> None:
+    """Gate #4 C-CRITICAL-1 RESIDUAL (the money boundary): an unreviewed ``live_guarded``
+    ``R4ARequestConfig`` (attacker manifest/policy/config hashes) cross-checked against the REAL
+    reviewed ``manifest``/``envelope`` FAILS CLOSED — the recording facade sees ZERO calls and no
+    unfrozen result escapes.
+
+    The admitted authority is now DERIVED from the TRUSTED manifest/envelope
+    (``manifest.manifest_hash()`` / ``envelope.policy_hash()`` / ``manifest.strategy_config_hash``),
+    not a caller-supplied ``AdmittedPins`` at the same call level as the declared config. So a single
+    caller can no longer supply MATCHING values for BOTH the declared config AND the admitted side to
+    self-approve (object separation was not authority separation). This mirrors R4-A
+    ``runner._authorization_block_reason``: the SESSION supplies the manifest/envelope (the independent
+    admitted authority), the AGENT supplies only the declared request.
+
+    Codex reproduced the pre-fix hole EXACTLY: ``facade_calls=1 mode=live_guarded
+    manifest=unreviewed-manifest policy=unreviewed-policy config_hash=unreviewed-cfg frozen=False``.
+    After the fix there is no admitted parameter, and the unreviewed declared config mismatches the
+    manifest-DERIVED admitted → fail closed. Forging the admitted side now requires forging the
+    reviewed manifest itself (a sha256 preimage) — the R4-A/review trust boundary, out of adapter scope.
+    """
+    manifest = _pinned_manifest()  # the REAL reviewed authority — NOT caller-forgeable free strings
+    envelope = _pinned_envelope()
+    leg = _fresh_write("A", leg_role="bid", price=0.49)
+    observation, decision = _reviewed_pair(leg)
+
+    # Codex's exact adversarial object: unreviewed hashes under the real-money live_guarded mode.
+    evil = R4ARequestConfig(
+        strategy_id="mm-dust",
+        strategy_config_hash="unreviewed-cfg",
+        policy_hash="unreviewed-policy",
+        session_id="sess-1",
+        manifest_hash="unreviewed-manifest",
+        mode="live_guarded",
+        wallet_equity_at_decision=1000.0,
+        fixed_fraction=0.001,
+        tif="GTC",
+    )
+
+    # Direct build: the declared pins are cross-checked against the manifest-DERIVED admitted side and
+    # FAIL CLOSED — the config cannot self-select its own admitted pin (there is no admitted parameter).
+    with pytest.raises(ValueError):
+        build_r4a_request(
+            leg,
+            evil,
+            observation=observation,
+            decision=decision,
+            manifest=manifest,
+            envelope=envelope,
+        )
+
+    # Composed path (the capstone control Codex demanded): no request is built, so the recording facade
+    # sees ZERO calls and no unfrozen result escapes (fail closed BEFORE any facade call).
+    facade = _RecordingFakeFacade(results=[_result()])
+    with pytest.raises(ValueError):
+        execute_plan(
+            decision,
+            facade,
+            observation=observation,
+            config=evil,
+            manifest=manifest,
+            envelope=envelope,
+            strategy_config=_pinned_strategy_config(),
+        )
+    assert facade.call_count == 0  # the unreviewed config reached ZERO facade calls
+
+
+def test_admitted_pins_parameter_is_gone() -> None:
+    """The forgeable ``AdmittedPins`` channel is REMOVED: neither ``execute_plan`` nor
+    ``build_r4a_request`` accepts an ``admitted`` parameter (a caller can no longer supply the admitted
+    side at all); both now REQUIRE the TRUSTED ``manifest``/``envelope`` the admitted pins are DERIVED
+    from. The dataclass itself is gone from the adapter's public surface — there is no caller-constructible
+    admitted authority anywhere."""
+    import veridex.mm_strategy.execution_adapter as adapter_module
+
+    exec_params = set(inspect.signature(execute_plan).parameters)
+    build_params = set(inspect.signature(build_r4a_request).parameters)
+
+    assert "admitted" not in exec_params, "the forgeable admitted channel must be gone from execute_plan"
+    assert "admitted" not in build_params, "the forgeable admitted channel must be gone from build_r4a_request"
+    assert {"manifest", "envelope"} <= exec_params, "execute_plan must require the trusted manifest/envelope"
+    assert {"manifest", "envelope"} <= build_params, "build_r4a_request must require the trusted manifest/envelope"
+
+    assert not hasattr(adapter_module, "AdmittedPins"), (
+        "the forgeable AdmittedPins dataclass must be removed — admitted pins are DERIVED from the "
+        "trusted manifest/envelope, never a caller-constructible parameter"
+    )
+
+
+def test_reviewed_config_matching_manifest_reaches_facade() -> None:
+    """Corrected-not-weakened (the HAPPY path): a declared ``R4ARequestConfig`` whose hashes MATCH the
+    reviewed ``manifest``/``envelope`` (the pinned strategy operating under its own reviewed authority)
+    builds and reaches the facade EXACTLY once with the bound request. The fix bars a MISMATCH, never
+    the honest run — and the request the facade consumes carries the manifest-DERIVED admitted pins."""
+    manifest = _pinned_manifest()
+    envelope = _pinned_envelope()
+    leg = _fresh_write("A", leg_role="bid", price=0.49)
+    observation, decision = _reviewed_pair(leg)
+
+    facade = _RecordingFakeFacade(results=[_result()])  # clean ABSTAINED — non-freezing
+    result = execute_plan(
+        decision,
+        facade,
+        observation=observation,
+        config=_pinned_config(),  # its hashes are DERIVED from the SAME reviewed manifest/envelope
+        manifest=manifest,
+        envelope=envelope,
+        strategy_config=_pinned_strategy_config(),
+    )
+
+    assert facade.call_count == 1  # the legitimate declaration reaches the facade
+    request = facade.calls[0]
+    # The declared config matched the manifest-DERIVED admitted authority (declared == admitted).
+    assert request.manifest_hash == manifest.manifest_hash()
+    assert request.policy_hash == envelope.policy_hash()
+    assert request.strategy_config_hash == manifest.strategy_config_hash
+    assert result.frozen is False

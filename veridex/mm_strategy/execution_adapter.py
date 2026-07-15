@@ -45,6 +45,7 @@ from veridex.dust_execution.facade import (
     MMExecutionToolResult,
     MMIntentParams,
 )
+from veridex.dust_execution.manifest import StrategyExperimentManifest
 from veridex.mm_strategy.config import StrategyConfig
 from veridex.mm_strategy.contracts import (
     NeutralIntent,
@@ -53,6 +54,7 @@ from veridex.mm_strategy.contracts import (
     StrategyObservation,
     reject_mixed_phase_plan,
 )
+from veridex.policy.envelope import PolicyEnvelope
 
 # The neutral intent kinds that reach the wire at all (the adapter calls the facade for these).
 _ACTIONABLE_KINDS: frozenset[str] = frozenset(
@@ -200,7 +202,8 @@ def execute_plan(
     *,
     observation: StrategyObservation,
     config: R4ARequestConfig,
-    admitted: AdmittedPins,
+    manifest: StrategyExperimentManifest,
+    envelope: PolicyEnvelope,
     strategy_config: StrategyConfig,
 ) -> PlanExecutionResult:
     """Build+fire each actionable leg's BOUND typed request IN ORDER, freezing on the first uncertain
@@ -209,8 +212,11 @@ def execute_plan(
     UNIFIED build→execute: for EACH actionable leg of the reviewed ``decision.intent_plan`` this
     :func:`build_r4a_request`s the singular typed :class:`MMExecutionToolRequest` — deriving the target
     token from the reviewed ``observation``'s stream identity, BINDING it to the stamped ``decision``,
-    and cross-checking the DECLARED ``config`` pins against the INDEPENDENT ``admitted`` authority (so a
-    caller-selected declared pin can never self-select the admitted pin) — and hands THAT typed request
+    and cross-checking the DECLARED ``config`` pins against the admitted pins DERIVED from the TRUSTED
+    ``manifest`` / ``envelope`` (``manifest.manifest_hash()`` / ``envelope.policy_hash()`` /
+    ``manifest.strategy_config_hash``) — the SAME session-supplied authority R4-A's runner trusts
+    (``runner._authorization_block_reason``, runner.py:1149-1150), never a caller-forgeable value — so a
+    caller-selected declared pin can never self-select the admitted pin — and hands THAT typed request
     to the facade. The value whose result controls freezing is exactly the bound, pin-cross-checked
     request; the facade never sees a raw ``NeutralIntent``.
 
@@ -260,11 +266,12 @@ def execute_plan(
             outcomes.append(LegOutcome(leg=leg, result=None, attempted=False))
             continue
 
-        # Build the SINGULAR bound request (reviewed-token derive + decision binding + INDEPENDENT
-        # admitted-pin cross-check) and hand THAT typed request to the facade — never a raw intent.
-        # A declared/admitted pin mismatch raises here, BEFORE the facade call (fail closed).
+        # Build the SINGULAR bound request (reviewed-token derive + decision binding + the declared
+        # config cross-checked against the manifest/envelope-DERIVED admitted pins) and hand THAT typed
+        # request to the facade — never a raw intent. A declared/admitted mismatch raises here, BEFORE
+        # the facade call (fail closed).
         request = build_r4a_request(
-            leg, config, observation=observation, decision=decision, admitted=admitted
+            leg, config, observation=observation, decision=decision, manifest=manifest, envelope=envelope
         )
         result = facade(request)
         outcomes.append(LegOutcome(leg=leg, result=result, attempted=True))
@@ -323,9 +330,11 @@ class R4ARequestConfig:
 
     Every field is PINNED session/manifest config — the operator wires it once; NONE is agent- or
     caller-supplied. The hashes here are the pins the strategy DECLARES it operates under; they are
-    cross-checked against the SEPARATE, INDEPENDENTLY-SOURCED :class:`AdmittedPins` authority at
-    :meth:`MMExecutionToolRequest.build` (Gate #4 C-CRITICAL-1). The two are NEVER the same object, so a
-    caller-selected declared pin can NOT also select the admitted pin — self-selection is impossible
+    cross-checked at :meth:`MMExecutionToolRequest.build` against the admitted pins DERIVED from the
+    TRUSTED ``manifest`` / ``envelope`` the session supplies (``manifest.manifest_hash()`` /
+    ``envelope.policy_hash()`` / ``manifest.strategy_config_hash`` — Gate #4 C-CRITICAL-1). The admitted
+    side is a cryptographic derivation of a session-supplied authority, NOT a caller-constructible value,
+    so a caller-selected declared pin can NOT also select the admitted pin — self-selection is impossible
     (mirrors R4-A ``runner._authorization_block_reason``'s declared-vs-admitted check, which sources the
     admitted pins from an INDEPENDENT ``manifest`` / ``envelope``, never from the request itself).
 
@@ -347,28 +356,6 @@ class R4ARequestConfig:
     # ``GTC`` is the operator-pinned session default. Like every field here it is session/manifest
     # config the operator wires once — NEVER agent- or caller-supplied.
     tif: TimeInForce
-
-
-@dataclass(frozen=True)
-class AdmittedPins:
-    """The INDEPENDENT admitted-pin authority the declared request pins are cross-checked against.
-
-    Gate #4 C-CRITICAL-1: the manifest / policy / strategy-config hashes the session is ADMITTED under,
-    sourced SEPARATELY from the caller's :class:`R4ARequestConfig` DECLARED pins (the operator wires the
-    admitted authority once from the reviewed manifest/policy — it is NOT read back from the request
-    config). Feeding these as the ``admitted_*`` side of :meth:`MMExecutionToolRequest.build`'s
-    fail-closed cross-check restores the R4-A runner's independence property
-    (``runner._authorization_block_reason``, runner.py:1158-1170): a caller-selected DECLARED pin
-    (e.g. an ``unreviewed-manifest`` under ``mode="live_guarded"``) can never ALSO select the admitted
-    pin, so it FAILS CLOSED (no request built, hence no R4-A order and no facade call) instead of being
-    self-approved. The adapter's normal operation passes the SAME reviewed hashes on both sides (it is
-    the pinned strategy, not an attacker); the value of independence is that a MISMATCH is now
-    unrepresentable-as-approved rather than silently accepted.
-    """
-
-    manifest_hash: str
-    policy_hash: str
-    strategy_config_hash: str
 
 
 def _intent_params(
@@ -411,7 +398,8 @@ def build_r4a_request(
     *,
     observation: StrategyObservation,
     decision: StrategyDecision,
-    admitted: AdmittedPins,
+    manifest: StrategyExperimentManifest,
+    envelope: PolicyEnvelope,
 ) -> MMExecutionToolRequest:
     """Build the SINGULAR typed R4-A request for ONE neutral leg (REQ-091/058, AC-024).
 
@@ -432,15 +420,20 @@ def build_r4a_request(
     unreachable), the params translate the physical role to an R4-A ``BUY`` / ``SELL`` side and bind
     the DERIVED token + config-pinned maker TIF so the request is WIREABLE at R4-A (Gate#3
     CRITICAL-1), carry no adapter-set size, and ``evidence_class`` is PINNED to the module constant —
-    never a caller/agent argument. The ``config`` hashes are DECLARED and cross-checked against the
-    SEPARATE, INDEPENDENTLY-SOURCED ``admitted`` :class:`AdmittedPins` authority (Gate #4 C-CRITICAL-1),
-    fail-closed via :meth:`MMExecutionToolRequest.build`: a caller-selected declared pin can never
-    self-select the admitted pin, so a mismatch RAISES (no request, hence no R4-A order / facade call)
-    rather than being self-approved. Untrusted agent metadata (``reason`` /
-    ``confidence`` / FV proof) is NOT a parameter and is NOT forwarded, so it has ZERO effect on the
-    mapping or the request (AC-024): the request is a pure function of (trusted leg, pinned config,
-    reviewed observation, bound decision). The adapter proposes a typed request; it never sizes,
-    signs, or writes.
+    never a caller/agent argument. The ``config`` hashes are DECLARED and cross-checked, fail-closed via
+    :meth:`MMExecutionToolRequest.build`, against the admitted pins DERIVED from the TRUSTED
+    ``manifest`` / ``envelope`` (``manifest.manifest_hash()`` / ``envelope.policy_hash()`` /
+    ``manifest.strategy_config_hash``) — the SAME session-supplied authority R4-A's runner cross-checks
+    against (``runner._authorization_block_reason``, runner.py:1149-1170). Because the admitted side is a
+    cryptographic derivation of a session-supplied authority — NOT a caller-constructible parameter — a
+    caller-selected declared pin can never self-select the admitted pin, so a mismatch RAISES (no request,
+    hence no R4-A order / facade call) rather than being self-approved (Gate #4 C-CRITICAL-1). Forging the
+    admitted side would require forging the reviewed manifest itself (a sha256 preimage) — the R4-A/review
+    trust boundary, out of this adapter's scope. Untrusted agent metadata (``reason`` / ``confidence`` /
+    FV proof) is NOT a parameter and is NOT forwarded, so it has ZERO effect on the mapping or the request
+    (AC-024): the request is a pure function of (trusted leg, pinned config, reviewed observation, bound
+    decision, trusted manifest/envelope). The adapter proposes a typed request; it never sizes, signs, or
+    writes.
     """
     # Bind the request to the REVIEWED (observation, decision) pair BEFORE building anything, so a
     # caller cannot substitute a different admitted token (Gate#3 CRITICAL-1 residual). Fail closed.
@@ -470,10 +463,12 @@ def build_r4a_request(
         manifest_hash=config.manifest_hash,
         evidence_class=_PINNED_EVIDENCE_CLASS,  # PINNED — never a caller/agent param (AC-025)
         mode=config.mode,
-        # Admitted pins from the INDEPENDENT authority (Gate #4 C-CRITICAL-1) — NEVER re-read from the
-        # declared ``config``, so a caller-selected declared pin cannot self-select the admitted pin.
-        admitted_manifest_hash=admitted.manifest_hash,
-        admitted_policy_hash=admitted.policy_hash,
-        admitted_strategy_config_hash=admitted.strategy_config_hash,
+        # Admitted pins DERIVED from the TRUSTED manifest/envelope (Gate #4 C-CRITICAL-1) — a
+        # cryptographic derivation of the session-supplied authority, NEVER re-read from the declared
+        # ``config`` and NEVER a caller-constructible value, so a caller-selected declared pin cannot
+        # self-select the admitted pin (mirrors runner._authorization_block_reason, runner.py:1166-1168).
+        admitted_manifest_hash=manifest.manifest_hash(),
+        admitted_policy_hash=envelope.policy_hash(),
+        admitted_strategy_config_hash=manifest.strategy_config_hash,
         # reason/confidence deliberately NOT passed: untrusted metadata has zero effect (AC-024).
     )

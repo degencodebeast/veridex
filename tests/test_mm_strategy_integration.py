@@ -12,13 +12,15 @@ fake — and asserts the cross-cutting trust invariants the individual tiers eac
         -> core.decide  (warm-seeded fold)  (transition table, anchor, guard, quote math — the ONE
                                             pure reducer; clock is the explicit as_of_ts input)
         -> StrategyDecision.intent_plan     (single-phase: cancel XOR place)
-        -> execution_adapter.execute_plan(decision, facade, observation=obs, config=cfg, admitted=pins)
+        -> execution_adapter.execute_plan(decision, facade, observation=obs, config=cfg,
+                                          manifest=manifest, envelope=envelope)
                                             (Gate #4 C-CRITICAL-1: the UNIFIED build→execute path —
                                             for each actionable leg it BUILDS the bound singular
                                             request (token DERIVED from the reviewed stream identity,
                                             BOUND to the stamped decision, declared pins cross-checked
-                                            against the INDEPENDENT admitted authority) and fires THAT
-                                            typed request IN ORDER; the facade never sees a raw intent)
+                                            against the admitted pins DERIVED from the TRUSTED
+                                            manifest/envelope) and fires THAT typed request IN ORDER;
+                                            the facade never sees a raw intent)
         -> _RecordingFakeFacade             (OFFLINE: counts the typed MMExecutionToolRequest calls,
                                             returns a scripted typed result; NEVER a wire primitive /
                                             signer / socket)
@@ -77,8 +79,9 @@ from tests.test_dust_execution_integration import _REPO_ROOT, _enumerate_sealed_
 # Reuse the E5-T4 OFFLINE recording facade + the pinned Mode-A adapter request config + a clean
 # (non-freezing) Mode-A ABSTAINED boundary result. NEVER a real facade: no network/wallet/submit.
 from tests.test_mm_strategy_adapter import (
-    _admitted_pins,
     _pinned_config,
+    _pinned_envelope,
+    _pinned_manifest,
     _RecordingFakeFacade,
     _result,
 )
@@ -219,11 +222,16 @@ def _drive_whole_lane(
 
     # adapter tier (Gate #4 C-CRITICAL-1): drive the UNIFIED build→execute path — ``execute_plan``
     # builds each actionable leg's bound singular request (reviewed-token derive + decision binding +
-    # INDEPENDENT admitted-pin cross-check) and hands THAT typed request to the OFFLINE recording
+    # the declared config cross-checked against the manifest/envelope-DERIVED admitted pins) and hands
+    # THAT typed request to the OFFLINE recording
     # facade. The pinned config is Mode-A (dry_run); the facade abstains. The requests the composed path
     # actually built + fired are exactly the typed requests the facade recorded.
     adapter_config = _pinned_config()
-    admitted = _admitted_pins()
+    # The TRUSTED reviewed manifest/envelope — the SESSION-supplied admitted authority (Gate #4
+    # C-CRITICAL-1). The composed path supplies them (never the strategy decision path), so the declared
+    # ``adapter_config`` is cross-checked against the manifest/envelope-DERIVED admitted pins end-to-end.
+    manifest = _pinned_manifest()
+    envelope = _pinned_envelope()
     facade = _RecordingFakeFacade(results=[_result()])
     plan_results: list[PlanExecutionResult] = []
     for observation, decision in zip(run.observations, tuple(decisions), strict=True):
@@ -235,7 +243,8 @@ def _drive_whole_lane(
                 facade,
                 observation=observation,
                 config=adapter_config,
-                admitted=admitted,
+                manifest=manifest,
+                envelope=envelope,
                 # Single TIF authority (Gate #4 F-MINOR-2): the declared request tif is cross-checked
                 # against THIS pinned, hash-bound StrategyConfig.tif — the run's own config.
                 strategy_config=config,
