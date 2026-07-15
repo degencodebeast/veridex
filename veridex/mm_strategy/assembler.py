@@ -274,6 +274,47 @@ def _authenticate_owned_fields(
         )
 
 
+# Gate #4 C-MAJOR-1: a mint row's DURABLE source generation and the released observation's
+# AUTHENTICATED generation are two declarations of ONE fact — they must never diverge.
+# ``ObservationTick.source_epoch`` is persisted into the ``MintEvent`` (and read back by
+# :func:`read_durable_source_generations` on an assembler restart); ``owned.book_source_epoch`` /
+# ``owned.market_status_epoch`` is authenticated onto the released observation the decision stream
+# consumes. For every mint source an observation authenticates a generation for, the tape generation
+# is BOUND to that SAME observation generation — one authority per source. ``match_state`` /
+# ``projection`` carry no observation-authenticated generation (and are never read back on resume), so
+# there is nothing to bind. ``fv`` is bound BY CONSTRUCTION: :func:`run_cadence` feeds the single
+# ``FvArrival.source_epoch`` to BOTH the tape row and the guard-leg cache.
+_OBSERVATION_AUTHENTICATED_EPOCH: dict[
+    MintSource, Callable[[AssemblerOwnedFacts], int | None]
+] = {
+    "book": lambda owned: owned.book_source_epoch,
+    "market_status": lambda owned: owned.market_status_epoch,
+}
+
+
+def _bind_mint_source_epoch(event: ObservationTick) -> None:
+    """Fail closed unless the tick's tape generation equals its observation-authenticated one.
+
+    Invoked BEFORE any tape append, so a divergent ``source_epoch`` NEVER seals onto the tape
+    (Gate #4 C-MAJOR-1). Without this bind a book (or market-status) tick could persist
+    ``source_epoch=999`` while releasing an observation authenticated at generation ``1``; a restart's
+    :func:`read_durable_source_generations` would then return — and trust — a generation the decision
+    stream never consumed, turning a restart into a false epoch increment/reset from two independently
+    caller-controlled fields even though every individual row is well typed.
+    """
+    authenticated = _OBSERVATION_AUTHENTICATED_EPOCH.get(event.source)
+    if authenticated is None:
+        return  # no observation-authenticated generation for this source — nothing to bind.
+    observation_epoch = authenticated(event.owned)
+    if event.source_epoch != observation_epoch:
+        raise ValueError(
+            "mint source_epoch disagrees with the observation-authenticated generation; "
+            "failing closed with ZERO tape append (Gate #4 C-MAJOR-1): "
+            f"source={event.source!r} tape_source_epoch={event.source_epoch!r} "
+            f"observation_epoch={observation_epoch!r}"
+        )
+
+
 def run_cadence(
     recorder: LiveRecorder, events: Iterable[CadenceEvent], *, guard_enabled: bool
 ) -> CadenceRun:
@@ -321,6 +362,10 @@ def run_cadence(
             )
             continue
         # Non-FV trigger: MINT one observation. The cadence sequence advances here (never on FV).
+        # Bind the tape generation to the observation-authenticated generation BEFORE the append, so
+        # a divergent source_epoch can never seal onto the tape (Gate #4 C-MAJOR-1) — one authority
+        # per source. A mismatch fails closed with ZERO append and no sequence advance.
+        _bind_mint_source_epoch(event)
         observation_sequence += 1
         mint_pair = mint(
             recorder,

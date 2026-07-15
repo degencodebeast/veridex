@@ -795,3 +795,122 @@ def test_fv_does_not_leak_across_sides(tmp_path):
     obs_yes, obs_no = by_side["YES"], by_side["NO"]
     assert obs_yes.guard_fv is not None and obs_yes.guard_fv.fv == 0.71  # YES owns the FV
     assert obs_no.guard_fv is None  # NO is a foreign side — YES's 0.71 is invisible
+
+
+# --- Gate #4 C-MAJOR-1: the mint tape generation is BOUND to the observation generation --------
+# (REQ-020b/027; Codex whole-lane external review)
+#
+# ``ObservationTick`` declares a generation TWICE: ``source_epoch`` is persisted into the ``MintEvent``
+# (read back by :func:`read_durable_source_generations` on restart) and ``owned.book_source_epoch`` /
+# ``owned.market_status_epoch`` is authenticated onto the released observation the decision stream
+# consumes. If those two caller-controlled fields disagree, a restart trusts a generation the stream
+# never consumed — a false epoch increment/reset even though every individual row is well typed.
+# ``run_cadence`` binds them per source BEFORE any tape append and fails closed on a mismatch, so a
+# divergent generation can never seal. These controls reproduce Codex's constructed mismatches
+# (book/market-status persisted 999 vs observation 1) against the actual module.
+
+
+def _mint_events_on_tape(session_dir) -> list[dict]:
+    _, events, _ = read_session(session_dir)
+    return [e for e in events if e.get("event_type") == "MintEvent"]
+
+
+def test_book_mint_epoch_mismatch_fails_zero_append(tmp_path):
+    """A book tick whose persisted ``source_epoch=999`` disagrees with the observation's authenticated
+    ``book_source_epoch=1`` (``owned`` + built) MUST fail closed with ZERO tape append — the mint row
+    is never written, so a restart cannot recover generation 999 (Codex C-MAJOR-1 control)."""
+
+    def build(observation_sequence: int, guard_fv: GuardFairValue | None) -> StrategyObservation:
+        # honest observation generation is 1 (the authenticated / consumed generation)
+        return _observation(
+            observation_sequence=observation_sequence,
+            guard_fv=guard_fv,
+            book_source_epoch=1,
+            as_of_ts=1_000,
+        )
+
+    tick = ObservationTick(
+        source="book",
+        source_epoch=999,  # divergent DURABLE tape generation
+        recv_ts=900,
+        owned=_owned(as_of_ts=1_000),  # owned.book_source_epoch=1 → observation generation
+        identity=_ID_A,
+        build=build,
+    )
+    rec = LiveRecorder(tmp_path, _start_meta())
+    with pytest.raises(ValueError, match="source_epoch"):
+        run_cadence(rec, [tick], guard_enabled=False)
+    rec.close()
+
+    # ZERO tape append: no MintEvent row sealed → the durable book generation is the default 0.
+    assert _mint_events_on_tape(tmp_path) == []
+    assert read_durable_source_generations(tmp_path).book_source_epoch == 0
+
+
+def test_market_status_mint_epoch_mismatch_fails_zero_append(tmp_path):
+    """A market-status tick whose persisted ``source_epoch=999`` disagrees with the observation's
+    authenticated ``market_status_epoch=1`` MUST fail closed with ZERO tape append — no market-status
+    generation seals, so a restart cannot recover 999 (Codex C-MAJOR-1 control)."""
+
+    def build(observation_sequence: int, guard_fv: GuardFairValue | None) -> StrategyObservation:
+        return _observation(
+            observation_sequence=observation_sequence, guard_fv=guard_fv, as_of_ts=1_000
+        )
+
+    tick = ObservationTick(
+        source="market_status",
+        source_epoch=999,  # divergent DURABLE tape generation
+        recv_ts=900,
+        owned=_owned(as_of_ts=1_000),  # owned.market_status_epoch=1 → observation generation
+        identity=_ID_A,
+        build=build,
+    )
+    rec = LiveRecorder(tmp_path, _start_meta())
+    with pytest.raises(ValueError, match="source_epoch"):
+        run_cadence(rec, [tick], guard_enabled=False)
+    rec.close()
+
+    assert _mint_events_on_tape(tmp_path) == []
+    assert read_durable_source_generations(tmp_path).market_status_epoch is None
+
+
+def test_restart_recovered_generation_equals_consumed(tmp_path):
+    """The generation a restart recovers EQUALS the generation the observation stream consumed —
+    the tape and the observation are bound to ONE authority per source (Codex C-MAJOR-1 closure).
+
+    Non-vacuous: the book generation is held at 7 (not the default 1), and the durable-max read back
+    from the tape matches the observation's authenticated ``book_source_epoch`` exactly."""
+
+    def build(observation_sequence: int, guard_fv: GuardFairValue | None) -> StrategyObservation:
+        return _observation(
+            observation_sequence=observation_sequence,
+            guard_fv=guard_fv,
+            book_source_epoch=7,
+            as_of_ts=1_000,
+        )
+
+    owned = AssemblerOwnedFacts(
+        book_source_epoch=7,  # the SAME generation persisted on the tape below
+        market_status="ACTIVE",
+        market_status_recv_ts=990,
+        market_status_epoch=1,
+        phase=1,
+        suspended=False,
+        match_state_recv_ts=990,
+    )
+    tick = ObservationTick(
+        source="book",
+        source_epoch=7,  # tape generation == observation generation (one authority)
+        recv_ts=900,
+        owned=owned,
+        identity=_ID_A,
+        build=build,
+    )
+    rec = LiveRecorder(tmp_path, _start_meta())
+    run = run_cadence(rec, [tick], guard_enabled=False)
+    rec.close()
+
+    consumed = run.observations[0].book_source_epoch
+    recovered = read_durable_source_generations(tmp_path).book_source_epoch
+    assert consumed == 7
+    assert recovered == consumed  # restart trusts the SAME generation the stream consumed
