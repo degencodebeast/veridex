@@ -39,7 +39,7 @@ def rolling_median(samples: tuple[float, ...]) -> float:
     a lower/upper median) — the SAME semantics every rolling median in the spec uses, so the
     basis and the REQ-080 venue references can never diverge at a config hash.
     """
-    return statistics.median(samples)
+    return float(statistics.median(samples))
 
 
 def halflife_ewma(prev: float, value: float, dt_ms: float, halflife_ms: float) -> float:
@@ -51,7 +51,7 @@ def halflife_ewma(prev: float, value: float, dt_ms: float, halflife_ms: float) -
     same-clock resample) retains full weight on ``prev`` and leaves the estimate unchanged.
     """
     decay = 0.5 ** (dt_ms / halflife_ms)
-    return decay * prev + (1.0 - decay) * value
+    return float(decay * prev + (1.0 - decay) * value)
 
 
 def basis(raw_gaps: tuple[BasisSample, ...], config: StrategyConfig) -> float:
