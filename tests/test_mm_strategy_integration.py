@@ -236,6 +236,9 @@ def _drive_whole_lane(
                 observation=observation,
                 config=adapter_config,
                 admitted=admitted,
+                # Single TIF authority (Gate #4 F-MINOR-2): the declared request tif is cross-checked
+                # against THIS pinned, hash-bound StrategyConfig.tif — the run's own config.
+                strategy_config=config,
             )
         )
 

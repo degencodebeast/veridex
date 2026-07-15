@@ -29,6 +29,7 @@ from veridex.dust_execution.facade import (
 )
 from veridex.dust_execution.manifest import StrategyExperimentManifest
 from veridex.dust_execution.runner import _build_resting_order
+from veridex.mm_strategy.config import StrategyConfig
 from veridex.mm_strategy.contracts import (
     InventoryProjection,
     NeutralIntent,
@@ -125,6 +126,7 @@ def _run_reviewed_plan(
     facade: _RecordingFakeFacade,
     config: R4ARequestConfig | None = None,
     admitted: AdmittedPins | None = None,
+    strategy_config: StrategyConfig | None = None,
 ) -> PlanExecutionResult:
     """Build the reviewed (observation, decision) pair for ``legs`` and drive the UNIFIED
     build→execute path (Gate #4 C-CRITICAL-1): ``execute_plan`` builds each actionable leg's bound
@@ -137,6 +139,9 @@ def _run_reviewed_plan(
         observation=observation,
         config=config if config is not None else _pinned_config(),
         admitted=admitted if admitted is not None else _admitted_pins(),
+        strategy_config=(
+            strategy_config if strategy_config is not None else _pinned_strategy_config()
+        ),
     )
 
 
@@ -362,6 +367,14 @@ def _pinned_config() -> R4ARequestConfig:
         fixed_fraction=0.001,
         tif="GTC",
     )
+
+
+def _pinned_strategy_config(*, tif: str = "GTC") -> StrategyConfig:
+    """The pinned, hash-bound ``StrategyConfig`` whose ``tif`` is the SINGLE time-in-force authority
+    (Gate #4 F-MINOR-2 / REQ-056). ``execute_plan`` cross-checks the DECLARED ``R4ARequestConfig.tif``
+    against THIS pinned tif — the wire tif must be the hash-bound maker tif, never a divergent
+    request-config value. Defaults to ``GTC`` so it matches ``_pinned_config()``'s pinned tif."""
+    return StrategyConfig(guard_enabled=False, tif=tif)  # type: ignore[arg-type]
 
 
 # The reviewed token identity — in production this is the decision's
@@ -815,7 +828,12 @@ def test_facade_receives_typed_request_not_raw_intent() -> None:
 
     facade = _StrictRequestFacade(result=_result())  # clean ABSTAINED — non-freezing, both legs fire
     result = execute_plan(
-        decision, facade, observation=observation, config=config, admitted=admitted
+        decision,
+        facade,
+        observation=observation,
+        config=config,
+        admitted=admitted,
+        strategy_config=_pinned_strategy_config(),
     )
 
     # Both actionable legs reached the facade as TYPED requests (no TypeError = not a raw intent).
@@ -875,7 +893,14 @@ def test_declared_pin_cannot_self_select_admitted_pin() -> None:
     # Whole unified path: no request is built, so no facade call is ever issued (fail closed).
     facade = _RecordingFakeFacade(results=[_result()])
     with pytest.raises(ValueError):
-        execute_plan(decision, facade, observation=observation, config=evil, admitted=admitted)
+        execute_plan(
+            decision,
+            facade,
+            observation=observation,
+            config=evil,
+            admitted=admitted,
+            strategy_config=_pinned_strategy_config(),
+        )
     assert facade.call_count == 0
 
     # Corrected-not-weakened: the HONEST path (the pinned strategy declaring the REVIEWED pins) still
@@ -899,6 +924,60 @@ def test_declared_pin_cannot_self_select_admitted_pin() -> None:
     )
     assert smuggled.mode == "live_guarded"  # self-feed accepts it — exactly the bug independence removes
     assert self_fed != admitted
+
+
+def test_request_tif_must_equal_pinned_strategy_tif() -> None:
+    """Gate #4 F-MINOR-2 / REQ-056: the TIF that reaches the wire has ONE authority — the pinned,
+    hash-bound ``StrategyConfig.tif`` (covered by ``strategy_config_hash``). ``execute_plan``
+    cross-checks the DECLARED ``R4ARequestConfig.tif`` against that pinned tif and FAILS CLOSED on a
+    disagreement — no request built, no facade call — so the applied tif can never silently diverge
+    from the tif the identity hash commits to (mirrors the declared-vs-admitted pin cross-check).
+
+    Before the fix ``StrategyConfig.tif`` was hash-bound but read NOWHERE while the adapter applied its
+    OWN unhashed ``R4ARequestConfig.tif`` — so changing the hashed knob moved the identity hash but
+    changed no wire behavior, and the tif that DID reach the wire was uncommitted (F-MINOR-2)."""
+    pinned = _pinned_strategy_config(tif="GTC")  # the SINGLE hash-bound tif authority
+    leg = _fresh_write("A", leg_role="bid", price=0.49)
+    observation, decision = _reviewed_pair(leg)
+
+    # A request config whose tif DISAGREES with the pinned, hash-bound strategy tif (GTD ≠ GTC).
+    drifted = R4ARequestConfig(
+        strategy_id="mm-dust",
+        strategy_config_hash="cfg-hash",
+        policy_hash="policy-hash",
+        session_id="sess-1",
+        manifest_hash="manifest-hash",
+        mode="dry_run",
+        wallet_equity_at_decision=1000.0,
+        fixed_fraction=0.001,
+        tif="GTD",
+    )
+    facade = _RecordingFakeFacade(results=[_result()])
+    with pytest.raises(ValueError):
+        execute_plan(
+            decision,
+            facade,
+            observation=observation,
+            config=drifted,
+            admitted=_admitted_pins(),
+            strategy_config=pinned,
+        )
+    # Fail closed BEFORE any facade call — no order, no wire tif divergence.
+    assert facade.call_count == 0
+
+    # Corrected-not-weakened: when the declared request tif EQUALS the pinned tif, the honest path
+    # builds and the built request emits EXACTLY the pinned, hash-bound tif on the wire.
+    ok_facade = _RecordingFakeFacade(results=[_result()])
+    execute_plan(
+        decision,
+        ok_facade,
+        observation=observation,
+        config=_pinned_config(),  # tif == "GTC" == pinned.tif
+        admitted=_admitted_pins(),
+        strategy_config=pinned,
+    )
+    assert ok_facade.call_count == 1
+    assert ok_facade.calls[0].intent_params.tif == pinned.tif == "GTC"
 
 
 def test_freeze_preserved_around_request_level_call() -> None:

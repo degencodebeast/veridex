@@ -82,7 +82,13 @@ class StrategyConfig(BaseModel):
     # REQUIRED, NO default: guarded-vs-unguarded is always an explicit choice.
     guard_enabled: bool
     restart_policy: Literal["fail_closed", "fail_open"] = "fail_closed"
-    tif: Literal["GTC", "GTD", "IOC", "FOK"] = "GTC"
+    # The SINGLE, hash-bound time-in-force authority (REQ-056, Gate #4 F-MINOR-2). TIF is a
+    # config-pinned choice from R4-A's ACCEPTED MAKER SET — a resting maker quote is never a
+    # taker (FAK/FOK), so the admissible set is exactly ``{GTC, GTD}``. The adapter's
+    # ``execute_plan`` cross-checks the declared ``R4ARequestConfig.tif`` against THIS pinned value
+    # and fails closed on a mismatch, so the tif that reaches the wire is exactly the one bound into
+    # ``config_hash`` (no silent divergence between the hashed knob and the applied wire tif).
+    tif: Literal["GTC", "GTD"] = "GTC"
     # Mono-valued by design: the ONLY anchor is the venue mid (REQ-051 — no microprice/smoothed).
     anchor_mode: Literal["mid"] = "mid"
 

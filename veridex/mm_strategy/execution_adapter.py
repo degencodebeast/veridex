@@ -45,6 +45,7 @@ from veridex.dust_execution.facade import (
     MMExecutionToolResult,
     MMIntentParams,
 )
+from veridex.mm_strategy.config import StrategyConfig
 from veridex.mm_strategy.contracts import (
     NeutralIntent,
     NeutralIntentKind,
@@ -200,9 +201,10 @@ def execute_plan(
     observation: StrategyObservation,
     config: R4ARequestConfig,
     admitted: AdmittedPins,
+    strategy_config: StrategyConfig,
 ) -> PlanExecutionResult:
     """Build+fire each actionable leg's BOUND typed request IN ORDER, freezing on the first uncertain
-    outcome (REQ-093/094; Gate #4 C-CRITICAL-1).
+    outcome (REQ-093/094; Gate #4 C-CRITICAL-1/F-MINOR-2).
 
     UNIFIED build→execute: for EACH actionable leg of the reviewed ``decision.intent_plan`` this
     :func:`build_r4a_request`s the singular typed :class:`MMExecutionToolRequest` — deriving the target
@@ -219,12 +221,34 @@ def execute_plan(
     path is REACHED, not bypassed, so the book is never early-returned as flat. The adapter adds NO leg
     of its own; a mismatched declared/admitted pin FAILS CLOSED (``build_r4a_request`` raises) BEFORE any
     facade call, so a rebound intent never reaches the wire.
+
+    Single TIF authority (Gate #4 F-MINOR-2 / REQ-056): the DECLARED ``config.tif`` (the value the
+    adapter binds onto every resting maker quote) is cross-checked against the pinned, hash-bound
+    ``strategy_config.tif`` — the sole knob ``config_hash`` → ``strategy_config_hash`` commits to — and
+    FAILS CLOSED on a disagreement (raise, no facade call), so the wire tif is EXACTLY the maker tif the
+    identity hash reflects, never a divergent request-config value (mirrors the declared-vs-admitted
+    pin check; "authenticate, don't accept").
     """
     # Defense in depth (Gate#3 IMPORTANT-1 / RED-48): a mixed cancel/placement plan is already
     # unconstructable at ``StrategyDecision``; re-assert it here (byte-identity-safe for any valid
     # single-phase decision) so a mixed plan never places a fresh write ahead of a reconciled
     # projection confirming the cancel (REQ-090/094).
     reject_mixed_phase_plan(decision.intent_plan, context="execute_plan")
+
+    # Single time-in-force authority (Gate #4 F-MINOR-2 / REQ-056). The DECLARED ``config.tif`` (bound
+    # onto every resting quote) MUST equal the pinned, hash-bound ``strategy_config.tif`` — the only
+    # knob ``strategy_config_hash`` actually commits to. A mismatch means the applied wire tif has
+    # DRIFTED from the hashed identity, so fail closed BEFORE any request is built (no order, no facade
+    # call), never silently apply a divergent tif (mirrors the declared-vs-admitted pin cross-check).
+    if config.tif != strategy_config.tif:
+        raise ValueError(
+            "execute_plan: declared R4ARequestConfig.tif "
+            f"({config.tif!r}) does not match the pinned, hash-bound StrategyConfig.tif "
+            f"({strategy_config.tif!r}) — the wire time-in-force must be the SINGLE hash-bound maker "
+            "authority (covered by strategy_config_hash), never a divergent request-config value "
+            "(Gate #4 F-MINOR-2 / REQ-056: TIF is a config-pinned choice from R4-A's accepted maker "
+            "set {GTC, GTD})"
+        )
 
     outcomes: list[LegOutcome] = []
     frozen = False

@@ -127,7 +127,9 @@ _PERTURBATIONS: dict[str, object] = {
     "rolling_depth_window": 121,
     "guard_enabled": False,
     "restart_policy": "fail_open",
-    "tif": "IOC",
+    # TIF is constrained to R4-A's accepted MAKER set {GTC, GTD} (REQ-056, Gate #4 F-MINOR-2) —
+    # ``GTD`` is the non-default maker alternate that moves the hash (never a taker IOC/FOK).
+    "tif": "GTD",
     "fee_bps": 101.0,
 }
 
@@ -165,6 +167,21 @@ def test_anchor_mode_is_mono_valued_mid() -> None:
     assert _base_config().anchor_mode == "mid"
     with pytest.raises(ValidationError):
         StrategyConfig(guard_enabled=True, anchor_mode="microprice")
+
+
+@pytest.mark.parametrize("maker_tif", ["GTC", "GTD"])
+def test_tif_accepts_only_maker_set(maker_tif: str) -> None:
+    # REQ-056 / Gate #4 F-MINOR-2: TIF is a config-pinned choice from R4-A's accepted MAKER set —
+    # a resting maker quote is never a taker, so exactly {GTC, GTD} construct.
+    assert StrategyConfig(guard_enabled=True, tif=maker_tif).tif == maker_tif  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("taker_tif", ["IOC", "FOK", "FAK"])
+def test_tif_rejects_taker_forms(taker_tif: str) -> None:
+    # The maker never rests a taker TIF; IOC/FOK/FAK are rejected at construction so the single,
+    # hash-bound tif authority can only ever be a valid maker tif (Gate #4 F-MINOR-2).
+    with pytest.raises(ValidationError):
+        StrategyConfig(guard_enabled=True, tif=taker_tif)  # type: ignore[arg-type]
 
 
 def test_guard_enabled_has_no_default() -> None:
