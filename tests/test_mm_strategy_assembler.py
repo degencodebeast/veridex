@@ -156,7 +156,7 @@ def test_absent_status_rows_yield_unknown_never_synthesized_active(tmp_path):
     mint(rec, _mint_event(source="book", source_epoch=0, recv_ts=4_000))  # book only, no status
     rec.close()
 
-    status = latest_market_status(absent)
+    status = latest_market_status(absent, "0xcond")
     assert status.status == "UNKNOWN"
     assert status.recv_ts is None and status.epoch is None
 
@@ -171,9 +171,53 @@ def test_absent_status_rows_yield_unknown_never_synthesized_active(tmp_path):
     )
     rec2.close()
 
-    active = latest_market_status(present)
+    active = latest_market_status(present, "0xcond")
     assert active.status == "ACTIVE"
     assert active.recv_ts == 4_100 and active.epoch == 7
+
+
+def test_replay_status_bound_to_requested_market(tmp_path):
+    """Gate #2 MAJOR-3 (REPLAY): the status read must be BOUND to the requested market, not global.
+
+    ``latest_market_status`` must return the latest durable row FOR THE REQUESTED
+    ``venue_market_ref`` — never the globally-latest row. Tape: ``A=CLOSED`` (earlier) then
+    ``B=ACTIVE`` (later, higher global ``sequence_no``). A query for A must return A's CLOSED, NOT
+    B's globally-latest ACTIVE. A market with no row on the tape yields typed UNKNOWN (fail closed),
+    never another market's row — a foreign ACTIVE can never be applied to A.
+    """
+    session = tmp_path / "two_markets"
+    rec = LiveRecorder(session, _start_meta())
+    record_market_status(
+        rec,
+        MarketStatusEvent(
+            venue_market_ref="0xA", status="CLOSED", recv_ts=5_000, epoch=1
+        ),
+    )
+    record_market_status(
+        rec,
+        MarketStatusEvent(
+            venue_market_ref="0xB", status="ACTIVE", recv_ts=5_100, epoch=1
+        ),
+    )
+    rec.close()
+
+    # A-query returns A's OWN CLOSED row, not B's globally-latest ACTIVE.
+    a_status = latest_market_status(session, "0xA")
+    assert a_status.venue_market_ref == "0xA"
+    assert a_status.status == "CLOSED"
+    assert a_status.recv_ts == 5_000 and a_status.epoch == 1
+
+    # B-query returns B's ACTIVE (non-vacuous: the market filter selects the right stream).
+    b_status = latest_market_status(session, "0xB")
+    assert b_status.venue_market_ref == "0xB"
+    assert b_status.status == "ACTIVE"
+    assert b_status.recv_ts == 5_100 and b_status.epoch == 1
+
+    # A market with NO row on the tape → typed UNKNOWN for THAT market, never a foreign row.
+    missing = latest_market_status(session, "0xC")
+    assert missing.status == "UNKNOWN"
+    assert missing.recv_ts is None and missing.epoch is None
+    assert missing.venue_market_ref == "0xC"
 
 
 # --- E3-T3: pair-aware FV cache sampling at the sealed global mint boundary -----------------

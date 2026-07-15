@@ -426,21 +426,33 @@ def resume_source_generations(
     )
 
 
-def latest_market_status(session_dir: str | Path) -> MarketStatusEvent:
-    """The latest durable market status — ``UNKNOWN`` (fail closed) when no status row exists.
+def latest_market_status(
+    session_dir: str | Path, venue_market_ref: str
+) -> MarketStatusEvent:
+    """The latest durable market status FOR *venue_market_ref* — ``UNKNOWN`` when none exists.
 
-    Scans the strict R4-B tape for ``MarketStatusEvent`` rows and returns the one with the greatest
-    global ``sequence_no`` as a typed :class:`MarketStatusEvent`. A tape WITHOUT any status row
-    yields ``MarketStatusEvent(status="UNKNOWN", recv_ts=None, epoch=None)`` — the harness never
-    silently synthesizes ``ACTIVE`` (REQ-027 / AC-053).
+    **Market-identity binding (trust-critical, REQ-027, Gate #2 MAJOR-3).** The read is BOUND to the
+    requested market: only ``MarketStatusEvent`` rows whose ``venue_market_ref`` equals
+    *venue_market_ref* are eligible, and the one with the greatest global ``sequence_no`` AMONG THOSE
+    is returned. A tape carrying ``A=CLOSED`` then ``B=ACTIVE`` therefore returns A's CLOSED for an
+    A-query — never B's globally-latest ACTIVE. A market with NO row on the tape yields
+    ``MarketStatusEvent(venue_market_ref=venue_market_ref, status="UNKNOWN", recv_ts=None,
+    epoch=None)`` (fail closed) — the harness never returns a foreign market's row nor silently
+    synthesizes ``ACTIVE`` (REQ-027 / AC-053).
     """
     _, events, _ = read_session_strict(session_dir)
     status_rows = [
-        row for row in events if row.get("event_type") == _MARKET_STATUS_EVENT_TYPE
+        row
+        for row in events
+        if row.get("event_type") == _MARKET_STATUS_EVENT_TYPE
+        and row.get("venue_market_ref") == venue_market_ref
     ]
     if not status_rows:
         return MarketStatusEvent(
-            venue_market_ref="", status="UNKNOWN", recv_ts=None, epoch=None
+            venue_market_ref=venue_market_ref,
+            status="UNKNOWN",
+            recv_ts=None,
+            epoch=None,
         )
     latest = max(status_rows, key=lambda row: row["sequence_no"])
     return MarketStatusEvent(

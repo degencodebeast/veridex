@@ -120,8 +120,17 @@ class GammaMarketStatusAuthority:
 
         A definite status (``ACTIVE``/``HALTED``/``CLOSED``) carries a non-None ``recv_ts`` (the
         read clock) and ``epoch`` (the authority generation). Any failure — the fetch raising, a
-        non-mapping result, or a missing/malformed ``active``/``closed`` flag — maps to
-        ``("UNKNOWN", None, None)`` (fail closed; the ``None`` sentinels iff ``UNKNOWN``).
+        non-mapping result, a missing/malformed ``active``/``closed`` flag, or an IDENTITY MISMATCH
+        (the returned object describes a different market) — maps to ``("UNKNOWN", None, None)``
+        (fail closed; the ``None`` sentinels iff ``UNKNOWN``).
+
+        **Market-identity binding (trust-critical, REQ-027, Gate #2 MAJOR-3).** The response is
+        BOUND to the request: the returned Gamma object's ``conditionId`` (the SAME on-chain identity
+        the resolver's :func:`_parse_gamma_market` keys on) must EQUAL *venue_market_ref* before any
+        flag is trusted. A fetch for ``0xEXPECTED`` returning ``{conditionId: 0xFOREIGN, active,
+        ¬closed}`` is a FOREIGN market's status and fails closed to ``UNKNOWN`` — a stale/misrouted
+        fetch can never let another market's ACTIVE authorize placement into this one. A missing or
+        non-string ``conditionId`` is equally unprovable and also fails closed.
         """
         try:
             market = self._fetch(venue_market_ref)
@@ -130,8 +139,16 @@ class GammaMarketStatusAuthority:
                     f"Gamma fetch for venue_market_ref={venue_market_ref!r} returned a "
                     f"non-mapping result: {type(market).__name__}"
                 )
+            returned_ref = market.get("conditionId")
+            if not isinstance(returned_ref, str) or returned_ref != venue_market_ref:
+                raise _GammaStatusUnavailable(
+                    f"Gamma market identity mismatch: requested "
+                    f"venue_market_ref={venue_market_ref!r} but returned "
+                    f"conditionId={returned_ref!r} (foreign/unidentifiable market)"
+                )
             status = status_from_gamma_market(market)
         except Exception:
-            # Fail closed: ANY fetch/parse failure is UNKNOWN, never a fabricated definite status.
+            # Fail closed: ANY fetch/parse/identity failure is UNKNOWN, never a fabricated definite
+            # status and never a foreign market's status.
             return ("UNKNOWN", None, None)
         return (status, int(self._clock()), self._epoch)

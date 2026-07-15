@@ -61,7 +61,8 @@ def test_gamma_active_closed_maps_total_and_disjoint() -> None:
         (False, False): "HALTED",
     }
     for (active, closed), expected in cases.items():
-        metadata = {"active": active, "closed": closed, "conditionId": "0xabc"}
+        # conditionId EQUALS the requested ref: the honest same-market case (identity binds).
+        metadata = {"active": active, "closed": closed, "conditionId": "ref"}
         authority = _authority({"ref": metadata}, epoch=7, recv_ts=1000)
 
         status, recv_ts, epoch = authority.read("ref")
@@ -95,6 +96,36 @@ def test_read_failure_is_unknown_with_none_sentinels() -> None:
     # (d) a non-mapping fetch result (e.g. an empty list) is malformed, not a market object.
     non_mapping = _authority({"ref": []}, epoch=7)
     assert non_mapping.read("ref") == ("UNKNOWN", None, None)
+
+
+def test_live_foreign_conditionid_is_unknown() -> None:
+    # Gate #2 MAJOR-3 (LIVE): the authority must BIND the response identity to the requested
+    # reference. A fetch for 0xEXPECTED returning a HEALTHY, otherwise-ACTIVE market whose OWN
+    # identity is 0xFOREIGN (conditionId=0xFOREIGN, active ∧ ¬closed) must NOT be accepted as this
+    # market's status — the returned object describes a DIFFERENT market. Unbound, this yields a
+    # foreign market's ACTIVE; bound, an identity mismatch fails closed to (UNKNOWN, None, None).
+    foreign = _authority(
+        {"0xEXPECTED": {"active": True, "closed": False, "conditionId": "0xFOREIGN"}},
+        epoch=7,
+        recv_ts=1000,
+    )
+    assert foreign.read("0xEXPECTED") == ("UNKNOWN", None, None)
+
+    # A missing conditionId cannot be proven to match the request either → UNKNOWN (fail closed),
+    # never a definite status inferred from an unidentifiable object.
+    no_identity = _authority(
+        {"0xEXPECTED": {"active": True, "closed": False}}, epoch=7, recv_ts=1000
+    )
+    assert no_identity.read("0xEXPECTED") == ("UNKNOWN", None, None)
+
+    # The honest same-market case is UNCHANGED: a fetch whose conditionId EQUALS the requested ref
+    # reads its definite status back with the non-None sentinels.
+    same_market = _authority(
+        {"0xEXPECTED": {"active": True, "closed": False, "conditionId": "0xEXPECTED"}},
+        epoch=7,
+        recv_ts=1000,
+    )
+    assert same_market.read("0xEXPECTED") == ("ACTIVE", 1000, 7)
 
 
 def test_module_imports_no_write_or_signer() -> None:
