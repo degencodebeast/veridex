@@ -49,6 +49,11 @@ from veridex.mm_strategy.assembler import (
 )
 from veridex.mm_strategy.config import StrategyConfig
 from veridex.mm_strategy.contracts import (
+    CALIBRATION_LABEL,
+    EDGE_LABEL,
+    EVIDENCE_CLASS,
+    RUN_LABEL,
+    STRATEGY_REVISION,
     GuardFairValue,
     InventoryProjection,
     ReasonCode,
@@ -68,6 +73,7 @@ __all__ = [
     "OBSERVED_MARKET_PRINT",
     "OWN_RECONCILED_FILL",
     "PERMITTED_CONCLUSION_SHAPE",
+    "PROMOTED_EVIDENCE_CLASSES",
     "SIX_METRIC_KEYS",
     "TRIGGER_REASON_CODES",
     "AblationConclusion",
@@ -81,6 +87,7 @@ __all__ = [
     "MatchedOpportunityReport",
     "ObservedMarketPrint",
     "ReplayResult",
+    "RunReceipt",
     "ablation_conclusion",
     "arm_configs",
     "arm_single_metrics",
@@ -90,6 +97,7 @@ __all__ = [
     "load_base_config_overrides",
     "load_tape",
     "matched_opportunity_report",
+    "mint_run_receipt",
     "neutralize_guard",
     "print_derived_trigger",
     "replay_arm",
@@ -975,3 +983,120 @@ def reviewed_reach_baseline(baseline: str) -> str:
             "or a price/book (p/b) reach is not a reviewed null and cannot assert edge"
         )
     return baseline
+
+
+# --- E6-T6: run-receipt labels/hashes + relabel-fails-closed + historical reproduction --------
+# REQ-116 (run-receipt provenance + labels) / REQ-043(H42) (evidence-class gating: Gate-B OPEN/STALE ⇒
+# EXPERIMENTAL_DUST) / AC-029 / AC-030. A run receipt is the honest provenance packet one replayed arm
+# emits: it PINS the full id/hash chain (strategy identity, ``config_hash``, per-observation hashes, the
+# linked state-hash chain, the per-decision ids, the canonical decisions digest) plus the Gate-B evidence
+# revision consumed and the four mandatory honesty labels. Two trust seams are STRUCTURAL here:
+#   (1) the evidence class is PINNED to EXPERIMENTAL_DUST — R4-B proves SAFETY, not alpha, so there is NO
+#       code path that promotes it to EVIDENCE_GATED / PROMOTED (promotion is a Gate B concern, out of
+#       R4-B scope). Under Gate-B OPEN/STALE an untrusted request-metadata relabel (asking for PROMOTED /
+#       EVIDENCE_GATED) has ZERO effect — the receipt FAILS CLOSED and stays EXPERIMENTAL_DUST;
+#   (2) the receipt pins the ORIGINAL ``config_hash``, so a later config revision (a new ``config_hash``)
+#       never rewrites history: the historical tape replays byte-identically under its originally-pinned
+#       config. The four labels are the pinned production honesty constants VERBATIM (imported, not
+#       re-declared), so the receipt can never drift from the pinned run labels.
+# TEST-SIDE, no ranked/research/maker import (``forbidden_import_hits`` still holds — nothing here imports
+# a ranked lane; the labels come from the pure ``veridex.mm_strategy.contracts`` honesty surface).
+
+# The two promotion evidence classes an R4-B receipt can NEVER wear (REQ-043(H42)/AC-029). Promotion is a
+# Gate B concern out of R4-B scope; naming them lets a test assert the fail-closed pin refuses them.
+PROMOTED_EVIDENCE_CLASSES = frozenset({"EVIDENCE_GATED", "PROMOTED"})
+
+
+@dataclass(frozen=True)
+class RunReceipt:
+    """The provenance packet one replayed arm emits — the pinned id/hash chain + honesty labels (REQ-116).
+
+    Pins the strategy identity (``strategy_id`` / ``strategy_revision``), the ``config_hash`` the run
+    executed under, every per-observation hash, the linked ``state_hash_chain`` (the folded prior→next
+    state-hash lineage) + its ``terminal_state_hash``, the per-decision ``decision_ids``, the canonical
+    ``decisions_digest``, and the Gate-B status + evidence revision consumed. ``evidence_class`` is PINNED
+    to :data:`EVIDENCE_CLASS` (``EXPERIMENTAL_DUST``; REQ-043(H42)); the four honesty labels are the pinned
+    production constants verbatim. Frozen + tuple-valued, so two receipts minted from the SAME replay
+    under the SAME pinned config compare byte-identically (AC-030).
+    """
+
+    strategy_id: str
+    strategy_revision: str
+    config_hash: str
+    observation_hashes: tuple[str, ...]
+    decision_ids: tuple[str, ...]
+    state_hash_chain: tuple[str, ...]
+    terminal_state_hash: str
+    decisions_digest: str
+    gate_b_status: str
+    gate_b_evidence_revision: str
+    evidence_class: str
+    run_label: str
+    calibration_label: str
+    edge_label: str
+
+    def labels(self) -> dict[str, str]:
+        """The four mandatory honesty labels as ONE mapping (REQ-116) — evidence class pinned to dust."""
+        return {
+            "evidence_class": self.evidence_class,
+            "run_label": self.run_label,
+            "calibration_label": self.calibration_label,
+            "edge_label": self.edge_label,
+        }
+
+
+def _state_hash_chain(result: ReplayResult) -> tuple[str, ...]:
+    """The folded prior→next state-hash lineage of an arm's decision stream (the linked chain; REQ-116).
+
+    ``(decisions[0].prior_state_hash, decisions[0].next_state_hash, decisions[1].next_state_hash, …)`` —
+    each decision's ``prior_state_hash`` equals the previous decision's ``next_state_hash`` by
+    construction of the fold, so the tuple is the linked state-hash chain the receipt pins; the last
+    element is the terminal ``state_hash``. Empty when the stream is empty.
+    """
+    decisions = result.decisions
+    if not decisions:
+        return ()
+    chain = [decisions[0].prior_state_hash]
+    chain.extend(d.next_state_hash for d in decisions)
+    return tuple(chain)
+
+
+def mint_run_receipt(
+    result: ReplayResult,
+    config: StrategyConfig,
+    *,
+    gate_b_status: str,
+    gate_b_evidence_revision: str,
+    requested_evidence_class: str | None = None,
+) -> RunReceipt:
+    """Mint the pinned provenance receipt for one replayed arm (REQ-116/043(H42)/AC-029/AC-030).
+
+    Every field is a pure function of the already-replayed ``result`` + the run's pinned ``config`` + the
+    Gate-B evidence revision consumed, so re-minting from the same replay under the same pinned config
+    reproduces the receipt byte-identically (AC-030). ``requested_evidence_class`` is UNTRUSTED request
+    metadata: the evidence class is PINNED to :data:`EVIDENCE_CLASS` (``EXPERIMENTAL_DUST``) and the
+    request has ZERO effect — R4-B has no promotion path, so under Gate-B OPEN/STALE an asked-for
+    ``PROMOTED`` / ``EVIDENCE_GATED`` relabel FAILS CLOSED (AC-029). The four honesty labels are the pinned
+    production constants verbatim (no re-declaration → no drift). The RED-29 mutation honors
+    ``requested_evidence_class`` here, routing the relabel through so ``evidence_class`` becomes the
+    promotion class and ``test_gate_b_open_metadata_relabel_stays_experimental_dust`` goes red.
+    """
+    # PINNED — the requested relabel is untrusted request metadata with ZERO effect (AC-029). There is no
+    # branch that assigns a promotion class: promotion is a Gate B concern, out of R4-B scope.
+    evidence_class = EVIDENCE_CLASS
+    return RunReceipt(
+        strategy_id=config.strategy_id,
+        strategy_revision=STRATEGY_REVISION,
+        config_hash=config.config_hash(),
+        observation_hashes=result.observation_hashes,
+        decision_ids=tuple(d.decision_id for d in result.decisions),
+        state_hash_chain=_state_hash_chain(result),
+        terminal_state_hash=result.state_hash,
+        decisions_digest=result.decisions_digest,
+        gate_b_status=gate_b_status,
+        gate_b_evidence_revision=gate_b_evidence_revision,
+        evidence_class=evidence_class,
+        run_label=RUN_LABEL,
+        calibration_label=CALIBRATION_LABEL,
+        edge_label=EDGE_LABEL,
+    )

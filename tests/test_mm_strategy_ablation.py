@@ -21,8 +21,10 @@ second copy of the policy.
 
 from __future__ import annotations
 
+import ast
 import json
 import time
+from pathlib import Path
 
 import pytest
 
@@ -35,6 +37,7 @@ from tests.mm_strategy_ablation_harness import (
     OBSERVED_MARKET_PRINT,
     OWN_RECONCILED_FILL,
     PERMITTED_CONCLUSION_SHAPE,
+    PROMOTED_EVIDENCE_CLASSES,
     SIX_METRIC_KEYS,
     TRIGGER_REASON_CODES,
     AblationConclusion,
@@ -43,6 +46,7 @@ from tests.mm_strategy_ablation_harness import (
     ForbiddenReachNullError,
     MarkoutReferenceError,
     ObservedMarketPrint,
+    RunReceipt,
     ablation_conclusion,
     arm_configs,
     arm_single_metrics,
@@ -52,6 +56,7 @@ from tests.mm_strategy_ablation_harness import (
     load_base_config_overrides,
     load_tape,
     matched_opportunity_report,
+    mint_run_receipt,
     neutralize_guard,
     print_derived_trigger,
     replay_arm,
@@ -706,3 +711,148 @@ def test_reach_baseline_rejects_forbidden_universal_null() -> None:
         assert not any(token in field_name for token in private_tokens), field_name
     for field_name in CounterfactualCapacityCeiling.__dataclass_fields__:
         assert not any(token in field_name for token in private_tokens), field_name
+
+
+# --- E6-T6: run-receipt labels/hashes + relabel-fails-closed + historical reproduction -------
+# REQ-116 (run-receipt provenance + labels), REQ-043(H42) (evidence-class gating: Gate-B OPEN/STALE ⇒
+# EXPERIMENTAL_DUST), AC-029 / AC-030 / RED-29 / RED-31. Three seams: (1) a request-metadata relabel to a
+# promotion class fails closed — the receipt stays EXPERIMENTAL_DUST; (2) a later config revision gets a
+# new config_hash but historical decisions reproduce byte-identically under their originally-pinned
+# config; (3) no ``veridex.research`` import anywhere in the harness/receipt or test source (AST scan).
+
+# The four mandatory honesty labels a dust run receipt PINS (REQ-116) — reused verbatim from the pinned
+# production honesty surface (``veridex.mm_strategy.contracts``), asserted here so a receipt can never
+# silently drift from them.
+_EXPECTED_RECEIPT_LABELS = {
+    "evidence_class": "EXPERIMENTAL_DUST",
+    "run_label": "DUST_LIVE",
+    "calibration_label": "UNCALIBRATED",
+    "edge_label": "NOT_PROVEN_EDGE",
+}
+
+
+@pytest.mark.parametrize("gate_b_status", ["OPEN", "STALE"])
+@pytest.mark.parametrize("requested", ["PROMOTED", "EVIDENCE_GATED"])
+def test_gate_b_open_metadata_relabel_stays_experimental_dust(
+    tmp_path, gate_b_status: str, requested: str
+) -> None:
+    """A request-metadata relabel to a promotion class FAILS CLOSED under Gate-B OPEN/STALE (AC-029/RED-29).
+
+    R4-B proves SAFETY, not alpha: there is NO code path that promotes the evidence class, so under a
+    Gate-B status of OPEN or STALE an untrusted request asking to relabel the run ``PROMOTED`` /
+    ``EVIDENCE_GATED`` has ZERO effect — the minted receipt stays ``EXPERIMENTAL_DUST`` and carries the
+    full pinned provenance (strategy id/revision, config hash, per-observation hashes, the linked
+    state-hash chain, decision ids, Gate-B evidence revision consumed) + the four honesty labels. The
+    RED-29 mutation honors ``requested_evidence_class`` inside ``mint_run_receipt``, routing the relabel
+    through so ``evidence_class`` becomes the requested promotion class and this test goes red.
+    """
+    # the two promotion classes an R4-B receipt can never wear are pinned by name (REQ-043(H42)).
+    assert frozenset({"PROMOTED", "EVIDENCE_GATED"}) == PROMOTED_EVIDENCE_CLASSES
+    assert requested in PROMOTED_EVIDENCE_CLASSES
+
+    tape = load_tape("healthy")
+    config = arm_configs(load_base_config_overrides()).guarded
+    result = replay_arm(tape, config, tmp_path / "arm")
+
+    receipt = mint_run_receipt(
+        result,
+        config,
+        gate_b_status=gate_b_status,
+        gate_b_evidence_revision="gate-b-rev-1",
+        requested_evidence_class=requested,
+    )
+
+    # fail closed: the relabel does NOT take effect — the evidence class stays EXPERIMENTAL_DUST.
+    assert isinstance(receipt, RunReceipt)
+    assert receipt.evidence_class == "EXPERIMENTAL_DUST"
+    assert receipt.evidence_class not in PROMOTED_EVIDENCE_CLASSES
+    assert receipt.labels() == _EXPECTED_RECEIPT_LABELS
+    # the promotion class is nowhere on the receipt (not smuggled into another label field).
+    assert requested not in receipt.labels().values()
+
+    # the receipt PINS the full id/hash provenance (REQ-116) + the Gate-B revision consumed.
+    assert receipt.strategy_id == config.strategy_id
+    assert receipt.strategy_revision == "r4b-v0"
+    assert receipt.config_hash == config.config_hash()
+    assert receipt.observation_hashes == result.observation_hashes
+    assert receipt.decision_ids == tuple(d.decision_id for d in result.decisions)
+    assert receipt.terminal_state_hash == result.state_hash
+    assert receipt.decisions_digest == result.decisions_digest
+    assert receipt.gate_b_status == gate_b_status
+    assert receipt.gate_b_evidence_revision == "gate-b-rev-1"
+    # the linked state-hash chain: decision i's prior hash is decision i-1's next hash.
+    chain = receipt.state_hash_chain
+    assert chain[-1] == result.state_hash
+    assert len(chain) == len(result.decisions) + 1
+    for i, decision in enumerate(result.decisions):
+        assert decision.prior_state_hash == chain[i]
+        assert decision.next_state_hash == chain[i + 1]
+
+
+def test_historical_decisions_reproduce_under_pinned_config(tmp_path) -> None:
+    """A later config revision gets a new hash, but historical decisions reproduce byte-identically (AC-030/RED-31).
+
+    The receipt pins the ORIGINAL ``config_hash``, so a later config revision (a genuinely new
+    ``config_hash``) never rewrites history: replaying the SAME historical tape under its
+    originally-pinned config reproduces the byte-identical decision stream, observation hashes, terminal
+    state hash, and receipt. Determinism is the load-bearing guarantee — the clock is an explicit
+    per-observation input, so the pinned config is a total reproduction key.
+    """
+    tape = load_tape("healthy")
+    original = arm_configs(load_base_config_overrides()).guarded
+
+    # Historical run under the originally-pinned config → its provenance receipt.
+    historical = replay_arm(tape, original, tmp_path / "historical")
+    receipt0 = mint_run_receipt(
+        historical, original, gate_b_status="OPEN", gate_b_evidence_revision="gate-b-rev-1"
+    )
+
+    # A later config revision: one knob changes → a genuinely NEW config_hash.
+    revised = original.model_copy(update={"half_spread": original.half_spread + 0.005})
+    assert revised.config_hash() != original.config_hash()
+
+    # Replaying the SAME historical tape under its ORIGINALLY-pinned config reproduces byte-identically —
+    # the later revision does not alter history.
+    replayed = replay_arm(tape, original, tmp_path / "replayed")
+    assert replayed.decisions == historical.decisions
+    assert replayed.decisions_digest == historical.decisions_digest
+    assert replayed.observation_hashes == historical.observation_hashes
+    assert replayed.state_hash == historical.state_hash
+
+    # the receipt reproduces byte-identically under the pinned config, and pins the ORIGINAL hash — never
+    # the revised one.
+    receipt1 = mint_run_receipt(
+        replayed, original, gate_b_status="OPEN", gate_b_evidence_revision="gate-b-rev-1"
+    )
+    assert receipt1 == receipt0
+    assert receipt0.config_hash == original.config_hash()
+    assert receipt0.config_hash != revised.config_hash()
+    assert receipt1.decision_ids == receipt0.decision_ids
+    assert receipt1.state_hash_chain == receipt0.state_hash_chain
+
+
+def test_no_research_import() -> None:
+    """No ``veridex.research`` import anywhere in the harness/receipt or ablation test source (AST scan).
+
+    A static AST scan (not a runtime import graph) of both the TEST-SIDE harness and this test module:
+    every ``import`` / ``from ... import`` is walked and asserted NOT to reference the ranked
+    ``veridex.research`` lane. The venue-only baseline arm + the honest run receipt would be a lie if the
+    harness could reach the ranked research tier, so this pins the boundary at the syntax level — an
+    ``importlib``-style dynamic dodge would still have to name the module as a string, which the broader
+    :func:`forbidden_import_hits` regex guard (asserted elsewhere) also covers.
+    """
+    forbidden_root = "veridex.research"
+    for source_path in (HARNESS_MODULE_PATH, Path(__file__).resolve()):
+        tree = ast.parse(source_path.read_text())
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    assert not (
+                        alias.name == forbidden_root
+                        or alias.name.startswith(forbidden_root + ".")
+                    ), f"{source_path.name}: forbidden import {alias.name!r}"
+            elif isinstance(node, ast.ImportFrom):
+                module = node.module or ""
+                assert not (
+                    module == forbidden_root or module.startswith(forbidden_root + ".")
+                ), f"{source_path.name}: forbidden import-from {module!r}"
