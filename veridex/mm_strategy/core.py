@@ -295,7 +295,11 @@ def _book_is_stale(observation: StrategyObservation, config: StrategyConfig) -> 
 
 
 def _leg_is_skewed(observation: StrategyObservation, config: StrategyConfig) -> bool:
-    """Row D ``leg_skew``: the book vs match-state read clocks diverge beyond ``max_leg_skew_ms``."""
+    """Row D ``leg_skew``: a COMPOSITE bound on the book↔match-state receive-clock INTER-ARRIVAL —
+    how far apart in local receive time ``book_recv_ts`` and ``match_state_recv_ts`` were assembled —
+    NOT a bound on match-state staleness measured against ``as_of_ts``. This is the deliberately
+    chosen (defensible) reading: a large book↔match arrival skew means the two legs describe
+    different instants and the joined observation is unreliable, beyond ``max_leg_skew_ms``."""
     return (
         abs(observation.book_recv_ts - observation.match_state_recv_ts)
         > config.max_leg_skew_ms
