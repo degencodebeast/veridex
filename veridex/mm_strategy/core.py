@@ -28,6 +28,7 @@ from __future__ import annotations
 from typing import Any, Literal
 
 from veridex.mm_strategy.basis import (
+    basis_from_state,
     event_smoother_update,
     halflife_ewma,
     reference_is_warm,
@@ -37,6 +38,7 @@ from veridex.mm_strategy.basis import (
 from veridex.mm_strategy.config import StrategyConfig
 from veridex.mm_strategy.contracts import (
     DecisionKind,
+    GuardFairValue,
     GuardStateWatermark,
     MarketStatus,
     ReasonCode,
@@ -174,13 +176,19 @@ def _accept(
             basis_samples=(),
             basis_ewma_value=None,
             basis_ewma_ts=None,
+            basis_sample_count=0,
             smoother_mid=None,
             smoother_mid_ts=None,
             spread_ref_samples=(),
             depth_ref_samples=(),
         )
     elif basis_reset:
-        update.update(basis_samples=(), basis_ewma_value=None, basis_ewma_ts=None)
+        update.update(
+            basis_samples=(),
+            basis_ewma_value=None,
+            basis_ewma_ts=None,
+            basis_sample_count=0,
+        )
     return state.model_copy(update=update)
 
 
@@ -466,6 +474,44 @@ def _admit_venue_updates(
     return updates
 
 
+def _fv_is_stale(
+    guard_fv: GuardFairValue, observation: StrategyObservation, config: StrategyConfig
+) -> bool:
+    """REQ-022 guard-scoped FV staleness — transport OR content staleness (either breach is stale).
+
+    * transport freshness bounds ``as_of_ts − fv_recv_ts`` by ``fv_freshness_ms``;
+    * content staleness bounds ``fv_recv_ts/1000 − fv_source_ts`` (both FV-side clocks — the ms
+      recorder clock and the integer-second source clock) by ``fv_source_lag_s``.
+
+    A transport-fresh but content-stale FV is stale (mirroring the R3 alignment pattern)."""
+    transport_stale = observation.as_of_ts - guard_fv.fv_recv_ts > config.fv_freshness_ms
+    content_stale = (
+        guard_fv.fv_recv_ts / 1000.0 - guard_fv.fv_source_ts > config.fv_source_lag_s
+    )
+    return transport_stale or content_stale
+
+
+def _guard_fv_block_reason(
+    observation: StrategyObservation, config: StrategyConfig
+) -> ReasonCode | None:
+    """The guard-scoped FV blocker reason, or ``None`` when the FV leg is present, fresh, and the
+    match-state is not suspended (the guard may proceed to warmup / residual).
+
+    Guard-scoped (REQ-022/076): the CALLER gates this behind ``config.guard_enabled`` — the baseline
+    arm never consults the FV leg, so a stale/missing FV can never make it abstain (Fable F1).
+    Evaluated in the closed-vocabulary declared order (REQ-063): a MISSING leg (``guard_fv is None``)
+    is ``txline_missing``; a present-but-stale leg is ``txline_stale``; a suspended match-state (the
+    UNIVERSAL leg, REQ-020(d)) is ``txline_suspended``. REQ-076 unifies the former ``fv_missing`` away.
+    """
+    if observation.guard_fv is None:
+        return "txline_missing"
+    if _fv_is_stale(observation.guard_fv, observation, config):
+        return "txline_stale"
+    if observation.suspended:
+        return "txline_suspended"
+    return None
+
+
 def _admit_basis_updates(
     observation: StrategyObservation, base: StrategyState, config: StrategyConfig
 ) -> dict[str, Any]:
@@ -473,6 +519,13 @@ def _admit_basis_updates(
     basis). Folds THIS frame's ``raw_gap = fv − mid`` into the config-selected basis state. For a
     row-F fv-epoch frame both bases were already cleared by ``_accept(basis_reset=True)``, so the
     fold yields exactly the current sample — the REQ-070 clear-then-admit (Codex R6 MAJOR-1.2).
+
+    **STAGE-1 FAIL-SAFE (REQ-022/076):** the FV freshness / suspension / presence gate PRECEDES the
+    fold, so a stale / missing / suspended FV frame NEVER trains the accumulator. Freezing the basis
+    (and its ``as_of_ts`` decay anchor) here is load-bearing: a stale sample folded in would silently
+    corrupt the basis — and shorten the EWMA decay interval — for EVERY subsequent fresh frame. This
+    is strictly stronger than the quote-level FV gate: it protects the accumulator itself, not merely
+    the quote. ``basis_sample_count`` advances in lockstep with the fold so REQ-032 warmup is honest.
 
     * ``halflife_ewma`` — fold into the BOUNDED SUFFICIENT ACCUMULATOR one sample at a time (Codex
       Gate#1-R2 MAJOR-1). The accumulator IS the online estimate, so it is independent of how much
@@ -484,20 +537,36 @@ def _admit_basis_updates(
     """
     if not (config.guard_enabled and observation.guard_fv is not None):
         return {}
+    # STAGE-1 FAIL-SAFE: freshness/suspension gate BEFORE the fold — a stale/suspended FV is frozen
+    # out of the accumulator, never trained (the guard_fv-None case already returned above).
+    if _guard_fv_block_reason(observation, config) is not None:
+        return {}
     mid = _mid(observation)
     if mid is None:
         return {}
     raw_gap = observation.guard_fv.fv - mid
+    count = base.basis_sample_count + 1
     if config.basis_estimator == "halflife_ewma":
         prev = base.basis_ewma_value
         prev_ts = base.basis_ewma_ts
         if prev is None or prev_ts is None:
-            return {"basis_ewma_value": raw_gap, "basis_ewma_ts": observation.as_of_ts}
+            return {
+                "basis_ewma_value": raw_gap,
+                "basis_ewma_ts": observation.as_of_ts,
+                "basis_sample_count": count,
+            }
         dt_ms = float(observation.as_of_ts - prev_ts)
         value = halflife_ewma(prev, raw_gap, dt_ms, float(config.ewma_halflife_ms))
-        return {"basis_ewma_value": value, "basis_ewma_ts": observation.as_of_ts}
+        return {
+            "basis_ewma_value": value,
+            "basis_ewma_ts": observation.as_of_ts,
+            "basis_sample_count": count,
+        }
     samples = base.basis_samples + ((observation.as_of_ts, raw_gap),)
-    return {"basis_samples": samples[-config.basis_window :]}
+    return {
+        "basis_samples": samples[-config.basis_window :],
+        "basis_sample_count": count,
+    }
 
 
 def _cooldown_deadline(observation: StrategyObservation, config: StrategyConfig) -> int:
@@ -532,6 +601,7 @@ def _apply_reset(
             "basis_samples": (),
             "basis_ewma_value": None,
             "basis_ewma_ts": None,
+            "basis_sample_count": 0,
             "event_cooldown_until_ts": _cooldown_deadline(observation, config),
         }
     )
@@ -640,6 +710,15 @@ def _no_anchor_reason(
     return "level_count_low"
 
 
+def _basis_is_warm(state: StrategyState, config: StrategyConfig) -> bool:
+    """REQ-032 basis warmup: at least ``basis_min_samples`` ACCEPTED basis samples have folded since
+    the last basis reset. Reads the explicit ``basis_sample_count`` so warmup is HONEST for BOTH
+    estimators — the ``halflife_ewma`` accumulator collapses its history into one scalar and cannot
+    be counted from ``basis_samples``. Below this floor the residual guard is inert (``basis_warmup``)
+    while the venue-only core still governs the quote (REQ-032)."""
+    return state.basis_sample_count >= config.basis_min_samples
+
+
 def _quote_disposition(
     observation: StrategyObservation, base: StrategyState, config: StrategyConfig
 ) -> StrategyDecision:
@@ -674,7 +753,33 @@ def _quote_disposition(
         # net-flat abstention is recorded here; the net_position != 0 -> ONE_SIDED_REDUCE reducing
         # side is E4-T6's inventory slot above (it pre-empts this branch when wired).
         return _decide("NO_QUOTE", ("two_sided_zone_exit",))
-    # --- GUARD slot (E4-T3/T4/T5): TxLINE side guard -> QUOTE_ONE_SIDED / escalation ---
+    # --- GUARD slot (E4-T3): TxLINE basis/residual guard -> abstain / (E4-T4/T5) escalate ---
+    # Guard-scoped (REQ-070 guard block / REQ-074..076): the baseline arm (guard OFF) never enters
+    # here, so a stale/missing FV can never make it abstain (Fable F1). The pinned order is FV
+    # freshness/suspension/presence (REQ-022/076) -> basis warmup (REQ-032) -> extreme residual
+    # (REQ-075). The event gate strictly PRECEDES this whole block: a row-C cooldown (or row-R/E) is
+    # resolved upstream in the reducer and never reaches the row-H disposition (REQ-074).
+    if config.guard_enabled:
+        fv_block = _guard_fv_block_reason(observation, config)
+        if fv_block is not None:
+            return _decide("NO_QUOTE", (fv_block,))
+        if not _basis_is_warm(base, config):
+            return _decide("NO_QUOTE", ("basis_warmup",))
+        guard_fv = observation.guard_fv
+        if guard_fv is not None:  # always true here (fv_block was None) — narrows for mypy totality
+            # residual = raw_gap − basis, with raw_gap = fv − anchor (the venue mid; REQ-070). The
+            # band is the ABSOLUTE config value: ``|residual|`` vs ``extreme_multiple × residual_band``,
+            # taken DIRECTLY from config and NEVER scaled by ``(best_ask − best_bid)`` (REQ-071 — a
+            # spread-relative band is the MAJOR-5 bug). The basis reads PRIOR state (compare-then-update).
+            residual = (guard_fv.fv - anchor) - basis_from_state(base, config)
+            if abs(residual) >= config.extreme_multiple * config.residual_band:
+                # REQ-075: the sole extreme rule (no separate absolute-cap knob). NO_QUOTE + cancel
+                # plan on exposure (the intent-plan wiring is a later E4 task) — never a taker chase.
+                return _decide("NO_QUOTE", ("residual_extreme",))
+            # Admissible (``|residual| < extreme × band``): the E4-T5 pre-match basis gate
+            # (prematch_basis_exceeds_spread, REQ-078) slots in between warmup and here, and the E4-T4
+            # side pull (residual_pull_ask/bid, REQ-073) inside the band — both WITHOUT reshaping this
+            # order. Until then a quiescent guarded frame falls through to the taxonomy floor below.
     # --- QUOTE math slot (E4-T7): anchor +/- half_spread legs, post-clamp cardinality ---
     return _decide("QUOTE_TWO_SIDED", ())
 

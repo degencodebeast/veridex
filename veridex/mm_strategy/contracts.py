@@ -371,6 +371,16 @@ class StrategyState(_FrozenModel):
     # fixture) constructs unchanged.
     basis_ewma_value: float | None = None
     basis_ewma_ts: int | None = None
+    # Count of ACCEPTED basis samples folded since the last basis reset (REQ-032 warmup). The
+    # ``halflife_ewma`` accumulator collapses its whole history into one scalar, so ``basis_samples``
+    # length cannot measure warmup for that arm — this explicit counter gives an HONEST cross-arm
+    # ``basis_min_samples`` warmup for BOTH estimators. The pure core is its SOLE author: it
+    # increments on every admitted sample (:func:`core._admit_basis_updates`) and clears it to ``0``
+    # exactly where ``basis_samples`` / the EWMA accumulator are cleared (a full REQ-033 reset, an
+    # ``fv_source_epoch`` increment, a row-R reset). Defaults to ``0`` so a fresh state (and the
+    # purity fixture) constructs unchanged; the guard reads it as ``basis_sample_count >=
+    # basis_min_samples`` (REQ-032 — pre-warmup the residual guard is inert, reason ``basis_warmup``).
+    basis_sample_count: int = 0
     # Event-cooldown deadline (REQ-081): the ``as_of_ts`` (observation clock, NEVER wall clock)
     # BEFORE which no (re)placement may occur after a reset/event trigger. The E2-T4 reducer ANCHORS
     # it at ``as_of_ts + book_state_dwell_before_quote_ms`` on a row-R reset / row-E event and reads

@@ -443,3 +443,271 @@ def test_phase_transition_is_a_reset_trigger() -> None:
     assert _classify_row(obs, seed_state, config) == "H"
     _, seeded = decide(obs, seed_state, config)
     assert seeded.last_phase == 1
+
+
+# =====================================================================================
+# E4-T3: basis/residual guard + quiescence + extreme + stale-FV fail-safe
+# (REQ-032 / REQ-070 guard block / REQ-071 / REQ-074 / REQ-075 / REQ-076 / REQ-077;
+#  AC-005 / AC-007 / AC-008 / AC-011; RED-02 / RED-08)
+#
+# These pin the GUARD slot (#5) inside the row-H disposition spine: FV freshness/suspension/
+# presence gates (guard-scoped, REQ-022/076), the REQ-032 basis warmup, the REQ-075 extreme-
+# residual abstention, the REQ-071 ABSOLUTE (never spread-relative) band, the strict REQ-074
+# event-gate precedence, and the STAGE-1 fail-safe: freshness gates the basis-EWMA UPDATE itself
+# (a stale FV never trains the accumulator), not merely the quote. The default estimator is
+# ``rolling_median``; the fail-safe test uses ``halflife_ewma`` to inspect the decay anchor.
+# =====================================================================================
+
+
+def _fresh_fv(
+    *, fv: float, as_of_ts: int = 100_000, fv_source_epoch: int = 1
+) -> GuardFairValue:
+    """A guard FV leg that is FRESH under the default config: transport age
+    ``as_of_ts − fv_recv_ts == 10 ms ≤ fv_freshness_ms`` (10 000) AND content lag
+    ``fv_recv_ts/1000 − fv_source_ts ≈ 6 s ≤ fv_source_lag_s`` (10). ``fv`` deliberately differs
+    from the venue mid (the anchor is never the FV — RED-01)."""
+    recv = as_of_ts - 10
+    return GuardFairValue(
+        fv=fv,
+        fv_source_ts=recv // 1000 - 5,
+        fv_recv_ts=recv,
+        fv_source_epoch=fv_source_epoch,
+        message_id="msg-1",
+        proof_status="proven",
+    )
+
+
+def _stale_fv(
+    *, fv: float, as_of_ts: int = 100_000, fv_source_epoch: int = 1
+) -> GuardFairValue:
+    """A TRANSPORT-stale guard FV: ``as_of_ts − fv_recv_ts == 20 000 ms > fv_freshness_ms`` (10 000).
+    The content clock is kept fresh so the staleness is unambiguously the transport gate (REQ-022);
+    ``fv_recv_ts`` stays ≤ ``as_of_ts`` so construction never trips the future-dating guard."""
+    recv = as_of_ts - 20_000
+    return GuardFairValue(
+        fv=fv,
+        fv_source_ts=recv // 1000 - 5,
+        fv_recv_ts=recv,
+        fv_source_epoch=fv_source_epoch,
+        message_id="msg-1",
+        proof_status="proven",
+    )
+
+
+def _guarded_warm_state(
+    *,
+    basis_gap: float = 0.0,
+    basis_count: int = 40,
+    fv_source_epoch: int = 1,
+    event_cooldown_until_ts: int | None = None,
+) -> StrategyState:
+    """A warm-reference state whose ``rolling_median`` basis is ALSO warm: ``basis_count`` accepted
+    samples all equal to ``basis_gap`` (so the median basis is exactly ``basis_gap``) with a matching
+    ``basis_sample_count``. ``last_phase=1`` matches the ``_obs`` default phase (no row-R transition)
+    and the guard watermark is seeded at ``fv_source_epoch`` (no row-F reset) so a fresh-FV frame at
+    the same epoch reaches row H and the guard block."""
+    return StrategyState(
+        last_observation_sequence=1,
+        last_book_source_epoch=1,
+        last_as_of_ts=99_000,
+        last_market_status_epoch=1,
+        last_market_status_recv_ts=1,
+        last_phase=1,
+        guard_watermark=GuardStateWatermark(fv_source_epoch=fv_source_epoch),
+        smoother_mid=0.5,
+        smoother_mid_ts=99_000,
+        spread_ref_samples=tuple(0.02 for _ in range(25)),
+        depth_ref_samples=tuple(100.0 for _ in range(25)),
+        basis_samples=tuple((900 + i, basis_gap) for i in range(basis_count)),
+        basis_sample_count=basis_count,
+        event_cooldown_until_ts=event_cooldown_until_ts,
+    )
+
+
+# --- AC-005 / RED-02: a persistent basis is not edge ---------------------------------------
+
+
+def test_persistent_basis_not_edge() -> None:
+    # A FULLY PERSISTENT basis (raw_gap == basis ⇒ residual == 0) is not tradable edge — a
+    # median-demeaned persistent offset can never, by itself, pull a side (RED-02). The guarded
+    # frame quotes normally (QUOTE_TWO_SIDED), identically to a zero-gap book: the guard is quiescent.
+    config = _config(guard_enabled=True)
+    state = _guarded_warm_state(basis_gap=0.035)
+    # raw_gap = fv 0.535 − mid 0.50 = 0.035 == basis 0.035 ⇒ residual 0.0.
+    obs = _obs(guard_fv=_fresh_fv(fv=0.535))
+    decision, _ = decide(obs, state, config)
+    assert decision.kind == "QUOTE_TWO_SIDED"
+    assert decision.reason_codes == ()
+
+
+# --- AC-007: extreme residual → NO_QUOTE, never a taker chase -------------------------------
+
+
+def test_extreme_residual_no_quote_no_taker_chase() -> None:
+    # |residual| ≥ extreme_multiple × band (3 × 0.02 = 0.06) ⇒ NO_QUOTE(residual_extreme) — never a
+    # taker chase, never a "bigger signal" (REQ-075). The high-|residual| moment is an FV-lateness
+    # (gap-tail) moment; the guard abstains rather than inverting its own toxicity logic.
+    config = _config(guard_enabled=True)
+    state = _guarded_warm_state(basis_gap=0.0)
+    # residual = (fv 0.60 − mid 0.50) − basis 0.0 = 0.10 ≥ 0.06.
+    obs = _obs(guard_fv=_fresh_fv(fv=0.60))
+    decision, _ = decide(obs, state, config)
+    assert decision.kind == "NO_QUOTE"
+    assert decision.reason_codes == ("residual_extreme",)
+    # No taker chase: v0 has no TAKE (REQ-061) and the extreme guard never escalates to a place.
+    assert decision.kind not in ("QUOTE_TWO_SIDED", "QUOTE_ONE_SIDED")
+    assert all(intent.kind != "place_quote" for intent in decision.intent_plan)
+
+
+# --- AC-008 / RED-08: missing / stale / suspended FV → NO_QUOTE, never a submit -------------
+
+
+def test_stale_or_suspended_fv_no_submit_quote() -> None:
+    # A missing / stale / suspended TxLINE leg in the GUARDED arm fails closed to NO_QUOTE with the
+    # exact reason — never a submit-capable quote; freshness/proof are never fabricated (REQ-076).
+    config = _config(guard_enabled=True)
+    state = _guarded_warm_state(basis_gap=0.0)
+
+    # Missing FV leg (guard_fv is None) ⇒ txline_missing.
+    d_missing, _ = decide(_obs(guard_fv=None), state, config)
+    assert d_missing.kind == "NO_QUOTE"
+    assert d_missing.reason_codes == ("txline_missing",)
+
+    # Transport-stale FV (age 20 s > fv_freshness_ms 10 s) ⇒ txline_stale.
+    d_stale, _ = decide(_obs(guard_fv=_stale_fv(fv=0.55)), state, config)
+    assert d_stale.kind == "NO_QUOTE"
+    assert d_stale.reason_codes == ("txline_stale",)
+
+    # Suspended match-state (fresh FV present) ⇒ txline_suspended.
+    suspended = _obs(guard_fv=_fresh_fv(fv=0.55)).model_copy(update={"suspended": True})
+    d_susp, _ = decide(suspended, state, config)
+    assert d_susp.kind == "NO_QUOTE"
+    assert d_susp.reason_codes == ("txline_suspended",)
+
+
+# --- AC-011 / REQ-032: pre-warmup the guard is inert (basis_warmup) -------------------------
+
+
+def test_warmup_guard_inert() -> None:
+    # Below ``basis_min_samples`` accepted samples the residual guard is INERT: the guarded frame is
+    # NO_QUOTE(basis_warmup) and the venue-only core still governs — a guard-OFF frame on the SAME
+    # book QUOTES (REQ-032). Warm venue references isolate the BASIS warmup from event warmup.
+    guarded = _config(guard_enabled=True)
+    baseline = _config(guard_enabled=False)
+    # Venue references warm, but the basis holds only 5 < basis_min_samples (30) accepted samples.
+    state = _guarded_warm_state(basis_gap=0.0, basis_count=5)
+
+    d_guard, _ = decide(_obs(guard_fv=_fresh_fv(fv=0.55)), state, guarded)
+    assert d_guard.kind == "NO_QUOTE"
+    assert d_guard.reason_codes == ("basis_warmup",)
+
+    # The venue-only core still applies: with the guard OFF the same book QUOTES.
+    d_base, _ = decide(_obs(), state, baseline)
+    assert d_base.kind == "QUOTE_TWO_SIDED"
+
+
+# --- REQ-074: the event gate strictly precedes the residual guard ---------------------------
+
+
+def test_event_gate_precedes_residual_guard() -> None:
+    # The event gate STRICTLY precedes the residual guard (REQ-074). A frame under an ACTIVE event
+    # cooldown (row C) whose residual WOULD be extreme is NO_QUOTE(event_cooldown) — the cooldown
+    # pre-empts the guard entirely, so the extreme-residual verdict never runs. (Mutation: letting
+    # the guard act while a cooldown is active surfaces residual_extreme here instead.)
+    config = _config(guard_enabled=True)
+    # Cooldown active: as_of_ts (100_000) < event_cooldown_until_ts (200_000).
+    state = _guarded_warm_state(basis_gap=0.0, event_cooldown_until_ts=200_000)
+    # residual = (fv 0.60 − mid 0.50) − basis 0.0 = 0.10 ≥ extreme 0.06 — WOULD be residual_extreme.
+    obs = _obs(guard_fv=_fresh_fv(fv=0.60))
+    assert _classify_row(obs, state, config) == "C"
+    decision, _ = decide(obs, state, config)
+    assert decision.kind == "NO_QUOTE"
+    assert decision.reason_codes == ("event_cooldown",)
+    assert decision.reason_codes != ("residual_extreme",)
+
+
+# --- REQ-071 / MAJOR-5: the residual band is ABSOLUTE, never spread-relative ----------------
+
+
+def test_residual_band_is_absolute_not_spread_relative() -> None:
+    # The residual band is an ABSOLUTE probability-space width — NEVER scaled by the book spread
+    # (REQ-071). Hold the residual FIXED (0.05) and VARY the spread wide↔narrow: the guard verdict
+    # is IDENTICAL because the extreme threshold (extreme_multiple × band = 0.06) carries no spread
+    # term. A spread-relative band (band × (best_ask − best_bid)) would read the NARROW book as
+    # extreme while the WIDE book stays admissible — flipping the verdict — and this test kills it.
+    # ``spread_blowout_multiple`` is raised so the wide spread does not trip the REQ-080 blowout
+    # event (row E), isolating the band-absoluteness under test; both mids are 0.50 (no mid-jump).
+    config = _config(guard_enabled=True, spread_blowout_multiple=1000.0)
+    state = _guarded_warm_state(basis_gap=0.0)
+
+    # Narrow spread 0.02 and wide spread 0.90 — SAME mid 0.50 ⇒ SAME anchor ⇒ SAME raw_gap
+    # (fv 0.55 − 0.50 = 0.05) ⇒ SAME residual 0.05 (< extreme 0.06).
+    narrow = _obs(bid=0.49, ask=0.51, guard_fv=_fresh_fv(fv=0.55))
+    wide = _obs(bid=0.05, ask=0.95, guard_fv=_fresh_fv(fv=0.55))
+
+    d_narrow, _ = decide(narrow, state, config)
+    d_wide, _ = decide(wide, state, config)
+
+    # The verdict is spread-invariant: an absolute band admits BOTH identically. (Under a
+    # spread-relative band the narrow book would flip to NO_QUOTE(residual_extreme).)
+    assert d_narrow.kind == d_wide.kind == "QUOTE_TWO_SIDED"
+    assert d_narrow.reason_codes == d_wide.reason_codes == ()
+
+
+# --- STAGE-1 fail-safe (mandated): freshness gates the EWMA UPDATE, not only the quote ------
+
+
+def test_stale_fv_not_admitted_to_basis() -> None:
+    # A stale/suspended FV must NOT train the basis accumulator — otherwise it silently corrupts the
+    # basis (and its ``as_of_ts`` decay anchor) for every later fresh frame. The freshness check
+    # PRECEDES the EWMA fold in the code path, so the accumulator stays FROZEN on a stale frame.
+    config = _config(
+        guard_enabled=True, basis_estimator="halflife_ewma", ewma_halflife_ms=1_000
+    )
+    # A warm EWMA basis: value 0.010 anchored at ts 90_000 (≥ basis_min_samples folded upstream).
+    warm = StrategyState(
+        last_observation_sequence=100,
+        last_book_source_epoch=1,
+        last_as_of_ts=99_000,
+        last_market_status_epoch=1,
+        last_market_status_recv_ts=1,
+        last_phase=1,
+        guard_watermark=GuardStateWatermark(fv_source_epoch=1),
+        smoother_mid=0.5,
+        smoother_mid_ts=99_000,
+        spread_ref_samples=tuple(0.02 for _ in range(25)),
+        depth_ref_samples=tuple(100.0 for _ in range(25)),
+        basis_ewma_value=0.010,
+        basis_ewma_ts=90_000,
+        basis_sample_count=40,
+    )
+
+    # (1) A transport-stale FV frame FREEZES the accumulator (value, ts, count all unchanged) and
+    # fails closed to NO_QUOTE(txline_stale) — the stale FV never trained the basis.
+    stale = _obs(
+        observation_sequence=101,
+        as_of_ts=100_000,
+        guard_fv=_stale_fv(fv=0.55, as_of_ts=100_000),
+    )
+    d_stale, after_stale = decide(stale, warm, config)
+    assert d_stale.kind == "NO_QUOTE"
+    assert d_stale.reason_codes == ("txline_stale",)
+    assert after_stale.basis_ewma_value == 0.010  # UNCHANGED — no stale training
+    assert after_stale.basis_ewma_ts == 90_000  # decay anchor UNCHANGED
+    assert after_stale.basis_sample_count == 40  # sample count UNCHANGED
+
+    # (2) No corruption: a subsequent FRESH frame yields the SAME basis it would have had if the
+    # stale frame had never arrived — because the frozen decay anchor (90_000) is preserved, the
+    # fresh fold decays over the GENUINE interval, not a stale-shortened one.
+    fresh = _obs(
+        observation_sequence=102,
+        as_of_ts=101_000,
+        guard_fv=_fresh_fv(fv=0.55, as_of_ts=101_000),
+    )
+    _, after_fresh_via_stale = decide(fresh, after_stale, config)
+    # The counterfactual: the SAME fresh frame applied directly to the pre-stale state.
+    _, after_fresh_direct = decide(fresh, warm, config)
+    assert after_fresh_via_stale.basis_ewma_value == pytest.approx(
+        after_fresh_direct.basis_ewma_value
+    )
+    assert after_fresh_via_stale.basis_ewma_ts == after_fresh_direct.basis_ewma_ts
