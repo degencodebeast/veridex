@@ -187,7 +187,7 @@ def _config(**overrides: object) -> StrategyConfig:
 
 def _resting_order() -> RestingOrderView:
     """One resting open order — the exposure a HALTED/CLOSED market's cancel plan would target."""
-    return RestingOrderView(client_order_id="c-1", side="YES", price=0.49, size=10.0)
+    return RestingOrderView(client_order_id="c-1", side="bid", price=0.49, size=10.0)
 
 
 def _obs(

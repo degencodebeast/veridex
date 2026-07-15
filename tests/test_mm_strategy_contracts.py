@@ -350,7 +350,7 @@ def test_non_finite_native_inputs_rejected() -> None:
         with pytest.raises(ValidationError):
             InventoryProjection(net_position=bad, resting=(), projection_as_of_ts=1_000, fresh=True)
         with pytest.raises(ValidationError):
-            RestingOrderView(client_order_id="c1", side="YES", price=0.5, size=bad)
+            RestingOrderView(client_order_id="c1", side="bid", price=0.5, size=bad)
 
     # None is still allowed on the optional top-of-book legs (a degraded book) — the guard rejects a
     # PRESENT non-finite value only, it never forces presence.
@@ -359,6 +359,23 @@ def test_non_finite_native_inputs_rejected() -> None:
     )
     assert degraded.bid is None and degraded.ask is None
     assert degraded.bid_size is None and degraded.ask_size is None
+
+
+def test_resting_order_view_side_rejects_non_bid_ask() -> None:
+    # Gate #4 F-MINOR-3 / REQ-096/AC-020/RED-17: `RestingOrderView.side` is compared with `==`
+    # against a desired leg's `leg_role` in the churn-suppression path (`_target_is_unchanged`,
+    # core.py:1262), in the SAME `bid`/`ask` vocabulary (core.py:1238-1241). An untyped `str` lets
+    # a case mismatch (`"BID"`) or wrong-vocabulary value (`"YES"`, the outcome-token side)
+    # construct silently — the `==` compare then goes silently False and churn suppression never
+    # fires. Pin the field so a side that would silently defeat churn suppression is structurally
+    # unconstructible.
+    for bad in ("YES", "BID", "ASK", "no"):
+        with pytest.raises(ValidationError):
+            RestingOrderView(client_order_id="c1", side=bad, price=0.5, size=1.0)
+
+    for ok in ("bid", "ask"):
+        view = RestingOrderView(client_order_id="c1", side=ok, price=0.5, size=1.0)
+        assert view.side == ok
 
 
 # --- StrategyState EWMA accumulator pair invariant (REQ-031/035) ---------------------------

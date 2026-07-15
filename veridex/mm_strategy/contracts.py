@@ -218,7 +218,7 @@ class RestingOrderView(_FrozenModel):
     """One resting open order supplied by the orchestration-layer inventory projection (REQ-020(g))."""
 
     client_order_id: str
-    side: str
+    side: Literal["bid", "ask"]
     price: float
     size: float
 
