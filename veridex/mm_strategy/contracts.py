@@ -150,6 +150,16 @@ def _reject_non_finite_optional(value: float | None, field: str) -> float | None
     return _reject_non_finite(value, field)
 
 
+def _reject_non_finite_tuple(values: tuple[float, ...], field: str) -> tuple[float, ...]:
+    """As :func:`_reject_non_finite`, applied to EVERY element of a rolling-reference / sample tuple
+    (Gate #2 MAJOR-5 — STATE accumulators). One poisoned element silently disables the `<` / `>` gate
+    that reduces the window, so the whole tuple must be finite; empty (the post-reset seed) is a NO-OP.
+    Reject-only: a finite window is returned unchanged, so a valid state's canonical hash is untouched."""
+    for index, value in enumerate(values):
+        _reject_non_finite(value, f"{field}[{index}]")
+    return values
+
+
 class _FrozenModel(BaseModel):
     """Shared base: immutable, no extra fields tolerated, canonical evidence hash.
 
@@ -463,6 +473,49 @@ class StrategyState(_FrozenModel):
     # (F/W/H) whose frame has passed the deadline clears it to ``None`` (warmup NEVER anchors one —
     # the liveness guarantee E2-T5 proves). ``None`` is the no-cooldown / fresh-state seed.
     event_cooldown_until_ts: int | None = None
+
+    @field_validator("smoother_mid")
+    @classmethod
+    def _smoother_mid_is_finite(cls, value: float | None) -> float | None:
+        # Gate #2 MAJOR-5 RESIDUAL (Codex): the observation-side fix rejected non-finite book/tick
+        # inputs, but the closure ALSO named STATE inputs. A NaN ``smoother_mid`` makes
+        # ``abs(mid - state.smoother_mid) > mid_jump_threshold`` False, silently disabling the row-E
+        # mid-jump gate — reachable through ORDINARY construction / JSON snapshot restore, not just a
+        # ``model_copy`` bypass. Reject-only: a finite (or absent) value passes through unchanged.
+        return _reject_non_finite_optional(value, "smoother_mid")
+
+    @field_validator("basis_ewma_value")
+    @classmethod
+    def _basis_ewma_value_is_finite(cls, value: float | None) -> float | None:
+        # As ``smoother_mid`` (Gate #2 MAJOR-5): a non-finite EWMA accumulator poisons the basis
+        # reduction it feeds. Optional — ``None`` is the fresh/reset seed the pair invariant guards.
+        return _reject_non_finite_optional(value, "basis_ewma_value")
+
+    @field_validator("spread_ref_samples")
+    @classmethod
+    def _spread_ref_samples_are_finite(cls, value: tuple[float, ...]) -> tuple[float, ...]:
+        # The rolling spread reference feeds the row-E ``spread_blowout_multiple`` ratio gate; one
+        # NaN/Inf element silently disables its comparison (Gate #2 MAJOR-5 RESIDUAL).
+        return _reject_non_finite_tuple(value, "spread_ref_samples")
+
+    @field_validator("depth_ref_samples")
+    @classmethod
+    def _depth_ref_samples_are_finite(cls, value: tuple[float, ...]) -> tuple[float, ...]:
+        # The rolling depth reference feeds the row-E ``depth_collapse_ratio`` gate; one non-finite
+        # element silently disables its comparison (Gate #2 MAJOR-5 RESIDUAL).
+        return _reject_non_finite_tuple(value, "depth_ref_samples")
+
+    @field_validator("basis_samples")
+    @classmethod
+    def _state_basis_samples_are_finite(
+        cls, value: tuple[tuple[int, float], ...]
+    ) -> tuple[tuple[int, float], ...]:
+        # The FLOAT slot of each ``(as_of_ts_ms, raw_gap)`` basis sample feeds the basis estimator's
+        # reduction; a NaN/Inf ``raw_gap`` poisons the residual-guard comparison. The int ``as_of_ts``
+        # slot is an epoch, not a float accumulator — only the second element is finite-checked here.
+        for index, (_as_of_ts, raw_gap) in enumerate(value):
+            _reject_non_finite(raw_gap, f"basis_samples[{index}].raw_gap")
+        return value
 
     @model_validator(mode="after")
     def _ewma_accumulator_pair(self) -> StrategyState:

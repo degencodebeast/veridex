@@ -463,6 +463,30 @@ def test_spread_blowout_and_mid_jump_pull_quotes_only_when_warm() -> None:
     assert cold_next.event_cooldown_until_ts is None  # warmup never creates a cooldown
 
 
+def test_state_smoother_mid_non_finite_rejected() -> None:
+    # Gate #2 MAJOR-5 RESIDUAL (Codex): a non-finite STATE accumulator silently DISABLES the policy
+    # comparison it feeds. `abs(mid - state.smoother_mid) > mid_jump_threshold` is False when
+    # ``smoother_mid`` is NaN, so the row-E mid-jump gate is suppressed and a book that should PULL
+    # quotes (NO_QUOTE ``book_thin``) instead admits (QUOTE_TWO_SIDED). The observation-side finite
+    # guard closed the crash surface, but the closure criterion ALSO named STATE inputs — a poisoned
+    # ``smoother_mid`` is reachable through ORDINARY model construction / JSON snapshot restore, not
+    # just ``model_copy``. Reject it at construction so the poisoned state is UNCONSTRUCTIBLE.
+    config = _config()
+    warm = _warm_state()  # smoother_mid == 0.5
+    jump = _obs(bid=0.55, ask=0.57)  # raw mid 0.56 — a 0.06 jump > mid_jump_threshold (0.02)
+
+    # (control) the VALID warm state BLOCKS the move.
+    d_valid, _ = decide(jump, warm, config)
+    assert d_valid.kind == "NO_QUOTE"
+    assert d_valid.reason_codes == ("book_thin",)
+
+    # (fix) the NaN/Inf variant is UNCONSTRUCTIBLE — before the guard it constructed and suppressed
+    # the gate (``decide`` returned QUOTE_TWO_SIDED on the SAME jumped frame).
+    for bad in (float("nan"), float("inf"), float("-inf")):
+        with pytest.raises(ValidationError):
+            StrategyState(**{**warm.model_dump(), "smoother_mid": bad})
+
+
 def test_phase_transition_is_a_reset_trigger() -> None:
     # REQ-080: a match-state ``phase`` transition is a RESET-class trigger (row R) — it pulls the
     # quote (NO_QUOTE ``phase_transition``), anchors an event cooldown, and re-seeds the smoother.

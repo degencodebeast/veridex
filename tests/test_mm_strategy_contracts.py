@@ -323,6 +323,52 @@ def test_partial_ewma_accumulator_rejected() -> None:
     assert fresh.basis_ewma_ts is None
 
 
+def test_state_sample_tuples_non_finite_rejected() -> None:
+    # Gate #2 MAJOR-5 RESIDUAL (Codex): the STATE-carried rolling references / basis window / EWMA
+    # scalar feed the same `<` / `>` policy comparisons as the observation legs, so a single NaN/Inf
+    # element silently disables its gate. Every FLOAT accumulator/reference on StrategyState must
+    # reject non-finite values at construction — including the OPTIONAL scalar and values nested
+    # inside the sample tuples (the float slot of each ``(as_of_ts, raw_gap)`` basis sample).
+    for bad in (float("nan"), float("inf"), float("-inf")):
+        with pytest.raises(ValidationError):
+            StrategyState(spread_ref_samples=(0.02, bad, 0.02))
+        with pytest.raises(ValidationError):
+            StrategyState(depth_ref_samples=(100.0, bad))
+        with pytest.raises(ValidationError):
+            StrategyState(basis_samples=((1_000, 0.01), (2_000, bad)))
+        with pytest.raises(ValidationError):
+            StrategyState(basis_ewma_value=bad, basis_ewma_ts=1_000)
+
+    # The INT slot of a basis sample (the ``as_of_ts`` epoch) is not a float accumulator — a sample
+    # window with finite gaps still constructs unchanged (reject-only: valid state is untouched).
+    ok = StrategyState(basis_samples=((1_000, 0.01), (2_000, 0.02)))
+    assert ok.basis_samples == ((1_000, 0.01), (2_000, 0.02))
+
+
+def test_state_non_finite_rejected_on_json_restore() -> None:
+    # Pydantic field validators run on ``model_validate`` / JSON restore too, not just kwargs
+    # construction — so a poisoned SNAPSHOT loaded from disk fails closed exactly like a direct
+    # construction (Gate #2 MAJOR-5 RESIDUAL: reachable via ordinary snapshot restoration).
+    good = StrategyState(
+        smoother_mid=0.5,
+        smoother_mid_ts=1_000,
+        spread_ref_samples=(0.02, 0.02),
+        depth_ref_samples=(100.0, 100.0),
+        basis_samples=((1_000, 0.01),),
+        basis_ewma_value=0.25,
+        basis_ewma_ts=1_000,
+    )
+    # A VALID snapshot round-trips unchanged (reject-only validator: byte-identity preserved).
+    assert StrategyState.model_validate(good.model_dump()) == good
+    assert StrategyState.model_validate_json(good.model_dump_json()) == good
+
+    for bad in (float("nan"), float("inf"), float("-inf")):
+        with pytest.raises(ValidationError):
+            StrategyState.model_validate({**good.model_dump(), "smoother_mid": bad})
+        with pytest.raises(ValidationError):
+            StrategyState.model_validate({**good.model_dump(), "spread_ref_samples": (0.02, bad)})
+
+
 # --- Honest labels + pinned strategy identity (HON-001 / HON-003 / REQ-044) ----------------
 
 
