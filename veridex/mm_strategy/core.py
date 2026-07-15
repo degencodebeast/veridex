@@ -29,7 +29,9 @@ from typing import Any, Literal
 
 from veridex.mm_strategy.basis import (
     basis_from_state,
+    ceil_to_tick,
     event_smoother_update,
+    floor_to_tick,
     halflife_ewma,
     reference_is_warm,
     rolling_depth_reference,
@@ -781,6 +783,72 @@ def _toxic_leg(
     return None
 
 
+# --- The E4-T7 QUOTE-math primitives: join-or-behind targets + directional round + post-clamp ---
+# The deterministic leg-price materialization the row-H quoting classes all resolve through (REQ-052/
+# 055/056). Join-or-behind (the ``min``/``max``) never posts BETTER than the current best — improving
+# is impossible, so a resting maker quote never crosses. The directional tick round is the maker-safety
+# invariant: a BID floors DOWN and an ASK ceils UP (never a side-agnostic round-to-nearest — the
+# rust_mm_bot/smm anti-pattern). The post-clamp omits any final leg outside the native ``(0,1)`` unit
+# interval, the boundary zone, or the tick grid (``leg_out_of_zone``). ``tick`` / ``best_bid`` /
+# ``best_ask`` all come from RAW observation facts; an admissible anchor (:func:`_venue_anchor`)
+# guarantees both touches are present, so the callers narrow ``bid`` / ``ask`` off ``None`` locally.
+
+
+def _bid_leg_price(
+    anchor: float, best_bid: float, tick: float, config: StrategyConfig
+) -> float:
+    """The join-or-behind BID leg price (REQ-052/055): ``floor_to_tick(min(anchor − half_spread,
+    best_bid))``. The ``min`` is join-or-behind — NEVER post a bid better (higher) than the current
+    best bid (join it or rest behind it; improving is impossible). The ``floor`` is the maker-safe
+    directional round (DOWN, never up THROUGH the target) — the side is chosen by role, never
+    defaulted (a round-to-nearest is the rust_mm_bot/smm anti-pattern; REQ-055)."""
+    return floor_to_tick(min(anchor - config.half_spread, best_bid), tick)
+
+
+def _ask_leg_price(
+    anchor: float, best_ask: float, tick: float, config: StrategyConfig
+) -> float:
+    """The join-or-behind ASK leg price (REQ-052/055): ``ceil_to_tick(max(anchor + half_spread,
+    best_ask))`` — the mirror of :func:`_bid_leg_price`. The ``max`` rests at or behind the best ask
+    (never lower — improving down is impossible); the ``ceil`` is the maker-safe directional round
+    (UP). BID→floor / ASK→ceil is role-driven; a defaulted side is a REQ-055 violation."""
+    return ceil_to_tick(max(anchor + config.half_spread, best_ask), tick)
+
+
+def _on_tick(price: float, tick: float) -> bool:
+    """True when ``price`` sits on the current tick grid (REQ-052 post-clamp). The join-or-behind
+    legs are on-tick BY CONSTRUCTION (:func:`_bid_leg_price` / :func:`_ask_leg_price` round to the
+    grid), so this is a defensive re-check whose small tolerance absorbs binary-representation dust —
+    it never fires on a rounded leg. The R4-A wire layer remains the authoritative tick check."""
+    ratio = price / tick
+    return abs(ratio - round(ratio)) <= 1e-9
+
+
+def _leg_in_zone(price: float, tick: float, config: StrategyConfig) -> bool:
+    """REQ-052 post-clamp: a final leg is admissible ONLY if it is strictly inside the native
+    ``(0, 1)`` unit interval AND inside the quoting ``boundary_zone`` AND on the tick grid; otherwise
+    the leg is OMITTED (``leg_out_of_zone``). Zone application is pinned per REQ-052 — the boundary
+    zone gates the anchor AND the final targets (this predicate), while the two-sided band gates the
+    anchor ONLY (upstream in :func:`_quote_disposition`)."""
+    boundary_low, boundary_high = config.boundary_zone
+    return (
+        0.0 < price < 1.0
+        and boundary_low <= price <= boundary_high
+        and _on_tick(price, tick)
+    )
+
+
+def _place_leg(
+    leg_role: Literal["bid", "ask"], price: float
+) -> NeutralIntent:
+    """A maker ``place_quote`` intent for one priced leg (REQ-056). ``post_only=True`` ALWAYS — a
+    maker quote is rejected if marketable, so it never crosses. The ``tif`` is the config-level
+    time-in-force the R4-A adapter applies when it maps this neutral intent onto the wire; the neutral
+    intent carries NO ``tif`` (and no size) field — decision identity is over side + price only
+    (REQ-057). ``leg_role`` is the physical side, authoritative for both quoting and reducing legs."""
+    return NeutralIntent(kind="place_quote", leg_role=leg_role, price=price, post_only=True)
+
+
 def _inventory_reduce(
     observation: StrategyObservation,
     base: StrategyState,
@@ -792,19 +860,72 @@ def _inventory_reduce(
     caller guarantees ``net_position != 0``). Quotes ONLY the reducing leg (:func:`_reducing_leg`) —
     UNLESS that leg is ALSO the guard's toxic leg (:func:`_toxic_leg`), in which case quoting to
     reduce would quote INTO the adverse flow, so it fails closed to ``NO_QUOTE(reduce_conflict)`` +
-    cancel (the cancel intent is E5-T3's; none is wired here). The reducing leg materialises as a
-    size-free ``place_quote`` intent whose ``leg_role`` IS the side — E4-T6 owns REQ-054 (WHICH side),
-    while E4-T7 fills the surviving leg's ``price`` (join-or-behind + directional rounding), so the
-    leg carries ``price=None`` here. NO size (R4-A owns sizing; REQ-057)."""
+    cancel (the cancel intent is E5-T3's; none is wired here).
+
+    E4-T6 owns REQ-054 (WHICH side reduces — the ``leg_role`` is AUTHORITATIVE and never recomputed
+    here); E4-T7 PRICES that leg (join-or-behind + directional round for ITS side). The reducing leg
+    materialises as a size-free ``place_quote`` intent (NO size — R4-A owns sizing; REQ-057).
+    INVENTORY SAFETY (REQ-052): if the reducing leg's computed price clamps OUT of zone we fail to
+    ``NO_QUOTE(leg_out_of_zone)`` — we NEVER side-flip to the opposite (adding) leg to salvage a
+    quote, since quoting the adding side would GROW the very position we are trying to reduce."""
     reducing = _reducing_leg(net_position)
     if reducing == _toxic_leg(observation, base, config, anchor):
         return _decide("NO_QUOTE", ("reduce_conflict",))
-    reduce_leg = NeutralIntent(kind="place_quote", leg_role=reducing, price=None)
+    best_bid = observation.bid
+    best_ask = observation.ask
+    if best_bid is None or best_ask is None:  # unreachable: admissible anchor ⇒ both touches present
+        return _decide("NO_QUOTE", (_no_anchor_reason(observation, config),))
+    tick = observation.tick_size
+    price = (
+        _bid_leg_price(anchor, best_bid, tick, config)
+        if reducing == "bid"
+        else _ask_leg_price(anchor, best_ask, tick, config)
+    )
+    if not _leg_in_zone(price, tick, config):
+        return _decide("NO_QUOTE", ("leg_out_of_zone",))
     return StrategyDecision(
         kind="ONE_SIDED_REDUCE",
         reason_codes=("inventory_reduce",),
-        intent_plan=(reduce_leg,),
+        intent_plan=(_place_leg(reducing, price),),
     )
+
+
+def _two_sided_quote(
+    observation: StrategyObservation, config: StrategyConfig, anchor: float
+) -> StrategyDecision:
+    """The E4-T7 QUOTE-math terminal (slot #6) over an admissible in-band anchor (REQ-052/055/056).
+
+    Build BOTH legs (join-or-behind targets + directional tick rounding: BID floors, ASK ceils),
+    post-clamp each against the native ``(0, 1)`` interval + boundary zone + tick grid, then resolve
+    cardinality:
+
+    * 2 legs survive → ``QUOTE_TWO_SIDED``;
+    * exactly 1 → ``QUOTE_ONE_SIDED`` on the surviving side (the other omitted as ``leg_out_of_zone``,
+      the recorded reason for the downgrade);
+    * 0 → ``NO_QUOTE(leg_out_of_zone)``.
+
+    An admissible anchor guarantees both touches are present (:func:`_venue_anchor`), so
+    ``observation.bid`` / ``observation.ask`` are non-``None`` here — the guard narrows them for mypy
+    and is unreachable (it re-derives the no-anchor reason rather than fabricating a leg)."""
+    best_bid = observation.bid
+    best_ask = observation.ask
+    if best_bid is None or best_ask is None:  # unreachable: admissible anchor ⇒ both touches present
+        return _decide("NO_QUOTE", (_no_anchor_reason(observation, config),))
+    tick = observation.tick_size
+    bid_price = _bid_leg_price(anchor, best_bid, tick, config)
+    ask_price = _ask_leg_price(anchor, best_ask, tick, config)
+    legs: list[NeutralIntent] = []
+    if _leg_in_zone(bid_price, tick, config):
+        legs.append(_place_leg("bid", bid_price))
+    if _leg_in_zone(ask_price, tick, config):
+        legs.append(_place_leg("ask", ask_price))
+    if len(legs) == 2:
+        return StrategyDecision(kind="QUOTE_TWO_SIDED", reason_codes=(), intent_plan=tuple(legs))
+    if len(legs) == 1:
+        return StrategyDecision(
+            kind="QUOTE_ONE_SIDED", reason_codes=("leg_out_of_zone",), intent_plan=tuple(legs)
+        )
+    return _decide("NO_QUOTE", ("leg_out_of_zone",))
 
 
 def _quote_disposition(
@@ -912,8 +1033,11 @@ def _quote_disposition(
                 return _decide("QUOTE_ONE_SIDED", ("residual_pull_ask",))
             if residual < -config.residual_band:
                 return _decide("QUOTE_ONE_SIDED", ("residual_pull_bid",))
-    # --- QUOTE math slot (E4-T7): anchor +/- half_spread legs, post-clamp cardinality ---
-    return _decide("QUOTE_TWO_SIDED", ())
+    # --- QUOTE math slot (E4-T7): join-or-behind anchor +/- half_spread legs, directional tick
+    # rounding, post-clamp + cardinality (REQ-052/055/056). This terminal can DOWNGRADE the eligible
+    # two-sided class: both legs clamped out -> NO_QUOTE(leg_out_of_zone), exactly one survives ->
+    # QUOTE_ONE_SIDED on that side, both survive -> QUOTE_TWO_SIDED with the priced legs.
+    return _two_sided_quote(observation, config, anchor)
 
 
 def _apply_healthy(

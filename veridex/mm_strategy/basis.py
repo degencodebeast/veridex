@@ -20,6 +20,7 @@ deterministic function of its arguments.
 
 from __future__ import annotations
 
+import math
 import statistics
 
 from veridex.mm_strategy.config import StrategyConfig
@@ -107,6 +108,38 @@ def residual(raw_gap: float, basis: float) -> float:
     into the estimate — yields exactly ``0.0`` and can never, by itself, become tradable edge.
     """
     return raw_gap - basis
+
+
+# --- Directional tick rounding (maker-safety invariant; REQ-055) ---------------------------
+# The BID / ASK sides round in OPPOSITE directions so a rounded quote never IMPROVES past its
+# join-or-behind target (crossing up on a bid, down on an ask). A single side-agnostic
+# round-to-nearest is the rust_mm_bot / smm REJECT anti-pattern: nearest can round a bid UP through
+# the best bid and an ask DOWN through the best ask, turning a resting maker quote into an improving
+# (potentially crossing) one. Both helpers snap the price/tick RATIO to 9 dp before the floor/ceil so
+# a value that is already on-tick (whose ratio is ``39.9999…`` in binary) never drops a whole tick on
+# representation dust, and re-snap the product to 12 dp so the returned price carries no FP tail. The
+# R4-A wire layer remains the AUTHORITATIVE tick / non-crossing check — this is the proposal courtesy.
+
+
+def floor_to_tick(price: float, tick: float) -> float:
+    """Round ``price`` DOWN to the nearest ``tick`` multiple — the maker-safe BID rounding (REQ-055).
+
+    A bid rests AT or BELOW its target, so rounding DOWN can never improve it past (cross up through)
+    the target. Mirror of :func:`ceil_to_tick`; the ratio is snapped to 9 dp before the floor to
+    absorb binary-representation dust and the product is re-snapped so no FP tail leaks into the price.
+    """
+    ticks = math.floor(round(price / tick, 9))
+    return round(ticks * tick, 12)
+
+
+def ceil_to_tick(price: float, tick: float) -> float:
+    """Round ``price`` UP to the nearest ``tick`` multiple — the maker-safe ASK rounding (REQ-055).
+
+    An ask rests AT or ABOVE its target, so rounding UP can never improve it past (cross down through)
+    the target. Mirror of :func:`floor_to_tick` (same FP-tolerance treatment, opposite direction).
+    """
+    ticks = math.ceil(round(price / tick, 9))
+    return round(ticks * tick, 12)
 
 
 # --- Event smoother + rolling venue references (REQ-036 / REQ-080 / AC-042 / RED-34/44/46) --

@@ -904,7 +904,8 @@ def test_inventory_over_soft_limit_reduces_side() -> None:
     reduce_leg = d_long.intent_plan[0]
     assert reduce_leg.kind == "place_quote"
     assert reduce_leg.leg_role == "ask"  # the REDUCING leg for a long — NOT "bid" (the adding leg)
-    assert reduce_leg.price is None  # E4-T7 fills the surviving leg's price (join-or-behind)
+    # E4-T7 fills the surviving leg's price: ask = ceil(max(anchor 0.50 + h 0.02, best_ask 0.51)) = 0.52.
+    assert reduce_leg.price == pytest.approx(0.52)
 
     # net SHORT YES (−0.6): the mirror — reduce by BUYING YES ⇒ the BID leg survives (never the ask).
     d_short, _ = decide(_obs(bid=0.49, ask=0.51, net_position=-0.6), state, config)
