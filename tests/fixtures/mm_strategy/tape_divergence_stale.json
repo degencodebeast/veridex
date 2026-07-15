@@ -1,0 +1,15 @@
+{
+  "_note": "Canned deterministic A/B DIVERGENCE tape — STALE FV NO_QUOTE. Three warmup ticks (fresh FV, gap 0.05) warm BOTH arms' venue references AND the guarded basis. The fourth tick arrives far in the future (as_of 50000) with NO fresh FV: the guard projects the last-seen FV (recv 29700), now transport-stale (50000 - 29700 = 20300 > fv_freshness_ms 10000), so arm B fails closed to NO_QUOTE/txline_stale BEFORE it ever reaches the residual band. Arm A is FV-blind and quotes BOTH sides (QUOTE_TWO_SIDED) on the same tick. Warmup prefix byte-identical across arms; streams diverge at tick 4 ONLY. Requires overrides ref_min_samples=2, basis_min_samples=2.",
+  "health": "divergence_stale",
+  "stream": {"fixture_id": 1, "market_ref": "TEAM-A/YES", "side": "YES", "token_id": "TOKEN-YES"},
+  "venue_market_ref": "0xmarket",
+  "events": [
+    {"kind": "fv", "source_ts": 8, "recv_ts": 9700, "value": 0.55, "source_epoch": 1},
+    {"kind": "tick", "source": "book", "recv_ts": 9900, "as_of_ts": 10000},
+    {"kind": "fv", "source_ts": 18, "recv_ts": 19700, "value": 0.55, "source_epoch": 1},
+    {"kind": "tick", "source": "book", "recv_ts": 19900, "as_of_ts": 20000},
+    {"kind": "fv", "source_ts": 28, "recv_ts": 29700, "value": 0.55, "source_epoch": 1},
+    {"kind": "tick", "source": "book", "recv_ts": 29900, "as_of_ts": 30000},
+    {"kind": "tick", "source": "book", "recv_ts": 49900, "as_of_ts": 50000}
+  ]
+}
