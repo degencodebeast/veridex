@@ -640,10 +640,19 @@ from veridex.dust_execution.signer import LocalFakeWalletControlPlane  # noqa: E
 from veridex.venues.sx_bet import FakeVenueAdapter  # noqa: E402
 
 # The agent-facing tool surface audited: the facade BOUNDARY module (the typed R4-B intent -> R4-A
-# contracts + the injectable proposer) and the ``tools=[]`` decision agent. Everything an agent / the
-# R4-B intent path DIRECTLY touches lives here; the money-network runner is imported LAZILY behind the
-# boundary and is intentionally NOT in this set (see the SCOPE note above).
-_AGENT_FACING_MODULES = ("veridex.dust_execution.facade", "veridex.runtime.agent")
+# contracts + the injectable proposer), the ``tools=[]`` decision agent, and the two R4-B strategy
+# surfaces an agent's intent path DIRECTLY touches — the ``execution_adapter`` (typed R4-B intent ->
+# high-level facade request; SEC-003) and the ``assembler`` (quote assembly from observations;
+# SEC-003). Everything an agent / the R4-B intent path DIRECTLY touches lives here; the money-network
+# runner is imported LAZILY behind the boundary and is intentionally NOT in this set (see the SCOPE
+# note above). ``veridex.runtime`` (the privileged runner) is deliberately NOT listed — it is created
+# by E7-T4 and the audit ``import_module``s each name, so listing it early would ModuleNotFoundError.
+_AGENT_FACING_MODULES = (
+    "veridex.dust_execution.facade",
+    "veridex.runtime.agent",
+    "veridex.mm_strategy.execution_adapter",
+    "veridex.mm_strategy.assembler",
+)
 
 # Forbidden as EXACT imported symbol names: raw venue write methods + a wire-capable/key-export signer
 # surface + local-key crypto (reuses the E3-T7 no-local-key set for the crypto surfaces).
