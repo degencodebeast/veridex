@@ -177,6 +177,11 @@ def _accept(
         # watermark): the row-R ``phase`` transition compares the NEXT frame against this value, and
         # a reset frame re-baselines it to its own phase so a reconnect never spuriously re-triggers.
         "last_phase": observation.phase,
+        # Advance the REQ-080 suspension watermark identically (the UNIVERSAL match-state leg,
+        # REQ-020(d)): the row-R suspension→reopen transition compares the NEXT frame against this
+        # value, and a reset frame (including the reopen itself) re-baselines it to its own
+        # ``suspended`` so the reopen is never re-triggered on the following frame.
+        "last_suspended": observation.suspended,
     }
     if full_reset:
         update.update(
@@ -235,11 +240,15 @@ def _guard_epoch_delta(
 # E4-T2 completes the REQ-080 venue-book set that reads PRIOR-state references: the ``phase``
 # transition (row R, via ``_phase_transition`` + the ``last_phase`` watermark) and the WARM-reference
 # ratio/jump/floor events (depth-vanish, spread-blowout, mid-jump, level-count floor — row E, via
-# ``_venue_event_reason``, gated behind ``_references_warm``). ``market_status`` / stream / projection
-# stay OUT of the trigger set — they are QUOTE-ONLY blockers (REQ-070/026/097). The remaining REQ-080
-# reset variants (gap-episode END, suspension→reopen) and the cancel/intent PLAN wiring stay for later
-# E4 tasks; they slot into the SAME row-E / row-R branches without reshaping this reducer. The row-H
-# quote here is the eligible DecisionKind CLASS only — E4 fills anchor/zones/prices and the intent plan.
+# ``_venue_event_reason``, gated behind ``_references_warm``). The UNIVERSAL match-state ``suspended``
+# leg (REQ-020(d)/REQ-080) is wired identically in BOTH arms: a ``suspended==True`` frame is the
+# QUOTE-ONLY gate ``txline_suspended`` (:func:`_suspended_block_reason`, on the universal row-H path,
+# OUTSIDE the guard block), and a suspension→reopen (True→False) is a row-R RESET (via
+# ``_suspension_reopen`` + the ``last_suspended`` watermark) — the Gate #4 F-CRITICAL-1 fix that made
+# the leg universal rather than guard-scoped. ``market_status`` / stream / projection stay OUT of the
+# trigger set — they are QUOTE-ONLY blockers (REQ-070/026/097). The remaining REQ-080 reset variant
+# (gap-episode END) stays for a later task; it slots into the SAME row-R branch without reshaping this
+# reducer. The row-H quote here is the eligible DecisionKind CLASS only.
 
 # The seven ACCEPTED-frame rows (row S/STALE is the watermark layer's reject rows, upstream — it
 # never reaches ``_classify_row``). Pinning this as a `Literal`, like every other closed vocabulary
@@ -310,16 +319,33 @@ def _phase_transition(observation: StrategyObservation, state: StrategyState) ->
     return state.last_phase is not None and observation.phase != state.last_phase
 
 
+def _suspension_reopen(observation: StrategyObservation, state: StrategyState) -> bool:
+    """REQ-080 RESET-class (row R) trigger: the match-state ``suspended`` flag transitioned
+    True→False vs the PRIOR accepted frame carried on ``state.last_suspended`` — the match REOPENING
+    after a suspension. The UNIVERSAL match-state leg (REQ-020(d)) drives this IDENTICALLY in both
+    ablation arms (never the guard leg), so the reopen reset is arm-symmetric (AC-051). A fresh /
+    cold-start / reset state (``last_suspended is None``) has no prior value to compare, so the first
+    accepted frame merely SEEDS the watermark — never a spurious reopen reset. Only True→False
+    triggers: going INTO a suspension (False→True) is the quote-gate (:func:`_suspended_block_reason`),
+    not a reset."""
+    return state.last_suspended is True and observation.suspended is False
+
+
 def _reset_reason(observation: StrategyObservation, state: StrategyState) -> ReasonCode:
-    """The truthful reset reason for an ACCEPTED-frame row-R trigger (REQ-033/036/080). The two
+    """The truthful reset reason for an ACCEPTED-frame row-R trigger (REQ-033/036/080). The three
     reset-class triggers detectable from a single accepted frame + prior state are the in-stream
-    ``tick_regime_changed`` signal and a match-state ``phase`` transition; ``tick_regime_changed``
-    takes precedence when both hold. (The book-epoch RECONNECT reset carries its own truthful
-    ``event_ref_warmup`` reason on the upstream path — this observation never saw a tick regime
-    change, REQ-036 — so it is NEVER routed through here.)"""
+    ``tick_regime_changed`` signal, a match-state ``phase`` transition, and a match-state
+    suspension→reopen (:func:`_suspension_reopen`); ``tick_regime_changed`` then ``phase`` take
+    precedence when several hold. A suspension→reopen carries the generic reset/warmup reason
+    ``event_ref_warmup`` (REQ-036 — a reset yields NO_QUOTE(``event_ref_warmup``); the closed §4.4
+    vocabulary has no dedicated reopen code and adding one is a spec revision, never task discretion),
+    the SAME truthful reset reason the book-epoch RECONNECT reset records. (That RECONNECT reset
+    carries its ``event_ref_warmup`` reason on the upstream path and is never routed through here.)"""
     if observation.tick_regime_changed:
         return "tick_regime_changed"
-    return "phase_transition"
+    if _phase_transition(observation, state):
+        return "phase_transition"
+    return "event_ref_warmup"
 
 
 def _venue_event_reason(
@@ -387,7 +413,11 @@ def _classify_row(
     randomness — so decision identity reproduces. (Row S is handled upstream by the watermark layer
     and never reaches here.)
     """
-    if observation.tick_regime_changed or _phase_transition(observation, state):
+    if (
+        observation.tick_regime_changed
+        or _phase_transition(observation, state)
+        or _suspension_reopen(observation, state)
+    ):
         return "R"
     if observation.book_status in ("gap", "excluded"):
         return "E"
@@ -454,6 +484,27 @@ def _token_mapping_reason(observation: StrategyObservation) -> ReasonCode | None
     watermark — the venue accumulators keyed on the present ``(market_ref, side)`` still train."""
     if not observation.token_id.strip():
         return "token_mapping_missing"
+    return None
+
+
+def _suspended_block_reason(observation: StrategyObservation) -> ReasonCode | None:
+    """The UNIVERSAL match-state suspension quote-blocker reason, or ``None`` when the match is live.
+
+    REQ-080 / REQ-020(d): match-state ``suspended`` is the UNIVERSAL leg — it gates quoting IDENTICALLY
+    in both ablation arms (never the guard leg), so this reads ``observation.suspended`` ALONE and is
+    applied on the UNIVERSAL quote path (:func:`_apply_healthy`), OUTSIDE the guard block. A suspended
+    frame is NO_QUOTE(``txline_suspended``) — resting a maker quote INTO a suspended match is the
+    archetypal adverse-selection event this lane's event-protection doctrine exists to prevent, and it
+    must fire in the baseline arm too (the Gate #4 F-CRITICAL-1 defect: the leg was guard-SCOPED, so
+    the baseline arm quoted two-sided into the suspension while the guarded arm abstained — arm-
+    ASYMMETRIC). Like the ``market_status`` / stream gates it is a QUOTE-ONLY blocker (never admission,
+    never cooldown): a suspended frame still trains the venue accumulators, and the REQ-033 reset fires
+    on the suspension→reopen transition (:func:`_suspension_reopen`, row R), not here. The reason is the
+    closed §4.4 ``txline_suspended`` — the guard's own suspension check (:func:`_guard_fv_block_reason`)
+    reports the SAME code, so the two paths stay consistent; the difference is that the gate is now
+    UNIVERSAL, not guard-scoped."""
+    if observation.suspended:
+        return "txline_suspended"
     return None
 
 
@@ -1186,10 +1237,12 @@ def _apply_healthy(
 
     * F (fv-epoch): guard inert until the basis re-warms → NO_QUOTE ``basis_warmup``.
     * W (warmup): references below floor → NO_QUOTE ``event_ref_warmup``.
-    * H (healthy): a QUOTE-ONLY blocker downgrades to ``NO_QUOTE`` first (admission unaffected) — a
-      missing/ambiguous outcome token (:func:`_token_mapping_reason`) PRE-EMPTS the status/stream
-      gate (its §4.4 vocabulary precedence: without a resolved venue token no order can be placed at
-      all); otherwise the venue-mid anchor + zone spine (:func:`_quote_disposition`) resolves the
+    * H (healthy): a QUOTE-ONLY blocker downgrades to ``NO_QUOTE`` first (admission unaffected), in
+      closed §4.4 vocabulary order — a missing/ambiguous outcome token (:func:`_token_mapping_reason`)
+      PRE-EMPTS the status/stream gate (without a resolved venue token no order can be placed at all),
+      then the UNIVERSAL match-state suspension gate (:func:`_suspended_block_reason`, ``txline_suspended``
+      — the REQ-080/REQ-020(d) leg, applied in BOTH arms outside the guard block); otherwise the
+      venue-mid anchor + zone spine (:func:`_quote_disposition`) resolves the
       eligible quote class (E4-T1; the guard + quote-math slots refine it in later E4 tasks). A
       resolved disposition whose priced legs already match the reconciled resting orders (side +
       price within ``price_epsilon``) SHORT-CIRCUITS to ``HOLD`` (``hold_unchanged``) with zero
@@ -1204,8 +1257,10 @@ def _apply_healthy(
         return _decide("NO_QUOTE", ("basis_warmup",)), next_state
     if row == "W":
         return _decide("NO_QUOTE", ("event_ref_warmup",)), next_state
-    blocker = _token_mapping_reason(observation) or _status_stream_reason(
-        observation, base, config
+    blocker = (
+        _token_mapping_reason(observation)
+        or _status_stream_reason(observation, base, config)
+        or _suspended_block_reason(observation)
     )
     if blocker is not None:
         return _decide("NO_QUOTE", (blocker,)), next_state

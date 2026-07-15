@@ -426,6 +426,14 @@ class StrategyState(_FrozenModel):
     # RESET-class (row R) event trigger. ``None`` (fresh/cold-start seed) has no prior phase to
     # compare, so the first accepted frame merely SEEDS this watermark — never a spurious reset.
     last_phase: int | None = None
+    # Last accepted match-state ``suspended`` flag (REQ-080 suspension→reopen row-R trigger; the
+    # UNIVERSAL match-state leg, REQ-020(d)). Mirrors ``last_phase``: the pure core carries the prior
+    # frame's ``suspended`` here and, on the NEXT accepted frame, a True→False transition (the match
+    # REOPENING) is a RESET-class (row R) event driven IDENTICALLY in both arms (never the guard leg).
+    # ``None`` (fresh/cold-start seed) has no prior value to compare, so the first accepted frame
+    # merely SEEDS this watermark — never a spurious reopen reset. FV-independent, so a guard-off state
+    # carries the SAME value across FV health (byte-identity across FV feeds holds — AC-051/056).
+    last_suspended: bool | None = None
     # Per-outcome accumulators + audit echo + quote lineage.
     outcomes: tuple[OutcomeAccumulator, ...] = ()
     inventory_echo: InventoryProjection | None = None
