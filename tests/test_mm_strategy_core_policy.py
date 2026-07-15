@@ -1276,3 +1276,133 @@ def test_epsilon_hold_zone() -> None:
     assert d_outside.kind == "QUOTE_TWO_SIDED"
     assert len(d_outside.intent_plan) == 2
     assert d_outside.reason_codes == ()
+
+
+# --- E5-T3: NO_QUOTE cancellation + single-phase plans (REQ-090/092; AC-016/018/019; RED-14/48) ---
+# The cancel-intent FUNNEL: every NO_QUOTE-with-exposure decision (whatever the underlying cause —
+# HALTED/CLOSED, a reset/event trigger, an extreme residual, reduce_conflict, a missing token
+# mapping, a boundary/band/stream/warmup block) compiles to the SINGLE-PHASE cancel plan
+# (``cancel_all_orders`` then ``abstain``, ``cancel_exposure_first``). A NO_QUOTE with NO resting
+# exposure emits nothing — ``no_quote`` alone is NEVER mistaken for a cancel. Placement plans stay
+# placement-only (fixed reduce→bid→ask ordering); no plan ever mixes a cancel and a place leg.
+
+
+# The canonical single-plan leg ordering (REQ-092): reduce before bid before ask. A cancel plan has
+# no placement legs; a placement plan has no cancel leg — the two phases are mutually exclusive.
+_LEG_ROLE_ORDER = {"reduce": 0, "bid": 1, "ask": 2}
+
+
+def _plan_kinds(decision: object) -> list[str]:
+    """The ordered ``kind`` of each intent in a decision's plan."""
+    return [leg.kind for leg in decision.intent_plan]  # type: ignore[attr-defined]
+
+
+def test_no_quote_with_exposure_cancels_then_abstains() -> None:
+    # AC-018 / RED-14: a NO_QUOTE decision that leaves resting exposure compiles to the single-phase
+    # cancel plan — ``cancel_all_orders`` THEN ``abstain`` (in that order) — and records
+    # ``cancel_exposure_first`` alongside the truthful underlying cause. R4-A has no bare single-order
+    # cancel: the honest churn is cancel-all + requote on the NEXT decision.
+    config = _config()
+    state = _warm_state()
+    exposure = (_resting("bid", 0.40), _resting("ask", 0.60))
+
+    # HALTED market over a warm, in-band book → NO_QUOTE(market_halted); with exposure it funnels.
+    d_halt, _ = decide(_obs(market_status="HALTED", resting=exposure), state, config)
+    assert d_halt.kind == "NO_QUOTE"
+    # The truthful cause is PRESERVED and ``cancel_exposure_first`` is appended (never replacing it).
+    assert d_halt.reason_codes == ("market_halted", "cancel_exposure_first")
+    assert _plan_kinds(d_halt) == ["cancel_all_orders", "abstain"]
+    # Single-phase: a cancel plan carries NO placement leg.
+    assert all(leg.kind != "place_quote" for leg in d_halt.intent_plan)
+
+    # The funnel is UNIVERSAL — a DIFFERENT NO_QUOTE cause (a degraded order stream) over the SAME
+    # exposure produces the SAME cancel plan; the cause code differs but the compiled plan does not.
+    d_stream, _ = decide(_obs(order_stream_ok=False, resting=exposure), state, config)
+    assert d_stream.kind == "NO_QUOTE"
+    assert d_stream.reason_codes == ("stream_degraded", "cancel_exposure_first")
+    assert _plan_kinds(d_stream) == ["cancel_all_orders", "abstain"]
+
+    # A THIRD cause (an out-of-boundary anchor) over exposure — still the same single-phase cancel.
+    boundary_state = state.model_copy(update={"smoother_mid": 0.02})
+    d_boundary, _ = decide(
+        _obs(bid=0.01, ask=0.03, resting=exposure), boundary_state, config
+    )
+    assert d_boundary.kind == "NO_QUOTE"
+    assert d_boundary.reason_codes == ("boundary_zone", "cancel_exposure_first")
+    assert _plan_kinds(d_boundary) == ["cancel_all_orders", "abstain"]
+
+
+def test_no_quote_no_exposure_zero_intents() -> None:
+    # AC-019: a NO_QUOTE with NO resting orders emits ZERO intents — ``no_quote`` alone is never a
+    # cancel. The cause code stands unadorned (no ``cancel_exposure_first``, nothing to cancel).
+    config = _config()
+    state = _warm_state()
+
+    d_halt, _ = decide(_obs(market_status="HALTED", resting=()), state, config)
+    assert d_halt.kind == "NO_QUOTE"
+    assert d_halt.reason_codes == ("market_halted",)
+    assert d_halt.intent_plan == ()
+
+    # A second cause with no exposure — also zero intents (not a cancel).
+    d_stream, _ = decide(_obs(order_stream_ok=False, resting=()), state, config)
+    assert d_stream.kind == "NO_QUOTE"
+    assert d_stream.reason_codes == ("stream_degraded",)
+    assert d_stream.intent_plan == ()
+
+
+def test_plan_is_single_phase_never_mixed() -> None:
+    # RED-48: across EVERY plan-bearing disposition — a two-sided placement, a one-sided inventory
+    # reduce, and a NO_QUOTE-with-exposure cancel — no plan contains BOTH a cancel-kind intent AND a
+    # ``place_quote`` intent. Cancel-phase legs XOR placement-phase legs, never both.
+    config = _config()
+    state = _warm_state()
+    exposure = (_resting("bid", 0.40), _resting("ask", 0.60))
+
+    # A two-sided placement whose resting orders DIFFER (so churn suppression does not HOLD): a real
+    # placement plan with both priced legs — placement-phase only.
+    d_two = decide(
+        _obs(bid=0.49, ask=0.51, resting=(_resting("bid", 0.10), _resting("ask", 0.90))),
+        state,
+        config,
+    )[0]
+    assert d_two.kind == "QUOTE_TWO_SIDED"
+
+    # A one-sided inventory reduce (net LONG over the soft limit) WITH resting exposure — still
+    # placement-phase only (the reduce leg), never a cancel mixed in.
+    d_reduce = decide(
+        _obs(bid=0.49, ask=0.51, net_position=0.6, resting=exposure), state, config
+    )[0]
+    assert d_reduce.kind == "ONE_SIDED_REDUCE"
+
+    # A NO_QUOTE with exposure — cancel-phase only.
+    d_cancel = decide(_obs(market_status="HALTED", resting=exposure), state, config)[0]
+    assert d_cancel.kind == "NO_QUOTE"
+
+    for decision in (d_two, d_reduce, d_cancel):
+        kinds = _plan_kinds(decision)
+        has_cancel = "cancel_all_orders" in kinds
+        has_place = "place_quote" in kinds
+        assert not (has_cancel and has_place), f"plan mixes cancel + place: {kinds}"
+
+
+def test_two_sided_ordered_no_atomicity_claim() -> None:
+    # AC-016: a two-sided placement plan orders its legs reduce→bid→ask (here bid then ask — a
+    # two-sided plan has no reduce leg), and the plan makes NO atomicity claim: the legs are
+    # independent ``place_quote`` intents sequenced in a plain tuple, not a single atomic op.
+    config = _config()
+    state = _warm_state()
+
+    decision, _ = decide(_obs(bid=0.49, ask=0.51), state, config)
+    assert decision.kind == "QUOTE_TWO_SIDED"
+
+    roles = [leg.leg_role for leg in decision.intent_plan]
+    assert roles == ["bid", "ask"]
+    # The ordering obeys the fixed reduce(0) < bid(1) < ask(2) rank — never a nondeterministic order.
+    ranks = [_LEG_ROLE_ORDER[role] for role in roles if role is not None]
+    assert ranks == sorted(ranks)
+
+    # No atomicity claim: each leg is an independent ``place_quote`` intent, and the decision carries
+    # no atomic/batch flag — the plan is a plain sequence, executed leg-by-leg by the R4-A adapter.
+    assert all(leg.kind == "place_quote" for leg in decision.intent_plan)
+    assert not hasattr(decision, "atomic")
+    assert not hasattr(decision, "atomic_plan")

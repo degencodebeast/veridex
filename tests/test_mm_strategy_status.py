@@ -361,9 +361,11 @@ def test_byte_identical_obs_differ_only_by_status_differ_in_eligibility() -> Non
 
 
 def test_halted_closed_cancel_never_place() -> None:
-    # HALTED / CLOSED never yield a placing decision: the gate emits NO_QUOTE with the status reason
-    # E4's cancel-on-exposure planner keys off. (The cancel-plan INTENT is E4's; E3-T6 pins that no
-    # fresh write is ever eligible under a halted/closed market, exposure or not.)
+    # HALTED / CLOSED never yield a placing decision: the gate emits NO_QUOTE with the status reason,
+    # and — with exposure resting — E5-T3's cancel funnel compiles that into the single-phase cancel
+    # plan (``cancel_all_orders`` then ``abstain``, ``cancel_exposure_first``) that WITHDRAWS the
+    # exposure. (E3-T6 pinned that no fresh write is ever eligible under a halted/closed market,
+    # exposure or not; E5-T3 now supplies the deferred cancel-plan INTENT — still never a place.)
     config = _config()
     state = _warm_state(last_market_status_epoch=1, last_market_status_recv_ts=1)
     for status, reason in (("HALTED", "market_halted"), ("CLOSED", "market_closed")):
@@ -377,5 +379,13 @@ def test_halted_closed_cancel_never_place() -> None:
         )
         decision, _ = decide(obs, state, config)
         assert decision.kind == "NO_QUOTE", status
-        assert decision.reason_codes == (reason,), status
+        # The truthful status cause is preserved; the cancel funnel appends ``cancel_exposure_first``.
+        assert decision.reason_codes == (reason, "cancel_exposure_first"), status
+        # The exposure is actively withdrawn: cancel-ALL then abstain — never a place under
+        # HALTED/CLOSED, and the plan is single-phase (no ``place_quote`` leg mixed in).
+        assert [leg.kind for leg in decision.intent_plan] == [
+            "cancel_all_orders",
+            "abstain",
+        ], status
+        assert all(leg.kind != "place_quote" for leg in decision.intent_plan), status
         assert decision.kind != "QUOTE_TWO_SIDED"  # never a place under HALTED/CLOSED

@@ -1218,6 +1218,59 @@ def _apply_healthy(
     return disposition, next_state
 
 
+# --- The E5-T3 cancel-intent funnel + single-phase invariant (REQ-090/092; AC-016/018/019) -------
+# R4-A has NO bare single-order cancel: the honest way to clear stale exposure is a cancel-ALL sweep
+# plus a requote on the NEXT decision. So a NO_QUOTE that leaves resting orders on the book is not a
+# passive abstention — it must actively withdraw that exposure. This is the ONE place every NO_QUOTE
+# cause (HALTED/CLOSED, reset/event trigger, extreme residual, reduce_conflict, boundary/band/stream/
+# warmup/token-mapping block) is funneled into the SAME cancel plan, so no cause needs to know about
+# cancellation. The single-phase invariant (REQ-092 / global constraint 17) is preserved BY
+# CONSTRUCTION: only a NO_QUOTE (whose ``intent_plan`` is always empty) is rewritten, and it is
+# rewritten to a cancel-ONLY plan — a placement disposition (QUOTE_*/ONE_SIDED_REDUCE) is never
+# touched, so cancel-phase legs and placement-phase legs can never coexist in one plan.
+
+
+def _cancel_exposure_plan() -> tuple[NeutralIntent, NeutralIntent]:
+    """The single-phase cancel plan for a NO_QUOTE that leaves resting exposure (REQ-090/092).
+
+    ``cancel_all_orders`` THEN ``abstain``, in that order — the cancel-ALL sweep withdraws every
+    resting order (R4-A exposes no single-order cancel), and the terminal ``abstain`` marks that this
+    decision proposes NO new placement (the requote, if any, is the NEXT decision). Both are
+    placement-free (``price=None``) and carry NO physical ``leg_role``: a cancel-all names no single
+    order, so it takes no per-leg ``client_order_id`` from :func:`_stamp_identity` (which stamps only
+    ``leg_role``-bearing legs). This is CANCEL-PHASE ONLY — it holds no ``place_quote`` leg, so a plan
+    built from it can never mix the two phases (REQ-092)."""
+    return (
+        NeutralIntent(kind="cancel_all_orders", leg_role=None),
+        NeutralIntent(kind="abstain", leg_role=None),
+    )
+
+
+def _funnel_cancel_on_exposure(
+    decision: StrategyDecision, observation: StrategyObservation
+) -> StrategyDecision:
+    """Compile a raw decision's ``intent_plan`` under the E5-T3 cancel funnel (REQ-090/092).
+
+    A NO_QUOTE that leaves resting exposure (the observation's ``InventoryProjection`` holds any
+    ``RestingOrderView``) is rewritten to the single-phase cancel plan (:func:`_cancel_exposure_plan`)
+    with ``cancel_exposure_first`` APPENDED to the truthful cause codes — the underlying reason
+    (``market_halted`` / ``boundary_zone`` / …) is preserved, never replaced, so provenance still
+    names WHY quoting stopped. A NO_QUOTE with NO resting exposure is left untouched (zero intents —
+    ``no_quote`` alone is never a cancel), and every placement disposition (QUOTE_*/ONE_SIDED_REDUCE)
+    and the churn-suppression HOLD pass through unchanged: only a NO_QUOTE is ever rewritten, and only
+    ever to a cancel-ONLY plan, so the single-phase invariant is preserved by construction (REQ-092).
+    Pure over ``(decision.kind, decision.reason_codes, observation.inventory.resting)`` — no clock, no
+    rng — and it reads no guard/FV field, so the E3-T4 guard-off byte-identity is unaffected."""
+    if decision.kind != "NO_QUOTE" or not observation.inventory.resting:
+        return decision
+    return decision.model_copy(
+        update={
+            "reason_codes": decision.reason_codes + ("cancel_exposure_first",),
+            "intent_plan": _cancel_exposure_plan(),
+        }
+    )
+
+
 def _stamp_identity(
     decision: StrategyDecision,
     observation: StrategyObservation,
@@ -1285,16 +1338,23 @@ def decide(
 ) -> tuple[StrategyDecision, StrategyState]:
     """Evaluate the reducer and return an IDENTITY-STAMPED ``(decision, next_state)`` (pure, total).
 
-    Thin identity wrapper over :func:`_decide_raw` (the watermark precondition layer + S/R/E/D/C/F/W/H
-    reducer): it runs the raw reducer once, then :func:`_stamp_identity` binds the deterministic
-    ``decision_id`` + per-leg ``client_order_id``s + the four causal hashes onto the single returned
-    decision — one choke point so EVERY branch's decision is stamped identically (REQ-025/095/AC-022).
+    Thin wrapper over :func:`_decide_raw` (the watermark precondition layer + S/R/E/D/C/F/W/H
+    reducer): it runs the raw reducer once, then :func:`_funnel_cancel_on_exposure` compiles the final
+    ``intent_plan`` (a NO_QUOTE that leaves resting exposure becomes the single-phase cancel plan;
+    REQ-090/092), and finally :func:`_stamp_identity` binds the deterministic ``decision_id`` + per-leg
+    ``client_order_id``s + the four causal hashes onto the single returned decision — one choke point
+    so EVERY branch's decision is compiled and stamped identically (REQ-025/090/092/095/AC-022).
 
     ``session_id`` is the per-run identity seam bound into ``decision_id``; it is keyword-only with an
     empty default so the pure fixtures / replay callers that pass only ``(observation, state, config)``
     are unaffected, while the orchestration layer supplies the real session when it wires the run loop.
     """
     decision, next_state = _decide_raw(observation, state, config)
+    # E5-T3 plan compilation: funnel a NO_QUOTE-with-exposure into the single-phase cancel plan
+    # BEFORE stamping, so the returned decision carries the compiled ``intent_plan`` and its identity
+    # is bound over the final plan. The funnel never touches ``next_state`` or the decision's causal
+    # hashes, so ``decision_id`` (computed from observation/config/prior-state) is unchanged.
+    decision = _funnel_cancel_on_exposure(decision, observation)
     stamped = _stamp_identity(
         decision, observation, state, next_state, config, session_id
     )
