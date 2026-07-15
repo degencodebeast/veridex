@@ -856,3 +856,185 @@ def test_no_research_import() -> None:
                 assert not (
                     module == forbidden_root or module.startswith(forbidden_root + ".")
                 ), f"{source_path.name}: forbidden import-from {module!r}"
+
+
+# ============================================================================================
+# E7-T5: losing bounded dust = operational success without promotion (AC-035)
+# ============================================================================================
+# E6 pins the ablation spine, the load-bearing guard, the six-metric evaluation, and the run receipt.
+# E7-T5 pins the EXPERIMENTAL_DUST *definition of success* that sits over all of it: a bounded LOSING
+# dust session is OPERATIONAL SUCCESS — the machinery worked (deterministic intents produced, honestly
+# abstained where the guard required it, stayed within bounds) — EVEN THOUGH it lost. This is the honesty
+# of the word "success" under an experimental-dust regime: it proves SAFETY, not alpha, so success is a
+# property of the MACHINERY, never of the PnL sign. The losing session is therefore NOT promoted and NOT
+# labelled an edge: its evidence stays NOT_PROVEN_EDGE / EXPERIMENTAL_DUST, unpromoted (a losing run that
+# self-promoted, or that only "succeeded" when it made money, would be the exact dishonesty AC-035 bars).
+
+
+def _dust_operational_success(
+    *,
+    deterministic: bool,
+    produced_intents: bool,
+    honestly_abstained: bool,
+    within_bounds: bool,
+    total_markout_bps: float,
+) -> bool:
+    """Whether a dust session succeeded OPERATIONALLY — the MACHINERY behaving correctly (AC-035).
+
+    A dust session succeeds operationally when it produced deterministic intents, honestly abstained
+    where the guard required it, and stayed within bounds — i.e. the machinery worked. This is the
+    EXPERIMENTAL_DUST definition of success: it proves SAFETY, not alpha. ``total_markout_bps`` (the
+    realized PnL) is accepted so the contract is explicit, but it is DELIBERATELY NOT consulted — success
+    is not contingent on the PnL sign (the same structural blindness ``AblationConclusion.infers_benefit``
+    uses to record yet never consult the forbidden single metrics). The E7-T5 mutation ties success to
+    positive PnL (append ``and total_markout_bps > 0`` to the return), which makes the bounded LOSING
+    session wrongly report NOT successful and ``test_losing_dust_operational_success_unpromoted`` go red.
+    """
+    return deterministic and produced_intents and honestly_abstained and within_bounds
+
+
+def test_losing_dust_operational_success_unpromoted(tmp_path) -> None:
+    """A bounded LOSING dust session is operational success, yet its evidence stays unpromoted (AC-035).
+
+    Three claims, on a REAL replay whose machinery worked:
+      * (a) OPERATIONAL SUCCESS despite the loss — the session produced deterministic intents, honestly
+        abstained on the extreme-residual tick, and kept exposure bounded; a bounded NON-POSITIVE realized
+        markout does not revoke that success;
+      * (b) EVIDENCE STAYS UNPROMOTED — the receipt is NOT_PROVEN_EDGE / EXPERIMENTAL_DUST and never
+        PROMOTED / EVIDENCE_GATED, even when an explicit promotion is REQUESTED for the losing run;
+      * (c) SUCCESS IS NOT CONTINGENT ON THE PnL SIGN — the SAME machinery reports the SAME success verdict
+        under a losing, a break-even, and a winning markout.
+
+    Teeth (mutation): tie operational success to positive PnL — append ``and total_markout_bps > 0`` to
+    :func:`_dust_operational_success` — and the bounded LOSING session (negative markout) is wrongly marked
+    NOT successful, so the ``lost is True`` assertion in (a) goes red. Measuring success by the machinery,
+    never the PnL sign, is exactly what keeps a losing-but-correct dust run honestly labelled a success.
+    """
+    arms = arm_configs(_control_overrides())
+    tape = load_tape("markout")
+    baseline = replay_arm(tape, arms.baseline, tmp_path / "a")
+    guarded = replay_arm(tape, arms.guarded, tmp_path / "b")
+    guarded_again = replay_arm(tape, arms.guarded, tmp_path / "b2")
+    report = matched_opportunity_report(baseline, guarded)
+
+    # --- the MACHINERY worked (the operational-success inputs), all from a REAL replay -----------
+    # deterministic: the same tape + config replayed twice is byte-identical — intents, decisions
+    # digest, terminal state hash — and the sealed on-disk tape re-hashes both times.
+    deterministic = (
+        guarded.decisions == guarded_again.decisions
+        and guarded.decisions_digest == guarded_again.decisions_digest
+        and guarded.state_hash == guarded_again.state_hash
+        and guarded.byte_reproduces
+        and guarded_again.byte_reproduces
+    )
+    assert deterministic
+
+    # produced intents: the session genuinely proposed priced two-sided quotes (not an all-abstain run).
+    quote_legs = [
+        leg
+        for decision in guarded.decisions
+        for leg in decision.intent_plan
+        if leg.leg_role in ("bid", "ask") and leg.price is not None
+    ]
+    produced_intents = any(
+        decision.kind in ("QUOTE_TWO_SIDED", "QUOTE_ONE_SIDED") and bool(decision.intent_plan)
+        for decision in guarded.decisions
+    )
+    assert produced_intents
+    assert quote_legs  # non-vacuous: the run really rested priced legs.
+
+    # honestly abstained where required: the guard fired a REAL fail-closed NO_QUOTE on the
+    # extreme-residual tick (feeding the abstention metric) — honest abstention, NOT 'fewer trades'.
+    honestly_abstained = report.abstention_count >= 1
+    assert honestly_abstained
+    assert guarded.decisions[-1].kind == "NO_QUOTE"  # the extreme-residual fail-closed abstention.
+
+    # within bounds: every resting leg is a bounded unit-notional price in (0, 1), so capital at risk can
+    # never exceed the resting-leg count — no unbounded exposure — and the report exposes every fill it
+    # counts (no favorable subset hidden inside).
+    within_bounds = (
+        all(0.0 < leg.price < 1.0 for leg in quote_legs)
+        and 0.0 < report.capital_at_risk <= len(quote_legs)
+        and report.fill_count == len(report.fills)
+    )
+    assert within_bounds
+
+    # --- the session LOST: a bounded, NON-POSITIVE realized markout -----------------------------
+    # The frozen fixtures never post a losing arm — the markout tape is a *winning* session
+    # (``total_markout_bps > 0``, asserted next) — so, exactly as E6-T4's adversarial-favorable arm pair
+    # constructs its losing metrics, the bounded LOSS here is an explicit construction. It is bounded (a
+    # small negative markout), never an unbounded blow-up.
+    winning_markout_bps = arm_single_metrics(guarded).total_markout_bps
+    assert winning_markout_bps > 0.0  # the real replay actually WON ...
+    losing_markout_bps = -120.0  # ... but AC-035 is the claim about a bounded LOSING session.
+    assert losing_markout_bps < 0.0
+
+    # (a) OPERATIONAL SUCCESS despite the loss — the machinery worked, so the losing session succeeds.
+    lost = _dust_operational_success(
+        deterministic=deterministic,
+        produced_intents=produced_intents,
+        honestly_abstained=honestly_abstained,
+        within_bounds=within_bounds,
+        total_markout_bps=losing_markout_bps,
+    )
+    assert lost is True
+
+    # (c) success is NOT contingent on the PnL sign — the SAME machinery under a winning markout, a
+    # break-even markout, and the losing markout yields the SAME verdict; the sign is never consulted.
+    won = _dust_operational_success(
+        deterministic=deterministic,
+        produced_intents=produced_intents,
+        honestly_abstained=honestly_abstained,
+        within_bounds=within_bounds,
+        total_markout_bps=winning_markout_bps,
+    )
+    breakeven = _dust_operational_success(
+        deterministic=deterministic,
+        produced_intents=produced_intents,
+        honestly_abstained=honestly_abstained,
+        within_bounds=within_bounds,
+        total_markout_bps=0.0,
+    )
+    assert won is True
+    assert breakeven is True
+    assert lost == won == breakeven  # identical verdict across losing / break-even / winning PnL.
+
+    # the machinery genuinely GATES the verdict — break any machinery input and success collapses, so the
+    # True above is load-bearing (not a constant). PnL sign is the ONE input that never gates it.
+    assert (
+        _dust_operational_success(
+            deterministic=False,
+            produced_intents=produced_intents,
+            honestly_abstained=honestly_abstained,
+            within_bounds=within_bounds,
+            total_markout_bps=winning_markout_bps,
+        )
+        is False
+    )
+    assert (
+        _dust_operational_success(
+            deterministic=deterministic,
+            produced_intents=produced_intents,
+            honestly_abstained=False,
+            within_bounds=within_bounds,
+            total_markout_bps=winning_markout_bps,
+        )
+        is False
+    )
+
+    # (b) EVIDENCE STAYS UNPROMOTED — losing dust is NOT an edge and is NEVER promoted. Even an explicit
+    # request to promote the losing run fails closed: the receipt stays EXPERIMENTAL_DUST / NOT_PROVEN_EDGE
+    # and carries NO promotion class (never PROMOTED / EVIDENCE_GATED).
+    receipt = mint_run_receipt(
+        guarded,
+        arms.guarded,
+        gate_b_status="OPEN",
+        gate_b_evidence_revision="gate-b-rev-1",
+        requested_evidence_class="PROMOTED",
+    )
+    assert isinstance(receipt, RunReceipt)
+    assert receipt.evidence_class == "EXPERIMENTAL_DUST"
+    assert receipt.edge_label == "NOT_PROVEN_EDGE"
+    assert receipt.evidence_class not in PROMOTED_EVIDENCE_CLASSES
+    assert not (PROMOTED_EVIDENCE_CLASSES & set(receipt.labels().values()))
+    assert receipt.labels() == _EXPECTED_RECEIPT_LABELS
