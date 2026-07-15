@@ -647,11 +647,15 @@ from veridex.venues.sx_bet import FakeVenueAdapter  # noqa: E402
 # runner is imported LAZILY behind the boundary and is intentionally NOT in this set (see the SCOPE
 # note above). ``veridex.runtime`` (the privileged runner) is deliberately NOT listed — it is created
 # by E7-T4 and the audit ``import_module``s each name, so listing it early would ModuleNotFoundError.
+# E7-T4 APPEND: ``veridex.mm_strategy.runtime`` — the neutral InProcessRuntime seam — joins the set in
+# the task that CREATES it, closing the SEC-003 runtime leg (Fable-R2-MAJOR-3): the seam is held to the
+# SAME no-raw-write/signer/vendored-CLOB(/concrete-venue-adapter) import bar as the adapter/assembler.
 _AGENT_FACING_MODULES = (
     "veridex.dust_execution.facade",
     "veridex.runtime.agent",
     "veridex.mm_strategy.execution_adapter",
     "veridex.mm_strategy.assembler",
+    "veridex.mm_strategy.runtime",
 )
 
 # Forbidden as EXACT imported symbol names: raw venue write methods + a wire-capable/key-export signer
@@ -660,8 +664,13 @@ _AGENT_BOUNDARY_FORBIDDEN_NAMES = frozenset(
     {"submit_order", "cancel_order", "cancel_all_orders", "SignerBackedWriteSeam"}
 ) | _NO_LOCAL_KEY_BANNED
 
-# Forbidden as a case-insensitive SUBSTRING of any imported module PATH: the vendored CLOB client.
-_AGENT_BOUNDARY_FORBIDDEN_PATH_FRAGMENTS = ("_vendor", "polymarket_clob")
+# Forbidden as a case-insensitive SUBSTRING of any imported module PATH: the vendored CLOB client,
+# plus (E7-T4, SEC-003 runtime leg) the concrete SX Bet venue adapter module. ``veridex.venues.sx_bet``
+# is a LIVE venue-write handle (``SXBetAdapter``: submit/cancel + EIP-712 signer surface), so importing
+# it onto the agent-facing surface is a raw-write reach — flagged by the ``sx_bet`` module-path
+# fragment. Deliberately NOT ``venues.base``: the facade legitimately imports the provider-neutral
+# ``VenueAdapter`` Protocol TYPE from there under TYPE_CHECKING, which is not a write handle.
+_AGENT_BOUNDARY_FORBIDDEN_PATH_FRAGMENTS = ("_vendor", "polymarket_clob", "sx_bet")
 
 
 def _imported_surface_from_source(source: str) -> set[str]:
@@ -1049,3 +1058,43 @@ def test_scoped_negative_relabel_guard_is_noop_on_benign_input() -> None:
     reject_scoped_negative_relabel("keep it tiny")
     label = label_for_scoped_negative(sequence_no=1, recv_ts=1_000, requested_relabel="EXPERIMENTAL_DUST")
     assert label.evidence_class == "EXPERIMENTAL_DUST"
+
+
+# =====================================================================================
+# E7-T4 (SEC-002/003, REQ-120/121/122, §6 group 10): the neutral InProcessRuntime seam is held to the
+# agent-facing import bar (SEC-003 runtime leg), and the new ``sx_bet`` module-path fragment that
+# closes the concrete-venue-adapter reach has real teeth (positive control). The generic clean/leak
+# audit above ALREADY covers ``veridex.mm_strategy.runtime`` now that it is in ``_AGENT_FACING_MODULES``;
+# this appends the runtime-specific positive control the E7-T4 mutation (c) demands.
+# =====================================================================================
+
+
+def test_runtime_seam_is_clean_and_sx_bet_fragment_has_teeth() -> None:
+    # (1) The neutral runtime seam is in the audited set and its REAL import surface is clean — it
+    # imports no raw venue write / signer / vendored CLOB / concrete venue adapter (SEC-003 runtime leg).
+    assert "veridex.mm_strategy.runtime" in _AGENT_FACING_MODULES
+    runtime_mod = _importlib.import_module("veridex.mm_strategy.runtime")
+    runtime_surface = _imported_surface_from_source(_inspect.getsource(runtime_mod))
+    assert runtime_surface, "runtime seam yielded an empty import surface (anti-inert)"
+    assert not _agent_boundary_import_offenders(runtime_surface), (
+        "the neutral runtime seam must import no raw-write/signer/vendored-CLOB/venue-adapter surface"
+    )
+
+    # (2) Positive control / teeth (E7-T4 mutation (c)): a runtime that REALLY imports the concrete SX
+    # Bet venue adapter (a live submit/cancel + EIP-712 signer handle) IS caught by the new ``sx_bet``
+    # module-path fragment — so the mutation ``from veridex.venues.sx_bet import SXBetAdapter`` in
+    # runtime.py flips this audit RED. A fragment that catches nothing would be an inert guard.
+    leak_src = "from veridex.venues.sx_bet import SXBetAdapter\nSEAM = SXBetAdapter\n"
+    caught = _agent_boundary_import_offenders(_imported_surface_from_source(leak_src))
+    assert caught, "the sx_bet fragment must catch a concrete venue-adapter import (SEC-003 teeth)"
+    assert any("sx_bet" in c.lower() for c in caught), (
+        f"the SX Bet venue-adapter import path must be flagged by the sx_bet fragment: {caught}"
+    )
+
+    # (3) Negative control: ``veridex.venues.base`` (the provider-neutral VenueAdapter Protocol TYPE the
+    # facade legitimately imports under TYPE_CHECKING) is NOT flagged by the sx_bet fragment — the bar
+    # targets the concrete write adapter, never the neutral type the boundary is built from.
+    base_type_src = "from veridex.venues.base import VenueAdapter\n"
+    assert not _agent_boundary_import_offenders(_imported_surface_from_source(base_type_src)), (
+        "the sx_bet fragment must not false-trip on the provider-neutral VenueAdapter Protocol type"
+    )
