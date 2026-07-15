@@ -36,6 +36,7 @@ SAME import bar as the adapter/assembler by the ``_AGENT_FACING_MODULES`` audit 
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Callable
 from typing import Literal
 
@@ -53,6 +54,11 @@ from veridex.runtime.runtime_events import (
     RuntimeStatus,
     runtime_event,
 )
+
+#: OPS-boundary logger for CONTAINED sink failures — the SEPARATE, non-recursive channel used to
+#: report a throwing sink (never re-emit into the sink itself: that would recurse). Reporting here is
+#: itself best-effort and never propagates to the caller (REQ-122 / AC-034).
+logger = logging.getLogger(__name__)
 
 #: The default agent identity a seam stamps its OPS telemetry with when none is supplied — the pinned
 #: strategy id (matches ``StrategyConfig.strategy_id``). It is telemetry identity ONLY, never a policy
@@ -147,10 +153,28 @@ class InProcessRuntime:
     def _emit(self, event: RuntimeEvent) -> None:
         """Best-effort OPS emission: hand the event to the sink, or drop it if none is wired.
 
-        Emission is NON-load-bearing — a correct decision never depends on the sink (REQ-122).
+        Emission is NON-load-bearing — a correct decision never depends on the sink (REQ-122 / AC-034).
+        This is the SINGLE chokepoint for every sink invocation (``decide`` AND the lifecycle façade),
+        so containing the sink call here contains it everywhere.
+
+        A throwing sink is CONTAINED at this OPS boundary: the ``try`` wraps ONLY the sink call — never
+        the caller's decision computation — so a real bug in ``decide()`` still propagates, but a sink
+        whose backend is down can neither abort nor alter the returned ``(decision, next_state)``. The
+        failure is reported on a SEPARATE non-recursive channel (the module ``logger``); it is NEVER
+        re-emitted into the same sink (that would recurse) and NEVER re-raised to the caller.
         """
-        if self._sink is not None:
+        if self._sink is None:
+            return
+        try:
             self._sink(event)
+        except Exception:
+            # OPS telemetry is best-effort: swallow ANY sink failure (RuntimeError, connection error,
+            # …) so telemetry can never gate policy availability. BaseException (KeyboardInterrupt /
+            # SystemExit) is deliberately NOT caught — those must still interrupt the process.
+            logger.warning(
+                "OPS telemetry sink raised on emit; dropping event (non-load-bearing, REQ-122)",
+                exc_info=True,
+            )
 
     def run_started(self, *, run_id: str | None = None) -> None:
         """Lifecycle façade: emit ``RUN_STARTED`` + ``STATUS_CHANGED(running)`` (OPS only)."""

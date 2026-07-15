@@ -180,6 +180,66 @@ def test_lifecycle_facade_emits_ops_only_events() -> None:
         assert event.agent_id == "agent-lc"
 
 
+def _throwing_sink() -> tuple[list[RuntimeEvent], Callable[[RuntimeEvent], None]]:
+    """An OPS sink that RECORDS each event then RAISES — models a sink whose backend is down.
+
+    Returns ``(seen, sink)`` where ``sink`` appends the event (proving it was reached) and THEN raises
+    ``RuntimeError`` — so a test can prove the seam CONTAINED the failure (``seen`` non-empty) rather
+    than merely skipped the sink call.
+    """
+    seen: list[RuntimeEvent] = []
+
+    def sink(event: RuntimeEvent) -> None:
+        seen.append(event)
+        raise RuntimeError("sink down")
+
+    return seen, sink
+
+
+def test_throwing_sink_does_not_abort_decision() -> None:
+    # IMPORTANT-3 (Gate #3): telemetry is best-effort / non-load-bearing (REQ-122 / AC-034). A sink
+    # that RAISES on emit must be CONTAINED at the OPS boundary — decide() must still return the
+    # byte-identical (decision, next_state) the DIRECT pure call produces, and the sink exception must
+    # NOT propagate out of decide(). Otherwise the telemetry channel controls the AVAILABILITY of the
+    # policy result despite being documented non-load-bearing.
+    observation = _obs()
+    config = _config(guard_enabled=False)
+    state = _warm_state()
+
+    direct_decision, direct_state = decide(observation, state, config, session_id="s")
+
+    seen, sink = _throwing_sink()
+    # The sink raises RuntimeError('sink down') on emit; the seam must swallow it at the OPS boundary
+    # and hand back the untouched policy result. (No assertRaises: a raised exception here IS the bug.)
+    seam_decision, seam_state = InProcessRuntime(sink=sink).decide(
+        observation, state, config, session_id="s", run_id="r1"
+    )
+
+    # Byte-identical decision/state despite the throwing sink — telemetry did not move or gate policy.
+    assert seam_decision.model_dump() == direct_decision.model_dump()
+    assert seam_state.model_dump() == direct_state.model_dump()
+    # Non-vacuity: the sink WAS actually reached (and raised) — proving containment, not a skipped emit.
+    assert seen, "the throwing sink must have been invoked (its failure contained, not skipped)"
+
+
+def test_throwing_sink_in_lifecycle_contained() -> None:
+    # IMPORTANT-3 (Gate #3): the SAME containment holds at EVERY sink invocation — the lifecycle façade
+    # (run_started / run_completed / run_failed) must not let a throwing sink propagate either, and a
+    # decide() through the same throwing sink stays contained and non-vacuous.
+    seen, sink = _throwing_sink()
+    runtime = InProcessRuntime(sink=sink, agent_id="agent-lc")
+
+    # None of these may raise, even though the sink raises on every emitted event.
+    runtime.run_started(run_id="r1")
+    runtime.run_completed(run_id="r1")
+    runtime.run_failed(run_id="r1", error="boom")
+
+    observation, config, state = _obs(), _config(), _warm_state()
+    decision, _ = runtime.decide(observation, state, config, session_id="s")
+    assert decision.observation_hash  # a real hash-stamped decision came back despite the throwing sink
+    assert seen, "the throwing sink must have been reached on the lifecycle/decide path (contained)"
+
+
 def test_null_sink_is_a_silent_noop() -> None:
     # With no sink wired, the seam is a silent pure pass-through — telemetry emission is best-effort
     # and never required for a correct decision (REQ-122: OPS is non-load-bearing).
