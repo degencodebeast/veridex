@@ -252,6 +252,49 @@ def test_execute_plan_fails_closed_on_mixed_plan_before_first_call() -> None:
     assert placement_result.frozen is False
 
 
+# --- Gate#3 MINOR-1: skipped_non_actionable vs frozen_by_prior_outcome ------------------------
+
+
+def test_clean_cancel_abstain_abstain_not_frozen() -> None:
+    """Gate#3 MINOR-1: in a clean ``(cancel_all_orders, abstain)`` plan the trailing ``abstain`` leg
+    was NEVER going to be attempted — it is ``skipped_non_actionable``, NOT frozen. Labeling a
+    non-actionable skip as a freeze corrupts per-leg audit semantics: ``plan.frozen`` is False yet the
+    abstain leg would have reported ``frozen == True`` under the old ``frozen == not attempted``."""
+    plan = (_cancel_leg(), NeutralIntent(kind="abstain", leg_role=None, price=None))
+    facade = _RecordingFakeFacade(results=[_result()])  # clean ABSTAINED cancel — non-freezing
+
+    result = execute_plan(plan, facade)
+
+    assert facade.call_count == 1  # only the cancel is actionable; the abstain is skipped
+    assert result.frozen is False  # plan not frozen — the cancel returned a clean result
+    cancel_outcome, abstain_outcome = result.outcomes
+    assert cancel_outcome.attempted is True
+    # The abstain leg: skipped because non-actionable, NOT frozen by a prior uncertain outcome.
+    assert abstain_outcome.attempted is False
+    assert abstain_outcome.frozen is False  # honest label — a skip is not a freeze
+    assert abstain_outcome.skipped_non_actionable is True
+    assert abstain_outcome.frozen_by_prior_outcome is False
+
+
+def test_uncertain_first_leg_freezes_subsequent() -> None:
+    """Gate#3 MINOR-1 (preserves the E5-T4 freeze semantics): an uncertain first leg FREEZES every
+    subsequent actionable leg — those are ``frozen_by_prior_outcome`` (``frozen == True``), a genuine
+    freeze, not a non-actionable skip. This is the freeze half the MINOR-1 relabeling must not weaken."""
+    plan = (_fresh_write("A"), _fresh_write("B"), _fresh_write("C"))
+    submitted = _result(admission="APPROVED", execution_status="SUBMITTED")  # uncertain ACK
+
+    result = execute_plan(plan, _RecordingFakeFacade(results=[submitted]))
+
+    assert result.frozen is True
+    attempted_leg, *frozen_legs = result.outcomes
+    assert attempted_leg.attempted is True
+    for frozen_leg in frozen_legs:  # B and C — actionable legs stopped by the prior freeze
+        assert frozen_leg.attempted is False
+        assert frozen_leg.frozen is True  # frozen by the prior uncertain outcome
+        assert frozen_leg.frozen_by_prior_outcome is True
+        assert frozen_leg.skipped_non_actionable is False
+
+
 # --- E5-T5: neutral→R4-A mapping + singular request + no size/take -----------------------------
 
 

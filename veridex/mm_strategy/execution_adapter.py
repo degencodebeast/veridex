@@ -114,9 +114,27 @@ class LegOutcome:
     attempted: bool
 
     @property
+    def skipped_non_actionable(self) -> bool:
+        """True when this leg was a NON-ACTIONABLE (``abstain``) leg that was NEVER going to reach the
+        wire (Gate#3 MINOR-1). Such a leg is skipped regardless of any freeze — it is NOT frozen. This
+        keys on the SAME :data:`_ACTIONABLE_KINDS` authority ``execute_plan`` uses to decide the skip,
+        so the label can never drift from the actual dispatch decision."""
+        return not self.attempted and self.leg.kind not in _ACTIONABLE_KINDS
+
+    @property
+    def frozen_by_prior_outcome(self) -> bool:
+        """True when an ACTIONABLE leg was FROZEN because a PRIOR leg returned an uncertain outcome
+        (Gate#3 MINOR-1 / REQ-093). An actionable leg is never left unattempted for any reason other
+        than the freeze, so an unattempted actionable leg is precisely a frozen-by-prior-outcome leg."""
+        return not self.attempted and self.leg.kind in _ACTIONABLE_KINDS
+
+    @property
     def frozen(self) -> bool:
-        """True when the leg was FROZEN (never attempted, no facade call)."""
-        return not self.attempted
+        """True when the leg was FROZEN by a prior uncertain outcome (Gate#3 MINOR-1). A non-actionable
+        ``abstain`` leg that was never going to be attempted is :attr:`skipped_non_actionable`, NOT
+        frozen — conflating the two corrupted per-leg audit semantics (a clean ``(cancel, abstain)``
+        plan reported ``plan.frozen == False`` yet its abstain leg reported ``frozen == True``)."""
+        return self.frozen_by_prior_outcome
 
     @property
     def possibly_unresolved(self) -> bool:
