@@ -28,24 +28,34 @@ import pytest
 
 from tests.mm_strategy_ablation_harness import (
     FIXTURES_DIR,
+    FORBIDDEN_REACH_NULLS,
     FORBIDDEN_SINGLE_METRICS,
     HARNESS_MODULE_PATH,
     MARKOUT_REFERENCE,
+    OBSERVED_MARKET_PRINT,
+    OWN_RECONCILED_FILL,
     PERMITTED_CONCLUSION_SHAPE,
     SIX_METRIC_KEYS,
+    TRIGGER_REASON_CODES,
     AblationConclusion,
     ArmSingleMetrics,
+    CounterfactualCapacityCeiling,
+    ForbiddenReachNullError,
     MarkoutReferenceError,
+    ObservedMarketPrint,
     ablation_conclusion,
     arm_configs,
     arm_single_metrics,
     config_field_diff,
+    counterfactual_capacity_ceiling,
     forbidden_import_hits,
     load_base_config_overrides,
     load_tape,
     matched_opportunity_report,
     neutralize_guard,
+    print_derived_trigger,
     replay_arm,
+    reviewed_reach_baseline,
     venue_future_mid_series,
 )
 
@@ -571,3 +581,128 @@ def test_fewer_trades_lower_loss_no_benefit_inference(tmp_path) -> None:
     )
     assert real_conclusion.shape == PERMITTED_CONCLUSION_SHAPE
     assert real_conclusion.infers_benefit() is False
+
+
+# ============================================================================================
+# E6-T5: print / reach / label honesty guards (REQ-115 / HON-002/004/005 / AC-028 / RED-28)
+# ============================================================================================
+# E6-T1..T4 pin the ablation spine, the load-bearing guard, and the six-metric evaluation. E6-T5 pins
+# the Gate B EXECUTION-EVIDENCE labeling seam that sits UNDER all of it: a third-party trade print is an
+# OBSERVED_MARKET_PRINT — an OBSERVATION of the market, NEVER our own fill / PnL / capacity / arrival
+# order (REQ-026/027/052). Three honesty seams, each made STRUCTURAL by the harness (not a runtime
+# check that could be bypassed):
+#   (1) our book-arrival timing is kept SEPARATE from third-party-print timing — conflating them would
+#       let a print masquerade as our own book event;
+#   (2) a raw reach % / a single print is structurally NOT a member of the closed REQ-080 venue-book
+#       trigger vocabulary (contracts.ReasonCode) and NEVER becomes our fill or feeds PnL;
+#   (3) counterfactual capacity is a RECOMPUTED CEILING (an upper bound from observed prints), never
+#       our realized fill / PnL / capacity; and a reach scored against a forbidden universal null
+#       (0.5, p/b) can never assert edge (REQ-054 / HON-004).
+# Private practitioner material (the privacy-locked quote/level-age anecdote) stays INTERNAL — it is
+# never surfaced as a field on the public diagnostic (HON-005).
+
+
+def test_raw_reach_or_print_cannot_become_trigger_or_fill() -> None:
+    """A raw reach % / a single third-party print is a diagnostic — NEVER a live trigger or our fill.
+
+    The AC-028 / RED-28 guard. A third-party trade print is an ``OBSERVED_MARKET_PRINT`` (Gate B
+    execution-evidence CEILING; REQ-026): an OBSERVATION of the market, not our own fill. This test
+    asserts, on a print observed OFFLINE:
+      * (label + timing) it wears the ``OBSERVED_MARKET_PRINT`` label — never ``OWN_RECONCILED_FILL`` —
+        and its print-observation timing is kept SEPARATE from our own book-arrival timing (distinct
+        fields, distinct values), so a print can never masquerade as our book event;
+      * (a) NO TRIGGER — neither the print nor its reach % is a member of the closed REQ-080 venue-book
+        trigger set, and :func:`print_derived_trigger` yields ``None``: a reach %/print cannot pull a
+        live quote;
+      * (b) NOT OUR FILL / NO PnL / NOT OUR CAPACITY — a print is never counted as our fill, never feeds
+        PnL, and the only capacity it informs is a RECOMPUTED counterfactual CEILING, never our capacity
+        (REQ-027).
+
+    Teeth (RED-28 mutation): let a reach % feed a quote trigger — return a real ``ReasonCode`` from
+    :func:`print_derived_trigger` keyed on ``mark.reach_fraction`` — and the ``print_derived_trigger(...)
+    is None`` assertion in branch (a) goes red. Scoring a reach %/print as a diagnostic (never a trigger)
+    is exactly what keeps it out of the quote decision.
+    """
+    # A third-party trade print, observed OFFLINE. Its print-observation timestamp is DISTINCT from our
+    # own book-arrival timestamp — a print is not our book event.
+    mark = ObservedMarketPrint(
+        price=0.53,
+        size=250.0,
+        print_recv_ts=1_000,
+        book_arrival_ts=1_050,
+        reach_fraction=0.42,
+    )
+
+    # (label) the print wears the Gate B ceiling label, never our-fill label.
+    assert mark.label == OBSERVED_MARKET_PRINT
+    assert mark.label != OWN_RECONCILED_FILL
+
+    # (timing) book-arrival vs third-party-print timing are SEPARATED — distinct fields AND values, so a
+    # third-party print can never be read as our own book event.
+    assert mark.book_arrival_ts != mark.print_recv_ts
+
+    # (a) NO TRIGGER: the print-derived trigger is None, and neither the print label nor its raw reach %
+    # is a member of the closed REQ-080 venue-book trigger vocabulary — a reach %/print cannot pull a
+    # live quote. This is the assertion the RED-28 mutation (a reach % feeding a trigger) breaks.
+    assert print_derived_trigger(mark) is None
+    # non-vacuity: the trigger set is genuinely the core's closed vocabulary (a REAL venue-book trigger
+    # IS a member) yet a raw reach %/print label is structurally NOT.
+    assert TRIGGER_REASON_CODES
+    assert "book_thin" in TRIGGER_REASON_CODES
+    assert OBSERVED_MARKET_PRINT not in TRIGGER_REASON_CODES
+    assert str(mark.reach_fraction) not in TRIGGER_REASON_CODES
+    assert "reach" not in "".join(TRIGGER_REASON_CODES)
+
+    # (b) NOT OUR FILL / NO PnL: a print is an observation, never counted as our fill or fed to PnL.
+    assert mark.is_our_fill() is False
+    assert mark.pnl_contribution() == 0.0
+
+    # (b, capacity) the ONLY capacity a print informs is a RECOMPUTED counterfactual CEILING — an upper
+    # bound from the observed print sizes, explicitly NOT our realized fill / PnL / capacity (REQ-027).
+    ceiling = counterfactual_capacity_ceiling((mark,))
+    assert isinstance(ceiling, CounterfactualCapacityCeiling)
+    assert ceiling.is_ceiling is True
+    assert ceiling.is_our_capacity is False
+    assert ceiling.label == OBSERVED_MARKET_PRINT
+    # it is a genuine recompute from the observed prints (the honest ceiling), not a stored our-fill
+    # number: two prints raise the ceiling to their summed size.
+    other = ObservedMarketPrint(
+        price=0.54,
+        size=100.0,
+        print_recv_ts=1_200,
+        book_arrival_ts=1_260,
+        reach_fraction=0.31,
+    )
+    assert counterfactual_capacity_ceiling((mark, other)).ceiling_size == pytest.approx(350.0)
+
+
+def test_reach_baseline_rejects_forbidden_universal_null() -> None:
+    """A reach baseline may not be a forbidden UNIVERSAL null (``0.5`` / ``p/b``); private notes stay in.
+
+    REQ-054 / HON-004: a raw ``0.5`` and the naive price/book (``p/b``) reach are FORBIDDEN as a reach
+    baseline — a reach scored against them can never assert edge, so :func:`reviewed_reach_baseline`
+    fails closed on them. This is a SCOPED negative (exactly those two nulls), NOT a universal ban on
+    reach as a diagnostic: a reviewed baseline passes through unchanged (HON-004). Separately, HON-005
+    pins that private practitioner material (the privacy-locked quote/level-age anecdote) stays INTERNAL
+    — it is never a field on the public ``OBSERVED_MARKET_PRINT`` diagnostic.
+    """
+    # the two forbidden universal nulls are pinned by name (REQ-054).
+    assert frozenset({"0.5", "p/b"}) == FORBIDDEN_REACH_NULLS
+
+    # each forbidden null FAILS CLOSED — the harness refuses to treat it as an edge baseline.
+    for forbidden in ("0.5", "p/b"):
+        with pytest.raises(ForbiddenReachNullError):
+            reviewed_reach_baseline(forbidden)
+
+    # HON-004 scope: reach is NOT universally banned — a reviewed, dependence-preserving null passes
+    # through unchanged, so a reach diagnostic itself is still permitted.
+    reviewed = "matched-dependence-preserving-null"
+    assert reviewed_reach_baseline(reviewed) == reviewed
+
+    # HON-005: no private practitioner material (quote/level-age anecdote) is surfaced as a public field
+    # on the diagnostic — it stays internal. A field carrying it would be a leak.
+    private_tokens = ("practitioner", "private", "anecdote", "quote_age", "level_age")
+    for field_name in ObservedMarketPrint.__dataclass_fields__:
+        assert not any(token in field_name for token in private_tokens), field_name
+    for field_name in CounterfactualCapacityCeiling.__dataclass_fields__:
+        assert not any(token in field_name for token in private_tokens), field_name

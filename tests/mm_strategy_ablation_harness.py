@@ -32,7 +32,7 @@ import json
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, get_args
 
 from veridex.live_recorder.contracts import LiveRecorderSessionMeta
 from veridex.live_recorder.recorder import LiveRecorder
@@ -51,6 +51,7 @@ from veridex.mm_strategy.config import StrategyConfig
 from veridex.mm_strategy.contracts import (
     GuardFairValue,
     InventoryProjection,
+    ReasonCode,
     StrategyDecision,
     StrategyObservation,
     StrategyState,
@@ -60,29 +61,39 @@ from veridex.mm_strategy.core import decide
 
 __all__ = [
     "FIXTURES_DIR",
+    "FORBIDDEN_REACH_NULLS",
     "FORBIDDEN_SINGLE_METRICS",
     "HARNESS_MODULE_PATH",
     "MARKOUT_REFERENCE",
+    "OBSERVED_MARKET_PRINT",
+    "OWN_RECONCILED_FILL",
     "PERMITTED_CONCLUSION_SHAPE",
     "SIX_METRIC_KEYS",
+    "TRIGGER_REASON_CODES",
     "AblationConclusion",
     "ArmConfigs",
     "ArmSingleMetrics",
     "CandidateFill",
+    "CounterfactualCapacityCeiling",
+    "ForbiddenReachNullError",
     "LoadedTape",
     "MarkoutReferenceError",
     "MatchedOpportunityReport",
+    "ObservedMarketPrint",
     "ReplayResult",
     "ablation_conclusion",
     "arm_configs",
     "arm_single_metrics",
     "config_field_diff",
+    "counterfactual_capacity_ceiling",
     "forbidden_import_hits",
     "load_base_config_overrides",
     "load_tape",
     "matched_opportunity_report",
     "neutralize_guard",
+    "print_derived_trigger",
     "replay_arm",
+    "reviewed_reach_baseline",
     "venue_future_mid_series",
 ]
 
@@ -832,3 +843,135 @@ def ablation_conclusion(
         fill_count_delta=guarded.fill_count - baseline.fill_count,
         per_fill_markout_delta=guarded.per_fill_markout - baseline.per_fill_markout,
     )
+
+
+# --- E6-T5: print / reach / label honesty — a print is a diagnostic, never a trigger / fill --
+# REQ-115 / HON-002 / HON-004 / HON-005 / REQ-026/027/052/053/054. Gate B pins the execution-evidence
+# CEILING: a third-party trade print is an OBSERVED_MARKET_PRINT — an OBSERVATION of the market, NEVER
+# our own fill / PnL / capacity / arrival-order (REQ-027). This block makes three honesty seams
+# STRUCTURAL (not a runtime check that could be bypassed):
+#   (1) a print carries its OWN third-party-print timing, kept SEPARATE from our book-arrival timing —
+#       conflating them would let a print masquerade as our own book event;
+#   (2) a raw reach % / a single print is structurally NOT a member of the closed REQ-080 venue-book
+#       trigger vocabulary (:data:`TRIGGER_REASON_CODES`, sourced from ``contracts.ReasonCode``) and
+#       NEVER becomes our fill or feeds PnL;
+#   (3) counterfactual capacity is a RECOMPUTED CEILING (an upper bound from observed prints), never
+#       our realized fill / PnL / capacity; and a reach scored against a forbidden universal null
+#       (``0.5`` / ``p/b``) can never assert edge (REQ-054 / HON-004).
+# Private practitioner material (the privacy-locked quote/level-age anecdote) stays INTERNAL — it is
+# never a field on the public diagnostic here (HON-005). TEST-SIDE, no ranked/research/maker import
+# (``forbidden_import_hits`` still holds — nothing below imports a ranked lane).
+
+# The Gate B execution-evidence CEILING label EVERY third-party trade print carries (REQ-026): an
+# OBSERVATION of the market, never OWN_RECONCILED_FILL — which is structurally unavailable to an
+# archive/replay harness (REQ-052) and named here only so a test can assert a print never wears it.
+OBSERVED_MARKET_PRINT = "OBSERVED_MARKET_PRINT"
+OWN_RECONCILED_FILL = "OWN_RECONCILED_FILL"
+
+# The closed REQ-080 venue-book EVENT trigger vocabulary — the ONLY reason codes that pull a live
+# quote. Sourced from the ``contracts.ReasonCode`` Literal so it can never silently drift from the
+# core; a reach % / print label is structurally NOT a member.
+TRIGGER_REASON_CODES = frozenset(get_args(ReasonCode))
+
+# Reach baselines FORBIDDEN as a universal null (REQ-054 / HON-004): a raw ``0.5`` and the naive
+# price/book (``p/b``) reach are NOT reviewed nulls — a reach scored against them can never assert
+# edge. This is a SCOPED negative (exactly these two nulls), not a universal ban on reach.
+FORBIDDEN_REACH_NULLS = frozenset({"0.5", "p/b"})
+
+
+class ForbiddenReachNullError(ValueError):
+    """A reach measured against a forbidden universal null (``0.5`` / ``p/b``) — REQ-054 / HON-004.
+
+    Fail-closed: a raw ``0.5`` or a price/book reach is not a reviewed null, so a reach scored against
+    it can never assert edge. The harness REFUSES the baseline rather than silently minting a spurious
+    edge — while still permitting reach as a diagnostic against a reviewed null (the scoped-negative,
+    HON-004).
+    """
+
+
+@dataclass(frozen=True)
+class ObservedMarketPrint:
+    """A third-party trade print — an ``OBSERVED_MARKET_PRINT`` diagnostic (Gate B ceiling; REQ-026/027).
+
+    A print is an OBSERVATION of the market's own activity: NEVER our fill, PnL, capacity, or
+    arrival-order (REQ-027). ``print_recv_ts`` (when WE observed the third-party print) is kept SEPARATE
+    from ``book_arrival_ts`` (when our OWN venue book observation arrived) — conflating the two timings
+    would let a third-party print masquerade as our book event. ``reach_fraction`` is a raw diagnostic %
+    only: it is neither a trigger (:func:`print_derived_trigger`) nor an edge claim. ``label`` is fixed
+    to :data:`OBSERVED_MARKET_PRINT`; the harness never mints :data:`OWN_RECONCILED_FILL` for a print.
+    No private practitioner field (quote/level-age anecdote) is carried — that material stays internal
+    (HON-005).
+    """
+
+    price: float
+    size: float
+    print_recv_ts: int
+    book_arrival_ts: int
+    reach_fraction: float
+    label: str = OBSERVED_MARKET_PRINT
+
+    def is_our_fill(self) -> bool:
+        """A print is NEVER our fill (REQ-027/052) — structurally ``False``."""
+        return False
+
+    def pnl_contribution(self) -> float:
+        """A print NEVER feeds PnL (REQ-027) — structurally ``0.0``."""
+        return 0.0
+
+
+def print_derived_trigger(mark: ObservedMarketPrint) -> ReasonCode | None:
+    """The live-quote trigger a third-party print / its reach % contributes — ALWAYS ``None`` (REQ-115).
+
+    The live trigger surface is the closed REQ-080 venue-book EVENT set (:data:`TRIGGER_REASON_CODES`);
+    a print / reach % is an ``OBSERVED_MARKET_PRINT`` diagnostic and is structurally NOT a member.
+    Returning ``None`` keeps a raw reach %/print out of the quote decision entirely. The RED-28 mutation
+    (return a real ``ReasonCode`` here, e.g. keyed on ``mark.reach_fraction``) routes a print into the
+    trigger set and ``test_raw_reach_or_print_cannot_become_trigger_or_fill`` goes red.
+    """
+    return None
+
+
+@dataclass(frozen=True)
+class CounterfactualCapacityCeiling:
+    """A RECOMPUTED counterfactual capacity CEILING from observed prints — NOT our fill / PnL / capacity.
+
+    ``ceiling_size`` is an UPPER BOUND recomputed from the observed third-party print sizes (the honest
+    no-queue / no-own-fill ceiling — the same evidence ceiling E6-T3 pins for markout). ``is_ceiling`` /
+    ``is_our_capacity`` make the labeling structural: this is never our realized fill, PnL, or capacity
+    (REQ-027/115). ``label`` stays :data:`OBSERVED_MARKET_PRINT` — the ceiling is derived from
+    observations, not from anything we executed.
+    """
+
+    ceiling_size: float
+    is_ceiling: bool = True
+    is_our_capacity: bool = False
+    label: str = OBSERVED_MARKET_PRINT
+
+
+def counterfactual_capacity_ceiling(
+    prints: tuple[ObservedMarketPrint, ...],
+) -> CounterfactualCapacityCeiling:
+    """Recompute the counterfactual capacity CEILING from observed prints (REQ-115 / REQ-027).
+
+    The ceiling is the summed observed print size — an upper bound on what COULD have been reached, not
+    a claim about what we filled. It is recomputed from the observations every call (producer metadata
+    is never trusted; REQ-052) and carries ``is_our_capacity=False`` so it can never be read as our
+    realized capacity.
+    """
+    return CounterfactualCapacityCeiling(ceiling_size=float(sum(p.size for p in prints)))
+
+
+def reviewed_reach_baseline(baseline: str) -> str:
+    """Validate a reach baseline is a REVIEWED null, not a forbidden UNIVERSAL one (REQ-054 / HON-004).
+
+    ``0.5`` and the naive price/book (``p/b``) reach are FORBIDDEN as a reach baseline — a reach scored
+    against them can never assert edge — so they fail closed via :class:`ForbiddenReachNullError`. A
+    reviewed baseline is returned unchanged. This is a SCOPED negative (exactly those two nulls), never a
+    universal ban on reach as a diagnostic (HON-004).
+    """
+    if baseline in FORBIDDEN_REACH_NULLS:
+        raise ForbiddenReachNullError(
+            f"reach baseline {baseline!r} is a forbidden universal null (REQ-054 / HON-004): a raw 0.5 "
+            "or a price/book (p/b) reach is not a reviewed null and cannot assert edge"
+        )
+    return baseline
