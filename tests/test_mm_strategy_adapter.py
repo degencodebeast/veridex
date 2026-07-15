@@ -19,7 +19,9 @@ import inspect
 from dataclasses import dataclass, field
 from typing import get_args
 
-from veridex.dust_execution.facade import IntentKind, MMExecutionToolResult
+from veridex.dust_execution.facade import IntentKind, MMExecutionToolResult, MMIntentParams
+from veridex.dust_execution.manifest import StrategyExperimentManifest
+from veridex.dust_execution.runner import _build_resting_order
 from veridex.mm_strategy.contracts import (
     InventoryProjection,
     NeutralIntent,
@@ -226,7 +228,14 @@ def _pinned_config() -> R4ARequestConfig:
         mode="dry_run",
         wallet_equity_at_decision=1000.0,
         fixed_fraction=0.001,
+        tif="GTC",
     )
+
+
+# The reviewed token identity — in production this is the decision's
+# ``observation.stream_identity().token_id`` (Gate #2 MAJOR-2), threaded to the adapter so the
+# singular R4-A request targets EXACTLY the token the decision reviewed (Gate#3 C-4).
+_R4A_TOKEN = "tok-reviewed"
 
 
 def test_mapping_total_exact_image_take_excluded() -> None:
@@ -261,7 +270,7 @@ def test_adapter_pins_evidence_class_not_caller_param() -> None:
     """The adapter PINS ``evidence_class="EXPERIMENTAL_DUST"`` — it is a constant in the adapter,
     never a caller/agent argument (not on the build function, not on the pinned config)."""
     config = _pinned_config()
-    request = build_r4a_request(_fresh_write("A"), config)
+    request = build_r4a_request(_fresh_write("A"), config, token_id=_R4A_TOKEN)
 
     assert request.evidence_class == "EXPERIMENTAL_DUST"
 
@@ -279,7 +288,7 @@ def test_adapter_sets_no_size() -> None:
     config = _pinned_config()
 
     # A fresh-write (make_quote) leg is the sizeable case — the adapter still sets no size.
-    make_request = build_r4a_request(_fresh_write("A"), config)
+    make_request = build_r4a_request(_fresh_write("A"), config, token_id=_R4A_TOKEN)
     assert make_request.intent_params.size is None
 
     # Holds for every neutral kind: no built request ever carries an adapter-set size.
@@ -289,7 +298,7 @@ def test_adapter_sets_no_size() -> None:
         _cancel_leg(),
         NeutralIntent(kind="abstain", leg_role=None, price=None),
     ):
-        assert build_r4a_request(leg, config).intent_params.size is None
+        assert build_r4a_request(leg, config, token_id=_R4A_TOKEN).intent_params.size is None
 
 
 def test_reason_confidence_cannot_move_decision() -> None:
@@ -299,13 +308,15 @@ def test_reason_confidence_cannot_move_decision() -> None:
     leg = _fresh_write("A")
 
     # The adapter never forwards untrusted agent metadata: the request carries no reason/confidence.
-    request = build_r4a_request(leg, config)
+    request = build_r4a_request(leg, config, token_id=_R4A_TOKEN)
     assert request.reason is None
     assert request.confidence is None
 
-    # There is no untrusted-metadata CHANNEL into the builder — only the trusted leg + pinned config.
+    # The builder's ONLY inputs are the TRUSTED leg, the pinned config, and the reviewed token
+    # identity (Gate#3 C-4) — no untrusted-metadata CHANNEL exists. ``token_id`` is the decision's
+    # reviewed ``observation.stream_identity().token_id``, a trusted causal input, NOT agent metadata.
     builder_params = set(inspect.signature(build_r4a_request).parameters)
-    assert builder_params == {"leg", "config"}
+    assert builder_params == {"leg", "config", "token_id"}
     assert not (builder_params & {"reason", "confidence", "proof_status", "fv_message_id"})
 
     # Two decisions that DIFFER only in untrusted FV metadata carry the SAME leg → identical request.
@@ -321,7 +332,128 @@ def test_reason_confidence_cannot_move_decision() -> None:
         fv_message_id="msg-cold",
         fv_proof_status="absent",
     )
-    assert build_r4a_request(hot.intent_plan[0], config) == build_r4a_request(cold.intent_plan[0], config)
+    assert build_r4a_request(hot.intent_plan[0], config, token_id=_R4A_TOKEN) == build_r4a_request(
+        cold.intent_plan[0], config, token_id=_R4A_TOKEN
+    )
 
     # The intent kind is a pure function of the TRUSTED leg.kind — nothing else moves it.
     assert request.intent_kind == NEUTRAL_TO_R4A[leg.kind]
+
+
+# --- Gate #3 CRITICAL-1: wireability at the REAL R4-A boundary ----------------------------------
+
+
+def _boundary_manifest() -> StrategyExperimentManifest:
+    """A minimal R4-A manifest for the REAL ``_build_resting_order`` constructor (it reads only
+    ``strategy_id`` from the manifest, as the client-order-id fallback). OFFLINE: a pure constructor
+    input — no venue, no signer, no wire, no submit/cancel."""
+    return StrategyExperimentManifest(
+        strategy_id="dust-maker-v0",
+        strategy_config_hash="cfg" * 4,
+        evidence_class="EXPERIMENTAL_DUST",
+        market="0xcondition",
+        universe=(_R4A_TOKEN,),
+        mode="dry_run",
+        max_orders=3,
+        max_notional=5.0,
+        max_session_loss=2.0,
+        max_daily_loss=4.0,
+        session_window=(1_700_000_000_000, 1_700_000_600_000),
+        required_inputs=("fair_value", "venue_book"),
+        permitted_intent_kinds=("make_quote", "cancel_replace", "cancel_all", "no_quote"),
+        market_fee_snapshot_hash="fee" * 4,
+        operator_authorization="op-ref-1",
+        forbidden_claims=("PROVEN_EDGE", "CALIBRATED"),
+    )
+
+
+def test_normal_bid_and_ask_build_valid_r4a_resting_order() -> None:
+    """Gate #3 CRITICAL-1 (RED at the REAL boundary): a normal ``place_quote(bid, 0.49)`` and
+    ``place_quote(ask, 0.51)`` — the adapter's NORMAL output for a core-produced quote — must EACH
+    build ``intent_params`` that construct a VALID post-only R4-A resting order via the REAL
+    ``_build_resting_order`` (bid→BUY, ask→SELL; the reviewed ``token_id``; the config-pinned GTC
+    maker TIF), with the resting SIZE R4-A-owned (``wire_size``), never adapter-set.
+
+    Before the fix ``_intent_params`` forwards ``side='bid'`` / ``token_id=None`` / ``tif=None``, so
+    ``_build_resting_order`` returns ``None`` — the adapter's normal output is UNWIREABLE for every
+    core quote (Codex CRITICAL-1)."""
+    config = _pinned_config()
+    manifest = _boundary_manifest()
+    wire_size = 4.0  # R4-A's resolve_dust_size output — the SOLE size authority (never the adapter)
+    tick_size = 0.01
+
+    bid_params = build_r4a_request(
+        _fresh_write("bid-1", leg_role="bid", price=0.49), config, token_id=_R4A_TOKEN
+    ).intent_params
+    ask_params = build_r4a_request(
+        _fresh_write("ask-1", leg_role="ask", price=0.51), config, token_id=_R4A_TOKEN
+    ).intent_params
+
+    # The adapter set NO size — sizing stays R4-A-owned (REQ-058/RED-22).
+    assert bid_params.size is None
+    assert ask_params.size is None
+
+    bid_order = _build_resting_order(
+        token_id=_R4A_TOKEN,
+        manifest=manifest,
+        intent_params=bid_params,
+        wire_size=wire_size,
+        tick_size=tick_size,
+    )
+    ask_order = _build_resting_order(
+        token_id=_R4A_TOKEN,
+        manifest=manifest,
+        intent_params=ask_params,
+        wire_size=wire_size,
+        tick_size=tick_size,
+    )
+
+    # WIREABLE post-only maker orders (each was None — unwireable — before the fix).
+    assert bid_order is not None
+    assert bid_order.side == "BUY"
+    assert bid_order.tif == "GTC"
+    assert bid_order.post_only is True
+    assert bid_order.native_price == 0.49
+    assert bid_order.token_id == _R4A_TOKEN
+    assert bid_order.size == wire_size  # R4-A-owned size, not adapter-set
+
+    assert ask_order is not None
+    assert ask_order.side == "SELL"
+    assert ask_order.tif == "GTC"
+    assert ask_order.post_only is True
+    assert ask_order.native_price == 0.51
+    assert ask_order.token_id == _R4A_TOKEN
+    assert ask_order.size == wire_size
+
+
+def test_wrong_or_missing_token_side_tif_fails_closed() -> None:
+    """Gate #3 CRITICAL-1: a request with a wrong/missing token, a non-{BUY,SELL} side, or a
+    non-{GTC,GTD} TIF must FAIL CLOSED at the REAL R4-A boundary — ``_build_resting_order`` returns
+    ``None`` and the singular target token matches no universe token. The adapter never emits a
+    wireable resting order from a malformed leg."""
+    manifest = _boundary_manifest()
+    wire_size = 4.0
+    tick_size = 0.01
+
+    def _rest(params: MMIntentParams) -> object:
+        return _build_resting_order(
+            token_id=_R4A_TOKEN,
+            manifest=manifest,
+            intent_params=params,
+            wire_size=wire_size,
+            tick_size=tick_size,
+        )
+
+    # Codex's exact pre-fix control: the neutral role forwarded literally + no token + no TIF.
+    prefix_control = MMIntentParams(token_id=None, side="bid", price=0.49, tif=None)
+    assert _rest(prefix_control) is None  # unwireable — R4-A rejects the maker order
+
+    # Each wire dimension is independently load-bearing at the real boundary:
+    assert _rest(MMIntentParams(token_id=_R4A_TOKEN, side="bid", price=0.49, tif="GTC")) is None  # role literal
+    assert _rest(MMIntentParams(token_id=_R4A_TOKEN, side="BUY", price=0.49, tif=None)) is None  # missing TIF
+    assert _rest(MMIntentParams(token_id=_R4A_TOKEN, side="BUY", price=0.49, tif="FOK")) is None  # taker TIF
+
+    # A missing target token: the runner's C-4 target (``intent_params.token_id``) matches NO
+    # universe token, so every token abstains ``intent_token_mismatch`` (fail closed, zero wire).
+    assert prefix_control.token_id is None
+    assert prefix_control.token_id not in manifest.universe

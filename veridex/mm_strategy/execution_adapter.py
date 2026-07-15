@@ -33,7 +33,7 @@ from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Literal, Protocol
 
-from veridex.dust_execution.contracts import ExecutionMode
+from veridex.dust_execution.contracts import ExecutionMode, TimeInForce
 from veridex.dust_execution.facade import (
     IntentKind,
     MMExecutionToolRequest,
@@ -217,6 +217,17 @@ NEUTRAL_TO_R4A: Mapping[NeutralIntentKind, IntentKind] = MappingProxyType(
     }
 )
 
+# The physical maker-leg role → R4-A wire SIDE (Gate#3 CRITICAL-1). A neutral ``leg_role`` is
+# R4-B-native venue-agnostic vocabulary (``bid`` / ``ask``); R4-A's ``_build_resting_order`` requires
+# a wire side in ``{BUY, SELL}`` and returns ``None`` (fail closed → ``intent_params_invalid``) for a
+# lowercase role. Forwarding the neutral role LITERALLY made every core quote unwireable — the pure
+# core only ever emits ``bid`` / ``ask`` for a placement leg (a reducing leg is still physically a
+# bid or ask — ``core._reducing_leg``), so ``reduce`` / ``None`` map to nothing and yield NO side
+# (an order-placing leg with no mappable side fails closed at the R4-A boundary, never on the wire).
+_ROLE_TO_R4A_SIDE: Mapping[str, Literal["BUY", "SELL"]] = MappingProxyType(
+    {"bid": "BUY", "ask": "SELL"}
+)
+
 # The honest evidence class every R4-B dust request is PINNED to — a module constant, NEVER a
 # caller/agent parameter (AC-025 consistency; mirrors ``facade._DEFAULT_EVIDENCE_CLASS``). An agent
 # cannot relabel a dust run as validated/promoted because it has no channel to supply this at all.
@@ -245,41 +256,69 @@ class R4ARequestConfig:
     mode: ExecutionMode
     wallet_equity_at_decision: float
     fixed_fraction: float
+    # The PINNED maker time-in-force every resting quote is bound to (Gate#3 CRITICAL-1). R4-A's
+    # ``_build_resting_order`` requires a TIF in ``{GTC, GTD}`` (a maker rest, never a FAK/FOK taker);
+    # ``GTC`` is the operator-pinned session default. Like every field here it is session/manifest
+    # config the operator wires once — NEVER agent- or caller-supplied.
+    tif: TimeInForce
 
 
-def _intent_params(leg: NeutralIntent) -> MMIntentParams:
-    """Translate a neutral leg's TRUSTED fields into typed R4-A ``MMIntentParams``.
+def _intent_params(
+    leg: NeutralIntent, config: R4ARequestConfig, token_id: str
+) -> MMIntentParams:
+    """Translate a neutral leg's TRUSTED fields into typed R4-A ``MMIntentParams`` (Gate#3 CRITICAL-1).
 
-    Carries side (from ``leg_role``), price, and the client-order ids — and NEVER a ``size``: R4-A's
-    ``resolve_dust_size`` is the sole sizing authority (REQ-058/RED-22), so ``size`` is left unset
-    (``None``). A ``cancel_all_orders`` / ``abstain`` leg carries no side/price/id, so its params are
-    empty. Only trusted leg fields flow here; no untrusted agent metadata is read (AC-024).
+    The neutral vocabulary is R4-B-native and must be TRANSLATED to R4-A's wire vocabulary, not
+    forwarded literally:
+
+      * ``leg_role`` (``bid`` / ``ask``) → the R4-A ``side`` (``BUY`` / ``SELL``) via
+        :data:`_ROLE_TO_R4A_SIDE`. A lowercase role would make ``_build_resting_order`` fail closed,
+        so an order-placing leg with no mappable side yields ``side=None`` (fail closed at R4-A).
+      * an order-placing (resting) leg carries the reviewed ``token_id`` (the decision's
+        ``observation.stream_identity().token_id`` — Gate #2 MAJOR-2 / Gate#3 C-4, so the singular
+        request targets EXACTLY the token the decision reviewed) and the config-pinned maker ``tif``.
+
+    Only a leg that actually RESTS an order at R4-A (``make_quote`` / ``cancel_replace`` — those with
+    a physical maker side) carries a ``token_id`` / ``tif``; a ``cancel_all_orders`` / ``abstain`` leg
+    (no side) rests no order and carries neither. NEVER a ``size``: R4-A's ``resolve_dust_size`` is the
+    sole sizing authority (REQ-058/RED-22), so ``size`` is left unset (``None``). Only trusted leg
+    fields + pinned config + the reviewed token flow here; no untrusted agent metadata is read (AC-024).
     """
-    side = leg.leg_role if leg.leg_role in ("bid", "ask") else None
+    side = _ROLE_TO_R4A_SIDE.get(leg.leg_role) if leg.leg_role is not None else None
+    rests_order = side is not None
     return MMIntentParams(
+        token_id=token_id if rests_order else None,
         side=side,
         price=leg.price,
+        tif=config.tif if rests_order else None,
         client_order_id=leg.client_order_id,
         replaces_client_order_id=leg.replaces_client_order_id,
         # size intentionally UNSET — the adapter never sizes (REQ-058/RED-22).
     )
 
 
-def build_r4a_request(leg: NeutralIntent, config: R4ARequestConfig) -> MMExecutionToolRequest:
+def build_r4a_request(
+    leg: NeutralIntent, config: R4ARequestConfig, *, token_id: str
+) -> MMExecutionToolRequest:
     """Build the SINGULAR typed R4-A request for ONE neutral leg (REQ-091/058, AC-024).
 
     The intent kind is the TOTAL :data:`NEUTRAL_TO_R4A` mapping of ``leg.kind`` (so ``take`` is
-    unreachable), the params carry no adapter-set size, and ``evidence_class`` is PINNED to the
-    module constant — never a caller/agent argument. The pinned hashes are declared AND cross-checked
-    as admitted (fail-closed via :meth:`MMExecutionToolRequest.build`). Untrusted agent metadata
-    (``reason`` / ``confidence`` / FV proof) is NOT a parameter and is NOT forwarded, so it has ZERO
-    effect on the mapping or the request (AC-024): the request is a pure function of (trusted leg,
-    pinned config). The adapter proposes a typed request; it never sizes, signs, or writes.
+    unreachable), the params translate the physical role to an R4-A ``BUY`` / ``SELL`` side and bind
+    the reviewed ``token_id`` + config-pinned maker TIF so the request is WIREABLE at R4-A (Gate#3
+    CRITICAL-1), carry no adapter-set size, and ``evidence_class`` is PINNED to the module constant —
+    never a caller/agent argument. ``token_id`` is the decision's reviewed
+    ``observation.stream_identity().token_id`` (Gate#3 C-4) — a TRUSTED causal input, not agent
+    metadata; the singular request therefore targets EXACTLY the token the decision reviewed. The
+    pinned hashes are declared AND cross-checked as admitted (fail-closed via
+    :meth:`MMExecutionToolRequest.build`). Untrusted agent metadata (``reason`` / ``confidence`` / FV
+    proof) is NOT a parameter and is NOT forwarded, so it has ZERO effect on the mapping or the
+    request (AC-024): the request is a pure function of (trusted leg, pinned config, reviewed token).
+    The adapter proposes a typed request; it never sizes, signs, or writes.
     """
     intent_kind = NEUTRAL_TO_R4A[leg.kind]
     return MMExecutionToolRequest.build(
         intent_kind=intent_kind,
-        intent_params=_intent_params(leg),
+        intent_params=_intent_params(leg, config, token_id),
         strategy_id=config.strategy_id,
         strategy_config_hash=config.strategy_config_hash,
         policy_hash=config.policy_hash,
