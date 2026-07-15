@@ -29,6 +29,7 @@ from veridex.mm_strategy.contracts import (
     NeutralIntent,
     NeutralIntentKind,
     StrategyDecision,
+    StrategyObservation,
 )
 from veridex.mm_strategy.core import projection_startup_gate
 from veridex.mm_strategy.execution_adapter import (
@@ -316,9 +317,68 @@ def _pinned_config() -> R4ARequestConfig:
 
 
 # The reviewed token identity — in production this is the decision's
-# ``observation.stream_identity().token_id`` (Gate #2 MAJOR-2), threaded to the adapter so the
-# singular R4-A request targets EXACTLY the token the decision reviewed (Gate#3 C-4).
+# ``observation.stream_identity().token_id`` (Gate #2 MAJOR-2). The adapter DERIVES the singular
+# request's target token from the reviewed observation's stream identity (Gate#3 C-4 / CRITICAL-1
+# residual), so the request targets EXACTLY the token the decision reviewed — never a caller string.
 _R4A_TOKEN = "tok-reviewed"
+
+# A SECOND manifest-admitted token — the substitution adversary's target (Gate#3 CRITICAL-1
+# residual). A price decided from ``_R4A_TOKEN``'s book must NEVER be routable onto this token.
+_OTHER_ADMITTED_TOKEN = "tok-other-admitted"
+
+
+def _reviewed_observation(*, token_id: str = _R4A_TOKEN) -> StrategyObservation:
+    """A healthy, guard-off reviewed observation on ``token_id`` — the TYPED reviewed input the
+    adapter DERIVES the target token from (``stream_identity().token_id``), never a caller string."""
+    return StrategyObservation(
+        fixture_id=42,
+        market_ref="TEAM-A/YES",
+        side="YES",
+        token_id=token_id,
+        venue_market_ref="0xmarket",
+        tick_size=0.01,
+        observation_sequence=10,
+        book_source_epoch=1,
+        bid=0.49,
+        ask=0.51,
+        bid_size=100.0,
+        ask_size=120.0,
+        book_status="ok",
+        status_reason=None,
+        book_recv_ts=1_000,
+        level_count_in_band=5,
+        tick_regime_changed=False,
+        phase=1,
+        suspended=False,
+        match_state_recv_ts=990,
+        guard_fv=None,
+        market_status="ACTIVE",
+        market_status_recv_ts=995,
+        market_status_epoch=3,
+        order_stream_ok=True,
+        projection_fresh=True,
+        inventory=InventoryProjection(
+            net_position=0.0, resting=(), projection_as_of_ts=1_000, fresh=True
+        ),
+        as_of_ts=1_000,
+    )
+
+
+def _reviewed_pair(
+    *legs: NeutralIntent, token_id: str = _R4A_TOKEN
+) -> tuple[StrategyObservation, StrategyDecision]:
+    """The reviewed (observation, decision) pair the singular request is DERIVED-from and BOUND-to
+    (Gate#3 CRITICAL-1 residual). The decision is STAMPED with the observation's own
+    ``observation_hash`` and carries exactly ``legs`` in its single-phase plan, on ``token_id`` — so
+    ``build_r4a_request`` derives the target token from the reviewed stream identity and refuses any
+    leg/observation not bound to this decision. No caller may pass a bare token string."""
+    observation = _reviewed_observation(token_id=token_id)
+    decision = StrategyDecision(
+        kind="QUOTE_TWO_SIDED",
+        intent_plan=legs,
+        observation_hash=observation.observation_hash(),
+    )
+    return observation, decision
 
 
 def test_mapping_total_exact_image_take_excluded() -> None:
@@ -353,7 +413,9 @@ def test_adapter_pins_evidence_class_not_caller_param() -> None:
     """The adapter PINS ``evidence_class="EXPERIMENTAL_DUST"`` — it is a constant in the adapter,
     never a caller/agent argument (not on the build function, not on the pinned config)."""
     config = _pinned_config()
-    request = build_r4a_request(_fresh_write("A"), config, token_id=_R4A_TOKEN)
+    leg = _fresh_write("A")
+    obs, decision = _reviewed_pair(leg)
+    request = build_r4a_request(leg, config, observation=obs, decision=decision)
 
     assert request.evidence_class == "EXPERIMENTAL_DUST"
 
@@ -371,7 +433,11 @@ def test_adapter_sets_no_size() -> None:
     config = _pinned_config()
 
     # A fresh-write (make_quote) leg is the sizeable case — the adapter still sets no size.
-    make_request = build_r4a_request(_fresh_write("A"), config, token_id=_R4A_TOKEN)
+    make_leg = _fresh_write("A")
+    make_obs, make_decision = _reviewed_pair(make_leg)
+    make_request = build_r4a_request(
+        make_leg, config, observation=make_obs, decision=make_decision
+    )
     assert make_request.intent_params.size is None
 
     # Holds for every neutral kind: no built request ever carries an adapter-set size.
@@ -387,7 +453,13 @@ def test_adapter_sets_no_size() -> None:
         _cancel_leg(),
         NeutralIntent(kind="abstain", leg_role=None, price=None),
     ):
-        assert build_r4a_request(leg, config, token_id=_R4A_TOKEN).intent_params.size is None
+        obs, decision = _reviewed_pair(leg)
+        assert (
+            build_r4a_request(
+                leg, config, observation=obs, decision=decision
+            ).intent_params.size
+            is None
+        )
 
 
 def test_valid_replacement_lineage_reaches_r4a_request() -> None:
@@ -404,7 +476,8 @@ def test_valid_replacement_lineage_reaches_r4a_request() -> None:
         replaces_client_order_id="old-order-1",
     )
 
-    request = build_r4a_request(leg, config, token_id=_R4A_TOKEN)
+    obs, decision = _reviewed_pair(leg)
+    request = build_r4a_request(leg, config, observation=obs, decision=decision)
 
     # The lineage the decision named survives the neutral→R4-A translation byte-for-byte.
     assert request.intent_params.replaces_client_order_id == "old-order-1"
@@ -418,35 +491,42 @@ def test_reason_confidence_cannot_move_decision() -> None:
     on the mapping or the built request — it is never an input to, nor forwarded by, the adapter."""
     config = _pinned_config()
     leg = _fresh_write("A")
+    obs, decision = _reviewed_pair(leg)
 
     # The adapter never forwards untrusted agent metadata: the request carries no reason/confidence.
-    request = build_r4a_request(leg, config, token_id=_R4A_TOKEN)
+    request = build_r4a_request(leg, config, observation=obs, decision=decision)
     assert request.reason is None
     assert request.confidence is None
 
-    # The builder's ONLY inputs are the TRUSTED leg, the pinned config, and the reviewed token
-    # identity (Gate#3 C-4) — no untrusted-metadata CHANNEL exists. ``token_id`` is the decision's
-    # reviewed ``observation.stream_identity().token_id``, a trusted causal input, NOT agent metadata.
+    # The builder's ONLY inputs are the TRUSTED leg, the pinned config, and the reviewed
+    # (observation, decision) pair — no untrusted-metadata CHANNEL exists. The target token is
+    # DERIVED from ``observation.stream_identity().token_id`` and BOUND to the stamped decision
+    # (Gate#3 C-4 / CRITICAL-1 residual), never a caller-supplied bare string.
     builder_params = set(inspect.signature(build_r4a_request).parameters)
-    assert builder_params == {"leg", "config", "token_id"}
+    assert builder_params == {"leg", "config", "observation", "decision"}
+    assert "token_id" not in builder_params  # no bare caller channel for the target token
     assert not (builder_params & {"reason", "confidence", "proof_status", "fv_message_id"})
 
-    # Two decisions that DIFFER only in untrusted FV metadata carry the SAME leg → identical request.
+    # Two decisions that DIFFER only in untrusted FV metadata — bound to the SAME reviewed
+    # observation and carrying the SAME leg — build the IDENTICAL request (FV metadata has zero
+    # effect on the mapping, the derived token, or the binding).
     hot = StrategyDecision(
         kind="QUOTE_TWO_SIDED",
         intent_plan=(leg,),
+        observation_hash=obs.observation_hash(),
         fv_message_id="msg-hot",
         fv_proof_status="proven",
     )
     cold = StrategyDecision(
         kind="QUOTE_TWO_SIDED",
         intent_plan=(leg,),
+        observation_hash=obs.observation_hash(),
         fv_message_id="msg-cold",
         fv_proof_status="absent",
     )
-    assert build_r4a_request(hot.intent_plan[0], config, token_id=_R4A_TOKEN) == build_r4a_request(
-        cold.intent_plan[0], config, token_id=_R4A_TOKEN
-    )
+    assert build_r4a_request(
+        hot.intent_plan[0], config, observation=obs, decision=hot
+    ) == build_r4a_request(cold.intent_plan[0], config, observation=obs, decision=cold)
 
     # The intent kind is a pure function of the TRUSTED leg.kind — nothing else moves it.
     assert request.intent_kind == NEUTRAL_TO_R4A[leg.kind]
@@ -494,11 +574,16 @@ def test_normal_bid_and_ask_build_valid_r4a_resting_order() -> None:
     wire_size = 4.0  # R4-A's resolve_dust_size output — the SOLE size authority (never the adapter)
     tick_size = 0.01
 
+    bid_leg = _fresh_write("bid-1", leg_role="bid", price=0.49)
+    ask_leg = _fresh_write("ask-1", leg_role="ask", price=0.51)
+    bid_obs, bid_decision = _reviewed_pair(bid_leg)
+    ask_obs, ask_decision = _reviewed_pair(ask_leg)
+
     bid_params = build_r4a_request(
-        _fresh_write("bid-1", leg_role="bid", price=0.49), config, token_id=_R4A_TOKEN
+        bid_leg, config, observation=bid_obs, decision=bid_decision
     ).intent_params
     ask_params = build_r4a_request(
-        _fresh_write("ask-1", leg_role="ask", price=0.51), config, token_id=_R4A_TOKEN
+        ask_leg, config, observation=ask_obs, decision=ask_decision
     ).intent_params
 
     # The adapter set NO size — sizing stays R4-A-owned (REQ-058/RED-22).
@@ -536,6 +621,60 @@ def test_normal_bid_and_ask_build_valid_r4a_resting_order() -> None:
     assert ask_order.native_price == 0.51
     assert ask_order.token_id == _R4A_TOKEN
     assert ask_order.size == wire_size
+
+
+def test_token_substitution_two_admitted_tokens_fails_closed() -> None:
+    """Gate #3 CRITICAL-1 (RESIDUAL): with TWO manifest-admitted tokens, a decision reviewed from
+    observation A (``tok-reviewed``) can NEVER be routed onto a DIFFERENT admitted token B
+    (``tok-other-admitted``). The singular request's target token is DERIVED from the reviewed
+    observation's ``stream_identity().token_id`` and BOUND to the stamped decision
+    (``decision.observation_hash == observation.observation_hash()``) — a caller has NO bare-string
+    channel to substitute token B.
+
+    Before the fix, ``build_r4a_request(reviewed_bid_leg, config, token_id="tok-other-admitted")``
+    copied the bare caller string into ``MMIntentParams`` and built a VALID, wireable R4-A
+    ``RestingOrder`` on token B — a price decided from token A's book targeting token B (Codex
+    CRITICAL-1 residual). After the fix that channel does not exist: substitution FAILS CLOSED (no
+    request built, no resting order, no facade call), and the only buildable request derives token A."""
+    config = _pinned_config()
+    leg = _fresh_write("bid-1", leg_role="bid", price=0.49)
+
+    # The decision was reviewed from observation A (token "tok-reviewed").
+    obs_a, decision = _reviewed_pair(leg, token_id=_R4A_TOKEN)
+
+    # Adversary lever #1 — pass a DIFFERENT admitted observation (token B) to try to steer the
+    # derived token to "tok-other-admitted". That observation is NOT the one the decision reviewed,
+    # so its hash != decision.observation_hash → FAIL CLOSED (no request built, no facade call).
+    obs_b = _reviewed_observation(token_id=_OTHER_ADMITTED_TOKEN)
+    assert obs_b.observation_hash() != decision.observation_hash
+    with pytest.raises(ValueError):
+        build_r4a_request(leg, config, observation=obs_b, decision=decision)
+
+    # Adversary lever #2 — a leg the reviewed decision never committed to also fails closed.
+    foreign_leg = _fresh_write("foreign", leg_role="ask", price=0.51)
+    with pytest.raises(ValueError):
+        build_r4a_request(foreign_leg, config, observation=obs_a, decision=decision)
+
+    # The ONLY buildable request derives the reviewed token A — token B is unrepresentable here.
+    request = build_r4a_request(leg, config, observation=obs_a, decision=decision)
+    assert request.intent_params.token_id == _R4A_TOKEN
+    assert request.intent_params.token_id != _OTHER_ADMITTED_TOKEN
+
+    # ... and it is a VALID wireable token-A resting order at the REAL R4-A boundary (bid→BUY/GTC),
+    # so the fix is corrected-not-weakened: the normal output stays wireable, only substitution is
+    # barred.
+    manifest = _boundary_manifest()  # universe == (_R4A_TOKEN,)
+    order = _build_resting_order(
+        token_id=_R4A_TOKEN,
+        manifest=manifest,
+        intent_params=request.intent_params,
+        wire_size=4.0,
+        tick_size=0.01,
+    )
+    assert order is not None
+    assert order.token_id == _R4A_TOKEN
+    assert order.side == "BUY"
+    assert order.tif == "GTC"
 
 
 def test_wrong_or_missing_token_side_tif_fails_closed() -> None:

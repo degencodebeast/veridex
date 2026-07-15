@@ -43,6 +43,8 @@ from veridex.dust_execution.facade import (
 from veridex.mm_strategy.contracts import (
     NeutralIntent,
     NeutralIntentKind,
+    StrategyDecision,
+    StrategyObservation,
     reject_mixed_phase_plan,
 )
 
@@ -326,23 +328,55 @@ def _intent_params(
 
 
 def build_r4a_request(
-    leg: NeutralIntent, config: R4ARequestConfig, *, token_id: str
+    leg: NeutralIntent,
+    config: R4ARequestConfig,
+    *,
+    observation: StrategyObservation,
+    decision: StrategyDecision,
 ) -> MMExecutionToolRequest:
     """Build the SINGULAR typed R4-A request for ONE neutral leg (REQ-091/058, AC-024).
 
+    The target token is DERIVED from the reviewed ``observation.stream_identity().token_id`` and the
+    observation is BOUND to the stamped ``decision`` (Gate#3 CRITICAL-1 residual). The caller has NO
+    bare-token channel: it cannot name a target token, so it cannot route a price decided from token
+    A's book onto a DIFFERENT admitted token B. Two invariants are checked and FAIL CLOSED (raise —
+    no request, hence no R4-A resting order and no facade call downstream) before anything is built:
+
+      * ``decision.observation_hash == observation.observation_hash()`` — the ``decision`` must be the
+        one actually reviewed FROM this ``observation`` (Gate #2 MAJOR-2 / Gate#3 C-4). A substituted
+        observation (a different admitted token) has a different hash and is refused, so the derived
+        token can only ever be the one the decision reviewed.
+      * ``leg in decision.intent_plan`` — the executed leg must be one the reviewed decision committed
+        to; a leg the decision never planned is refused.
+
     The intent kind is the TOTAL :data:`NEUTRAL_TO_R4A` mapping of ``leg.kind`` (so ``take`` is
     unreachable), the params translate the physical role to an R4-A ``BUY`` / ``SELL`` side and bind
-    the reviewed ``token_id`` + config-pinned maker TIF so the request is WIREABLE at R4-A (Gate#3
+    the DERIVED token + config-pinned maker TIF so the request is WIREABLE at R4-A (Gate#3
     CRITICAL-1), carry no adapter-set size, and ``evidence_class`` is PINNED to the module constant —
-    never a caller/agent argument. ``token_id`` is the decision's reviewed
-    ``observation.stream_identity().token_id`` (Gate#3 C-4) — a TRUSTED causal input, not agent
-    metadata; the singular request therefore targets EXACTLY the token the decision reviewed. The
-    pinned hashes are declared AND cross-checked as admitted (fail-closed via
-    :meth:`MMExecutionToolRequest.build`). Untrusted agent metadata (``reason`` / ``confidence`` / FV
-    proof) is NOT a parameter and is NOT forwarded, so it has ZERO effect on the mapping or the
-    request (AC-024): the request is a pure function of (trusted leg, pinned config, reviewed token).
-    The adapter proposes a typed request; it never sizes, signs, or writes.
+    never a caller/agent argument. The pinned hashes are declared AND cross-checked as admitted
+    (fail-closed via :meth:`MMExecutionToolRequest.build`). Untrusted agent metadata (``reason`` /
+    ``confidence`` / FV proof) is NOT a parameter and is NOT forwarded, so it has ZERO effect on the
+    mapping or the request (AC-024): the request is a pure function of (trusted leg, pinned config,
+    reviewed observation, bound decision). The adapter proposes a typed request; it never sizes,
+    signs, or writes.
     """
+    # Bind the request to the REVIEWED (observation, decision) pair BEFORE building anything, so a
+    # caller cannot substitute a different admitted token (Gate#3 CRITICAL-1 residual). Fail closed.
+    if decision.observation_hash != observation.observation_hash():
+        raise ValueError(
+            "build_r4a_request: decision is not bound to the reviewed observation "
+            "(decision.observation_hash != observation.observation_hash()) — refusing to derive a "
+            "target token from an unbound/substituted observation (Gate#3 CRITICAL-1: a caller "
+            "cannot route a price decided from one admitted token onto a different admitted token)"
+        )
+    if leg not in decision.intent_plan:
+        raise ValueError(
+            "build_r4a_request: leg is not part of the bound decision's intent_plan — refusing to "
+            "build a request for a leg the reviewed decision never committed to (Gate#3 CRITICAL-1)"
+        )
+
+    # DERIVE the target token from the reviewed stream identity — NEVER a caller argument (Gate#3 C-4).
+    token_id = observation.stream_identity().token_id
     intent_kind = NEUTRAL_TO_R4A[leg.kind]
     return MMExecutionToolRequest.build(
         intent_kind=intent_kind,
