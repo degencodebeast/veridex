@@ -39,6 +39,7 @@ from veridex.mm_strategy.basis import (
 )
 from veridex.mm_strategy.config import StrategyConfig
 from veridex.mm_strategy.contracts import (
+    STRATEGY_REVISION,
     DecisionKind,
     GuardFairValue,
     GuardStateWatermark,
@@ -48,6 +49,8 @@ from veridex.mm_strategy.contracts import (
     StrategyDecision,
     StrategyObservation,
     StrategyState,
+    client_order_id,
+    decision_id,
 )
 
 
@@ -1163,7 +1166,90 @@ def _apply_healthy(
     return _quote_disposition(observation, base, config), next_state
 
 
+def _stamp_identity(
+    decision: StrategyDecision,
+    observation: StrategyObservation,
+    prior_state: StrategyState,
+    next_state: StrategyState,
+    config: StrategyConfig,
+    session_id: str,
+) -> StrategyDecision:
+    """Bind the deterministic decision / client-order ids + the four causal hashes onto a raw
+    decision (REQ-025/095/AC-022).
+
+    ``decision_id = H(strategy_id, strategy_revision, config_hash, session_id, observation_hash,
+    prior_state_hash)`` via the SOLE canonical serializer — ``strategy_id`` is the runtime-authoritative
+    ``config.strategy_id`` (the same literal ``contracts.STRATEGY_ID`` pins), ``strategy_revision`` the
+    pinned ``contracts.STRATEGY_REVISION``, and ``session_id`` the per-run seam threaded from
+    :func:`decide`. It is a PURE function of the decision's causes — NO wall clock, NO rng, NO call
+    counter — so an authorized retry on identical inputs reproduces a byte-identical id while a
+    distinct observation (distinct ``observation_hash``) yields a distinct id (REQ-095). Because the id
+    is a deterministic function of the already-identical guard-off hashes, the E3-T4 baseline-arm
+    byte-identity is unaffected.
+
+    Each intent leg's ``client_order_id = H(decision_id, leg_role)`` is stamped per leg (a leg with no
+    physical role keeps its ``None``). Replacement lineage lives in the leg's ``replaces_client_order_id``
+    (untouched here): the determinism of ``client_order_id`` is exactly what lets a later replacing leg
+    name the EXACT old id — same decision inputs + same role reproduce the same id (REQ-095).
+    """
+    observation_hash = observation.observation_hash()
+    config_hash = config.config_hash()
+    prior_state_hash = prior_state.state_hash()
+    next_state_hash = next_state.state_hash()
+    decision_identity = decision_id(
+        config.strategy_id,
+        STRATEGY_REVISION,
+        config_hash,
+        session_id,
+        observation_hash,
+        prior_state_hash,
+    )
+    stamped_legs = tuple(
+        leg.model_copy(
+            update={"client_order_id": client_order_id(decision_identity, leg.leg_role)}
+        )
+        if leg.leg_role is not None
+        else leg
+        for leg in decision.intent_plan
+    )
+    return decision.model_copy(
+        update={
+            "decision_id": decision_identity,
+            "intent_plan": stamped_legs,
+            "observation_hash": observation_hash,
+            "config_hash": config_hash,
+            "prior_state_hash": prior_state_hash,
+            "next_state_hash": next_state_hash,
+        }
+    )
+
+
 def decide(
+    observation: StrategyObservation,
+    state: StrategyState,
+    config: StrategyConfig,
+    *,
+    session_id: str = "",
+) -> tuple[StrategyDecision, StrategyState]:
+    """Evaluate the reducer and return an IDENTITY-STAMPED ``(decision, next_state)`` (pure, total).
+
+    Thin identity wrapper over :func:`_decide_raw` (the watermark precondition layer + S/R/E/D/C/F/W/H
+    reducer): it runs the raw reducer once, then :func:`_stamp_identity` binds the deterministic
+    ``decision_id`` + per-leg ``client_order_id``s + the four causal hashes onto the single returned
+    decision — one choke point so EVERY branch's decision is stamped identically (REQ-025/095/AC-022).
+
+    ``session_id`` is the per-run identity seam bound into ``decision_id``; it is keyword-only with an
+    empty default so the pure fixtures / replay callers that pass only ``(observation, state, config)``
+    are unaffected, while the orchestration layer supplies the real session when it wires the run loop.
+    """
+    decision, next_state = _decide_raw(observation, state, config)
+    stamped = _stamp_identity(
+        decision, observation, state, next_state, config, session_id
+    )
+    return stamped, next_state
+
+
+def _decide_raw(
     observation: StrategyObservation,
     state: StrategyState,
     config: StrategyConfig,
