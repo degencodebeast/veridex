@@ -60,16 +60,22 @@ from veridex.mm_strategy.core import decide
 
 __all__ = [
     "FIXTURES_DIR",
+    "FORBIDDEN_SINGLE_METRICS",
     "HARNESS_MODULE_PATH",
     "MARKOUT_REFERENCE",
+    "PERMITTED_CONCLUSION_SHAPE",
     "SIX_METRIC_KEYS",
+    "AblationConclusion",
     "ArmConfigs",
+    "ArmSingleMetrics",
     "CandidateFill",
     "LoadedTape",
     "MarkoutReferenceError",
     "MatchedOpportunityReport",
     "ReplayResult",
+    "ablation_conclusion",
     "arm_configs",
+    "arm_single_metrics",
     "config_field_diff",
     "forbidden_import_hits",
     "load_base_config_overrides",
@@ -719,4 +725,110 @@ def matched_opportunity_report(
         markout_reference="venue",
         matched_opportunity_count=len(deltas),
         fills=guarded_fills,
+    )
+
+
+# --- E6-T4: forbidden-comparison guard — the ONLY permitted A/B conclusion shape -------------
+# REQ-114 names three comparisons that are FORBIDDEN as a benefit verdict on their own:
+#   (1) total-PnL-alone, (2) fill-count-alone ("fewer trades ≠ better"), (3) per-fill-markout-alone.
+# An arm that merely trades LESS with a lower total loss is NOT "better" — that is selection bias, not a
+# risk edge. The single conclusion the harness will ever yield is a matched-opportunity risk-edge
+# HYPOTHESIS, pending Gate B: hypothesis-only, evidence-gated, never a promotion. :class:`AblationConclusion`
+# has NO benefit/better/winner field, so by construction a favorable single metric can never travel as a
+# verdict. The three forbidden single-metric deltas ARE recorded on the conclusion (an honest packet is
+# transparent about what was observed) but the verdict — :meth:`AblationConclusion.infers_benefit` — is
+# structurally blind to them. This is offline diagnostics over an already-replayed arm pair; no
+# ranked/research/maker import (the ``forbidden_import_hits`` guard still holds).
+
+# The three FORBIDDEN-alone comparison names (REQ-114) — each is diagnostic, none is a verdict.
+FORBIDDEN_SINGLE_METRICS = frozenset({"total_pnl", "fill_count", "per_fill_markout"})
+
+# The ONLY conclusion shape the harness permits (REQ-114). It is a HYPOTHESIS over MATCHED opportunities,
+# explicitly PENDING Gate B — it contains no "benefit"/"better"/"winner" term, so no verdict can hide in
+# the label. The RED-25 mutation (a benefit flag keyed on lower total loss / fewer trades) can only live
+# in ``infers_benefit`` below; this constant stays hypothesis-only regardless.
+PERMITTED_CONCLUSION_SHAPE = "risk-edge hypothesis on matched opportunities, pending Gate B"
+
+
+@dataclass(frozen=True)
+class ArmSingleMetrics:
+    """One arm's three FORBIDDEN-alone single metrics (REQ-114) — none is a benefit verdict on its own.
+
+    ``total_markout_bps`` is the arm's total venue-referenced markout (the "total PnL" comparison),
+    ``fill_count`` its candidate-fill count ("fewer trades ≠ better"), ``per_fill_markout`` its mean
+    per-fill markout. Grouped here so a conclusion can RECORD the differentials transparently while its
+    verdict stays blind to them — a lower total loss / fewer trades / better per-fill never infers benefit.
+    """
+
+    total_markout_bps: float
+    fill_count: int
+    per_fill_markout: float
+
+
+@dataclass(frozen=True)
+class AblationConclusion:
+    """The ONLY permitted A/B conclusion: a matched-opportunity risk-edge HYPOTHESIS, pending Gate B.
+
+    There is deliberately NO ``benefit`` / ``better`` / ``winner`` field: a favorable single metric can
+    never travel as a verdict (REQ-114). The three forbidden single-metric deltas (``total_markout_delta``,
+    ``fill_count_delta``, ``per_fill_markout_delta``) are recorded so the packet is honest about what was
+    observed, but :meth:`infers_benefit` is structurally blind to them — the conclusion is fed ONLY by the
+    matched-opportunity delta (the honest paired A-vs-B markout over the SAME eligible opportunities) and
+    stays a hypothesis pending Gate B. ``hypothesis_only`` / ``gate_b_pending`` are invariants of the shape.
+    """
+
+    matched_opportunity_markout: float
+    total_markout_delta: float
+    fill_count_delta: int
+    per_fill_markout_delta: float
+    shape: str = PERMITTED_CONCLUSION_SHAPE
+    hypothesis_only: bool = True
+    gate_b_pending: bool = True
+
+    def infers_benefit(self) -> bool:
+        """Whether this conclusion infers benefit from a single favorable metric — ALWAYS ``False`` (REQ-114).
+
+        A lower total loss, fewer trades, or a better per-fill markout can NEVER become a benefit verdict:
+        the only conclusion is the matched-opportunity hypothesis pending Gate B. The recorded single-metric
+        deltas are intentionally NOT consulted here — the RED-25 mutation keys a benefit flag on one of them
+        (e.g. ``self.total_markout_delta > 0``), which this honest implementation refuses to do.
+        """
+        return False
+
+
+def arm_single_metrics(result: ReplayResult) -> ArmSingleMetrics:
+    """The arm's three forbidden-alone single metrics from its OWN venue-referenced candidate fills.
+
+    Total markout (sum), fill count, and mean per-fill markout — each a FORBIDDEN-alone comparison input
+    (REQ-114). Scored against ``MARKOUT_REFERENCE`` (the venue's own future mid), never the FV the guard
+    consumes, so the RED-26 fail-closed guard still applies uniformly.
+    """
+    fills = _candidate_fills(result, reference=MARKOUT_REFERENCE)
+    total = float(sum(f.markout_bps for f in fills))
+    per_fill = total / len(fills) if fills else 0.0
+    return ArmSingleMetrics(
+        total_markout_bps=total,
+        fill_count=len(fills),
+        per_fill_markout=per_fill,
+    )
+
+
+def ablation_conclusion(
+    report: MatchedOpportunityReport,
+    baseline: ArmSingleMetrics,
+    guarded: ArmSingleMetrics,
+) -> AblationConclusion:
+    """Reduce a guarded-vs-baseline six-metric report to the ONLY permitted conclusion (REQ-114).
+
+    The forbidden single-metric differentials (total PnL, fill count, per-fill markout) are recorded on the
+    conclusion for an honest packet, but they are DELIBERATELY not consulted for the verdict: the conclusion
+    is the matched-opportunity risk-edge HYPOTHESIS pending Gate B — the honest paired delta over the SAME
+    eligible opportunities — and nothing else. A benefit/"better" verdict from any single favorable metric
+    (a lower total loss, fewer trades, a better per-fill markout) is forbidden by the shape itself.
+    """
+    return AblationConclusion(
+        matched_opportunity_markout=report.matched_opportunity_markout,
+        total_markout_delta=guarded.total_markout_bps - baseline.total_markout_bps,
+        fill_count_delta=guarded.fill_count - baseline.fill_count,
+        per_fill_markout_delta=guarded.per_fill_markout - baseline.per_fill_markout,
     )

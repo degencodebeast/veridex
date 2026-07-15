@@ -28,11 +28,17 @@ import pytest
 
 from tests.mm_strategy_ablation_harness import (
     FIXTURES_DIR,
+    FORBIDDEN_SINGLE_METRICS,
     HARNESS_MODULE_PATH,
     MARKOUT_REFERENCE,
+    PERMITTED_CONCLUSION_SHAPE,
     SIX_METRIC_KEYS,
+    AblationConclusion,
+    ArmSingleMetrics,
     MarkoutReferenceError,
+    ablation_conclusion,
     arm_configs,
+    arm_single_metrics,
     config_field_diff,
     forbidden_import_hits,
     load_base_config_overrides,
@@ -476,3 +482,92 @@ def test_markout_reference_is_venue_not_fv(tmp_path) -> None:
     # an FV-referenced markout is REFUSED — the harness fails closed rather than compute a circular score.
     with pytest.raises(MarkoutReferenceError):
         matched_opportunity_report(baseline, guarded, reference="fv")
+
+
+# --- RED-25 / AC-026: forbidden-comparison guard — "fewer trades ≠ better" -------------------
+# REQ-114 names three forbidden comparisons: total-PnL-alone, fill-count-alone ("fewer trades ≠
+# better"), per-fill-markout-alone. NONE may become a benefit/"better" verdict; the ONLY permitted
+# conclusion is a matched-opportunity risk-edge HYPOTHESIS, pending Gate B.
+
+
+def _adversarial_favorable_arm_pair() -> tuple[ArmSingleMetrics, ArmSingleMetrics]:
+    """A (baseline, guarded) single-metric pair where arm B trades LESS with lower total loss.
+
+    The exact REQ-114 forbidden-favorable case: arm B posts FEWER fills (3 < 12), carries a LOWER total
+    loss (-40 vs -900 bps, i.e. less negative), AND a better per-fill markout. EVERY single metric points
+    "B looks better" — precisely the temptation the forbidden-comparison guard must refuse. The values are
+    an explicit adversarial construction (not a replay artefact) because the frozen fixtures never post a
+    losing arm; the point is the conclusion logic's refusal, exercised against the worst-case flattery.
+    """
+    baseline = ArmSingleMetrics(total_markout_bps=-900.0, fill_count=12, per_fill_markout=-75.0)
+    guarded = ArmSingleMetrics(total_markout_bps=-40.0, fill_count=3, per_fill_markout=-13.3)
+    return baseline, guarded
+
+
+def test_fewer_trades_lower_loss_no_benefit_inference(tmp_path) -> None:
+    """An arm trading LESS with lower total loss is NOT "better" — only the matched hypothesis survives.
+
+    REQ-114 forbids three comparisons by name: total-PnL-alone, fill-count-alone ("fewer trades ≠
+    better"), per-fill-markout-alone. Arm B here trades fewer fills, carries a lower total loss, AND a
+    better per-fill markout — every single metric flatters it — yet the ONLY conclusion the guard yields
+    is the matched-opportunity risk-edge HYPOTHESIS pending Gate B: no single favorable metric becomes a
+    benefit verdict. The six-metric report feeding the conclusion is a REAL replay (non-vacuous).
+    """
+    # the three forbidden-alone comparisons are pinned by name (REQ-114).
+    assert frozenset(
+        {"total_pnl", "fill_count", "per_fill_markout"}
+    ) == FORBIDDEN_SINGLE_METRICS
+
+    arms = arm_configs(_control_overrides())
+    tape = load_tape("markout")
+    baseline_run = replay_arm(tape, arms.baseline, tmp_path / "a")
+    guarded_run = replay_arm(tape, arms.guarded, tmp_path / "b")
+    report = matched_opportunity_report(baseline_run, guarded_run)
+
+    baseline_metrics, guarded_metrics = _adversarial_favorable_arm_pair()
+
+    # the scenario really is the forbidden-favorable one: B trades LESS, lower total loss, better per-fill.
+    assert guarded_metrics.fill_count < baseline_metrics.fill_count  # fewer trades
+    assert guarded_metrics.total_markout_bps > baseline_metrics.total_markout_bps  # lower total loss
+    assert guarded_metrics.per_fill_markout > baseline_metrics.per_fill_markout  # better per-fill
+
+    conclusion = ablation_conclusion(report, baseline_metrics, guarded_metrics)
+
+    # the ONLY permitted conclusion shape — a matched-opportunity risk-edge HYPOTHESIS pending Gate B.
+    assert conclusion.shape == PERMITTED_CONCLUSION_SHAPE
+    assert "hypothesis" in PERMITTED_CONCLUSION_SHAPE
+    assert "matched opportunities" in PERMITTED_CONCLUSION_SHAPE
+    assert "pending Gate B" in PERMITTED_CONCLUSION_SHAPE
+    assert conclusion.hypothesis_only is True
+    assert conclusion.gate_b_pending is True
+
+    # THE GUARD: despite fewer trades + lower total loss + better per-fill markout, NO benefit is inferred.
+    assert conclusion.infers_benefit() is False
+
+    # the forbidden single-metric deltas are RECORDED (an honest packet) but NON-conclusive — every one
+    # points "B better", yet none moves the verdict off the pending-Gate-B hypothesis.
+    assert conclusion.total_markout_delta > 0.0  # B's lower total loss is visible ...
+    assert conclusion.fill_count_delta < 0  # ... and its fewer trades ...
+    assert conclusion.per_fill_markout_delta > 0.0  # ... and its better per-fill markout ...
+    # ... yet AblationConclusion carries NO benefit/better/winner verdict field — forbidden by shape.
+    verdict_terms = ("benefit", "better", "winner", "beats", "superior")
+    assert not any(
+        term in field_name
+        for field_name in AblationConclusion.__dataclass_fields__
+        for term in verdict_terms
+    )
+    assert not any(term in PERMITTED_CONCLUSION_SHAPE.lower() for term in verdict_terms)
+
+    # the permitted conclusion is fed by the REAL matched-opportunity signal — the honest paired delta
+    # over the SAME eligible opportunities — never by any single arm-total metric.
+    assert conclusion.matched_opportunity_markout == report.matched_opportunity_markout
+
+    # exercised on the REAL arm pair too: reading each arm's OWN single metrics still yields no benefit
+    # verdict — only the matched-opportunity hypothesis pending Gate B.
+    real_conclusion = ablation_conclusion(
+        report,
+        arm_single_metrics(baseline_run),
+        arm_single_metrics(guarded_run),
+    )
+    assert real_conclusion.shape == PERMITTED_CONCLUSION_SHAPE
+    assert real_conclusion.infers_benefit() is False
