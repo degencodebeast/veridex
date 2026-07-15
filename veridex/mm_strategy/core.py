@@ -434,6 +434,25 @@ def _status_stream_reason(
     return None
 
 
+def _token_mapping_reason(observation: StrategyObservation) -> ReasonCode | None:
+    """The token-mapping blocker reason (REQ-062/024), or ``None`` when this outcome's venue token
+    identity is resolved.
+
+    The resolved ``token_id`` arrives ON the observation — the assembler resolves the
+    ``(market_ref, side) -> token_id`` mapping via the pinned maker mapping and the pure core NEVER
+    imports that surface (E3-T5 import closure). A BLANK / whitespace-only ``token_id`` is the
+    assembler's signal that the mapping was MISSING or AMBIGUOUS: without an unambiguous token this
+    outcome cannot place an order on the venue, so it fails closed to
+    NO_QUOTE(``token_mapping_missing``). The core NEVER fabricates or defaults a token to salvage a
+    quote (REQ-062) — a missing identity blocks the outcome's order-placing actions, it does not
+    invent one. This is a QUOTE-ONLY blocker (like the status/stream gate): it downgrades an
+    otherwise placement-eligible row-H disposition to ``NO_QUOTE`` without touching admission or the
+    watermark — the venue accumulators keyed on the present ``(market_ref, side)`` still train."""
+    if not observation.token_id.strip():
+        return "token_mapping_missing"
+    return None
+
+
 def _admit_venue_updates(
     observation: StrategyObservation, base: StrategyState, config: StrategyConfig
 ) -> dict[str, Any]:
@@ -1053,9 +1072,11 @@ def _apply_healthy(
 
     * F (fv-epoch): guard inert until the basis re-warms → NO_QUOTE ``basis_warmup``.
     * W (warmup): references below floor → NO_QUOTE ``event_ref_warmup``.
-    * H (healthy): a QUOTE-ONLY status/stream blocker downgrades to ``NO_QUOTE`` first (admission
-      unaffected); otherwise the venue-mid anchor + zone spine (:func:`_quote_disposition`) resolves
-      the eligible quote class (E4-T1; the guard + quote-math slots refine it in later E4 tasks).
+    * H (healthy): a QUOTE-ONLY blocker downgrades to ``NO_QUOTE`` first (admission unaffected) — a
+      missing/ambiguous outcome token (:func:`_token_mapping_reason`) PRE-EMPTS the status/stream
+      gate (its §4.4 vocabulary precedence: without a resolved venue token no order can be placed at
+      all); otherwise the venue-mid anchor + zone spine (:func:`_quote_disposition`) resolves the
+      eligible quote class (E4-T1; the guard + quote-math slots refine it in later E4 tasks).
     """
     updates = _admit_venue_updates(observation, base, config)
     updates.update(_admit_basis_updates(observation, base, config))
@@ -1066,7 +1087,9 @@ def _apply_healthy(
         return _decide("NO_QUOTE", ("basis_warmup",)), next_state
     if row == "W":
         return _decide("NO_QUOTE", ("event_ref_warmup",)), next_state
-    blocker = _status_stream_reason(observation, base, config)
+    blocker = _token_mapping_reason(observation) or _status_stream_reason(
+        observation, base, config
+    )
     if blocker is not None:
         return _decide("NO_QUOTE", (blocker,)), next_state
     return _quote_disposition(observation, base, config), next_state

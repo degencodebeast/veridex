@@ -26,7 +26,10 @@ Pinned invariants (REQ-023/050/051/053/054/060/082/097; AC-001/002/004/009/036/0
 
 from __future__ import annotations
 
+import ast
 import inspect
+from pathlib import Path
+from typing import get_args
 
 import pytest
 from pydantic import ValidationError
@@ -34,9 +37,11 @@ from pydantic import ValidationError
 from veridex.mm_strategy import core
 from veridex.mm_strategy.config import StrategyConfig
 from veridex.mm_strategy.contracts import (
+    DecisionKind,
     GuardFairValue,
     GuardStateWatermark,
     InventoryProjection,
+    NeutralIntent,
     StrategyObservation,
     StrategyState,
 )
@@ -965,3 +970,107 @@ def test_reduce_conflict_no_quote() -> None:
     assert d_ok.kind == "ONE_SIDED_REDUCE"
     assert d_ok.reason_codes == ("inventory_reduce",)
     assert d_ok.intent_plan[0].leg_role == "ask"
+
+
+# --- E4-T8: no take / no widen / no size image + the token-mapping-missing gate --------------
+# The v0 honesty invariants (REQ-057/061/062/024; AC-014/015; RED-12/13). Three tests LOCK an
+# ABSENCE by introspection (a spec-forbidden verb / field can never silently return) and one drives
+# the token-mapping fail-closed gate (a missing/ambiguous outcome identity blocks that outcome's
+# order-placing actions, never a fabricated/defaulted token).
+
+
+def test_no_take_no_widen_in_decisionkind() -> None:
+    # REQ-061/060 (Fable F3): the CLOSED v0 taxonomy has NO aggressive ``take`` verb and NO ``WIDEN``
+    # verb — R4-B is proposal-only, never aggressive/liquidity-taking. Introspect the ``DecisionKind``
+    # Literal members directly (case-insensitively) so adding EITHER verb to the vocabulary trips this
+    # tripwire (the mutation add of ``"take"`` MUST fail here). Both are behavior-bearing spec
+    # revisions, never task-plan discretion.
+    members = get_args(DecisionKind)
+    lowered = {member.lower() for member in members}
+    assert "take" not in lowered, f"DecisionKind must not contain a take verb; got {members!r}"
+    assert "widen" not in lowered, f"DecisionKind must not contain a WIDEN verb; got {members!r}"
+    # Exact-case belt-and-braces (the two forms the spec/mutation name verbatim).
+    assert "TAKE" not in members and "take" not in members
+    assert "WIDEN" not in members
+
+
+def test_no_size_in_neutral_intent() -> None:
+    # REQ-057 (shares E1-T2): the neutral intent proposes NO size of any kind — ``resolve_dust_size``
+    # is the SOLE wire-size authority and decision identity is over side + price only. Introspect the
+    # frozen ``NeutralIntent`` model fields so a re-introduced size field (under any casing) trips
+    # this lock.
+    field_names = set(NeutralIntent.model_fields)
+    assert "size" not in field_names, f"NeutralIntent must carry no size field; got {field_names!r}"
+    assert not any("size" in name for name in field_names), (
+        f"NeutralIntent must carry no size-bearing field; got {field_names!r}"
+    )
+
+
+def test_ambiguous_token_mapping_blocks_outcome() -> None:
+    # AC-015 / RED-13 (REQ-062/024): the resolved venue ``token_id`` arrives ON the observation (the
+    # assembler resolves it via the pinned maker mapping; the pure core NEVER imports that surface). A
+    # MISSING or AMBIGUOUS (market_ref, side) -> token mapping surfaces as a BLANK ``token_id`` on the
+    # observation: without an unambiguous token the outcome cannot place an order, so it fails closed to
+    # NO_QUOTE(``token_mapping_missing``) — the core NEVER fabricates or defaults a token to salvage a
+    # place. The per-(market_ref, side) own-book identity is keyed on the observation and asserted below.
+    config = _config()
+    state = _warm_state()
+
+    # CONTROL — a resolved token_id on an otherwise placement-eligible frame QUOTES (baseline).
+    resolved = _obs(bid=0.49, ask=0.51)
+    assert resolved.token_id != "" and resolved.token_id.strip() != ""
+    d_ok, _ = decide(resolved, state, config)
+    assert d_ok.kind == "QUOTE_TWO_SIDED"
+
+    # MISSING mapping (empty token_id) — the SAME placement-eligible frame is blocked, never placed.
+    missing = resolved.model_copy(update={"token_id": ""})
+    d_missing, _ = decide(missing, state, config)
+    assert d_missing.kind == "NO_QUOTE"
+    assert d_missing.reason_codes == ("token_mapping_missing",)
+    assert d_missing.intent_plan == ()  # NO fabricated/defaulted place on a missing token
+
+    # AMBIGUOUS mapping (whitespace-only token_id — the assembler could not disambiguate) — same gate.
+    ambiguous = resolved.model_copy(update={"token_id": "   "})
+    d_ambiguous, _ = decide(ambiguous, state, config)
+    assert d_ambiguous.kind == "NO_QUOTE"
+    assert d_ambiguous.reason_codes == ("token_mapping_missing",)
+    assert d_ambiguous.intent_plan == ()
+
+    # The own-book basis/residual identity is keyed per outcome ON the observation (REQ-024): the
+    # resolved token travels with the (market_ref, side) leg the decision reasons over — it is not a
+    # side-channel the core reconstructs. Assert the identity leg is present + coherent on the frame.
+    assert resolved.market_ref and resolved.side and resolved.token_id
+    assert (resolved.market_ref, resolved.side) == ("TEAM-A/YES", "YES")
+
+
+def test_no_hardcoded_fixture_or_market_key() -> None:
+    # AC-014 / RED-12 (REQ-024): a STATIC AST scan of the production decision path proves no decision
+    # is keyed to a baked-in fixture id or market key. Two invariants:
+    #   (a) the pure decision core NEVER reads ``fixture_id`` — it is provenance metadata, not a
+    #       decision input, so it must not appear as an attribute access anywhere in core.py.
+    #   (b) no per-outcome identity key (market_ref / venue_market_ref / token_id) is COMPARED against
+    #       a hard-coded literal — a decision routed by ``x.market_ref == "TEAM-A/YES"`` or
+    #       ``x.fixture_id == 0`` is a fabricated/fixture-pinned route. (Reading ``token_id`` for the
+    #       blank-mapping gate is a truthiness check, not a literal comparison, so it is admissible.)
+    source = Path(core.__file__).read_text(encoding="utf-8")
+    tree = ast.parse(source)
+
+    fixture_reads = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Attribute) and node.attr == "fixture_id"
+    ]
+    assert fixture_reads == [], (
+        "the pure decision core must not read observation.fixture_id on any decision path"
+    )
+
+    identity_keys = {"market_ref", "venue_market_ref", "token_id"}
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Compare):
+            continue
+        operands = [node.left, *node.comparators]
+        attrs = {op.attr for op in operands if isinstance(op, ast.Attribute)}
+        consts = [op for op in operands if isinstance(op, ast.Constant)]
+        assert not (attrs & identity_keys and consts), (
+            f"core must not compare an identity key to a hard-coded literal (line {node.lineno})"
+        )
