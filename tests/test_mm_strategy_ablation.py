@@ -24,16 +24,23 @@ from __future__ import annotations
 import json
 import time
 
+import pytest
+
 from tests.mm_strategy_ablation_harness import (
     FIXTURES_DIR,
     HARNESS_MODULE_PATH,
+    MARKOUT_REFERENCE,
+    SIX_METRIC_KEYS,
+    MarkoutReferenceError,
     arm_configs,
     config_field_diff,
     forbidden_import_hits,
     load_base_config_overrides,
     load_tape,
+    matched_opportunity_report,
     neutralize_guard,
     replay_arm,
+    venue_future_mid_series,
 )
 
 # --- RED-24: arm identity — the config diff is the guard block, nothing else ----------------
@@ -349,3 +356,123 @@ def test_placebo_anti_predictive_next_change_only() -> None:
     # this placebo, and the forward-only assertion above is what keeps it honest.
     assert same > 0.0
     assert forward < same
+
+
+# ============================================================================================
+# E6-T3: six-metric matched-opportunity report + venue-derived reference (REQ-112/113/AC-027/RED-26)
+# ============================================================================================
+# E6-T1 proves the arms are IDENTICAL except the guard block; E6-T2 proves the guard is LOAD-BEARING and
+# the markout methodology is forward-only. E6-T3 pins the EVALUATION REPORT that would score the arms:
+# the SIX mandatory metrics reported ALWAYS TOGETHER (no favorable subset alone), each markout scored
+# against a VENUE-derived reference — the venue's OWN future mid at the next venue change (event-time) —
+# NEVER the TxLINE FV the guard consumes. Scoring the FV-driven guard against the SAME FV is circular
+# self-validation (a guard that merely parrots FV would look perfect), so an FV-referenced markout FAILS
+# CLOSED (REQ-113/RED-26). The report runs on the ``markout`` tape: both arms warm and quote two-sided
+# while the venue mid STEPS (so an event-time markout horizon exists), then the guarded arm fails closed
+# to NO_QUOTE on the extreme-residual tick (a real abstention feeding the abstention metric).
+
+
+def _sign_for(leg_role: str) -> int:
+    """Markout sign by side — a bid (long) gains when the venue rises; an ask (short) when it falls."""
+    return 1 if leg_role == "bid" else -1
+
+
+def test_six_metrics_reported_together(tmp_path) -> None:
+    """The evaluation report carries ALL SIX mandatory metrics together — no favorable subset (AC-027).
+
+    ``metrics()`` returns EXACTLY the pinned six-metric set, so a flattering number (better per-fill
+    markout, fewer fills) can never be exposed on its own — it always travels with the honest
+    denominators (matched-opportunity delta, abstention count, capital at risk). The tape is exercised
+    for real: the guarded arm posts candidate fills against stepping venue mids AND abstains once, so
+    every metric is non-vacuous, not a hard-coded zero.
+    """
+    arms = arm_configs(_control_overrides())
+    tape = load_tape("markout")
+    baseline = replay_arm(tape, arms.baseline, tmp_path / "a")
+    guarded = replay_arm(tape, arms.guarded, tmp_path / "b")
+
+    report = matched_opportunity_report(baseline, guarded)
+
+    # the pinned six-metric set is EXACTLY these keys — the report cannot emit a favorable subset alone.
+    assert frozenset(
+        {
+            "per_fill_markout",
+            "matched_opportunity_markout",
+            "exposure_normalized_adverse_selection",
+            "fill_count",
+            "abstention_count",
+            "capital_at_risk",
+        }
+    ) == SIX_METRIC_KEYS
+    assert set(report.metrics()) == SIX_METRIC_KEYS
+    for key in SIX_METRIC_KEYS:
+        assert report.metrics()[key] is not None, key
+
+    # non-vacuity: the naive favorable metric (per-fill markout) is reported WITH real honest
+    # denominators — genuine fills, at least one abstention, capital genuinely at risk, and a non-empty
+    # MATCHED (paired A-vs-B over the SAME eligible opportunities) set.
+    assert report.fill_count > 0
+    assert report.abstention_count >= 1
+    assert report.capital_at_risk > 0.0
+    assert report.matched_opportunity_count > 0
+    # internal consistency: the fill count is exactly the candidate-fill detail the report exposes, and
+    # per-fill markout is their mean — no favorable-subset filtering hidden inside.
+    assert report.fill_count == len(report.fills)
+    assert report.metrics()["per_fill_markout"] == pytest.approx(
+        sum(f.markout_bps for f in report.fills) / len(report.fills)
+    )
+
+
+def test_markout_reference_is_venue_not_fv(tmp_path) -> None:
+    """The markout reference is the VENUE future mid (event-time), never the FV — FV fails closed (RED-26).
+
+    Scoring the FV-driven guard against the SAME FV is circular self-validation. Every fill is scored
+    against the venue's OWN future mid at the next venue change; an FV-referenced markout is REFUSED
+    (``MarkoutReferenceError``) rather than computed. On this tape the FV (mid+0.05) and the venue mid
+    genuinely DISAGREE, so 'venue-derived' is a real distinction: recomputing the SAME fills against the
+    FV yields a DIFFERENT mean. The pinned reference is ``"venue"``.
+    """
+    arms = arm_configs(_control_overrides())
+    tape = load_tape("markout")
+    baseline = replay_arm(tape, arms.baseline, tmp_path / "a")
+    guarded = replay_arm(tape, arms.guarded, tmp_path / "b")
+
+    report = matched_opportunity_report(baseline, guarded)
+    assert MARKOUT_REFERENCE == "venue"
+    assert report.markout_reference == "venue"
+
+    # the venue future-mid series is EVENT-TIME (the NEXT venue change), not a fixed wall-clock offset.
+    venue_future = venue_future_mid_series(guarded.observations)
+    assert any(v is not None for v in venue_future)
+
+    # per-fill markout is the VENUE-referenced mean over the SAME candidate fills the report exposes.
+    assert report.per_fill_markout == pytest.approx(
+        sum(f.markout_bps for f in report.fills) / len(report.fills)
+    )
+
+    # PER-FILL, the score is the venue's OWN future mid, never the FV the guard consumed. The FV
+    # genuinely DISAGREES with the venue mid on this tape (fv = mid+0.05), so re-scoring the SAME fill
+    # against the FV-at-horizon yields a DIFFERENT number — proof the report is not vacuously the FV.
+    assert report.fills  # there are candidate fills to score
+    for fill in report.fills:
+        horizon_fv = guarded.observations[fill.horizon_index].guard_fv
+        assert horizon_fv is not None  # the guarded arm saw a fair value at every scored horizon
+        assert horizon_fv.fv != fill.venue_future_mid  # FV and venue disagree at every scored fill
+        venue_markout = round(
+            _sign_for(fill.leg_role)
+            * (fill.venue_future_mid - fill.quote_price)
+            / fill.venue_now
+            * 1e4
+        )
+        fv_markout = round(
+            _sign_for(fill.leg_role)
+            * (horizon_fv.fv - fill.quote_price)
+            / fill.venue_now
+            * 1e4
+        )
+        assert fill.markout_bps == venue_markout  # the report scored against the VENUE future mid ...
+        assert fill.markout_bps != fv_markout  # ... NOT the circular FV reference.
+
+    # an FV-referenced markout is REFUSED — the harness fails closed rather than compute a circular score.
+    with pytest.raises(MarkoutReferenceError):
+        matched_opportunity_report(baseline, guarded, reference="fv")

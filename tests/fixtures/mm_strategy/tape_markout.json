@@ -1,0 +1,22 @@
+{
+  "_note": "Canned deterministic E6-T3 MARKOUT tape — stepping venue mid (bounded drift) + a guard-driven extreme abstain. Unlike the E6-T1/T2 tapes (fixed venue microstructure) each tick carries an explicit venue bid/ask so the venue mid STEPS by +0.01 (< mid_jump_threshold 0.02) across the quoting ticks — the step is what gives each resting quote leg an EVENT-TIME markout horizon (the venue's OWN next-change mid). The step is bounded (0.50 -> 0.51 -> 0.52) so the raw mid never drifts past mid_jump_threshold from the lagging smoothed mid (no spurious book_thin). FV tracks mid+0.05 through warmup + quoting (gap 0.05 == basis, residual 0 -> both arms quote two-sided, no skew), then the LAST tick keeps the venue mid STABLE at 0.52 while the FV JUMPS to 0.67 so the guarded residual (0.15 - 0.05 = 0.10) BREACHES the extreme wall (extreme_multiple*residual_band = 3.0*0.03 = 0.09): arm B fails closed to NO_QUOTE/residual_extreme (a REAL guard-driven abstention feeding the abstention metric) while the FV-blind arm A quotes. The venue book is arm-identical (both arms see the same mid); only guard_fv differs. FV and the venue mid genuinely DISAGREE (fv = mid+0.05), so scoring against the venue future mid is a real distinction from an FV-referenced (circular) score. Requires overrides ref_min_samples=2, basis_min_samples=2.",
+  "health": "markout",
+  "stream": {"fixture_id": 1, "market_ref": "TEAM-A/YES", "side": "YES", "token_id": "TOKEN-YES"},
+  "venue_market_ref": "0xmarket",
+  "events": [
+    {"kind": "fv", "source_ts": 8, "recv_ts": 9700, "value": 0.55, "source_epoch": 1},
+    {"kind": "tick", "source": "book", "recv_ts": 9900, "as_of_ts": 10000, "bid": 0.49, "ask": 0.51},
+    {"kind": "fv", "source_ts": 18, "recv_ts": 19700, "value": 0.55, "source_epoch": 1},
+    {"kind": "tick", "source": "book", "recv_ts": 19900, "as_of_ts": 20000, "bid": 0.49, "ask": 0.51},
+    {"kind": "fv", "source_ts": 28, "recv_ts": 29700, "value": 0.55, "source_epoch": 1},
+    {"kind": "tick", "source": "book", "recv_ts": 29900, "as_of_ts": 30000, "bid": 0.49, "ask": 0.51},
+    {"kind": "fv", "source_ts": 38, "recv_ts": 39700, "value": 0.55, "source_epoch": 1},
+    {"kind": "tick", "source": "book", "recv_ts": 39900, "as_of_ts": 40000, "bid": 0.49, "ask": 0.51},
+    {"kind": "fv", "source_ts": 48, "recv_ts": 49700, "value": 0.56, "source_epoch": 1},
+    {"kind": "tick", "source": "book", "recv_ts": 49900, "as_of_ts": 50000, "bid": 0.50, "ask": 0.52},
+    {"kind": "fv", "source_ts": 58, "recv_ts": 59700, "value": 0.57, "source_epoch": 1},
+    {"kind": "tick", "source": "book", "recv_ts": 59900, "as_of_ts": 60000, "bid": 0.51, "ask": 0.53},
+    {"kind": "fv", "source_ts": 68, "recv_ts": 69700, "value": 0.67, "source_epoch": 1},
+    {"kind": "tick", "source": "book", "recv_ts": 69900, "as_of_ts": 70000, "bid": 0.51, "ask": 0.53}
+  ]
+}

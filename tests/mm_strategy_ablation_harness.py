@@ -61,16 +61,23 @@ from veridex.mm_strategy.core import decide
 __all__ = [
     "FIXTURES_DIR",
     "HARNESS_MODULE_PATH",
+    "MARKOUT_REFERENCE",
+    "SIX_METRIC_KEYS",
     "ArmConfigs",
+    "CandidateFill",
     "LoadedTape",
+    "MarkoutReferenceError",
+    "MatchedOpportunityReport",
     "ReplayResult",
     "arm_configs",
     "config_field_diff",
     "forbidden_import_hits",
     "load_base_config_overrides",
     "load_tape",
+    "matched_opportunity_report",
     "neutralize_guard",
     "replay_arm",
+    "venue_future_mid_series",
 ]
 
 HARNESS_MODULE_PATH = Path(__file__).resolve()
@@ -178,10 +185,19 @@ def _observation(
     identity: StreamIdentity,
     venue_market_ref: str,
     book_source_epoch: int = 1,
+    bid: float = 0.49,
+    ask: float = 0.51,
+    bid_size: float = 100.0,
+    ask_size: float = 120.0,
 ) -> StrategyObservation:
     """One healthy per-tick observation — arm-IDENTICAL venue/match-state facts; only ``guard_fv`` is
     arm-dependent. Mirrors the E3-T4 honest builder so ``run_cadence``'s field-for-field authentication
-    passes. Every ``recv_ts`` is ``<= as_of_ts`` (REQ-022 guard)."""
+    passes. Every ``recv_ts`` is ``<= as_of_ts`` (REQ-022 guard).
+
+    ``bid``/``ask``/sizes default to the fixed microstructure the E6-T1/T2 tapes rely on (their rows
+    omit these keys, so those streams stay byte-identical). A tape MAY carry per-tick ``bid``/``ask`` to
+    STEP the venue mid — the E6-T3 markout tape does this so an event-time markout horizon (the next
+    venue change) exists; the venue book is still arm-identical (both arms see the same mid)."""
     recv = as_of_ts - 10
     return StrategyObservation(
         fixture_id=identity.fixture_id,
@@ -192,10 +208,10 @@ def _observation(
         tick_size=0.01,
         observation_sequence=observation_sequence,
         book_source_epoch=book_source_epoch,
-        bid=0.49,
-        ask=0.51,
-        bid_size=100.0,
-        ask_size=120.0,
+        bid=bid,
+        ask=ask,
+        bid_size=bid_size,
+        ask_size=ask_size,
         book_status="ok",
         status_reason=None,
         book_recv_ts=recv,
@@ -235,8 +251,15 @@ def _tick(
     raw: dict[str, Any], identity: StreamIdentity, venue_market_ref: str
 ) -> ObservationTick:
     """Build a non-FV :class:`ObservationTick` from a raw tape row. The ``build`` factory binds the
-    cadence-assigned sequence + projected guard leg onto arm-identical venue facts."""
+    cadence-assigned sequence + projected guard leg onto arm-identical venue facts.
+
+    ``bid``/``ask``/sizes are OPTIONAL on the row and default to the E6-T1/T2 fixed microstructure, so
+    tapes that omit them are unchanged; the E6-T3 markout tape supplies them to step the venue mid."""
     as_of_ts = int(raw["as_of_ts"])
+    bid = float(raw.get("bid", 0.49))
+    ask = float(raw.get("ask", 0.51))
+    bid_size = float(raw.get("bid_size", 100.0))
+    ask_size = float(raw.get("ask_size", 120.0))
 
     def build(
         observation_sequence: int, guard_fv: GuardFairValue | None
@@ -247,6 +270,10 @@ def _tick(
             as_of_ts=as_of_ts,
             identity=identity,
             venue_market_ref=venue_market_ref,
+            bid=bid,
+            ask=ask,
+            bid_size=bid_size,
+            ask_size=ask_size,
         )
 
     return ObservationTick(
@@ -426,3 +453,270 @@ def forbidden_import_hits() -> list[str]:
             if re.search(rf"\b{re.escape(root)}\b", stripped):
                 hits.append(stripped)
     return hits
+
+
+# --- E6-T3: six-metric matched-opportunity report, venue-derived reference -------------------
+# The evaluation report that would SCORE the two arms (REQ-112/113/AC-027/RED-26). Two trust rules:
+#   (1) the SIX mandatory metrics are reported ALWAYS TOGETHER (no favorable subset alone) — a
+#       flattering per-fill number can never travel without matched-opportunity, abstention, exposure;
+#   (2) every markout is scored against the VENUE's OWN future mid at the next venue change (event-time,
+#       step-function replay), NEVER the TxLINE FV the guard consumes. Scoring the FV-driven guard
+#       against the same FV is circular self-validation, so an FV-referenced markout FAILS CLOSED.
+# This is offline diagnostics over an already-replayed arm pair — NO ranked/research/maker import (the
+# ``forbidden_import_hits`` guard still holds); the markout math mirrors ``veridex.maker.markout`` in
+# shape but is re-implemented here so the harness never depends on the maker tier.
+
+# The ONE permitted markout reference. The mutation for RED-26 flips this to ``"fv"``; the fail-closed
+# guard below keys on the LITERAL ``"venue"``, so that flip makes the default report fail closed and
+# ``test_markout_reference_is_venue_not_fv`` goes red.
+MARKOUT_REFERENCE = "venue"
+
+# The SIX mandatory metrics (REQ-112). Field names are venue/execution-flavored on purpose — none is a
+# ranked-lane term (no score/rank/edge/confidence/alpha), so the E7-T1 diagnostic denylist stays clean.
+SIX_METRIC_KEYS = frozenset(
+    {
+        "per_fill_markout",
+        "matched_opportunity_markout",
+        "exposure_normalized_adverse_selection",
+        "fill_count",
+        "abstention_count",
+        "capital_at_risk",
+    }
+)
+
+# Decision kinds that rest a priced quote leg (a candidate fill / eligible opportunity).
+_QUOTE_LEG_ROLES = ("bid", "ask")
+
+
+class MarkoutReferenceError(ValueError):
+    """Raised when a markout would be scored against a non-venue (e.g. FV) reference (REQ-113/RED-26).
+
+    Fail-closed: scoring the FV-driven guard against the SAME FV is circular self-validation, so the
+    harness REFUSES to compute an FV-referenced markout rather than silently returning a circular score.
+    """
+
+
+@dataclass(frozen=True)
+class CandidateFill:
+    """One resting quote leg scored against the venue's OWN future mid at the next venue change.
+
+    ``observation_index`` is where the leg rested; ``horizon_index`` is the EVENT-TIME markout horizon —
+    the NEXT observation whose venue mid DIFFERS (a venue change, not a fixed wall-clock offset).
+    ``markout_bps`` is signed by side (a bid gains when the venue rises above the quote, an ask when it
+    falls below) and referenced ONLY to ``venue_future_mid`` — never to the TxLINE FV the guard consumes.
+    Every resting quote is a candidate here: this is the honest CEILING model (no queue / no own-fill
+    claim), the same evidence ceiling Gate B pins for reach/print/capacity.
+    """
+
+    observation_index: int
+    horizon_index: int
+    leg_role: str
+    quote_price: float
+    venue_now: float
+    venue_future_mid: float
+    markout_bps: int
+
+
+@dataclass(frozen=True)
+class MatchedOpportunityReport:
+    """The SIX mandatory evaluation metrics, reported ALWAYS TOGETHER (REQ-112/AC-027).
+
+    :meth:`metrics` returns EXACTLY :data:`SIX_METRIC_KEYS`, so no favorable subset (better per-fill
+    markout, fewer fills) can be exposed on its own — the honest denominators (matched-opportunity
+    delta over the SAME eligible opportunities, abstention count, capital at risk) always travel with
+    it. Every markout is venue-derived (``markout_reference == "venue"``); the FV the guard consumes is
+    NEVER the evaluation reference. ``fills`` is the per-fill detail behind ``per_fill_markout``.
+    """
+
+    per_fill_markout: float
+    matched_opportunity_markout: float
+    exposure_normalized_adverse_selection: float
+    fill_count: int
+    abstention_count: int
+    capital_at_risk: float
+    markout_reference: str
+    matched_opportunity_count: int
+    fills: tuple[CandidateFill, ...]
+
+    def metrics(self) -> dict[str, float]:
+        """The SIX mandatory metrics as ONE mapping — EXACTLY ``SIX_METRIC_KEYS``, no subset (AC-027)."""
+        return {
+            "per_fill_markout": self.per_fill_markout,
+            "matched_opportunity_markout": self.matched_opportunity_markout,
+            "exposure_normalized_adverse_selection": self.exposure_normalized_adverse_selection,
+            "fill_count": self.fill_count,
+            "abstention_count": self.abstention_count,
+            "capital_at_risk": self.capital_at_risk,
+        }
+
+
+def _venue_mid(obs: StrategyObservation) -> float | None:
+    """The venue mid ``(bid + ask) / 2`` when the book has both sides, else ``None`` (a stale book)."""
+    if obs.bid is None or obs.ask is None:
+        return None
+    return (obs.bid + obs.ask) / 2.0
+
+
+def _horizon_indices(mids: list[float | None]) -> list[int | None]:
+    """For each observation, the index of the NEXT venue CHANGE — the event-time markout horizon.
+
+    ``horizon[i]`` is the smallest ``j > i`` whose venue mid is present AND differs from ``mid[i]`` (a
+    genuine venue change on the step-function tape), or ``None`` when the book is stale at ``i`` or no
+    future change exists. This is EVENT-TIME, never a fixed wall-clock offset (REQ-113)."""
+    horizons: list[int | None] = []
+    for i, now in enumerate(mids):
+        idx: int | None = None
+        if now is not None:
+            for j in range(i + 1, len(mids)):
+                if mids[j] is not None and mids[j] != now:
+                    idx = j
+                    break
+        horizons.append(idx)
+    return horizons
+
+
+def venue_future_mid_series(
+    observations: tuple[StrategyObservation, ...],
+) -> tuple[float | None, ...]:
+    """The event-time next-venue-change mid for each observation (VENUE-derived reference; REQ-113).
+
+    ``None`` where the book is stale or no future venue change exists. This is the ONLY reference the
+    markout is scored against — the venue's own future price, never the FV the guard consumes.
+    """
+    mids = [_venue_mid(o) for o in observations]
+    horizons = _horizon_indices(mids)
+    return tuple(mids[h] if h is not None else None for h in horizons)
+
+
+def _markout_bps(*, leg_role: str, quote_price: float, venue_now: float, venue_future: float) -> int:
+    """Signed venue-referenced markout in bps — a bid gains when the venue rises, an ask when it falls.
+
+    Mirrors ``veridex.maker.markout.forward_markout_bps`` in shape but is re-implemented here so this
+    TEST-SIDE harness never imports the maker tier. The reference is ``venue_future`` (the venue's OWN
+    future mid), never the FV.
+    """
+    sign = 1 if leg_role == "bid" else -1
+    return round(sign * (venue_future - quote_price) / venue_now * 1e4)
+
+
+def _candidate_fills(result: ReplayResult, *, reference: str) -> tuple[CandidateFill, ...]:
+    """Every resting quote leg with a scorable event-time horizon, scored against the venue future mid.
+
+    A resting leg (``leg_role`` in bid/ask with a price) at observation ``i`` is a candidate fill when a
+    future venue change exists. ``reference`` MUST be ``"venue"``: an FV reference is circular and fails
+    closed (REQ-113/RED-26). Decisions are folded 1:1 over the observation stream in ``replay_arm``, so
+    ``result.decisions[i]`` is the decision on ``result.observations[i]``.
+    """
+    if reference != "venue":
+        raise MarkoutReferenceError(
+            f"markout reference must be venue-derived (the venue's own future mid), not {reference!r}: "
+            "scoring the FV-driven guard against the FV it consumes is circular self-validation "
+            "(REQ-113/RED-26)"
+        )
+    observations = result.observations
+    mids = [_venue_mid(o) for o in observations]
+    horizons = _horizon_indices(mids)
+    fills: list[CandidateFill] = []
+    for i, decision in enumerate(result.decisions):
+        now = mids[i]
+        h = horizons[i]
+        if now is None or now == 0.0 or h is None:
+            continue
+        future = mids[h]
+        if future is None:
+            continue
+        for leg in decision.intent_plan:
+            if leg.leg_role not in _QUOTE_LEG_ROLES or leg.price is None:
+                continue
+            fills.append(
+                CandidateFill(
+                    observation_index=i,
+                    horizon_index=h,
+                    leg_role=leg.leg_role,
+                    quote_price=leg.price,
+                    venue_now=now,
+                    venue_future_mid=future,
+                    markout_bps=_markout_bps(
+                        leg_role=leg.leg_role,
+                        quote_price=leg.price,
+                        venue_now=now,
+                        venue_future=future,
+                    ),
+                )
+            )
+    return tuple(fills)
+
+
+def _capital_at_risk(result: ReplayResult) -> float:
+    """Quote-side exposure — the sum of resting-leg quote prices (unit notional; R4-B proposes no size).
+
+    R4-B v0 carries NO size field (REQ-057), so the per-leg notional is the quote price itself; capital
+    at risk is the total price rested across the arm's quote legs.
+    """
+    total = 0.0
+    for decision in result.decisions:
+        for leg in decision.intent_plan:
+            if leg.leg_role in _QUOTE_LEG_ROLES and leg.price is not None:
+                total += leg.price
+    return total
+
+
+def _abstention_count(result: ReplayResult) -> int:
+    """Count of ``NO_QUOTE`` abstentions — the guard's fail-closed abstentions (NOT 'fewer trades')."""
+    return sum(1 for d in result.decisions if d.kind == "NO_QUOTE")
+
+
+def _matched_opportunity_deltas(
+    baseline_fills: tuple[CandidateFill, ...], guarded_fills: tuple[CandidateFill, ...]
+) -> list[int]:
+    """Paired guarded-minus-baseline markout over the SAME eligible opportunities (REQ-112).
+
+    Keyed on ``(observation_index, leg_role)`` — the SAME venue opportunity — so the delta compares the
+    two arms ONLY where BOTH rested a leg. This strips the selection bias the spec names (arm B looking
+    better merely because it traded LESS): an opportunity arm B abstained on is absent from BOTH sides.
+    """
+    a = {(f.observation_index, f.leg_role): f.markout_bps for f in baseline_fills}
+    b = {(f.observation_index, f.leg_role): f.markout_bps for f in guarded_fills}
+    return [b[key] - a[key] for key in sorted(a.keys() & b.keys())]
+
+
+def matched_opportunity_report(
+    baseline: ReplayResult,
+    guarded: ReplayResult,
+    *,
+    reference: str = MARKOUT_REFERENCE,
+) -> MatchedOpportunityReport:
+    """Score the guarded arm vs the baseline into the SIX mandatory metrics (REQ-112/113/AC-027).
+
+    All six metrics are computed and returned TOGETHER — there is no partial-report path. Every markout
+    is scored against the venue's OWN future mid at the next venue change (event-time); ``reference``
+    other than ``"venue"`` (e.g. ``"fv"``) FAILS CLOSED via :class:`MarkoutReferenceError`. The default
+    ``reference`` is the pinned :data:`MARKOUT_REFERENCE` — the RED-26 mutation flips that constant to
+    ``"fv"``, which routes the default call through the fail-closed guard.
+    """
+    guarded_fills = _candidate_fills(guarded, reference=reference)
+    baseline_fills = _candidate_fills(baseline, reference=reference)
+
+    per_fill = (
+        sum(f.markout_bps for f in guarded_fills) / len(guarded_fills)
+        if guarded_fills
+        else 0.0
+    )
+    deltas = _matched_opportunity_deltas(baseline_fills, guarded_fills)
+    matched = sum(deltas) / len(deltas) if deltas else 0.0
+
+    capital = _capital_at_risk(guarded)
+    adverse_mass = float(sum(-f.markout_bps for f in guarded_fills if f.markout_bps < 0))
+    adverse_norm = adverse_mass / capital if capital > 0.0 else 0.0
+
+    return MatchedOpportunityReport(
+        per_fill_markout=per_fill,
+        matched_opportunity_markout=matched,
+        exposure_normalized_adverse_selection=adverse_norm,
+        fill_count=len(guarded_fills),
+        abstention_count=_abstention_count(guarded),
+        capital_at_risk=capital,
+        markout_reference="venue",
+        matched_opportunity_count=len(deltas),
+        fills=guarded_fills,
+    )
