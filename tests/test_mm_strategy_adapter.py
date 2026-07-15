@@ -21,7 +21,12 @@ from typing import get_args
 
 import pytest
 
-from veridex.dust_execution.facade import IntentKind, MMExecutionToolResult, MMIntentParams
+from veridex.dust_execution.facade import (
+    IntentKind,
+    MMExecutionToolRequest,
+    MMExecutionToolResult,
+    MMIntentParams,
+)
 from veridex.dust_execution.manifest import StrategyExperimentManifest
 from veridex.dust_execution.runner import _build_resting_order
 from veridex.mm_strategy.contracts import (
@@ -34,6 +39,8 @@ from veridex.mm_strategy.contracts import (
 from veridex.mm_strategy.core import projection_startup_gate
 from veridex.mm_strategy.execution_adapter import (
     NEUTRAL_TO_R4A,
+    AdmittedPins,
+    PlanExecutionResult,
     R4ARequestConfig,
     build_r4a_request,
     execute_plan,
@@ -82,22 +89,55 @@ def _result(
 class _RecordingFakeFacade:
     """OFFLINE recording fake — counts calls and returns a scripted result per call.
 
-    NEVER a real facade: no network, no wallet/signer, no submit/cancel. The scripted ``results``
-    are replayed in order (the last is reused if the plan somehow issues more calls than scripted,
-    which would itself be a freeze-boundary violation the count assertion catches).
+    NEVER a real facade: no network, no wallet/signer, no submit/cancel. The seam consumes the typed
+    :class:`MMExecutionToolRequest` the adapter built and pin-cross-checked (Gate #4 C-CRITICAL-1) —
+    never a raw ``NeutralIntent`` — and records it, so ``calls`` is executable evidence the facade sees
+    exactly the bound request whose result controls freezing. The scripted ``results`` are replayed in
+    order (the last is reused if the plan somehow issues more calls than scripted, which would itself be
+    a freeze-boundary violation the count assertion catches).
     """
 
     results: list[MMExecutionToolResult]
-    calls: list[NeutralIntent] = field(default_factory=list)
+    calls: list[MMExecutionToolRequest] = field(default_factory=list)
 
-    def __call__(self, leg: NeutralIntent) -> MMExecutionToolResult:
+    def __call__(self, request: MMExecutionToolRequest) -> MMExecutionToolResult:
         result = self.results[min(len(self.calls), len(self.results) - 1)]
-        self.calls.append(leg)
+        self.calls.append(request)
         return result
 
     @property
     def call_count(self) -> int:
         return len(self.calls)
+
+
+def _admitted_pins() -> AdmittedPins:
+    """The INDEPENDENT admitted-pin authority (Gate #4 C-CRITICAL-1), sourced SEPARATELY from
+    ``_pinned_config``. It carries the SAME reviewed manifest/policy/config hashes (the adapter is the
+    pinned strategy, not an attacker), but as a DISTINCT object the request config is never read back
+    from — so the declared/admitted cross-check is a real independence check, not a self-comparison."""
+    return AdmittedPins(
+        manifest_hash="manifest-hash", policy_hash="policy-hash", strategy_config_hash="cfg-hash"
+    )
+
+
+def _run_reviewed_plan(
+    *legs: NeutralIntent,
+    facade: _RecordingFakeFacade,
+    config: R4ARequestConfig | None = None,
+    admitted: AdmittedPins | None = None,
+) -> PlanExecutionResult:
+    """Build the reviewed (observation, decision) pair for ``legs`` and drive the UNIFIED
+    build→execute path (Gate #4 C-CRITICAL-1): ``execute_plan`` builds each actionable leg's bound
+    typed request (independent admitted authority) and hands THAT request to ``facade``. This is the
+    ONE composed path the freeze boundary now wraps — the facade never sees a raw ``NeutralIntent``."""
+    observation, decision = _reviewed_pair(*legs)
+    return execute_plan(
+        decision,
+        facade,
+        observation=observation,
+        config=config if config is not None else _pinned_config(),
+        admitted=admitted if admitted is not None else _admitted_pins(),
+    )
 
 
 # --- freeze on pending / uncertain ACK -------------------------------------------------------
@@ -115,7 +155,7 @@ def test_pending_leg_freezes_fresh_writes() -> None:
     )
     facade = _RecordingFakeFacade(results=[pending])
 
-    result = execute_plan(plan, facade)
+    result = _run_reviewed_plan(*plan, facade=facade)
 
     assert facade.call_count == 1  # only leg A was attempted
     assert result.frozen is True
@@ -132,7 +172,7 @@ def test_submitted_is_possibly_unresolved_not_filled() -> None:
 
     plan = (_fresh_write("A"),)
     facade = _RecordingFakeFacade(results=[submitted])
-    result = execute_plan(plan, facade)
+    result = _run_reviewed_plan(*plan, facade=facade)
 
     outcome = result.outcomes[0]
     assert outcome.possibly_unresolved is True
@@ -159,7 +199,7 @@ def test_first_leg_submitted_freezes_second_fresh_write_exactly_one_facade_call(
     )
     facade = _RecordingFakeFacade(results=[leg1])
 
-    result = execute_plan(plan, facade)
+    result = _run_reviewed_plan(*plan, facade=facade)
 
     assert facade.call_count == 1  # EXACTLY ONE facade call across the plan
     assert result.outcomes[0].attempted is True
@@ -174,7 +214,7 @@ def test_cancel_ack_alone_no_replacement() -> None:
     cancel_ack = _result(admission="APPROVED", execution_status="SUBMITTED")  # cancel reached the wire
     facade = _RecordingFakeFacade(results=[cancel_ack])
 
-    result = execute_plan(plan, facade)
+    result = _run_reviewed_plan(*plan, facade=facade)
 
     assert facade.call_count == 1  # only the cancel — no replacement fresh write
     assert result.replacement_triggered is False
@@ -207,7 +247,7 @@ def test_reconcile_path_reached_not_bypassed() -> None:
     submitted = _result(admission="APPROVED", execution_status="SUBMITTED")
     facade = _RecordingFakeFacade(results=[submitted])
 
-    result = execute_plan(plan, facade)
+    result = _run_reviewed_plan(*plan, facade=facade)
 
     assert result.awaiting_reconciliation is True  # reconcile path REACHED, not bypassed
     assert result.book_treated_flat is False
@@ -216,41 +256,49 @@ def test_reconcile_path_reached_not_bypassed() -> None:
 
 
 def test_execute_plan_fails_closed_on_mixed_plan_before_first_call() -> None:
-    """Gate #3 IMPORTANT-1 / RED-48: even if a mixed cancel+placement plan reaches ``execute_plan``
-    by BYPASSING ``StrategyDecision`` construction (a hand-built tuple), the adapter fails closed
-    BEFORE the first facade call — defense in depth for the single-phase invariant. A mixed plan
-    must NEVER place a fresh write ahead of a reconciled projection confirming the cancel."""
-    mixed_plan = (_cancel_leg(), _fresh_write("A"))  # cancel-phase + placement-phase in one call
-    facade = _RecordingFakeFacade(results=[_result(admission="APPROVED", execution_status="SUBMITTED")])
-
+    """Gate #3 IMPORTANT-1 / RED-48 (+ Gate #4 C-CRITICAL-1): the single-phase invariant is enforced
+    at the SOURCE. ``execute_plan`` now walks a reviewed ``StrategyDecision`` (the unified build→execute
+    path), and a mixed cancel+placement plan is UNCONSTRUCTABLE at ``StrategyDecision`` — so the
+    bare-tuple bypass surface no longer exists: there is no way to hand ``execute_plan`` a mixed plan.
+    ``execute_plan`` re-asserts the invariant on ``decision.intent_plan`` as byte-safe defense in depth.
+    A mixed plan must NEVER place a fresh write ahead of a reconciled projection confirming the cancel."""
+    # Primary defense: a mixed plan (either ordering) is UNCONSTRUCTABLE at ``StrategyDecision``, so it
+    # can never even be built into the input ``execute_plan`` now requires (no fresh write, no cancel).
+    obs = _reviewed_observation()
     with pytest.raises(ValueError):
-        execute_plan(mixed_plan, facade)
-
-    assert facade.call_count == 0  # fails closed BEFORE any facade call — no fresh write, no cancel
-
-    # The reverse ordering (placement then cancel) is equally rejected before any call.
-    reverse_facade = _RecordingFakeFacade(
-        results=[_result(admission="APPROVED", execution_status="SUBMITTED")]
-    )
+        StrategyDecision(
+            kind="QUOTE_TWO_SIDED",
+            intent_plan=(_cancel_leg(), _fresh_write("A")),  # cancel-phase + placement-phase
+            observation_hash=obs.observation_hash(),
+        )
     with pytest.raises(ValueError):
-        execute_plan((_fresh_write("A"), _cancel_leg()), reverse_facade)
-    assert reverse_facade.call_count == 0
+        StrategyDecision(
+            kind="QUOTE_TWO_SIDED",
+            intent_plan=(_fresh_write("A"), _cancel_leg()),  # reverse ordering, equally rejected
+            observation_hash=obs.observation_hash(),
+        )
 
-    # Valid CONTROLS still execute normally: a cancel-only plan (cancel THEN abstain) and a
-    # placement-only plan each drive the facade for their single actionable phase. A clean
-    # (non-freezing) ``ABSTAINED`` result keeps the control focused on the phase invariant.
+    # Valid CONTROLS still execute normally through the composed path: a cancel-only plan (cancel THEN
+    # abstain) and a placement-only plan each drive the facade for their single actionable phase, and
+    # the facade sees the bound TYPED request (never a raw intent). A clean (non-freezing) ``ABSTAINED``
+    # result keeps the control focused on the phase invariant.
     cancel_only_facade = _RecordingFakeFacade(results=[_result()])
-    cancel_result = execute_plan(
-        (_cancel_leg(), NeutralIntent(kind="abstain", leg_role=None, price=None)),
-        cancel_only_facade,
+    cancel_result = _run_reviewed_plan(
+        _cancel_leg(),
+        NeutralIntent(kind="abstain", leg_role=None, price=None),
+        facade=cancel_only_facade,
     )
     assert cancel_only_facade.call_count == 1  # only the cancel is actionable; abstain is skipped
     assert cancel_result.frozen is False
+    assert isinstance(cancel_only_facade.calls[0], MMExecutionToolRequest)
 
     placement_facade = _RecordingFakeFacade(results=[_result()])
-    placement_result = execute_plan((_fresh_write("A"), _fresh_write("B")), placement_facade)
+    placement_result = _run_reviewed_plan(
+        _fresh_write("A"), _fresh_write("B"), facade=placement_facade
+    )
     assert placement_facade.call_count == 2  # both placement legs attempted (clean, non-freezing)
     assert placement_result.frozen is False
+    assert all(isinstance(c, MMExecutionToolRequest) for c in placement_facade.calls)
 
 
 # --- Gate#3 MINOR-1: skipped_non_actionable vs frozen_by_prior_outcome ------------------------
@@ -264,7 +312,7 @@ def test_clean_cancel_abstain_abstain_not_frozen() -> None:
     plan = (_cancel_leg(), NeutralIntent(kind="abstain", leg_role=None, price=None))
     facade = _RecordingFakeFacade(results=[_result()])  # clean ABSTAINED cancel — non-freezing
 
-    result = execute_plan(plan, facade)
+    result = _run_reviewed_plan(*plan, facade=facade)
 
     assert facade.call_count == 1  # only the cancel is actionable; the abstain is skipped
     assert result.frozen is False  # plan not frozen — the cancel returned a clean result
@@ -284,7 +332,7 @@ def test_uncertain_first_leg_freezes_subsequent() -> None:
     plan = (_fresh_write("A"), _fresh_write("B"), _fresh_write("C"))
     submitted = _result(admission="APPROVED", execution_status="SUBMITTED")  # uncertain ACK
 
-    result = execute_plan(plan, _RecordingFakeFacade(results=[submitted]))
+    result = _run_reviewed_plan(*plan, facade=_RecordingFakeFacade(results=[submitted]))
 
     assert result.frozen is True
     attempted_leg, *frozen_legs = result.outcomes
@@ -415,7 +463,9 @@ def test_adapter_pins_evidence_class_not_caller_param() -> None:
     config = _pinned_config()
     leg = _fresh_write("A")
     obs, decision = _reviewed_pair(leg)
-    request = build_r4a_request(leg, config, observation=obs, decision=decision)
+    request = build_r4a_request(
+        leg, config, observation=obs, decision=decision, admitted=_admitted_pins()
+    )
 
     assert request.evidence_class == "EXPERIMENTAL_DUST"
 
@@ -436,7 +486,7 @@ def test_adapter_sets_no_size() -> None:
     make_leg = _fresh_write("A")
     make_obs, make_decision = _reviewed_pair(make_leg)
     make_request = build_r4a_request(
-        make_leg, config, observation=make_obs, decision=make_decision
+        make_leg, config, observation=make_obs, decision=make_decision, admitted=_admitted_pins()
     )
     assert make_request.intent_params.size is None
 
@@ -456,7 +506,7 @@ def test_adapter_sets_no_size() -> None:
         obs, decision = _reviewed_pair(leg)
         assert (
             build_r4a_request(
-                leg, config, observation=obs, decision=decision
+                leg, config, observation=obs, decision=decision, admitted=_admitted_pins()
             ).intent_params.size
             is None
         )
@@ -477,7 +527,9 @@ def test_valid_replacement_lineage_reaches_r4a_request() -> None:
     )
 
     obs, decision = _reviewed_pair(leg)
-    request = build_r4a_request(leg, config, observation=obs, decision=decision)
+    request = build_r4a_request(
+        leg, config, observation=obs, decision=decision, admitted=_admitted_pins()
+    )
 
     # The lineage the decision named survives the neutral→R4-A translation byte-for-byte.
     assert request.intent_params.replaces_client_order_id == "old-order-1"
@@ -494,7 +546,9 @@ def test_reason_confidence_cannot_move_decision() -> None:
     obs, decision = _reviewed_pair(leg)
 
     # The adapter never forwards untrusted agent metadata: the request carries no reason/confidence.
-    request = build_r4a_request(leg, config, observation=obs, decision=decision)
+    request = build_r4a_request(
+        leg, config, observation=obs, decision=decision, admitted=_admitted_pins()
+    )
     assert request.reason is None
     assert request.confidence is None
 
@@ -503,7 +557,7 @@ def test_reason_confidence_cannot_move_decision() -> None:
     # DERIVED from ``observation.stream_identity().token_id`` and BOUND to the stamped decision
     # (Gate#3 C-4 / CRITICAL-1 residual), never a caller-supplied bare string.
     builder_params = set(inspect.signature(build_r4a_request).parameters)
-    assert builder_params == {"leg", "config", "observation", "decision"}
+    assert builder_params == {"leg", "config", "observation", "decision", "admitted"}
     assert "token_id" not in builder_params  # no bare caller channel for the target token
     assert not (builder_params & {"reason", "confidence", "proof_status", "fv_message_id"})
 
@@ -525,8 +579,10 @@ def test_reason_confidence_cannot_move_decision() -> None:
         fv_proof_status="absent",
     )
     assert build_r4a_request(
-        hot.intent_plan[0], config, observation=obs, decision=hot
-    ) == build_r4a_request(cold.intent_plan[0], config, observation=obs, decision=cold)
+        hot.intent_plan[0], config, observation=obs, decision=hot, admitted=_admitted_pins()
+    ) == build_r4a_request(
+        cold.intent_plan[0], config, observation=obs, decision=cold, admitted=_admitted_pins()
+    )
 
     # The intent kind is a pure function of the TRUSTED leg.kind — nothing else moves it.
     assert request.intent_kind == NEUTRAL_TO_R4A[leg.kind]
@@ -580,10 +636,10 @@ def test_normal_bid_and_ask_build_valid_r4a_resting_order() -> None:
     ask_obs, ask_decision = _reviewed_pair(ask_leg)
 
     bid_params = build_r4a_request(
-        bid_leg, config, observation=bid_obs, decision=bid_decision
+        bid_leg, config, observation=bid_obs, decision=bid_decision, admitted=_admitted_pins()
     ).intent_params
     ask_params = build_r4a_request(
-        ask_leg, config, observation=ask_obs, decision=ask_decision
+        ask_leg, config, observation=ask_obs, decision=ask_decision, admitted=_admitted_pins()
     ).intent_params
 
     # The adapter set NO size — sizing stays R4-A-owned (REQ-058/RED-22).
@@ -648,15 +704,21 @@ def test_token_substitution_two_admitted_tokens_fails_closed() -> None:
     obs_b = _reviewed_observation(token_id=_OTHER_ADMITTED_TOKEN)
     assert obs_b.observation_hash() != decision.observation_hash
     with pytest.raises(ValueError):
-        build_r4a_request(leg, config, observation=obs_b, decision=decision)
+        build_r4a_request(
+            leg, config, observation=obs_b, decision=decision, admitted=_admitted_pins()
+        )
 
     # Adversary lever #2 — a leg the reviewed decision never committed to also fails closed.
     foreign_leg = _fresh_write("foreign", leg_role="ask", price=0.51)
     with pytest.raises(ValueError):
-        build_r4a_request(foreign_leg, config, observation=obs_a, decision=decision)
+        build_r4a_request(
+            foreign_leg, config, observation=obs_a, decision=decision, admitted=_admitted_pins()
+        )
 
     # The ONLY buildable request derives the reviewed token A — token B is unrepresentable here.
-    request = build_r4a_request(leg, config, observation=obs_a, decision=decision)
+    request = build_r4a_request(
+        leg, config, observation=obs_a, decision=decision, admitted=_admitted_pins()
+    )
     assert request.intent_params.token_id == _R4A_TOKEN
     assert request.intent_params.token_id != _OTHER_ADMITTED_TOKEN
 
@@ -708,3 +770,154 @@ def test_wrong_or_missing_token_side_tif_fails_closed() -> None:
     # universe token, so every token abstains ``intent_token_mismatch`` (fail closed, zero wire).
     assert prefix_control.token_id is None
     assert prefix_control.token_id not in manifest.universe
+
+
+# =====================================================================================
+# Gate #4 C-CRITICAL-1 — unify build↔execute: the facade consumes the bound TYPED request, the
+# admitted pin is INDEPENDENTLY sourced (no self-select), and the freeze wraps the request-level call.
+# =====================================================================================
+
+
+@dataclass
+class _StrictRequestFacade:
+    """Codex control 1: a facade that REQUIRES the typed :class:`MMExecutionToolRequest` — as the real
+    R4-A proposer ``propose_mm_execution`` does — and TypeErrors on a raw ``NeutralIntent``. Before the
+    unification ``execute_plan`` called ``facade(leg)`` with the raw neutral intent, so this facade
+    raised; after, it receives the exact bound typed request. Records the requests it consumed."""
+
+    result: MMExecutionToolResult
+    calls: list[MMExecutionToolRequest] = field(default_factory=list)
+
+    def __call__(self, request: object) -> MMExecutionToolResult:
+        if not isinstance(request, MMExecutionToolRequest):
+            raise TypeError(
+                f"facade requires MMExecutionToolRequest, got {type(request).__name__}"
+            )
+        self.calls.append(request)
+        return self.result
+
+
+def test_facade_receives_typed_request_not_raw_intent() -> None:
+    """Gate #4 C-CRITICAL-1 (control 1): the unified build→execute path hands the R4-A facade the EXACT
+    bound typed ``MMExecutionToolRequest`` for each leg — NEVER a raw ``NeutralIntent``. A facade that
+    (like the real proposer) requires a typed request no longer TypeErrors, and each request it receives
+    is byte-identical to ``build_r4a_request`` for the same reviewed (observation, decision) — so the
+    token/side/TIF/hashes the facade consumes ARE the bound reviewed values.
+
+    Before the fix ``execute_plan`` called ``facade(leg)`` with the raw neutral intent, so a
+    request-requiring facade raised ``TypeError`` and no whole-lane path proved the facade consumed the
+    bound request whose result controls freezing (Codex CRITICAL-1)."""
+    config = _pinned_config()
+    admitted = _admitted_pins()
+    bid = _fresh_write("bid-1", leg_role="bid", price=0.49)
+    ask = _fresh_write("ask-1", leg_role="ask", price=0.51)
+    observation, decision = _reviewed_pair(bid, ask)
+
+    facade = _StrictRequestFacade(result=_result())  # clean ABSTAINED — non-freezing, both legs fire
+    result = execute_plan(
+        decision, facade, observation=observation, config=config, admitted=admitted
+    )
+
+    # Both actionable legs reached the facade as TYPED requests (no TypeError = not a raw intent).
+    assert len(facade.calls) == 2
+    assert all(isinstance(r, MMExecutionToolRequest) for r in facade.calls)
+
+    # Each received request is byte-identical to the standalone build for the SAME reviewed pair —
+    # the facade consumes exactly the bound, pin-cross-checked request, not a detached side artifact.
+    assert facade.calls[0] == build_r4a_request(
+        bid, config, observation=observation, decision=decision, admitted=admitted
+    )
+    assert facade.calls[1] == build_r4a_request(
+        ask, config, observation=observation, decision=decision, admitted=admitted
+    )
+
+    # The bound wire fields the facade actually consumes are exactly the reviewed values.
+    assert facade.calls[0].intent_params.token_id == _R4A_TOKEN
+    assert facade.calls[0].intent_params.side == "BUY"
+    assert facade.calls[0].intent_params.tif == "GTC"
+    assert facade.calls[1].intent_params.side == "SELL"
+    assert result.frozen is False
+
+
+def test_declared_pin_cannot_self_select_admitted_pin() -> None:
+    """Gate #4 C-CRITICAL-1 (control 2): a caller-selected DECLARED config (unreviewed
+    manifest/policy/config + ``mode="live_guarded"``) is cross-checked against the INDEPENDENT admitted
+    authority and FAILS CLOSED — no request built, no order, no facade call. The declared pin can never
+    ALSO select the admitted pin, because the admitted authority is a SEPARATE object the caller does
+    not supply (mirrors R4-A ``runner._authorization_block_reason``'s declared-vs-admitted check).
+
+    Before the fix ``build_r4a_request`` passed the SAME ``R4ARequestConfig`` hashes to BOTH the declared
+    and admitted sides of ``MMExecutionToolRequest.build``, so the unreviewed declaration self-approved
+    (Codex CRITICAL-1)."""
+    admitted = _admitted_pins()  # the INDEPENDENT reviewed authority — NOT derived from the request
+    leg = _fresh_write("A", leg_role="bid", price=0.49)
+    observation, decision = _reviewed_pair(leg)
+
+    evil = R4ARequestConfig(
+        strategy_id="mm-dust",
+        strategy_config_hash="unreviewed-cfg",
+        policy_hash="unreviewed-policy",
+        session_id="sess-1",
+        manifest_hash="unreviewed-manifest",
+        mode="live_guarded",
+        wallet_equity_at_decision=1000.0,
+        fixed_fraction=0.001,
+        tif="GTC",
+    )
+
+    # Direct build: the declared pins are cross-checked against the INDEPENDENT admitted authority and
+    # FAIL CLOSED — the config cannot select its own admitted pin (self-selection is impossible).
+    with pytest.raises(ValueError):
+        build_r4a_request(
+            leg, evil, observation=observation, decision=decision, admitted=admitted
+        )
+
+    # Whole unified path: no request is built, so no facade call is ever issued (fail closed).
+    facade = _RecordingFakeFacade(results=[_result()])
+    with pytest.raises(ValueError):
+        execute_plan(decision, facade, observation=observation, config=evil, admitted=admitted)
+    assert facade.call_count == 0
+
+    # Corrected-not-weakened: the HONEST path (the pinned strategy declaring the REVIEWED pins) still
+    # builds against the same independent authority — independence bars a MISMATCH, not the honest run.
+    request = build_r4a_request(
+        leg, _pinned_config(), observation=observation, decision=decision, admitted=admitted
+    )
+    assert request.manifest_hash == admitted.manifest_hash
+    assert request.mode == "dry_run"
+
+    # Mutation witness: the ONLY way the unreviewed declaration builds is if the admitted authority is
+    # ALSO the caller's unreviewed pins — the pre-fix SELF-FEED. With independent sourcing the caller
+    # never supplies the admitted authority, so this self-consistency path is unreachable in the adapter.
+    self_fed = AdmittedPins(
+        manifest_hash="unreviewed-manifest",
+        policy_hash="unreviewed-policy",
+        strategy_config_hash="unreviewed-cfg",
+    )
+    smuggled = build_r4a_request(
+        leg, evil, observation=observation, decision=decision, admitted=self_fed
+    )
+    assert smuggled.mode == "live_guarded"  # self-feed accepts it — exactly the bug independence removes
+    assert self_fed != admitted
+
+
+def test_freeze_preserved_around_request_level_call() -> None:
+    """Gate #4 C-CRITICAL-1 (control 3): the first-uncertain FREEZE is preserved AROUND the unified
+    request-level call. A three-leg placement plan whose first leg ACKs ``SUBMITTED`` issues EXACTLY ONE
+    facade call (a TYPED request), freezes the two remaining fresh writes (no further request built, no
+    further facade call), reaches the reconcile path, and never treats the book flat or resumes in-plan."""
+    plan = (_fresh_write("A"), _fresh_write("B"), _fresh_write("C"))
+    submitted = _result(admission="APPROVED", execution_status="SUBMITTED")  # uncertain first-leg ACK
+    facade = _RecordingFakeFacade(results=[submitted])
+
+    result = _run_reviewed_plan(*plan, facade=facade)
+
+    assert facade.call_count == 1  # EXACTLY ONE request-level facade call across the plan
+    assert isinstance(facade.calls[0], MMExecutionToolRequest)  # and it consumed a TYPED request
+    assert result.frozen is True
+    assert result.awaiting_reconciliation is True  # reconcile path REACHED, not bypassed
+    assert result.outcomes[0].attempted is True
+    assert result.outcomes[1].frozen is True  # second fresh write frozen (never built/called)
+    assert result.outcomes[2].frozen is True  # third fresh write frozen
+    assert result.can_resume_within_plan is False
+    assert result.book_treated_flat is False

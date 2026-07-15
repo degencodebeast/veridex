@@ -1,11 +1,16 @@
 """R4-B → R4-A execution adapter — the pending/ambiguous FREEZE safety boundary (E5-T4).
 
-The adapter fires the pure strategy's neutral ``intent_plan`` at R4-A's execution facade IN ORDER,
-consuming each leg's typed :class:`~veridex.dust_execution.facade.MMExecutionToolResult` (the
-STRATEGY ``admission`` + the SEPARATE closed-vocab EXECUTION ``execution_status`` /
-``execution_reason_codes``). Its one job here is the REQ-093 freeze boundary: the moment a leg
-returns an UNCERTAIN outcome, every remaining leg is frozen (all remaining fresh-write legs under
-single-phase plans) and no further facade call is issued.
+The adapter walks the pure strategy's single-phase ``intent_plan`` IN ORDER and, for EACH actionable
+leg, BUILDS the singular typed :class:`~veridex.dust_execution.facade.MMExecutionToolRequest`
+(:func:`build_r4a_request` — the reviewed-observation token derive + decision binding + the
+INDEPENDENT admitted-pin cross-check) and hands THAT typed request — never a raw ``NeutralIntent`` —
+to R4-A's execution facade, consuming each leg's typed
+:class:`~veridex.dust_execution.facade.MMExecutionToolResult` (the STRATEGY ``admission`` + the
+SEPARATE closed-vocab EXECUTION ``execution_status`` / ``execution_reason_codes``). Build and execute
+are ONE unified path (Gate #4 C-CRITICAL-1): the value the facade consumes is exactly the bound,
+pin-cross-checked request whose result controls freezing. Its one job here is the REQ-093 freeze
+boundary: the moment a leg returns an UNCERTAIN outcome, every remaining leg is frozen (all remaining
+fresh-write legs under single-phase plans) and no further request is built or facade call issued.
 
 An UNCERTAIN outcome is any of:
   * a plain ``SUBMITTED`` — an uncertain ACK; an order may be live-but-unsettled, so the leg is
@@ -65,13 +70,17 @@ _NOT_ARMED_EXECUTION_REASONS: frozenset[str] = frozenset(
 
 
 class ExecutionFacade(Protocol):
-    """The injectable facade seam: propose ONE neutral leg, get back the typed boundary result.
+    """The injectable facade seam: propose ONE bound typed request, get back the typed result.
 
-    In production this is R4-A's proposer (wired in E5-T5); in every E5-T4 test it is an OFFLINE
-    recording fake. The adapter treats it as opaque — it consumes only the typed result.
+    In production this is R4-A's proposer (:func:`~veridex.dust_execution.facade.propose_mm_execution`,
+    wired in E5-T5), which consumes an :class:`~veridex.dust_execution.facade.MMExecutionToolRequest`;
+    in every E5-T4 test it is an OFFLINE recording fake. The seam consumes the SAME typed request the
+    adapter built and pin-cross-checked (Gate #4 C-CRITICAL-1) — never a raw ``NeutralIntent`` — so the
+    value whose result controls freezing is exactly the bound, admitted-pin-checked request. The
+    adapter treats it as opaque: it consumes only the typed result.
     """
 
-    def __call__(self, leg: NeutralIntent) -> MMExecutionToolResult: ...
+    def __call__(self, request: MMExecutionToolRequest) -> MMExecutionToolResult: ...
 
 
 def _has_pending_reconciliation(result: MMExecutionToolResult) -> bool:
@@ -185,35 +194,55 @@ class PlanExecutionResult:
 
 
 def execute_plan(
-    intent_plan: tuple[NeutralIntent, ...],
+    decision: StrategyDecision,
     facade: ExecutionFacade,
+    *,
+    observation: StrategyObservation,
+    config: R4ARequestConfig,
+    admitted: AdmittedPins,
 ) -> PlanExecutionResult:
-    """Fire each actionable leg through the injected facade IN ORDER, freezing on the first uncertain
-    outcome (REQ-093/094).
+    """Build+fire each actionable leg's BOUND typed request IN ORDER, freezing on the first uncertain
+    outcome (REQ-093/094; Gate #4 C-CRITICAL-1).
 
-    Walks the plan once. A non-actionable (``abstain``) leg is recorded and skipped. Each actionable
-    leg is proposed to the facade EXACTLY once; the moment a leg's outcome
-    :func:`freezes_fresh_writes`, every remaining leg is FROZEN (no further facade call). A
-    possibly-unresolved outcome sets ``awaiting_reconciliation`` — the reconcile path is REACHED, not
-    bypassed, so the book is never early-returned as flat. The adapter adds NO leg of its own.
+    UNIFIED build→execute: for EACH actionable leg of the reviewed ``decision.intent_plan`` this
+    :func:`build_r4a_request`s the singular typed :class:`MMExecutionToolRequest` — deriving the target
+    token from the reviewed ``observation``'s stream identity, BINDING it to the stamped ``decision``,
+    and cross-checking the DECLARED ``config`` pins against the INDEPENDENT ``admitted`` authority (so a
+    caller-selected declared pin can never self-select the admitted pin) — and hands THAT typed request
+    to the facade. The value whose result controls freezing is exactly the bound, pin-cross-checked
+    request; the facade never sees a raw ``NeutralIntent``.
+
+    Walks the plan once. A non-actionable (``abstain``) leg is recorded and skipped (no request built,
+    no facade call). Each actionable leg is proposed to the facade EXACTLY once; the moment a leg's
+    outcome :func:`freezes_fresh_writes`, every remaining leg is FROZEN (no further request built, no
+    further facade call). A possibly-unresolved outcome sets ``awaiting_reconciliation`` — the reconcile
+    path is REACHED, not bypassed, so the book is never early-returned as flat. The adapter adds NO leg
+    of its own; a mismatched declared/admitted pin FAILS CLOSED (``build_r4a_request`` raises) BEFORE any
+    facade call, so a rebound intent never reaches the wire.
     """
-    # Defense in depth (Gate#3 IMPORTANT-1 / RED-48): a mixed cancel/placement plan is
-    # unconstructable at ``StrategyDecision``, but ``execute_plan`` also accepts a bare tuple that may
-    # bypass the decision contract. Fail closed BEFORE the first facade call so a mixed plan never
-    # places a fresh write ahead of a reconciled projection confirming the cancel (REQ-090/094).
-    reject_mixed_phase_plan(intent_plan, context="execute_plan")
+    # Defense in depth (Gate#3 IMPORTANT-1 / RED-48): a mixed cancel/placement plan is already
+    # unconstructable at ``StrategyDecision``; re-assert it here (byte-identity-safe for any valid
+    # single-phase decision) so a mixed plan never places a fresh write ahead of a reconciled
+    # projection confirming the cancel (REQ-090/094).
+    reject_mixed_phase_plan(decision.intent_plan, context="execute_plan")
 
     outcomes: list[LegOutcome] = []
     frozen = False
     awaiting_reconciliation = False
 
-    for leg in intent_plan:
+    for leg in decision.intent_plan:
         if frozen or leg.kind not in _ACTIONABLE_KINDS:
-            # Frozen (a prior leg halted the plan) OR a no-wire-action leg: never call the facade.
+            # Frozen (a prior leg halted the plan) OR a no-wire-action leg: build nothing, call nothing.
             outcomes.append(LegOutcome(leg=leg, result=None, attempted=False))
             continue
 
-        result = facade(leg)
+        # Build the SINGULAR bound request (reviewed-token derive + decision binding + INDEPENDENT
+        # admitted-pin cross-check) and hand THAT typed request to the facade — never a raw intent.
+        # A declared/admitted pin mismatch raises here, BEFORE the facade call (fail closed).
+        request = build_r4a_request(
+            leg, config, observation=observation, decision=decision, admitted=admitted
+        )
+        result = facade(request)
         outcomes.append(LegOutcome(leg=leg, result=result, attempted=True))
 
         if is_possibly_unresolved(result):
@@ -266,12 +295,15 @@ _PINNED_EVIDENCE_CLASS: Literal["EXPERIMENTAL_DUST"] = "EXPERIMENTAL_DUST"
 
 @dataclass(frozen=True)
 class R4ARequestConfig:
-    """The ONE pinned request config the adapter builds every R4-A request from (REQ-058).
+    """The pinned request config the adapter DECLARES every R4-A request under (REQ-058).
 
     Every field is PINNED session/manifest config — the operator wires it once; NONE is agent- or
-    caller-supplied. The pinned hashes are the admitted pins the strategy declares it operates under
-    (declared == admitted: the adapter is the pinned strategy, not an attacker, so it feeds the same
-    pins to both sides of :meth:`MMExecutionToolRequest.build`'s fail-closed cross-check).
+    caller-supplied. The hashes here are the pins the strategy DECLARES it operates under; they are
+    cross-checked against the SEPARATE, INDEPENDENTLY-SOURCED :class:`AdmittedPins` authority at
+    :meth:`MMExecutionToolRequest.build` (Gate #4 C-CRITICAL-1). The two are NEVER the same object, so a
+    caller-selected declared pin can NOT also select the admitted pin — self-selection is impossible
+    (mirrors R4-A ``runner._authorization_block_reason``'s declared-vs-admitted check, which sources the
+    admitted pins from an INDEPENDENT ``manifest`` / ``envelope``, never from the request itself).
 
     ``wallet_equity_at_decision`` / ``fixed_fraction`` are the PINNED mechanical sizing inputs the
     adapter threads to R4-A's ``propose_mm_execution`` — they are NEVER agent-supplied and the adapter
@@ -291,6 +323,28 @@ class R4ARequestConfig:
     # ``GTC`` is the operator-pinned session default. Like every field here it is session/manifest
     # config the operator wires once — NEVER agent- or caller-supplied.
     tif: TimeInForce
+
+
+@dataclass(frozen=True)
+class AdmittedPins:
+    """The INDEPENDENT admitted-pin authority the declared request pins are cross-checked against.
+
+    Gate #4 C-CRITICAL-1: the manifest / policy / strategy-config hashes the session is ADMITTED under,
+    sourced SEPARATELY from the caller's :class:`R4ARequestConfig` DECLARED pins (the operator wires the
+    admitted authority once from the reviewed manifest/policy — it is NOT read back from the request
+    config). Feeding these as the ``admitted_*`` side of :meth:`MMExecutionToolRequest.build`'s
+    fail-closed cross-check restores the R4-A runner's independence property
+    (``runner._authorization_block_reason``, runner.py:1158-1170): a caller-selected DECLARED pin
+    (e.g. an ``unreviewed-manifest`` under ``mode="live_guarded"``) can never ALSO select the admitted
+    pin, so it FAILS CLOSED (no request built, hence no R4-A order and no facade call) instead of being
+    self-approved. The adapter's normal operation passes the SAME reviewed hashes on both sides (it is
+    the pinned strategy, not an attacker); the value of independence is that a MISMATCH is now
+    unrepresentable-as-approved rather than silently accepted.
+    """
+
+    manifest_hash: str
+    policy_hash: str
+    strategy_config_hash: str
 
 
 def _intent_params(
@@ -333,6 +387,7 @@ def build_r4a_request(
     *,
     observation: StrategyObservation,
     decision: StrategyDecision,
+    admitted: AdmittedPins,
 ) -> MMExecutionToolRequest:
     """Build the SINGULAR typed R4-A request for ONE neutral leg (REQ-091/058, AC-024).
 
@@ -353,8 +408,11 @@ def build_r4a_request(
     unreachable), the params translate the physical role to an R4-A ``BUY`` / ``SELL`` side and bind
     the DERIVED token + config-pinned maker TIF so the request is WIREABLE at R4-A (Gate#3
     CRITICAL-1), carry no adapter-set size, and ``evidence_class`` is PINNED to the module constant —
-    never a caller/agent argument. The pinned hashes are declared AND cross-checked as admitted
-    (fail-closed via :meth:`MMExecutionToolRequest.build`). Untrusted agent metadata (``reason`` /
+    never a caller/agent argument. The ``config`` hashes are DECLARED and cross-checked against the
+    SEPARATE, INDEPENDENTLY-SOURCED ``admitted`` :class:`AdmittedPins` authority (Gate #4 C-CRITICAL-1),
+    fail-closed via :meth:`MMExecutionToolRequest.build`: a caller-selected declared pin can never
+    self-select the admitted pin, so a mismatch RAISES (no request, hence no R4-A order / facade call)
+    rather than being self-approved. Untrusted agent metadata (``reason`` /
     ``confidence`` / FV proof) is NOT a parameter and is NOT forwarded, so it has ZERO effect on the
     mapping or the request (AC-024): the request is a pure function of (trusted leg, pinned config,
     reviewed observation, bound decision). The adapter proposes a typed request; it never sizes,
@@ -388,8 +446,10 @@ def build_r4a_request(
         manifest_hash=config.manifest_hash,
         evidence_class=_PINNED_EVIDENCE_CLASS,  # PINNED — never a caller/agent param (AC-025)
         mode=config.mode,
-        admitted_manifest_hash=config.manifest_hash,
-        admitted_policy_hash=config.policy_hash,
-        admitted_strategy_config_hash=config.strategy_config_hash,
+        # Admitted pins from the INDEPENDENT authority (Gate #4 C-CRITICAL-1) — NEVER re-read from the
+        # declared ``config``, so a caller-selected declared pin cannot self-select the admitted pin.
+        admitted_manifest_hash=admitted.manifest_hash,
+        admitted_policy_hash=admitted.policy_hash,
+        admitted_strategy_config_hash=admitted.strategy_config_hash,
         # reason/confidence deliberately NOT passed: untrusted metadata has zero effect (AC-024).
     )

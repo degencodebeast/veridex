@@ -12,20 +12,24 @@ fake — and asserts the cross-cutting trust invariants the individual tiers eac
         -> core.decide  (warm-seeded fold)  (transition table, anchor, guard, quote math — the ONE
                                             pure reducer; clock is the explicit as_of_ts input)
         -> StrategyDecision.intent_plan     (single-phase: cancel XOR place)
-        -> execution_adapter.build_r4a_request(leg, config, observation=obs, decision=dec)
-                                            (CRITICAL-1: the request is DERIVED from the reviewed
-                                            observation's stream identity and BOUND to the stamped
-                                            decision — never a caller bare-token channel)
-        -> execution_adapter.execute_plan   (fires each actionable leg IN ORDER)
-        -> _RecordingFakeFacade             (OFFLINE: counts typed calls, returns a scripted typed
-                                            result; NEVER a wire primitive / signer / socket)
+        -> execution_adapter.execute_plan(decision, facade, observation=obs, config=cfg, admitted=pins)
+                                            (Gate #4 C-CRITICAL-1: the UNIFIED build→execute path —
+                                            for each actionable leg it BUILDS the bound singular
+                                            request (token DERIVED from the reviewed stream identity,
+                                            BOUND to the stamped decision, declared pins cross-checked
+                                            against the INDEPENDENT admitted authority) and fires THAT
+                                            typed request IN ORDER; the facade never sees a raw intent)
+        -> _RecordingFakeFacade             (OFFLINE: counts the typed MMExecutionToolRequest calls,
+                                            returns a scripted typed result; NEVER a wire primitive /
+                                            signer / socket)
 
 HARD OFFLINE BOUNDARY (REQ-093/094, AC-017): the whole lane runs against a RECORDING facade fake in
 Mode-A (``dry_run``). There is NO live call, NO network, NO wallet/signer/submit/cancel, NO Mode-B
 arm. :func:`test_whole_lane_no_direct_wire_no_live_call` bans ``socket.socket`` for the duration of a
 whole-lane run as executable evidence the lane opens no socket, and asserts the recording facade sees
-ONLY typed :class:`NeutralIntent` requests (never a wire primitive) and returns ONLY the clean Mode-A
-abstention (never a ``SUBMITTED`` the adapter could treat as live).
+ONLY bound typed :class:`MMExecutionToolRequest` requests (never a raw neutral intent, never a wire
+primitive) and returns ONLY the clean Mode-A abstention (never a ``SUBMITTED`` the adapter could treat
+as live).
 
 REUSE, not reinvention: the A/B ablation harness (``run_cadence`` + ``decide`` fold + the six-metric
 venue-referenced report + the pinned-label run receipt), the E5-T4 OFFLINE ``_RecordingFakeFacade`` +
@@ -72,7 +76,12 @@ from tests.test_dust_execution_integration import _REPO_ROOT, _enumerate_sealed_
 
 # Reuse the E5-T4 OFFLINE recording facade + the pinned Mode-A adapter request config + a clean
 # (non-freezing) Mode-A ABSTAINED boundary result. NEVER a real facade: no network/wallet/submit.
-from tests.test_mm_strategy_adapter import _pinned_config, _RecordingFakeFacade, _result
+from tests.test_mm_strategy_adapter import (
+    _admitted_pins,
+    _pinned_config,
+    _RecordingFakeFacade,
+    _result,
+)
 
 # Reuse the R4-B rank-denylist ground truth + a complete valid directional row (assertion: the three
 # rank surfaces reject any dumped R4-B diagnostic field).
@@ -92,7 +101,6 @@ from veridex.maker.leaderboard import maker_rank_key
 from veridex.mm_strategy.assembler import run_cadence
 from veridex.mm_strategy.config import StrategyConfig
 from veridex.mm_strategy.contracts import (
-    NeutralIntent,
     StrategyDecision,
     StrategyObservation,
     StrategyState,
@@ -101,7 +109,6 @@ from veridex.mm_strategy.contracts import (
 from veridex.mm_strategy.core import decide
 from veridex.mm_strategy.execution_adapter import (
     PlanExecutionResult,
-    build_r4a_request,
     execute_plan,
 )
 from veridex.scoring import _rank_key as dir_key
@@ -210,27 +217,32 @@ def _drive_whole_lane(
         decision, state = decide(observation, state, config)
         decisions.append(decision)
 
-    # adapter tier: build the bound singular request per leg, then execute the single-phase plan at
-    # the OFFLINE recording facade. The pinned config is Mode-A (dry_run); the facade abstains.
+    # adapter tier (Gate #4 C-CRITICAL-1): drive the UNIFIED build→execute path — ``execute_plan``
+    # builds each actionable leg's bound singular request (reviewed-token derive + decision binding +
+    # INDEPENDENT admitted-pin cross-check) and hands THAT typed request to the OFFLINE recording
+    # facade. The pinned config is Mode-A (dry_run); the facade abstains. The requests the composed path
+    # actually built + fired are exactly the typed requests the facade recorded.
     adapter_config = _pinned_config()
+    admitted = _admitted_pins()
     facade = _RecordingFakeFacade(results=[_result()])
-    requests: list[MMExecutionToolRequest] = []
     plan_results: list[PlanExecutionResult] = []
     for observation, decision in zip(run.observations, tuple(decisions), strict=True):
         # Single-phase invariant (defense in depth): a mixed cancel+placement plan fails closed here.
         reject_mixed_phase_plan(decision.intent_plan, context="e8-t1 whole-lane")
-        for leg in decision.intent_plan:
-            requests.append(
-                build_r4a_request(
-                    leg, adapter_config, observation=observation, decision=decision
-                )
+        plan_results.append(
+            execute_plan(
+                decision,
+                facade,
+                observation=observation,
+                config=adapter_config,
+                admitted=admitted,
             )
-        plan_results.append(execute_plan(decision.intent_plan, facade))
+        )
 
     return WholeLaneRun(
         observations=run.observations,
         decisions=tuple(decisions),
-        requests=tuple(requests),
+        requests=tuple(facade.calls),  # the bound typed requests the composed path built + fired
         plan_results=tuple(plan_results),
         facade=facade,
         final_state=state,
@@ -392,11 +404,14 @@ def test_whole_lane_no_direct_wire_no_live_call(tmp_path: Path) -> None:
     # Mode-A/replay only — the pinned adapter config is dry_run (never an armed Mode-B money surface).
     assert _pinned_config().mode == "dry_run"
 
-    # The recording facade saw ONLY typed NeutralIntent requests — never a wire primitive. And it was
-    # actually driven (an actionable leg reached it), so this is not a vacuous no-call assertion.
+    # The recording facade saw ONLY bound typed MMExecutionToolRequest requests — never a wire
+    # primitive AND never a raw NeutralIntent (Gate #4 C-CRITICAL-1: the unified build→execute path
+    # hands the facade the typed request whose result controls freezing). And it was actually driven (an
+    # actionable leg reached it), so this is not a vacuous no-call assertion.
     assert run.facade.call_count > 0, "the whole lane must actually drive the facade (non-vacuous)"
-    assert all(isinstance(call, NeutralIntent) for call in run.facade.calls), (
-        "the facade must see ONLY typed high-level NeutralIntent requests — never a wire primitive"
+    assert all(isinstance(call, MMExecutionToolRequest) for call in run.facade.calls), (
+        "the facade must see ONLY bound typed MMExecutionToolRequest requests — never a raw neutral "
+        "intent, never a wire primitive"
     )
     # The facade has no submit/cancel/sign surface at all — its ONLY entry point is __call__(leg).
     assert not any(
