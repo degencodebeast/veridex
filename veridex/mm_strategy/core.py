@@ -765,6 +765,25 @@ def _quote_disposition(
             return _decide("NO_QUOTE", (fv_block,))
         if not _basis_is_warm(base, config):
             return _decide("NO_QUOTE", ("basis_warmup",))
+        # E4-T5 PRE-MATCH BASIS GATE (REQ-078/AC-054): pre-match ONLY (``phase == 0``), with the
+        # basis warm, a persistent basis WIDER than the venue's OWN top-of-book spread
+        # (``|basis| >= best_ask − best_bid``) means the pre-match edge estimate is unreliable → fail
+        # closed. This comparison is DELIBERATELY spread-relative and is CORRECT/intentional
+        # (REQ-078). It is a DISTINCT quantity from the residual band below it: that band is the
+        # ABSOLUTE ``residual_band`` config width, NEVER scaled by ``(best_ask − best_bid)`` (REQ-071,
+        # the MAJOR-5 bug) — basis-vs-spread HERE, residual-vs-absolute-band THERE. Precedence is
+        # load-bearing: this gate PRECEDES the residual wall, so a pre-match block is recorded as
+        # ``prematch_basis_exceeds_spread`` and is NEVER mislabeled ``residual_extreme`` (RED-50). The
+        # basis reads PRIOR state (compare-then-update). Post-match frames (``phase != 0``) skip this
+        # gate entirely. ``_spread`` is non-``None`` here (an admissible anchor implies both touches
+        # present); the guard keeps the branch total for mypy.
+        prematch_spread = _spread(observation)
+        if (
+            observation.phase == 0
+            and prematch_spread is not None
+            and abs(basis_from_state(base, config)) >= prematch_spread
+        ):
+            return _decide("NO_QUOTE", ("prematch_basis_exceeds_spread",))
         guard_fv = observation.guard_fv
         if guard_fv is not None:  # always true here (fv_block was None) — narrows for mypy totality
             # residual = raw_gap − basis, with raw_gap = fv − anchor (the venue mid; REQ-070). The

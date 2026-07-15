@@ -805,3 +805,67 @@ def test_pull_threshold_is_absolute_band() -> None:
     d_wide_quiet, _ = decide(wide_quiet, state, config)
     assert d_narrow_quiet.kind == d_wide_quiet.kind == "QUOTE_TWO_SIDED"
     assert d_narrow_quiet.reason_codes == d_wide_quiet.reason_codes == ()
+
+
+# --- E4-T5 / REQ-078 / AC-054 / RED-50: pre-match basis gate --------------------------------
+# A pre-match-ONLY fail-closed gate inside the guard block, BETWEEN basis-warmup and the residual
+# band. Pre-match (``phase == 0``) with the basis warm, a persistent basis WIDER than the venue's
+# own top-of-book spread (``|basis| >= best_ask − best_bid``) means the pre-match edge estimate is
+# unreliable -> NO_QUOTE(prematch_basis_exceeds_spread). This comparison is DELIBERATELY
+# spread-relative (REQ-078) and is a DISTINCT quantity from the residual band below it, which is the
+# ABSOLUTE ``residual_band`` config width NEVER scaled by the spread (REQ-071): basis-vs-spread here,
+# residual-vs-absolute-band there. Precedence is load-bearing — the gate PRECEDES the residual wall,
+# so a pre-match block is never mislabeled ``residual_extreme``.
+
+
+def test_prematch_basis_exceeds_spread_no_quote() -> None:
+    # AC-054: guarded, pre-match (``phase == 0``), warmup complete, ``|basis| >= (best_ask − best_bid)``
+    # ⇒ NO_QUOTE(prematch_basis_exceeds_spread). The default book bid=0.49/ask=0.51 has spread 0.02;
+    # a basis of 0.03 exceeds it (0.03 chosen over 0.02 to clear the IEEE-754 0.020000000000000018
+    # float representation of the spread). ``last_phase=0`` matches the pre-match obs so the phase is
+    # unchanged (no row-R reset pre-empts the guard block).
+    config = _config(guard_enabled=True)
+    prematch_state = _guarded_warm_state(basis_gap=0.03).model_copy(update={"last_phase": 0})
+    prematch = _obs(guard_fv=_fresh_fv(fv=0.53)).model_copy(update={"phase": 0})
+
+    decision, _ = decide(prematch, prematch_state, config)
+    assert decision.kind == "NO_QUOTE"
+    assert decision.reason_codes == ("prematch_basis_exceeds_spread",)
+
+    # CONTROL 1 — ``|basis| < spread`` at ``phase == 0`` does NOT trip the gate: basis 0.01 < spread
+    # 0.02, so the frame falls through to the residual band (residual ≈ 0 ⇒ quiescent ⇒ quote).
+    narrow_basis_state = _guarded_warm_state(basis_gap=0.01).model_copy(
+        update={"last_phase": 0}
+    )
+    narrow_basis = _obs(guard_fv=_fresh_fv(fv=0.51)).model_copy(update={"phase": 0})
+    d_narrow, _ = decide(narrow_basis, narrow_basis_state, config)
+    assert d_narrow.kind == "QUOTE_TWO_SIDED"
+    assert d_narrow.reason_codes != ("prematch_basis_exceeds_spread",)
+
+    # CONTROL 2 — ``phase != 0`` (post-match) with ``|basis| >= spread`` does NOT trip: the gate is
+    # pre-match ONLY. Same basis 0.03 ≥ spread 0.02, but phase 1 skips the gate; the residual (0.0)
+    # is quiescent so the frame quotes normally. (``last_phase=1`` default ⇒ no row-R transition.)
+    postmatch_state = _guarded_warm_state(basis_gap=0.03)
+    postmatch = _obs(guard_fv=_fresh_fv(fv=0.53))  # phase defaults to 1
+    d_post, _ = decide(postmatch, postmatch_state, config)
+    assert d_post.kind == "QUOTE_TWO_SIDED"
+    assert d_post.reason_codes != ("prematch_basis_exceeds_spread",)
+
+
+def test_prematch_gate_not_residual_extreme_reason() -> None:
+    # RED-50: when the pre-match gate fires, the reason is ``prematch_basis_exceeds_spread``, NEVER
+    # ``residual_extreme`` — the gate PRECEDES the residual band. Construct a frame where BOTH would
+    # fire: pre-match (``phase == 0``) with basis 0.03 ≥ spread 0.02 (gate), AND a residual that is
+    # extreme (residual = (fv 0.62 − mid 0.50) − basis 0.03 = 0.09 ≥ extreme 0.06). Because the
+    # pre-match gate runs first, the recorded reason is the pre-match reason — a pre-match block is
+    # never mislabeled as an extreme-residual block. (Mutation: reusing ``residual_extreme`` as the
+    # pre-match reason — or placing the gate AFTER the residual wall — surfaces ``residual_extreme``
+    # here and fails this test.)
+    config = _config(guard_enabled=True)
+    state = _guarded_warm_state(basis_gap=0.03).model_copy(update={"last_phase": 0})
+    obs = _obs(guard_fv=_fresh_fv(fv=0.62)).model_copy(update={"phase": 0})
+
+    decision, _ = decide(obs, state, config)
+    assert decision.kind == "NO_QUOTE"
+    assert decision.reason_codes == ("prematch_basis_exceeds_spread",)
+    assert decision.reason_codes != ("residual_extreme",)
