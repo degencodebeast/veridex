@@ -434,6 +434,14 @@ class StrategyState(_FrozenModel):
     # merely SEEDS this watermark — never a spurious reopen reset. FV-independent, so a guard-off state
     # carries the SAME value across FV health (byte-identity across FV feeds holds — AC-051/056).
     last_suspended: bool | None = None
+    # Whether the last accepted frame's book was IN a ``gap|excluded`` episode (REQ-033 gap-episode-END
+    # row-R trigger). Mirrors ``last_suspended``: the pure core carries the prior frame's in-gap status
+    # here and, on the NEXT accepted frame, an in-gap→ok transition (the episode ENDING) is a
+    # RESET-class (row R) event — venue accumulators + basis do not survive the outage. ``None``
+    # (fresh/cold-start seed) has no prior value to compare, so the first accepted frame merely SEEDS
+    # this watermark — never a spurious end reset. Derived from RAW ``book_status`` alone, so it is
+    # FV-independent and a guard-off state carries the SAME value across FV health (byte-identity holds).
+    last_book_in_gap: bool | None = None
     # Per-outcome accumulators + audit echo + quote lineage.
     outcomes: tuple[OutcomeAccumulator, ...] = ()
     inventory_echo: InventoryProjection | None = None

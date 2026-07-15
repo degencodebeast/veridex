@@ -182,6 +182,12 @@ def _accept(
         # value, and a reset frame (including the reopen itself) re-baselines it to its own
         # ``suspended`` so the reopen is never re-triggered on the following frame.
         "last_suspended": observation.suspended,
+        # Advance the REQ-033 gap-episode watermark identically: carry whether THIS frame's book is IN
+        # a ``gap|excluded`` episode so the NEXT accepted frame can detect the episode END (an
+        # in-gap→ok transition is a row-R RESET). A reset frame (including the gap-END reset itself,
+        # whose book is ``ok``) re-baselines it to its own status so the END is never re-triggered on
+        # the following frame. Derived from RAW ``book_status`` alone — FV-independent (both arms agree).
+        "last_book_in_gap": observation.book_status in ("gap", "excluded"),
     }
     if full_reset:
         update.update(
@@ -245,10 +251,14 @@ def _guard_epoch_delta(
 # QUOTE-ONLY gate ``txline_suspended`` (:func:`_suspended_block_reason`, on the universal row-H path,
 # OUTSIDE the guard block), and a suspension→reopen (True→False) is a row-R RESET (via
 # ``_suspension_reopen`` + the ``last_suspended`` watermark) — the Gate #4 F-CRITICAL-1 fix that made
-# the leg universal rather than guard-scoped. ``market_status`` / stream / projection stay OUT of the
-# trigger set — they are QUOTE-ONLY blockers (REQ-070/026/097). The remaining REQ-080 reset variant
-# (gap-episode END) stays for a later task; it slots into the SAME row-R branch without reshaping this
-# reducer. The row-H quote here is the eligible DecisionKind CLASS only.
+# the leg universal rather than guard-scoped. The END of a ``gap|excluded`` episode is likewise a
+# row-R RESET (via ``_gap_episode_end`` + the ``last_book_in_gap`` watermark — the Gate #4
+# F-IMPORTANT-1 fix): the pre-gap smoother / refs / basis do not survive the outage, so the first ok
+# frame after it re-seeds from its own mid rather than governing the post-gap decision from stale
+# references. It is the mirror of the row-E gap ENTRY, mutually exclusive by the current frame's
+# ``book_status`` (ENTRY ⇒ in ``gap|excluded``, END ⇒ ``ok``), so the two never collide (AC-057).
+# ``market_status`` / stream / projection stay OUT of the trigger set — they are QUOTE-ONLY blockers
+# (REQ-070/026/097). The row-H quote here is the eligible DecisionKind CLASS only.
 
 # The seven ACCEPTED-frame rows (row S/STALE is the watermark layer's reject rows, upstream — it
 # never reaches ``_classify_row``). Pinning this as a `Literal`, like every other closed vocabulary
@@ -331,16 +341,37 @@ def _suspension_reopen(observation: StrategyObservation, state: StrategyState) -
     return state.last_suspended is True and observation.suspended is False
 
 
+def _gap_episode_end(observation: StrategyObservation, state: StrategyState) -> bool:
+    """REQ-033 RESET-class (row R) trigger: the END of a book ``gap|excluded`` episode — the PRIOR
+    accepted frame was IN a ``gap|excluded`` episode (``state.last_book_in_gap`` is True) and THIS
+    frame's book is no longer in one (``book_status == "ok"``). The pre-gap smoother / rolling refs /
+    basis must NOT survive the outage and govern the post-gap decision (Gate #4 F-IMPORTANT-1): the
+    outage may have repriced the market, so the first healthy frame after it re-seeds from its OWN mid
+    rather than being guessed continuous from stale references (REQ-033/036 rationale). Detectable from
+    a single accepted frame + prior state via the book-status watermark, and derived from RAW
+    ``book_status`` alone, so it is FV-independent and drives the SAME reset in both ablation arms.
+
+    A fresh / cold-start / reset state (``last_book_in_gap is None``) has no prior value to compare, so
+    the first accepted frame merely SEEDS the watermark — never a spurious end reset. Mirror-image of
+    the row-E gap ENTRY (:func:`_classify_row` book-status branch, RED-53): ENTRY needs the CURRENT
+    book IN ``gap|excluded`` while END needs it OUT, so an ONGOING gap frame (row E) and a gap-END frame
+    (row R) are mutually exclusive by the current frame's ``book_status`` — they never collide (AC-057).
+    """
+    return state.last_book_in_gap is True and observation.book_status not in ("gap", "excluded")
+
+
 def _reset_reason(observation: StrategyObservation, state: StrategyState) -> ReasonCode:
-    """The truthful reset reason for an ACCEPTED-frame row-R trigger (REQ-033/036/080). The three
+    """The truthful reset reason for an ACCEPTED-frame row-R trigger (REQ-033/036/080). The four
     reset-class triggers detectable from a single accepted frame + prior state are the in-stream
-    ``tick_regime_changed`` signal, a match-state ``phase`` transition, and a match-state
-    suspension→reopen (:func:`_suspension_reopen`); ``tick_regime_changed`` then ``phase`` take
-    precedence when several hold. A suspension→reopen carries the generic reset/warmup reason
+    ``tick_regime_changed`` signal, a match-state ``phase`` transition, a match-state
+    suspension→reopen (:func:`_suspension_reopen`), and the END of a ``gap|excluded`` episode
+    (:func:`_gap_episode_end`); ``tick_regime_changed`` then ``phase`` take precedence when several
+    hold. A suspension→reopen OR a gap-episode END carries the generic reset/warmup reason
     ``event_ref_warmup`` (REQ-036 — a reset yields NO_QUOTE(``event_ref_warmup``); the closed §4.4
-    vocabulary has no dedicated reopen code and adding one is a spec revision, never task discretion),
-    the SAME truthful reset reason the book-epoch RECONNECT reset records. (That RECONNECT reset
-    carries its ``event_ref_warmup`` reason on the upstream path and is never routed through here.)"""
+    vocabulary has no dedicated reopen/episode-end code and adding one is a spec revision, never task
+    discretion), the SAME truthful reset reason the book-epoch RECONNECT reset records. (That RECONNECT
+    reset carries its ``event_ref_warmup`` reason on the upstream path and is never routed through
+    here.)"""
     if observation.tick_regime_changed:
         return "tick_regime_changed"
     if _phase_transition(observation, state):
@@ -417,6 +448,7 @@ def _classify_row(
         observation.tick_regime_changed
         or _phase_transition(observation, state)
         or _suspension_reopen(observation, state)
+        or _gap_episode_end(observation, state)
     ):
         return "R"
     if observation.book_status in ("gap", "excluded"):
