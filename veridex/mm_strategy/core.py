@@ -965,6 +965,48 @@ def _two_sided_quote(
     return _decide("NO_QUOTE", ("leg_out_of_zone",))
 
 
+def _residual_pull_quote(
+    observation: StrategyObservation,
+    config: StrategyConfig,
+    anchor: float,
+    toxic: Literal["ask", "bid"],
+) -> StrategyDecision:
+    """The E4-T4 directional side-pull as a PRICED quote class (REQ-073 + E4-T7 materialization).
+
+    The guard PULLS the adverse (``toxic``) leg and RESTS the OPPOSITE (surviving) leg; this materialises
+    that surviving leg's price through the SAME join-or-behind + directional-round + post-clamp authority
+    the two-sided quote and inventory reduce use (:func:`_bid_leg_price` / :func:`_ask_leg_price` /
+    :func:`_leg_in_zone`) — never a re-implementation, so the ``residual_band`` middle-band pull emits a
+    real ``place_quote`` leg an EMPTY plan could not (the MAJOR-4/A1 defect: E5 cannot recover a price E4
+    never materialised). A POSITIVE residual pulls the ASK ⇒ the BID rests (``residual_pull_ask``, floored
+    DOWN); a NEGATIVE residual pulls the BID ⇒ the ASK rests (``residual_pull_bid``, ceiled UP) — the
+    side is role-driven, never defaulted (REQ-055). If the surviving leg clamps OUT of zone we fail closed
+    to ``NO_QUOTE(leg_out_of_zone)`` and NEVER side-flip to the toxic leg to salvage a quote — quoting the
+    adverse side is exactly the flow the pull exists to avoid (the same never-flip rule
+    :func:`_inventory_reduce` applies to its reducing leg). An admissible anchor guarantees both touches
+    are present (:func:`_venue_anchor`), so the ``None`` guard is unreachable and narrows for mypy."""
+    best_bid = observation.bid
+    best_ask = observation.ask
+    if best_bid is None or best_ask is None:  # unreachable: admissible anchor ⇒ both touches present
+        return _decide("NO_QUOTE", (_no_anchor_reason(observation, config),))
+    tick = observation.tick_size
+    if toxic == "ask":
+        resting: Literal["bid", "ask"] = "bid"
+        reason: ReasonCode = "residual_pull_ask"
+        price = _bid_leg_price(anchor, best_bid, tick, config)
+    else:
+        resting = "ask"
+        reason = "residual_pull_bid"
+        price = _ask_leg_price(anchor, best_ask, tick, config)
+    if not _leg_in_zone(price, tick, config):
+        return _decide("NO_QUOTE", ("leg_out_of_zone",))
+    return StrategyDecision(
+        kind="QUOTE_ONE_SIDED",
+        reason_codes=(reason,),
+        intent_plan=(_place_leg(resting, price),),
+    )
+
+
 def _quote_disposition(
     observation: StrategyObservation, base: StrategyState, config: StrategyConfig
 ) -> StrategyDecision:
@@ -1072,10 +1114,12 @@ def _quote_disposition(
             # quiescent and falls through to the two-sided taxonomy floor (E4-T5's pre-match basis gate
             # REQ-078 slots between warmup and the extreme wall, WITHOUT reshaping this order).
             side = _residual_side(residual, config)
-            if side == "ask":
-                return _decide("QUOTE_ONE_SIDED", ("residual_pull_ask",))
-            if side == "bid":
-                return _decide("QUOTE_ONE_SIDED", ("residual_pull_bid",))
+            if side is not None:
+                # E4-T7 materialisation: PULL the toxic ``side`` and price the RESTING (surviving) leg
+                # through the shared join-or-behind + directional-round + post-clamp authority. An
+                # out-of-zone survivor fails closed to NO_QUOTE(leg_out_of_zone), NEVER a toxic-side flip
+                # (MAJOR-4/A1 — an empty ``intent_plan`` cannot place the permitted surviving leg).
+                return _residual_pull_quote(observation, config, anchor, side)
     # --- QUOTE math slot (E4-T7): join-or-behind anchor +/- half_spread legs, directional tick
     # rounding, post-clamp + cardinality (REQ-052/055/056). This terminal can DOWNGRADE the eligible
     # two-sided class: both legs clamped out -> NO_QUOTE(leg_out_of_zone), exactly one survives ->

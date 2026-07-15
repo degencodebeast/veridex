@@ -812,6 +812,77 @@ def test_pull_threshold_is_absolute_band() -> None:
     assert d_narrow_quiet.reason_codes == d_wide_quiet.reason_codes == ()
 
 
+# --- MAJOR-4 / [A1] / REQ-073/052/055: the residual-pull surviving leg MUST be PRICED ---------
+# The directional side-pull is a QUOTE class: the guard PULLS the adverse (toxic) leg and RESTS the
+# opposite (surviving) leg. E4-T7 owns materializing that surviving leg's price through the SAME
+# join-or-behind + directional-round + post-clamp authority as the two-sided quote / inventory
+# reduce — a QUOTE_ONE_SIDED with an EMPTY ``intent_plan`` is a class that cannot place its permitted
+# leg (E5 cannot recover a price E4 never materialized). residual +0.04 pulls the ASK ⇒ the BID rests
+# (floored); residual −0.04 pulls the BID ⇒ the ASK rests (ceiled); an out-of-zone survivor fails
+# closed to NO_QUOTE(leg_out_of_zone) and NEVER side-flips to the toxic leg.
+
+
+def test_residual_pull_ask_prices_resting_bid() -> None:
+    # residual = fv 0.54 − mid 0.50 − basis 0.0 = +0.04 (pull band 0.02 < 0.04 < extreme 0.06) ⇒ PULL
+    # the toxic ASK, the BID RESTS. The surviving BID leg is priced via the E4-T7 join-or-behind BID
+    # authority: floor(min(anchor − half_spread, best_bid)) = floor(min(0.50 − 0.02, 0.49)) =
+    # floor(0.48) = 0.48. QUOTE_ONE_SIDED(residual_pull_ask) MUST carry that ONE priced BID leg — not
+    # an empty plan (the MAJOR-4/A1 defect).
+    config = _config(guard_enabled=True)
+    state = _guarded_warm_state(basis_gap=0.0)
+    obs = _obs(guard_fv=_fresh_fv(fv=0.54))  # residual = +0.04
+
+    decision, _ = decide(obs, state, config)
+    assert decision.kind == "QUOTE_ONE_SIDED"
+    assert decision.reason_codes == ("residual_pull_ask",)
+    assert len(decision.intent_plan) == 1
+    leg = decision.intent_plan[0]
+    assert leg.kind == "place_quote"
+    assert leg.leg_role == "bid"  # the surviving (non-toxic) side rests; the ASK is pulled
+    assert leg.price == pytest.approx(0.48)
+    assert leg.post_only is True
+
+
+def test_residual_pull_bid_prices_resting_ask() -> None:
+    # residual = fv 0.46 − mid 0.50 − basis 0.0 = −0.04 (pull band) ⇒ PULL the toxic BID, the ASK
+    # RESTS. The surviving ASK leg is priced via the E4-T7 join-or-behind ASK authority:
+    # ceil(max(anchor + half_spread, best_ask)) = ceil(max(0.50 + 0.02, 0.51)) = ceil(0.52) = 0.52.
+    # QUOTE_ONE_SIDED(residual_pull_bid) MUST carry that ONE priced (ceiled) ASK leg.
+    config = _config(guard_enabled=True)
+    state = _guarded_warm_state(basis_gap=0.0)
+    obs = _obs(guard_fv=_fresh_fv(fv=0.46))  # residual = −0.04
+
+    decision, _ = decide(obs, state, config)
+    assert decision.kind == "QUOTE_ONE_SIDED"
+    assert decision.reason_codes == ("residual_pull_bid",)
+    assert len(decision.intent_plan) == 1
+    leg = decision.intent_plan[0]
+    assert leg.kind == "place_quote"
+    assert leg.leg_role == "ask"  # the surviving (non-toxic) side rests; the BID is pulled
+    assert leg.price == pytest.approx(0.52)
+    assert leg.post_only is True
+
+
+def test_residual_pull_invalid_survivor_no_quote_never_flips() -> None:
+    # The surviving leg clamps OUT of zone ⇒ NO_QUOTE(leg_out_of_zone), NEVER a leg on the toxic side.
+    # residual +0.04 pulls the ASK so the BID would rest, but a half_spread of 0.47 pushes the BID
+    # target below the lower boundary: floor(min(0.50 − 0.47, 0.49)) = floor(0.03) = 0.03 < 0.04 ⇒ out
+    # of the (0.04, 0.96) boundary zone. The anchor stays at the smoother-aligned mid 0.50 (no REQ-080
+    # mid-jump into row E) and the book stays narrow (no spread blowout), so row H is reached and only
+    # the survivor's post-clamp fails. It must fail closed WITHOUT side-flipping to the toxic ASK leg —
+    # quoting the adverse side is exactly the flow the pull exists to avoid.
+    config = _config(guard_enabled=True, half_spread=0.47)
+    state = _guarded_warm_state(basis_gap=0.0)
+    obs = _obs(guard_fv=_fresh_fv(fv=0.54))  # residual = +0.04 ⇒ pull ASK, BID would rest
+
+    decision, _ = decide(obs, state, config)
+    assert decision.kind == "NO_QUOTE"
+    assert decision.reason_codes == ("leg_out_of_zone",)
+    assert decision.intent_plan == ()
+    # Never side-flip to the toxic (ASK) side to salvage a quote.
+    assert not any(leg.leg_role == "ask" for leg in decision.intent_plan)
+
+
 # --- E4-T5 / REQ-078 / AC-054 / RED-50: pre-match basis gate --------------------------------
 # A pre-match-ONLY fail-closed gate inside the guard block, BETWEEN basis-warmup and the residual
 # band. Pre-match (``phase == 0``) with the basis warm, a persistent basis WIDER than the venue's
