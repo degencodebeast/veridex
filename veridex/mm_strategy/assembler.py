@@ -1,0 +1,496 @@
+"""Recorder-global mint boundary + typed per-source epoch resume (MM-R4-B, milestone E3).
+
+The adapter-tier seam between the durable live-recorder tape and the pure strategy core. Two
+load-bearing trust rules pin this module (REQ-020b/027):
+
+* **ONE global sequence authority.** Every source (book/FV/status/match-state/projection) is
+  minted through the SAME :class:`~veridex.live_recorder.recorder.LiveRecorder`, inheriting one
+  strictly-monotonic ``sequence_no``. This module NEVER mints its own sequence — it consumes the
+  recorder-assigned ``(recv_ts, sequence_no)`` pair via
+  :meth:`~veridex.live_recorder.recorder.LiveRecorder.record_and_return_pair`.
+* **The assembler is the SOLE author of per-source epochs.** Generations live on the tape as
+  ``MintEvent.source_epoch`` (never a ``meta.json`` field — that would break R3 meta byte-identity),
+  so :func:`read_durable_source_generations` reads the durable max per source back from the tape and
+  :func:`resume_source_generations` typed-increments it on an assembler restart.
+
+Imports (E3-T5 audits this boundary): stdlib + the pure ``mm_strategy.contracts`` types + the
+``veridex.live_recorder`` READ/resume/alignment surfaces ONLY. NEVER ``veridex.venues.base`` /
+``veridex.venues.sx_bet`` — no submit / cancel / signer surface. The FV-independent cadence engine
+(:func:`run_cadence` / :func:`project_guard_fv`) folds INJECTED observation facts and imports the
+``mm_strategy.contracts`` types + ``veridex.live_recorder`` ONLY — never ``mm_strategy.core`` /
+``mm_strategy.config`` / a venue surface — so decision/state identity is a downstream consequence of
+the identical observation stream (a valid replay reproduces it), not an assembler import.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Callable, Iterable
+from dataclasses import dataclass
+from pathlib import Path
+
+from veridex.live_recorder.alignment import FvPoint, eligible_fv_pair
+from veridex.live_recorder.recorder import LiveRecorder
+from veridex.live_recorder.replay import read_session_strict
+from veridex.mm_strategy.contracts import (
+    GuardFairValue,
+    MarketStatus,
+    MarketStatusEvent,
+    MintEvent,
+    MintSource,
+    ProofStatus,
+    SourceGenerations,
+    StrategyObservation,
+    StreamIdentity,
+)
+
+_MINT_EVENT_TYPE = "MintEvent"
+_MARKET_STATUS_EVENT_TYPE = "MarketStatusEvent"
+
+
+def mint(recorder: LiveRecorder, event: MintEvent) -> tuple[int, int]:
+    """Mint one source observation through the single global recorder, returning its sealed pair.
+
+    Records ``event`` (self-describing — ``event_type == "MintEvent"``) via
+    :meth:`~veridex.live_recorder.recorder.LiveRecorder.record_and_return_pair`, so the assembler
+    binds to the recorder-assigned GLOBAL ``(recv_ts, sequence_no)`` — never a locally-minted
+    counter. The placeholder ``event.sequence_no`` is overridden by the recorder authority.
+    """
+    return recorder.record_and_return_pair(event.model_dump())
+
+
+# NOTE (Gate #2 MAJOR-2 residual): the former ``sample_fv_into_mint(recorder, event, fv_cache)`` —
+# a second, IDENTITY-FREE FV-selection seam — was RETIRED. It sampled a bare ``list[FvPoint]`` at the
+# sealed mint boundary WITHOUT comparing the winner to the trigger's ``StreamIdentity`` (``FvPoint``
+# carries no identity), so a market-B trigger could pull a foreign market-A fair value. It had ZERO
+# in-repo callers (superseded by :func:`project_guard_fv`, which keys FV selection by identity), so
+# removal — not identity-binding — is the closure. The ONLY FV-selection path is the identity-keyed
+# guard projection below; the sealed-pair persist↔decide control lives on :func:`mint` +
+# :func:`~veridex.live_recorder.alignment.eligible_fv_pair`.
+
+
+# --- FV-independent cadence + guard-off projection (REQ-020(d/d2) / AC-049/051/056) ---------
+# The load-bearing A/B baseline-arm integrity seam. Two invariants pin this section:
+#   * GUARD-OFF PROJECTION — with the guard config-disabled the assembler emits ``guard_fv=None`` on
+#     EVERY observation regardless of FV feed health, so no fv value / ts / epoch enters a baseline
+#     observation (or, via ``decide``, its state). The baseline observation/decision/state stream is
+#     therefore BYTE-IDENTICAL across healthy / stale / absent / reconnecting FV — E3-T5/E6 rely on
+#     this ``guard_enabled=False`` byte-identity guarantee.
+#   * FV-INDEPENDENT CADENCE — observations are minted ONLY by book/status/match-state/projection
+#     events. An FV arrival updates the single-authority latest-value cache (minted through the ONE
+#     global recorder so its ``sequence_no`` is comparable to a trigger pair, per E3-T3) but NEVER
+#     mints an observation nor advances ``observation_sequence``, in EITHER arm.
+
+
+ObservationFactory = Callable[[int, GuardFairValue | None], StrategyObservation]
+"""Builds one observation from the cadence-assigned ``observation_sequence`` and the projected guard
+leg (``None`` in the baseline arm). The driver is the SOLE author of both; the caller supplies the RAW
+venue / match-state facts (arm-IDENTICAL), so the guard leg is the ONLY arm-dependent input.
+
+The factory is trusted ONLY to assemble the arm-identical venue MICROSTRUCTURE (bid/ask/sizes/level
+counts). It is NOT authoritative for the assembler-owned fields — :func:`run_cadence` authenticates
+the returned observation against the cadence-assigned sequence, the projected guard leg, and the
+tick's declared :class:`AssemblerOwnedFacts` before release, and FAILS CLOSED on any forgery
+(Gate #2 MAJOR-1). A factory that ignores the injected sequence, injects an FV leg under a guard-off
+run, or forges an epoch / status / match-state value is REJECTED — the boundary is ENFORCED, not a
+convention the honest builder happens to follow."""
+
+
+@dataclass(frozen=True)
+class AssemblerOwnedFacts:
+    """The observation fields the ASSEMBLER — not the factory — is authoritative for (REQ-020b/027).
+
+    These are declared on the :class:`ObservationTick` by the assembler orchestration (source epochs
+    read off the durable tape, market status from :func:`latest_market_status`, the match-state leg
+    from the match-state authority), NEVER minted by the observation factory. :func:`run_cadence`
+    validates the built observation field-for-field against this bundle (plus the cadence-assigned
+    ``observation_sequence`` and the projected guard leg) and RAISES on any mismatch, so the factory
+    can only assemble the arm-identical microstructure — it cannot forge an assembler-owned value.
+    """
+
+    book_source_epoch: int
+    market_status: MarketStatus
+    market_status_recv_ts: int | None
+    market_status_epoch: int | None
+    phase: int
+    suspended: bool
+    match_state_recv_ts: int
+
+
+@dataclass(frozen=True)
+class FvArrival:
+    """A raw FV arrival fed into the single-authority latest-value cache (REQ-020(d2) / REQ-027).
+
+    Minting an :class:`FvArrival` updates the cache the GUARDED arm samples but NEVER mints an
+    observation nor advances ``observation_sequence`` — the FV leg has ZERO cadence authority in
+    either arm. ``message_id`` / ``proof_status`` ride into the guard leg only when the guard is on.
+    ``identity`` binds the arrival to ITS observation stream (fixture + market + side/token); the
+    guard projection only ever selects an FV whose identity matches the minting tick, so a foreign
+    market/side fair value can never bleed into another stream (Gate #2 MAJOR-2).
+    """
+
+    source_ts: int
+    recv_ts: int
+    value: float
+    source_epoch: int
+    identity: StreamIdentity
+    message_id: str | None = None
+    proof_status: ProofStatus = "unavailable_no_message_id"
+
+
+@dataclass(frozen=True)
+class ObservationTick:
+    """A book / market-status / match-state / projection event that MINTS exactly one observation.
+
+    ``source`` MUST be a non-FV mint source — an FV trigger can never mint an observation
+    (REQ-020(d2)); construction fails closed otherwise. ``build`` is invoked with the cadence-assigned
+    ``observation_sequence`` and the projected guard leg to produce the fully-validated observation;
+    ``owned`` declares the assembler-owned fields :func:`run_cadence` then authenticates that
+    observation against (the factory may assemble only the arm-identical microstructure).
+    ``identity`` is the tick's stream identity: :func:`run_cadence` keys FV selection by it AND
+    authenticates that the built observation reports the SAME identity, so the factory can neither
+    borrow a foreign stream's FV nor mislabel the stream it built (Gate #2 MAJOR-2).
+    """
+
+    source: MintSource
+    source_epoch: int
+    recv_ts: int
+    owned: AssemblerOwnedFacts
+    identity: StreamIdentity
+    build: ObservationFactory
+
+    def __post_init__(self) -> None:
+        if self.source == "fv":
+            raise ValueError(
+                "an FV source can never mint an observation (REQ-020(d2)); use FvArrival"
+            )
+
+
+CadenceEvent = FvArrival | ObservationTick
+
+
+@dataclass(frozen=True)
+class _CachedFv:
+    """One raw FV arrival sealed at its global recorder pair — the guard-scoped cache entry. Carries
+    the FV epoch / proof reference the guarded projection folds into a :class:`GuardFairValue`, plus
+    the ``identity`` of the stream that owns it so :func:`project_guard_fv` selects only same-stream
+    FV (Gate #2 MAJOR-2)."""
+
+    point: FvPoint
+    source_epoch: int
+    message_id: str | None
+    proof_status: ProofStatus
+    identity: StreamIdentity
+
+
+@dataclass(frozen=True)
+class CadenceRun:
+    """The minted observation stream plus each observation's SEALED global ``(recv_ts, sequence_no)``
+    mint pair (audit). ``len(mint_pairs) == len(observations)`` — an FV arrival contributes neither."""
+
+    observations: tuple[StrategyObservation, ...]
+    mint_pairs: tuple[tuple[int, int], ...]
+
+
+def project_guard_fv(
+    fv_cache: list[_CachedFv],
+    mint_pair: tuple[int, int],
+    *,
+    identity: StreamIdentity,
+    guard_enabled: bool,
+) -> GuardFairValue | None:
+    """Project the guard leg for one observation — the canonical guard-off rule (REQ-020(d2)).
+
+    Guard-OFF (``guard_enabled=False``) ALWAYS returns ``None`` WITHOUT reading ``fv_cache``: no fv
+    value / ts / epoch can enter a baseline observation, so the baseline stream is byte-identical
+    across FV feed health BY CONSTRUCTION (the cache is literally unobservable in the baseline arm).
+    Guard-ON samples the single-authority cache at the SEALED global ``mint_pair`` via
+    :func:`~veridex.live_recorder.alignment.eligible_fv_pair` (no look-ahead) and abstains (``None``)
+    when nothing is visible below the boundary — the FV is never imputed.
+
+    Selection is KEYED by ``identity`` (Gate #2 MAJOR-2): only cache rows whose stream identity
+    equals the minting tick's identity are eligible, so a foreign fixture / market / side FV is
+    INVISIBLE to this stream — a shared process-global cache can no longer broadcast one outcome's
+    fair value across outcomes. Dropping this key re-opens the cross-market/cross-side leak.
+    """
+    if not guard_enabled:
+        return None
+    same_stream = [entry for entry in fv_cache if entry.identity == identity]
+    winner = eligible_fv_pair(
+        [entry.point for entry in same_stream], mint_pair[0], mint_pair[1]
+    )
+    if winner is None:
+        return None
+    cached = next(entry for entry in same_stream if entry.point is winner)
+    return GuardFairValue(
+        fv=cached.point.value,
+        fv_source_ts=cached.point.source_ts,
+        fv_recv_ts=cached.point.recv_ts,
+        fv_source_epoch=cached.source_epoch,
+        message_id=cached.message_id,
+        proof_status=cached.proof_status,
+    )
+
+
+def _authenticate_owned_fields(
+    built: StrategyObservation,
+    *,
+    observation_sequence: int,
+    guard_fv: GuardFairValue | None,
+    owned: AssemblerOwnedFacts,
+    identity: StreamIdentity,
+) -> None:
+    """Fail closed unless the factory reproduced EVERY assembler-owned field verbatim (REQ-020b/027).
+
+    The cadence-assigned ``observation_sequence`` and the projected ``guard_fv`` leg are COMPUTED by
+    :func:`run_cadence`; the epoch / market-status / match-state facts are DECLARED on the tick via
+    :class:`AssemblerOwnedFacts`; the stream ``identity`` is the key FV selection was bound to. A
+    factory that ignores the injected sequence, injects an FV leg under a guard-off run (``guard_fv``
+    is ``None`` there, so ANY non-null leg mismatches), forges an epoch / status / match-state value,
+    or mislabels the stream it built (so the FV keyed to ``identity`` would ride a foreign-stream
+    observation) is REJECTED here — the trust boundary is enforced, not a convention the honest
+    builder happens to follow (Gate #2 MAJOR-1/MAJOR-2).
+    """
+    checks: tuple[tuple[str, object, object], ...] = (
+        ("observation_sequence", observation_sequence, built.observation_sequence),
+        ("guard_fv", guard_fv, built.guard_fv),
+        ("identity", identity, built.stream_identity()),
+        ("book_source_epoch", owned.book_source_epoch, built.book_source_epoch),
+        ("market_status", owned.market_status, built.market_status),
+        ("market_status_recv_ts", owned.market_status_recv_ts, built.market_status_recv_ts),
+        ("market_status_epoch", owned.market_status_epoch, built.market_status_epoch),
+        ("phase", owned.phase, built.phase),
+        ("suspended", owned.suspended, built.suspended),
+        ("match_state_recv_ts", owned.match_state_recv_ts, built.match_state_recv_ts),
+    )
+    mismatches = [
+        f"{name}: assembler={authoritative!r} factory={returned!r}"
+        for name, authoritative, returned in checks
+        if authoritative != returned
+    ]
+    if mismatches:
+        raise ValueError(
+            "observation factory forged assembler-owned field(s); failing closed "
+            "(REQ-020b/027, Gate #2 MAJOR-1): " + "; ".join(mismatches)
+        )
+
+
+# Gate #4 C-MAJOR-1: a mint row's DURABLE source generation and the released observation's
+# AUTHENTICATED generation are two declarations of ONE fact — they must never diverge.
+# ``ObservationTick.source_epoch`` is persisted into the ``MintEvent`` (and read back by
+# :func:`read_durable_source_generations` on an assembler restart); ``owned.book_source_epoch`` /
+# ``owned.market_status_epoch`` is authenticated onto the released observation the decision stream
+# consumes. For every mint source an observation authenticates a generation for, the tape generation
+# is BOUND to that SAME observation generation — one authority per source. ``match_state`` /
+# ``projection`` carry no observation-authenticated generation (and are never read back on resume), so
+# there is nothing to bind. ``fv`` is bound BY CONSTRUCTION: :func:`run_cadence` feeds the single
+# ``FvArrival.source_epoch`` to BOTH the tape row and the guard-leg cache.
+_OBSERVATION_AUTHENTICATED_EPOCH: dict[
+    MintSource, Callable[[AssemblerOwnedFacts], int | None]
+] = {
+    "book": lambda owned: owned.book_source_epoch,
+    "market_status": lambda owned: owned.market_status_epoch,
+}
+
+
+def _bind_mint_source_epoch(event: ObservationTick) -> None:
+    """Fail closed unless the tick's tape generation equals its observation-authenticated one.
+
+    Invoked BEFORE any tape append, so a divergent ``source_epoch`` NEVER seals onto the tape
+    (Gate #4 C-MAJOR-1). Without this bind a book (or market-status) tick could persist
+    ``source_epoch=999`` while releasing an observation authenticated at generation ``1``; a restart's
+    :func:`read_durable_source_generations` would then return — and trust — a generation the decision
+    stream never consumed, turning a restart into a false epoch increment/reset from two independently
+    caller-controlled fields even though every individual row is well typed.
+    """
+    authenticated = _OBSERVATION_AUTHENTICATED_EPOCH.get(event.source)
+    if authenticated is None:
+        return  # no observation-authenticated generation for this source — nothing to bind.
+    observation_epoch = authenticated(event.owned)
+    if event.source_epoch != observation_epoch:
+        raise ValueError(
+            "mint source_epoch disagrees with the observation-authenticated generation; "
+            "failing closed with ZERO tape append (Gate #4 C-MAJOR-1): "
+            f"source={event.source!r} tape_source_epoch={event.source_epoch!r} "
+            f"observation_epoch={observation_epoch!r}"
+        )
+
+
+def run_cadence(
+    recorder: LiveRecorder, events: Iterable[CadenceEvent], *, guard_enabled: bool
+) -> CadenceRun:
+    """Fold a heterogeneous event stream into the minted observation stream (REQ-020(d)/(d2)).
+
+    Every event rides the ONE global ``recorder`` (the single sequence authority), but only a non-FV
+    :class:`ObservationTick` MINTS an observation and advances ``observation_sequence``; an
+    :class:`FvArrival` updates the latest-value cache alone (no observation, no sequence advance — in
+    EITHER arm). Each minted observation binds the cadence-assigned sequence and the
+    :func:`project_guard_fv` leg (``None`` in the baseline arm) onto the tick's arm-IDENTICAL
+    ``build`` facts, so a guard-off run yields a byte-identical observation stream regardless of FV
+    feed health. Decision/state identity follows downstream from feeding that stream to ``decide``.
+    """
+    observation_sequence = 0
+    fv_cache: list[_CachedFv] = []
+    observations: list[StrategyObservation] = []
+    mint_pairs: list[tuple[int, int]] = []
+    for event in events:
+        if isinstance(event, FvArrival):
+            # FV arrival: seal it on the global tape and cache it — but mint NO observation and do
+            # NOT advance observation_sequence (latest-value cache only, both arms).
+            pair = mint(
+                recorder,
+                MintEvent(
+                    sequence_no=0,
+                    source="fv",
+                    source_epoch=event.source_epoch,
+                    recv_ts=event.recv_ts,
+                    identity=event.identity,
+                ),
+            )
+            fv_cache.append(
+                _CachedFv(
+                    point=FvPoint(
+                        source_ts=event.source_ts,
+                        recv_ts=pair[0],
+                        value=event.value,
+                        sequence_no=pair[1],
+                    ),
+                    source_epoch=event.source_epoch,
+                    message_id=event.message_id,
+                    proof_status=event.proof_status,
+                    identity=event.identity,
+                )
+            )
+            continue
+        # Non-FV trigger: MINT one observation. The cadence sequence advances here (never on FV).
+        # Bind the tape generation to the observation-authenticated generation BEFORE the append, so
+        # a divergent source_epoch can never seal onto the tape (Gate #4 C-MAJOR-1) — one authority
+        # per source. A mismatch fails closed with ZERO append and no sequence advance.
+        _bind_mint_source_epoch(event)
+        observation_sequence += 1
+        mint_pair = mint(
+            recorder,
+            MintEvent(
+                sequence_no=0,
+                source=event.source,
+                source_epoch=event.source_epoch,
+                recv_ts=event.recv_ts,
+                identity=event.identity,
+            ),
+        )
+        guard_fv = project_guard_fv(
+            fv_cache, mint_pair, identity=event.identity, guard_enabled=guard_enabled
+        )
+        built = event.build(observation_sequence, guard_fv)
+        # The factory assembles only the arm-identical microstructure; the assembler AUTHENTICATES
+        # every field it owns before release, so a forged sequence / guard-off FV injection / epoch /
+        # status / match-state / stream-identity value fails closed (Gate #2 MAJOR-1/MAJOR-2) — not
+        # merely a helper convention. Selection was keyed by the tick's identity, so binding the built
+        # observation to that SAME identity forbids the FV riding a mislabeled (foreign) stream.
+        _authenticate_owned_fields(
+            built,
+            observation_sequence=observation_sequence,
+            guard_fv=guard_fv,
+            owned=event.owned,
+            identity=event.identity,
+        )
+        observations.append(built)
+        mint_pairs.append(mint_pair)
+    return CadenceRun(observations=tuple(observations), mint_pairs=tuple(mint_pairs))
+
+
+def record_market_status(
+    recorder: LiveRecorder, event: MarketStatusEvent
+) -> tuple[int, int]:
+    """Record one typed :class:`MarketStatusEvent` row through the single global recorder.
+
+    Tagged with ``event_type == "MarketStatusEvent"`` so :func:`latest_market_status` can identify
+    it on the durable tape. Returns the recorder-assigned ``(recv_ts, sequence_no)`` pair.
+    """
+    payload = {**event.model_dump(), "event_type": _MARKET_STATUS_EVENT_TYPE}
+    return recorder.record_and_return_pair(payload)
+
+
+def read_durable_source_generations(session_dir: str | Path) -> SourceGenerations:
+    """Read the durable-max per-source generations from the tape's ``MintEvent`` rows.
+
+    The SOLE per-source-epoch channel (Fable-plan-review-R4 Minor-1): scans the strict R4-B tape for
+    ``MintEvent`` rows and takes the maximum ``source_epoch`` per source. ``book`` is the universal
+    generation (defaults to ``0`` when the tape carries no book row yet); ``fv`` / ``market_status``
+    are ``None`` when the tape has no such generation — mirroring guard-off (no FV epoch anywhere)
+    and the ``UNKNOWN`` status sentinel. NEVER reads ``meta.json`` (it carries no epoch field).
+    """
+    _, events, _ = read_session_strict(session_dir)
+    per_source: dict[str, int] = {}
+    for row in events:
+        if row.get("event_type") != _MINT_EVENT_TYPE:
+            continue
+        source = row["source"]
+        epoch = row["source_epoch"]
+        current = per_source.get(source)
+        if current is None or epoch > current:
+            per_source[source] = epoch
+    return SourceGenerations(
+        book_source_epoch=per_source.get("book", 0),
+        fv_source_epoch=per_source.get("fv"),
+        market_status_epoch=per_source.get("market_status"),
+    )
+
+
+def resume_source_generations(
+    prior: SourceGenerations, *, guard_enabled: bool
+) -> SourceGenerations:
+    """Typed per-source generation resume on an assembler restart (REQ-020b/(d2)/(e)).
+
+    A restart is a NEW generation. ``book_source_epoch`` ALWAYS increments (the universal source).
+    ``fv_source_epoch`` increments IFF ``guard_enabled`` — guard-off leaves it ``None`` (no FV epoch
+    anywhere, REQ-020(d2)). ``market_status_epoch`` increments IFF a prior market-status generation
+    is present, else stays ``None``. The assembler is the sole author of these epochs.
+    """
+    # guard-off ⇒ NO fv epoch anywhere (REQ-020(d2)); status increments only when already present.
+    fv_next = (prior.fv_source_epoch or 0) + 1 if guard_enabled else None
+    status_next = (
+        prior.market_status_epoch + 1 if prior.market_status_epoch is not None else None
+    )
+
+    return SourceGenerations(
+        book_source_epoch=prior.book_source_epoch + 1,
+        fv_source_epoch=fv_next,
+        market_status_epoch=status_next,
+    )
+
+
+def latest_market_status(
+    session_dir: str | Path, venue_market_ref: str
+) -> MarketStatusEvent:
+    """The latest durable market status FOR *venue_market_ref* — ``UNKNOWN`` when none exists.
+
+    **Market-identity binding (trust-critical, REQ-027, Gate #2 MAJOR-3).** The read is BOUND to the
+    requested market: only ``MarketStatusEvent`` rows whose ``venue_market_ref`` equals
+    *venue_market_ref* are eligible, and the one with the greatest global ``sequence_no`` AMONG THOSE
+    is returned. A tape carrying ``A=CLOSED`` then ``B=ACTIVE`` therefore returns A's CLOSED for an
+    A-query — never B's globally-latest ACTIVE. A market with NO row on the tape yields
+    ``MarketStatusEvent(venue_market_ref=venue_market_ref, status="UNKNOWN", recv_ts=None,
+    epoch=None)`` (fail closed) — the harness never returns a foreign market's row nor silently
+    synthesizes ``ACTIVE`` (REQ-027 / AC-053).
+    """
+    _, events, _ = read_session_strict(session_dir)
+    status_rows = [
+        row
+        for row in events
+        if row.get("event_type") == _MARKET_STATUS_EVENT_TYPE
+        and row.get("venue_market_ref") == venue_market_ref
+    ]
+    if not status_rows:
+        return MarketStatusEvent(
+            venue_market_ref=venue_market_ref,
+            status="UNKNOWN",
+            recv_ts=None,
+            epoch=None,
+        )
+    latest = max(status_rows, key=lambda row: row["sequence_no"])
+    return MarketStatusEvent(
+        venue_market_ref=latest["venue_market_ref"],
+        status=latest["status"],
+        recv_ts=latest["recv_ts"],
+        epoch=latest["epoch"],
+    )

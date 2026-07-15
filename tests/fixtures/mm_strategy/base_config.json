@@ -1,0 +1,7 @@
+{
+  "_note": "Shared StrategyConfig knob overrides for the A/B ablation harness. Deliberately EXCLUDES `guard_enabled` — that is the ONE knob the harness flips between arm A (baseline) and arm B (guarded). Every field here is applied IDENTICALLY to both arms, so the only config difference is the guard block (REQ-110). Values are non-default (default residual_band=0.02, fee_bps=100.0) so the config identity is non-trivial and the hash-level arm-identity check is meaningful.",
+  "overrides": {
+    "residual_band": 0.03,
+    "fee_bps": 80.0
+  }
+}

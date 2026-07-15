@@ -1,0 +1,10 @@
+{
+  "_note": "PLACEBO control series for the forward-NEXT-change markout methodology (REQ-111 / RED-27). Each sample pins a guard residual SIGN and the venue reference mid at that tick. The residual is deliberately constructed to be ANTI-predictive of the FORWARD next change (mid[i+1]-mid[i]) yet perfectly aligned with the SAME (contemporaneous) change (mid[i]-mid[i-1]) that produced it. Scoring the signal against the forward next change — the ONLY honest markout horizon — reveals NO predictive edge (in fact anti). Scoring it against the same move is near-CIRCULAR and would spuriously report a perfect edge. This series is the adversarial input that exposes that circularity: an honest evaluator must reject it, a same-move evaluator would falsely promote it.",
+  "samples": [
+    {"residual": -1.0, "mid": 0.50},
+    {"residual": 1.0, "mid": 0.53},
+    {"residual": -1.0, "mid": 0.50},
+    {"residual": 1.0, "mid": 0.53},
+    {"residual": -1.0, "mid": 0.50}
+  ]
+}

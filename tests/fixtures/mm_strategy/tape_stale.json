@@ -1,0 +1,12 @@
+{
+  "_note": "Canned deterministic replay tape — STALE FV feed. A single old/stale FV arrival, no fresh follow-up. Same fixed non-FV cadence as tape_healthy/tape_absent. Under arm A the stale FV is invisible (byte-identical baseline stream); under arm B a stale FV is gated out by the freshness rules, so the guarded stream also differs from healthy — but the honesty claim this tape backs is the arm-A invariance across FV health (RED-23).",
+  "health": "stale",
+  "stream": {"fixture_id": 1, "market_ref": "TEAM-A/YES", "side": "YES", "token_id": "TOKEN-YES"},
+  "venue_market_ref": "0xmarket",
+  "events": [
+    {"kind": "fv", "source_ts": 1, "recv_ts": 800, "value": 0.20, "source_epoch": 1},
+    {"kind": "tick", "source": "book", "recv_ts": 900, "as_of_ts": 1000},
+    {"kind": "tick", "source": "match_state", "recv_ts": 1090, "as_of_ts": 1100},
+    {"kind": "tick", "source": "projection", "recv_ts": 1190, "as_of_ts": 1200}
+  ]
+}

@@ -24,6 +24,7 @@ from typing import Any
 __all__ = [
     "R3_R4_RANK_DENYLIST",
     "R4A_EXECUTION_DENYLIST_FIELDS",
+    "R4B_STRATEGY_DENYLIST_FIELDS",
     "assert_no_r3r4_in_rank",
 ]
 
@@ -86,27 +87,56 @@ R4A_EXECUTION_DENYLIST_FIELDS = frozenset(
     }
 )
 
+#: FROZEN closed set of EVERY R4-B experimental-STRATEGY diagnostic/telemetry field name a
+#: rank input must never carry (SEC-005, AC-033, §6.3(6)). R4-B is the experimental
+#: market-maker strategy lane; these are its per-arm policy-experiment OBSERVATIONS —
+#: matched-opportunity markout, exposure-normalized adverse selection, per-fill markout,
+#: fill/abstention counts, capital-at-risk, the bandit ``arm_id``, and decision reason codes.
+#: They belong to the strategy-experiment telemetry lane, NOT to any ranked leaderboard: the
+#: ranked lanes rank on quote-quality / CLV / toxicity evidence only. Frozen as a WHOLE closed
+#: set (mirroring :data:`R4A_EXECUTION_DENYLIST_FIELDS`) so a set-equality test over this literal
+#: makes omitting or renaming ANY one field fail. Folded into :data:`R3_R4_RANK_DENYLIST` below
+#: so the single canonical denylist — and thus every rank surface — rejects them.
+R4B_STRATEGY_DENYLIST_FIELDS = frozenset(
+    {
+        "matched_opportunity_markout",
+        "exposure_normalized_adverse_selection",
+        "per_fill_markout",
+        "fill_count",
+        "abstention_count",
+        "capital_at_risk",
+        "arm_id",
+        "decision_reason_codes",
+    }
+)
+
 #: Canonical, FROZEN, non-generic R3/R4 execution-field denylist (SEC-006). Every name here
 #: is an R3 (queue-position fill simulation) or R4/R4-A (real own-fill reconciliation)
-#: execution observation the recorder/dust lane may carry but a rank input may not. The full
-#: R4-A execution-outcome set is folded in via :data:`R4A_EXECUTION_DENYLIST_FIELDS` so a
-#: single canonical set feeds every rank surface. Generic legitimate maker-row names (``side``,
-#: ``spread``, ``size``, ``real_executable_edge_bps`` — emitted as ``None``) are DELIBERATELY
-#: EXCLUDED, and ``label``/``ranked`` are NOT listed here (they are already covered by
+#: execution observation the recorder/dust lane may carry but a rank input may not, PLUS the
+#: full R4-B experimental-strategy telemetry set (SEC-005). The R4-A execution-outcome set is
+#: folded in via :data:`R4A_EXECUTION_DENYLIST_FIELDS` and the R4-B strategy-telemetry set via
+#: :data:`R4B_STRATEGY_DENYLIST_FIELDS`, so a single canonical set feeds every rank surface.
+#: Generic legitimate maker-row names (``side``, ``spread``, ``size``,
+#: ``real_executable_edge_bps`` — emitted as ``None``) are DELIBERATELY EXCLUDED, and
+#: ``label``/``ranked`` are NOT listed here (they are already covered by
 #: ``leaderboard._R2_BRACKET_KEYS``) so the two guards stay orthogonal.
-R3_R4_RANK_DENYLIST = frozenset(
-    {
-        # --- R3 queue-position / executability observations ---
-        "queue_ahead_size",
-        "outbid_within_ms",
-        "stepped_ahead_count",
-        "executability",
-        "available_size_at_price",
-        "cumulative_size_to_clear",
-        "cost_clearing_threshold",
-        "fee_stress_multiplier",
-    }
-) | R4A_EXECUTION_DENYLIST_FIELDS  # --- full R4/R4-A real own-fill / inventory / markout set ---
+R3_R4_RANK_DENYLIST = (
+    frozenset(
+        {
+            # --- R3 queue-position / executability observations ---
+            "queue_ahead_size",
+            "outbid_within_ms",
+            "stepped_ahead_count",
+            "executability",
+            "available_size_at_price",
+            "cumulative_size_to_clear",
+            "cost_clearing_threshold",
+            "fee_stress_multiplier",
+        }
+    )
+    | R4A_EXECUTION_DENYLIST_FIELDS  # --- full R4/R4-A real own-fill / inventory / markout set ---
+    | R4B_STRATEGY_DENYLIST_FIELDS  # --- full R4-B experimental-strategy telemetry set (SEC-005) ---
+)
 
 
 def assert_no_r3r4_in_rank(metrics: Mapping[str, Any]) -> None:

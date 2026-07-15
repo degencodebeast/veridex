@@ -14,7 +14,9 @@ from veridex.live_recorder.contracts import (
 from veridex.live_recorder.recorder import LiveRecorder, session_content_hash
 from veridex.live_recorder.replay import (
     iter_change_series,
+    max_sequence_no,
     read_session,
+    read_session_strict,
     replay_reproduces,
 )
 from veridex.runtime.evidence import serialize_payload
@@ -149,3 +151,49 @@ def test_replay_byte_determinism_and_duplicate_sequence_raises(tmp_path):
     events_with_dup_sequence_no = events + [dict(events[-1])]
     with pytest.raises(ValueError):
         session_content_hash(events_with_dup_sequence_no)
+
+
+# --- E3-T2: strict fail-closed reader + durable-tail max (REQ-020b/027) --------------------
+
+
+def test_strict_reader_rejects_row_missing_sequence_no(tmp_path):
+    """``read_session_strict`` FAILS CLOSED on a non-gap event row lacking ``sequence_no``."""
+    session = tmp_path / "s1"
+    session.mkdir()
+    (session / "meta.json").write_text(_start_meta().model_dump_json())
+
+    good = _fv_dict(sequence_no=1, recv_ts=100, fv=0.60)
+    no_seq = {k: v for k, v in _fv_dict(sequence_no=2, recv_ts=200, fv=0.61).items() if k != "sequence_no"}
+    (session / "records.jsonl").write_text(
+        serialize_payload(good) + "\n" + json.dumps(no_seq) + "\n"
+    )
+
+    with pytest.raises(ValueError):
+        read_session_strict(session)
+
+    # a gap row legitimately always carries a sequence_no; the plain reader stays permissive
+    _, events, _ = read_session(session)
+    assert len(events) == 2  # read_session is unchanged for R3 back-compat
+
+
+def test_persisted_pair_survives_restart_read_strict(tmp_path):
+    """The pair written by ``record_and_return_pair`` == the pair ``read_session_strict`` returns."""
+    rec = LiveRecorder(tmp_path, _start_meta())
+    persisted = rec.record_and_return_pair(
+        _fv_dict(sequence_no=0, recv_ts=100, fv=0.60)
+    )
+    rec.close()
+
+    _, events, _ = read_session_strict(tmp_path)
+    assert len(events) == 1
+    row = events[0]
+    assert persisted == (row["recv_ts"], row["sequence_no"])
+
+
+def test_max_sequence_no_spans_events_and_gap_tail(tmp_path):
+    """``max_sequence_no`` is the durable max over ALL rows — events AND a gap-at-tail."""
+    rec = LiveRecorder(tmp_path, _start_meta())
+    rec.record(_fv_dict(sequence_no=0, recv_ts=100, fv=0.60))  # seq 1
+    rec.record_gap(from_ts=200, to_ts=300, source="venue", reason="disconnect")  # seq 2 (last)
+    rec.close()
+    assert max_sequence_no(tmp_path) == 2  # NOT 1 (events-only would miss the gap tail)

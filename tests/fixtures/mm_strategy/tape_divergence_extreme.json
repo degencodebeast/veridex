@@ -1,0 +1,16 @@
+{
+  "_note": "Canned deterministic A/B DIVERGENCE tape — EXTREME RESIDUAL ABSTAIN + CANCEL. Same warmup basis (gap 0.05) as tape_divergence_pull; the fourth tick's FV JUMPS to 0.65 so the guarded residual (0.15 - 0.05 = 0.10) BREACHES the extreme wall (extreme_multiple * residual_band = 3.0 * 0.03 = 0.09): arm B fails closed to NO_QUOTE/residual_extreme (a cancel-on-exposure plan when resting; none here). Arm A is FV-blind and quotes BOTH sides (QUOTE_TWO_SIDED). Warmup prefix byte-identical across arms; streams diverge at tick 4 ONLY. Requires overrides ref_min_samples=2, basis_min_samples=2.",
+  "health": "divergence_extreme",
+  "stream": {"fixture_id": 1, "market_ref": "TEAM-A/YES", "side": "YES", "token_id": "TOKEN-YES"},
+  "venue_market_ref": "0xmarket",
+  "events": [
+    {"kind": "fv", "source_ts": 8, "recv_ts": 9700, "value": 0.55, "source_epoch": 1},
+    {"kind": "tick", "source": "book", "recv_ts": 9900, "as_of_ts": 10000},
+    {"kind": "fv", "source_ts": 18, "recv_ts": 19700, "value": 0.55, "source_epoch": 1},
+    {"kind": "tick", "source": "book", "recv_ts": 19900, "as_of_ts": 20000},
+    {"kind": "fv", "source_ts": 28, "recv_ts": 29700, "value": 0.55, "source_epoch": 1},
+    {"kind": "tick", "source": "book", "recv_ts": 29900, "as_of_ts": 30000},
+    {"kind": "fv", "source_ts": 38, "recv_ts": 39700, "value": 0.65, "source_epoch": 1},
+    {"kind": "tick", "source": "book", "recv_ts": 39900, "as_of_ts": 40000}
+  ]
+}
