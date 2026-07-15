@@ -1,0 +1,11 @@
+{
+  "_note": "Canned deterministic replay tape — ABSENT FV feed. No FV arrival at all; only the fixed non-FV cadence (book / match_state / projection). This is the reference variant for the RED-23 arm-A invariance check: with the guard off, tape_healthy and tape_stale must produce a decision stream + state byte-identical to THIS one (E3-T4 guard-off byte-identity).",
+  "health": "absent",
+  "stream": {"fixture_id": 1, "market_ref": "TEAM-A/YES", "side": "YES", "token_id": "TOKEN-YES"},
+  "venue_market_ref": "0xmarket",
+  "events": [
+    {"kind": "tick", "source": "book", "recv_ts": 900, "as_of_ts": 1000},
+    {"kind": "tick", "source": "match_state", "recv_ts": 1090, "as_of_ts": 1100},
+    {"kind": "tick", "source": "projection", "recv_ts": 1190, "as_of_ts": 1200}
+  ]
+}

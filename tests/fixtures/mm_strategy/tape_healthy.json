@@ -1,0 +1,13 @@
+{
+  "_note": "Canned deterministic replay tape — HEALTHY FV feed. Fresh FV arrivals interleave the fixed non-FV cadence. Under arm A (guard_enabled=False) these FV rows are INVISIBLE (guard-off projection returns None without reading the cache, per E3-T4), so this tape's baseline-arm decision stream is byte-identical to tape_stale/tape_absent. Under arm B (guard_enabled=True) the FV leg populates and the stream differs (non-vacuity contrast). Microstructure (bid/ask/sizes) is arm-identical and fixed across ticks.",
+  "health": "healthy",
+  "stream": {"fixture_id": 1, "market_ref": "TEAM-A/YES", "side": "YES", "token_id": "TOKEN-YES"},
+  "venue_market_ref": "0xmarket",
+  "events": [
+    {"kind": "fv", "source_ts": 500, "recv_ts": 850, "value": 0.55, "source_epoch": 1},
+    {"kind": "tick", "source": "book", "recv_ts": 900, "as_of_ts": 1000},
+    {"kind": "fv", "source_ts": 600, "recv_ts": 1050, "value": 0.58, "source_epoch": 1},
+    {"kind": "tick", "source": "match_state", "recv_ts": 1090, "as_of_ts": 1100},
+    {"kind": "tick", "source": "projection", "recv_ts": 1190, "as_of_ts": 1200}
+  ]
+}
