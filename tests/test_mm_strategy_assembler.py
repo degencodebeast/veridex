@@ -14,8 +14,10 @@ from veridex.live_recorder.contracts import LiveRecorderSessionMeta
 from veridex.live_recorder.recorder import LiveRecorder
 from veridex.live_recorder.replay import read_session, read_session_strict
 from veridex.mm_strategy.assembler import (
+    AssemblerOwnedFacts,
     CadenceRun,
     FvArrival,
+    ObservationFactory,
     ObservationTick,
     latest_market_status,
     mint,
@@ -298,16 +300,39 @@ def _observation(
     )
 
 
+def _owned(*, as_of_ts: int) -> AssemblerOwnedFacts:
+    """The assembler-owned facts for one honest tick — EXACTLY what :func:`_observation` builds, so
+    :func:`run_cadence`'s field-for-field authentication passes silently (Gate #2 MAJOR-1)."""
+    recv = as_of_ts - 10
+    return AssemblerOwnedFacts(
+        book_source_epoch=1,
+        market_status="ACTIVE",
+        market_status_recv_ts=recv,
+        market_status_epoch=1,
+        phase=1,
+        suspended=False,
+        match_state_recv_ts=recv,
+    )
+
+
 def _tick(source: MintSource, recv_ts: int, *, as_of_ts: int) -> ObservationTick:
     """A non-FV mint whose ``build`` factory binds the cadence-assigned sequence + projected guard
-    leg onto arm-identical venue facts (``book_source_epoch`` held at 1 — no reset in this stream)."""
+    leg onto arm-identical venue facts (``book_source_epoch`` held at 1 — no reset in this stream).
+    ``owned`` declares the assembler-owned fields the driver authenticates the built observation
+    against — the honest factory reproduces them verbatim, so authentication passes."""
 
     def build(observation_sequence: int, guard_fv: GuardFairValue | None) -> StrategyObservation:
         return _observation(
             observation_sequence=observation_sequence, guard_fv=guard_fv, as_of_ts=as_of_ts
         )
 
-    return ObservationTick(source=source, source_epoch=1, recv_ts=recv_ts, build=build)
+    return ObservationTick(
+        source=source,
+        source_epoch=1,
+        recv_ts=recv_ts,
+        owned=_owned(as_of_ts=as_of_ts),
+        build=build,
+    )
 
 
 def _ticks() -> list[ObservationTick]:
@@ -475,3 +500,97 @@ def test_project_guard_fv_off_never_reads_cache():
     # guard-ON over the same cache DOES surface the leg (non-vacuous contrast).
     leg = project_guard_fv(cache, (1_000, 5), guard_enabled=True)
     assert leg is not None and leg.fv == 0.55 and leg.fv_source_epoch == 9
+
+
+# --- Gate #2 MAJOR-1: the assembler AUTHENTICATES its owned observation fields ---------------
+# (REQ-020b/027, AC-049/051/056; Codex external review)
+#
+# The observation FACTORY is trusted ONLY to assemble the arm-identical venue microstructure.
+# ``run_cadence`` is the SOLE author of ``observation_sequence`` (the cadence counter) and the
+# projected ``guard_fv`` leg, and the tick's ``AssemblerOwnedFacts`` declare the epoch / market-status
+# / match-state values. A malicious or buggy factory that ignores the injected sequence, injects an FV
+# leg under a guard-off run, or forges an epoch / status / match-state value MUST fail closed — the
+# boundary is ENFORCED, not a convention the honest builder follows. These controls reproduce Codex's
+# constructed malicious-factory attack against the actual module.
+
+
+def _malicious_tick(
+    build: ObservationFactory, *, source: MintSource = "book", as_of_ts: int = 1_000
+) -> ObservationTick:
+    """A tick whose honest ``owned`` facts are declared by the assembler, but whose ``build`` factory
+    forges an assembler-owned field — the exact trust-boundary attack Codex constructed."""
+    return ObservationTick(
+        source=source,
+        source_epoch=1,
+        recv_ts=as_of_ts - 100,
+        owned=_owned(as_of_ts=as_of_ts),
+        build=build,
+    )
+
+
+def test_malicious_factory_sequence_override_fails_closed(tmp_path):
+    """A factory that ignores the cadence-assigned sequence and forges ``observation_sequence=999``
+    MUST be rejected — ``run_cadence`` does NOT emit 999 (Codex MAJOR-1 control)."""
+
+    def evil(observation_sequence: int, guard_fv: GuardFairValue | None) -> StrategyObservation:
+        # ignore the injected sequence (which is 1 for the sole tick); forge 999.
+        return _observation(observation_sequence=999, guard_fv=guard_fv, as_of_ts=1_000)
+
+    rec = LiveRecorder(tmp_path, _start_meta())
+    with pytest.raises(ValueError, match="observation_sequence"):
+        run_cadence(rec, [_malicious_tick(evil)], guard_enabled=False)
+    rec.close()
+
+
+def test_malicious_factory_guard_off_fv_injection_fails_closed(tmp_path):
+    """Under ``guard_enabled=False`` the projected leg is ALWAYS ``None``; a factory that injects a
+    non-null ``GuardFairValue`` anyway MUST fail closed — guard-off carries NO FV element
+    (Codex MAJOR-1 control; the byte-identity guarantee is now enforced, not conventional)."""
+    injected = GuardFairValue(
+        fv=0.61,
+        fv_source_ts=500,
+        fv_recv_ts=980,
+        fv_source_epoch=1,
+        message_id=None,
+        proof_status="unavailable_no_message_id",
+    )
+
+    def evil(observation_sequence: int, guard_fv: GuardFairValue | None) -> StrategyObservation:
+        # guard-off hands guard_fv=None; forge a non-null leg regardless.
+        return _observation(
+            observation_sequence=observation_sequence, guard_fv=injected, as_of_ts=1_000
+        )
+
+    rec = LiveRecorder(tmp_path, _start_meta())
+    with pytest.raises(ValueError, match="guard_fv"):
+        run_cadence(rec, [_malicious_tick(evil)], guard_enabled=False)
+    rec.close()
+
+
+@pytest.mark.parametrize(
+    ("field_name", "overrides"),
+    [
+        ("book_source_epoch", {"book_source_epoch": 7}),
+        ("market_status", {"market_status": "HALTED"}),
+        ("market_status_epoch", {"market_status_epoch": 99}),
+        ("phase", {"phase": 0}),
+        ("suspended", {"suspended": True}),
+        ("match_state_recv_ts", {"match_state_recv_ts": 123}),
+    ],
+)
+def test_malicious_factory_epoch_status_matchstate_override_fails_closed(
+    tmp_path, field_name, overrides
+):
+    """A factory that forges a source-epoch / market-status / match-state field DIFFERENT from the
+    assembler's authoritative :class:`AssemblerOwnedFacts` MUST fail closed (Codex MAJOR-1)."""
+
+    def evil(observation_sequence: int, guard_fv: GuardFairValue | None) -> StrategyObservation:
+        base = _observation(
+            observation_sequence=observation_sequence, guard_fv=guard_fv, as_of_ts=1_000
+        )
+        return base.model_copy(update=overrides)
+
+    rec = LiveRecorder(tmp_path, _start_meta())
+    with pytest.raises(ValueError, match=field_name):
+        run_cadence(rec, [_malicious_tick(evil)], guard_enabled=False)
+    rec.close()

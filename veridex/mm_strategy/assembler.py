@@ -33,6 +33,7 @@ from veridex.live_recorder.recorder import LiveRecorder
 from veridex.live_recorder.replay import read_session_strict
 from veridex.mm_strategy.contracts import (
     GuardFairValue,
+    MarketStatus,
     MarketStatusEvent,
     MintEvent,
     MintSource,
@@ -94,7 +95,36 @@ def sample_fv_into_mint(
 ObservationFactory = Callable[[int, GuardFairValue | None], StrategyObservation]
 """Builds one observation from the cadence-assigned ``observation_sequence`` and the projected guard
 leg (``None`` in the baseline arm). The driver is the SOLE author of both; the caller supplies the RAW
-venue / match-state facts (arm-IDENTICAL), so the guard leg is the ONLY arm-dependent input."""
+venue / match-state facts (arm-IDENTICAL), so the guard leg is the ONLY arm-dependent input.
+
+The factory is trusted ONLY to assemble the arm-identical venue MICROSTRUCTURE (bid/ask/sizes/level
+counts). It is NOT authoritative for the assembler-owned fields — :func:`run_cadence` authenticates
+the returned observation against the cadence-assigned sequence, the projected guard leg, and the
+tick's declared :class:`AssemblerOwnedFacts` before release, and FAILS CLOSED on any forgery
+(Gate #2 MAJOR-1). A factory that ignores the injected sequence, injects an FV leg under a guard-off
+run, or forges an epoch / status / match-state value is REJECTED — the boundary is ENFORCED, not a
+convention the honest builder happens to follow."""
+
+
+@dataclass(frozen=True)
+class AssemblerOwnedFacts:
+    """The observation fields the ASSEMBLER — not the factory — is authoritative for (REQ-020b/027).
+
+    These are declared on the :class:`ObservationTick` by the assembler orchestration (source epochs
+    read off the durable tape, market status from :func:`latest_market_status`, the match-state leg
+    from the match-state authority), NEVER minted by the observation factory. :func:`run_cadence`
+    validates the built observation field-for-field against this bundle (plus the cadence-assigned
+    ``observation_sequence`` and the projected guard leg) and RAISES on any mismatch, so the factory
+    can only assemble the arm-identical microstructure — it cannot forge an assembler-owned value.
+    """
+
+    book_source_epoch: int
+    market_status: MarketStatus
+    market_status_recv_ts: int | None
+    market_status_epoch: int | None
+    phase: int
+    suspended: bool
+    match_state_recv_ts: int
 
 
 @dataclass(frozen=True)
@@ -120,12 +150,15 @@ class ObservationTick:
 
     ``source`` MUST be a non-FV mint source — an FV trigger can never mint an observation
     (REQ-020(d2)); construction fails closed otherwise. ``build`` is invoked with the cadence-assigned
-    ``observation_sequence`` and the projected guard leg to produce the fully-validated observation.
+    ``observation_sequence`` and the projected guard leg to produce the fully-validated observation;
+    ``owned`` declares the assembler-owned fields :func:`run_cadence` then authenticates that
+    observation against (the factory may assemble only the arm-identical microstructure).
     """
 
     source: MintSource
     source_epoch: int
     recv_ts: int
+    owned: AssemblerOwnedFacts
     build: ObservationFactory
 
     def __post_init__(self) -> None:
@@ -188,6 +221,45 @@ def project_guard_fv(
     )
 
 
+def _authenticate_owned_fields(
+    built: StrategyObservation,
+    *,
+    observation_sequence: int,
+    guard_fv: GuardFairValue | None,
+    owned: AssemblerOwnedFacts,
+) -> None:
+    """Fail closed unless the factory reproduced EVERY assembler-owned field verbatim (REQ-020b/027).
+
+    The cadence-assigned ``observation_sequence`` and the projected ``guard_fv`` leg are COMPUTED by
+    :func:`run_cadence`; the epoch / market-status / match-state facts are DECLARED on the tick via
+    :class:`AssemblerOwnedFacts`. A factory that ignores the injected sequence, injects an FV leg
+    under a guard-off run (``guard_fv`` is ``None`` there, so ANY non-null leg mismatches), or forges
+    an epoch / status / match-state value is REJECTED here — the trust boundary is enforced, not a
+    convention the honest builder happens to follow (Gate #2 MAJOR-1).
+    """
+    checks: tuple[tuple[str, object, object], ...] = (
+        ("observation_sequence", observation_sequence, built.observation_sequence),
+        ("guard_fv", guard_fv, built.guard_fv),
+        ("book_source_epoch", owned.book_source_epoch, built.book_source_epoch),
+        ("market_status", owned.market_status, built.market_status),
+        ("market_status_recv_ts", owned.market_status_recv_ts, built.market_status_recv_ts),
+        ("market_status_epoch", owned.market_status_epoch, built.market_status_epoch),
+        ("phase", owned.phase, built.phase),
+        ("suspended", owned.suspended, built.suspended),
+        ("match_state_recv_ts", owned.match_state_recv_ts, built.match_state_recv_ts),
+    )
+    mismatches = [
+        f"{name}: assembler={authoritative!r} factory={returned!r}"
+        for name, authoritative, returned in checks
+        if authoritative != returned
+    ]
+    if mismatches:
+        raise ValueError(
+            "observation factory forged assembler-owned field(s); failing closed "
+            "(REQ-020b/027, Gate #2 MAJOR-1): " + "; ".join(mismatches)
+        )
+
+
 def run_cadence(
     recorder: LiveRecorder, events: Iterable[CadenceEvent], *, guard_enabled: bool
 ) -> CadenceRun:
@@ -244,7 +316,17 @@ def run_cadence(
             ),
         )
         guard_fv = project_guard_fv(fv_cache, mint_pair, guard_enabled=guard_enabled)
-        observations.append(event.build(observation_sequence, guard_fv))
+        built = event.build(observation_sequence, guard_fv)
+        # The factory assembles only the arm-identical microstructure; the assembler AUTHENTICATES
+        # every field it owns before release, so a forged sequence / guard-off FV injection / epoch /
+        # status / match-state value fails closed (Gate #2 MAJOR-1) — not merely a helper convention.
+        _authenticate_owned_fields(
+            built,
+            observation_sequence=observation_sequence,
+            guard_fv=guard_fv,
+            owned=event.owned,
+        )
+        observations.append(built)
         mint_pairs.append(mint_pair)
     return CadenceRun(observations=tuple(observations), mint_pairs=tuple(mint_pairs))
 
