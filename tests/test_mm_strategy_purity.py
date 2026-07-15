@@ -507,3 +507,118 @@ def test_assembler_import_closure() -> None:
     assert "veridex.venues.sx_bet" in out_bad, (
         f"audit failed to name the forbidden SX submit surface it should have caught: {out_bad!r}"
     )
+
+
+# --- (4) Reverse-import bar: no ranked lane imports mm_strategy (E7-T2, SEC-001/§6.3(2)/RED-19) ---
+# The REVERSE of the assembler import-closure guard above (§6.3(8)) and of E3-T5: the ranked /
+# promotion lane — ``veridex.maker.**`` + ``veridex.scoring`` + ``veridex.leaderboard`` — must NEVER
+# import the R4-B strategy tier ``veridex.mm_strategy.*``: not the pure ``core``, not the
+# ``execution_adapter``, not the ``assembler`` (nor ``contracts``/``config``/``basis`` — ANY
+# mm_strategy import is a leak). That keeps an EXPERIMENTAL R4-B strategy from ever leaking into a
+# scored / promoted outcome. Proven two ways, mirroring the dust-execution isolation guard in
+# ``tests/test_dust_execution_sec_isolation.py``:
+#   (a) STATIC AST per-module scan — reuses the bypass-hardened ``_imports_module``
+#       (``tests/test_no_r3_r4_code.py``) over the pinned ``_ranked_modnames`` enumeration
+#       (``tests/test_dust_execution_sec_isolation.py``): no ranked module's source imports
+#       ``veridex.mm_strategy`` in ANY statically resolvable form.
+#   (b) FRESH-SUBPROCESS transitive audit — importing every ranked lane in a clean interpreter leaves
+#       ``sys.modules`` free of BOTH ``veridex.mm_strategy`` (this task's new audit, which closes the
+#       static-AST ceiling for an import-TIME COMPUTED pull the source scan cannot resolve) AND
+#       ``veridex.dust_execution`` (REUSING ``_run_ranked_import_audit`` — the R4-A leg, so the
+#       reverse bar covers the whole R4-A/R4-B strategy stack, not just the pure tier).
+#
+# NOTE — the ranked-enumeration / import-matcher helpers are imported LAZILY inside the test body
+# (not at module top). ``test_pure_tier_fresh_process_exact_whitelist`` imports
+# ``_purity_decide_fixture`` from THIS module in a clean subprocess, so any module-LEVEL import that
+# drags a ranked lane (``veridex.maker`` / ``veridex.dust_execution`` via those sibling test modules)
+# into ``sys.modules`` would make the purity audit flag this harness itself. Deferring keeps this
+# module's top-level import surface within the pure-tier whitelist.
+
+# The R4-B strategy package PREFIX no ranked lane may import — the umbrella that subsumes the three
+# named surfaces the reverse bar must cover (``core`` / ``execution_adapter`` / ``assembler``), plus
+# the pure ``contracts``/``config``/``basis`` siblings.
+_MM_STRATEGY_PREFIX = "veridex.mm_strategy"
+
+# Fresh-interpreter audit proving ranked lanes pull in NO ``veridex.mm_strategy`` module — mirrors the
+# ``_RANKED_IMPORT_AUDIT`` dust-execution script in ``tests/test_dust_execution_sec_isolation.py``,
+# retargeted at the mm_strategy tier (the R4-A/dust leg is covered by REUSING
+# ``_run_ranked_import_audit`` directly). Reads a JSON ``{sys_path, modules}`` on stdin, imports the
+# modules (re-executing every body in a clean interpreter), and exits 3 — naming the offenders on
+# stdout — if any ``veridex.mm_strategy*`` is resident, else 0. Offline: no creds/network.
+_RANKED_MM_STRATEGY_IMPORT_AUDIT = """
+import importlib, json, sys
+
+payload = json.loads(sys.stdin.read())
+for _extra in payload.get("sys_path", []):
+    sys.path.insert(0, _extra)
+for _name in payload["modules"]:
+    importlib.import_module(_name)
+_leaked = sorted(
+    m for m in sys.modules
+    if m == "veridex.mm_strategy" or m.startswith("veridex.mm_strategy.")
+)
+if _leaked:
+    sys.stdout.write(json.dumps(_leaked))
+    sys.exit(3)
+sys.exit(0)
+"""
+
+
+def _run_ranked_mm_strategy_import_audit(
+    modules: list[str], sys_path: list[str] | None = None
+) -> tuple[int, str]:
+    """Import ``modules`` in a FRESH interpreter and report whether any ``veridex.mm_strategy*`` loaded.
+
+    Mirrors ``_run_ranked_import_audit`` (the dust-execution sibling) but retargets the resident-module
+    scan at the mm_strategy tier. Returns ``(returncode, stdout)``: rc==0 means no mm_strategy module
+    was resident; rc==3 means at least one was, and stdout is the JSON list naming the offenders.
+    """
+    proc = subprocess.run(
+        [sys.executable, "-c", _RANKED_MM_STRATEGY_IMPORT_AUDIT],
+        input=json.dumps({"modules": list(modules), "sys_path": list(sys_path or [])}),
+        cwd=str(Path(__file__).resolve().parents[1]),
+        capture_output=True,
+        text=True,
+    )
+    return proc.returncode, proc.stdout
+
+
+def test_ranked_lanes_do_not_import_mm_strategy() -> None:
+    # LAZY imports (see the NOTE above): pulled in INSIDE the test so this module's top-level import
+    # surface stays within the pure-tier whitelist the fresh-subprocess purity audit enforces.
+    from tests.test_dust_execution_sec_isolation import (
+        _ranked_modnames,
+        _run_ranked_import_audit,
+    )
+    from tests.test_no_r3_r4_code import _imports_module
+
+    # (a) STATIC AST ceiling: no ranked-lane module's source imports veridex.mm_strategy in any
+    # statically resolvable form (the umbrella prefix subsumes core / execution_adapter / assembler).
+    # Reuses the pinned ranked enumeration + the bypass-hardened import matcher — the SAME technique
+    # the forward dust-execution bar uses, run in reverse.
+    ranked = _ranked_modnames()
+    assert ranked, "ranked-lane enumeration must be non-empty (anti-inert)"
+    offenders = [m for m in ranked if _imports_module(m, _MM_STRATEGY_PREFIX)]
+    assert not offenders, (
+        "ranked lanes (veridex.maker.**, veridex.scoring, veridex.leaderboard) must NOT import "
+        "veridex.mm_strategy.* (core/execution_adapter/assembler) — an experimental R4-B strategy "
+        f"cannot leak into the ranked/promotion path (SEC-001): {offenders}"
+    )
+
+    # (b1) FRESH-SUBPROCESS transitive audit, mm_strategy leg: importing every ranked lane in a clean
+    # interpreter genuinely re-executes each module body, so even an import-TIME COMPUTED mm_strategy
+    # pull the static AST bar cannot resolve is observed. No veridex.mm_strategy* may be resident → 0.
+    rc_mm, out_mm = _run_ranked_mm_strategy_import_audit(ranked)
+    assert rc_mm == 0, (
+        "importing ranked lanes in a clean interpreter must load NO veridex.mm_strategy module "
+        f"(transitive closure); audit reported: {out_mm}"
+    )
+
+    # (b2) FRESH-SUBPROCESS transitive audit, R4-A leg (REUSE): the SAME ranked lanes pull in no
+    # veridex.dust_execution either — so the reverse bar covers the whole R4-A/R4-B strategy stack,
+    # not just the pure tier. Delegates to the pinned _run_ranked_import_audit (its SEC-003 sibling).
+    rc_dust, out_dust = _run_ranked_import_audit(ranked)
+    assert rc_dust == 0, (
+        "importing ranked lanes in a clean interpreter must load NO veridex.dust_execution module "
+        f"(transitive closure); audit reported: {out_dust}"
+    )
