@@ -41,6 +41,7 @@ from veridex.mm_strategy.contracts import (
     GuardFairValue,
     GuardStateWatermark,
     MarketStatus,
+    NeutralIntent,
     ReasonCode,
     StrategyDecision,
     StrategyObservation,
@@ -719,6 +720,93 @@ def _basis_is_warm(state: StrategyState, config: StrategyConfig) -> bool:
     return state.basis_sample_count >= config.basis_min_samples
 
 
+def _reducing_leg(net_position: float) -> Literal["ask", "bid"]:
+    """The inventory-REDUCING leg for a non-flat net position (REQ-054/083). The reducing leg is the
+    one that moves the net toward zero: a net LONG YES (``> 0``) reduces by SELLING YES — the ASK leg
+    — and a net SHORT YES (``< 0``) reduces by BUYING YES — the BID leg. The caller guarantees
+    ``net_position != 0`` (the flat case abstains, never reduces)."""
+    return "ask" if net_position > 0 else "bid"
+
+
+def _guard_residual(
+    observation: StrategyObservation,
+    base: StrategyState,
+    config: StrategyConfig,
+    anchor: float,
+) -> float | None:
+    """The E4-T4 guard residual ``(fv − anchor) − basis`` for the ``reduce_conflict`` coupling, or
+    ``None`` when the guard exposes NO directional signal to compare against.
+
+    Returns ``None`` — no toxic side — whenever the guard cannot speak: the guard is disabled, the FV
+    leg is missing / stale / suspended (:func:`_guard_fv_block_reason`), or the basis is still warming
+    (:func:`_basis_is_warm`). This mirrors the conditions under which the guard block itself computes
+    a residual, and reads the SAME PRIOR-state basis (compare-then-update). It is DELIBERATELY the
+    inventory rule's own read rather than a refactor of the guard block: the inventory slot pre-empts
+    the guard (REQ-083 precedence), so it can never rely on the guard block having run. A guard that
+    cannot speak yields no conflict, so the reduce proceeds — the fail direction here REDUCES exposure.
+    """
+    if not config.guard_enabled:
+        return None
+    if _guard_fv_block_reason(observation, config) is not None:
+        return None
+    if not _basis_is_warm(base, config):
+        return None
+    guard_fv = observation.guard_fv
+    if guard_fv is None:  # unreachable once fv_block is None — narrows for mypy totality
+        return None
+    return (guard_fv.fv - anchor) - basis_from_state(base, config)
+
+
+def _toxic_leg(
+    observation: StrategyObservation,
+    base: StrategyState,
+    config: StrategyConfig,
+    anchor: float,
+) -> Literal["ask", "bid"] | None:
+    """The leg the E4-T4 guard would PULL as adverse (REQ-073), or ``None`` when quiescent / no guard
+    signal. Uses the SAME sign + ABSOLUTE ``residual_band`` threshold as the directional side-pull: a
+    residual ABOVE ``+residual_band`` means fair value sits above the anchor so the ASK is adverse
+    (the ``residual_pull_ask`` direction); BELOW ``−residual_band`` the BID is adverse
+    (``residual_pull_bid``). A quiescent residual (``|residual| <= residual_band``) pulls nothing, so
+    there is no toxic leg. Read here so the inventory rule can detect a reducing leg that is ALSO the
+    toxic leg (``reduce_conflict``) WITHOUT reshaping the guard block below (REQ-071 — never
+    spread-relative)."""
+    residual = _guard_residual(observation, base, config, anchor)
+    if residual is None:
+        return None
+    if residual > config.residual_band:
+        return "ask"
+    if residual < -config.residual_band:
+        return "bid"
+    return None
+
+
+def _inventory_reduce(
+    observation: StrategyObservation,
+    base: StrategyState,
+    config: StrategyConfig,
+    anchor: float,
+    net_position: float,
+) -> StrategyDecision:
+    """The inventory-reducing one-sided disposition for a non-flat net position (REQ-054/083; the
+    caller guarantees ``net_position != 0``). Quotes ONLY the reducing leg (:func:`_reducing_leg`) —
+    UNLESS that leg is ALSO the guard's toxic leg (:func:`_toxic_leg`), in which case quoting to
+    reduce would quote INTO the adverse flow, so it fails closed to ``NO_QUOTE(reduce_conflict)`` +
+    cancel (the cancel intent is E5-T3's; none is wired here). The reducing leg materialises as a
+    size-free ``place_quote`` intent whose ``leg_role`` IS the side — E4-T6 owns REQ-054 (WHICH side),
+    while E4-T7 fills the surviving leg's ``price`` (join-or-behind + directional rounding), so the
+    leg carries ``price=None`` here. NO size (R4-A owns sizing; REQ-057)."""
+    reducing = _reducing_leg(net_position)
+    if reducing == _toxic_leg(observation, base, config, anchor):
+        return _decide("NO_QUOTE", ("reduce_conflict",))
+    reduce_leg = NeutralIntent(kind="place_quote", leg_role=reducing, price=None)
+    return StrategyDecision(
+        kind="ONE_SIDED_REDUCE",
+        reason_codes=("inventory_reduce",),
+        intent_plan=(reduce_leg,),
+    )
+
+
 def _quote_disposition(
     observation: StrategyObservation, base: StrategyState, config: StrategyConfig
 ) -> StrategyDecision:
@@ -729,13 +817,15 @@ def _quote_disposition(
     1. anchor validity — no admissible venue mid → NO_QUOTE class (:func:`_no_anchor_reason`).
     2. boundary zone — an anchor outside ``config.boundary_zone`` → NO_QUOTE ``boundary_zone``.
     3. **INVENTORY slot (E4-T6):** ``|net_position| ≥ inventory_soft_limit`` → ``ONE_SIDED_REDUCE``
-       (the inventory-reducing side). Not wired here.
+       (:func:`_inventory_reduce`, the inventory-reducing leg) — PRE-EMPTS the two-sided band and the
+       guard; a reducing leg that is also the guard's toxic leg fails closed (``reduce_conflict``).
     4. two-sided band — an anchor outside ``config.two_sided_band`` (but inside the boundary) is at
-       most one-sided (REQ-054): net-flat is the pinned ``two_sided_zone_exit`` abstention here; the
-       ``ONE_SIDED_REDUCE`` branch for ``net_position != 0`` is E4-T6's inventory slot above.
+       most one-sided (REQ-054): net-flat is the pinned ``two_sided_zone_exit`` abstention; a non-flat
+       net quotes the reducing leg (:func:`_inventory_reduce`, same ``reduce_conflict`` fail-close).
     5. **GUARD slot (E4-T3/T4/T5):** the TxLINE side guard → ``QUOTE_ONE_SIDED`` / escalation.
     6. **QUOTE math slot (E4-T7):** ``anchor ± half_spread`` legs, join-or-behind, directional tick
-       rounding, post-clamp boundary/cardinality — which can DOWNGRADE the class below.
+       rounding, post-clamp boundary/cardinality — which can DOWNGRADE the class below. It also fills
+       the ``ONE_SIDED_REDUCE`` reducing leg's ``price`` (E4-T6 emits it with ``price=None``).
 
     Until the guard/quote-math slots are filled a fully-admissible in-band anchor is the eligible
     ``QUOTE_TWO_SIDED`` CLASS (the taxonomy floor; REQ-060).
@@ -747,11 +837,20 @@ def _quote_disposition(
     if not (boundary_low <= anchor <= boundary_high):
         return _decide("NO_QUOTE", ("boundary_zone",))
     # --- INVENTORY slot (E4-T6): |net_position| >= inventory_soft_limit -> ONE_SIDED_REDUCE ---
+    # Inventory PRE-EMPTS the two-sided band AND the guard (REQ-083 precedence: data-validity ->
+    # NO_QUOTE class -> INVENTORY -> guard -> quote): over the soft limit we quote ONLY the reducing
+    # leg regardless of anchor position (even squarely inside the two-sided band). ``_inventory_reduce``
+    # reaches DOWN into the guard's toxic side (residual sign) for the ``reduce_conflict`` fail-close.
+    net_position = observation.inventory.net_position
+    if abs(net_position) >= config.inventory_soft_limit:
+        return _inventory_reduce(observation, base, config, anchor, net_position)
     two_sided_low, two_sided_high = config.two_sided_band
     if not (two_sided_low <= anchor <= two_sided_high):
-        # Outside the two-sided band, inside the boundary: at most one-sided (REQ-054). The pinned
-        # net-flat abstention is recorded here; the net_position != 0 -> ONE_SIDED_REDUCE reducing
-        # side is E4-T6's inventory slot above (it pre-empts this branch when wired).
+        # Outside the two-sided band, inside the boundary: at most one-sided (REQ-054). This EXTENDS
+        # E4-T1's net-flat-only abstention — ``net_position != 0`` quotes the reducing leg (subject to
+        # the same ``reduce_conflict`` fail-close), while net-flat keeps the pinned abstention.
+        if net_position != 0.0:
+            return _inventory_reduce(observation, base, config, anchor, net_position)
         return _decide("NO_QUOTE", ("two_sided_zone_exit",))
     # --- GUARD slot (E4-T3): TxLINE basis/residual guard -> abstain / (E4-T4/T5) escalate ---
     # Guard-scoped (REQ-070 guard block / REQ-074..076): the baseline arm (guard OFF) never enters

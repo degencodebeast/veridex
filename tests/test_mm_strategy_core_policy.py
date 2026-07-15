@@ -869,3 +869,98 @@ def test_prematch_gate_not_residual_extreme_reason() -> None:
     assert decision.kind == "NO_QUOTE"
     assert decision.reason_codes == ("prematch_basis_exceeds_spread",)
     assert decision.reason_codes != ("residual_extreme",)
+
+
+# =====================================================================================
+# E4-T6: inventory-reducing one-sided rule (REQ-054 which-side / REQ-083 / AC-023)
+#
+# The INVENTORY slot (#3) inside the row-H disposition spine, ABOVE the two-sided band and the
+# guard: ``|net_position| >= inventory_soft_limit`` quotes ONLY the inventory-REDUCING leg
+# (ONE_SIDED_REDUCE) — net LONG YES (> 0) reduces by SELLING YES (the ASK leg), net SHORT YES (< 0)
+# reduces by BUYING YES (the BID leg). The reducing leg materialises as a size-free ``place_quote``
+# intent whose ``leg_role`` IS the side (price=None — E4-T7 fills the surviving leg's price). The
+# two-sided-band exit is EXTENDED: outside the band, net != 0 quotes the reducing leg, net-flat keeps
+# the E4-T1 pinned ``two_sided_zone_exit`` abstention. reduce_conflict (the cross-slot coupling): when
+# the reducing leg is ALSO the leg the E4-T4 guard would PULL as adverse (residual sign), reducing
+# would quote INTO adverse flow, so it fails closed to NO_QUOTE(``reduce_conflict``) + cancel (E5-T3
+# owns the cancel intent). NO size (R4-A owns sizing).
+# =====================================================================================
+
+
+def test_inventory_over_soft_limit_reduces_side() -> None:
+    # AC-023: ``|net_position| >= inventory_soft_limit`` (0.5) ⇒ ONE_SIDED_REDUCE quoting ONLY the
+    # REDUCING leg. Inventory pre-empts the two-sided band + the guard, so it fires even with the
+    # anchor (0.50) squarely inside the two-sided band where an unencumbered book would quote both
+    # sides. The SPECIFIC surviving leg is pinned via the intent's physical ``leg_role`` so the
+    # adding-vs-reducing direction is load-bearing (the mutation quoting the ADDING leg flips it).
+    config = _config()  # guard OFF — isolate the inventory rule from any residual/toxic signal
+    state = _warm_state()
+
+    # net LONG YES (+0.6): reduce by SELLING YES ⇒ the ASK leg survives (never the bid).
+    d_long, _ = decide(_obs(bid=0.49, ask=0.51, net_position=0.6), state, config)
+    assert d_long.kind == "ONE_SIDED_REDUCE"
+    assert d_long.reason_codes == ("inventory_reduce",)
+    assert len(d_long.intent_plan) == 1
+    reduce_leg = d_long.intent_plan[0]
+    assert reduce_leg.kind == "place_quote"
+    assert reduce_leg.leg_role == "ask"  # the REDUCING leg for a long — NOT "bid" (the adding leg)
+    assert reduce_leg.price is None  # E4-T7 fills the surviving leg's price (join-or-behind)
+
+    # net SHORT YES (−0.6): the mirror — reduce by BUYING YES ⇒ the BID leg survives (never the ask).
+    d_short, _ = decide(_obs(bid=0.49, ask=0.51, net_position=-0.6), state, config)
+    assert d_short.kind == "ONE_SIDED_REDUCE"
+    assert d_short.reason_codes == ("inventory_reduce",)
+    assert d_short.intent_plan[0].leg_role == "bid"  # NOT "ask" (the adding leg for a short)
+
+
+def test_two_sided_zone_exit_reducing_or_abstain() -> None:
+    # REQ-054: outside the two-sided band (inside the boundary) is at most one-sided. This EXTENDS the
+    # E4-T1 net-flat-only abstention: with net BELOW the soft limit (|0.2| < 0.5 ⇒ slot #3 does NOT
+    # fire) the band-exit governs — net != 0 quotes the REDUCING leg, net-flat abstains. The anchor
+    # 0.80 is inside the boundary (0.04, 0.96) but outside the two-sided band (0.30, 0.70); the
+    # smoother is aligned to 0.80 so no REQ-080 mid-jump (row E) pre-empts the row-H zone logic.
+    config = _config()  # guard OFF
+    band_state = _warm_state().model_copy(update={"smoother_mid": 0.80})
+
+    # net LONG != 0 (below soft limit) ⇒ the reducing (ask) leg, not the abstention.
+    d_long, _ = decide(_obs(bid=0.79, ask=0.81, net_position=0.2), band_state, config)
+    assert d_long.kind == "ONE_SIDED_REDUCE"
+    assert d_long.reason_codes == ("inventory_reduce",)
+    assert d_long.intent_plan[0].leg_role == "ask"
+
+    # net SHORT != 0 ⇒ the reducing (bid) leg — the mirror.
+    d_short, _ = decide(_obs(bid=0.79, ask=0.81, net_position=-0.2), band_state, config)
+    assert d_short.kind == "ONE_SIDED_REDUCE"
+    assert d_short.intent_plan[0].leg_role == "bid"
+
+    # net-FLAT (net_position == 0) ⇒ the pinned abstention is preserved (E4-T1 ``two_sided_zone_exit``).
+    d_flat, _ = decide(_obs(bid=0.79, ask=0.81, net_position=0.0), band_state, config)
+    assert d_flat.kind == "NO_QUOTE"
+    assert d_flat.reason_codes == ("two_sided_zone_exit",)
+    assert d_flat.intent_plan == ()
+
+
+def test_reduce_conflict_no_quote() -> None:
+    # The reduce_conflict coupling (REQ-083, fail closed): when the inventory-reducing leg is ALSO the
+    # leg the E4-T4 guard would PULL as adverse (by residual sign), quoting to reduce would quote INTO
+    # the adverse flow ⇒ NO_QUOTE(reduce_conflict) + cancel (no place). net LONG (reduce = ASK) with a
+    # POSITIVE residual (fv 0.54 − mid 0.50 − basis 0.0 = +0.04 > residual_band 0.02 ⇒ the guard pulls
+    # the ASK) is the conflict: reducing leg == toxic leg.
+    config = _config(guard_enabled=True)
+    state = _guarded_warm_state(basis_gap=0.0)
+
+    conflict = _obs(guard_fv=_fresh_fv(fv=0.54), net_position=0.6)  # reduce=ask, toxic=ask
+    d_conflict, _ = decide(conflict, state, config)
+    assert d_conflict.kind == "NO_QUOTE"
+    assert d_conflict.reason_codes == ("reduce_conflict",)
+    assert d_conflict.intent_plan == ()  # E5-T3 owns the cancel intent — none wired here (no place)
+
+    # CONTROL — SAME long inventory (reduce = ASK) but a NEGATIVE residual (fv 0.46 ⇒ the guard would
+    # pull the BID, toxic = bid) is NOT the reducing leg, so there is NO conflict and the reduce
+    # proceeds on the ask. This pins that the conflict is DIRECTIONAL (reducing == toxic), not merely
+    # "guard active + over-limit".
+    no_conflict = _obs(guard_fv=_fresh_fv(fv=0.46), net_position=0.6)  # reduce=ask, toxic=bid
+    d_ok, _ = decide(no_conflict, state, config)
+    assert d_ok.kind == "ONE_SIDED_REDUCE"
+    assert d_ok.reason_codes == ("inventory_reduce",)
+    assert d_ok.intent_plan[0].leg_role == "ask"
