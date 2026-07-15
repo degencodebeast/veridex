@@ -485,3 +485,56 @@ def test_hash_stable_under_unicode_and_float() -> None:
         observation_hash=obs.observation_hash(),
     )
     assert serialize_payload(decision.model_dump()) == serialize_payload(decision.model_dump())
+
+
+def _cancel_leg() -> NeutralIntent:
+    return NeutralIntent(kind="cancel_all_orders", leg_role=None, price=None)
+
+
+def _place_leg(client_order_id: str = "A") -> NeutralIntent:
+    return NeutralIntent(
+        kind="place_quote", leg_role="bid", price=0.49, client_order_id=client_order_id
+    )
+
+
+def test_mixed_cancel_placement_plan_unconstructable() -> None:
+    # REQ-090/094 / AC-016 / RED-48: a neutral plan is ONE structural phase — either a cleanup
+    # (cancel) phase or a fresh-placement phase, NEVER both in one call. A mixed plan would place a
+    # fresh write BEFORE a later reconciled projection confirms the cancellation (cleanup-then-VERIFY
+    # violated). `StrategyDecision` must make such a plan UNCONSTRUCTABLE — a reject-only invariant.
+    #
+    # Both orderings must fail at construction (the phase set is order-independent).
+    with pytest.raises(ValidationError):
+        StrategyDecision(intent_plan=(_cancel_leg(), _place_leg()))
+    with pytest.raises(ValidationError):
+        StrategyDecision(intent_plan=(_place_leg(), _cancel_leg()))
+
+    # `replace_quote` is a placement-phase kind too — it too may not co-occur with a cancel.
+    with pytest.raises(ValidationError):
+        StrategyDecision(
+            intent_plan=(
+                _cancel_leg(),
+                NeutralIntent(kind="replace_quote", leg_role="bid", price=0.5, client_order_id="B"),
+            )
+        )
+
+    # The invariant survives JSON / dict restoration — a hand-crafted mixed plan cannot be smuggled
+    # back in through ``model_validate`` (round-trip persistence is a real reconstruction path).
+    mixed_payload = {
+        "intent_plan": (
+            {"kind": "cancel_all_orders", "leg_role": None, "price": None},
+            {"kind": "place_quote", "leg_role": "bid", "price": 0.49, "client_order_id": "A"},
+        ),
+    }
+    with pytest.raises(ValidationError):
+        StrategyDecision.model_validate(mixed_payload)
+
+    # Valid CONTROLS: a cancel-only plan (cancel THEN abstain — abstain is NEITHER phase) and a
+    # placement-only plan both construct normally. The validator rejects ONLY genuinely mixed plans.
+    cancel_only = StrategyDecision(
+        intent_plan=(_cancel_leg(), NeutralIntent(kind="abstain", leg_role=None, price=None))
+    )
+    assert {leg.kind for leg in cancel_only.intent_plan} == {"cancel_all_orders", "abstain"}
+
+    placement_only = StrategyDecision(intent_plan=(_place_leg("A"), _place_leg("B")))
+    assert {leg.kind for leg in placement_only.intent_plan} == {"place_quote"}

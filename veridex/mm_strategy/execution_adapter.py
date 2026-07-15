@@ -40,7 +40,11 @@ from veridex.dust_execution.facade import (
     MMExecutionToolResult,
     MMIntentParams,
 )
-from veridex.mm_strategy.contracts import NeutralIntent, NeutralIntentKind
+from veridex.mm_strategy.contracts import (
+    NeutralIntent,
+    NeutralIntentKind,
+    reject_mixed_phase_plan,
+)
 
 # The neutral intent kinds that reach the wire at all (the adapter calls the facade for these).
 _ACTIONABLE_KINDS: frozenset[str] = frozenset(
@@ -173,6 +177,12 @@ def execute_plan(
     possibly-unresolved outcome sets ``awaiting_reconciliation`` — the reconcile path is REACHED, not
     bypassed, so the book is never early-returned as flat. The adapter adds NO leg of its own.
     """
+    # Defense in depth (Gate#3 IMPORTANT-1 / RED-48): a mixed cancel/placement plan is
+    # unconstructable at ``StrategyDecision``, but ``execute_plan`` also accepts a bare tuple that may
+    # bypass the decision contract. Fail closed BEFORE the first facade call so a mixed plan never
+    # places a fresh write ahead of a reconciled projection confirming the cancel (REQ-090/094).
+    reject_mixed_phase_plan(intent_plan, context="execute_plan")
+
     outcomes: list[LegOutcome] = []
     frozen = False
     awaiting_reconciliation = False

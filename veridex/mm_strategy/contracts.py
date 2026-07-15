@@ -561,6 +561,39 @@ class NeutralIntent(_FrozenModel):
         return _reject_price_out_of_unit_interval(value)
 
 
+# --- Structural single-phase invariant (REQ-090/094; AC-016; RED-48) ----------------------
+# A neutral ``intent_plan`` is ONE structural phase: either a CLEANUP (cancel) phase or a fresh
+# PLACEMENT phase — NEVER both in one call. ``abstain`` is NEITHER phase (a cancel-only plan may
+# carry a trailing ``abstain``; a placement plan carries only place/replace legs). A mixed plan
+# would fire a fresh write BEFORE a later reconciled projection confirms the cancellation, breaking
+# cleanup-then-VERIFY — so it is made UNCONSTRUCTABLE at the decision contract (below) and failed
+# closed at the adapter's ``execute_plan`` as defense in depth.
+_CANCEL_PHASE_KINDS: Final[frozenset[NeutralIntentKind]] = frozenset({"cancel_all_orders"})
+_PLACEMENT_PHASE_KINDS: Final[frozenset[NeutralIntentKind]] = frozenset(
+    {"place_quote", "replace_quote"}
+)
+
+
+def reject_mixed_phase_plan(
+    intent_plan: tuple[NeutralIntent, ...], *, context: str
+) -> tuple[NeutralIntent, ...]:
+    """Fail closed on a plan mixing a cancel-phase and a placement-phase leg (REQ-090/094, RED-48).
+
+    A reject-only invariant: a single-phase plan (including empty, cancel-only + ``abstain``, or
+    placement-only) is returned UNCHANGED, so this is byte-identity-safe for every valid decision.
+    """
+    kinds = {leg.kind for leg in intent_plan}
+    if (kinds & _CANCEL_PHASE_KINDS) and (kinds & _PLACEMENT_PHASE_KINDS):
+        raise ValueError(
+            f"{context}: intent_plan mixes a cancel-phase leg "
+            f"{sorted(kinds & _CANCEL_PHASE_KINDS)} with a placement-phase leg "
+            f"{sorted(kinds & _PLACEMENT_PHASE_KINDS)} — a plan is a single structural phase "
+            "(cancel XOR place); a mixed plan would place a fresh write before a reconciled "
+            "projection confirms the cancel (REQ-090/094, AC-016, RED-48)"
+        )
+    return intent_plan
+
+
 class StrategyDecision(_FrozenModel):
     """The pure strategy's provenance-bound output — the ONE decision name (Fable F8; REQ-025).
 
@@ -581,6 +614,14 @@ class StrategyDecision(_FrozenModel):
     next_state_hash: str = ""
     fv_message_id: str | None = None
     fv_proof_status: ProofStatus | None = None
+
+    @model_validator(mode="after")
+    def _intent_plan_is_single_phase(self) -> StrategyDecision:
+        # Codex Gate#3 IMPORTANT-1 / RED-48: make a mixed cancel/placement plan UNCONSTRUCTABLE —
+        # a plan is a single structural phase (cancel XOR place). Reject-only, so a valid single-phase
+        # decision (the funnel's output is already single-phase) is byte-identical (REQ-090/094).
+        reject_mixed_phase_plan(self.intent_plan, context="StrategyDecision")
+        return self
 
 
 # --- Market-status authority (replay row + read-only live protocol) -----------------------

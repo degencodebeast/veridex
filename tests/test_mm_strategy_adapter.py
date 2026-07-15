@@ -19,6 +19,8 @@ import inspect
 from dataclasses import dataclass, field
 from typing import get_args
 
+import pytest
+
 from veridex.dust_execution.facade import IntentKind, MMExecutionToolResult, MMIntentParams
 from veridex.dust_execution.manifest import StrategyExperimentManifest
 from veridex.dust_execution.runner import _build_resting_order
@@ -210,6 +212,44 @@ def test_reconcile_path_reached_not_bypassed() -> None:
     assert result.book_treated_flat is False
     assert result.frozen is True
     assert freezes_fresh_writes(submitted) is True
+
+
+def test_execute_plan_fails_closed_on_mixed_plan_before_first_call() -> None:
+    """Gate #3 IMPORTANT-1 / RED-48: even if a mixed cancel+placement plan reaches ``execute_plan``
+    by BYPASSING ``StrategyDecision`` construction (a hand-built tuple), the adapter fails closed
+    BEFORE the first facade call — defense in depth for the single-phase invariant. A mixed plan
+    must NEVER place a fresh write ahead of a reconciled projection confirming the cancel."""
+    mixed_plan = (_cancel_leg(), _fresh_write("A"))  # cancel-phase + placement-phase in one call
+    facade = _RecordingFakeFacade(results=[_result(admission="APPROVED", execution_status="SUBMITTED")])
+
+    with pytest.raises(ValueError):
+        execute_plan(mixed_plan, facade)
+
+    assert facade.call_count == 0  # fails closed BEFORE any facade call — no fresh write, no cancel
+
+    # The reverse ordering (placement then cancel) is equally rejected before any call.
+    reverse_facade = _RecordingFakeFacade(
+        results=[_result(admission="APPROVED", execution_status="SUBMITTED")]
+    )
+    with pytest.raises(ValueError):
+        execute_plan((_fresh_write("A"), _cancel_leg()), reverse_facade)
+    assert reverse_facade.call_count == 0
+
+    # Valid CONTROLS still execute normally: a cancel-only plan (cancel THEN abstain) and a
+    # placement-only plan each drive the facade for their single actionable phase. A clean
+    # (non-freezing) ``ABSTAINED`` result keeps the control focused on the phase invariant.
+    cancel_only_facade = _RecordingFakeFacade(results=[_result()])
+    cancel_result = execute_plan(
+        (_cancel_leg(), NeutralIntent(kind="abstain", leg_role=None, price=None)),
+        cancel_only_facade,
+    )
+    assert cancel_only_facade.call_count == 1  # only the cancel is actionable; abstain is skipped
+    assert cancel_result.frozen is False
+
+    placement_facade = _RecordingFakeFacade(results=[_result()])
+    placement_result = execute_plan((_fresh_write("A"), _fresh_write("B")), placement_facade)
+    assert placement_facade.call_count == 2  # both placement legs attempted (clean, non-freezing)
+    assert placement_result.frozen is False
 
 
 # --- E5-T5: neutral→R4-A mapping + singular request + no size/take -----------------------------
