@@ -184,6 +184,68 @@ def test_neutral_intent_leg_role_is_closed_literal() -> None:
     assert frozenset(get_args(non_none_args[0])) == {"bid", "ask", "reduce"}
 
 
+def test_replace_quote_requires_exact_old_id() -> None:
+    # Codex Gate#3 IMPORTANT-2 / REQ-091/095 / AC-021: a `replace_quote` is the ONE kind that names
+    # the exact prior order it supersedes — its `replaces_client_order_id` MUST be a non-empty exact
+    # old client-order id. A None/empty lineage would map to `cancel_replace` unchanged and produce an
+    # unusable replacement (R4-A later abstains); R4-B's contract promised the exact old id, so the
+    # malformed replacement is made UNCONSTRUCTABLE at the neutral contract, on every restore path.
+    for bad_lineage in (None, ""):
+        with pytest.raises(ValidationError):
+            NeutralIntent(
+                kind="replace_quote", leg_role="bid", price=0.5, replaces_client_order_id=bad_lineage
+            )
+        # The same invariant fires on `model_validate` / JSON restoration, never only at __init__.
+        with pytest.raises(ValidationError):
+            NeutralIntent.model_validate(
+                {
+                    "kind": "replace_quote",
+                    "leg_role": "bid",
+                    "price": 0.5,
+                    "replaces_client_order_id": bad_lineage,
+                }
+            )
+
+    # A `replace_quote` WITH a real exact old id constructs and preserves the lineage verbatim.
+    valid = NeutralIntent(
+        kind="replace_quote", leg_role="bid", price=0.5, replaces_client_order_id="old-order-1"
+    )
+    assert valid.replaces_client_order_id == "old-order-1"
+    assert NeutralIntent.model_validate(valid.model_dump()) == valid
+
+
+def test_non_replacement_kind_rejects_lineage() -> None:
+    # Codex Gate#3 IMPORTANT-2: only `replace_quote` carries replacement lineage. A `place_quote`,
+    # `cancel_all_orders`, or `abstain` leg that carries a `replaces_client_order_id` is malformed —
+    # a fresh placement / cleanup / no-op does not supersede a named prior order. The invariant is
+    # kind-dependent and reject-only, enforced on construction AND `model_validate` restoration.
+    # Explicit typed constructions — smuggling lineage onto each non-replacement kind is rejected.
+    with pytest.raises(ValidationError):
+        NeutralIntent(
+            kind="place_quote", leg_role="bid", price=0.49, replaces_client_order_id="old-order-1"
+        )
+    with pytest.raises(ValidationError):
+        NeutralIntent(
+            kind="cancel_all_orders", leg_role=None, replaces_client_order_id="old-order-1"
+        )
+    with pytest.raises(ValidationError):
+        NeutralIntent(kind="abstain", leg_role=None, replaces_client_order_id="old-order-1")
+
+    # The SAME invariant fires on `model_validate` / JSON restoration (a hand-crafted dict payload) —
+    # the smuggled lineage cannot be reintroduced through the restore path either.
+    non_replacement = (
+        {"kind": "place_quote", "leg_role": "bid", "price": 0.49},
+        {"kind": "cancel_all_orders", "leg_role": None, "price": None},
+        {"kind": "abstain", "leg_role": None, "price": None},
+    )
+    for payload in non_replacement:
+        with pytest.raises(ValidationError):
+            NeutralIntent.model_validate({**payload, "replaces_client_order_id": "old-order-1"})
+
+        # The SAME leg WITHOUT lineage stays valid — the invariant rejects only the smuggled lineage.
+        assert NeutralIntent.model_validate(payload).replaces_client_order_id is None
+
+
 def test_guard_off_observation_has_no_fv_element() -> None:
     # Codex-R5 MAJOR-1: the whole FV leg is one optional nested field, so a guard-off observation
     # carries NO fv / fv_source_ts / fv_source_epoch (nor fv_recv_ts) anywhere at the top level —
@@ -514,7 +576,13 @@ def test_mixed_cancel_placement_plan_unconstructable() -> None:
         StrategyDecision(
             intent_plan=(
                 _cancel_leg(),
-                NeutralIntent(kind="replace_quote", leg_role="bid", price=0.5, client_order_id="B"),
+                NeutralIntent(
+                    kind="replace_quote",
+                    leg_role="bid",
+                    price=0.5,
+                    client_order_id="B",
+                    replaces_client_order_id="B-old",
+                ),
             )
         )
 

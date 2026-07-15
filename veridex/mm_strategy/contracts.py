@@ -560,6 +560,33 @@ class NeutralIntent(_FrozenModel):
             return None
         return _reject_price_out_of_unit_interval(value)
 
+    @model_validator(mode="after")
+    def _replacement_lineage_matches_kind(self) -> NeutralIntent:
+        # Codex Gate#3 IMPORTANT-2 (REQ-091/095, AC-021): replacement lineage is a KIND-DEPENDENT
+        # invariant. ``replace_quote`` is the ONE kind that supersedes a named prior order, so it MUST
+        # carry a non-empty exact old client-order id — a None/empty lineage maps to ``cancel_replace``
+        # unchanged and produces an unusable replacement (R4-A later abstains), NOT the exact-old-id
+        # replacement R4-B's contract promised. Every non-replacement kind (place/cancel_all/abstain)
+        # rests, cleans, or no-ops without superseding anything, so it must carry NO lineage at all.
+        # Reject-only, so a valid intent (the funnel only ever emits non-replacement kinds with lineage
+        # None) is byte-identical; runs on construction AND ``model_validate`` / JSON restoration.
+        has_lineage = bool(self.replaces_client_order_id)
+        if self.kind == "replace_quote":
+            if not has_lineage:
+                raise ValueError(
+                    "kind='replace_quote' requires a non-empty exact replaces_client_order_id "
+                    "(the prior order it supersedes), got "
+                    f"replaces_client_order_id={self.replaces_client_order_id!r} "
+                    "(REQ-091/095, AC-021)"
+                )
+        elif self.replaces_client_order_id is not None:
+            raise ValueError(
+                f"kind={self.kind!r} must not carry replacement lineage — only 'replace_quote' "
+                f"supersedes a named prior order, got replaces_client_order_id="
+                f"{self.replaces_client_order_id!r} (REQ-091/095, AC-021)"
+            )
+        return self
+
 
 # --- Structural single-phase invariant (REQ-090/094; AC-016; RED-48) ----------------------
 # A neutral ``intent_plan`` is ONE structural phase: either a CLEANUP (cancel) phase or a fresh

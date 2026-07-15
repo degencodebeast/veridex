@@ -334,11 +334,40 @@ def test_adapter_sets_no_size() -> None:
     # Holds for every neutral kind: no built request ever carries an adapter-set size.
     for leg in (
         _fresh_write("A"),
-        NeutralIntent(kind="replace_quote", leg_role="bid", price=0.5, client_order_id="B"),
+        NeutralIntent(
+            kind="replace_quote",
+            leg_role="bid",
+            price=0.5,
+            client_order_id="B",
+            replaces_client_order_id="B-old",
+        ),
         _cancel_leg(),
         NeutralIntent(kind="abstain", leg_role=None, price=None),
     ):
         assert build_r4a_request(leg, config, token_id=_R4A_TOKEN).intent_params.size is None
+
+
+def test_valid_replacement_lineage_reaches_r4a_request() -> None:
+    """Codex Gate#3 IMPORTANT-2 / REQ-091 / AC-021: a VALID `replace_quote` (naming the exact prior
+    order) reaches the singular R4-A request with its lineage preserved UNCHANGED — the adapter maps
+    the kind to `cancel_replace` and forwards `replaces_client_order_id` verbatim, never dropping or
+    rewriting the old-order reference the decision committed to."""
+    config = _pinned_config()
+    leg = NeutralIntent(
+        kind="replace_quote",
+        leg_role="bid",
+        price=0.5,
+        client_order_id="new-order",
+        replaces_client_order_id="old-order-1",
+    )
+
+    request = build_r4a_request(leg, config, token_id=_R4A_TOKEN)
+
+    # The lineage the decision named survives the neutral→R4-A translation byte-for-byte.
+    assert request.intent_params.replaces_client_order_id == "old-order-1"
+    # ... and the surrounding translation is the wireable maker replacement (kind + reviewed token).
+    assert request.intent_params.token_id == _R4A_TOKEN
+    assert request.intent_params.side == "BUY"
 
 
 def test_reason_confidence_cannot_move_decision() -> None:

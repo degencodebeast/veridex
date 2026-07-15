@@ -63,6 +63,7 @@ from tests.mm_strategy_ablation_harness import (
     reviewed_reach_baseline,
     venue_future_mid_series,
 )
+from veridex.mm_strategy.contracts import NeutralIntent, StrategyDecision
 
 # --- RED-24: arm identity — the config diff is the guard block, nothing else ----------------
 
@@ -197,18 +198,66 @@ def test_harness_is_test_side_no_ranked_import() -> None:
 # — kind + closed reason codes + priced legs — holding every other knob equal (REQ-110/111).
 
 
+def _normalize_lineage(decisions):
+    """Codex Gate#3 [B1]: a per-STREAM normalizer that strips arm-specific order ids from replacement
+    lineage while preserving the RELATIONSHIP (which prior order a replace supersedes).
+
+    Every ``client_order_id`` / ``replaces_client_order_id`` is a ``config_hash``-derived hash, so it
+    necessarily differs between arm A and arm B even when the two arms make the SAME logical decision.
+    We canonicalize each distinct order id to a positional token by first-appearance across the stream
+    in decision/leg order — an ordering both arms share when their structure matches. A replace leg's
+    old-order reference then normalizes to the token of the placed order it names (a low, shared index
+    for a correct replacement) or to a fresh token if it names an order NEVER placed in this stream (a
+    foreign/dangling lineage). Returns a callable mapping a raw ``replaces_client_order_id`` → its
+    normalized token (or None when there is no lineage).
+    """
+    canonical: dict[str, int] = {}
+    # Register every PLACED order first — these are the orders that exist in this stream, in order.
+    for decision in decisions:
+        for leg in decision.intent_plan:
+            if leg.client_order_id is not None and leg.client_order_id not in canonical:
+                canonical[leg.client_order_id] = len(canonical)
+
+    def token(replaces_client_order_id):
+        if replaces_client_order_id is None:
+            return None
+        if replaces_client_order_id not in canonical:
+            # References an order never placed in this stream — a foreign/dangling lineage. It gets a
+            # fresh token AFTER the placed orders, so it can never collide with a correct reference.
+            canonical[replaces_client_order_id] = len(canonical)
+        return canonical[replaces_client_order_id]
+
+    return token
+
+
 def _decision_signature(
     decision,
-) -> tuple[str, tuple[str, ...], tuple[tuple[str, str | None, float | None, bool], ...]]:
-    """The SUBSTANTIVE decision: kind + closed reason codes + priced legs (kind/side/price/post_only).
+    lineage_token=lambda replaces_client_order_id: None,
+) -> tuple[
+    str, tuple[str, ...], tuple[tuple[str, str | None, float | None, bool, object], ...]
+]:
+    """The SUBSTANTIVE decision: kind + closed reason codes + priced legs
+    (kind/side/price/post_only + normalized replacement lineage).
 
     EXCLUDES the per-arm identity stamp (``config_hash`` / ``decision_id`` / the four causal hashes /
     per-leg ``client_order_id``), which differs between arms purely because ``guard_enabled`` differs.
-    An honest guard A/B contrast is over exactly this substance — the behaviour the guard changes when
-    everything else is held equal.
+    Codex Gate#3 [B1]: it DOES include the replacement LINEAGE relationship — but only after the raw,
+    arm-specific old-order id is normalized to a stream-positional token via ``lineage_token`` (see
+    :func:`_normalize_lineage`). Comparing only kind/role/price/post_only let a replace that names the
+    wrong/missing prior order appear quiescent; the normalized lineage token closes that gap while
+    staying invariant to the arm-specific ids an honest A/B holds equal. The default token drops
+    lineage entirely (None), so a stream with no replace legs — the whole current corpus — is
+    unchanged. An honest guard A/B contrast is over exactly this substance.
     """
     legs = tuple(
-        (leg.kind, leg.leg_role, leg.price, leg.post_only) for leg in decision.intent_plan
+        (
+            leg.kind,
+            leg.leg_role,
+            leg.price,
+            leg.post_only,
+            lineage_token(leg.replaces_client_order_id),
+        )
+        for leg in decision.intent_plan
     )
     return (decision.kind, decision.reason_codes, legs)
 
@@ -256,8 +305,14 @@ def test_guard_active_streams_differ(tmp_path) -> None:
         baseline = replay_arm(tape, arms.baseline, tmp_path / f"a_{health}")
         guarded = replay_arm(tape, arms.guarded, tmp_path / f"b_{health}")
 
-        base_sig = [_decision_signature(d) for d in baseline.decisions]
-        guard_sig = [_decision_signature(d) for d in guarded.decisions]
+        base_sig = [
+            _decision_signature(d, _normalize_lineage(baseline.decisions))
+            for d in baseline.decisions
+        ]
+        guard_sig = [
+            _decision_signature(d, _normalize_lineage(guarded.decisions))
+            for d in guarded.decisions
+        ]
 
         # the streams DIFFER in substance — the guard changed behaviour (AC-025) ...
         assert base_sig != guard_sig, health
@@ -297,8 +352,12 @@ def test_quiescent_streams_identical(tmp_path) -> None:
     baseline = replay_arm(tape, arms.baseline, tmp_path / "a")
     guarded = replay_arm(tape, arms.guarded, tmp_path / "b")
 
-    base_sig = [_decision_signature(d) for d in baseline.decisions]
-    guard_sig = [_decision_signature(d) for d in guarded.decisions]
+    base_sig = [
+        _decision_signature(d, _normalize_lineage(baseline.decisions)) for d in baseline.decisions
+    ]
+    guard_sig = [
+        _decision_signature(d, _normalize_lineage(guarded.decisions)) for d in guarded.decisions
+    ]
     # NO trigger ⇒ the guarded and baseline decision streams are substance-IDENTICAL.
     assert base_sig == guard_sig
 
@@ -309,6 +368,71 @@ def test_quiescent_streams_identical(tmp_path) -> None:
     # ... and the arms are NOT byte-identical objects: their identity stamps (config_hash / decision_id)
     # differ, so the match is over decision SUBSTANCE — exactly what an honest A/B holds equal.
     assert guarded.decisions_digest != baseline.decisions_digest
+
+
+def _place_decision(client_order_id: str) -> StrategyDecision:
+    """A tick that PLACES one bid — the order a later tick may replace (arm-specific coid)."""
+    return StrategyDecision(
+        kind="QUOTE_TWO_SIDED",
+        intent_plan=(
+            NeutralIntent(
+                kind="place_quote", leg_role="bid", price=0.49, client_order_id=client_order_id
+            ),
+        ),
+    )
+
+
+def _replace_decision(client_order_id: str, replaces_client_order_id: str) -> StrategyDecision:
+    """A tick that REPLACES a prior resting bid, naming the exact old order (arm-specific coids)."""
+    return StrategyDecision(
+        kind="QUOTE_TWO_SIDED",
+        intent_plan=(
+            NeutralIntent(
+                kind="replace_quote",
+                leg_role="bid",
+                price=0.50,
+                client_order_id=client_order_id,
+                replaces_client_order_id=replaces_client_order_id,
+            ),
+        ),
+    )
+
+
+def test_ab_signature_compares_lineage_normalized() -> None:
+    """Codex Gate#3 [B1]: the A/B decision signature must compare replacement LINEAGE, after
+    normalizing the arm-specific (``config_hash``-derived) order ids out.
+
+    A replace leg's ``client_order_id`` / ``replaces_client_order_id`` differ between arms purely
+    because ``decision_id`` (hence the hashed ids) differs by ``guard_enabled`` — an honest A/B holds
+    that identity stamp equal. But the lineage RELATIONSHIP (which prior order the replace supersedes)
+    is substantive: a replace that names the wrong/foreign old order is a real behavioural divergence,
+    NOT quiescence. So the signature must (a) treat two arms whose replace names the SAME logical prior
+    placement as identical, yet (b) diverge when one arm's replace names a foreign order never placed.
+    Comparing only kind/role/price/post_only (the pre-[B1] signature) would let that divergence hide.
+    """
+    # Arm A: place order X, then replace X (correct lineage). Ids are arm-A-specific hashes.
+    arm_a = [_place_decision("A-x"), _replace_decision("A-y", replaces_client_order_id="A-x")]
+    # Arm B (correct): the SAME structure with arm-B-specific ids — replace names the placed order.
+    arm_b_ok = [_place_decision("B-x"), _replace_decision("B-y", replaces_client_order_id="B-x")]
+    # Arm B (wrong): the replace names a FOREIGN order never placed in this stream — a real divergence
+    # that only lineage comparison can see (kind/role/price/post_only are byte-identical to arm A).
+    arm_b_bad = [
+        _place_decision("B-x"),
+        _replace_decision("B-y", replaces_client_order_id="B-foreign"),
+    ]
+
+    def sig(decisions: list[StrategyDecision]) -> list[object]:
+        token = _normalize_lineage(decisions)
+        return [_decision_signature(d, token) for d in decisions]
+
+    # (a) arm-specific ids normalized OUT: correct lineage in both arms → IDENTICAL signatures.
+    assert sig(arm_a) == sig(arm_b_ok)
+    # (b) a foreign/wrong old-order reference is NOT quiescent — the normalized signature diverges.
+    assert sig(arm_a) != sig(arm_b_bad)
+
+    # Non-vacuity: the divergence is EXACTLY the replace tick's lineage — the place tick still matches.
+    assert sig(arm_a)[0] == sig(arm_b_bad)[0]
+    assert sig(arm_a)[1] != sig(arm_b_bad)[1]
 
 
 # --- placebo: forward-NEXT-change markout methodology (never the near-circular same-move) -----
