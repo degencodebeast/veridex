@@ -58,26 +58,14 @@ def mint(recorder: LiveRecorder, event: MintEvent) -> tuple[int, int]:
     return recorder.record_and_return_pair(event.model_dump())
 
 
-def sample_fv_into_mint(
-    recorder: LiveRecorder, event: MintEvent, fv_cache: list[FvPoint]
-) -> tuple[tuple[int, int], FvPoint | None]:
-    """Mint one non-FV trigger and sample the FV cache at its SEALED global boundary (REQ-020(d2)).
-
-    The single seam where a book/status/match/projection trigger pulls the aligned FV into its next
-    observation WITHOUT look-ahead (AC-058 / RED-54). The trigger is minted through the ONE global
-    recorder (:func:`mint`), which SEALS its global ``(recv_ts, sequence_no)`` to the tape; that
-    recorder-assigned pair — never a locally-minted counter — is the visibility boundary handed to
-    :func:`~veridex.live_recorder.alignment.eligible_fv_pair`. ``fv_cache`` is the RAW FV arrival
-    history (corrections retained); sampling abstains (``None``) when nothing is visible below the
-    boundary — the FV is never imputed.
-
-    Returns the sealed ``(recv_ts, sequence_no)`` boundary AND the sampled ``FvPoint | None`` so the
-    caller binds both into the next observation. The returned pair is EXACTLY the persisted tape pair
-    — the live decision boundary IS the sealed replay boundary (the 3-way persist↔decide control).
-    """
-    mint_pair = mint(recorder, event)
-    sampled = eligible_fv_pair(fv_cache, mint_pair[0], mint_pair[1])
-    return mint_pair, sampled
+# NOTE (Gate #2 MAJOR-2 residual): the former ``sample_fv_into_mint(recorder, event, fv_cache)`` —
+# a second, IDENTITY-FREE FV-selection seam — was RETIRED. It sampled a bare ``list[FvPoint]`` at the
+# sealed mint boundary WITHOUT comparing the winner to the trigger's ``StreamIdentity`` (``FvPoint``
+# carries no identity), so a market-B trigger could pull a foreign market-A fair value. It had ZERO
+# in-repo callers (superseded by :func:`project_guard_fv`, which keys FV selection by identity), so
+# removal — not identity-binding — is the closure. The ONLY FV-selection path is the identity-keyed
+# guard projection below; the sealed-pair persist↔decide control lives on :func:`mint` +
+# :func:`~veridex.live_recorder.alignment.eligible_fv_pair`.
 
 
 # --- FV-independent cadence + guard-off projection (REQ-020(d/d2) / AC-049/051/056) ---------

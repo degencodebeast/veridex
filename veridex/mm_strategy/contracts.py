@@ -608,6 +608,19 @@ class MintEvent(_FrozenModel):
     recv_ts: int
     identity: StreamIdentity | None = None
 
+    @model_validator(mode="after")
+    def _fv_row_requires_identity(self) -> MintEvent:
+        # FV mint rows participate in cadence/replay FV selection, which is keyed by StreamIdentity
+        # (Gate #2 MAJOR-2). An ``fv`` row with no identity would be a fair value with no stream
+        # context, re-opening the identity-free selection hole at the type boundary. Non-FV sources
+        # (an epoch/status probe minted without stream context) may still leave it ``None``.
+        if self.source == "fv" and self.identity is None:
+            raise ValueError(
+                "a MintEvent with source='fv' must carry a StreamIdentity (Gate #2 MAJOR-2); "
+                "an FV row that participates in cadence/replay cannot be identity-free"
+            )
+        return self
+
 
 class SourceGenerations(_FrozenModel):
     """Frozen typed per-source generation state — the assembler is the SOLE author (REQ-020b/(d2)/(e)).

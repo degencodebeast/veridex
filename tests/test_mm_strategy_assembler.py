@@ -26,7 +26,6 @@ from veridex.mm_strategy.assembler import (
     record_market_status,
     resume_source_generations,
     run_cadence,
-    sample_fv_into_mint,
 )
 from veridex.mm_strategy.config import StrategyConfig
 from veridex.mm_strategy.contracts import (
@@ -54,12 +53,25 @@ def _start_meta() -> LiveRecorderSessionMeta:
     )
 
 
-def _mint_event(*, source: MintSource, source_epoch: int, recv_ts: int) -> MintEvent:
+def _mint_event(
+    *,
+    source: MintSource,
+    source_epoch: int,
+    recv_ts: int,
+    identity: StreamIdentity | None = None,
+) -> MintEvent:
+    # An ``fv`` row must carry a stream identity (Gate #2 MAJOR-2); default a valid one so the
+    # epoch-resume tape can seed an FV generation without asserting the identity content.
+    if source == "fv" and identity is None:
+        identity = StreamIdentity(
+            fixture_id=1, market_ref="0xA", side="YES", token_id="TOK-A"
+        )
     return MintEvent(
         sequence_no=0,  # placeholder — the recorder reassigns the global sequence
         source=source,
         source_epoch=source_epoch,
         recv_ts=recv_ts,
+        identity=identity,
     )
 
 
@@ -227,11 +239,12 @@ def test_replay_status_bound_to_requested_market(tmp_path):
 def test_pair_used_by_eligible_fv_pair_equals_disk_equals_post_restart(tmp_path):
     """3-way control: the pair fed to ``eligible_fv_pair`` == the disk pair == the post-restart pair.
 
-    The assembler mints a non-FV trigger through the ONE global recorder; ``sample_fv_into_mint``
-    hands that recorder-SEALED ``(recv_ts, sequence_no)`` to ``eligible_fv_pair`` as the visibility
-    boundary. That decision boundary must be EXACTLY the pair persisted to ``records.jsonl`` and the
-    EXACT pair a strict reload returns after a restart — the live decision boundary IS the sealed
-    replay boundary, never a parallel guess (Codex-plan-review-R2 MAJOR-1; AC-058/RED-54).
+    The assembler mints a non-FV trigger through the ONE global recorder (:func:`mint`), which SEALS
+    its global ``(recv_ts, sequence_no)`` to the tape; that recorder-assigned pair is the visibility
+    boundary handed to ``eligible_fv_pair``. That decision boundary must be EXACTLY the pair persisted
+    to ``records.jsonl`` and the EXACT pair a strict reload returns after a restart — the live
+    decision boundary IS the sealed replay boundary, never a parallel guess (Codex-plan-review-R2
+    MAJOR-1; AC-058/RED-54).
     """
     rec = LiveRecorder(tmp_path, _start_meta())
     # a raw FV arrival cache (corrections retained) — the sampling input.
@@ -241,8 +254,11 @@ def test_pair_used_by_eligible_fv_pair_equals_disk_equals_post_restart(tmp_path)
     ]
     trigger = _mint_event(source="book", source_epoch=0, recv_ts=1_200)
 
-    # (1) the pair the assembler feeds eligible_fv_pair (returned alongside the sampled point).
-    decision_pair, sampled = sample_fv_into_mint(rec, trigger, fv_cache)
+    from veridex.live_recorder.alignment import eligible_fv_pair
+
+    # (1) the sealed pair the assembler feeds eligible_fv_pair as the visibility boundary.
+    decision_pair = mint(rec, trigger)
+    sampled = eligible_fv_pair(fv_cache, decision_pair[0], decision_pair[1])
     rec.close()
     assert sampled is not None and sampled.value == 0.58  # freshest visible FV below the pair
 
@@ -283,6 +299,62 @@ def test_mint_boundary_visible_below_sealed_pair_across_triggers(tmp_path, trigg
     got = eligible_fv_pair([fv_before, fv_after], mint_recv_ts=trig_recv, mint_sequence_no=trig_seq)
     assert got is fv_before  # BEFORE (seq-1) visible; AFTER (seq+1, fresher source) invisible
     assert got.value == 0.5
+
+
+# --- Gate #2 MAJOR-2 residual: no identity-free FV-selection path may exist ------------------
+# (REQ-020b/027, Gate #2 MAJOR-2)
+#
+# The main cadence path binds FV selection to `StreamIdentity` (project_guard_fv). A SECOND,
+# identity-free selection helper (`sample_fv_into_mint`) samples a bare `list[FvPoint]` — a type
+# with no fixture/market/side identity — so it returned the globally-freshest visible point
+# without comparing it to the trigger's identity. Codex's control: a market-B trigger plus a
+# visible market-A FvPoint(0.77) returned the foreign 0.77. That dead (zero in-repo caller) path
+# is RETIRED; the ONLY FV-selection path is the identity-keyed guard projection.
+
+
+def test_no_identity_free_fv_sampling_path():
+    """The identity-free FV-sampling entry point must not exist on the assembler (MAJOR-2 residual).
+
+    `sample_fv_into_mint` selected the freshest visible `FvPoint` at the sealed mint boundary
+    WITHOUT comparing it to the trigger's `StreamIdentity` — `FvPoint` carries no identity, so a
+    market-B trigger could sample a foreign market-A fair value (Codex control: `0.77`). Because it
+    had ZERO in-repo callers (superseded by `project_guard_fv`), it is removed rather than bound.
+    Assert the module exposes no such identity-free FV-selection entry and it is not importable.
+    """
+    import veridex.mm_strategy.assembler as assembler
+
+    assert not hasattr(assembler, "sample_fv_into_mint")
+    with pytest.raises(ImportError):
+        from veridex.mm_strategy.assembler import (  # noqa: F401
+            sample_fv_into_mint,
+        )
+
+
+def test_fv_mint_event_requires_identity():
+    """An FV `MintEvent` participating in cadence/replay MUST carry a stream identity (MAJOR-2).
+
+    A `source="fv"` mint row with `identity=None` was constructible, leaving an FV tape row with no
+    stream context. The type boundary now rejects it; a valid `StreamIdentity` constructs, and
+    non-FV sources (an epoch/status probe minted without stream context) are unaffected.
+    """
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError):
+        MintEvent(sequence_no=0, source="fv", source_epoch=0, recv_ts=1_000, identity=None)
+
+    # a valid identity constructs
+    MintEvent(
+        sequence_no=0,
+        source="fv",
+        source_epoch=0,
+        recv_ts=1_000,
+        identity=StreamIdentity(
+            fixture_id=1, market_ref="0xA", side="YES", token_id="TOK-A"
+        ),
+    )
+
+    # non-FV sources may still be minted without a stream identity (probe row).
+    MintEvent(sequence_no=0, source="book", source_epoch=0, recv_ts=1_000, identity=None)
 
 
 # --- E3-T4: guard-off projection + FV-independent cadence -----------------------------------
