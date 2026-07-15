@@ -631,19 +631,21 @@ def test_event_gate_precedes_residual_guard() -> None:
 
 def test_residual_band_is_absolute_not_spread_relative() -> None:
     # The residual band is an ABSOLUTE probability-space width — NEVER scaled by the book spread
-    # (REQ-071). Hold the residual FIXED (0.05) and VARY the spread wide↔narrow: the guard verdict
+    # (REQ-071). Hold the residual FIXED (0.01) and VARY the spread wide↔narrow: the guard verdict
     # is IDENTICAL because the extreme threshold (extreme_multiple × band = 0.06) carries no spread
     # term. A spread-relative band (band × (best_ask − best_bid)) would read the NARROW book as
     # extreme while the WIDE book stays admissible — flipping the verdict — and this test kills it.
     # ``spread_blowout_multiple`` is raised so the wide spread does not trip the REQ-080 blowout
     # event (row E), isolating the band-absoluteness under test; both mids are 0.50 (no mid-jump).
+    # The residual (0.01) is deliberately kept in the QUIESCENT zone (≤ residual_band 0.02, below the
+    # E4-T4 side-pull band) so this test isolates the EXTREME threshold's absoluteness alone.
     config = _config(guard_enabled=True, spread_blowout_multiple=1000.0)
     state = _guarded_warm_state(basis_gap=0.0)
 
     # Narrow spread 0.02 and wide spread 0.90 — SAME mid 0.50 ⇒ SAME anchor ⇒ SAME raw_gap
-    # (fv 0.55 − 0.50 = 0.05) ⇒ SAME residual 0.05 (< extreme 0.06).
-    narrow = _obs(bid=0.49, ask=0.51, guard_fv=_fresh_fv(fv=0.55))
-    wide = _obs(bid=0.05, ask=0.95, guard_fv=_fresh_fv(fv=0.55))
+    # (fv 0.51 − 0.50 = 0.01) ⇒ SAME residual 0.01 (≤ band 0.02 ⇒ quiescent, well below extreme 0.06).
+    narrow = _obs(bid=0.49, ask=0.51, guard_fv=_fresh_fv(fv=0.51))
+    wide = _obs(bid=0.05, ask=0.95, guard_fv=_fresh_fv(fv=0.51))
 
     d_narrow, _ = decide(narrow, state, config)
     d_wide, _ = decide(wide, state, config)
@@ -711,3 +713,95 @@ def test_stale_fv_not_admitted_to_basis() -> None:
         after_fresh_direct.basis_ewma_value
     )
     assert after_fresh_via_stale.basis_ewma_ts == after_fresh_direct.basis_ewma_ts
+
+
+# --- E4-T4 / REQ-073 / AC-006: directional residual side-pull (the worst-bug rule) ----------
+# The residual axis inside the admissible band has THREE regimes by increasing |residual|:
+#   quiescent  |residual| <= residual_band (0.02)                 -> QUOTE_TWO_SIDED (E4-T1 floor)
+#   pull       residual_band < |residual| < extreme (0.06)        -> QUOTE_ONE_SIDED (THIS task)
+#   extreme    |residual| >= extreme_multiple*residual_band (0.06)-> NO_QUOTE(residual_extreme) (T3)
+# residual = (fv - anchor) - basis, anchor = venue mid. DIRECTION (REQ-073): fv ABOVE the anchor
+# (positive residual) means the venue's YES ASK is too cheap vs fair value, so a taker will lift our
+# resting ask adversely -> PULL THE ASK. Symmetric: fv BELOW the anchor (negative residual) means our
+# YES BID is too high -> PULL THE BID. A flipped sign quotes INTO the adverse flow and loses money.
+
+
+def test_positive_residual_pulls_ask() -> None:
+    # residual > +residual_band ⇒ PULL the YES ASK (REQ-073/AC-006). basis is a persistent 0.0, so
+    # residual = fv 0.54 − mid 0.50 = +0.04, which sits in the pull band (0.02 < 0.04 < 0.06). fair
+    # value is ABOVE the anchor ⇒ our resting ask is too cheap ⇒ pull the ask; the bid may rest, so
+    # the disposition is QUOTE_ONE_SIDED (never a two-sided quote, never NO_QUOTE — not extreme).
+    config = _config(guard_enabled=True)
+    state = _guarded_warm_state(basis_gap=0.0)
+    obs = _obs(guard_fv=_fresh_fv(fv=0.54))  # residual = +0.04
+
+    decision, _ = decide(obs, state, config)
+    assert decision.kind == "QUOTE_ONE_SIDED"
+    assert decision.reason_codes == ("residual_pull_ask",)
+
+
+def test_negative_residual_pulls_bid() -> None:
+    # residual < −residual_band ⇒ PULL the YES BID (REQ-073/AC-006). residual = fv 0.46 − mid 0.50 =
+    # −0.04, in the pull band (−0.06 < −0.04 < −0.02). fair value is BELOW the anchor ⇒ our resting
+    # bid is too high ⇒ pull the bid; the ask may rest ⇒ QUOTE_ONE_SIDED. This is the mirror image of
+    # the positive case: the SIGN of the residual selects the side, and only that one side is pulled.
+    config = _config(guard_enabled=True)
+    state = _guarded_warm_state(basis_gap=0.0)
+    obs = _obs(guard_fv=_fresh_fv(fv=0.46))  # residual = −0.04
+
+    decision, _ = decide(obs, state, config)
+    assert decision.kind == "QUOTE_ONE_SIDED"
+    assert decision.reason_codes == ("residual_pull_bid",)
+
+
+def test_sign_mutation_pulls_wrong_side_fails() -> None:
+    # THE adversarial sign-flip guard (RED-03). This test pins the WHOLE sign→side mapping in one
+    # place: a POSITIVE residual pulls the ASK and a NEGATIVE residual pulls the BID — never the
+    # reverse. Flipping the `>`/`<` comparison in the pull logic swaps both branches, so a positive
+    # residual would pull the BID and a negative residual the ASK — quoting INTO the adverse flow.
+    # Both assertions below then fail, killing the money-bug mutation. (The direction is asserted for
+    # a SPECIFIC residual sign so the failure is about DIRECTION, not mechanics.)
+    config = _config(guard_enabled=True)
+    state = _guarded_warm_state(basis_gap=0.0)
+
+    # fair value ABOVE anchor (residual +0.04) ⇒ ask is too cheap ⇒ pull the ASK, NOT the bid.
+    pos = _obs(guard_fv=_fresh_fv(fv=0.54))
+    d_pos, _ = decide(pos, state, config)
+    assert d_pos.reason_codes == ("residual_pull_ask",)
+    assert d_pos.reason_codes != ("residual_pull_bid",)
+
+    # fair value BELOW anchor (residual −0.04) ⇒ bid is too high ⇒ pull the BID, NOT the ask.
+    neg = _obs(guard_fv=_fresh_fv(fv=0.46))
+    d_neg, _ = decide(neg, state, config)
+    assert d_neg.reason_codes == ("residual_pull_bid",)
+    assert d_neg.reason_codes != ("residual_pull_ask",)
+
+
+def test_pull_threshold_is_absolute_band() -> None:
+    # The pull threshold is the ABSOLUTE ``residual_band`` (0.02) — NEVER scaled by the book spread
+    # (REQ-071, consistent with E4-T3's extreme band). Held at a FIXED residual, varying the spread
+    # wide↔narrow must not change the verdict. ``spread_blowout_multiple`` is raised so the wide book
+    # does not trip the REQ-080 spread-blowout event (row E); both mids are 0.50 (no mid-jump), so
+    # the ONLY thing that varies is the raw spread.
+    config = _config(guard_enabled=True, spread_blowout_multiple=1000.0)
+    state = _guarded_warm_state(basis_gap=0.0)
+
+    # (1) residual JUST ABOVE the band pulls the ask under BOTH spreads (spread-invariant pull).
+    # residual = fv 0.53 − mid 0.50 = +0.03 (> band 0.02, < extreme 0.06). Same mid 0.50 for both.
+    narrow_pull = _obs(bid=0.49, ask=0.51, guard_fv=_fresh_fv(fv=0.53))  # spread 0.02
+    wide_pull = _obs(bid=0.05, ask=0.95, guard_fv=_fresh_fv(fv=0.53))  # spread 0.90
+    d_narrow_pull, _ = decide(narrow_pull, state, config)
+    d_wide_pull, _ = decide(wide_pull, state, config)
+    assert d_narrow_pull.kind == d_wide_pull.kind == "QUOTE_ONE_SIDED"
+    assert d_narrow_pull.reason_codes == d_wide_pull.reason_codes == ("residual_pull_ask",)
+
+    # (2) residual JUST BELOW the band does NOT pull under EITHER spread (stays QUOTE_TWO_SIDED).
+    # residual = fv 0.515 − mid 0.50 = +0.015 (< band 0.02) ⇒ quiescent. A spread-RELATIVE threshold
+    # (band × spread) would shrink to 0.0004 on the narrow book, so 0.015 would SPURIOUSLY exceed it
+    # and pull the ask — this arm kills the spread-scaling mutation.
+    narrow_quiet = _obs(bid=0.49, ask=0.51, guard_fv=_fresh_fv(fv=0.515))
+    wide_quiet = _obs(bid=0.05, ask=0.95, guard_fv=_fresh_fv(fv=0.515))
+    d_narrow_quiet, _ = decide(narrow_quiet, state, config)
+    d_wide_quiet, _ = decide(wide_quiet, state, config)
+    assert d_narrow_quiet.kind == d_wide_quiet.kind == "QUOTE_TWO_SIDED"
+    assert d_narrow_quiet.reason_codes == d_wide_quiet.reason_codes == ()

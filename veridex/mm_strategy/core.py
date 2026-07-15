@@ -776,10 +776,24 @@ def _quote_disposition(
                 # REQ-075: the sole extreme rule (no separate absolute-cap knob). NO_QUOTE + cancel
                 # plan on exposure (the intent-plan wiring is a later E4 task) — never a taker chase.
                 return _decide("NO_QUOTE", ("residual_extreme",))
-            # Admissible (``|residual| < extreme × band``): the E4-T5 pre-match basis gate
-            # (prematch_basis_exceeds_spread, REQ-078) slots in between warmup and here, and the E4-T4
-            # side pull (residual_pull_ask/bid, REQ-073) inside the band — both WITHOUT reshaping this
-            # order. Until then a quiescent guarded frame falls through to the taxonomy floor below.
+            # E4-T4 DIRECTIONAL SIDE PULL (REQ-073/071/AC-006), INSIDE the admissible band. The SIGN
+            # of the residual selects the ONE side to pull; the threshold is the ABSOLUTE
+            # ``residual_band`` (REQ-071 — the SAME config width the extreme wall scales, NEVER the
+            # ``(best_ask − best_bid)`` spread; a spread-relative band is the MAJOR-5 bug). The
+            # direction is load-bearing (the worst-bug rule): ``residual = fv − anchor − basis`` with
+            # the anchor the venue mid, so a POSITIVE residual means fair value is ABOVE the anchor —
+            # the venue's YES ask is too cheap relative to fv, a taker will lift our resting ask
+            # adversely, so we PULL THE ASK (the bid may rest → QUOTE_ONE_SIDED). Symmetric: a NEGATIVE
+            # residual means fv is BELOW the anchor — our YES bid is too high, so we PULL THE BID. A
+            # flipped comparison would quote INTO the adverse flow. No widen path (v0); the pull is on
+            # THIS outcome's own book (no naive YES-vs-NO cross-compare). ``residual_band`` (0.02) <
+            # ``|residual|`` < extreme (0.06): the middle band; ``|residual| <= residual_band`` is
+            # quiescent and falls through to the two-sided taxonomy floor (E4-T5's pre-match basis gate
+            # REQ-078 slots between warmup and the extreme wall, WITHOUT reshaping this order).
+            if residual > config.residual_band:
+                return _decide("QUOTE_ONE_SIDED", ("residual_pull_ask",))
+            if residual < -config.residual_band:
+                return _decide("QUOTE_ONE_SIDED", ("residual_pull_bid",))
     # --- QUOTE math slot (E4-T7): anchor +/- half_spread legs, post-clamp cardinality ---
     return _decide("QUOTE_TWO_SIDED", ())
 
