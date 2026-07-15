@@ -43,6 +43,7 @@ from veridex.mm_strategy.contracts import (
     DecisionKind,
     GuardFairValue,
     GuardStateWatermark,
+    InventoryProjection,
     MarketStatus,
     NeutralIntent,
     ReasonCode,
@@ -1359,6 +1360,24 @@ def decide(
         decision, observation, state, next_state, config, session_id
     )
     return stamped, next_state
+
+
+def projection_startup_gate(
+    inventory: InventoryProjection | None,
+) -> StrategyDecision | None:
+    """Startup truth from the INJECTED open-order/inventory projection (REQ-094/097, AC-021).
+
+    At session startup the orchestration layer INJECTS the reconciled open-order / inventory
+    projection — the strategy NEVER queries the venue for it. A MISSING (``None``) or STALE
+    (``fresh is False``) projection is data-degraded: the strategy cannot safely reason over unknown
+    inventory, so it fails CLOSED to ``NO_QUOTE(projection_stale)`` — the SAME closed-vocab reason the
+    per-tick :func:`_status_stream_reason` gate downgrades a stale in-flight projection with, so the
+    startup and steady-state paths agree. Returns ``None`` only when the projection is present AND
+    fresh (startup may proceed to the reducer). Pure: no clock, no I/O, no venue read.
+    """
+    if inventory is None or not inventory.fresh:
+        return _decide("NO_QUOTE", ("projection_stale",))
+    return None
 
 
 def _decide_raw(
