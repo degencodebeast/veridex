@@ -4,8 +4,8 @@ The adapter fires the pure strategy's neutral ``intent_plan`` at R4-A's executio
 consuming each leg's typed :class:`~veridex.dust_execution.facade.MMExecutionToolResult` (the
 STRATEGY ``admission`` + the SEPARATE closed-vocab EXECUTION ``execution_status`` /
 ``execution_reason_codes``). Its one job here is the REQ-093 freeze boundary: the moment a leg
-returns an UNCERTAIN outcome, every remaining fresh-write leg is FROZEN and no further fresh-write
-facade call is issued.
+returns an UNCERTAIN outcome, every remaining leg is frozen (all remaining fresh-write legs under
+single-phase plans) and no further facade call is issued.
 
 An UNCERTAIN outcome is any of:
   * a plain ``SUBMITTED`` — an uncertain ACK; an order may be live-but-unsettled, so the leg is
@@ -41,10 +41,6 @@ from veridex.dust_execution.facade import (
     MMIntentParams,
 )
 from veridex.mm_strategy.contracts import NeutralIntent, NeutralIntentKind
-
-# The neutral intent kinds that place a NEW order on the wire — the legs the freeze protects. A
-# ``cancel_all_orders`` is a risk-reducing (never fresh-write) leg; ``abstain`` is no wire action.
-_FRESH_WRITE_KINDS: frozenset[str] = frozenset({"place_quote", "replace_quote"})
 
 # The neutral intent kinds that reach the wire at all (the adapter calls the facade for these).
 _ACTIONABLE_KINDS: frozenset[str] = frozenset(
@@ -95,7 +91,7 @@ def is_possibly_unresolved(result: MMExecutionToolResult) -> bool:
 
 
 def freezes_fresh_writes(result: MMExecutionToolResult) -> bool:
-    """True when this leg's outcome must FREEZE every remaining fresh-write leg (REQ-093).
+    """True when this leg's outcome must FREEZE every remaining leg (REQ-093).
 
     The conservative safety predicate: any NON-clean first-leg outcome halts fresh writes — a
     possibly-unresolved ACK/pending leg (an order may be live) OR a withheld ``mode_b_not_armed`` leg
