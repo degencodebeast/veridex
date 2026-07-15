@@ -4,13 +4,25 @@ import Link from 'next/link';
 import { Badge } from '@/components/ui/Badge';
 import { Num } from '@/components/ui/Num';
 import { SegmentedControl } from '@/components/ui/SegmentedControl';
+import { InfoTip } from '@/components/ui/InfoTip';
 import { AGENTS } from '@/lib/fixtures/catalog';
+import { MAKER_ARENA_RESULT, MAKER_AGENT_META } from '@/lib/fixtures/maker';
+import { GLOSSARY } from '@/lib/glossary';
+import { useLane, type Lane } from '@/hooks/useLane';
 import type { AgentSummary } from '@/lib/catalog';
+import type { MakerArenaResultView, MakerLeaderboardRow } from '@/lib/contracts';
 import styles from './AgentsScreen.module.css';
 
 type Sort = 'clv' | 'runs';
 
-export function AgentsScreen({ agents = AGENTS }: { agents?: AgentSummary[] }) {
+export function AgentsScreen({
+  agents = AGENTS,
+  makerResult = MAKER_ARENA_RESULT,
+}: {
+  agents?: AgentSummary[];
+  makerResult?: MakerArenaResultView;
+}) {
+  const [lane, setLane] = useLane();
   const [q, setQ] = useState('');
   const [sort, setSort] = useState<Sort>('clv');
 
@@ -29,45 +41,116 @@ export function AgentsScreen({ agents = AGENTS }: { agents?: AgentSummary[] }) {
         </div>
       </header>
 
-      <div className={styles.controls}>
-        <input
-          type="search" role="searchbox" className={styles.search} placeholder="Search agents…"
-          value={q} onChange={(e) => setQ(e.target.value)}
+      {/* LANE SWITCH — separate lanes, different agents; never one set re-ranked. */}
+      <div className={styles.laneRow}>
+        <span className={styles.laneLabel}>LANE</span>
+        <SegmentedControl<Lane>
+          ariaLabel="Agents lane"
+          value={lane}
+          onChange={setLane}
+          options={[{ value: 'directional', label: 'Directional' }, { value: 'maker', label: 'Maker' }]}
         />
-        <SegmentedControl<Sort>
-          ariaLabel="Sort" value={sort} onChange={setSort}
-          options={[{ value: 'clv', label: 'Avg CLV' }, { value: 'runs', label: 'Runs' }]}
-        />
+        <span className={styles.laneNote}>Separate lanes, different agents — not one set re-ranked.</span>
       </div>
 
-      {shown.length === 0 ? (
-        <p className={styles.empty} data-testid="agents-empty">No agents match.</p>
+      {lane === 'directional' ? (
+        <>
+          <div className={styles.controls}>
+            <input
+              type="search" role="searchbox" className={styles.search} placeholder="Search agents…"
+              value={q} onChange={(e) => setQ(e.target.value)}
+            />
+            <SegmentedControl<Sort>
+              ariaLabel="Sort" value={sort} onChange={setSort}
+              options={[{ value: 'clv', label: 'Avg CLV' }, { value: 'runs', label: 'Runs' }]}
+            />
+          </div>
+
+          {shown.length === 0 ? (
+            <p className={styles.empty} data-testid="agents-empty">No agents match.</p>
+          ) : (
+            <div className={styles.tableWrap}>
+              <table className={styles.table}>
+                <thead>
+                  <tr><th>AGENT</th><th>ARCHETYPE</th><th>MODE</th><th className={styles.r}>AVG CLV</th><th className={styles.r}>RUNS</th><th>PROOF</th><th>SOURCE</th></tr>
+                </thead>
+                <tbody>
+                  {shown.map((a) => (
+                    <tr key={a.agent_id} className={styles.row}>
+                      <td><Link href={`/agents/${a.agent_id}`} className={styles.link}>{a.agent_name} ›</Link></td>
+                      <td className="mono">{a.archetype}</td>
+                      <td className="mono">{a.mode}</td>
+                      <td className={styles.num}><Num value={a.avg_clv_bps} kind="bps" /></td>
+                      <td className={styles.num}>{a.runs}</td>
+                      <td><Badge variant={a.proof_mode} /></td>
+                      <td>
+                        {a.source_mode === 'live' ? <Badge variant="live" />
+                          : a.source_mode === 'replay' ? <Badge variant="replay" />
+                            : <span className={`${styles.mixedSrc} mono`}>mixed</span>}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </>
       ) : (
-        <div className={styles.tableWrap}>
-          <table className={styles.table}>
-            <thead>
-              <tr><th>AGENT</th><th>ARCHETYPE</th><th>MODE</th><th className={styles.r}>AVG CLV</th><th className={styles.r}>RUNS</th><th>PROOF</th><th>SOURCE</th></tr>
-            </thead>
-            <tbody>
-              {shown.map((a) => (
-                <tr key={a.agent_id} className={styles.row}>
-                  <td><Link href={`/agents/${a.agent_id}`} className={styles.link}>{a.agent_name} ›</Link></td>
-                  <td className="mono">{a.archetype}</td>
-                  <td className="mono">{a.mode}</td>
-                  <td className={styles.num}><Num value={a.avg_clv_bps} kind="bps" /></td>
-                  <td className={styles.num}>{a.runs}</td>
-                  <td><Badge variant={a.proof_mode} /></td>
-                  <td>
-                    {a.source_mode === 'live' ? <Badge variant="live" />
-                      : a.source_mode === 'replay' ? <Badge variant="replay" />
-                        : <span className={`${styles.mixedSrc} mono`}>mixed</span>}
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
+        <MakerAgentsTable result={makerResult} />
       )}
     </section>
+  );
+}
+
+// Maker Arena lane (MM-R1) — the 2 maker agents only (txline-fair-mm = candidate, naive-mm =
+// control), a SEPARATE population from the directional roster (SEC-005). Ranked by toxicity
+// loss ASC, never CLV — no Avg CLV column here. Rows deep-link to the Maker Proof Card.
+function MakerAgentsTable({ result }: { result: MakerArenaResultView }) {
+  const ranked = useMemo(
+    () => [...result.leaderboard].sort((a, b) => a.avg_toxicity_loss_bps - b.avg_toxicity_loss_bps),
+    [result],
+  );
+
+  return (
+    <>
+      <div className={styles.controls}>
+        <span className={styles.makerSortNote}>ranked by adverse-selection toxicity (lower = better) · <Badge variant="mm-r1" /> · n={result.fixture_universe_n}</span>
+      </div>
+      <div className={styles.tableWrap}>
+        <table className={styles.table}>
+          <thead>
+            <tr>
+              <th>MAKER AGENT</th><th>ROLE</th>
+              <th className={styles.r}>TOXICITY LOSS ↓ <InfoTip label={GLOSSARY.toxicity_loss.label}>{GLOSSARY.toxicity_loss.definition}</InfoTip></th>
+              <th className={styles.r}>MARKOUT <InfoTip label={GLOSSARY.mean_markout_diagnostic.label}>{GLOSSARY.mean_markout_diagnostic.definition}</InfoTip></th>
+              <th className={styles.r}>QUOTES</th>
+              <th>RUNG</th><th></th>
+            </tr>
+          </thead>
+          <tbody>
+            {ranked.map((r: MakerLeaderboardRow) => {
+              const meta = MAKER_AGENT_META[r.agent_id];
+              return (
+                <tr key={r.agent_id} className={styles.row} data-testid="maker-agent-row">
+                  <td><Link href={`/proof/maker/${r.agent_id}`} className={styles.link} data-testid="maker-agent-link">{r.agent_id} ›</Link></td>
+                  <td className="mono">{meta?.role ?? '—'}</td>
+                  <td className={styles.num}><Num value={r.avg_toxicity_loss_bps} kind="bps" /></td>
+                  <td className={`${styles.num} ${styles.diagnostic}`}>{r.avg_markout_bps}</td>
+                  <td className={styles.num}>{r.quote_count.toLocaleString()}</td>
+                  <td><Badge variant="mm-r1" /></td>
+                  <td className={styles.proofLink}>PROOF →</td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+        <div className={styles.tableFoot}>
+          <span className={styles.footNote}>
+            <b>ⓘ markout is diagnostic only</b>, never CLV — naive-mm&apos;s higher markout is more toxic → ranked 2nd. No fill / PnL / executable-edge claim (null by construction). Maker agents never appear in the CLV-ranked list.
+          </span>
+          <span className={styles.footCount}>{ranked.length} maker agents · n={result.fixture_universe_n}</span>
+        </div>
+      </div>
+    </>
   );
 }

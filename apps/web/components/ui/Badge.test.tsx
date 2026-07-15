@@ -12,12 +12,14 @@ beforeEach(() => {
 });
 
 describe('Badge (PAT-002: one component, full vocabulary)', () => {
-  it('covers the full 13-variant status vocabulary', () => {
+  it('covers the full 13-variant status vocabulary plus the Maker Arena (MM-R1) additions', () => {
     expect([...BADGE_VARIANTS].sort()).toEqual(
       [
         'anchored', 'eligible', 'invalid', 'live', 'llm', 'not-anchored',
         'not-eligible', 'partial', 'pending', 'replay', 'reproducible',
         'valid', 'verified',
+        // Maker Arena lane (MM-R1) — falsification verdicts + rung/caveat chips.
+        'mm-r1', 'separated', 'inconclusive', 'inverted', 'uncalibrated', 'small-n', 'trades-not-fills',
       ].sort(),
     );
   });

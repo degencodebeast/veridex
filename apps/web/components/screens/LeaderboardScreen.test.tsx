@@ -1,8 +1,9 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, afterEach } from 'vitest';
 import { render, screen, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { LeaderboardScreen } from '@/components/screens/LeaderboardScreen';
 import { LEADERBOARD_ROWS } from '@/lib/fixtures/catalog';
+import { MAKER_ARENA_RESULT } from '@/lib/fixtures/maker';
 import type { LeaderboardRow } from '@/lib/catalog';
 
 function mk(p: Partial<LeaderboardRow>): LeaderboardRow {
@@ -78,5 +79,71 @@ describe('LeaderboardScreen (REQ-013 / AC-005 / WD-7)', () => {
     // still ranked by avg clv desc within the filtered set (parseFloat tolerates the " bps" unit)
     const clvs = rows.map((r) => parseFloat(within(r).getByTestId('lb-clv').textContent!.replace('+', '')));
     expect([...clvs]).toEqual([...clvs].sort((a, b) => b - a));
+  });
+});
+
+describe('LeaderboardScreen — Maker Arena lane (MM-R1)', () => {
+  afterEach(() => {
+    window.history.replaceState(null, '', '/'); // reset any ?lane= query between tests
+  });
+
+  it('defaults to the Directional lane — the existing board is untouched', () => {
+    render(<LeaderboardScreen />);
+    expect(screen.getByRole('radio', { name: 'Directional' })).toHaveAttribute('aria-checked', 'true');
+    expect(screen.getAllByTestId('lb-row').length).toBe(LEADERBOARD_ROWS.length);
+    expect(screen.queryByTestId('lb-maker-row')).toBeNull();
+  });
+
+  it('the lane toggle switches to the maker board and is URL-addressable (?lane=maker)', async () => {
+    const user = userEvent.setup();
+    render(<LeaderboardScreen />);
+    await user.click(screen.getByRole('radio', { name: 'Maker' }));
+    expect(screen.queryByTestId('lb-row')).toBeNull();
+    expect(screen.getAllByTestId('lb-maker-row').length).toBe(2);
+    expect(new URLSearchParams(window.location.search).get('lane')).toBe('maker');
+  });
+
+  it('maker board ranks by avg_toxicity_loss_bps ASC (lower = better) — never CLV (SEC-005)', async () => {
+    const user = userEvent.setup();
+    render(<LeaderboardScreen />);
+    await user.click(screen.getByRole('radio', { name: 'Maker' }));
+    const rows = screen.getAllByTestId('lb-maker-row');
+    expect(within(rows[0]).getByTestId('lb-maker-agent')).toHaveTextContent('txline-fair-mm');
+    expect(within(rows[1]).getByTestId('lb-maker-agent')).toHaveTextContent('naive-mm');
+    const toxicities = rows.map((r) => parseFloat(within(r).getByTestId('lb-maker-toxicity').textContent!));
+    expect([...toxicities]).toEqual([...toxicities].sort((a, b) => a - b));
+    // the maker table itself carries no AVG CLV column (the lane-note prose mentioning
+    // "Avg CLV" descriptively is expected and stays visible in both lanes).
+    expect(within(screen.getByRole('table')).queryByText(/avg clv/i)).toBeNull();
+  });
+
+  it('EXEC EDGE renders the literal null and the n=18 small-sample caveat is always shown', async () => {
+    const user = userEvent.setup();
+    render(<LeaderboardScreen />);
+    await user.click(screen.getByRole('radio', { name: 'Maker' }));
+    screen.getAllByTestId('lb-maker-edge').forEach((cell) => expect(cell).toHaveTextContent('null'));
+    expect(screen.getAllByText(/n=18/i).length).toBeGreaterThan(0);
+  });
+
+  it('shows the SEPARATED falsification headline with the Δ and CI (leads with the claim, not the mean)', async () => {
+    const user = userEvent.setup();
+    render(<LeaderboardScreen />);
+    await user.click(screen.getByRole('radio', { name: 'Maker' }));
+    expect(screen.getAllByText(/separated/i).length).toBeGreaterThan(0);
+    expect(screen.getByText(/\+43/)).toBeInTheDocument();
+    expect(screen.getByText('[34, 52]')).toBeInTheDocument();
+  });
+
+  it('markout is a muted diagnostic column, never the rank axis — matches the sealed fixture (SEC-005)', () => {
+    expect(MAKER_ARENA_RESULT.rank_axis).toBe('avg_toxicity_loss_bps');
+    expect(MAKER_ARENA_RESULT.leaderboard.every((r) => r.real_executable_edge_bps === null)).toBe(true);
+  });
+
+  it('SEC-005: maker rows never carry a directional rank/CLV key', () => {
+    for (const row of MAKER_ARENA_RESULT.leaderboard) {
+      expect(Object.keys(row)).not.toContain('avg_clv_bps');
+      expect(Object.keys(row)).not.toContain('rank');
+      expect(Object.keys(row)).toContain('maker_rank');
+    }
   });
 });
