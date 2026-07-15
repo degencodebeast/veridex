@@ -127,7 +127,13 @@ def floor_to_tick(price: float, tick: float) -> float:
     A bid rests AT or BELOW its target, so rounding DOWN can never improve it past (cross up through)
     the target. Mirror of :func:`ceil_to_tick`; the ratio is snapped to 9 dp before the floor to
     absorb binary-representation dust and the product is re-snapped so no FP tail leaks into the price.
+
+    Precondition: ``tick`` is finite and strictly positive (defense-in-depth — the AUTHORITATIVE
+    guard is the ``StrategyObservation.tick_size`` construction validator, so an observation carrying
+    ``tick_size <= 0`` never exists to reach here; Gate #2 MAJOR-5).
     """
+    if not math.isfinite(tick) or tick <= 0.0:
+        raise ValueError(f"tick must be a finite, strictly positive grid size, got {tick!r}")
     ticks = math.floor(round(price / tick, 9))
     return round(ticks * tick, 12)
 
@@ -137,7 +143,12 @@ def ceil_to_tick(price: float, tick: float) -> float:
 
     An ask rests AT or ABOVE its target, so rounding UP can never improve it past (cross down through)
     the target. Mirror of :func:`floor_to_tick` (same FP-tolerance treatment, opposite direction).
+
+    Precondition: ``tick`` is finite and strictly positive (defense-in-depth — the AUTHORITATIVE
+    guard is the ``StrategyObservation.tick_size`` construction validator; Gate #2 MAJOR-5).
     """
+    if not math.isfinite(tick) or tick <= 0.0:
+        raise ValueError(f"tick must be a finite, strictly positive grid size, got {tick!r}")
     ticks = math.ceil(round(price / tick, 9))
     return round(ticks * tick, 12)
 

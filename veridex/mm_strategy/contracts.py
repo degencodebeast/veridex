@@ -32,9 +32,16 @@ Design invariants worth stating once:
 from __future__ import annotations
 
 import hashlib
+import math
 from typing import Final, Literal, Protocol
 
-from pydantic import BaseModel, ConfigDict, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    ValidationInfo,
+    field_validator,
+    model_validator,
+)
 
 from veridex.runtime.evidence import serialize_payload
 
@@ -112,10 +119,35 @@ ProofStatus = Literal[
 
 
 def _reject_price_out_of_unit_interval(value: float) -> float:
-    """Native ``[0,1]`` price guard: rejects decimal-odds-style values (e.g. ``1.4``)."""
+    """Native ``[0,1]`` price guard: rejects decimal-odds-style values (e.g. ``1.4``).
+
+    ``NaN`` / ``±Inf`` fail this bound too (every comparison against ``NaN`` is ``False``, and an
+    infinity is outside ``[0, 1]``), so a unit-interval field is already finite by construction.
+    """
     if not (0.0 <= value <= 1.0):
         raise ValueError(f"price must be a native probability in [0, 1], got {value!r}")
     return value
+
+
+def _reject_non_finite(value: float, field: str) -> float:
+    """Reject ``NaN`` / ``±Inf`` in a native numeric UNIT (Gate #2 MAJOR-5 — REQ-041/070).
+
+    A non-finite input silently DISABLES every downstream comparison (each ``<`` / ``<=`` against a
+    ``NaN`` is ``False``, so a poisoned book slides through a zone / depth / anchor gate it should
+    fail), and a zero-or-``NaN`` tick would crash the total core's directional rounding. Rejecting at
+    construction keeps ``decide`` total for every CONSTRUCTIBLE observation.
+    """
+    if not math.isfinite(value):
+        raise ValueError(f"{field} must be a finite number (no NaN/Inf), got {value!r}")
+    return value
+
+
+def _reject_non_finite_optional(value: float | None, field: str) -> float | None:
+    """As :func:`_reject_non_finite`, but ``None`` (an absent / degraded-book leg) is allowed — the
+    guard rejects a PRESENT non-finite value only, it never forces presence."""
+    if value is None:
+        return None
+    return _reject_non_finite(value, field)
 
 
 class _FrozenModel(BaseModel):
@@ -185,6 +217,11 @@ class RestingOrderView(_FrozenModel):
     def _price_in_unit_interval(cls, value: float) -> float:
         return _reject_price_out_of_unit_interval(value)
 
+    @field_validator("size")
+    @classmethod
+    def _size_is_finite(cls, value: float) -> float:
+        return _reject_non_finite(value, "size")
+
 
 class InventoryProjection(_FrozenModel):
     """Typed net-position + resting-order snapshot the decision reasons over (REQ-020(g))."""
@@ -193,6 +230,11 @@ class InventoryProjection(_FrozenModel):
     resting: tuple[RestingOrderView, ...]
     projection_as_of_ts: int
     fresh: bool
+
+    @field_validator("net_position")
+    @classmethod
+    def _net_position_is_finite(cls, value: float) -> float:
+        return _reject_non_finite(value, "net_position")
 
 
 # --- Observation --------------------------------------------------------------------------
@@ -242,6 +284,26 @@ class StrategyObservation(_FrozenModel):
     inventory: InventoryProjection
     # (h) the single clock the decision is evaluated at
     as_of_ts: int
+
+    @field_validator("tick_size")
+    @classmethod
+    def _tick_size_is_finite_positive(cls, value: float) -> float:
+        # Gate #2 MAJOR-5 / REQ-041/070: the tick GRID divisor must be finite AND strictly positive.
+        # A zero (or non-finite) tick reaches `basis.floor_to_tick`/`ceil_to_tick` (`price / tick`)
+        # and crashes the supposedly-total core with ZeroDivisionError; a negative tick would invert
+        # the maker-safe directional rounding. Reject at construction so `decide` stays total for
+        # every CONSTRUCTIBLE observation — the crash surface is fenced out where the value enters.
+        if not math.isfinite(value) or value <= 0.0:
+            raise ValueError(f"tick_size must be a finite, strictly positive number, got {value!r}")
+        return value
+
+    @field_validator("bid", "ask", "bid_size", "ask_size")
+    @classmethod
+    def _native_units_are_finite(cls, value: float | None, info: ValidationInfo) -> float | None:
+        # Gate #2 MAJOR-5 audit: a PRESENT NaN/Inf in a raw top-of-book price/depth silently disables
+        # the zone / anchor / min-depth comparisons (every `<`/`<=` on NaN is False). None (a degraded
+        # / absent leg) stays legal — only a present non-finite value is rejected.
+        return _reject_non_finite_optional(value, info.field_name or "value")
 
     @field_validator("phase")
     @classmethod

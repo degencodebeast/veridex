@@ -33,6 +33,7 @@ from veridex.mm_strategy.contracts import (
     MarketStatus,
     NeutralIntent,
     ReasonCode,
+    RestingOrderView,
     StrategyDecision,
     StrategyObservation,
     StrategyState,
@@ -252,6 +253,50 @@ def test_future_timestamp_is_construction_error() -> None:
 def test_market_status_image_is_closed() -> None:
     # Defensive: the status alphabet is exactly the four spec values.
     assert frozenset(get_args(MarketStatus)) == {"ACTIVE", "HALTED", "CLOSED", "UNKNOWN"}
+
+
+# --- Finite / positive native-unit construction guard (Gate #2 MAJOR-5 — REQ-041/070) ------
+
+
+def test_tick_size_zero_rejected_at_construction() -> None:
+    # Gate #2 MAJOR-5 / REQ-070 totality: a zero (or non-positive / non-finite) tick_size makes the
+    # directional tick rounding (`floor_to_tick`/`ceil_to_tick`: `price / tick`) crash the
+    # supposedly-total core with ZeroDivisionError. Reject it AT THE BOUNDARY so `decide` stays total
+    # for every CONSTRUCTIBLE observation — the crash surface is removed where the value enters, not
+    # patched with a defensive branch deep in the QUOTE-math terminal.
+    for bad in (0.0, -0.01, float("nan"), float("inf"), float("-inf")):
+        with pytest.raises(ValidationError):
+            _make_observation(tick_size=bad)
+
+    # A valid positive finite tick still constructs — the guard REJECTS bad input, never narrows the
+    # valid set (so every existing valid-tick observation is byte-identical to before).
+    ok = _make_observation(tick_size=0.01)
+    assert ok.tick_size == 0.01
+
+
+def test_non_finite_native_inputs_rejected() -> None:
+    # NaN/Inf in a native price/size field silently DISABLE comparisons (every `<` / `<=` on NaN is
+    # False), so a poisoned book could pass a zone / anchor / depth gate it should fail. Reject
+    # non-finite native units at construction (the Gate #2 MAJOR-5 audit): best_bid / best_ask /
+    # top-of-book depths on the observation, plus the shared inventory value objects.
+    for field in ("bid", "ask", "bid_size", "ask_size"):
+        for bad in (float("nan"), float("inf"), float("-inf")):
+            with pytest.raises(ValidationError):
+                _make_observation(**{field: bad})
+
+    for bad in (float("nan"), float("inf"), float("-inf")):
+        with pytest.raises(ValidationError):
+            InventoryProjection(net_position=bad, resting=(), projection_as_of_ts=1_000, fresh=True)
+        with pytest.raises(ValidationError):
+            RestingOrderView(client_order_id="c1", side="YES", price=0.5, size=bad)
+
+    # None is still allowed on the optional top-of-book legs (a degraded book) — the guard rejects a
+    # PRESENT non-finite value only, it never forces presence.
+    degraded = _make_observation(
+        book_status="gap", bid=None, ask=None, bid_size=None, ask_size=None
+    )
+    assert degraded.bid is None and degraded.ask is None
+    assert degraded.bid_size is None and degraded.ask_size is None
 
 
 # --- StrategyState EWMA accumulator pair invariant (REQ-031/035) ---------------------------

@@ -83,6 +83,7 @@ def _obs(
     bid_size: float | None = 100.0,
     ask_size: float | None = 120.0,
     net_position: float = 0.0,
+    tick_size: float = 0.01,
 ) -> StrategyObservation:
     """A healthy per-tick observation; every ``recv_ts`` is derived ≤ ``as_of_ts`` so construction
     never trips the REQ-022 future-dating guard. Raw top-of-book + zone knobs are exposed so each
@@ -96,7 +97,7 @@ def _obs(
         side="YES",
         token_id="TOKEN-YES",
         venue_market_ref="0xmarket",
-        tick_size=0.01,
+        tick_size=tick_size,
         observation_sequence=observation_sequence,
         book_source_epoch=book_source_epoch,
         bid=bid,
@@ -143,6 +144,46 @@ def _warm_state(
         spread_ref_samples=tuple(0.02 for _ in range(25)),
         depth_ref_samples=tuple(100.0 for _ in range(25)),
     )
+
+
+# --- Gate #2 MAJOR-5: decide is TOTAL for every constructible observation (REQ-070) ---------
+
+
+def test_decide_total_for_all_constructible_observations() -> None:
+    # REQ-070 totality: the REAL `decide` must return EXACTLY ONE decision for every CONSTRUCTIBLE
+    # observation — no ZeroDivisionError / NaN-comparison escape. The crash surface (a zero / non-
+    # finite tick reaching `floor_to_tick`'s `price / tick`) is now removed AT CONSTRUCTION, so the
+    # healthy row-H frame that previously hit `floor_to_tick(price, 0.0)` is either unconstructible
+    # or total — never a partial function that raises through `decide`.
+    config = _config()
+    state = _warm_state()
+
+    # The exact prior crash input is now UNCONSTRUCTIBLE — the ZeroDivisionError can never be reached
+    # because the poisoned observation never exists (fail at the boundary, keep `decide` total).
+    with pytest.raises(ValidationError):
+        _obs(tick_size=0.0)
+
+    # A healthy row-H frame (reaches the E4-T7 QUOTE-math terminal + `floor_to_tick`/`ceil_to_tick`)
+    # returns exactly one decision and a well-typed next state.
+    decision, next_state = decide(_obs(), state, config)
+    assert decision.kind in get_args(DecisionKind)
+    assert isinstance(next_state, StrategyState)
+
+    # Adversarial totality sweep THROUGH the real `decide`: any tick that CONSTRUCTS yields exactly
+    # one decision; the non-finite / non-positive ticks are fenced out at the boundary and never
+    # reach `decide` (so they cannot crash it). Include the previously-fatal 0.0 among the candidates.
+    tick_candidates = [0.0, -0.01, float("nan"), float("inf"), float("-inf"), 0.001, 0.01, 0.05, 0.25]
+    constructed = 0
+    for tick in tick_candidates:
+        try:
+            obs = _obs(tick_size=tick)
+        except ValidationError:
+            continue  # unconstructible input is fenced out at the boundary — never reaches decide
+        constructed += 1
+        d, ns = decide(obs, state, config)  # must NOT raise ZeroDivisionError / NaN escape
+        assert d.kind in get_args(DecisionKind)
+        assert isinstance(ns, StrategyState)
+    assert constructed >= 1  # the valid finite ticks still construct and decide totally
 
 
 # --- RED-01 / AC-004: the anchor is the venue mid, never raw FV -----------------------------
