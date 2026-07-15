@@ -279,3 +279,70 @@ def test_resume_seeds_from_max_including_gap_tail(tmp_path):
     assert all_seqs == [1, 2, 3]
     assert sealed.event_count == 3
     assert replay_reproduces(tmp_path) is True
+
+
+# --- Gate #2 CRITICAL-1 (Codex): resume must reconcile DISK meta + frame an unterminated tail -----
+
+
+def test_resume_stale_meta_cannot_reopen_finalized(tmp_path):
+    """STALE-START vs DISK: a stale START meta must not reopen a FINALIZED session and erase its seal.
+
+    Codex CRITICAL-1(a): resume must reconcile against the DURABLE ``meta.json`` on disk, NOT the
+    caller's claim. A caller passing a fresh START object (all post-start fields None) must NOT
+    bypass the finalized-session guard — otherwise ``LiveRecorder.__init__`` rewrites ``meta.json``
+    with START bytes and erases ``ended_ts`` / ``event_count`` / ``content_hash``. The durable seal
+    (``records.jsonl`` + ``meta.json``) must stay byte-for-byte unchanged, ``content_hash`` non-null.
+    """
+    rec = LiveRecorder(tmp_path, _start_meta())
+    rec.record(_heartbeat(0))
+    rec.finalize(ended_ts=1_700_000_900)  # SEALED
+    rec.close()
+
+    sealed_meta, _, _ = read_session(tmp_path)
+    assert sealed_meta.content_hash is not None  # genuinely finalized
+    records_before = (tmp_path / "records.jsonl").read_bytes()
+    meta_before = (tmp_path / "meta.json").read_bytes()
+
+    # A stale START object — NOT the durable finalized model on disk — must fail closed.
+    with pytest.raises(ValueError):
+        resume_recorder(tmp_path, _start_meta())
+
+    # ZERO mutation: both durable files byte-unchanged, the seal survived.
+    assert (tmp_path / "records.jsonl").read_bytes() == records_before
+    assert (tmp_path / "meta.json").read_bytes() == meta_before
+    resealed, _, _ = read_session(tmp_path)
+    assert resealed.content_hash == sealed_meta.content_hash  # still non-null, NOT erased
+    assert replay_reproduces(tmp_path) is True
+
+
+def test_resume_missing_final_newline_preserves_full_stream(tmp_path):
+    """COMPLETE-but-unterminated final record: resume frames the missing newline so no row is lost.
+
+    Codex CRITICAL-1(b): a VALID final JSON object whose trailing newline was lost in the crash must
+    be framed BEFORE append. Without framing, the next append concatenates onto that final object and
+    ``read_session`` sees one merged, unparseable final line — silently dropping BOTH the original
+    final record and the newly appended one. After the fix the FULL stream (original final record +
+    new event) is present and replay identity holds.
+    """
+    rec = LiveRecorder(tmp_path, _start_meta())
+    rec.record(_heartbeat(0))  # seq 1
+    rec.close()
+
+    # Simulate a crash that persisted the final record's bytes but lost its trailing newline.
+    records_path = tmp_path / "records.jsonl"
+    data = records_path.read_bytes()
+    assert data.endswith(b"\n")
+    records_path.write_bytes(data[:-1])  # complete-but-unterminated final record
+
+    meta, events, _ = read_session(tmp_path)
+    assert [e["sequence_no"] for e in events] == [1]  # the unterminated record still reads
+
+    rec2 = resume_recorder(tmp_path, meta)
+    rec2.record(_heartbeat(1))  # seq 2 — must land on its OWN line, NOT merged onto seq 1
+    sealed = rec2.finalize(ended_ts=1_700_000_900)
+    rec2.close()
+
+    _, events, _ = read_session(tmp_path)
+    assert [e["sequence_no"] for e in events] == [1, 2]  # FULL stream, not an empty/dropped stream
+    assert sealed.event_count == 2
+    assert replay_reproduces(tmp_path) is True

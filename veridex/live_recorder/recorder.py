@@ -178,16 +178,22 @@ def resume_recorder(
     surfaces only at :func:`~veridex.live_recorder.replay.replay_reproduces`); this opener instead:
 
     (iv) FAILS CLOSED FIRST — before ANY truncation / writer-open / append / meta-write — on a
-        FINALIZED or partially-finalized session. Resume recovers a process killed BEFORE
-        ``finalize()``; a completed seal is TERMINAL evidence and must never be reopened/resealed.
-        Only crash-partial START metadata is resumable: ``ended_ts`` / ``event_count`` /
-        ``content_hash`` ALL absent (the start-meta shape). Also raises on any malformed NON-final
-        row, missing / duplicate / regressed ``sequence_no``, so a corrupted middle never resumes.
+        FINALIZED or partially-finalized session, reconciling against the DURABLE on-disk
+        ``meta.json`` (NOT merely the caller-supplied object). Resume recovers a process killed
+        BEFORE ``finalize()``; a completed seal is TERMINAL evidence and must never be
+        reopened/resealed. Both the durable meta AND the supplied object must be crash-partial START
+        shape (``ended_ts`` / ``event_count`` / ``content_hash`` ALL absent), and the supplied object
+        must MATCH the durable meta field-for-field — so a stale START claim can never bypass a
+        durable seal and erase it via the START-meta rewrite in ``__init__``. Also raises on any
+        malformed NON-final row, missing / duplicate / regressed ``sequence_no``, so a corrupted
+        middle never resumes.
     (ii) VALIDATES the durable prefix (every ``sequence_no`` present, unique, strictly increasing)
         in one raw pass BEFORE any append.
     (iii) if the ONLY defect is a crash-truncated FINAL JSON line, PHYSICALLY truncates that
         incomplete tail (to the last complete ``\\n``) before appending — never appends onto
         malformed bytes (that would merge the next row onto the partial and make the tape unreadable).
+        A COMPLETE-but-unterminated final record (valid JSON, trailing ``\\n`` lost in the crash) is
+        instead FRAMED with a newline before append, so the next row never concatenates onto it.
     (i) HYDRATES ``_events`` with the COMPLETE valid durable prefix (events AND gap rows) via
         :func:`~veridex.live_recorder.replay.read_session_strict`, so ``finalize()`` seals the full
         pre+post-restart stream and ``replay_reproduces()`` stays True.
@@ -204,17 +210,31 @@ def resume_recorder(
 
     session_dir = Path(session_dir)
     records_path = session_dir / RECORDS_FILENAME
+    meta_path = session_dir / META_FILENAME
 
-    # (iv) FAIL CLOSED FIRST — only crash-partial START metadata is resumable.
-    if not (
-        meta.ended_ts is None
-        and meta.event_count is None
-        and meta.content_hash is None
-    ):
+    # (iv) FAIL CLOSED FIRST — reconcile against the DURABLE on-disk meta.json, NOT the caller's
+    # claim. A completed (or partial) seal is TERMINAL evidence: it must never be reopened or
+    # resealed, and a stale START object supplied by the caller must NOT be able to erase a durable
+    # seal via the START-meta rewrite in ``LiveRecorder.__init__``. So the finalized-session guard
+    # reads DISK, and the supplied object must match the durable meta field-for-field before any
+    # writer opens.
+    disk_meta = LiveRecorderSessionMeta.model_validate_json(meta_path.read_text())
+    for source_meta, origin in ((disk_meta, "durable meta.json"), (meta, "supplied meta")):
+        if not (
+            source_meta.ended_ts is None
+            and source_meta.event_count is None
+            and source_meta.content_hash is None
+        ):
+            raise ValueError(
+                "resume_recorder refuses a finalized or partially-finalized session (terminal "
+                f"evidence, from {origin}): ended_ts={source_meta.ended_ts!r}, "
+                f"event_count={source_meta.event_count!r}, "
+                f"content_hash={'<set>' if source_meta.content_hash is not None else None!r}"
+            )
+    if meta != disk_meta:
         raise ValueError(
-            "resume_recorder refuses a finalized or partially-finalized session (terminal "
-            f"evidence): ended_ts={meta.ended_ts!r}, event_count={meta.event_count!r}, "
-            f"content_hash={'<set>' if meta.content_hash is not None else None!r}"
+            "resume_recorder: supplied meta is inconsistent with the durable meta.json on disk — "
+            "refusing to rewrite session metadata from a mismatched object"
         )
 
     # (ii)+(iii) Validate the durable prefix and detect a crash-truncated FINAL line in ONE raw pass,
@@ -252,6 +272,12 @@ def resume_recorder(
     if truncated_tail:
         cut = raw.rfind(b"\n")
         records_path.write_bytes(raw[: cut + 1] if cut != -1 else b"")
+    elif raw and not raw.endswith(b"\n"):
+        # (iii-b) COMPLETE-but-unterminated final record: valid JSON whose trailing newline was lost
+        # in the crash. Frame it with a newline BEFORE opening the append writer, so the next append
+        # lands on its OWN line instead of concatenating onto the final object — which would make
+        # read_session see one merged, unparseable final line and silently drop BOTH rows.
+        records_path.write_bytes(raw + b"\n")
 
     # All fail-closed checks passed. Construct in append mode (does NOT clobber records.jsonl or
     # valid rows; rewrites meta.json with the SAME crash-partial START bytes).
