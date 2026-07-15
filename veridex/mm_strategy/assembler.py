@@ -40,6 +40,7 @@ from veridex.mm_strategy.contracts import (
     ProofStatus,
     SourceGenerations,
     StrategyObservation,
+    StreamIdentity,
 )
 
 _MINT_EVENT_TYPE = "MintEvent"
@@ -134,12 +135,16 @@ class FvArrival:
     Minting an :class:`FvArrival` updates the cache the GUARDED arm samples but NEVER mints an
     observation nor advances ``observation_sequence`` — the FV leg has ZERO cadence authority in
     either arm. ``message_id`` / ``proof_status`` ride into the guard leg only when the guard is on.
+    ``identity`` binds the arrival to ITS observation stream (fixture + market + side/token); the
+    guard projection only ever selects an FV whose identity matches the minting tick, so a foreign
+    market/side fair value can never bleed into another stream (Gate #2 MAJOR-2).
     """
 
     source_ts: int
     recv_ts: int
     value: float
     source_epoch: int
+    identity: StreamIdentity
     message_id: str | None = None
     proof_status: ProofStatus = "unavailable_no_message_id"
 
@@ -153,12 +158,16 @@ class ObservationTick:
     ``observation_sequence`` and the projected guard leg to produce the fully-validated observation;
     ``owned`` declares the assembler-owned fields :func:`run_cadence` then authenticates that
     observation against (the factory may assemble only the arm-identical microstructure).
+    ``identity`` is the tick's stream identity: :func:`run_cadence` keys FV selection by it AND
+    authenticates that the built observation reports the SAME identity, so the factory can neither
+    borrow a foreign stream's FV nor mislabel the stream it built (Gate #2 MAJOR-2).
     """
 
     source: MintSource
     source_epoch: int
     recv_ts: int
     owned: AssemblerOwnedFacts
+    identity: StreamIdentity
     build: ObservationFactory
 
     def __post_init__(self) -> None:
@@ -174,12 +183,15 @@ CadenceEvent = FvArrival | ObservationTick
 @dataclass(frozen=True)
 class _CachedFv:
     """One raw FV arrival sealed at its global recorder pair — the guard-scoped cache entry. Carries
-    the FV epoch / proof reference the guarded projection folds into a :class:`GuardFairValue`."""
+    the FV epoch / proof reference the guarded projection folds into a :class:`GuardFairValue`, plus
+    the ``identity`` of the stream that owns it so :func:`project_guard_fv` selects only same-stream
+    FV (Gate #2 MAJOR-2)."""
 
     point: FvPoint
     source_epoch: int
     message_id: str | None
     proof_status: ProofStatus
+    identity: StreamIdentity
 
 
 @dataclass(frozen=True)
@@ -192,7 +204,11 @@ class CadenceRun:
 
 
 def project_guard_fv(
-    fv_cache: list[_CachedFv], mint_pair: tuple[int, int], *, guard_enabled: bool
+    fv_cache: list[_CachedFv],
+    mint_pair: tuple[int, int],
+    *,
+    identity: StreamIdentity,
+    guard_enabled: bool,
 ) -> GuardFairValue | None:
     """Project the guard leg for one observation — the canonical guard-off rule (REQ-020(d2)).
 
@@ -202,15 +218,21 @@ def project_guard_fv(
     Guard-ON samples the single-authority cache at the SEALED global ``mint_pair`` via
     :func:`~veridex.live_recorder.alignment.eligible_fv_pair` (no look-ahead) and abstains (``None``)
     when nothing is visible below the boundary — the FV is never imputed.
+
+    Selection is KEYED by ``identity`` (Gate #2 MAJOR-2): only cache rows whose stream identity
+    equals the minting tick's identity are eligible, so a foreign fixture / market / side FV is
+    INVISIBLE to this stream — a shared process-global cache can no longer broadcast one outcome's
+    fair value across outcomes. Dropping this key re-opens the cross-market/cross-side leak.
     """
     if not guard_enabled:
         return None
+    same_stream = [entry for entry in fv_cache if entry.identity == identity]
     winner = eligible_fv_pair(
-        [entry.point for entry in fv_cache], mint_pair[0], mint_pair[1]
+        [entry.point for entry in same_stream], mint_pair[0], mint_pair[1]
     )
     if winner is None:
         return None
-    cached = next(entry for entry in fv_cache if entry.point is winner)
+    cached = next(entry for entry in same_stream if entry.point is winner)
     return GuardFairValue(
         fv=cached.point.value,
         fv_source_ts=cached.point.source_ts,
@@ -227,19 +249,23 @@ def _authenticate_owned_fields(
     observation_sequence: int,
     guard_fv: GuardFairValue | None,
     owned: AssemblerOwnedFacts,
+    identity: StreamIdentity,
 ) -> None:
     """Fail closed unless the factory reproduced EVERY assembler-owned field verbatim (REQ-020b/027).
 
     The cadence-assigned ``observation_sequence`` and the projected ``guard_fv`` leg are COMPUTED by
     :func:`run_cadence`; the epoch / market-status / match-state facts are DECLARED on the tick via
-    :class:`AssemblerOwnedFacts`. A factory that ignores the injected sequence, injects an FV leg
-    under a guard-off run (``guard_fv`` is ``None`` there, so ANY non-null leg mismatches), or forges
-    an epoch / status / match-state value is REJECTED here — the trust boundary is enforced, not a
-    convention the honest builder happens to follow (Gate #2 MAJOR-1).
+    :class:`AssemblerOwnedFacts`; the stream ``identity`` is the key FV selection was bound to. A
+    factory that ignores the injected sequence, injects an FV leg under a guard-off run (``guard_fv``
+    is ``None`` there, so ANY non-null leg mismatches), forges an epoch / status / match-state value,
+    or mislabels the stream it built (so the FV keyed to ``identity`` would ride a foreign-stream
+    observation) is REJECTED here — the trust boundary is enforced, not a convention the honest
+    builder happens to follow (Gate #2 MAJOR-1/MAJOR-2).
     """
     checks: tuple[tuple[str, object, object], ...] = (
         ("observation_sequence", observation_sequence, built.observation_sequence),
         ("guard_fv", guard_fv, built.guard_fv),
+        ("identity", identity, built.stream_identity()),
         ("book_source_epoch", owned.book_source_epoch, built.book_source_epoch),
         ("market_status", owned.market_status, built.market_status),
         ("market_status_recv_ts", owned.market_status_recv_ts, built.market_status_recv_ts),
@@ -288,6 +314,7 @@ def run_cadence(
                     source="fv",
                     source_epoch=event.source_epoch,
                     recv_ts=event.recv_ts,
+                    identity=event.identity,
                 ),
             )
             fv_cache.append(
@@ -301,6 +328,7 @@ def run_cadence(
                     source_epoch=event.source_epoch,
                     message_id=event.message_id,
                     proof_status=event.proof_status,
+                    identity=event.identity,
                 )
             )
             continue
@@ -313,18 +341,24 @@ def run_cadence(
                 source=event.source,
                 source_epoch=event.source_epoch,
                 recv_ts=event.recv_ts,
+                identity=event.identity,
             ),
         )
-        guard_fv = project_guard_fv(fv_cache, mint_pair, guard_enabled=guard_enabled)
+        guard_fv = project_guard_fv(
+            fv_cache, mint_pair, identity=event.identity, guard_enabled=guard_enabled
+        )
         built = event.build(observation_sequence, guard_fv)
         # The factory assembles only the arm-identical microstructure; the assembler AUTHENTICATES
         # every field it owns before release, so a forged sequence / guard-off FV injection / epoch /
-        # status / match-state value fails closed (Gate #2 MAJOR-1) — not merely a helper convention.
+        # status / match-state / stream-identity value fails closed (Gate #2 MAJOR-1/MAJOR-2) — not
+        # merely a helper convention. Selection was keyed by the tick's identity, so binding the built
+        # observation to that SAME identity forbids the FV riding a mislabeled (foreign) stream.
         _authenticate_owned_fields(
             built,
             observation_sequence=observation_sequence,
             guard_fv=guard_fv,
             owned=event.owned,
+            identity=event.identity,
         )
         observations.append(built)
         mint_pairs.append(mint_pair)

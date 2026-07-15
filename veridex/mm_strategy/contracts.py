@@ -295,6 +295,19 @@ class StrategyObservation(_FrozenModel):
         """``sha256`` hexdigest over the canonical serialization (REQ-020 / REQ-040)."""
         return self._canonical_hash()
 
+    def stream_identity(self) -> StreamIdentity:
+        """The observation's per-stream identity key — field group (a) as a :class:`StreamIdentity`.
+
+        The assembler binds FV selection to this same key, so a built observation can be authenticated
+        against the tick's declared stream identity and a cross-market/cross-side FV cannot bleed in
+        (Gate #2 MAJOR-2)."""
+        return StreamIdentity(
+            fixture_id=self.fixture_id,
+            market_ref=self.market_ref,
+            side=self.side,
+            token_id=self.token_id,
+        )
+
 
 # --- State --------------------------------------------------------------------------------
 
@@ -493,6 +506,24 @@ class MarketStatusEvent(_FrozenModel):
 MintSource = Literal["book", "fv", "market_status", "match_state", "projection"]
 
 
+class StreamIdentity(_FrozenModel):
+    """The typed per-stream identity a mint / FV arrival / cache row is bound to (REQ-020b/027/070).
+
+    The SAME identity leg the observation carries at :class:`StrategyObservation` field group (a) —
+    ``fixture_id`` + ``market_ref`` + ``side`` + ``token_id`` — lifted into a single hashable key so
+    an FV arrival, its cache row, and its mint envelope all declare WHICH observation stream owns
+    them. The guard projection keys FV selection by this identity, so a foreign fixture / market /
+    side FV can NEVER be visible to another stream's minting tick (Gate #2 MAJOR-2). ``raw_gap`` is
+    a per-``(market_ref, side)`` quantity (REQ-070); a shared process-global FV cache with no such
+    key would let one outcome's fair value drive another outcome's residual pull.
+    """
+
+    fixture_id: int
+    market_ref: str
+    side: str
+    token_id: str
+
+
 class MintEvent(_FrozenModel):
     """A typed global-envelope tape row for one minted source observation (REQ-020b/027).
 
@@ -501,6 +532,11 @@ class MintEvent(_FrozenModel):
     per-source generation ``source_epoch``. The durable tape of these rows is the SOLE channel for
     per-source epochs — the assembler reads the durable max per source back from here, never from
     ``meta.json``.
+
+    ``identity`` binds the row to the observation stream it belongs to (Gate #2 MAJOR-2). It is
+    OPTIONAL — an epoch/status probe minted without stream context leaves it ``None`` — but the
+    FV-independent cadence stamps every mint (FV arrival AND non-FV trigger) with its stream
+    identity, so the durable tape row is the persisted analog of the in-memory per-stream FV cache.
     """
 
     sequence_no: int
@@ -508,6 +544,7 @@ class MintEvent(_FrozenModel):
     source: MintSource
     source_epoch: int
     recv_ts: int
+    identity: StreamIdentity | None = None
 
 
 class SourceGenerations(_FrozenModel):

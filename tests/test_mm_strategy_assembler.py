@@ -38,6 +38,7 @@ from veridex.mm_strategy.contracts import (
     SourceGenerations,
     StrategyObservation,
     StrategyState,
+    StreamIdentity,
 )
 from veridex.mm_strategy.core import decide
 
@@ -256,21 +257,29 @@ def _config(*, guard_enabled: bool) -> StrategyConfig:
     return StrategyConfig(guard_enabled=guard_enabled)
 
 
+# The single stream every legacy E3-T4 helper mints into — one fixture / market / side / token.
+_ID_A = StreamIdentity(
+    fixture_id=1, market_ref="TEAM-A/YES", side="YES", token_id="TOKEN-YES"
+)
+
+
 def _observation(
     *,
     observation_sequence: int,
     guard_fv: GuardFairValue | None,
     book_source_epoch: int = 1,
     as_of_ts: int = 1_000,
+    identity: StreamIdentity = _ID_A,
 ) -> StrategyObservation:
     """One healthy per-tick observation; every ``recv_ts`` is ≤ ``as_of_ts`` (REQ-022 guard). The
-    RAW venue / match-state facts are arm-INDEPENDENT — only ``guard_fv`` differs between arms."""
+    RAW venue / match-state facts are arm-INDEPENDENT — only ``guard_fv`` differs between arms.
+    ``identity`` binds the observation's stream leg (a); it defaults to the single legacy stream."""
     recv = as_of_ts - 10
     return StrategyObservation(
-        fixture_id=1,
-        market_ref="TEAM-A/YES",
-        side="YES",
-        token_id="TOKEN-YES",
+        fixture_id=identity.fixture_id,
+        market_ref=identity.market_ref,
+        side=identity.side,
+        token_id=identity.token_id,
         venue_market_ref="0xmarket",
         tick_size=0.01,
         observation_sequence=observation_sequence,
@@ -315,15 +324,21 @@ def _owned(*, as_of_ts: int) -> AssemblerOwnedFacts:
     )
 
 
-def _tick(source: MintSource, recv_ts: int, *, as_of_ts: int) -> ObservationTick:
+def _tick(
+    source: MintSource, recv_ts: int, *, as_of_ts: int, identity: StreamIdentity = _ID_A
+) -> ObservationTick:
     """A non-FV mint whose ``build`` factory binds the cadence-assigned sequence + projected guard
     leg onto arm-identical venue facts (``book_source_epoch`` held at 1 — no reset in this stream).
     ``owned`` declares the assembler-owned fields the driver authenticates the built observation
-    against — the honest factory reproduces them verbatim, so authentication passes."""
+    against — the honest factory reproduces them verbatim, so authentication passes. ``identity``
+    is the tick's stream; the honest factory builds an observation reporting that SAME identity."""
 
     def build(observation_sequence: int, guard_fv: GuardFairValue | None) -> StrategyObservation:
         return _observation(
-            observation_sequence=observation_sequence, guard_fv=guard_fv, as_of_ts=as_of_ts
+            observation_sequence=observation_sequence,
+            guard_fv=guard_fv,
+            as_of_ts=as_of_ts,
+            identity=identity,
         )
 
     return ObservationTick(
@@ -331,6 +346,7 @@ def _tick(source: MintSource, recv_ts: int, *, as_of_ts: int) -> ObservationTick
         source_epoch=1,
         recv_ts=recv_ts,
         owned=_owned(as_of_ts=as_of_ts),
+        identity=identity,
         build=build,
     )
 
@@ -344,11 +360,12 @@ def _ticks() -> list[ObservationTick]:
     ]
 
 
-# FV arrivals of differing feed health — none of which may touch a guard-OFF observation.
-_FV_FRESH = FvArrival(source_ts=500, recv_ts=850, value=0.55, source_epoch=1)
-_FV_FRESH2 = FvArrival(source_ts=600, recv_ts=1_050, value=0.58, source_epoch=1)
-_FV_STALE = FvArrival(source_ts=1, recv_ts=800, value=0.20, source_epoch=1)
-_FV_RECON = FvArrival(source_ts=700, recv_ts=1_050, value=0.62, source_epoch=2)
+# FV arrivals of differing feed health — none of which may touch a guard-OFF observation. All bind
+# the single legacy stream identity ``_ID_A`` (guard-on single-stream selection is unchanged).
+_FV_FRESH = FvArrival(source_ts=500, recv_ts=850, value=0.55, source_epoch=1, identity=_ID_A)
+_FV_FRESH2 = FvArrival(source_ts=600, recv_ts=1_050, value=0.58, source_epoch=1, identity=_ID_A)
+_FV_STALE = FvArrival(source_ts=1, recv_ts=800, value=0.20, source_epoch=1, identity=_ID_A)
+_FV_RECON = FvArrival(source_ts=700, recv_ts=1_050, value=0.62, source_epoch=2, identity=_ID_A)
 
 
 def _healthy_events() -> list[FvArrival | ObservationTick]:
@@ -494,11 +511,12 @@ def test_project_guard_fv_off_never_reads_cache():
             source_epoch=9,
             message_id="m",
             proof_status="proven",
+            identity=_ID_A,
         )
     ]
-    assert project_guard_fv(cache, (1_000, 5), guard_enabled=False) is None
+    assert project_guard_fv(cache, (1_000, 5), identity=_ID_A, guard_enabled=False) is None
     # guard-ON over the same cache DOES surface the leg (non-vacuous contrast).
-    leg = project_guard_fv(cache, (1_000, 5), guard_enabled=True)
+    leg = project_guard_fv(cache, (1_000, 5), identity=_ID_A, guard_enabled=True)
     assert leg is not None and leg.fv == 0.55 and leg.fv_source_epoch == 9
 
 
@@ -524,6 +542,7 @@ def _malicious_tick(
         source_epoch=1,
         recv_ts=as_of_ts - 100,
         owned=_owned(as_of_ts=as_of_ts),
+        identity=_ID_A,
         build=build,
     )
 
@@ -594,3 +613,69 @@ def test_malicious_factory_epoch_status_matchstate_override_fails_closed(
     with pytest.raises(ValueError, match=field_name):
         run_cadence(rec, [_malicious_tick(evil)], guard_enabled=False)
     rec.close()
+
+
+# --- Gate #2 MAJOR-2: the FV cache is keyed by stream identity (no cross-stream broadcast) ----
+# (REQ-020b/027, REQ-070; Codex external review)
+#
+# The FV latest-value cache must carry fixture/market/side/token identity and KEY selection by it,
+# so a foreign outcome's fair value can never drive another outcome's residual pull. These controls
+# reproduce Codex's constructed cross-market broadcast (one FV arrival, honest ticks for markets A
+# and B, both emitting ``guard_fv=0.77``) and a cross-side variant against the actual module.
+
+# A second market on the SAME fixture, and a same-market opposite side — the two foreign streams.
+_ID_B = StreamIdentity(
+    fixture_id=1, market_ref="TEAM-B/YES", side="YES", token_id="TOKEN-B-YES"
+)
+_ID_NO = StreamIdentity(
+    fixture_id=1, market_ref="TEAM-A/YES", side="NO", token_id="TOKEN-NO"
+)
+
+
+def test_fv_does_not_leak_across_markets(tmp_path):
+    """Codex's cross-market control: ONE FV arrival for market A (0.77) then honest guard-ON ticks
+    for A and B → A's observation carries ``guard_fv=0.77``, B's carries ``None`` (NEVER 0.77).
+
+    Without an identity key the process-global cache broadcasts A's fair value onto B's tick (both
+    observations emitted 0.77); keying selection by stream identity makes A's FV INVISIBLE to B."""
+    fv_a = FvArrival(source_ts=500, recv_ts=850, value=0.77, source_epoch=1, identity=_ID_A)
+    tick_a = _tick("book", 900, as_of_ts=1_000, identity=_ID_A)
+    tick_b = _tick("book", 1_090, as_of_ts=1_100, identity=_ID_B)
+
+    run = _cadence(tmp_path, [fv_a, tick_a, tick_b], guard_enabled=True)
+    by_market = {o.market_ref: o for o in run.observations}
+
+    obs_a, obs_b = by_market["TEAM-A/YES"], by_market["TEAM-B/YES"]
+    # A owns the FV — it surfaces on A's guard leg (non-vacuous: the cache IS consulted).
+    assert obs_a.guard_fv is not None and obs_a.guard_fv.fv == 0.77
+    # B is a FOREIGN stream — A's 0.77 must be invisible; B has no FV of its own.
+    assert obs_b.guard_fv is None
+    assert not (obs_b.guard_fv is not None and obs_b.guard_fv.fv == 0.77)
+
+    # Per-stream correctness (not merely "B is always None"): give B its OWN FV and A keeps 0.77
+    # while B now sees ONLY its own 0.33 — neither stream ever reads the other's value.
+    fv_b = FvArrival(source_ts=600, recv_ts=1_000, value=0.33, source_epoch=1, identity=_ID_B)
+    run2 = _cadence(
+        tmp_path / "per_stream", [fv_a, tick_a, fv_b, tick_b], guard_enabled=True
+    )
+    by_market2 = {o.market_ref: o for o in run2.observations}
+    a2, b2 = by_market2["TEAM-A/YES"], by_market2["TEAM-B/YES"]
+    assert a2.guard_fv is not None and a2.guard_fv.fv == 0.77
+    assert b2.guard_fv is not None and b2.guard_fv.fv == 0.33
+
+
+def test_fv_does_not_leak_across_sides(tmp_path):
+    """Cross-side variant: an FV for (market, side=YES) is NOT selected for (market, side=NO).
+
+    A same-market opposite side is a distinct ``(market_ref, side)`` stream (REQ-070 ``raw_gap`` is
+    per outcome); the YES fair value must never alias onto the NO minting tick."""
+    fv_yes = FvArrival(source_ts=500, recv_ts=850, value=0.71, source_epoch=1, identity=_ID_A)
+    tick_yes = _tick("book", 900, as_of_ts=1_000, identity=_ID_A)
+    tick_no = _tick("book", 1_090, as_of_ts=1_100, identity=_ID_NO)
+
+    run = _cadence(tmp_path, [fv_yes, tick_yes, tick_no], guard_enabled=True)
+    by_side = {o.side: o for o in run.observations}
+
+    obs_yes, obs_no = by_side["YES"], by_side["NO"]
+    assert obs_yes.guard_fv is not None and obs_yes.guard_fv.fv == 0.71  # YES owns the FV
+    assert obs_no.guard_fv is None  # NO is a foreign side — YES's 0.71 is invisible
