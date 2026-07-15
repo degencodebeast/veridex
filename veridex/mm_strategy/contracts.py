@@ -336,6 +336,11 @@ class StrategyState(_FrozenModel):
     last_market_status_recv_ts: int | None = None
     # Guard-scoped watermark — None in a guard-off state (no FV element anywhere).
     guard_watermark: GuardStateWatermark | None = None
+    # Last accepted match-state phase (REQ-080 ``phase`` transition trigger). The pure core carries
+    # the prior frame's ``phase`` here and, on the NEXT accepted frame, a differing phase is a
+    # RESET-class (row R) event trigger. ``None`` (fresh/cold-start seed) has no prior phase to
+    # compare, so the first accepted frame merely SEEDS this watermark — never a spurious reset.
+    last_phase: int | None = None
     # Per-outcome accumulators + audit echo + quote lineage.
     outcomes: tuple[OutcomeAccumulator, ...] = ()
     inventory_echo: InventoryProjection | None = None

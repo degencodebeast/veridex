@@ -31,6 +31,8 @@ from veridex.mm_strategy.basis import (
     event_smoother_update,
     halflife_ewma,
     reference_is_warm,
+    rolling_depth_reference,
+    rolling_spread_reference,
 )
 from veridex.mm_strategy.config import StrategyConfig
 from veridex.mm_strategy.contracts import (
@@ -162,6 +164,10 @@ def _accept(
         "last_market_status_epoch": status_epoch,
         "last_market_status_recv_ts": status_recv_ts,
         "guard_watermark": _guard_watermark(observation, state, config),
+        # Advance the REQ-080 phase watermark on EVERY accepted frame (like the clock/sequence
+        # watermark): the row-R ``phase`` transition compares the NEXT frame against this value, and
+        # a reset frame re-baselines it to its own phase so a reconnect never spuriously re-triggers.
+        "last_phase": observation.phase,
     }
     if full_reset:
         update.update(
@@ -208,14 +214,17 @@ def _guard_epoch_delta(
 # row's ``(smoother, refs, basis, cooldown, quote)`` transition. All gates read PRIOR-state
 # accumulator values (compare-then-update, universal); training folds into the NEXT state.
 #
-# SCOPE (E2-T4): the reset/event triggers detectable from a SINGLE frame + state are wired here —
-# ``tick_regime_changed`` (row R) and ``book_status ∈ {gap, excluded}`` (row E, the RED-53 canonical
-# newly-entered gap book), plus data-degraded book-stale / leg-skew (row D). The REMAINING REQ-080
-# triggers that require prior-frame comparison (phase transition, gap-episode END, suspension→reopen,
-# depth-vanish, spread-blowout, mid-jump, level-count floor) are completed in E4 alongside the
-# cancel-plan / intent-plan wiring; they slot into the SAME row-E / row-R branches without reshaping
-# this reducer. The row-H quote here is the eligible DecisionKind CLASS only — E4 fills anchor/zones/
-# prices and the intent plan.
+# SCOPE (E2-T4 + E4-T2): the reset/event triggers are wired via ``_classify_row``. E2-T4 seeded the
+# single-frame triggers — ``tick_regime_changed`` (row R), ``book_status ∈ {gap, excluded}`` (row E,
+# the RED-53 canonical newly-entered gap book), and data-degraded book-stale / leg-skew (row D).
+# E4-T2 completes the REQ-080 venue-book set that reads PRIOR-state references: the ``phase``
+# transition (row R, via ``_phase_transition`` + the ``last_phase`` watermark) and the WARM-reference
+# ratio/jump/floor events (depth-vanish, spread-blowout, mid-jump, level-count floor — row E, via
+# ``_venue_event_reason``, gated behind ``_references_warm``). ``market_status`` / stream / projection
+# stay OUT of the trigger set — they are QUOTE-ONLY blockers (REQ-070/026/097). The remaining REQ-080
+# reset variants (gap-episode END, suspension→reopen) and the cancel/intent PLAN wiring stay for later
+# E4 tasks; they slot into the SAME row-E / row-R branches without reshaping this reducer. The row-H
+# quote here is the eligible DecisionKind CLASS only — E4 fills anchor/zones/prices and the intent plan.
 
 # The seven ACCEPTED-frame rows (row S/STALE is the watermark layer's reject rows, upstream — it
 # never reaches ``_classify_row``). Pinning this as a `Literal`, like every other closed vocabulary
@@ -278,20 +287,96 @@ def _references_warm(state: StrategyState, config: StrategyConfig) -> bool:
     )
 
 
+def _phase_transition(observation: StrategyObservation, state: StrategyState) -> bool:
+    """REQ-080 RESET-class (row R) trigger: the match-state ``phase`` changed vs the PRIOR accepted
+    frame's phase carried on ``state.last_phase``. A fresh / cold-start / reset state
+    (``last_phase is None``) has no prior phase to compare, so the first accepted frame merely SEEDS
+    the phase watermark — never a spurious reset."""
+    return state.last_phase is not None and observation.phase != state.last_phase
+
+
+def _reset_reason(observation: StrategyObservation, state: StrategyState) -> ReasonCode:
+    """The truthful reset reason for an ACCEPTED-frame row-R trigger (REQ-033/036/080). The two
+    reset-class triggers detectable from a single accepted frame + prior state are the in-stream
+    ``tick_regime_changed`` signal and a match-state ``phase`` transition; ``tick_regime_changed``
+    takes precedence when both hold. (The book-epoch RECONNECT reset carries its own truthful
+    ``event_ref_warmup`` reason on the upstream path — this observation never saw a tick regime
+    change, REQ-036 — so it is NEVER routed through here.)"""
+    if observation.tick_regime_changed:
+        return "tick_regime_changed"
+    return "phase_transition"
+
+
+def _venue_event_reason(
+    observation: StrategyObservation, state: StrategyState, config: StrategyConfig
+) -> ReasonCode | None:
+    """The REQ-080 venue-book EVENT-trigger reason for a WARM-reference frame, or ``None`` (row E).
+
+    These ratio/jump/floor gates are evaluable ONLY on warmed references (REQ-080 / REQ-070 row E),
+    so the caller gates this behind :func:`_references_warm`; the reset-class triggers (tick-regime,
+    ``phase``) are row R and the ``gap`` / ``excluded`` book ENTRY is handled separately. Each fired
+    trigger routes the frame to row E (NO_QUOTE + cooldown, no admission). ``market_status`` / stream
+    / projection are DELIBERATELY absent — they are QUOTE-ONLY blockers, never triggers
+    (REQ-070/026/097; the ``market_status != ACTIVE`` mutation adds exactly that and MUST fail).
+
+    Evaluated in a pinned deterministic order (first match wins). Each gate reads the PRIOR-state
+    rolling references / smoothed prior mid (compare-then-update, universal):
+
+    * depth-vanish — top depth ``< min_top_depth`` OR ``< depth_collapse_ratio ×`` the state-carried
+      rolling-depth reference.
+    * spread-blowout — raw spread ``> spread_blowout_multiple ×`` the rolling-spread reference.
+    * mid-jump — ``|raw mid − the STATE-carried smoothed prior mid| > mid_jump_threshold`` (compares
+      the RAW book mid against ``state.smoother_mid``, REQ-036 compare-then-update).
+    * level-count floor — ``level_count_in_band < min_level_count``.
+
+    The depth / spread / mid gates need BOTH raw touches — an absent side yields ``None`` and the gate
+    is skipped (a degraded book is row E via ``book_status`` or row D, never a spurious ratio
+    trigger). Closed §4.4 vocabulary (REQ-063): depth-vanish / spread-blowout / mid-jump all surface
+    as ``book_thin`` — the sole 'venue book untrustworthy to anchor' reason beyond the status codes;
+    a dedicated per-trigger code would be a spec revision, never task discretion.
+    """
+    depth = _top_depth(observation)
+    if depth is not None:
+        depth_ref = rolling_depth_reference(state.depth_ref_samples, config)
+        if depth < config.min_top_depth or depth < config.depth_collapse_ratio * depth_ref:
+            return "book_thin"
+    spread = _spread(observation)
+    if spread is not None:
+        spread_ref = rolling_spread_reference(state.spread_ref_samples, config)
+        if spread > config.spread_blowout_multiple * spread_ref:
+            return "book_thin"
+    mid = _mid(observation)
+    if (
+        mid is not None
+        and state.smoother_mid is not None
+        and abs(mid - state.smoother_mid) > config.mid_jump_threshold
+    ):
+        return "book_thin"
+    if observation.level_count_in_band < config.min_level_count:
+        return "level_count_low"
+    return None
+
+
 def _classify_row(
     observation: StrategyObservation, state: StrategyState, config: StrategyConfig
 ) -> Row:
     """Classify an ACCEPTED observation into EXACTLY ONE of the reducer rows R/E/D/C/F/W/H.
 
     Rows are evaluated in spec REQ-070 order, so an earlier row PRE-EMPTS a later one — most notably
-    a ``tick_regime_changed`` reset (row R) pre-empts the REQ-080 book triggers (row E) for the same
-    frame (Fable-plan-review Minor-1). Purely a function of ``(observation, prior state, config)`` —
-    no clock, no randomness — so decision identity reproduces. (Row S is handled upstream by the
-    watermark layer and never reaches here.)
+    a RESET-class reset (row R: ``tick_regime_changed`` OR a ``phase`` transition) pre-empts the
+    REQ-080 book triggers (row E) for the same frame (Fable-plan-review Minor-1). The row-E ratio /
+    jump / floor triggers (:func:`_venue_event_reason`) are evaluable ONLY on WARM references (REQ-080
+    / REQ-070 row E), so they are gated behind :func:`_references_warm`; below the warmup floor those
+    gates are inadmissible and the frame falls through to row W (which never anchors a cooldown — the
+    liveness guarantee). Purely a function of ``(observation, prior state, config)`` — no clock, no
+    randomness — so decision identity reproduces. (Row S is handled upstream by the watermark layer
+    and never reaches here.)
     """
-    if observation.tick_regime_changed:
+    if observation.tick_regime_changed or _phase_transition(observation, state):
         return "R"
     if observation.book_status in ("gap", "excluded"):
+        return "E"
+    if _references_warm(state, config) and _venue_event_reason(observation, state, config):
         return "E"
     if _book_is_stale(observation, config) or _leg_is_skewed(observation, config):
         return "D"
@@ -457,9 +542,19 @@ def _apply_event(
     observation: StrategyObservation, base: StrategyState, config: StrategyConfig
 ) -> tuple[StrategyDecision, StrategyState]:
     """Row E (EVENT-TRIGGER): NO admission (a trigger frame never trains accumulators); NO_QUOTE +
-    an event cooldown anchored at this frame. The E2-T4 self-contained trigger is entry into a
-    ``gap`` / ``excluded`` book (RED-53); the ratio/jump triggers slot in here in E4."""
-    reason: ReasonCode = "book_gap" if observation.book_status == "gap" else "book_excluded"
+    an event cooldown anchored at this frame. Two trigger families reach here (row R pre-empts both):
+    ENTRY into a ``gap`` / ``excluded`` book (E2-T4; RED-53), and the E4-T2 warm-reference venue
+    events (depth-vanish / spread-blowout / mid-jump / level-count floor; REQ-080). ``base`` admitted
+    nothing on a row-E frame, so its venue accumulators are the PRIOR-state values
+    :func:`_venue_event_reason` recomputes the trigger reason from."""
+    if observation.book_status == "gap":
+        reason: ReasonCode = "book_gap"
+    elif observation.book_status == "excluded":
+        reason = "book_excluded"
+    else:
+        # A warm-reference venue event — row E was classified, so a reason is present; the ``or``
+        # fallback is a mypy-total guard (never taken) that keeps the reason a closed ReasonCode.
+        reason = _venue_event_reason(observation, base, config) or "book_thin"
     next_state = base.model_copy(
         update={"event_cooldown_until_ts": _cooldown_deadline(observation, config)}
     )
@@ -691,7 +786,7 @@ def decide(
     base = _accept(observation, state, config, full_reset=False, basis_reset=basis_reset)
     row = _classify_row(observation, state, config)
     if row == "R":
-        return _apply_reset(observation, base, config, reason="tick_regime_changed")
+        return _apply_reset(observation, base, config, reason=_reset_reason(observation, state))
     if row == "E":
         return _apply_event(observation, base, config)
     if row == "D":

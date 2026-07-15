@@ -40,7 +40,7 @@ from veridex.mm_strategy.contracts import (
     StrategyObservation,
     StrategyState,
 )
-from veridex.mm_strategy.core import _venue_anchor, decide
+from veridex.mm_strategy.core import _classify_row, _venue_anchor, decide
 
 
 def _config(*, guard_enabled: bool = False, **overrides: object) -> StrategyConfig:
@@ -217,14 +217,21 @@ def test_boundary_and_two_sided_zones() -> None:
     d_in, _ = decide(_obs(bid=0.49, ask=0.51), state, config)
     assert d_in.kind == "QUOTE_TWO_SIDED"
 
+    # Each off-mid zone case aligns the state's smoothed prior mid with the frame mid so the E4-T2
+    # REQ-080 MID-JUMP event trigger (|raw mid − smoothed prior mid| > threshold, a warm-reference
+    # row-E pre-emption) does not fire — isolating the row-H boundary / two-sided ZONE logic under test
+    # (a real stream's smoother tracks the mid, so a settled book has no jump).
+
     # Anchor 0.02 is OUTSIDE the boundary zone → NO_QUOTE (boundary_zone).
-    d_boundary, _ = decide(_obs(bid=0.01, ask=0.03), state, config)
+    boundary_state = state.model_copy(update={"smoother_mid": 0.02})
+    d_boundary, _ = decide(_obs(bid=0.01, ask=0.03), boundary_state, config)
     assert d_boundary.kind == "NO_QUOTE"
     assert d_boundary.reason_codes == ("boundary_zone",)
 
     # Anchor 0.80 is inside the boundary zone but OUTSIDE the two-sided band → at most one-sided.
     # Net-flat (net_position == 0) is the pinned abstention (two_sided_zone_exit; REQ-054).
-    d_band, _ = decide(_obs(bid=0.79, ask=0.81, net_position=0.0), state, config)
+    band_state = state.model_copy(update={"smoother_mid": 0.80})
+    d_band, _ = decide(_obs(bid=0.79, ask=0.81, net_position=0.0), band_state, config)
     assert d_band.kind == "NO_QUOTE"
     assert d_band.reason_codes == ("two_sided_zone_exit",)
 
@@ -280,3 +287,159 @@ def test_no_microprice_config_path() -> None:
     # No ``core`` code path references a microprice / smoothed-anchor selection.
     source = inspect.getsource(core).lower()
     assert "microprice" not in source
+
+
+# --- E4-T2: venue-book event detection using state references (REQ-080/AC-010; RED-09/RED-10) ---
+# These pin the REQ-080 venue-book EVENT triggers that pull quotes (NO_QUOTE + cooldown) inside the
+# REAL ``decide`` reducer — ORTHOGONAL to E4-T1's row-H quote-disposition spine. The row-E ratio/jump
+# gates (depth-vanish, spread-blowout, mid-jump) compare the RAW book against the STATE-CARRIED
+# rolling references / smoothed prior mid and are inadmissible while the references warm; the
+# reset-class ``phase`` transition lands in row R (re-seed). ``market_status`` / stream stay OUT of
+# the trigger set — they are admission-QUOTE-only blockers (REQ-070/026/097), never triggers.
+
+
+def test_reconnect_disappearing_depth_pulls_quotes() -> None:
+    # RED-09: after a reconnect the top-of-book depth collapses — a warm-reference DEPTH-VANISH
+    # event. The venue-book trigger PULLS the quote (NO_QUOTE ``book_thin``) and anchors an event
+    # cooldown (REQ-080/081), so no fresh placement occurs until the dwell elapses.
+    config = _config()
+    state = _warm_state()  # warm depth reference (median of 25 samples) == 100.0
+    dwell = config.book_state_dwell_before_quote_ms
+
+    # (a) The ABSOLUTE floor form: top depth min(10, 10) == 10 < ``min_top_depth`` (50).
+    vanished = _obs(bid=0.49, ask=0.51, bid_size=10.0, ask_size=10.0)
+    assert _classify_row(vanished, state, config) == "E"
+    decision, next_state = decide(vanished, state, config)
+    assert decision.kind == "NO_QUOTE"
+    assert decision.reason_codes == ("book_thin",)
+    # The event anchors a cooldown (cancel-plan + cooldown; REQ-081) and ADMITS NOTHING (row E).
+    assert next_state.event_cooldown_until_ts == vanished.as_of_ts + dwell
+    assert next_state.spread_ref_samples == state.spread_ref_samples
+    assert next_state.depth_ref_samples == state.depth_ref_samples
+    assert next_state.smoother_mid == state.smoother_mid
+
+    # (b) The RATIO form INDEPENDENTLY of the absolute floor: with a high rolling-depth reference
+    # (1000), a depth of 100 clears the absolute floor (100 >= 50) yet collapses below
+    # ``depth_collapse_ratio`` (0.25) x 1000 == 250 — depth-vanish still fires.
+    high_ref = state.model_copy(update={"depth_ref_samples": tuple(1000.0 for _ in range(25))})
+    ratio_vanish = _obs(bid=0.49, ask=0.51, bid_size=100.0, ask_size=100.0)
+    assert _classify_row(ratio_vanish, high_ref, config) == "E"
+    d_ratio, _ = decide(ratio_vanish, high_ref, config)
+    assert d_ratio.kind == "NO_QUOTE"
+    assert d_ratio.reason_codes == ("book_thin",)
+
+
+def test_tick_regime_change_invalidates_plan() -> None:
+    # AC-010/RED-10: a ``tick_regime_changed`` frame is a RESET-class trigger (row R) — it pulls the
+    # quote (NO_QUOTE ``tick_regime_changed``), anchors an event cooldown, and RE-SEEDS the smoother
+    # from this frame's own ok-book mid (the reset transition E4-T2 leaves to E2-T4's row R).
+    config = _config()
+    state = _warm_state()
+    dwell = config.book_state_dwell_before_quote_ms
+
+    tick = _obs(bid=0.49, ask=0.51, tick_regime_changed=True)
+    assert _classify_row(tick, state, config) == "R"
+    decision, next_state = decide(tick, state, config)
+    assert decision.kind == "NO_QUOTE"
+    assert decision.reason_codes == ("tick_regime_changed",)
+    # Row R invalidates the plan: cooldown anchored, rolling refs cleared, smoother re-seeded from
+    # this frame's ok mid (0.50) so the references can re-warm.
+    assert next_state.event_cooldown_until_ts == tick.as_of_ts + dwell
+    assert next_state.spread_ref_samples == ()
+    assert next_state.depth_ref_samples == ()
+    assert next_state.smoother_mid == 0.50
+
+
+def test_status_not_in_trigger_list() -> None:
+    # REQ-070/080: ``market_status`` is admission-QUOTE-only, NEVER a venue-book EVENT trigger. A
+    # market_status change ALONE — a fully-healthy, warm, in-band book — must NOT classify row E or
+    # anchor an event cooldown; it stays row H (venue-healthy) and the status only downgrades the
+    # WRITE to NO_QUOTE while admission keeps training. (Mutation: adding ``market_status != ACTIVE``
+    # to the trigger set reclassifies this frame to row E and anchors a cooldown → this test fails.)
+    config = _config()
+    state = _warm_state()
+
+    # A HALTED market over a fully-healthy book (mid 0.50 == smoothed prior mid, depth 100, spread
+    # 0.02, level 5): the venue book is UNCHANGED, so no venue-book trigger fires.
+    obs = _obs(market_status="HALTED", market_status_epoch=5)
+    assert _classify_row(obs, state, config) == "H"
+    decision, next_state = decide(obs, state, config)
+    assert decision.kind == "NO_QUOTE"
+    assert decision.reason_codes == ("market_halted",)
+    # The load-bearing assertion: status is QUOTE-only, so NO event cooldown is created (a real
+    # venue-book trigger WOULD anchor one), and admission is ungated — the venue accumulators train.
+    assert next_state.event_cooldown_until_ts is None
+    assert len(next_state.spread_ref_samples) == len(state.spread_ref_samples) + 1
+    assert len(next_state.depth_ref_samples) == len(state.depth_ref_samples) + 1
+
+
+def test_spread_blowout_and_mid_jump_pull_quotes_only_when_warm() -> None:
+    # REQ-080: the spread-blowout and mid-jump gates compare the RAW book against the STATE-carried
+    # rolling-spread reference / smoothed prior mid, and are INADMISSIBLE while the references warm
+    # (``event_ref_warmup``) — the liveness-preserving warmup gate. Both surface as ``book_thin``.
+    config = _config()
+    warm = _warm_state()  # rolling-spread ref (median 25x0.02) == 0.02; smoothed prior mid == 0.5
+
+    # (a) SPREAD-BLOWOUT: raw spread 0.10 > ``spread_blowout_multiple`` (3.0) x 0.02 == 0.06. The mid
+    # (bid 0.45 + ask 0.55)/2 == 0.50 equals the smoothed prior mid, so ONLY the spread gate fires.
+    blowout = _obs(bid=0.45, ask=0.55)
+    assert _classify_row(blowout, warm, config) == "E"
+    d_spread, _ = decide(blowout, warm, config)
+    assert d_spread.kind == "NO_QUOTE"
+    assert d_spread.reason_codes == ("book_thin",)
+
+    # (b) MID-JUMP: raw mid (0.55 + 0.57)/2 == 0.56 vs smoothed prior mid 0.5 — a jump of 0.06 >
+    # ``mid_jump_threshold`` (0.02). Depth 100 and spread 0.02 are nominal, so ONLY mid-jump fires.
+    jump = _obs(bid=0.55, ask=0.57)
+    assert _classify_row(jump, warm, config) == "E"
+    d_jump, _ = decide(jump, warm, config)
+    assert d_jump.kind == "NO_QUOTE"
+    assert d_jump.reason_codes == ("book_thin",)
+
+    # (c) WARMUP INADMISSIBILITY: the SAME jumped/blown frames on a state whose references are BELOW
+    # ``ref_min_samples`` are row W (WARMUP) — the ratio/jump gates cannot fire without a warm
+    # reference, so the frame ADMITS (no cooldown) instead of pulling quotes (REQ-080 liveness).
+    cold = StrategyState(
+        last_observation_sequence=1,
+        last_book_source_epoch=1,
+        last_as_of_ts=99_000,
+        last_market_status_epoch=1,
+        last_market_status_recv_ts=1,
+        smoother_mid=0.5,
+        smoother_mid_ts=99_000,
+        spread_ref_samples=(0.02, 0.02),  # 2 < ref_min_samples (20) => NOT warm
+        depth_ref_samples=(100.0, 100.0),
+    )
+    assert _classify_row(jump, cold, config) == "W"
+    d_cold, cold_next = decide(jump, cold, config)
+    assert d_cold.kind == "NO_QUOTE"
+    assert d_cold.reason_codes == ("event_ref_warmup",)
+    assert cold_next.event_cooldown_until_ts is None  # warmup never creates a cooldown
+
+
+def test_phase_transition_is_a_reset_trigger() -> None:
+    # REQ-080: a match-state ``phase`` transition is a RESET-class trigger (row R) — it pulls the
+    # quote (NO_QUOTE ``phase_transition``), anchors an event cooldown, and re-seeds the smoother.
+    # It compares against the phase carried on the PRIOR state (``last_phase``); a state with no prior
+    # phase merely SEEDS the watermark (no spurious reset).
+    config = _config()
+    dwell = config.book_state_dwell_before_quote_ms
+    # A warm state whose LAST accepted phase was 0; the incoming frame is phase 1 → a transition.
+    state = _warm_state().model_copy(update={"last_phase": 0})
+
+    obs = _obs(bid=0.49, ask=0.51)  # phase == 1 (the _obs default)
+    assert obs.phase == 1
+    assert _classify_row(obs, state, config) == "R"
+    decision, next_state = decide(obs, state, config)
+    assert decision.kind == "NO_QUOTE"
+    assert decision.reason_codes == ("phase_transition",)
+    assert next_state.event_cooldown_until_ts == obs.as_of_ts + dwell
+    assert next_state.smoother_mid == 0.50  # re-seeded from this ok-book mid
+    assert next_state.last_phase == 1  # the phase watermark advances to the current frame
+
+    # No prior phase (``last_phase is None``) merely SEEDS the watermark — never a spurious reset.
+    seed_state = _warm_state()
+    assert seed_state.last_phase is None
+    assert _classify_row(obs, seed_state, config) == "H"
+    _, seeded = decide(obs, seed_state, config)
+    assert seeded.last_phase == 1
