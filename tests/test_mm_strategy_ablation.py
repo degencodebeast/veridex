@@ -64,6 +64,7 @@ from tests.mm_strategy_ablation_harness import (
     venue_future_mid_series,
 )
 from veridex.mm_strategy.contracts import NeutralIntent, StrategyDecision
+from veridex.mm_strategy.core import decide
 
 # --- RED-24: arm identity — the config diff is the guard block, nothing else ----------------
 
@@ -368,6 +369,218 @@ def test_quiescent_streams_identical(tmp_path) -> None:
     # ... and the arms are NOT byte-identical objects: their identity stamps (config_hash / decision_id)
     # differ, so the match is over decision SUBSTANCE — exactly what an honest A/B holds equal.
     assert guarded.decisions_digest != baseline.decisions_digest
+
+
+# ============================================================================================
+# Gate #4 F-IMPORTANT-2 (REQ-032 / REQ-070 rows F/W): basis warmup falls through to venue-only
+# ============================================================================================
+# During basis warmup the residual guard is INERT (REQ-032) and "the venue-only core still applies",
+# so the guarded arm (B) must produce the SAME venue decision as the FV-blind baseline (A) on every
+# matched opportunity — the A/B HONESTY FOUNDATION. AC-025's quiescent-control identity compares the
+# :func:`_decision_signature` (kind + reason_codes + legs), so a spurious NO_QUOTE(basis_warmup) on a
+# matched opportunity is a REAL divergence that inflates arm B's abstention count. The E6 control
+# (``ref_min_samples == basis_min_samples == 2``) collapses to zero width the window where references
+# are WARM but the basis is still COLD, hiding the divergence; these tests reopen it with
+# ``basis_min_samples > ref_min_samples``.
+#
+# Two rows carry the inert-guard warmup:
+#   * row H — guard on, refs warm, basis cold: the WHOLE guard block (FV-freshness + prematch + residual)
+#     is bypassed → venue-only, signature == baseline (tests 1 and 5).
+#   * row F — an ``fv_source_epoch`` increment clears the basis: dispositioned per its UNDERLYING row —
+#     refs warm → venue-only (test 2), refs cold → NO_QUOTE(event_ref_warmup) (test 3).
+# REQ-070 row F reads "per the underlying row, with the guard inert (``basis_warmup``)"; the controller
+# ruling reads the parenthetical as NAMING the inert cause, not mandating NO_QUOTE — tests 2 and 3
+# encode that interpretation, PENDING Codex confirmation in the re-review packet.
+
+_WARMUP_TAPE = "quiescent"  # 4-tick FV-fresh no-trigger tape; mid 0.50, fv 0.55 (residual 0.0)
+
+
+def _followon(template, *, observation_sequence, as_of_ts, fv_source_epoch=None, stale_fv=False):
+    """Clone a warmed quiescent observation into a follow-on frame (book epoch + refs UNCHANGED).
+
+    ``fv_source_epoch=None`` strips the guard leg — the guard-off/baseline frame. A guarded frame
+    carries a FRESH FV unless ``stale_fv`` pushes ``fv_recv_ts`` past ``fv_freshness_ms``. Every
+    ``recv_ts`` stays ``<= as_of_ts`` (REQ-022). Passing ``fv_source_epoch`` ABOVE the warmed
+    watermark makes the frame an FV-epoch increment (row F); passing the SAME value keeps it on its
+    underlying W/H row. The venue book / inventory are arm-identical, so cloning the guarded template
+    and dropping the guard leg yields the byte-matching baseline frame.
+    """
+    fresh_recv = as_of_ts - 100
+    update = {
+        "observation_sequence": observation_sequence,
+        "as_of_ts": as_of_ts,
+        "book_recv_ts": fresh_recv,
+        "match_state_recv_ts": fresh_recv,
+        "market_status_recv_ts": fresh_recv,
+        "inventory": template.inventory.model_copy(update={"projection_as_of_ts": as_of_ts}),
+    }
+    if fv_source_epoch is None:
+        update["guard_fv"] = None
+    else:
+        update["guard_fv"] = template.guard_fv.model_copy(
+            update={
+                "fv_source_epoch": fv_source_epoch,
+                # transport-stale ⇒ age > fv_freshness_ms (10 s); fresh ⇒ 300 ms old. Both <= as_of_ts.
+                "fv_recv_ts": (as_of_ts - 20_000) if stale_fv else (as_of_ts - 300),
+                "fv_source_ts": (as_of_ts // 1000) - 2,
+            }
+        )
+    return template.model_copy(update=update)
+
+
+def test_basis_warmup_quiescent_arms_identical(tmp_path) -> None:
+    """RED — the A/B honesty foundation: with ``basis_min_samples > ref_min_samples`` a window exists
+    where references are WARM but the basis is still COLD. REQ-032 makes the guard inert there and the
+    venue-only core still applies, so the guarded arm must produce the SAME venue decision as the
+    FV-blind baseline on every such matched opportunity.
+
+    Currently FAILS: on the refs-warm/basis-cold frame the guarded arm returns NO_QUOTE(basis_warmup)
+    while the baseline arm quotes two-sided — the spurious, non-guard abstention this fix removes.
+    """
+    overrides = {**load_base_config_overrides(), "ref_min_samples": 2, "basis_min_samples": 5}
+    arms = arm_configs(overrides)
+    baseline = replay_arm(load_tape(_WARMUP_TAPE), arms.baseline, tmp_path / "a")
+    guarded = replay_arm(load_tape(_WARMUP_TAPE), arms.guarded, tmp_path / "b")
+
+    base_sig = [_decision_signature(d) for d in baseline.decisions]
+    guard_sig = [_decision_signature(d) for d in guarded.decisions]
+    # whole-stream SUBSTANCE identity: during basis warmup the guard changes NOTHING (venue-only).
+    assert guard_sig == base_sig
+
+    # non-vacuity 1: the basis stayed COLD for the whole tape (never reached basis_min_samples), so the
+    # identity is proven over the basis-warmup window — not a fully-warm fall-through where the guard
+    # ran and found residual 0.0.
+    assert guarded.final_state.basis_sample_count < overrides["basis_min_samples"]
+    # non-vacuity 2: references DID warm — at least one frame is a genuine venue-only two-sided quote (a
+    # matched opportunity), so the arms agree on SUBSTANCE, not on a blanket warmup abstention.
+    window = [i for i, d in enumerate(baseline.decisions) if d.kind == "QUOTE_TWO_SIDED"]
+    assert window, "expected >=1 refs-warm/basis-cold two-sided frame (the collapsed E6 window)"
+    for i in window:
+        assert guarded.decisions[i].kind == "QUOTE_TWO_SIDED"
+        assert "basis_warmup" not in guarded.decisions[i].reason_codes
+    # non-vacuity 3: the guarded arm genuinely saw a fresh FV (a live guard, not an absent-FV artefact).
+    assert any(o.guard_fv is not None for o in guarded.observations)
+
+
+def test_fv_epoch_reset_refs_warm_falls_through_to_venue_only(tmp_path) -> None:
+    """RED — REQ-070 row F with WARM references (underlying row H): an ``fv_source_epoch`` increment
+    (an FV reconnect) clears the basis, so the guard is inert and the frame is dispositioned per its
+    underlying row — a venue-only two-sided quote, byte-identical in SUBSTANCE to the FV-blind baseline.
+
+    Currently FAILS: the guarded arm returns NO_QUOTE(basis_warmup). (REQ-070 row-F interpretation per
+    the controller ruling — the parenthetical ``basis_warmup`` names the inert cause, not the decision —
+    PENDING Codex confirmation.)
+    """
+    arms = arm_configs(_control_overrides())  # ref_min=2, basis_min=2 → both arms fully warm post-tape
+    warm_g = replay_arm(load_tape(_WARMUP_TAPE), arms.guarded, tmp_path / "g")
+    warm_b = replay_arm(load_tape(_WARMUP_TAPE), arms.baseline, tmp_path / "b")
+    template = warm_g.observations[0]
+    seq = warm_g.final_state.last_observation_sequence + 1
+    as_of = warm_g.final_state.last_as_of_ts + 10_000
+
+    # FV reconnect: fv_source_epoch increments (book epoch UNCHANGED) → basis-only reset (row F).
+    epoch = template.guard_fv.fv_source_epoch + 1
+    guarded_frame = _followon(template, observation_sequence=seq, as_of_ts=as_of, fv_source_epoch=epoch)
+    baseline_frame = _followon(template, observation_sequence=seq, as_of_ts=as_of)  # guard leg stripped
+
+    g_decision, _ = decide(guarded_frame, warm_g.final_state, arms.guarded)
+    b_decision, _ = decide(baseline_frame, warm_b.final_state, arms.baseline)
+
+    # the baseline (row H, guard off) quotes two-sided; the guarded row-F frame must MATCH it.
+    assert b_decision.kind == "QUOTE_TWO_SIDED" and b_decision.reason_codes == ()
+    assert _decision_signature(g_decision) == _decision_signature(b_decision)
+    # explicit: the guard is inert (venue-only), NOT a NO_QUOTE(basis_warmup) abstention.
+    assert g_decision.kind == "QUOTE_TWO_SIDED"
+    assert "basis_warmup" not in g_decision.reason_codes
+
+
+def test_fv_epoch_reset_refs_cold_is_event_ref_warmup(tmp_path) -> None:
+    """RED / Site-2 routing guard-rail — REQ-070 row F with COLD references (underlying row W): an
+    ``fv_source_epoch`` increment while references are still below ``ref_min_samples`` dispositions per
+    the underlying W row → NO_QUOTE(event_ref_warmup), NOT NO_QUOTE(basis_warmup) and NEVER a quote.
+
+    Proves Site-2 routes row F to the CORRECT underlying row and the fall-through never fires while
+    references are cold (row-W venue-reference warmup is a genuinely-unsafe quote, REQ-080). Currently
+    FAILS: the guarded arm returns NO_QUOTE(basis_warmup).
+    """
+    # ref_min high so references never warm on the 4-tick tape; basis_min low so the guard watermark is
+    # seeded (the FV-epoch increment is detectable) while the underlying row stays W, not H.
+    overrides = {**load_base_config_overrides(), "ref_min_samples": 10, "basis_min_samples": 2}
+    arms = arm_configs(overrides)
+    warm_g = replay_arm(load_tape(_WARMUP_TAPE), arms.guarded, tmp_path / "g")
+    template = warm_g.observations[0]
+    seq = warm_g.final_state.last_observation_sequence + 1
+    as_of = warm_g.final_state.last_as_of_ts + 10_000
+
+    epoch = template.guard_fv.fv_source_epoch + 1  # FV-epoch increment (row F)
+    frame = _followon(template, observation_sequence=seq, as_of_ts=as_of, fv_source_epoch=epoch)
+    decision, _ = decide(frame, warm_g.final_state, arms.guarded)
+
+    assert decision.kind == "NO_QUOTE"
+    assert decision.reason_codes == ("event_ref_warmup",)
+    # non-vacuity: this genuinely was an FV-epoch frame (watermark seeded) with references below floor.
+    assert warm_g.final_state.guard_watermark is not None
+    assert len(warm_g.final_state.spread_ref_samples) < overrides["ref_min_samples"]
+
+
+def test_venue_reference_warmup_still_blocks(tmp_path) -> None:
+    """Guard-rail (Row W UNCHANGED): while references are COLD (below ``ref_min_samples``) every
+    accepted frame is NO_QUOTE(event_ref_warmup) in BOTH arms — the basis-warmup fall-through NEVER
+    fires while references are cold (that is venue-reference warmup, REQ-070 row W, where the
+    event-protection gates are not yet evaluable so quoting is genuinely unsafe).
+
+    Passes pre- AND post-fix; it goes red only if the fall-through mis-fires on a refs-cold frame.
+    """
+    overrides = {**load_base_config_overrides(), "ref_min_samples": 10, "basis_min_samples": 5}
+    arms = arm_configs(overrides)
+    baseline = replay_arm(load_tape(_WARMUP_TAPE), arms.baseline, tmp_path / "a")
+    guarded = replay_arm(load_tape(_WARMUP_TAPE), arms.guarded, tmp_path / "b")
+
+    assert [_decision_signature(d) for d in guarded.decisions] == [
+        _decision_signature(d) for d in baseline.decisions
+    ]
+    # every guarded warmup frame is a venue-reference-warmup abstention — never a quote, never basis_warmup.
+    assert all(d.kind != "QUOTE_TWO_SIDED" for d in guarded.decisions)
+    assert all("basis_warmup" not in d.reason_codes for d in guarded.decisions)
+    # non-vacuity: references really stayed COLD (smoother seeded, refs below floor) and ≥1 frame blocked.
+    assert guarded.final_state.smoother_mid is not None
+    assert len(guarded.final_state.spread_ref_samples) < overrides["ref_min_samples"]
+    assert any(d.reason_codes == ("event_ref_warmup",) for d in guarded.decisions)
+
+
+def test_stale_fv_during_basis_warmup_is_venue_only(tmp_path) -> None:
+    """RED (reading-B proof) — the WHOLE guard, including the FV-freshness gate, is inert during basis
+    warmup: guard ON, references WARM, basis COLD, FV transport-stale (no epoch change → underlying row
+    H) → the guarded arm falls through to the venue-only decision, byte-identical to the FV-blind
+    baseline — NOT NO_QUOTE(txline_stale).
+
+    If the FV-freshness gate fired during basis warmup, a stale-FV frame would abstain on arm B while
+    arm A quotes → a dishonest divergence attributed to a guard that cannot act anyway (no basis).
+    Currently FAILS: the guarded arm returns NO_QUOTE(txline_stale) (the FV-freshness gate fires FIRST).
+    """
+    overrides = {**load_base_config_overrides(), "ref_min_samples": 2, "basis_min_samples": 10}
+    arms = arm_configs(overrides)
+    warm_g = replay_arm(load_tape(_WARMUP_TAPE), arms.guarded, tmp_path / "g")
+    warm_b = replay_arm(load_tape(_WARMUP_TAPE), arms.baseline, tmp_path / "b")
+    template = warm_g.observations[0]
+    seq = warm_g.final_state.last_observation_sequence + 1
+    as_of = warm_g.final_state.last_as_of_ts + 10_000
+
+    # SAME fv epoch (no reset → underlying row H), but the FV leg is transport-stale.
+    epoch = template.guard_fv.fv_source_epoch
+    guarded_frame = _followon(
+        template, observation_sequence=seq, as_of_ts=as_of, fv_source_epoch=epoch, stale_fv=True
+    )
+    baseline_frame = _followon(template, observation_sequence=seq, as_of_ts=as_of)
+
+    g_decision, _ = decide(guarded_frame, warm_g.final_state, arms.guarded)
+    b_decision, _ = decide(baseline_frame, warm_b.final_state, arms.baseline)
+
+    assert b_decision.kind == "QUOTE_TWO_SIDED"
+    assert _decision_signature(g_decision) == _decision_signature(b_decision)
+    assert "txline_stale" not in g_decision.reason_codes
+    # non-vacuity: the basis really is still below the floor (cold) at this frame.
+    assert warm_g.final_state.basis_sample_count < overrides["basis_min_samples"]
 
 
 def _place_decision(client_order_id: str) -> StrategyDecision:

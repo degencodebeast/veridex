@@ -657,25 +657,33 @@ def test_stale_or_suspended_fv_no_submit_quote() -> None:
     assert d_susp.reason_codes == ("txline_suspended",)
 
 
-# --- AC-011 / REQ-032: pre-warmup the guard is inert (basis_warmup) -------------------------
+# --- AC-011 / REQ-032: pre-warmup the guard is inert → venue-only (Gate #4 F-IMPORTANT-2) ----
 
 
 def test_warmup_guard_inert() -> None:
-    # Below ``basis_min_samples`` accepted samples the residual guard is INERT: the guarded frame is
-    # NO_QUOTE(basis_warmup) and the venue-only core still governs — a guard-OFF frame on the SAME
-    # book QUOTES (REQ-032). Warm venue references isolate the BASIS warmup from event warmup.
+    # Below ``basis_min_samples`` accepted samples the residual guard is INERT and "the venue-only core
+    # still applies" (REQ-032 / Gate #4 F-IMPORTANT-2): the guarded frame falls THROUGH to the SAME
+    # venue-only two-sided quote the guard-OFF baseline produces on the SAME book — NOT a spurious
+    # NO_QUOTE(basis_warmup) abstention (which would inflate arm B's abstention count on a matched
+    # opportunity, breaking the AC-025 quiescent-control identity). Warm venue references isolate the
+    # BASIS warmup from event (venue-reference) warmup.
     guarded = _config(guard_enabled=True)
     baseline = _config(guard_enabled=False)
     # Venue references warm, but the basis holds only 5 < basis_min_samples (30) accepted samples.
     state = _guarded_warm_state(basis_gap=0.0, basis_count=5)
 
+    # The guard is inert during basis warmup → the venue-only two-sided quote, with NO basis_warmup reason.
     d_guard, _ = decide(_obs(guard_fv=_fresh_fv(fv=0.55)), state, guarded)
-    assert d_guard.kind == "NO_QUOTE"
-    assert d_guard.reason_codes == ("basis_warmup",)
+    assert d_guard.kind == "QUOTE_TWO_SIDED"
+    assert d_guard.reason_codes == ()
 
-    # The venue-only core still applies: with the guard OFF the same book QUOTES.
+    # ... and it is the SAME decision the guard-OFF baseline produces on the SAME book (arm identity):
+    # both venue-only, same priced legs (side + price), the FV-blind core untouched.
     d_base, _ = decide(_obs(), state, baseline)
     assert d_base.kind == "QUOTE_TWO_SIDED"
+    assert [(leg.leg_role, leg.price) for leg in d_guard.intent_plan] == [
+        (leg.leg_role, leg.price) for leg in d_base.intent_plan
+    ]
 
 
 # --- REQ-074: the event gate strictly precedes the residual guard ---------------------------

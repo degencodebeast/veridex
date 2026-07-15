@@ -327,10 +327,15 @@ def test_fv_epoch_increment_resets_basis_only() -> None:
         state,
         _config(guard_enabled=True),
     )
-    # E2-T4 row F (fv-epoch increment; frame otherwise W/H): the guard is inert until the basis
-    # re-warms, so the disposition is NO_QUOTE(basis_warmup).
+    # E2-T4 row F (fv-epoch increment): the FV reset clears the basis, so the guard is INERT and the
+    # frame is dispositioned PER ITS UNDERLYING W/H row (REQ-070 row F / REQ-032 / Gate #4
+    # F-IMPORTANT-2 — the parenthetical ``basis_warmup`` names the inert cause, not the decision;
+    # controller ruling, pending Codex). Here ``_seeded_state`` holds only 2 rolling-reference samples
+    # (< ``ref_min_samples`` 20), so the UNDERLYING row is W → NO_QUOTE(event_ref_warmup), NOT the
+    # former unconditional NO_QUOTE(basis_warmup). (The refs-WARM row-F path → venue-only quote is
+    # covered by the ``[F]`` case of ``test_every_frame_class_matches_exactly_one_row`` below.)
     assert decision.kind == "NO_QUOTE"
-    assert decision.reason_codes == ("basis_warmup",)
+    assert decision.reason_codes == ("event_ref_warmup",)
     # Basis window CLEARED-then-ADMIT (Codex R6 MAJOR-1.2): exactly the current valid FV sample is
     # re-admitted as the first sample (raw_gap = fv 0.5 − mid 0.5 = 0.0 at this frame's as_of_ts).
     assert next_state.basis_samples == ((1_100, 0.0),)
@@ -677,7 +682,12 @@ def _row_cases() -> list[tuple[str, StrategyObservation, StrategyState, Strategy
             "NO_QUOTE",
             ("event_cooldown",),
         ),
-        # F — FV-EPOCH increment (guarded arm): basis cleared-then-admit, guard inert (basis_warmup).
+        # F — FV-EPOCH increment (guarded arm): basis cleared-then-admit, guard INERT. Still classifies
+        # as EXACTLY row F (totality intact), but is dispositioned per its UNDERLYING row (REQ-070 row F
+        # / Gate #4 F-IMPORTANT-2): ``_warm_state`` has WARM references, so the underlying row is H and
+        # the cleared-cold basis keeps the guard block inert → the venue-only two-sided quote (matching
+        # the FV-blind baseline), NOT the former NO_QUOTE(basis_warmup). (``basis_warmup`` names the
+        # inert cause, not the decision; controller ruling, pending Codex.)
         (
             "F",
             _obs(
@@ -688,8 +698,8 @@ def _row_cases() -> list[tuple[str, StrategyObservation, StrategyState, Strategy
             _warm_state(guard_watermark=GuardStateWatermark(fv_source_epoch=1)),
             guarded,
             "F",
-            "NO_QUOTE",
-            ("basis_warmup",),
+            "QUOTE_TWO_SIDED",
+            (),
         ),
         # W — WARMUP: healthy non-trigger frame with references below ref_min_samples (2 < 20).
         (

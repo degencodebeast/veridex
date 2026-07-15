@@ -830,8 +830,9 @@ def _basis_is_warm(state: StrategyState, config: StrategyConfig) -> bool:
     """REQ-032 basis warmup: at least ``basis_min_samples`` ACCEPTED basis samples have folded since
     the last basis reset. Reads the explicit ``basis_sample_count`` so warmup is HONEST for BOTH
     estimators — the ``halflife_ewma`` accumulator collapses its history into one scalar and cannot
-    be counted from ``basis_samples``. Below this floor the residual guard is inert (``basis_warmup``)
-    while the venue-only core still governs the quote (REQ-032)."""
+    be counted from ``basis_samples``. Below this floor the residual guard is INERT and the venue-only
+    core still governs the quote (REQ-032 / Gate #4 F-IMPORTANT-2): the guard block is bypassed
+    ENTIRELY — no ``basis_warmup`` reason is emitted and the decision matches the FV-blind baseline."""
     return state.basis_sample_count >= config.basis_min_samples
 
 
@@ -1141,16 +1142,24 @@ def _quote_disposition(
         return _decide("NO_QUOTE", ("two_sided_zone_exit",))
     # --- GUARD slot (E4-T3): TxLINE basis/residual guard -> abstain / (E4-T4/T5) escalate ---
     # Guard-scoped (REQ-070 guard block / REQ-074..076): the baseline arm (guard OFF) never enters
-    # here, so a stale/missing FV can never make it abstain (Fable F1). The pinned order is FV
-    # freshness/suspension/presence (REQ-022/076) -> basis warmup (REQ-032) -> extreme residual
-    # (REQ-075). The event gate strictly PRECEDES this whole block: a row-C cooldown (or row-R/E) is
-    # resolved upstream in the reducer and never reaches the row-H disposition (REQ-074).
-    if config.guard_enabled:
+    # here, so a stale/missing FV can never make it abstain (Fable F1). REQ-032 / Gate #4 F-IMPORTANT-2:
+    # during BASIS WARMUP the residual guard is INADMISSIBLE and the guard is INERT — "the venue-only
+    # core still applies". So the ENTIRE guard block runs ONLY when the basis is warm; while the basis
+    # is cold the block is bypassed (NO ``basis_warmup`` reason, and NOT even the FV-freshness gate) and
+    # the frame falls through to the venue-only quote below, producing the SAME (kind, reason_codes,
+    # legs) the FV-blind baseline arm produces for this frame (AC-025 quiescent-control identity — a
+    # spurious NO_QUOTE(basis_warmup) here would inflate arm B's abstention count on a MATCHED
+    # opportunity). Gating the whole block (not merely relocating the warmup check) is load-bearing: if
+    # the FV-freshness gate fired during basis warmup, a stale/missing FV would abstain on arm B while
+    # arm A quotes — a dishonest divergence attributed to a guard that cannot act anyway (no basis). When
+    # the basis IS warm the pinned in-block order is FV freshness/suspension/presence (REQ-022/076) ->
+    # prematch basis gate (REQ-078) -> extreme residual (REQ-075) -> side pull (REQ-073). The event gate
+    # strictly PRECEDES this whole block: a row-C cooldown (or row-R/E) is resolved upstream in the
+    # reducer and never reaches the row-H disposition (REQ-074).
+    if config.guard_enabled and _basis_is_warm(base, config):
         fv_block = _guard_fv_block_reason(observation, config)
         if fv_block is not None:
             return _decide("NO_QUOTE", (fv_block,))
-        if not _basis_is_warm(base, config):
-            return _decide("NO_QUOTE", ("basis_warmup",))
         # E4-T5 PRE-MATCH BASIS GATE (REQ-078/AC-054): pre-match ONLY (``phase == 0``), with the
         # basis warm, a persistent basis WIDER than the venue's OWN top-of-book spread
         # (``|basis| >= best_ask − best_bid``) means the pre-match edge estimate is unreliable → fail
@@ -1267,7 +1276,12 @@ def _apply_healthy(
     the guarded basis trains (row F = clear-then-admit via the pre-cleared ``base``); any elapsed
     cooldown clears to ``None`` (WARMUP never anchors one — the liveness E2-T5 proves). Quote:
 
-    * F (fv-epoch): guard inert until the basis re-warms → NO_QUOTE ``basis_warmup``.
+    * F (fv-epoch): the FV reset cleared the basis, so the guard is INERT (REQ-032 / REQ-070 row F /
+      Gate #4 F-IMPORTANT-2); the frame is dispositioned PER ITS UNDERLYING W/H row — references cold →
+      NO_QUOTE ``event_ref_warmup`` (row W), references warm → the row-H venue-only disposition (the
+      cleared-cold basis keeps :func:`_quote_disposition`'s guard block inert, so the decision matches
+      the FV-blind baseline). NOT an unconditional NO_QUOTE ``basis_warmup``: REQ-070 row F's
+      ``basis_warmup`` names the guard's inert CAUSE, not the decision (controller ruling, pending Codex).
     * W (warmup): references below floor → NO_QUOTE ``event_ref_warmup``.
     * H (healthy): a QUOTE-ONLY blocker downgrades to ``NO_QUOTE`` first (admission unaffected), in
       closed §4.4 vocabulary order — a missing/ambiguous outcome token (:func:`_token_mapping_reason`)
@@ -1285,9 +1299,16 @@ def _apply_healthy(
     updates["event_cooldown_until_ts"] = None
     next_state = base.model_copy(update=updates)
 
-    if row == "F":
-        return _decide("NO_QUOTE", ("basis_warmup",)), next_state
-    if row == "W":
+    # Row F (fv-epoch increment) is dispositioned PER ITS UNDERLYING W/H row with the guard inert
+    # (REQ-070 row F / REQ-032 / Gate #4 F-IMPORTANT-2): the FV reset already cleared the basis
+    # (:func:`_accept` set ``basis_sample_count = 0``), so the guard cannot speak. References COLD →
+    # the underlying row is W → NO_QUOTE(``event_ref_warmup``) (row-W venue-reference warmup is a
+    # genuinely-unsafe quote — the REQ-080 event-protection gates are not yet evaluable); references
+    # WARM → the underlying row is H → the blocker chain + venue-only quote below (the cleared-cold
+    # basis renders :func:`_quote_disposition`'s guard block inert, so the decision matches the FV-blind
+    # baseline). The row-F basis clear-then-admit STATE transition is UNCHANGED — only the DECISION
+    # defers to the underlying row, never ``next_state`` (the ``_admit_basis_updates`` fold above).
+    if row == "W" or (row == "F" and not _references_warm(base, config)):
         return _decide("NO_QUOTE", ("event_ref_warmup",)), next_state
     blocker = (
         _token_mapping_reason(observation)
