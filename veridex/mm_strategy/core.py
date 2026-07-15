@@ -707,6 +707,10 @@ def _venue_anchor(
     depth = _top_depth(observation)
     if mid is None or depth is None:
         return None
+    # Both floors below are already pre-empted by row E (REQ-080): _venue_event_reason pre-empts to
+    # row E whenever depth < min_top_depth or level_count_in_band < min_level_count on a warm frame,
+    # so a row-H frame never reaches here sub-floor. Retained as local anchor-honesty defense-in-depth
+    # in case the row-E pre-emption changes.
     if depth < config.min_top_depth:
         return None
     if observation.level_count_in_band < config.min_level_count:
@@ -729,6 +733,9 @@ def _no_anchor_reason(
         or depth < config.min_top_depth
     ):
         return "book_thin"
+    # Already pre-empted by row E (REQ-080): a warm sub-floor level count surfaces as level_count_low
+    # via _venue_event_reason before row H, so this return is unreachable at row H. Retained as
+    # defense-in-depth (mirrors _venue_anchor's gate order) if the row-E pre-emption changes.
     return "level_count_low"
 
 
@@ -778,6 +785,23 @@ def _guard_residual(
     return (guard_fv.fv - anchor) - basis_from_state(base, config)
 
 
+def _residual_side(
+    residual: float, config: StrategyConfig
+) -> Literal["ask", "bid"] | None:
+    """The SOLE residual sign→side rule (REQ-073/071 — the worst-bug MAJOR-5 direction), shared by the
+    inventory ``reduce_conflict`` detection (:func:`_toxic_leg`) and the guard's directional side-pull
+    (:func:`_quote_disposition`) so the ``±residual_band`` threshold has ONE definition. A residual
+    ABOVE ``+residual_band`` means fair value sits above the anchor → the ASK is adverse
+    (``residual_pull_ask``); BELOW ``−residual_band`` the BID is adverse (``residual_pull_bid``). The
+    band is the ABSOLUTE config width, NEVER scaled by ``(best_ask − best_bid)`` (REQ-071). A quiescent
+    residual (``|residual| <= residual_band``) selects no side (``None``)."""
+    if residual > config.residual_band:
+        return "ask"
+    if residual < -config.residual_band:
+        return "bid"
+    return None
+
+
 def _toxic_leg(
     observation: StrategyObservation,
     base: StrategyState,
@@ -785,21 +809,15 @@ def _toxic_leg(
     anchor: float,
 ) -> Literal["ask", "bid"] | None:
     """The leg the E4-T4 guard would PULL as adverse (REQ-073), or ``None`` when quiescent / no guard
-    signal. Uses the SAME sign + ABSOLUTE ``residual_band`` threshold as the directional side-pull: a
-    residual ABOVE ``+residual_band`` means fair value sits above the anchor so the ASK is adverse
-    (the ``residual_pull_ask`` direction); BELOW ``−residual_band`` the BID is adverse
-    (``residual_pull_bid``). A quiescent residual (``|residual| <= residual_band``) pulls nothing, so
-    there is no toxic leg. Read here so the inventory rule can detect a reducing leg that is ALSO the
-    toxic leg (``reduce_conflict``) WITHOUT reshaping the guard block below (REQ-071 — never
-    spread-relative)."""
+    signal. Applies the SAME sign + ABSOLUTE ``residual_band`` rule as the directional side-pull via the
+    shared :func:`_residual_side`, so a residual ABOVE ``+residual_band`` yields the adverse ASK and
+    BELOW ``−residual_band`` the adverse BID; a quiescent residual pulls nothing. Read here so the
+    inventory rule can detect a reducing leg that is ALSO the toxic leg (``reduce_conflict``) WITHOUT
+    reshaping the guard block below (REQ-071 — never spread-relative)."""
     residual = _guard_residual(observation, base, config, anchor)
     if residual is None:
         return None
-    if residual > config.residual_band:
-        return "ask"
-    if residual < -config.residual_band:
-        return "bid"
-    return None
+    return _residual_side(residual, config)
 
 
 # --- The E4-T7 QUOTE-math primitives: join-or-behind targets + directional round + post-clamp ---
@@ -1023,19 +1041,24 @@ def _quote_disposition(
             and abs(basis_from_state(base, config)) >= prematch_spread
         ):
             return _decide("NO_QUOTE", ("prematch_basis_exceeds_spread",))
-        guard_fv = observation.guard_fv
-        if guard_fv is not None:  # always true here (fv_block was None) — narrows for mypy totality
-            # residual = raw_gap − basis, with raw_gap = fv − anchor (the venue mid; REQ-070). The
-            # band is the ABSOLUTE config value: ``|residual|`` vs ``extreme_multiple × residual_band``,
-            # taken DIRECTLY from config and NEVER scaled by ``(best_ask − best_bid)`` (REQ-071 — a
-            # spread-relative band is the MAJOR-5 bug). The basis reads PRIOR state (compare-then-update).
-            residual = (guard_fv.fv - anchor) - basis_from_state(base, config)
+        # residual = raw_gap − basis, with raw_gap = fv − anchor (the venue mid; REQ-070), computed by
+        # :func:`_guard_residual` — the SAME formula the inventory ``reduce_conflict`` reads, so the
+        # load-bearing (MAJOR-5) residual definition lives in ONE place. The gates above (guard on, FV
+        # fresh/present, basis warm) already passed — the SAME conditions the helper re-checks — so it
+        # returns a value here and never the ``None`` path; ``residual is not None`` narrows for mypy
+        # totality (it was ``guard_fv is not None`` before the collapse). Basis reads PRIOR state.
+        residual = _guard_residual(observation, base, config, anchor)
+        if residual is not None:
+            # The extreme band is the ABSOLUTE config value: ``|residual|`` vs ``extreme_multiple ×
+            # residual_band``, taken DIRECTLY from config and NEVER scaled by ``(best_ask − best_bid)``
+            # (REQ-071 — a spread-relative band is the MAJOR-5 bug).
             if abs(residual) >= config.extreme_multiple * config.residual_band:
                 # REQ-075: the sole extreme rule (no separate absolute-cap knob). NO_QUOTE + cancel
                 # plan on exposure (the intent-plan wiring is a later E4 task) — never a taker chase.
                 return _decide("NO_QUOTE", ("residual_extreme",))
-            # E4-T4 DIRECTIONAL SIDE PULL (REQ-073/071/AC-006), INSIDE the admissible band. The SIGN
-            # of the residual selects the ONE side to pull; the threshold is the ABSOLUTE
+            # E4-T4 DIRECTIONAL SIDE PULL (REQ-073/071/AC-006), INSIDE the admissible band, via the
+            # shared :func:`_residual_side` (the SAME sign rule the inventory ``reduce_conflict`` uses).
+            # The SIGN of the residual selects the ONE side to pull; the threshold is the ABSOLUTE
             # ``residual_band`` (REQ-071 — the SAME config width the extreme wall scales, NEVER the
             # ``(best_ask − best_bid)`` spread; a spread-relative band is the MAJOR-5 bug). The
             # direction is load-bearing (the worst-bug rule): ``residual = fv − anchor − basis`` with
@@ -1048,9 +1071,10 @@ def _quote_disposition(
             # ``|residual|`` < extreme (0.06): the middle band; ``|residual| <= residual_band`` is
             # quiescent and falls through to the two-sided taxonomy floor (E4-T5's pre-match basis gate
             # REQ-078 slots between warmup and the extreme wall, WITHOUT reshaping this order).
-            if residual > config.residual_band:
+            side = _residual_side(residual, config)
+            if side == "ask":
                 return _decide("QUOTE_ONE_SIDED", ("residual_pull_ask",))
-            if residual < -config.residual_band:
+            if side == "bid":
                 return _decide("QUOTE_ONE_SIDED", ("residual_pull_bid",))
     # --- QUOTE math slot (E4-T7): join-or-behind anchor +/- half_spread legs, directional tick
     # rounding, post-clamp + cardinality (REQ-052/055/056). This terminal can DOWNGRADE the eligible
