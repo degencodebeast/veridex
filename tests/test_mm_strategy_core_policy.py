@@ -42,6 +42,7 @@ from veridex.mm_strategy.contracts import (
     GuardStateWatermark,
     InventoryProjection,
     NeutralIntent,
+    RestingOrderView,
     StrategyObservation,
     StrategyState,
 )
@@ -84,6 +85,7 @@ def _obs(
     ask_size: float | None = 120.0,
     net_position: float = 0.0,
     tick_size: float = 0.01,
+    resting: tuple[RestingOrderView, ...] = (),
 ) -> StrategyObservation:
     """A healthy per-tick observation; every ``recv_ts`` is derived ≤ ``as_of_ts`` so construction
     never trips the REQ-022 future-dating guard. Raw top-of-book + zone knobs are exposed so each
@@ -119,7 +121,7 @@ def _obs(
         order_stream_ok=order_stream_ok,
         projection_fresh=projection_fresh,
         inventory=InventoryProjection(
-            net_position=net_position, resting=(), projection_as_of_ts=as_of_ts, fresh=True
+            net_position=net_position, resting=resting, projection_as_of_ts=as_of_ts, fresh=True
         ),
         as_of_ts=as_of_ts,
     )
@@ -1210,3 +1212,67 @@ def test_no_hardcoded_fixture_or_market_key() -> None:
         assert not (attrs & identity_keys and consts), (
             f"core must not compare an identity key to a hard-coded literal (line {node.lineno})"
         )
+
+
+# --- E5-T2 / REQ-096 / AC-020 / RED-17: churn suppression — HOLD on an unchanged target -----
+
+
+def _resting(side: str, price: float) -> RestingOrderView:
+    """One reconciled resting order (the InventoryProjection view the churn gate compares against).
+
+    Side is the physical leg role (``"bid"`` / ``"ask"``) — the SAME vocabulary the desired
+    ``place_quote`` legs carry — and the size is deliberately arbitrary: the compare is over side +
+    price ONLY (NO size dimension; REQ-057/096)."""
+    return RestingOrderView(client_order_id=f"c-{side}", side=side, price=price, size=10.0)
+
+
+def test_unchanged_target_holds_no_churn() -> None:
+    # AC-020 / RED-17 (REQ-096): a healthy row-H frame whose DESIRED quote legs already match the
+    # reconciled resting orders (side + price within `price_epsilon`) must HOLD and emit NOTHING —
+    # no cancel/replace/place churn. The default in-window frame anchors at the venue mid 0.50 and
+    # would quote bid@0.48 + ask@0.52 (half_spread 0.02, join-or-behind).
+    config = _config()
+    state = _warm_state()
+
+    # Baseline: with NO resting orders the SAME frame is a live two-sided placement (a leg is ADDED
+    # relative to the empty resting set), proving the HOLD below is the resting MATCH, not abstention.
+    fresh_decision, _ = decide(_obs(resting=()), state, config)
+    assert fresh_decision.kind == "QUOTE_TWO_SIDED"
+    assert len(fresh_decision.intent_plan) == 2
+
+    # The resting orders equal the desired legs on side + price WITHIN `price_epsilon` (diff 0.002 <
+    # 0.005) — the size (10.0) is arbitrary and never read (side + price only).
+    obs = _obs(resting=(_resting("bid", 0.482), _resting("ask", 0.518)))
+    decision, next_state = decide(obs, state, config)
+
+    assert decision.kind == "HOLD"
+    assert decision.reason_codes == ("hold_unchanged",)
+    assert decision.intent_plan == ()  # short-circuit: zero cancel/replace/place intents
+
+    # The HOLD suppresses only the OUTPUT churn — the admitting row-H frame still trained its venue
+    # accumulators into the next state (the smoother folded this frame's mid), so a later genuinely
+    # different target is not starved of warm references.
+    assert next_state.smoother_mid is not None
+
+
+def test_epsilon_hold_zone() -> None:
+    # The epsilon boundary is load-bearing (REQ-096): a desired price WITHIN `price_epsilon` of the
+    # resting one holds; a price just OUTSIDE it is a real move and must replace (proceed to quote).
+    # Desired legs at the default frame are bid@0.48 + ask@0.52 (venue mid 0.50, half_spread 0.02).
+    config = _config()  # price_epsilon = 0.005 (default)
+    state = _warm_state()
+
+    # WITHIN the band: bid off by 0.004 (< 0.005), ask exact → still the SAME target → HOLD.
+    inside = _obs(resting=(_resting("bid", 0.484), _resting("ask", 0.520)))
+    d_inside, _ = decide(inside, state, config)
+    assert d_inside.kind == "HOLD"
+    assert d_inside.reason_codes == ("hold_unchanged",)
+    assert d_inside.intent_plan == ()
+
+    # JUST OUTSIDE the band: bid off by 0.006 (> 0.005) → a genuine re-center → NOT a HOLD; the
+    # normal placement plan proceeds (a two-sided replace with both priced legs).
+    outside = _obs(resting=(_resting("bid", 0.474), _resting("ask", 0.520)))
+    d_outside, _ = decide(outside, state, config)
+    assert d_outside.kind == "QUOTE_TWO_SIDED"
+    assert len(d_outside.intent_plan) == 2
+    assert d_outside.reason_codes == ()

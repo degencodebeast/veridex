@@ -1130,6 +1130,48 @@ def _quote_disposition(
     return _two_sided_quote(observation, config, anchor)
 
 
+def _target_is_unchanged(
+    decision: StrategyDecision, observation: StrategyObservation, config: StrategyConfig
+) -> bool:
+    """Churn suppression (REQ-096 / AC-020 / RED-17): True when the DESIRED priced quote legs already
+    match the reconciled resting orders, so re-emitting them would be needless cancel-replace churn.
+
+    The compare is over SIDE + PRICE ONLY — NEVER size (REQ-057/096: a neutral intent carries no
+    size and ``resolve_dust_size`` is the sole wire-size authority, so a size drift is NOT a target
+    change). A desired leg's side is its physical ``leg_role`` (``bid`` / ``ask`` — authoritative for
+    both quoting and reducing legs, :func:`_place_leg`); the reconciled side is the orchestration-layer
+    ``RestingOrderView.side`` on the observation's ``InventoryProjection`` (REQ-020(g)), supplied in the
+    SAME vocabulary — the reconciled resting state, never a fabricated baseline. Two dispositions are
+    "unchanged" IFF there is a one-to-one pairing of desired legs to resting orders on the same side
+    whose prices agree within ``config.price_epsilon`` (the ADOPTED Gridora recenter-buffer threshold,
+    from the band/anchor edge) AND no leg is added or removed (equal cardinality — the loop consumes one
+    resting order per desired leg, so an exhausted pairing leaves none on either side).
+
+    An EMPTY desired plan is never "unchanged" here: a NO_QUOTE that leaves exposure resting is a
+    cancel case (E5-T3), not a HOLD, so it returns ``False`` and the disposition stands untouched.
+    """
+    desired = decision.intent_plan
+    if not desired:
+        return False
+    resting = observation.inventory.resting
+    if len(desired) != len(resting):
+        return False
+    unmatched = list(resting)
+    for leg in desired:
+        if leg.price is None:  # a placement leg always carries a price; guards for mypy totality
+            return False
+        for index, order in enumerate(unmatched):
+            if (
+                order.side == leg.leg_role
+                and abs(leg.price - order.price) <= config.price_epsilon
+            ):
+                unmatched.pop(index)
+                break
+        else:
+            return False
+    return True
+
+
 def _apply_healthy(
     observation: StrategyObservation,
     base: StrategyState,
@@ -1147,7 +1189,10 @@ def _apply_healthy(
       missing/ambiguous outcome token (:func:`_token_mapping_reason`) PRE-EMPTS the status/stream
       gate (its §4.4 vocabulary precedence: without a resolved venue token no order can be placed at
       all); otherwise the venue-mid anchor + zone spine (:func:`_quote_disposition`) resolves the
-      eligible quote class (E4-T1; the guard + quote-math slots refine it in later E4 tasks).
+      eligible quote class (E4-T1; the guard + quote-math slots refine it in later E4 tasks). A
+      resolved disposition whose priced legs already match the reconciled resting orders (side +
+      price within ``price_epsilon``) SHORT-CIRCUITS to ``HOLD`` (``hold_unchanged``) with zero
+      intents — churn suppression (:func:`_target_is_unchanged`; REQ-096 / AC-020).
     """
     updates = _admit_venue_updates(observation, base, config)
     updates.update(_admit_basis_updates(observation, base, config))
@@ -1163,7 +1208,14 @@ def _apply_healthy(
     )
     if blocker is not None:
         return _decide("NO_QUOTE", (blocker,)), next_state
-    return _quote_disposition(observation, base, config), next_state
+    disposition = _quote_disposition(observation, base, config)
+    # Churn suppression (REQ-096 / AC-020): the DESIRED priced legs already resting (side + price
+    # within `price_epsilon`) ⇒ re-emitting them is needless cancel-replace churn, so HOLD and emit
+    # nothing. State training already folded above (row H admits), so a later genuinely-changed
+    # target is not starved of warm references; only the OUTPUT churn is suppressed.
+    if _target_is_unchanged(disposition, observation, config):
+        return _decide("HOLD", ("hold_unchanged",)), next_state
+    return disposition, next_state
 
 
 def _stamp_identity(
