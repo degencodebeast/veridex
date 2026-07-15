@@ -28,11 +28,19 @@ CLOB write handle. It proposes; it does not sign or write.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Protocol
+from types import MappingProxyType
+from typing import Literal, Protocol
 
-from veridex.dust_execution.facade import MMExecutionToolResult
-from veridex.mm_strategy.contracts import NeutralIntent
+from veridex.dust_execution.contracts import ExecutionMode
+from veridex.dust_execution.facade import (
+    IntentKind,
+    MMExecutionToolRequest,
+    MMExecutionToolResult,
+    MMIntentParams,
+)
+from veridex.mm_strategy.contracts import NeutralIntent, NeutralIntentKind
 
 # The neutral intent kinds that place a NEW order on the wire — the legs the freeze protects. A
 # ``cancel_all_orders`` is a risk-reducing (never fresh-write) leg; ``abstain`` is no wire action.
@@ -191,4 +199,100 @@ def execute_plan(
         outcomes=tuple(outcomes),
         frozen=frozen,
         awaiting_reconciliation=awaiting_reconciliation,
+    )
+
+
+# ---------------------------------------------------------------------------
+# E5-T5 — neutral→R4-A translation: total mapping + singular request build.
+# ---------------------------------------------------------------------------
+
+# The TOTAL neutral→R4-A intent-kind mapping (REQ-091, §6.3(5)). Every ``NeutralIntentKind`` maps,
+# and the IMAGE is EXACTLY the closed non-aggressive 4-set ``{make_quote, cancel_replace, cancel_all,
+# no_quote}``. R4-A's ``take`` (the AGGRESSIVE cross-the-spread kind) is deliberately UNREACHABLE:
+# the pure strategy proposes no aggressive intent, so ``take`` can never be emitted — the honesty
+# guarantee §6.3(5) encodes structurally (an aggressive fill is unrepresentable, not merely gated).
+# A ``MappingProxyType`` makes the table read-only so no caller can mutate the pinned image.
+NEUTRAL_TO_R4A: Mapping[NeutralIntentKind, IntentKind] = MappingProxyType(
+    {
+        "place_quote": "make_quote",
+        "replace_quote": "cancel_replace",
+        "cancel_all_orders": "cancel_all",
+        "abstain": "no_quote",
+    }
+)
+
+# The honest evidence class every R4-B dust request is PINNED to — a module constant, NEVER a
+# caller/agent parameter (AC-025 consistency; mirrors ``facade._DEFAULT_EVIDENCE_CLASS``). An agent
+# cannot relabel a dust run as validated/promoted because it has no channel to supply this at all.
+_PINNED_EVIDENCE_CLASS: Literal["EXPERIMENTAL_DUST"] = "EXPERIMENTAL_DUST"
+
+
+@dataclass(frozen=True)
+class R4ARequestConfig:
+    """The ONE pinned request config the adapter builds every R4-A request from (REQ-058).
+
+    Every field is PINNED session/manifest config — the operator wires it once; NONE is agent- or
+    caller-supplied. The pinned hashes are the admitted pins the strategy declares it operates under
+    (declared == admitted: the adapter is the pinned strategy, not an attacker, so it feeds the same
+    pins to both sides of :meth:`MMExecutionToolRequest.build`'s fail-closed cross-check).
+
+    ``wallet_equity_at_decision`` / ``fixed_fraction`` are the PINNED mechanical sizing inputs the
+    adapter threads to R4-A's ``propose_mm_execution`` — they are NEVER agent-supplied and the adapter
+    ITSELF never sizes with them: R4-A's ``resolve_dust_size`` is the sole wire-size authority (REQ-058).
+    """
+
+    strategy_id: str
+    strategy_config_hash: str
+    policy_hash: str
+    session_id: str
+    manifest_hash: str
+    mode: ExecutionMode
+    wallet_equity_at_decision: float
+    fixed_fraction: float
+
+
+def _intent_params(leg: NeutralIntent) -> MMIntentParams:
+    """Translate a neutral leg's TRUSTED fields into typed R4-A ``MMIntentParams``.
+
+    Carries side (from ``leg_role``), price, and the client-order ids — and NEVER a ``size``: R4-A's
+    ``resolve_dust_size`` is the sole sizing authority (REQ-058/RED-22), so ``size`` is left unset
+    (``None``). A ``cancel_all_orders`` / ``abstain`` leg carries no side/price/id, so its params are
+    empty. Only trusted leg fields flow here; no untrusted agent metadata is read (AC-024).
+    """
+    side = leg.leg_role if leg.leg_role in ("bid", "ask") else None
+    return MMIntentParams(
+        side=side,
+        price=leg.price,
+        client_order_id=leg.client_order_id,
+        replaces_client_order_id=leg.replaces_client_order_id,
+        # size intentionally UNSET — the adapter never sizes (REQ-058/RED-22).
+    )
+
+
+def build_r4a_request(leg: NeutralIntent, config: R4ARequestConfig) -> MMExecutionToolRequest:
+    """Build the SINGULAR typed R4-A request for ONE neutral leg (REQ-091/058, AC-024).
+
+    The intent kind is the TOTAL :data:`NEUTRAL_TO_R4A` mapping of ``leg.kind`` (so ``take`` is
+    unreachable), the params carry no adapter-set size, and ``evidence_class`` is PINNED to the
+    module constant — never a caller/agent argument. The pinned hashes are declared AND cross-checked
+    as admitted (fail-closed via :meth:`MMExecutionToolRequest.build`). Untrusted agent metadata
+    (``reason`` / ``confidence`` / FV proof) is NOT a parameter and is NOT forwarded, so it has ZERO
+    effect on the mapping or the request (AC-024): the request is a pure function of (trusted leg,
+    pinned config). The adapter proposes a typed request; it never sizes, signs, or writes.
+    """
+    intent_kind = NEUTRAL_TO_R4A[leg.kind]
+    return MMExecutionToolRequest.build(
+        intent_kind=intent_kind,
+        intent_params=_intent_params(leg),
+        strategy_id=config.strategy_id,
+        strategy_config_hash=config.strategy_config_hash,
+        policy_hash=config.policy_hash,
+        session_id=config.session_id,
+        manifest_hash=config.manifest_hash,
+        evidence_class=_PINNED_EVIDENCE_CLASS,  # PINNED — never a caller/agent param (AC-025)
+        mode=config.mode,
+        admitted_manifest_hash=config.manifest_hash,
+        admitted_policy_hash=config.policy_hash,
+        admitted_strategy_config_hash=config.strategy_config_hash,
+        # reason/confidence deliberately NOT passed: untrusted metadata has zero effect (AC-024).
     )

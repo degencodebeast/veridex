@@ -15,12 +15,22 @@ Resumption comes ONLY from a new observation/projection decision, never a within
 
 from __future__ import annotations
 
+import inspect
 from dataclasses import dataclass, field
+from typing import get_args
 
-from veridex.dust_execution.facade import MMExecutionToolResult
-from veridex.mm_strategy.contracts import InventoryProjection, NeutralIntent
+from veridex.dust_execution.facade import IntentKind, MMExecutionToolResult
+from veridex.mm_strategy.contracts import (
+    InventoryProjection,
+    NeutralIntent,
+    NeutralIntentKind,
+    StrategyDecision,
+)
 from veridex.mm_strategy.core import projection_startup_gate
 from veridex.mm_strategy.execution_adapter import (
+    NEUTRAL_TO_R4A,
+    R4ARequestConfig,
+    build_r4a_request,
     execute_plan,
     freezes_fresh_writes,
     is_possibly_unresolved,
@@ -198,3 +208,120 @@ def test_reconcile_path_reached_not_bypassed() -> None:
     assert result.book_treated_flat is False
     assert result.frozen is True
     assert freezes_fresh_writes(submitted) is True
+
+
+# --- E5-T5: neutral→R4-A mapping + singular request + no size/take -----------------------------
+
+
+def _pinned_config() -> R4ARequestConfig:
+    """The ONE pinned request config — every hash/id/mode/sizing input is pinned session config,
+    NEVER agent-supplied (REQ-058). ``wallet_equity``/``fixed_fraction`` are the pinned sizing
+    inputs the adapter threads to R4-A's proposer; the adapter itself never sizes."""
+    return R4ARequestConfig(
+        strategy_id="mm-dust",
+        strategy_config_hash="cfg-hash",
+        policy_hash="policy-hash",
+        session_id="sess-1",
+        manifest_hash="manifest-hash",
+        mode="dry_run",
+        wallet_equity_at_decision=1000.0,
+        fixed_fraction=0.001,
+    )
+
+
+def test_mapping_total_exact_image_take_excluded() -> None:
+    """§6.3(5): ``NEUTRAL_TO_R4A`` is TOTAL over the neutral domain, its image is EXACTLY the
+    non-aggressive 4-set, and the aggressive ``take`` kind is UNREACHABLE (never in the image)."""
+    neutral_members = set(get_args(NeutralIntentKind))
+    intent_members = set(get_args(IntentKind))
+
+    # TOTAL: every NeutralIntentKind member is a key (no neutral kind is left unmapped).
+    assert set(NEUTRAL_TO_R4A.keys()) == neutral_members
+
+    # EXACT image: the closed non-aggressive 4-set — no more, no less.
+    assert set(NEUTRAL_TO_R4A.values()) == {"make_quote", "cancel_replace", "cancel_all", "no_quote"}
+
+    # ``take`` (the aggressive kind) is NEVER in the image — it is unrepresentable by design.
+    assert "take" not in set(NEUTRAL_TO_R4A.values())
+    assert "take" in intent_members  # (sanity: ``take`` IS a valid R4-A kind — just never emitted)
+
+    # Every image value is a real R4-A ``IntentKind`` (no minted synonym).
+    assert set(NEUTRAL_TO_R4A.values()) <= intent_members
+
+    # The exact pinned pairing.
+    assert dict(NEUTRAL_TO_R4A) == {
+        "place_quote": "make_quote",
+        "replace_quote": "cancel_replace",
+        "cancel_all_orders": "cancel_all",
+        "abstain": "no_quote",
+    }
+
+
+def test_adapter_pins_evidence_class_not_caller_param() -> None:
+    """The adapter PINS ``evidence_class="EXPERIMENTAL_DUST"`` — it is a constant in the adapter,
+    never a caller/agent argument (not on the build function, not on the pinned config)."""
+    config = _pinned_config()
+    request = build_r4a_request(_fresh_write("A"), config)
+
+    assert request.evidence_class == "EXPERIMENTAL_DUST"
+
+    # NOT a caller/agent parameter of the adapter's request builder.
+    builder_params = inspect.signature(build_r4a_request).parameters
+    assert "evidence_class" not in builder_params
+
+    # NOT a field of the pinned config either — an agent cannot smuggle it in via config.
+    assert "evidence_class" not in set(R4ARequestConfig.__dataclass_fields__)
+
+
+def test_adapter_sets_no_size() -> None:
+    """RED-22 / REQ-058: the adapter sets NO agent size on the built request — sizing is deferred
+    to R4-A's ``resolve_dust_size`` (the sole wire-size authority)."""
+    config = _pinned_config()
+
+    # A fresh-write (make_quote) leg is the sizeable case — the adapter still sets no size.
+    make_request = build_r4a_request(_fresh_write("A"), config)
+    assert make_request.intent_params.size is None
+
+    # Holds for every neutral kind: no built request ever carries an adapter-set size.
+    for leg in (
+        _fresh_write("A"),
+        NeutralIntent(kind="replace_quote", leg_role="bid", price=0.5, client_order_id="B"),
+        _cancel_leg(),
+        NeutralIntent(kind="abstain", leg_role=None, price=None),
+    ):
+        assert build_r4a_request(leg, config).intent_params.size is None
+
+
+def test_reason_confidence_cannot_move_decision() -> None:
+    """AC-024 / RED-21: untrusted FV metadata (reason / confidence / proof status) has ZERO effect
+    on the mapping or the built request — it is never an input to, nor forwarded by, the adapter."""
+    config = _pinned_config()
+    leg = _fresh_write("A")
+
+    # The adapter never forwards untrusted agent metadata: the request carries no reason/confidence.
+    request = build_r4a_request(leg, config)
+    assert request.reason is None
+    assert request.confidence is None
+
+    # There is no untrusted-metadata CHANNEL into the builder — only the trusted leg + pinned config.
+    builder_params = set(inspect.signature(build_r4a_request).parameters)
+    assert builder_params == {"leg", "config"}
+    assert not (builder_params & {"reason", "confidence", "proof_status", "fv_message_id"})
+
+    # Two decisions that DIFFER only in untrusted FV metadata carry the SAME leg → identical request.
+    hot = StrategyDecision(
+        kind="QUOTE_TWO_SIDED",
+        intent_plan=(leg,),
+        fv_message_id="msg-hot",
+        fv_proof_status="proven",
+    )
+    cold = StrategyDecision(
+        kind="QUOTE_TWO_SIDED",
+        intent_plan=(leg,),
+        fv_message_id="msg-cold",
+        fv_proof_status="absent",
+    )
+    assert build_r4a_request(hot.intent_plan[0], config) == build_r4a_request(cold.intent_plan[0], config)
+
+    # The intent kind is a pure function of the TRUSTED leg.kind — nothing else moves it.
+    assert request.intent_kind == NEUTRAL_TO_R4A[leg.kind]
