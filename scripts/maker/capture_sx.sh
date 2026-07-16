@@ -24,7 +24,10 @@ echo "[capture_sx] watch:  tail -f ${LOG}     (stdout: WS banner + gaps)"
 echo "[capture_sx] watch:  tail -f ${OUT}     (tape rows)"
 
 # 2>&1 | tee: stdout+stderr go to the log AND the terminal; pipefail propagates the poller's exit code.
-./.venv/bin/python -m scripts.maker.sx_bet_poller \
+# -u (unbuffered): the poller logs the WS banner + gaps via print()->stdout, which Python BLOCK-buffers
+# the moment stdout is piped into tee (not a TTY) — so without -u the log stays empty until the buffer
+# fills or the process exits. -u forces line-unbuffered stdout so gaps stream to the log live.
+./.venv/bin/python -u -m scripts.maker.sx_bet_poller \
   --fixtures scripts/txline_live/wc-qf-fixtures.json \
   --fixture-id "${FIXTURE_ID}" \
   --out "${OUT}" \
