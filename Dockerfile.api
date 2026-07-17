@@ -13,6 +13,7 @@ WORKDIR /app
 #   live     — httpx (the live TxLINE/venue async HTTP the router imports)
 COPY pyproject.toml ./
 COPY veridex ./veridex
+COPY veridex_agent ./veridex_agent
 RUN pip install --no-cache-dir ".[api,postgres,live]"
 
 # Network binding (overridable). The process is the isolation boundary, so bind all interfaces.
