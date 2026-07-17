@@ -15,12 +15,75 @@ TRUST PATH (CON-004): no LLM SDK imports. No network here — the async SSE shel
 
 from __future__ import annotations
 
+import enum
 from typing import Any
 
 from pydantic import BaseModel
 
 #: Default seconds since the last tick before the feed is considered stale.
 DEFAULT_STALE_AFTER_S: int = 30
+
+
+class FeedState(str, enum.Enum):
+    """The five connection-derived feed states (R-0a — consumed by III-3's health panel).
+
+    A ``str`` enum so a state renders directly as its wire value in JSON/UI without a
+    separate serializer. The five states are exhaustive and mutually exclusive for a
+    single observation of the feed:
+
+    * ``DISCONNECTED`` — no active connection (initial, or the stream dropped).
+    * ``CONNECTING`` — a connection is being established / no frame has arrived yet.
+    * ``LIVE`` — connected and at least one fresh odds record has been received.
+    * ``HEARTBEAT_ONLY`` — connected and fresh, but ONLY heartbeats (no odds records):
+      liveness is proven, yet there is no market data — so no pack can be minted.
+    * ``STALE`` — connected, but the last frame is older than the staleness budget.
+    """
+
+    DISCONNECTED = "disconnected"
+    CONNECTING = "connecting"
+    LIVE = "live"
+    HEARTBEAT_ONLY = "heartbeat_only"
+    STALE = "stale"
+
+
+def derive_feed_state(
+    *,
+    connecting: bool,
+    connected: bool,
+    odds_records_seen: int,
+    heartbeats_seen: int,
+    last_frame_ts: int | None,
+    now_ts: int,
+    stale_after_s: int = DEFAULT_STALE_AFTER_S,
+) -> FeedState:
+    """Derive the current :class:`FeedState` from observed feed signals (pure).
+
+    Precedence, for a connected feed: staleness dominates (a feed whose last frame is older than
+    the budget is ``STALE`` regardless of what that frame was), then a fresh odds record makes the
+    feed ``LIVE``, then a fresh heartbeat (with no odds) makes it ``HEARTBEAT_ONLY``; a connected
+    feed that has produced no frame yet is still ``CONNECTING``.
+
+    Args:
+        connecting: A connection is being established (only consulted when not ``connected``).
+        connected: The stream is currently connected.
+        odds_records_seen: Count of odds records received.
+        heartbeats_seen: Count of heartbeat frames received.
+        last_frame_ts: Unix seconds of the last frame (odds or heartbeat), or ``None``.
+        now_ts: Current Unix seconds (the staleness reference).
+        stale_after_s: Staleness budget in seconds.
+
+    Returns:
+        The single :class:`FeedState` describing this observation.
+    """
+    if not connected:
+        return FeedState.CONNECTING if connecting else FeedState.DISCONNECTED
+    if last_frame_ts is not None and (now_ts - last_frame_ts) > stale_after_s:
+        return FeedState.STALE
+    if odds_records_seen > 0:
+        return FeedState.LIVE
+    if heartbeats_seen > 0:
+        return FeedState.HEARTBEAT_ONLY
+    return FeedState.CONNECTING
 
 
 class FeedHealthReport(BaseModel):
