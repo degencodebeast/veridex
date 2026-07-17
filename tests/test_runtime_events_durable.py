@@ -380,3 +380,114 @@ async def test_standalone_run_emits_durable_events_readable_owner_scoped(tmp_pat
         other = await client.get("/agents/instances/inst_studio/runtime-events", headers=_bearer(_DID_BOB))
         assert other.status_code in (403, 404), other.text
         assert "studio-agent" not in other.text  # no leak of the agent identity
+
+
+# ---------------------------------------------------------------------------
+# RED 6 — durability honesty: a WAL-fsync / cursor-fsync fault must stay VISIBLE
+# (Foundation-gate MINOR — a known durability fault must NOT be cleared by a mere empty queue)
+# ---------------------------------------------------------------------------
+
+
+def _one(agent_id: str, tag: str) -> Any:
+    return runtime_event(RuntimeEventType.ACTION_EMITTED, agent_id=agent_id, tag=tag)
+
+
+async def test_wal_fsync_failure_surfaces_and_persists_degraded(tmp_path: Path, monkeypatch: Any) -> None:
+    """A WAL-fsync fault commits the batch to the store but is NOT proven on disk.
+
+    The store must report ``degraded`` afterward EVEN once the queue drains — reporting healthy
+    after a known fsync fault silently weakens the WAL durability guarantee. RED before the fix:
+    :flush_once suppresses the fsync OSError and :253 then clears ``degraded`` on the empty queue.
+    """
+    store = InMemoryStore()
+    dstore = DurableRuntimeEventStore(store=store, wal_dir=tmp_path)
+    dstore.enqueue(_one("wf", "a"))  # opens the WAL lazily
+    wal_fd = dstore._wal.fileno()  # type: ignore[union-attr]
+
+    real_fsync = os.fsync
+
+    def failing_wal_fsync(fd: int) -> None:
+        if fd == wal_fd:  # only the WAL fsync fails; the cursor-persist fsync stays real
+            raise OSError("simulated WAL fsync failure")
+        return real_fsync(fd)
+
+    monkeypatch.setattr(os, "fsync", failing_wal_fsync)
+
+    committed = await dstore.flush_once()
+    assert committed == 1  # the store commit itself still succeeds (data is in the store)
+    assert len(await store.list_runtime_events("wf")) == 1
+    assert dstore.pending == 0  # queue fully drained ...
+    assert dstore.degraded is True  # ... yet a known fsync fault keeps it visibly degraded
+    assert dstore.flush_failures >= 1  # the durability fault is counted, not swallowed
+
+
+async def test_wal_fsync_fault_persists_until_a_real_durability_success(tmp_path: Path, monkeypatch: Any) -> None:
+    """The fsync fault must survive an empty queue and clear ONLY when a later fsync actually succeeds."""
+    store = InMemoryStore()
+    dstore = DurableRuntimeEventStore(store=store, wal_dir=tmp_path)
+    dstore.enqueue(_one("wp", "a"))
+    wal_fd = dstore._wal.fileno()  # type: ignore[union-attr]
+
+    real_fsync = os.fsync
+    fail = {"on": True}
+
+    def fsync_ctl(fd: int) -> None:
+        if fail["on"] and fd == wal_fd:
+            raise OSError("simulated WAL fsync failure")
+        return real_fsync(fd)
+
+    monkeypatch.setattr(os, "fsync", fsync_ctl)
+
+    await dstore.flush_once()
+    assert dstore.degraded is True  # fault recorded
+
+    # A subsequent flush with fsync STILL failing keeps it degraded (recovery needs a real success).
+    dstore.enqueue(_one("wp", "b"))
+    await dstore.flush_once()
+    assert dstore.degraded is True
+    assert dstore.pending == 0  # backlog empty, but the durability fault is unresolved
+
+    # fsync now SUCCEEDS on a later flush -> only then does degraded clear (and only when caught up).
+    fail["on"] = False
+    dstore.enqueue(_one("wp", "c"))
+    await dstore.flush_once()
+    assert dstore.degraded is False
+    assert dstore.pending == 0
+
+
+async def test_cursor_fsync_failure_surfaces_and_persists_degraded(tmp_path: Path, monkeypatch: Any) -> None:
+    """A cursor-persist fsync fault raises ``degraded`` and is NOT cleared by a later empty-queue pass.
+
+    Only once a cursor persist actually succeeds may ``degraded`` clear. RED before the fix: the cursor
+    path raises ``degraded`` but :253 clears it on the very next empty queue.
+    """
+    store = InMemoryStore()
+    dstore = DurableRuntimeEventStore(store=store, wal_dir=tmp_path)
+    dstore.enqueue(_one("cf", "a"))
+    wal_fd = dstore._wal.fileno()  # type: ignore[union-attr]
+
+    real_fsync = os.fsync
+    fail = {"on": True}
+
+    def fsync_ctl(fd: int) -> None:
+        # WAL fsync (wal_fd) is fine; only the cursor-persist fsync (a different fd) fails.
+        if fail["on"] and fd != wal_fd:
+            raise OSError("simulated cursor fsync failure")
+        return real_fsync(fd)
+
+    monkeypatch.setattr(os, "fsync", fsync_ctl)
+
+    await dstore.flush_once()
+    assert dstore.degraded is True  # cursor-persist fault surfaced
+    assert dstore.pending == 0  # queue empty ...
+
+    # ... and a later empty-queue pass (nothing to flush, no durability check) does NOT clear it.
+    await dstore.flush_once()
+    assert dstore.degraded is True
+
+    # A cursor persist now succeeds -> degraded clears once caught up.
+    fail["on"] = False
+    dstore.enqueue(_one("cf", "b"))
+    await dstore.flush_once()
+    assert dstore.degraded is False
+    assert dstore.pending == 0

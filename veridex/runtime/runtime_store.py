@@ -155,6 +155,10 @@ class DurableRuntimeEventStore:
         self._pending: deque[_PendingEntry] = deque()
         self._committed_lines: int = self._read_cursor()
         self._degraded = False
+        # Distinct from the backlog ``_degraded`` flag: a durability (WAL-fsync / cursor-persist)
+        # fault must OUTLIVE an empty queue — the store is only proven-durable again once a later
+        # durability check actually succeeds, never merely because the backlog drained.
+        self._durability_fault = False
         self._flush_failures = 0
 
         self._running = False
@@ -227,11 +231,18 @@ class DurableRuntimeEventStore:
             batch = [self._pending.popleft() for _ in range(min(self._batch_size, len(self._pending)))]
 
         # Per-BATCH fsync: push the WAL from OS page cache to disk BEFORE we rely on it (this bounds
-        # the disclosed power-loss window to ≤ one batch).
+        # the disclosed power-loss window to ≤ one batch). A failure here means the batch commits to
+        # the store but is NOT proven on disk — catch it so the flusher never crashes, but record a
+        # VISIBLE durability fault (never suppress-and-forget) that survives an empty queue.
+        fsync_ok = True
         with self._lock:
             if self._wal is not None:
-                with contextlib.suppress(OSError, ValueError):
+                try:
                     os.fsync(self._wal.fileno())
+                except (OSError, ValueError):
+                    fsync_ok = False
+                    self._durability_fault = True
+                    self._flush_failures += 1
 
         try:
             await self._store.append_runtime_events([entry.row for entry in batch])
@@ -247,10 +258,14 @@ class DurableRuntimeEventStore:
         # Advance the durable cursor by the count of WAL-BACKED rows only — the cursor is a WAL-line
         # index, and an in-memory-only entry (WAL append failed) has no WAL line to skip on replay.
         self._committed_lines += sum(1 for entry in batch if entry.wal_backed)
-        self._persist_cursor(self._committed_lines)
+        cursor_ok = self._persist_cursor(self._committed_lines)
         with self._lock:
+            if fsync_ok and cursor_ok:
+                # A full durability pass (WAL fsync + cursor persist) succeeded → any prior
+                # durability fault is now proven resolved. Recovery requires proven-durable state.
+                self._durability_fault = False
             if not self._pending:
-                self._degraded = False  # fully caught up → visibly recovered
+                self._degraded = False  # backlog fully caught up → store-backlog state recovered
         return len(batch)
 
     async def drain(self, *, max_passes: int = 10_000) -> None:
@@ -316,8 +331,13 @@ class DurableRuntimeEventStore:
 
     @property
     def degraded(self) -> bool:
-        """``True`` when a WAL/flush failure has left un-committed backlog (visible fail-closed)."""
-        return self._degraded
+        """``True`` while un-committed backlog OR an unresolved durability fault exists (fail-closed).
+
+        Two independent lifetimes are ORed: the store-backlog ``_degraded`` (cleared when the queue
+        drains) and ``_durability_fault`` (a WAL-fsync / cursor-persist fault, cleared ONLY by a
+        subsequent successful durability check — never by a mere empty queue).
+        """
+        return self._degraded or self._durability_fault
 
     @property
     def flush_failures(self) -> int:
@@ -372,8 +392,13 @@ class DurableRuntimeEventStore:
         except (OSError, ValueError):
             return 0
 
-    def _persist_cursor(self, n: int) -> None:
-        """Atomically persist the cursor (temp + ``fsync`` + ``os.replace``); degrade on failure."""
+    def _persist_cursor(self, n: int) -> bool:
+        """Atomically persist the cursor (temp + ``fsync`` + ``os.replace``); return success.
+
+        On failure, record a VISIBLE durability fault (which outlives an empty queue) rather than a
+        mere backlog-degraded state — a cursor-persist fault stays visible until a subsequent cursor
+        persist actually succeeds.
+        """
         try:
             tmp = self._cursor_path.with_suffix(".tmp")
             tmp.write_text(str(n), encoding="utf-8")
@@ -384,5 +409,7 @@ class DurableRuntimeEventStore:
                 os.close(fd)
             os.replace(tmp, self._cursor_path)
         except OSError:
-            self._degraded = True
+            self._durability_fault = True
             self._flush_failures += 1
+            return False
+        return True
