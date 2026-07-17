@@ -116,7 +116,7 @@ def _entry(agent_id: str) -> dict[str, Any]:
     return {
         "agent_id": agent_id,
         "owner": "team",
-        "strategy": "value_clv",
+        "strategy": "baseline",
         "model": None,
         "proof_mode": "reproducible",
     }

@@ -985,7 +985,23 @@ def create_app(
             _check_owner(competition, operator_principal)
 
         ticks = build_demo_ticks()
-        agents = build_agents_from_roster(competition.entries)
+        # Build the DECLARED roster (by strategy, position-independent). An entry referencing a
+        # Studio-deployed instance runs the ACTUAL deployed contestant (pinned config_hash +
+        # effective_config), never a same-named reconstruction — fail-closed on an unknown strategy
+        # or a config drift (never a silent substitution). This runs AFTER the I-7b owner-gate above.
+        try:
+            agents = await build_agents_from_roster(
+                competition.entries, get_instance=dep_store.get_agent_instance
+            )
+        except KeyError as exc:
+            # A roster entry references a deployed instance that no longer exists — fail closed.
+            raise HTTPException(
+                status_code=409, detail=f"rostered deployed instance not found: {exc}"
+            ) from None
+        except ValueError as exc:
+            # Unknown declared strategy or a config drift from the pinned deployed identity — refuse
+            # rather than silently substitute or run a drifted contestant.
+            raise HTTPException(status_code=400, detail=str(exc)) from None
 
         async def _broadcast(event: CompetitionEvent) -> None:
             await arena_manager.broadcast(competition_id, event)

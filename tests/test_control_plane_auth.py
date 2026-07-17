@@ -64,7 +64,7 @@ def _dry_run_config(*, operator_id: str | None, envelope: dict[str, object] | No
 _AGENT_A = {
     "agent_id": "agent-alpha",
     "owner": "team-a",
-    "strategy": "value_clv",
+    "strategy": "baseline",
     "model": None,
     "proof_mode": "reproducible",
     "execution_eligibility": True,
@@ -72,7 +72,7 @@ _AGENT_A = {
 _AGENT_B = {
     "agent_id": "agent-beta",
     "owner": "team-b",
-    "strategy": "contrarian_clv",
+    "strategy": "contrarian",
     "model": None,
     "proof_mode": "reproducible",
     "execution_eligibility": True,

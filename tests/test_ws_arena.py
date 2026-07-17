@@ -41,7 +41,7 @@ _COMPETITION_CONFIG = {
 _AGENT_ENTRY_A = {
     "agent_id": "agent-alpha",
     "owner": "team-a",
-    "strategy": "value_clv",
+    "strategy": "baseline",
     "model": None,
     "proof_mode": "reproducible",
 }
@@ -49,7 +49,7 @@ _AGENT_ENTRY_A = {
 _AGENT_ENTRY_B = {
     "agent_id": "agent-beta",
     "owner": "team-b",
-    "strategy": "contrarian_clv",
+    "strategy": "contrarian",
     "model": None,
     "proof_mode": "reproducible",
 }

@@ -107,8 +107,16 @@ class AgentEntry(BaseModel):
         strategy: Strategy label (e.g. ``"kelly_clv_v2"``).
         model: Optional LLM model slug used by the agent.
         proof_mode: Raw proof-mode string; normalisation is deferred to Task 3.
-        config_hash: Optional content-hash of the agent's config snapshot.
+        config_hash: Optional content-hash of the agent's config snapshot. When ``instance_id`` is
+            set, this pins the referenced Studio-deployed instance's ``config_hash`` — the roster's
+            identity commitment that the arena verifies against the live instance at start (I-7).
         execution_eligibility: Whether the agent is cleared to execute.
+        instance_id: Optional reference to a Studio-deployed :class:`~veridex.deploy.instance.AgentInstance`
+            (I-7 roster->instance binding). When set, the arena runs the ACTUAL deployed contestant —
+            it builds the agent from that instance's pinned ``effective_config`` and refuses (fail-closed)
+            if the live instance's ``config_hash`` has drifted from the pinned ``config_hash`` above.
+            Optional + legacy-compatible: a roster entry without a deployed instance leaves it ``None``
+            and is built by its declared ``strategy`` (mirrors I-2's optional-field idiom).
     """
 
     agent_id: str
@@ -118,6 +126,7 @@ class AgentEntry(BaseModel):
     proof_mode: str  # normalisation deferred to Task 3; kept as plain str here
     config_hash: str | None = None
     execution_eligibility: bool = False
+    instance_id: str | None = None
 
 
 # Allowed forward transitions: each status maps to the one valid next status.
