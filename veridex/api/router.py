@@ -41,6 +41,7 @@ import time
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
@@ -95,7 +96,6 @@ from veridex.competition.service import (
     CompetitionIntegrityError,
     CompetitionStateError,
     _default_policy_envelope,
-    create_competition,
     register_agent,
     start_competition,
 )
@@ -350,6 +350,25 @@ def create_app(
         owner = competition.config.operator_id
         if owner is not None and owner != principal_operator_id:
             raise HTTPException(status_code=403, detail="operator does not own this competition")
+
+    def _require_competition_owner(competition: Competition, principal_did: str) -> None:
+        """Enforce Privy owner-scoping on a competition write (I-7b; fail-closed).
+
+        The competition's ``owner_id`` is SERVER-DERIVED (set to the creator's principal DID at
+        create time). A competition whose ``owner_id`` is ``None`` is legacy/UNOWNED: it is refused
+        to EVERY caller (403) — an unowned competition is never silently inherited (mirror I-2's
+        fail-closed None handling). This is distinct from :func:`_check_owner`, which gates the
+        Phase-2B control-plane on the operator-token ``config.operator_id``.
+
+        Args:
+            competition: The loaded competition.
+            principal_did: The authenticated Privy principal's DID.
+
+        Raises:
+            HTTPException: 403 if the competition is unowned or owned by a different principal.
+        """
+        if competition.owner_id is None or competition.owner_id != principal_did:
+            raise HTTPException(status_code=403, detail="principal does not own this competition")
 
     # --- POST /demo/run ---------------------------------------------------
 
@@ -817,19 +836,36 @@ def create_app(
     @app.post("/competitions", response_model=CompetitionCreateResponse)
     async def create_competition_endpoint(
         config: CompetitionConfig,
+        principal: PrivyPrincipal = Depends(require_principal),  # noqa: B008
         dep_store: Store = Depends(_get_store),  # noqa: B008
     ) -> CompetitionCreateResponse:
-        """Create a new DRAFT competition from the supplied configuration.
+        """Create a new DRAFT competition owned by the authenticated principal (I-7b).
+
+        The ``owner_id`` is SERVER-DERIVED from the verified Privy principal (``principal.did``); a
+        client-supplied owner is structurally unable to reach it (the request body is a
+        :class:`~veridex.competition.models.CompetitionConfig`, which has no ``owner_id`` field, so
+        any forged key is dropped by the model). Constructed inline (rather than via
+        ``service.create_competition``) so the owner is set at construction — the service signature
+        is frozen and out of scope for I-7b.
 
         Args:
             config: Immutable :class:`~veridex.competition.models.CompetitionConfig`.
+            principal: The authenticated Privy principal (injected by ``require_principal``).
             dep_store: Injected store dependency.
 
         Returns:
             A :class:`~veridex.api.schemas.CompetitionCreateResponse` with ``competition_id``
             and ``status="draft"``.
         """
-        comp = await create_competition(dep_store, config)
+        comp = Competition(
+            competition_id=f"c_{uuid4().hex}",
+            config=config,
+            status=CompetitionStatus.DRAFT,
+            entries=[],
+            run_id=None,
+            owner_id=principal.did,
+        )
+        await dep_store.create_competition(comp)
         return CompetitionCreateResponse(
             competition_id=comp.competition_id,
             status=comp.status.value,
@@ -841,16 +877,22 @@ def create_app(
     async def register_agent_endpoint(
         competition_id: str,
         entry: AgentEntry,
+        principal: PrivyPrincipal = Depends(require_principal),  # noqa: B008
         dep_store: Store = Depends(_get_store),  # noqa: B008
     ) -> AgentRegisterResponse:
-        """Register an agent on a competition's roster.
+        """Register an agent on a competition's roster (owner-scoped + lifecycle-enforced; I-7b).
 
-        Pins ``config_hash`` (CON-207) and normalises ``proof_mode`` to the two canonical
-        Phase-2A values via :func:`~veridex.competition.service.register_agent`.
+        Only the competition's owner may mutate its roster, and only while it is still forming.
+        Enforced in order (authorization before state): owner-gate (403), then the lifecycle gates
+        (409) — the roster is frozen once the competition has started/finalized, an agent cannot be
+        registered twice, and the roster cannot exceed ``config.roster_size``. On success delegates
+        to :func:`~veridex.competition.service.register_agent`, which pins ``config_hash`` (CON-207)
+        and normalises ``proof_mode`` to the two canonical Phase-2A values.
 
         Args:
             competition_id: The owning competition.
             entry: Raw agent entry from the wire boundary.
+            principal: The authenticated Privy principal (injected by ``require_principal``).
             dep_store: Injected store dependency.
 
         Returns:
@@ -858,8 +900,28 @@ def create_app(
             ``config_hash``, and the normalised ``proof_mode``.
 
         Raises:
-            HTTPException: 404 when ``competition_id`` is not found.
+            HTTPException: 404 (unknown competition), 403 (caller is not the owner), 409 (roster
+                frozen post-start, duplicate agent, or roster cap exceeded).
         """
+        try:
+            competition = await dep_store.get_competition(competition_id)
+        except KeyError:
+            raise HTTPException(status_code=404, detail=f"competition {competition_id!r} not found") from None
+
+        _require_competition_owner(competition, principal.did)
+
+        # Lifecycle gates (409): the roster is only mutable while the competition is still forming.
+        if competition.status not in (CompetitionStatus.DRAFT, CompetitionStatus.OPEN):
+            raise HTTPException(
+                status_code=409, detail="roster is frozen: competition has already started"
+            )
+        if any(existing.agent_id == entry.agent_id for existing in competition.entries):
+            raise HTTPException(status_code=409, detail=f"agent {entry.agent_id!r} is already registered")
+        if len(competition.entries) >= competition.config.roster_size:
+            raise HTTPException(
+                status_code=409, detail=f"roster is full (cap {competition.config.roster_size})"
+            )
+
         try:
             finalized = await register_agent(dep_store, competition_id, entry)
         except KeyError:
@@ -875,6 +937,7 @@ def create_app(
     @app.post("/competitions/{competition_id}/start", response_model=CompetitionStartResponse)
     async def start_competition_endpoint(
         competition_id: str,
+        principal: PrivyPrincipal = Depends(require_principal),  # noqa: B008
         authorization: str | None = Header(default=None),  # noqa: B008
         dep_store: Store = Depends(_get_store),  # noqa: B008
     ) -> CompetitionStartResponse:
@@ -885,13 +948,15 @@ def create_app(
         deterministic Agent objects (alternating deterministic/contrarian).  This produces a real
         ≥2-row leaderboard with distinct CLV without any LLM or network calls.
 
-        Control-plane auth (fail-closed): a ``paper`` start is OPEN/public; a ``dry_run`` /
-        ``live_guarded`` start REQUIRES a valid operator bearer token (401) AND competition
-        ownership (403).  The live executor lane runs DOWNSTREAM of the seal as a separate derived
-        block and is broadcast live (persist-before-broadcast).
+        Auth (fail-closed): EVERY start requires the authenticated Privy owner (I-7b — a non-owner
+        is refused 403, regardless of execution mode). ADDITIONALLY, a ``dry_run`` / ``live_guarded``
+        start requires a valid operator bearer token (401) AND control-plane ownership (403). The
+        live executor lane runs DOWNSTREAM of the seal as a separate derived block and is broadcast
+        live (persist-before-broadcast).
 
         Args:
             competition_id: The competition to start.
+            principal: The authenticated Privy principal (injected by ``require_principal``).
             authorization: Operator bearer header (required only for non-paper modes).
             dep_store: Injected store dependency.
 
@@ -909,10 +974,15 @@ def create_app(
         except KeyError:
             raise HTTPException(status_code=404, detail=f"competition {competition_id!r} not found") from None
 
-        # Fail-closed auth gate for non-paper modes (paper stays public).
+        # I-7b: only the Privy owner may start their competition (fail-closed; applies to every
+        # execution mode, including paper). The operator-token gate below is an ADDITIONAL,
+        # orthogonal control-plane check that stays scoped to non-paper modes.
+        _require_competition_owner(competition, principal.did)
+
+        # Fail-closed auth gate for non-paper modes (paper stays public at the operator layer).
         if competition.config.execution_mode != ExecutionMode.PAPER:
-            principal = _authenticate(authorization)
-            _check_owner(competition, principal)
+            operator_principal = _authenticate(authorization)
+            _check_owner(competition, operator_principal)
 
         ticks = build_demo_ticks()
         agents = build_agents_from_roster(competition.entries)

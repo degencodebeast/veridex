@@ -138,6 +138,11 @@ class Competition(BaseModel):
         status: Current lifecycle state.
         entries: Registered agent roster.
         run_id: Optional correlation ID for the active simulation / live run.
+        owner_id: The SERVER-DERIVED owner identity (the authenticated Privy principal's DID) set
+            when the competition is created (I-7b). Optional + legacy-compatible: a pre-change
+            competition persisted without an ``owner_id`` still loads with ``None`` and is treated
+            as UNOWNED (never silently granted to any caller — fail-closed, mirrors I-2's
+            ``AgentInstance.operator_id``).
     """
 
     competition_id: str
@@ -145,6 +150,7 @@ class Competition(BaseModel):
     status: CompetitionStatus
     entries: list[AgentEntry]
     run_id: str | None
+    owner_id: str | None = None
 
     def advance_status(self, new: CompetitionStatus) -> None:
         """Mutate status to `new`, enforcing monotonic forward-only transitions.

@@ -622,7 +622,8 @@ def _build_competition(
 
     Args:
         competition_id: Primary key value.
-        config_json: JSON-serialized :class:`~veridex.competition.models.CompetitionConfig`.
+        config_json: JSON-serialized :class:`~veridex.competition.models.CompetitionConfig`, which
+            ALSO carries the server-derived ``owner_id`` rider (I-7b; zero DDL — no owner column).
         status: Raw status string (one of ``_COMPETITION_STATUS_VALUES``).
         run_id: Optional run correlation id (may be ``None``).
         entries_json: JSON-serialized list of :class:`~veridex.competition.models.AgentEntry` dicts.
@@ -630,13 +631,38 @@ def _build_competition(
     Returns:
         The reconstructed :class:`~veridex.competition.models.Competition`.
     """
+    config_data = json.loads(config_json)
+    # ``owner_id`` (I-7b) rides in the config_json blob to avoid a schema change. A legacy row
+    # written before I-7b has no such key → ``None`` → the competition loads as UNOWNED (fail-closed,
+    # never silently inherited). Pop it before validating so it never leaks into CompetitionConfig.
+    owner_id = config_data.pop("owner_id", None)
     return Competition(
         competition_id=competition_id,
-        config=CompetitionConfig.model_validate(json.loads(config_json)),
+        config=CompetitionConfig.model_validate(config_data),
         status=CompetitionStatus(status),
         entries=[AgentEntry.model_validate(e) for e in json.loads(entries_json)],
         run_id=run_id,
+        owner_id=owner_id,
     )
+
+
+def _serialize_competition_config(config: CompetitionConfig, owner_id: str | None) -> str:
+    """Canonically serialize a config with the I-7b ``owner_id`` rider folded in (zero DDL).
+
+    The competition's server-derived ``owner_id`` is stored inside the ``config_json`` blob (there is
+    no ``owner_id`` column) so :func:`_build_competition` can read it back. Kept as the single write
+    counterpart to that read so the rider convention lives in one reviewable place.
+
+    Args:
+        config: The competition's immutable config snapshot.
+        owner_id: The server-derived owner DID (or ``None`` for an unowned/legacy competition).
+
+    Returns:
+        The canonical JSON string for the ``config_json`` column.
+    """
+    payload = config.model_dump(mode="json")
+    payload["owner_id"] = owner_id
+    return serialize_payload(payload)
 
 
 # ---------------------------------------------------------------------------
@@ -1550,7 +1576,7 @@ class PostgresStore:
                         "VALUES (%s, %s, %s, %s, %s)",
                         (
                             competition.competition_id,
-                            serialize_payload(competition.config.model_dump(mode="json")),
+                            _serialize_competition_config(competition.config, competition.owner_id),
                             competition.status.value,
                             competition.run_id,
                             serialize_payload([e.model_dump(mode="json") for e in competition.entries]),
@@ -1675,17 +1701,26 @@ class PostgresStore:
             config: The new config snapshot (canonically serialized).
 
         Raises:
-            KeyError: If no competition with ``competition_id`` exists (detected via ``rowcount``).
+            KeyError: If no competition with ``competition_id`` exists.
         """
         conn = await self._connect()
         try:
             async with conn.transaction(), conn.cursor() as cur:
+                # The server-derived ``owner_id`` (I-7b) rides in config_json; a naive rewrite would
+                # strip it and silently un-own the competition. Read the current owner and fold it
+                # back in so a config mutation (e.g. the kill-switch) can never drop ownership.
+                await cur.execute(
+                    "SELECT config_json FROM competitions WHERE competition_id = %s",
+                    (competition_id,),
+                )
+                existing = await cur.fetchone()
+                if existing is None:
+                    raise KeyError(f"no competition persisted with competition_id={competition_id!r}")
+                owner_id = json.loads(existing[0]).get("owner_id")
                 await cur.execute(
                     "UPDATE competitions SET config_json = %s WHERE competition_id = %s",
-                    (serialize_payload(config.model_dump(mode="json")), competition_id),
+                    (_serialize_competition_config(config, owner_id), competition_id),
                 )
-                if cur.rowcount == 0:
-                    raise KeyError(f"no competition persisted with competition_id={competition_id!r}")
         finally:
             await self._release(conn)
 
