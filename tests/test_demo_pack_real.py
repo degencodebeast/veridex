@@ -33,8 +33,9 @@ from scripts.txline_live_capture_accept import FakeStreamClient, odds_frames
 from veridex.ingest.capture_chain import (
     GENUINE_TXLINE_PROVENANCE,
     TEST_FAKE_PROVENANCE,
-    genuine_backfill_authority,
-    genuine_live_sse_authority,
+    PackAuthority,
+    _genuine_backfill_authority,
+    _genuine_live_sse_authority,
     is_genuine_pack,
     read_pack_provenance,
     run_capture_chain,
@@ -71,12 +72,39 @@ def _odds_record(fixture_id: int, ts_ms: int) -> dict:
     }
 
 
-def _build_pack(tmp_path: Path, authority: dict | None, name: str = "pack") -> Path:
-    """Build a small ReplayPack under ``tmp_path/name`` with the given closed-set authority."""
+def _build_pack(tmp_path: Path, authority: PackAuthority | None, name: str = "pack") -> Path:
+    """Build a small ReplayPack under ``tmp_path/name`` with the given sealed authority capability."""
     session = tmp_path / f"session_{name}"
     pack_dir = tmp_path / name
     _write_session(session, [_odds_record(1, 100), _odds_record(1, 200)])
     pack_from_session(session, pack_dir, authority=authority)
+    return pack_dir
+
+
+#: The five hash-bound authority field names — used by the read-side fail-safe controls below.
+_AUTHORITY_FIELD_NAMES = ("provenance", "test_capture", "synthetic", "evidence_rung", "capture_method")
+
+
+def _build_self_consistent_pack_with_authority(tmp_path: Path, authority_fields: dict, name: str) -> Path:
+    """Bank a v2 pack whose ``capture`` authority block is exactly ``authority_fields``, hash recomputed.
+
+    Builds a legacy v1 pack (data-only), then folds ``authority_fields`` into a ``pack_version=2``
+    ``capture`` block and RECOMPUTES ``content_hash`` so the pack stays internally self-consistent
+    (``verify_content_hash`` passes). This lets a control assert the READ-side gate (``is_genuine_pack``)
+    fail-safes on an incoherent-but-self-consistent authority block WITHOUT needing a sealed genuine
+    capability (which the public API cannot mint) — it directly exercises the reader's own coherence check.
+    """
+    session = tmp_path / f"session_{name}"
+    pack_dir = tmp_path / name
+    _write_session(session, [_odds_record(1, 100), _odds_record(1, 200)])
+    pack_from_session(session, pack_dir)  # v1, data-only hash, no authority fields in capture
+    doc = json.loads((pack_dir / "pack.json").read_text())
+    doc["pack_version"] = 2
+    doc["capture"].update(authority_fields)  # add ONLY the (possibly-omitted) authority fields
+    doc["content_hash"] = _compute_content_hash(
+        pack_dir, doc["fixtures"], pack_version=2, capture=doc["capture"]
+    )
+    (pack_dir / "pack.json").write_text(json.dumps(doc))
     return pack_dir
 
 
@@ -172,7 +200,7 @@ def test_control2_relabel_and_recompute_diverges_from_pin(tmp_path: Path):
     shutil.copytree(DEFAULT_PACK_DIR, copy)
     doc = json.loads((copy / "pack.json").read_text())
     doc["pack_version"] = 2
-    doc["capture"].update(genuine_backfill_authority())
+    doc["capture"].update(_genuine_backfill_authority().as_capture_fields())
     doc["content_hash"] = _compute_content_hash(
         copy, doc["fixtures"], pack_version=2, capture=doc["capture"]
     )
@@ -209,27 +237,57 @@ def test_control3_custom_fake_source_cannot_mint_genuine(tmp_path: Path):
     assert read_pack_provenance(result.pack_dir) == TEST_FAKE_PROVENANCE
 
 
-# --- Control 4: the arbitrary-string stamping helper is gone; the authority builders are typed --
-def test_control4_arbitrary_stamp_helper_is_removed_and_builders_take_no_string():
+# --- Control 4 (D-residual): the PUBLIC generic builder cannot mint genuine from arbitrary records --
+def test_control4_public_builder_cannot_mint_genuine_from_arbitrary_records(tmp_path: Path):
+    """D-residual (Codex re-gate): the ordinary PUBLIC surface cannot mint a genuine pack from
+    arbitrary data. There is NO public genuine-authority builder, constructing a genuine capability
+    through the public class API fails closed, the open-dict input is gone, and feeding a synthetic
+    session + the strongest publicly-obtainable authority never reads genuine.
+    (RED before the fix: ``pack_from_session(<synthetic>, authority=genuine_backfill_authority())``
+    yielded ``hash_verifies=True, is_genuine=True``.)
+    """
     import veridex.ingest.capture_chain as cc
 
-    # The public arbitrary-string minting helper must not exist — a generic caller can no longer
-    # mint genuine by passing a constant.
+    # The old arbitrary-string minting helper AND the public genuine-authority builders are gone.
     assert not hasattr(cc, "stamp_pack_provenance")
-    # The closed genuine authority builders accept NO caller-supplied provenance string.
-    assert inspect.signature(cc.genuine_live_sse_authority).parameters == {}
-    assert inspect.signature(cc.genuine_backfill_authority).parameters == {}
-    # And run_capture_chain still has NO provenance parameter (no injection seam).
+    assert not hasattr(cc, "genuine_backfill_authority")
+    assert not hasattr(cc, "genuine_live_sse_authority")
+    # run_capture_chain still has NO provenance parameter (no injection seam).
     assert "provenance" not in inspect.signature(run_capture_chain).parameters
+
+    # Constructing a genuine capability through the public class constructor fails closed (no seal).
+    with pytest.raises(PermissionError):
+        PackAuthority(
+            provenance=GENUINE_TXLINE_PROVENANCE,
+            test_capture=False,
+            synthetic=False,
+            evidence_rung="backfilled-price-history",
+            capture_method="odds-updates-backfill",
+        )
+
+    # The open-dict authority input is gone — a raw dict (the old bypass) is rejected by the builder.
+    session = tmp_path / "session_dict"
+    _write_session(session, [_odds_record(1, 100), _odds_record(1, 200)])
+    with pytest.raises((AttributeError, TypeError)):
+        pack_from_session(
+            session, tmp_path / "pack_dict", authority={"provenance": GENUINE_TXLINE_PROVENANCE}
+        )
+
+    # Feeding a synthetic session + the strongest PUBLICLY-obtainable authority never mints genuine.
+    synth_pack = _build_pack(tmp_path, synthetic_authority(), name="pub_synth")
+    assert verify_content_hash(synth_pack) is True
+    assert is_genuine_pack(synth_pack) is False
 
 
 # --- Control 5: genuine live SSE and genuine verified backfill -> DISTINCT rungs, both verify ---
 def test_control5_live_and_backfill_are_distinct_genuine_rungs(tmp_path: Path):
-    live = genuine_live_sse_authority()
-    backfill = genuine_backfill_authority()
-    assert live["evidence_rung"] == "recorded-live-quote"
-    assert backfill["evidence_rung"] == "backfilled-price-history"
-    assert live["evidence_rung"] != backfill["evidence_rung"]
+    # The two CLOSED genuine producers (sealed capabilities) — reached via the module-private
+    # constructors that only trusted producer paths call.
+    live = _genuine_live_sse_authority()
+    backfill = _genuine_backfill_authority()
+    assert live.evidence_rung == "recorded-live-quote"
+    assert backfill.evidence_rung == "backfilled-price-history"
+    assert live.evidence_rung != backfill.evidence_rung
 
     live_pack = _build_pack(tmp_path, live, name="live")
     backfill_pack = _build_pack(tmp_path, backfill, name="backfill")
@@ -246,6 +304,8 @@ def test_control5_live_and_backfill_are_distinct_genuine_rungs(tmp_path: Path):
         pytest.param(lambda a: a.update(synthetic=True), id="synthetic_true"),
         pytest.param(lambda a: a.pop("provenance"), id="missing_provenance"),
         pytest.param(lambda a: a.pop("evidence_rung"), id="missing_evidence_rung"),
+        # E-residual: a hash-valid v2 authority block with `synthetic` OMITTED must fail closed.
+        pytest.param(lambda a: a.pop("synthetic"), id="missing_synthetic"),
         pytest.param(lambda a: a.update(evidence_rung="synthetic"), id="non_genuine_rung"),
         pytest.param(lambda a: a.update(capture_method="totally-unknown"), id="unknown_method"),
         pytest.param(lambda a: a.update(provenance="synthetic-illustrative"), id="contradictory_provenance"),
@@ -255,11 +315,12 @@ def test_control6_incoherent_authority_never_reads_genuine(tmp_path: Path, mutat
     """A pack whose authority block is self-consistent (verify passes) but INCOHERENT for a genuine
 
     capture must never read genuine — test_capture, synthetic, missing/contradictory fields, or an
-    unrecognized rung/method all fail-safe to False.
+    unrecognized rung/method all fail-safe to False. The read-side gate (``is_genuine_pack``) is
+    exercised directly against a self-consistent pack whose capture block carries the mutated fields.
     """
-    authority = genuine_backfill_authority()
-    mutate(authority)
-    pack = _build_pack(tmp_path, authority, name="incoherent")
+    authority_fields = _genuine_backfill_authority().as_capture_fields()
+    mutate(authority_fields)
+    pack = _build_self_consistent_pack_with_authority(tmp_path, authority_fields, name="incoherent")
     # The pack is internally self-consistent (its own hash verifies)...
     assert verify_content_hash(pack) is True
     # ...but the incoherent authority can never read genuine.

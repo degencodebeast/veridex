@@ -114,17 +114,14 @@ class FakeStreamClient:
 class RecordingFakeSource:
     """The recording-fake capture seam: canned auth + canned ``/odds/stream``, NO network.
 
-    Its :attr:`provenance` is FIXED to :data:`TEST_FAKE_PROVENANCE` and is NOT a constructor
-    argument — there is no way to construct this source so it declares genuine provenance. The
-    fake credentials embed :data:`SENTINEL_SECRET` so a leak-scan can prove secret hygiene.
+    It declares NO ``provenance`` of its own: authority is derived structurally from the concrete
+    producer TYPE by :func:`~veridex.ingest.capture_chain._authority_for_source` (this fake maps to
+    :data:`TEST_FAKE_PROVENANCE`, never genuine), never from anything the source says about itself.
+    The fake credentials embed :data:`SENTINEL_SECRET` so a leak-scan can prove secret hygiene.
     """
 
     def __init__(self, frames: Iterable[str] | None = None) -> None:
         self._frames = list(frames) if frames is not None else odds_frames()
-
-    @property
-    def provenance(self) -> str:
-        return TEST_FAKE_PROVENANCE
 
     def credentials(self) -> tuple[str, str]:
         return (f"jwt-{SENTINEL_SECRET}", f"tok-{SENTINEL_SECRET}")

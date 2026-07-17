@@ -11,13 +11,18 @@ from __future__ import annotations
 import hashlib
 import json
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from pydantic import BaseModel
 
 from veridex.ingest.live_client import marketstates_from_record_stream
 from veridex.ingest.marketstate import MarketState
 from veridex.ingest.recorder import read_session
+
+if TYPE_CHECKING:
+    # Type-only import (avoids a runtime cycle: capture_chain imports this module). A PackAuthority is
+    # a SEALED provenance capability — see :mod:`veridex.ingest.capture_chain`.
+    from veridex.ingest.capture_chain import PackAuthority
 
 #: The current authority-inclusive pack format. A v2 pack folds its authority block (below) INTO
 #: ``content_hash``; a legacy v1 pack hashes DATA FILES ONLY (see :func:`_compute_content_hash`).
@@ -107,7 +112,7 @@ def _compute_content_hash(
 
 
 def pack_from_session(
-    session_dir: Path, out_dir: Path, *, authority: dict[str, Any] | None = None
+    session_dir: Path, out_dir: Path, *, authority: PackAuthority | None = None
 ) -> ReplayPack:
     """Pure file transform: recorder session -> self-describing, hashed ReplayPack.
 
@@ -115,12 +120,15 @@ def pack_from_session(
     native TxLINE record per line, unwrapped from its envelope), copies any
     ``updates_<fid>.json`` present, computes ``content_hash``, writes ``out_dir/pack.json``.
 
-    Provenance authority (MAJOR-1): when ``authority`` is supplied (a CLOSED-set authority block
-    from :mod:`veridex.ingest.capture_chain` — e.g. :func:`~veridex.ingest.capture_chain.
-    genuine_backfill_authority`), its :data:`_AUTHORITY_FIELDS` are merged into the ``capture`` block
-    AND folded into a ``pack_version=2`` ``content_hash``, so the provenance declaration is
-    tamper-evident. When ``authority`` is ``None`` the pack stays legacy ``pack_version=1`` with a
-    DATA-ONLY hash (backward compatible) — such a pack can never read genuine (fail-safe).
+    Provenance authority (MAJOR-1 / D-residual): ``authority`` is a SEALED
+    :class:`~veridex.ingest.capture_chain.PackAuthority` capability, NOT a raw dict — the open-dict
+    input is gone, so an arbitrary caller can no longer smuggle genuine field VALUES into a pack. A
+    GENUINE capability is constructible ONLY by the CLOSED producer paths (live capture + the
+    verified-backfill banker); the ordinary/public builder can only ever receive a non-genuine
+    (synthetic/test) capability, so it can NEVER mint a genuine pack from arbitrary records. When a
+    capability is supplied, its five authority fields are merged into the ``capture`` block AND folded
+    into a ``pack_version=2`` ``content_hash`` (tamper-evident). When ``authority`` is ``None`` the
+    pack stays legacy ``pack_version=1`` with a DATA-ONLY hash — such a pack can never read genuine.
     """
     meta, records, gaps = read_session(session_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -162,9 +170,10 @@ def pack_from_session(
 
     pack_version = 1
     if authority is not None:
-        # Merge ONLY the recognized authority fields (the closed set that the v2 hash binds), so a
-        # caller cannot smuggle extra unhashed keys into the authority region via `authority`.
-        capture.update({field: authority.get(field) for field in _AUTHORITY_FIELDS})
+        # Merge ONLY the recognized authority fields (the closed set that the v2 hash binds) from the
+        # sealed capability, so a caller cannot smuggle extra unhashed keys into the authority region.
+        fields = authority.as_capture_fields()
+        capture.update({field: fields.get(field) for field in _AUTHORITY_FIELDS})
         pack_version = PACK_FORMAT_VERSION
 
     pack = ReplayPack(

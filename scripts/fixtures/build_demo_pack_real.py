@@ -23,9 +23,10 @@ BACKFILL, not a live ``/odds/stream`` SSE recording — so the pack self-declare
 and it never over-claims to be a live-recorded-quote tape.
 
 Reproducible + deterministic: the frozen :func:`~veridex.ingest.replay_pack.pack_from_session`
-transform folds R-0a's CLOSED :func:`~veridex.ingest.capture_chain.genuine_backfill_authority` into a
-tamper-evident v2 ``content_hash``; this script only selects verbatim records, so re-running it over
-the same raw packs reproduces the SAME ``content_hash`` pinned in ``scripts/demo_phase2d.py``.
+transform folds R-0a's SEALED, CLOSED ``_genuine_backfill_authority`` capability (this verified-backfill
+banker is its only owned caller — it is NOT on the public API surface) into a tamper-evident v2
+``content_hash``; this script only selects verbatim records, so re-running it over the same raw packs
+reproduces the SAME ``content_hash`` pinned in ``scripts/demo_phase2d.py``.
 
 Run (operator, with the raw WC packs present):
     .venv/bin/python scripts/fixtures/build_demo_pack_real.py
@@ -44,7 +45,7 @@ from typing import Any
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
-from veridex.ingest.capture_chain import genuine_backfill_authority  # noqa: E402
+from veridex.ingest.capture_chain import _genuine_backfill_authority  # noqa: E402
 from veridex.ingest.recorder import SessionMeta, envelope_line  # noqa: E402
 from veridex.ingest.replay_pack import ReplayPack, pack_from_session, verify_content_hash  # noqa: E402
 
@@ -119,7 +120,7 @@ def build(dst: Path = DEMO_PACK_REAL_DIR) -> ReplayPack:
         # backfilled-price-history rung, odds-updates-backfill method) is folded INTO the v2
         # content_hash by pack_from_session — this IS genuine TxLINE odds (not synthetic, not
         # Polymarket), and its authority is now tamper-evident, not a post-hoc unhashed string.
-        pack_from_session(session_dir, dst, authority=genuine_backfill_authority())
+        pack_from_session(session_dir, dst, authority=_genuine_backfill_authority())
 
     # A transparent, NON-authority human note (not one of the hashed authority fields).
     pack_path = dst / "pack.json"

@@ -38,7 +38,7 @@ from typing import Any
 
 from veridex.backtest import mode_ladder_label
 from veridex.backtest.runner import run_backtest
-from veridex.ingest.capture_chain import is_genuine_pack, synthetic_authority
+from veridex.ingest.capture_chain import SYNTHETIC_PROVENANCE, is_genuine_pack, synthetic_authority
 from veridex.ingest.recorder import SessionMeta, envelope_line
 from veridex.ingest.replay_pack import load_pack_marketstates, pack_from_session, verify_content_hash
 from veridex.runtime.window import RunWindow
@@ -74,8 +74,8 @@ FLAGSHIP_STRATEGY_LABEL = SHARP_MOMENTUM_V2_LABEL
 _MARKET_ALLOWLIST = ("OU",)
 #: The truthful ``kind`` labels a manifest row may carry — a proof-only demo NEVER emits "live".
 HONEST_KINDS: frozenset[str] = frozenset({"backtest", "paper", "replay"})
-#: Data-provenance marker the shipped pack self-declares (its odds are illustrative, not captured).
-SYNTHETIC_PROVENANCE = "synthetic-illustrative"
+#: Data-provenance marker the shipped pack self-declares — the canonical constant is owned by
+#: :mod:`veridex.ingest.capture_chain` (single source of truth; re-exported here for local use).
 #: Fail-safe label for a pack that declares NEITHER synthetic NOR a positive real marker — we must
 #: never assert it was really captured, so it reads "unknown" and still carries a cautious caveat.
 UNKNOWN_PROVENANCE = "unknown-provenance"

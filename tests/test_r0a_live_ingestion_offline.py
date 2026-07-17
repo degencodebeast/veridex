@@ -20,6 +20,7 @@ import pytest
 
 from scripts.txline_live_capture_accept import (
     SENTINEL_SECRET,
+    FakeStreamClient,
     RecordingFakeSource,
     heartbeat_only_frames,
     odds_frames,
@@ -68,11 +69,37 @@ def test_fake_pack_is_test_provenance_never_genuine(tmp_path):
     # Structural invariant (MAJOR-1): authority is derived from the CLOSED producer set BY TYPE, not
     # from anything the source declares — so a fake/unknown source maps to test, never genuine, and
     # run_capture_chain has NO provenance parameter to inject "genuine" through.
-    assert _authority_for_source(RecordingFakeSource())["provenance"] == TEST_FAKE_PROVENANCE
-    assert _authority_for_source(RecordingFakeSource())["provenance"] != GENUINE_TXLINE_PROVENANCE
+    assert _authority_for_source(RecordingFakeSource()).provenance == TEST_FAKE_PROVENANCE
+    assert _authority_for_source(RecordingFakeSource()).provenance != GENUINE_TXLINE_PROVENANCE
     assert "provenance" not in inspect.signature(run_capture_chain).parameters
     # ONLY the real live source's concrete TYPE maps to genuine authority.
-    assert _authority_for_source(LiveCaptureSource())["provenance"] == GENUINE_TXLINE_PROVENANCE
+    assert _authority_for_source(LiveCaptureSource()).provenance == GENUINE_TXLINE_PROVENANCE
+
+
+# --- RED (F-residual): a fake SUBCLASS of LiveCaptureSource must NOT inherit genuine authority ------
+def test_fake_livecapturesource_subclass_maps_to_test_not_genuine(tmp_path):
+    """F-residual (Codex re-gate): a caller can subclass ``LiveCaptureSource`` and override
+    ``credentials`` / ``stream_client`` with canned data, then route it through the ordinary
+    ``run_capture_chain`` entrypoint. EXACT-type membership (``type(source) is LiveCaptureSource``,
+    not ``isinstance``) must map the subclass to the fail-safe TEST authority — never genuine.
+    (RED before the fix: the subclass passed ``isinstance`` and received ``genuine-txline``.)
+    """
+
+    class FakeLive(LiveCaptureSource):
+        def credentials(self) -> tuple[str, str]:
+            return ("jwt-x", "tok-x")
+
+        def stream_client(self) -> FakeStreamClient:
+            return FakeStreamClient(odds_frames(fixture_id=9, count=3))
+
+    # Structural: the exact-type gate rejects the subclass.
+    assert _authority_for_source(FakeLive()).provenance == TEST_FAKE_PROVENANCE
+    assert _authority_for_source(FakeLive()).provenance != GENUINE_TXLINE_PROVENANCE
+    # End-to-end through the ordinary entrypoint: the banked pack reads TEST, never genuine.
+    result = _run_chain(FakeLive(), tmp_path)
+    assert result.pack_dir is not None
+    assert is_genuine_pack(result.pack_dir) is False
+    assert read_pack_provenance(result.pack_dir) == TEST_FAKE_PROVENANCE
 
 
 # --- RED 3: secret scrubbing — sentinel leaks into no artifact/log --------------------------------

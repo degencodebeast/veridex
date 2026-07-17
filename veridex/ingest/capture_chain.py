@@ -31,9 +31,9 @@ from __future__ import annotations
 
 import json
 import time
-from dataclasses import dataclass
+from dataclasses import InitVar, dataclass
 from pathlib import Path
-from typing import Any, Protocol, runtime_checkable
+from typing import Any, Final, Protocol, runtime_checkable
 
 from veridex.ingest.feed_health import DEFAULT_STALE_AFTER_S, FeedState, derive_feed_state
 from veridex.ingest.live_client import build_auth_headers
@@ -71,57 +71,116 @@ _GENUINE_CAPTURE_METHODS: frozenset[str] = frozenset({LIVE_SSE_CAPTURE_METHOD, B
 #: Default TxLINE odds SSE endpoint path appended to the base URL.
 _ODDS_STREAM_PATH = "/odds/stream"
 
+#: Module-private capability SEAL (D-residual). Only the CLOSED producer paths in THIS module hold it,
+#: so only they can mint a GENUINE :class:`PackAuthority`. It is deliberately not part of the public
+#: API surface — reaching for it is equivalent to editing trusted application code, which is outside
+#: the honesty threat model (a public caller cannot obtain it).
+_AUTHORITY_SEAL: Final[object] = object()
 
-def genuine_live_sse_authority() -> dict[str, Any]:
-    """CLOSED-set authority for a GENUINE pack captured from the live ``/odds/stream`` SSE feed.
 
-    The ONLY genuine-live producer; takes NO caller-supplied provenance string. Its distinct
-    ``recorded-live-quote`` rung separates it from the verified-backfill genuine path.
+@dataclass(frozen=True)
+class PackAuthority:
+    """A SEALED provenance capability: the five authority fields a v2 pack binds (MAJOR-1 honesty core).
+
+    The D-residual fix. A GENUINE capability — one carrying ``provenance == GENUINE_TXLINE_PROVENANCE``
+    OR a genuine ``evidence_rung`` / ``capture_method`` — can be constructed ONLY by the CLOSED producer
+    paths in this module (:func:`_authority_for_source` for live capture, :func:`_genuine_backfill_authority`
+    for the verified-backfill banker), which pass the module-private :data:`_AUTHORITY_SEAL`. Any other
+    attempt to construct a genuine capability raises. Non-genuine capabilities (synthetic / test /
+    unknown) need no seal. So an arbitrary public caller cannot fabricate a genuine capability to hand to
+    :func:`~veridex.ingest.replay_pack.pack_from_session`: the ordinary public builder can NEVER mint a
+    genuine pack from arbitrary records. This is application-level honesty (a closed set of trusted
+    producers), NOT signed-origin crypto — the cryptographic-attestation upgrade stays post-hackathon.
     """
-    return {
-        "provenance": GENUINE_TXLINE_PROVENANCE,
-        "test_capture": False,
-        "synthetic": False,
-        "evidence_rung": EvidenceRung.RECORDED_LIVE_QUOTE.value,
-        "capture_method": LIVE_SSE_CAPTURE_METHOD,
-    }
+
+    provenance: str
+    test_capture: bool
+    synthetic: bool
+    evidence_rung: str | None
+    capture_method: str
+    seal: InitVar[object | None] = None
+
+    def __post_init__(self, seal: object | None) -> None:
+        if self._claims_genuine() and seal is not _AUTHORITY_SEAL:
+            raise PermissionError(
+                "a genuine PackAuthority can be minted only by a closed producer path "
+                "(live capture or the verified-backfill banker), never via the public API"
+            )
+
+    def _claims_genuine(self) -> bool:
+        """True if ANY field carries a genuine marker — the whole capability is then seal-gated."""
+        return (
+            self.provenance == GENUINE_TXLINE_PROVENANCE
+            or str(self.evidence_rung) in _GENUINE_EVIDENCE_RUNGS
+            or self.capture_method in _GENUINE_CAPTURE_METHODS
+        )
+
+    def as_capture_fields(self) -> dict[str, Any]:
+        """The five authority fields as a plain dict for the pack ``capture`` block / v2 hash."""
+        return {
+            "provenance": self.provenance,
+            "test_capture": self.test_capture,
+            "synthetic": self.synthetic,
+            "evidence_rung": self.evidence_rung,
+            "capture_method": self.capture_method,
+        }
 
 
-def genuine_backfill_authority() -> dict[str, Any]:
-    """CLOSED-set authority for a GENUINE pack curated from the verified ``/odds/updates`` backfill.
+def _genuine_live_sse_authority() -> PackAuthority:
+    """SEALED authority for a GENUINE pack captured from the live ``/odds/stream`` SSE feed.
 
-    The ONLY genuine-backfill producer; takes NO caller-supplied provenance string. Its distinct
-    ``backfilled-price-history`` rung separates it from the live-SSE genuine path.
+    CLOSED producer — NOT on the public API surface (D-residual): only :func:`_authority_for_source`
+    reaches it, and it passes the module-private seal. Its distinct ``recorded-live-quote`` rung
+    separates it from the verified-backfill genuine path.
     """
-    return {
-        "provenance": GENUINE_TXLINE_PROVENANCE,
-        "test_capture": False,
-        "synthetic": False,
-        "evidence_rung": EvidenceRung.BACKFILLED_PRICE_HISTORY.value,
-        "capture_method": BACKFILL_CAPTURE_METHOD,
-    }
+    return PackAuthority(
+        provenance=GENUINE_TXLINE_PROVENANCE,
+        test_capture=False,
+        synthetic=False,
+        evidence_rung=EvidenceRung.RECORDED_LIVE_QUOTE.value,
+        capture_method=LIVE_SSE_CAPTURE_METHOD,
+        seal=_AUTHORITY_SEAL,
+    )
 
 
-def synthetic_authority() -> dict[str, Any]:
-    """CLOSED-set authority for a SYNTHETIC illustrative pack (the shipped demo tape) — non-genuine."""
-    return {
-        "provenance": SYNTHETIC_PROVENANCE,
-        "test_capture": False,
-        "synthetic": True,
-        "evidence_rung": EvidenceRung.SYNTHETIC.value,
-        "capture_method": SYNTHETIC_CAPTURE_METHOD,
-    }
+def _genuine_backfill_authority() -> PackAuthority:
+    """SEALED authority for a GENUINE pack curated from the verified ``/odds/updates`` backfill.
+
+    CLOSED producer — NOT on the public API surface (D-residual): the verified-backfill banker
+    (``scripts/fixtures/build_demo_pack_real.py``) is the only owned caller, and this constructs the
+    genuine capability with the module-private seal. Its distinct ``backfilled-price-history`` rung
+    separates it from the live-SSE genuine path.
+    """
+    return PackAuthority(
+        provenance=GENUINE_TXLINE_PROVENANCE,
+        test_capture=False,
+        synthetic=False,
+        evidence_rung=EvidenceRung.BACKFILLED_PRICE_HISTORY.value,
+        capture_method=BACKFILL_CAPTURE_METHOD,
+        seal=_AUTHORITY_SEAL,
+    )
 
 
-def test_fake_authority() -> dict[str, Any]:
-    """CLOSED-set authority for a recording-fake / unknown-source capture — a TEST pack, non-genuine."""
-    return {
-        "provenance": TEST_FAKE_PROVENANCE,
-        "test_capture": True,
-        "synthetic": False,
-        "evidence_rung": None,
-        "capture_method": RECORDING_FAKE_CAPTURE_METHOD,
-    }
+def synthetic_authority() -> PackAuthority:
+    """Public capability for a SYNTHETIC illustrative pack (the shipped demo tape) — non-genuine, unsealed."""
+    return PackAuthority(
+        provenance=SYNTHETIC_PROVENANCE,
+        test_capture=False,
+        synthetic=True,
+        evidence_rung=EvidenceRung.SYNTHETIC.value,
+        capture_method=SYNTHETIC_CAPTURE_METHOD,
+    )
+
+
+def test_fake_authority() -> PackAuthority:
+    """Public capability for a recording-fake / unknown-source capture — a TEST pack, non-genuine, unsealed."""
+    return PackAuthority(
+        provenance=TEST_FAKE_PROVENANCE,
+        test_capture=True,
+        synthetic=False,
+        evidence_rung=None,
+        capture_method=RECORDING_FAKE_CAPTURE_METHOD,
+    )
 
 
 def _scrub(text: str, *secrets: str) -> str:
@@ -203,16 +262,20 @@ class LiveCaptureSource:
         return httpx.AsyncClient(timeout=httpx.Timeout(30.0, read=None))
 
 
-def _authority_for_source(source: CaptureSource) -> dict[str, Any]:
-    """Derive a pack's authority from a CLOSED set of controller-owned producer TYPES (MAJOR-1).
+def _authority_for_source(source: CaptureSource) -> PackAuthority:
+    """Derive a pack's authority from a CLOSED set of controller-owned producer TYPES (MAJOR-1 / F-residual).
 
     This is the honesty core: authority is keyed off the concrete producer, NEVER off anything the
-    source declares about itself. Only :class:`LiveCaptureSource` (the real live seam) maps to the
-    genuine live-SSE authority; every other/unknown/custom source — including one that hardcodes a
-    ``provenance='genuine-txline'`` attribute — maps to the fail-safe test/unknown authority.
+    source declares about itself. EXACT-type membership (``type(source) is LiveCaptureSource``), NOT
+    ``isinstance`` — a fake SUBCLASS that overrides ``credentials`` / ``stream_client`` with canned data
+    must NOT inherit genuine authority (the F-residual bypass). Only the concrete :class:`LiveCaptureSource`
+    maps to the genuine live-SSE capability; every other/unknown/custom/subclassed source — including one
+    that hardcodes a ``provenance='genuine-txline'`` attribute — maps to the fail-safe test/unknown
+    capability. A future legitimate producer must be given an EXPLICIT reviewed authority mapping here,
+    never inherit genuine by accident.
     """
-    if isinstance(source, LiveCaptureSource):
-        return genuine_live_sse_authority()
+    if type(source) is LiveCaptureSource:
+        return _genuine_live_sse_authority()
     return test_fake_authority()
 
 
@@ -240,7 +303,8 @@ def is_genuine_pack(pack_dir: Path) -> bool:
     2. :func:`~veridex.ingest.replay_pack.verify_content_hash` passes — the authority declaration is
        intact and unchanged since it was hashed (a post-build relabel fails here);
     3. a coherent genuine state — ``provenance == genuine-txline``, ``test_capture is False``,
-       ``synthetic is not True``, an allowed genuine ``evidence_rung`` AND ``capture_method``.
+       ``synthetic is False`` (an OMITTED ``synthetic`` fails closed), an allowed genuine
+       ``evidence_rung`` AND ``capture_method``.
 
     ANY missing, contradictory, or unrecognized field → False.
     """
@@ -256,7 +320,9 @@ def is_genuine_pack(pack_dir: Path) -> bool:
     return (
         str(capture.get("provenance", "")).strip() == GENUINE_TXLINE_PROVENANCE
         and capture.get("test_capture") is False
-        and capture.get("synthetic") is not True
+        # E-residual: require an EXPLICIT ``synthetic is False`` — a MISSING (None) value must fail
+        # closed (matches this function's documented "ANY missing field -> False" rule).
+        and capture.get("synthetic") is False
         and str(capture.get("evidence_rung", "")) in _GENUINE_EVIDENCE_RUNGS
         and str(capture.get("capture_method", "")) in _GENUINE_CAPTURE_METHODS
     )
@@ -293,7 +359,7 @@ async def run_capture_chain(
     """
     # Authority is derived from the CLOSED producer set BY TYPE, never from the source's own words.
     authority = _authority_for_source(source)
-    provenance = str(authority["provenance"])
+    provenance = str(authority.provenance)
     jwt, token = source.credentials()  # fail-closed for the live source — raises BEFORE any I/O
     headers = build_auth_headers(jwt, token)
     url = f"{base_url}{_ODDS_STREAM_PATH}"
