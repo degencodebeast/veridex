@@ -95,6 +95,8 @@ from veridex.competition.service import (
     CompetitionConflictError,
     CompetitionIntegrityError,
     CompetitionStateError,
+    RosterInstanceNotFoundError,
+    RosterInstanceNotOwnedError,
     _default_policy_envelope,
     register_agent,
     start_competition,
@@ -900,9 +902,11 @@ def create_app(
             ``config_hash``, and the normalised ``proof_mode``.
 
         Raises:
-            HTTPException: 404 (unknown competition), 403 (caller is not the owner), 409 (roster
-                frozen post-start, duplicate agent, or roster cap exceeded), 400 (an instance-bound
-                entry references a deployed instance that does not exist — fail-closed).
+            HTTPException: 404 (unknown competition; OR an instance-bound entry whose referenced
+                deployed instance is absent/unowned-legacy — mirror I-2, no existence leak), 403
+                (caller is not the competition owner; OR the referenced deployed instance is owned by
+                another principal — mirror I-2), 409 (roster frozen post-start, duplicate agent, or
+                roster cap exceeded), 400 (other domain rejection, e.g. an unrecognised proof_mode).
         """
         try:
             competition = await dep_store.get_competition(competition_id)
@@ -924,12 +928,19 @@ def create_app(
             )
 
         try:
-            finalized = await register_agent(dep_store, competition_id, entry)
+            finalized = await register_agent(dep_store, competition_id, entry, principal_did=principal.did)
+        except RosterInstanceNotOwnedError:
+            # Instance-bound entry references a deployed instance owned by another principal — mirror I-2
+            # (deploy.py GET /agents/instances/{id}): 403, and no config_hash was read/returned.
+            raise HTTPException(status_code=403, detail="principal does not own this agent instance") from None
+        except RosterInstanceNotFoundError:
+            # Absent OR unowned-legacy(None) instance — mirror I-2: 404, INDISTINGUISHABLE, no existence
+            # leak and no config_hash disclosure to a non-owner.
+            raise HTTPException(status_code=404, detail="agent instance not found") from None
         except KeyError:
             raise HTTPException(status_code=404, detail=f"competition {competition_id!r} not found") from None
         except ValueError as exc:
-            # An instance-bound entry references a deployed instance that does not exist — fail closed
-            # (never roster a dangling instance reference).
+            # Any other domain rejection (e.g. an unrecognised proof_mode) — fail closed with 400.
             raise HTTPException(status_code=400, detail=str(exc)) from None
         return AgentRegisterResponse(
             agent_id=finalized.agent_id,

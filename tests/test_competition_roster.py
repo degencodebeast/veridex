@@ -285,9 +285,14 @@ async def test_start_still_requires_owner_after_roster_change() -> None:
 # ---------------------------------------------------------------------------
 
 
-def _deployed_baseline_instance(*, instance_id: str, config_hash: str) -> AgentInstance:
+def _deployed_baseline_instance(
+    *, instance_id: str, config_hash: str, operator_id: str | None = _DID_ALICE
+) -> AgentInstance:
     """A deployed instance whose effective_config runs the deterministic baseline agent — it scores on
-    the demo ticks, so the built deployed contestant appears on the finalized leaderboard by agent_id."""
+    the demo ticks, so the built deployed contestant appears on the finalized leaderboard by agent_id.
+
+    ``operator_id`` is the SERVER-DERIVED deploy owner (I-2). Defaults to Alice (the demo owner); pass
+    another DID (or ``None`` for an unowned/legacy row) to exercise the cross-owner authz cases."""
     effective = AgentRunConfig(agent_id="deployed-contestant", strategy="baseline").model_dump(mode="json")
     return AgentInstance(
         instance_id=instance_id,
@@ -300,7 +305,7 @@ def _deployed_baseline_instance(*, instance_id: str, config_hash: str) -> AgentI
         source_mode="replay",
         execution_mode="paper",
         run_id="run-x",
-        operator_id=_DID_ALICE,
+        operator_id=operator_id,
         created_at="2026-01-01T00:00:00+00:00",
         updated_at="2026-01-01T00:00:00+00:00",
     )
@@ -393,5 +398,85 @@ async def test_register_bound_entry_then_genuine_drift_still_400s() -> None:
             start = await client.post(f"/competitions/{comp_id}/start", headers=_bearer(_DID_ALICE))
             assert start.status_code == 400, start.text
             assert "drift" in start.text.lower()
+    finally:
+        await _drain(app)
+
+
+# ---------------------------------------------------------------------------
+# MAJOR-2 (dec-i7-scope-003) — cross-owner instance grafting is refused with NO leak. The register
+# path must owner-scope the referenced deployed instance EXACTLY as I-2 does (deploy.py GET
+# /agents/instances/{id}): owned-by-another -> 403; absent OR unowned-legacy(None) -> 404 (no existence
+# leak); the caller's OWN instance still binds. The check runs BEFORE any config_hash is read/returned,
+# so a non-owner never learns even the deployed config_hash (an identity fingerprint I-2 hides).
+# ---------------------------------------------------------------------------
+
+
+async def test_register_cross_owner_instance_is_refused_with_no_leak() -> None:
+    store = InMemoryStore()
+    # Bob deploys an instance — its config_hash is Bob-private (I-2 hides even its existence from others).
+    await store.persist_agent_instance(
+        _deployed_baseline_instance(instance_id="inst_bob", config_hash="BOB_SECRET_HASH", operator_id=_DID_BOB)
+    )
+    app = create_app(store=store, settings=_privy_settings())
+    try:
+        async with _transport(app) as client:
+            create = await client.post("/competitions", json=_COMPETITION_CONFIG, headers=_bearer(_DID_ALICE))
+            comp_id = create.json()["competition_id"]
+
+            # Alice tries to graft BOB's deployed instance onto HER competition roster.
+            reg = await client.post(
+                f"/competitions/{comp_id}/agents",
+                json=_bound_reg_body("grafted", "inst_bob"),
+                headers=_bearer(_DID_ALICE),
+            )
+            # Refused (mirror I-2 owned-by-another -> 403), and Bob's config_hash is NOT disclosed.
+            assert reg.status_code == 403, reg.text
+            assert "BOB_SECRET_HASH" not in reg.text
+
+            # The graft never landed on the roster -> a start can never run Bob's contestant.
+            state = await client.get(f"/competitions/{comp_id}")
+            roster = state.json()["roster"]
+            assert all(e.get("instance_id") != "inst_bob" for e in roster)
+            assert all(e.get("config_hash") != "BOB_SECRET_HASH" for e in roster)
+    finally:
+        await _drain(app)
+
+
+async def test_register_unowned_legacy_instance_is_hidden_404() -> None:
+    store = InMemoryStore()
+    # A legacy/unowned deployed row (operator_id is None) is NEVER inherited — hidden as absent (I-2).
+    await store.persist_agent_instance(
+        _deployed_baseline_instance(instance_id="inst_legacy", config_hash="LEGACY_SECRET_HASH", operator_id=None)
+    )
+    app = create_app(store=store, settings=_privy_settings())
+    try:
+        async with _transport(app) as client:
+            create = await client.post("/competitions", json=_COMPETITION_CONFIG, headers=_bearer(_DID_ALICE))
+            comp_id = create.json()["competition_id"]
+            reg = await client.post(
+                f"/competitions/{comp_id}/agents",
+                json=_bound_reg_body("grafted", "inst_legacy"),
+                headers=_bearer(_DID_ALICE),
+            )
+            assert reg.status_code == 404, reg.text
+            assert "LEGACY_SECRET_HASH" not in reg.text
+    finally:
+        await _drain(app)
+
+
+async def test_register_absent_instance_is_404_no_leak() -> None:
+    store = InMemoryStore()
+    app = create_app(store=store, settings=_privy_settings())
+    try:
+        async with _transport(app) as client:
+            create = await client.post("/competitions", json=_COMPETITION_CONFIG, headers=_bearer(_DID_ALICE))
+            comp_id = create.json()["competition_id"]
+            reg = await client.post(
+                f"/competitions/{comp_id}/agents",
+                json=_bound_reg_body("grafted", "inst_does_not_exist"),
+                headers=_bearer(_DID_ALICE),
+            )
+            # Absent instance is INDISTINGUISHABLE from unowned/owned-by-another for a non-owner (404).
+            assert reg.status_code == 404, reg.text
     finally:
         await _drain(app)
