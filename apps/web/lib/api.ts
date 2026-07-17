@@ -15,6 +15,7 @@
 //     not in wire CompetitionStateResponse; they come from the WS stream + /leaderboard.
 //   - InspectorRecord: proof_mode/is_live/clv_explanation are not in wire InspectorRecord.
 import { CHECK_ORDER } from '@/lib/checks';
+import { getAuthToken } from '@/lib/auth';
 import { isMockEnabled, MOCK_FIXTURES } from '@/lib/mock';
 import { COCKPIT_DEMO } from '@/lib/fixtures/cockpit';
 import { INSPECTOR_DEMO_QUANTITIES } from '@/lib/fixtures/inspector';
@@ -54,6 +55,34 @@ export class ApiError extends Error {
     super(message);
     this.name = 'ApiError';
   }
+}
+
+// POST an owner-scoped route with the auth-contract@1 bearer. Attaches Authorization when the
+// seam (lib/auth.ts) has a token; omits it otherwise — the fail-closed "no token ⇒ never fires"
+// guarantee lives at the UI layer (components/auth/AuthGate keeps the gated affordance out of the
+// DOM entirely) plus the backend, which 401s any request missing a valid bearer before any side
+// effect (auth-contract@1). This client stays a dumb, honest transport: it never fabricates a
+// bearer and never silently eats a 401. On a 401 it re-acquires the token (re-auth) and retries
+// EXACTLY ONCE — never an infinite loop; the final response is returned as-is for the caller to
+// inspect, so a persistent 401 always surfaces (via the existing !res.ok → ApiError check).
+async function authedFetch(path: string, body: unknown): Promise<Response> {
+  const token = await getAuthToken();
+  const doFetch = (bearer: string | null) =>
+    fetch(`${API_BASE}${path}`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        accept: 'application/json',
+        ...(bearer ? { authorization: `Bearer ${bearer}` } : {}),
+      },
+      body: JSON.stringify(body),
+    });
+  let res = await doFetch(token);
+  if (res.status === 401) {
+    const retryToken = await getAuthToken(); // re-auth: re-acquire token / re-login
+    if (retryToken) res = await doFetch(retryToken);
+  }
+  return res;
 }
 
 async function getJson<T>(path: string): Promise<T> {
@@ -491,13 +520,14 @@ export class DeployPreflightError extends Error {
  * surfaces it as a {@link DeployPreflightError} so the UI can name the failing check instead of a
  * bare status. The 200 body is the pinned instance + the launched ``run_id`` (returned WITHOUT
  * awaiting the seal).
+ *
+ * auth-contract@1: owner-scoped — carries the bearer from lib/auth.ts when the seam has a token
+ * (never fabricates one when it doesn't), and retries once on a 401 (see authedFetch). The
+ * fail-closed "no token → never fires" guarantee is enforced at the UI layer by wrapping the
+ * calling affordance in {@link AuthGate}, not by this function refusing to fetch.
  */
 export async function deployAgent(payload: DeployAgentPayload): Promise<DeployAgentResult> {
-  const res = await fetch(`${API_BASE}/agents/deploy`, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json', accept: 'application/json' },
-    body: JSON.stringify(payload),
-  });
+  const res = await authedFetch('/agents/deploy', payload);
   if (res.status === 422) {
     const body = (await res.json().catch(() => ({}))) as { detail?: { failed_checks?: string[]; checks?: DeployPreflightVerdict[] } };
     const detail = body.detail ?? {};
