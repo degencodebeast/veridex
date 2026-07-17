@@ -99,6 +99,15 @@ describe('maker wire contract binding — maker_arena_result.json parses into Ma
     expect(m.proof_card.falsification.verdict).toBe('SEPARATED');
   });
 
+  // I-R remediation (M3): the sealed configuration identity must survive the adapter — the
+  // wire carries result.config_hash and the view-model must preserve it verbatim.
+  it('M3: adaptMakerArenaResult preserves the sealed config_hash verbatim', () => {
+    const m = load<MakerArenaResultResponseWire>('maker_arena_result.json');
+    expect(m.result.config_hash).toMatch(/^[0-9a-f]{64}$/); // the fixture really carries it
+    const view = adaptMakerArenaResult(m);
+    expect(view.config_hash).toBe(m.result.config_hash);
+  });
+
   it('adaptMakerArenaResult → Maker view-model (rank/edge/labels preserved, edge stays null)', () => {
     const m = load<MakerArenaResultResponseWire>('maker_arena_result.json');
     const view = adaptMakerArenaResult(m);

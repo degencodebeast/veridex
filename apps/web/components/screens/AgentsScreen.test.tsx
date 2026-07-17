@@ -79,4 +79,18 @@ describe('AgentsScreen — Maker Arena lane (MM-R1)', () => {
       expect(row.real_executable_edge_bps).toBeNull();
     }
   });
+
+  // I-R remediation (Min5): the visible PROOF affordance must be a working accessible link,
+  // not dead table-cell text beside a working agent-name link.
+  it('Min5: the visible PROOF affordance is a real accessible link to the maker proof route', async () => {
+    const user = userEvent.setup();
+    render(<AgentsScreen />);
+    await user.click(screen.getByRole('radio', { name: 'Maker' }));
+    const proofLinks = screen.getAllByRole('link', { name: /proof card for/i });
+    expect(proofLinks).toHaveLength(2);
+    for (const link of proofLinks) {
+      expect(link.getAttribute('href')).toMatch(/^\/proof\/maker\/(txline-fair-mm|naive-mm)$/);
+      expect(link).toHaveTextContent(/proof/i);
+    }
+  });
 });

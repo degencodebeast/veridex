@@ -4,6 +4,8 @@ import userEvent from '@testing-library/user-event';
 import { LeaderboardScreen } from '@/components/screens/LeaderboardScreen';
 import { LEADERBOARD_ROWS } from '@/lib/fixtures/catalog';
 import { MAKER_ARENA_RESULT } from '@/lib/fixtures/maker';
+import { MAKER_INCONCLUSIVE, MAKER_INVERTED } from '../../__tests__/fixtures/makerVariants';
+import type { MakerArenaResultView } from '@/lib/contracts';
 import type { LeaderboardRow } from '@/lib/catalog';
 
 function mk(p: Partial<LeaderboardRow>): LeaderboardRow {
@@ -144,6 +146,48 @@ describe('LeaderboardScreen — Maker Arena lane (MM-R1)', () => {
       expect(Object.keys(row)).not.toContain('avg_clv_bps');
       expect(Object.keys(row)).not.toContain('rank');
       expect(Object.keys(row)).toContain('maker_rank');
+    }
+  });
+});
+
+// I-R remediation (M1 / Min5): the falsification strip must derive its badge, headline, and CI
+// copy from the REAL verdict, and the visible PROOF affordance must be a working link.
+describe('LeaderboardScreen — Maker verdict honesty + proof links (I-R M1, Min5)', () => {
+  afterEach(() => {
+    window.history.replaceState(null, '', '/'); // reset any ?lane= query between tests
+  });
+
+  async function openMakerLane(result: MakerArenaResultView) {
+    const user = userEvent.setup();
+    render(<LeaderboardScreen makerResult={result} />);
+    await user.click(screen.getByRole('radio', { name: 'Maker' }));
+  }
+
+  it('M1: INCONCLUSIVE renders no separated claim — headline and CI copy follow the real verdict', async () => {
+    await openMakerLane(MAKER_INCONCLUSIVE);
+    expect(screen.getByText('Inconclusive')).toBeInTheDocument();
+    expect(screen.queryByText('Separated')).toBeNull();
+    expect(screen.queryByText(/separated from the naive control/i)).toBeNull();
+    expect(screen.queryByText(/whole ci above zero/i)).toBeNull();
+    expect(screen.getByText(/no separation/i)).toBeInTheDocument();
+  });
+
+  it('M1: INVERTED renders the Inverted verdict — never a separated/less-toxic candidate claim', async () => {
+    await openMakerLane(MAKER_INVERTED);
+    expect(screen.getByText('Inverted')).toBeInTheDocument();
+    expect(screen.queryByText('Separated')).toBeNull();
+    expect(screen.queryByText(/separated from the naive control/i)).toBeNull();
+    expect(screen.queryByText(/whole ci above zero/i)).toBeNull();
+    expect(screen.getByText(/reliably more toxic|reliably worse/i)).toBeInTheDocument();
+  });
+
+  it('Min5: the visible PROOF affordance is a real accessible link to the maker proof route', async () => {
+    await openMakerLane(MAKER_ARENA_RESULT);
+    const proofLinks = screen.getAllByRole('link', { name: /proof card for/i });
+    expect(proofLinks).toHaveLength(2);
+    for (const link of proofLinks) {
+      expect(link.getAttribute('href')).toMatch(/^\/proof\/maker\/(txline-fair-mm|naive-mm)$/);
+      expect(link).toHaveTextContent(/proof/i);
     }
   });
 });
