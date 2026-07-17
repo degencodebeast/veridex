@@ -901,7 +901,8 @@ def create_app(
 
         Raises:
             HTTPException: 404 (unknown competition), 403 (caller is not the owner), 409 (roster
-                frozen post-start, duplicate agent, or roster cap exceeded).
+                frozen post-start, duplicate agent, or roster cap exceeded), 400 (an instance-bound
+                entry references a deployed instance that does not exist — fail-closed).
         """
         try:
             competition = await dep_store.get_competition(competition_id)
@@ -926,6 +927,10 @@ def create_app(
             finalized = await register_agent(dep_store, competition_id, entry)
         except KeyError:
             raise HTTPException(status_code=404, detail=f"competition {competition_id!r} not found") from None
+        except ValueError as exc:
+            # An instance-bound entry references a deployed instance that does not exist — fail closed
+            # (never roster a dangling instance reference).
+            raise HTTPException(status_code=400, detail=str(exc)) from None
         return AgentRegisterResponse(
             agent_id=finalized.agent_id,
             config_hash=finalized.config_hash,

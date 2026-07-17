@@ -268,9 +268,21 @@ async def create_competition(store: Store, config: CompetitionConfig) -> Competi
 async def register_agent(store: Store, competition_id: str, entry: AgentEntry) -> AgentEntry:
     """Pin ``config_hash`` + normalize ``proof_mode``, then persist the finalized entry.
 
-    The ``config_hash`` is computed over the canonical serialization of exactly
-    ``{agent_id, strategy, model, proof_mode}`` (the normalized proof mode), EXCLUDING the
-    incoming ``config_hash`` and ``execution_eligibility`` fields (CON-207).
+    Two roster kinds (I-7):
+
+    - **Instance-bound** (``entry.instance_id`` set): the entry references a Studio-deployed
+      :class:`~veridex.deploy.instance.AgentInstance`. We PIN that instance's identity — its
+      ``instance_id`` + its **deployment** ``config_hash`` — onto the entry, so the arena runs the
+      ACTUAL deployed contestant at start (:func:`~veridex.api.demo_fixtures.bind_roster_instance`).
+      The label hash is deliberately NOT recomputed here: the deployment ``config_hash`` (a
+      ``DeployConfig`` serialization) and the label hash below are DIFFERENT serializers, so
+      recomputing would clobber the pinned deployment hash and make the start-time binding
+      FALSE-drift (HTTP 400) for every bound entry. Fail-closed: an entry referencing an unknown
+      instance is refused (never rostered with a dangling reference).
+    - **Declared** (no ``instance_id``): unchanged legacy behavior — the ``config_hash`` is computed
+      over the canonical serialization of exactly ``{agent_id, strategy, model, proof_mode}`` (the
+      normalized proof mode), EXCLUDING the incoming ``config_hash`` and ``execution_eligibility``
+      fields (CON-207).
 
     Args:
         store: The async repository.
@@ -280,19 +292,37 @@ async def register_agent(store: Store, competition_id: str, entry: AgentEntry) -
     Returns:
         The finalized :class:`~veridex.competition.models.AgentEntry` (with ``config_hash``
         pinned and ``proof_mode`` normalized) that was persisted.
+
+    Raises:
+        ValueError: If ``entry.instance_id`` references a deployed instance that does not exist.
     """
     normalized_proof_mode = normalize_proof_mode(entry.proof_mode)
-    config_hash = hashlib.sha256(
-        serialize_payload(
-            {
-                "agent_id": entry.agent_id,
-                "strategy": entry.strategy,
-                "model": entry.model,
+    if entry.instance_id is not None:
+        try:
+            instance = await store.get_agent_instance(entry.instance_id)
+        except KeyError as exc:
+            raise ValueError(
+                f"roster entry {entry.agent_id!r} references unknown deployed instance {entry.instance_id!r}"
+            ) from exc
+        finalized = entry.model_copy(
+            update={
                 "proof_mode": normalized_proof_mode,
+                "config_hash": instance.config_hash,
+                "instance_id": instance.instance_id,
             }
-        ).encode("utf-8")
-    ).hexdigest()
-    finalized = entry.model_copy(update={"proof_mode": normalized_proof_mode, "config_hash": config_hash})
+        )
+    else:
+        config_hash = hashlib.sha256(
+            serialize_payload(
+                {
+                    "agent_id": entry.agent_id,
+                    "strategy": entry.strategy,
+                    "model": entry.model,
+                    "proof_mode": normalized_proof_mode,
+                }
+            ).encode("utf-8")
+        ).hexdigest()
+        finalized = entry.model_copy(update={"proof_mode": normalized_proof_mode, "config_hash": config_hash})
     await store.add_agent_entry(competition_id, finalized)
     return finalized
 

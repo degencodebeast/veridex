@@ -275,3 +275,123 @@ async def test_start_still_requires_owner_after_roster_change() -> None:
             assert owner.json()["status"] == "finalized"
     finally:
         await _drain(app)
+
+
+# ---------------------------------------------------------------------------
+# MAJOR-1 (dec-i7-scope-002) — the roster->instance binding must be REACHABLE end-to-end via the
+# HTTP register path. register_agent must PIN the deployed instance's DEPLOYMENT config_hash onto the
+# entry (not clobber it with a {agent_id,strategy,model,proof_mode} label hash) — otherwise start
+# FALSE-drifts 400 for EVERY instance-bound entry. And a GENUINE drift must still 400 (no over-correct).
+# ---------------------------------------------------------------------------
+
+
+def _deployed_baseline_instance(*, instance_id: str, config_hash: str) -> AgentInstance:
+    """A deployed instance whose effective_config runs the deterministic baseline agent — it scores on
+    the demo ticks, so the built deployed contestant appears on the finalized leaderboard by agent_id."""
+    effective = AgentRunConfig(agent_id="deployed-contestant", strategy="baseline").model_dump(mode="json")
+    return AgentInstance(
+        instance_id=instance_id,
+        template_id="baseline-v1",
+        agent_id="deployed-contestant",
+        submitted_config=effective,
+        effective_config=effective,
+        config_hash=config_hash,
+        policy_hash="pol-hash",
+        source_mode="replay",
+        execution_mode="paper",
+        run_id="run-x",
+        operator_id=_DID_ALICE,
+        created_at="2026-01-01T00:00:00+00:00",
+        updated_at="2026-01-01T00:00:00+00:00",
+    )
+
+
+def _bound_reg_body(agent_id: str, instance_id: str) -> dict[str, Any]:
+    """A register body that REFERENCES a Studio-deployed instance (carries instance_id). Its strategy
+    LABEL is deliberately different from the deployed strategy — the pin must come from the instance,
+    not this label."""
+    return {
+        "agent_id": agent_id,
+        "owner": "team",
+        "strategy": "momentum",
+        "model": None,
+        "proof_mode": "reproducible",
+        "instance_id": instance_id,
+    }
+
+
+async def test_register_bound_entry_pins_deployment_hash_and_start_runs_deployed_contestant() -> None:
+    store = InMemoryStore()
+    await store.persist_agent_instance(_deployed_baseline_instance(instance_id="inst_e2e", config_hash="DEPLOY_HASH_1"))
+    app = create_app(store=store, settings=_privy_settings())
+    try:
+        async with _transport(app) as client:
+            create = await client.post("/competitions", json=_COMPETITION_CONFIG, headers=_bearer(_DID_ALICE))
+            assert create.status_code == 200, create.text
+            comp_id = create.json()["competition_id"]
+
+            # Register the BOUND entry (references the deployed instance). The register path MUST pin the
+            # DEPLOYMENT config_hash, NOT recompute a label hash.
+            reg = await client.post(
+                f"/competitions/{comp_id}/agents",
+                json=_bound_reg_body("deployed-contestant", "inst_e2e"),
+                headers=_bearer(_DID_ALICE),
+            )
+            assert reg.status_code == 200, reg.text
+            assert reg.json()["config_hash"] == "DEPLOY_HASH_1"
+
+            reg2 = await client.post(
+                f"/competitions/{comp_id}/agents",
+                json=_reg_body("plain-b", "contrarian"),
+                headers=_bearer(_DID_ALICE),
+            )
+            assert reg2.status_code == 200, reg2.text
+
+            # THE TRAP (pre-fix): register clobbered config_hash -> start FALSE-drifts 400.
+            # Post-fix: no false drift -> finalized, and the arena runs the ACTUAL deployed contestant.
+            start = await client.post(f"/competitions/{comp_id}/start", headers=_bearer(_DID_ALICE))
+            assert start.status_code == 200, start.text
+            assert start.json()["status"] == "finalized"
+
+            state = await client.get(f"/competitions/{comp_id}")
+            assert state.status_code == 200, state.text
+            agent_ids = {row["agent_id"] for row in state.json()["leaderboard"]}
+            assert "deployed-contestant" in agent_ids
+    finally:
+        await _drain(app)
+
+
+async def test_register_bound_entry_then_genuine_drift_still_400s() -> None:
+    store = InMemoryStore()
+    await store.persist_agent_instance(
+        _deployed_baseline_instance(instance_id="inst_drift", config_hash="DEPLOY_HASH_1")
+    )
+    app = create_app(store=store, settings=_privy_settings())
+    try:
+        async with _transport(app) as client:
+            create = await client.post("/competitions", json=_COMPETITION_CONFIG, headers=_bearer(_DID_ALICE))
+            comp_id = create.json()["competition_id"]
+            reg = await client.post(
+                f"/competitions/{comp_id}/agents",
+                json=_bound_reg_body("deployed-contestant", "inst_drift"),
+                headers=_bearer(_DID_ALICE),
+            )
+            assert reg.status_code == 200, reg.text
+            reg2 = await client.post(
+                f"/competitions/{comp_id}/agents",
+                json=_reg_body("plain-b", "contrarian"),
+                headers=_bearer(_DID_ALICE),
+            )
+            assert reg2.status_code == 200, reg2.text
+
+            # The deployed instance's config DRIFTS after it was rostered (re-deployed under same id).
+            await store.persist_agent_instance(
+                _deployed_baseline_instance(instance_id="inst_drift", config_hash="DEPLOY_HASH_2")
+            )
+
+            # Fail-closed: pinned snapshot (DEPLOY_HASH_1) != live (DEPLOY_HASH_2) -> 400, never run.
+            start = await client.post(f"/competitions/{comp_id}/start", headers=_bearer(_DID_ALICE))
+            assert start.status_code == 400, start.text
+            assert "drift" in start.text.lower()
+    finally:
+        await _drain(app)
