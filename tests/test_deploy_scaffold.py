@@ -130,11 +130,17 @@ class TestComposeSkeleton:
             "api-runtime must reference the I-5-owned Dockerfile.api placeholder"
         )
 
-    def test_no_env_values_injected(self) -> None:
-        # Env INJECTION (+ :? required-var guards) is D-1; D-0 stays structural.
-        for name, svc in _load_compose()["services"].items():
-            assert "environment" not in (svc or {}), (
-                f"service {name!r} injects environment values — that is D-1 scope"
+    def test_env_injected_with_failclosed_guards(self) -> None:
+        # SUPERSEDED BY D-1: env INJECTION (+ `:?` required-var guards) was explicitly D-1 scope and
+        # has now landed. The D-1 contract is that required secrets are injected ONLY through
+        # interpolation with a fail-closed `:?` guard — never a committed literal, never a silent
+        # localhost default. (Full D-1 env-matrix coverage lives in tests/test_d1_compose_deploy.py.)
+        api_env = _load_compose()["services"]["api-runtime"].get("environment", {})
+        assert api_env, "D-1 must inject the api-runtime env matrix"
+        raw = "\n".join(f"{k}={v}" for k, v in api_env.items()) if isinstance(api_env, dict) else "\n".join(api_env)
+        for secret in ("DATABASE_URL", "CORS_ORIGINS", "OPERATOR_TOKEN", "PRIVY_APP_ID", "PRIVY_VERIFICATION_KEY"):
+            assert f"{secret}=${{{secret}:?" in raw or f"{secret}: ${{{secret}:?" in raw, (
+                f"required secret {secret!r} must carry a fail-closed `:?` guard (no literal, no silent default)"
             )
 
 
@@ -163,7 +169,7 @@ class TestDockerignoreSecretExclusions:
         # Dockerfile.agent already builds from the repo root; the root
         # .dockerignore must carry the same secret exclusions.
         lines = _dockerignore_lines(ROOT)
-        assert SECRET_EXCLUSION_LINES <= set(lines)
+        assert set(lines) >= SECRET_EXCLUSION_LINES
 
 
 # ── RED row 3: runbook + provisioning inventory ────────────────────────────

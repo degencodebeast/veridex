@@ -26,6 +26,7 @@ from typing import Any
 
 from fastapi import FastAPI
 
+from veridex.api.readiness import build_readiness_router
 from veridex.api.router import create_app
 from veridex.config import get_settings
 from veridex.store import InMemoryStore, PostgresStore, Store
@@ -128,6 +129,15 @@ def create_server_app(
         app.state.db_pool = None
 
     app.state.store = store
+
+    # D-1 deployment READINESS probe (additive; distinct from I-5's /healthz liveness). Reads the
+    # live pool lazily (opened in the lifespan) + REPLAY_PACK_ROOT; the compose healthcheck curls it.
+    app.include_router(
+        build_readiness_router(
+            get_pool=lambda: getattr(app.state, "db_pool", None),
+            pack_root=resolved_env.get("REPLAY_PACK_ROOT", ""),
+        )
+    )
     return app
 
 
