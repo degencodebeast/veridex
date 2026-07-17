@@ -38,7 +38,7 @@ from typing import Any
 
 from veridex.backtest import mode_ladder_label
 from veridex.backtest.runner import run_backtest
-from veridex.ingest.capture_chain import is_genuine_pack
+from veridex.ingest.capture_chain import is_genuine_pack, synthetic_authority
 from veridex.ingest.recorder import SessionMeta, envelope_line
 from veridex.ingest.replay_pack import load_pack_marketstates, pack_from_session, verify_content_hash
 from veridex.runtime.window import RunWindow
@@ -60,7 +60,7 @@ DEMO_PACK_REAL_DIR = Path(__file__).parent / "fixtures" / "demo_pack_real"
 #: PINNED ``content_hash`` of the banked real demo pack — the tamper-evidence contract binding this
 #: script to exactly those banked bytes. Regenerate via ``scripts/fixtures/build_demo_pack_real.py``
 #: (deterministic); a mismatch means the pack was tampered OR the pin was edited without rebuilding.
-DEMO_PACK_REAL_CONTENT_HASH = "dcb15c5a14cd583ec99c5086db83541dde6b4fcac721a57ff2e53bed876a1ef5"
+DEMO_PACK_REAL_CONTENT_HASH = "f16c3853a80fc6f0b4e5fe21d8f1c0dcfd4c66d732e5a915193988604f9ddb0b"
 #: The Sharp-Momentum harness (II-10) needs >=2 distinct fixtures; a single-fixture pack would
 #: silently disable its gate, so the resolver/guard REFUSES anything with fewer.
 SHARP_MOMENTUM_MIN_FIXTURES = 2
@@ -128,11 +128,11 @@ def build_reference_pack(dst: Path) -> Path:
     transform live capture uses, so the shipped pack is a genuine, content-hashed ReplayPack (its
     ``run_backtest`` replay path verifies the hash and refuses a tampered pack).
 
-    The pack SELF-DECLARES its synthetic provenance in its ``capture`` block (``synthetic: true`` +
+    The pack SELF-DECLARES its synthetic authority in its ``capture`` block (``synthetic: true`` +
     ``provenance``) so a downstream reader can never separate the numbers from the fact that the odds
     are illustrative. ``endpoints`` is empty — a synthetic tape was never streamed from a real feed.
-    Both markers live in ``capture`` metadata, which ``content_hash`` does NOT cover (it hashes the
-    DATA files), so the pack's ``content_hash`` — and therefore the demo's run ids — are unchanged.
+    MAJOR-1: those authority markers are folded INTO the v2 ``content_hash``, so the pack can never be
+    relabeled genuine without breaking its own hash (and it can never read genuine).
 
     Args:
         dst: Destination pack directory (recreated from scratch if it already exists).
@@ -153,13 +153,11 @@ def build_reference_pack(dst: Path) -> Path:
         )
         if dst.exists():
             shutil.rmtree(dst)
-        pack_from_session(session_dir, dst)
-    # Stamp the synthetic-provenance markers INTO the pack's capture block (open dict; not hashed).
-    pack_path = dst / "pack.json"
-    pack_doc = json.loads(pack_path.read_text())
-    pack_doc["capture"]["provenance"] = SYNTHETIC_PROVENANCE
-    pack_doc["capture"]["synthetic"] = True
-    pack_path.write_text(json.dumps(pack_doc))
+        # MAJOR-1: the synthetic authority (provenance=synthetic-illustrative, synthetic=True) is
+        # folded INTO the v2 content_hash by pack_from_session, so the synthetic label is
+        # tamper-evident — a reader can never separate the numbers from the fact they're illustrative,
+        # and the pack can NEVER be relabeled genuine without breaking its own hash.
+        pack_from_session(session_dir, dst, authority=synthetic_authority())
     return dst
 
 

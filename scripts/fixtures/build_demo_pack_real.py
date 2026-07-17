@@ -23,9 +23,9 @@ BACKFILL, not a live ``/odds/stream`` SSE recording — so the pack self-declare
 and it never over-claims to be a live-recorded-quote tape.
 
 Reproducible + deterministic: the frozen :func:`~veridex.ingest.replay_pack.pack_from_session`
-transform and R-0a's :func:`~veridex.ingest.capture_chain.stamp_pack_provenance` do all the work;
-this script only selects verbatim records and stamps honest metadata, so re-running it over the same
-raw packs reproduces the SAME ``content_hash`` pinned in ``scripts/demo_phase2d.py``.
+transform folds R-0a's CLOSED :func:`~veridex.ingest.capture_chain.genuine_backfill_authority` into a
+tamper-evident v2 ``content_hash``; this script only selects verbatim records, so re-running it over
+the same raw packs reproduces the SAME ``content_hash`` pinned in ``scripts/demo_phase2d.py``.
 
 Run (operator, with the raw WC packs present):
     .venv/bin/python scripts/fixtures/build_demo_pack_real.py
@@ -44,10 +44,9 @@ from typing import Any
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
-from veridex.ingest.capture_chain import GENUINE_TXLINE_PROVENANCE, stamp_pack_provenance  # noqa: E402
+from veridex.ingest.capture_chain import genuine_backfill_authority  # noqa: E402
 from veridex.ingest.recorder import SessionMeta, envelope_line  # noqa: E402
 from veridex.ingest.replay_pack import ReplayPack, pack_from_session, verify_content_hash  # noqa: E402
-from veridex.provenance import EvidenceRung  # noqa: E402
 
 #: The banked destination (committed, small, tamper-evident).
 DEMO_PACK_REAL_DIR = ROOT / "scripts" / "fixtures" / "demo_pack_real"
@@ -89,11 +88,13 @@ def _read_verbatim_prefix(fixture_id: int, limit: int) -> list[dict[str, Any]]:
 
 
 def build(dst: Path = DEMO_PACK_REAL_DIR) -> ReplayPack:
-    """Bank the curated genuine WC demo pack at ``dst`` and stamp it honestly; return the ReplayPack.
+    """Bank the curated genuine WC demo pack at ``dst`` with hash-bound authority; return the ReplayPack.
 
-    The pack is stamped ``genuine-txline`` (R-0a's genuine provenance — it IS genuine TxLINE odds)
-    with ``test_capture=False``, PLUS a transparent ``evidence_rung="backfilled-price-history"`` and a
-    ``capture_method`` note so no reader mistakes this REST backfill for a live SSE recording.
+    The genuine-backfill authority (``provenance="genuine-txline"``, ``test_capture=False``,
+    ``evidence_rung="backfilled-price-history"``, ``capture_method="odds-updates-backfill"``) is
+    folded INTO the v2 ``content_hash`` by :func:`~veridex.ingest.replay_pack.pack_from_session`, so
+    the declaration is tamper-evident and no reader mistakes this REST backfill for a live SSE
+    recording.
     """
     all_records: list[dict[str, Any]] = []
     for fixture_id in WC_FIXTURE_IDS:
@@ -114,15 +115,15 @@ def build(dst: Path = DEMO_PACK_REAL_DIR) -> ReplayPack:
         )
         if dst.exists():
             shutil.rmtree(dst)
-        pack_from_session(session_dir, dst)  # re-read post-stamp below (stamping is not hashed)
+        # MAJOR-1: the genuine-backfill authority (provenance=genuine-txline, test_capture=False,
+        # backfilled-price-history rung, odds-updates-backfill method) is folded INTO the v2
+        # content_hash by pack_from_session — this IS genuine TxLINE odds (not synthetic, not
+        # Polymarket), and its authority is now tamper-evident, not a post-hoc unhashed string.
+        pack_from_session(session_dir, dst, authority=genuine_backfill_authority())
 
-    # R-0a's genuine stamp — this IS genuine TxLINE odds (not synthetic, not Polymarket).
-    stamp_pack_provenance(dst, GENUINE_TXLINE_PROVENANCE, test_capture=False)
-    # Transparent, NON-hashed capture metadata: the precise evidence rung + how it was captured.
+    # A transparent, NON-authority human note (not one of the hashed authority fields).
     pack_path = dst / "pack.json"
     pack_doc = json.loads(pack_path.read_text())
-    pack_doc["capture"]["evidence_rung"] = EvidenceRung.BACKFILLED_PRICE_HISTORY.value
-    pack_doc["capture"]["capture_method"] = "odds-updates-backfill"
     pack_doc["capture"]["curation"] = (
         f"first {RECORDS_PER_FIXTURE} verbatim records per fixture "
         f"({', '.join(str(fid) for fid in WC_FIXTURE_IDS)}) — FIFA WC 2026 quarter-finals"

@@ -28,6 +28,7 @@ from veridex.ingest.capture_chain import (
     GENUINE_TXLINE_PROVENANCE,
     TEST_FAKE_PROVENANCE,
     LiveCaptureSource,
+    _authority_for_source,
     is_genuine_pack,
     read_pack_provenance,
     run_capture_chain,
@@ -64,13 +65,14 @@ def test_fake_pack_is_test_provenance_never_genuine(tmp_path):
     assert read_pack_provenance(result.pack_dir) != GENUINE_TXLINE_PROVENANCE
     assert is_genuine_pack(result.pack_dir) is False
 
-    # Structural invariant: the fake source's provenance is FIXED to test and run_capture_chain has
-    # NO provenance parameter — so no caller can inject "genuine" through the fake seam.
-    assert RecordingFakeSource().provenance == TEST_FAKE_PROVENANCE
-    assert RecordingFakeSource().provenance != GENUINE_TXLINE_PROVENANCE
+    # Structural invariant (MAJOR-1): authority is derived from the CLOSED producer set BY TYPE, not
+    # from anything the source declares — so a fake/unknown source maps to test, never genuine, and
+    # run_capture_chain has NO provenance parameter to inject "genuine" through.
+    assert _authority_for_source(RecordingFakeSource())["provenance"] == TEST_FAKE_PROVENANCE
+    assert _authority_for_source(RecordingFakeSource())["provenance"] != GENUINE_TXLINE_PROVENANCE
     assert "provenance" not in inspect.signature(run_capture_chain).parameters
-    # Only the real live source declares genuine provenance.
-    assert LiveCaptureSource().provenance == GENUINE_TXLINE_PROVENANCE
+    # ONLY the real live source's concrete TYPE maps to genuine authority.
+    assert _authority_for_source(LiveCaptureSource())["provenance"] == GENUINE_TXLINE_PROVENANCE
 
 
 # --- RED 3: secret scrubbing — sentinel leaks into no artifact/log --------------------------------

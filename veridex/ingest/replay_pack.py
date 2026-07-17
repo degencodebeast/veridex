@@ -19,13 +19,37 @@ from veridex.ingest.live_client import marketstates_from_record_stream
 from veridex.ingest.marketstate import MarketState
 from veridex.ingest.recorder import read_session
 
+#: The current authority-inclusive pack format. A v2 pack folds its authority block (below) INTO
+#: ``content_hash``; a legacy v1 pack hashes DATA FILES ONLY (see :func:`_compute_content_hash`).
+PACK_FORMAT_VERSION = 2
+
+#: The authority-bearing ``capture`` fields a v2 ``content_hash`` binds, in a FIXED order. Read with
+#: an explicit ``None`` default so DELETING a field (not just editing it) also changes the hash — a
+#: dropped ``provenance``/``test_capture`` can never silently pass verification.
+_AUTHORITY_FIELDS: tuple[str, ...] = ("provenance", "test_capture", "synthetic", "evidence_rung", "capture_method")
+
+#: Domain separator between the data-file region and the authority region of a v2 digest, so a v2
+#: hash can never collide with a v1 (data-only) hash over the same files.
+_AUTHORITY_DOMAIN_SEP = b"\x00replaypack.authority.v2\x00"
+
 
 class ReplayPack(BaseModel):
     pack_version: int = 1
-    capture: dict[str, Any]  # {started_ts, ended_ts, endpoints, tool, gaps}
+    capture: dict[str, Any]  # {started_ts, ended_ts, endpoints, tool, gaps, + v2 authority fields}
     fixtures: list[dict[str, Any]]  # [{fixture_id, records, odds_updates?}]
     closing_policy: str = "con-040_last_pre_inrunning"
-    content_hash: str  # sha256 over canonically-ordered data-file bytes
+    content_hash: str  # v1: sha256 over data-file bytes; v2: data-file bytes + authority block
+
+
+def _canonical_authority_bytes(capture: dict[str, Any]) -> bytes:
+    """Deterministic serialization of the :data:`_AUTHORITY_FIELDS` for the v2 ``content_hash``.
+
+    Each field is read with a ``None`` default (explicit-null) and the whole block is emitted with
+    sorted keys + a stable separator, so any edit OR deletion of an authority field changes the
+    bytes — the tamper-evidence that binds the provenance declaration to the pack identity.
+    """
+    normalized = {field: capture.get(field) for field in _AUTHORITY_FIELDS}
+    return json.dumps(normalized, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
 
 
 def _manifest_filenames(fixtures: list[dict[str, Any]]) -> list[str]:
@@ -46,13 +70,25 @@ def _manifest_filenames(fixtures: list[dict[str, Any]]) -> list[str]:
     return sorted(names)
 
 
-def _compute_content_hash(pack_dir: Path, fixtures: list[dict[str, Any]]) -> str:
+def _compute_content_hash(
+    pack_dir: Path,
+    fixtures: list[dict[str, Any]],
+    *,
+    pack_version: int = 1,
+    capture: dict[str, Any] | None = None,
+) -> str:
     """sha256 over length-prefixed (name, bytes) pairs for each MANIFEST-referenced data file,
     in sorted-filename order. Hash scope == the `fixtures` manifest exactly: a file present in
     `pack_dir` but not referenced by `fixtures` (e.g. a stale leftover from a prior build into
     the same directory) is excluded, so content_hash always describes exactly what `fixtures`
     lists — never more, never less. Length-prefixing (rather than a bare separator byte) makes
     the (name, bytes) decomposition provably injective.
+
+    Version-aware (MAJOR-1): for ``pack_version >= 2`` the canonical AUTHORITY block
+    (:func:`_canonical_authority_bytes` over ``capture``) is folded in after the data region behind
+    a domain separator, so relabeling a pack's provenance/test_capture/synthetic markers changes its
+    identity. A legacy ``pack_version == 1`` hash covers DATA FILES ONLY (unchanged semantics) — such
+    packs keep loading, but their authority is not hash-bound and can never read genuine.
     """
     digest = hashlib.sha256()
     for name in _manifest_filenames(fixtures):
@@ -62,15 +98,29 @@ def _compute_content_hash(pack_dir: Path, fixtures: list[dict[str, Any]]) -> str
         digest.update(name_bytes)
         digest.update(len(file_bytes).to_bytes(8, "big"))
         digest.update(file_bytes)
+    if pack_version >= 2:
+        authority_bytes = _canonical_authority_bytes(capture or {})
+        digest.update(_AUTHORITY_DOMAIN_SEP)
+        digest.update(len(authority_bytes).to_bytes(8, "big"))
+        digest.update(authority_bytes)
     return digest.hexdigest()
 
 
-def pack_from_session(session_dir: Path, out_dir: Path) -> ReplayPack:
+def pack_from_session(
+    session_dir: Path, out_dir: Path, *, authority: dict[str, Any] | None = None
+) -> ReplayPack:
     """Pure file transform: recorder session -> self-describing, hashed ReplayPack.
 
     Splits enveloped records per fixture into ``out_dir/odds_<fid>.jsonl`` (one RAW
     native TxLINE record per line, unwrapped from its envelope), copies any
     ``updates_<fid>.json`` present, computes ``content_hash``, writes ``out_dir/pack.json``.
+
+    Provenance authority (MAJOR-1): when ``authority`` is supplied (a CLOSED-set authority block
+    from :mod:`veridex.ingest.capture_chain` — e.g. :func:`~veridex.ingest.capture_chain.
+    genuine_backfill_authority`), its :data:`_AUTHORITY_FIELDS` are merged into the ``capture`` block
+    AND folded into a ``pack_version=2`` ``content_hash``, so the provenance declaration is
+    tamper-evident. When ``authority`` is ``None`` the pack stays legacy ``pack_version=1`` with a
+    DATA-ONLY hash (backward compatible) — such a pack can never read genuine (fail-safe).
     """
     meta, records, gaps = read_session(session_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -102,7 +152,7 @@ def pack_from_session(session_dir: Path, out_dir: Path) -> ReplayPack:
 
         fixtures.append(fixture_entry)
 
-    capture = {
+    capture: dict[str, Any] = {
         "started_ts": meta.started_ts,
         "ended_ts": ended_ts,
         "endpoints": meta.endpoints,
@@ -110,7 +160,19 @@ def pack_from_session(session_dir: Path, out_dir: Path) -> ReplayPack:
         "gaps": gaps,
     }
 
-    pack = ReplayPack(capture=capture, fixtures=fixtures, content_hash=_compute_content_hash(out_dir, fixtures))
+    pack_version = 1
+    if authority is not None:
+        # Merge ONLY the recognized authority fields (the closed set that the v2 hash binds), so a
+        # caller cannot smuggle extra unhashed keys into the authority region via `authority`.
+        capture.update({field: authority.get(field) for field in _AUTHORITY_FIELDS})
+        pack_version = PACK_FORMAT_VERSION
+
+    pack = ReplayPack(
+        pack_version=pack_version,
+        capture=capture,
+        fixtures=fixtures,
+        content_hash=_compute_content_hash(out_dir, fixtures, pack_version=pack_version, capture=capture),
+    )
     (out_dir / "pack.json").write_text(pack.model_dump_json())
     return pack
 
@@ -192,9 +254,20 @@ def verify_content_hash(pack_dir: Path) -> bool:
     """Recompute content_hash from the manifest's referenced data files; compare to pack.json's
     stored value. A corrupt/missing manifest, or a manifest-referenced file that's gone, counts
     as a FAILED verification (returns False) rather than raising.
+
+    Version-aware (MAJOR-1): recomputes with the manifest's ``pack_version`` + ``capture`` block, so
+    a v2 pack's AUTHORITY fields are re-checked too — a post-build relabel of provenance/test_capture
+    that does NOT recompute the hash fails here.
     """
     try:
         manifest = json.loads((pack_dir / "pack.json").read_text())
-        return _compute_content_hash(pack_dir, manifest["fixtures"]) == manifest["content_hash"]
-    except (json.JSONDecodeError, KeyError, FileNotFoundError):
+        pack_version = int(manifest.get("pack_version", 1))
+        recomputed = _compute_content_hash(
+            pack_dir,
+            manifest["fixtures"],
+            pack_version=pack_version,
+            capture=manifest.get("capture", {}),
+        )
+        return recomputed == manifest["content_hash"]
+    except (json.JSONDecodeError, KeyError, FileNotFoundError, TypeError, ValueError):
         return False

@@ -11,12 +11,17 @@ session format (:class:`~veridex.ingest.recorder.SessionMeta`,
 :func:`veridex.ingest.replay_pack.pack_from_session`, and
 :func:`veridex.ingest.live_client.build_auth_headers`.
 
-PROVENANCE HONESTY (the trust boundary) — a pack's provenance is stamped from the capture
-SOURCE's OWN declared provenance, and :func:`run_capture_chain` has NO provenance parameter.
-Only :class:`LiveCaptureSource` (real creds via ``require_live_creds``, fail-closed) declares
-:data:`GENUINE_TXLINE_PROVENANCE`; any recording-fake source declares
-:data:`TEST_FAKE_PROVENANCE`. A fake-backed run therefore can NEVER mint a "genuine TxLINE"
-pack — the exact failure this task prevents (a demo passing a fake pack off as live TxLINE).
+PROVENANCE HONESTY (the trust boundary, MAJOR-1) — a pack's authority (provenance, test_capture,
+synthetic, evidence rung, capture method) is derived from a CLOSED set of controller-owned producers
+(:func:`_authority_for_source`), NEVER copied from a caller/source-supplied string, and it is folded
+into the pack's VERSIONED ``content_hash`` (pack_version 2) so a post-build relabel is refused by
+:func:`~veridex.ingest.replay_pack.verify_content_hash`. Only the concrete :class:`LiveCaptureSource`
+(real creds via ``require_live_creds``, fail-closed) maps to :data:`GENUINE_TXLINE_PROVENANCE`; every
+other/unknown/custom source maps to :data:`TEST_FAKE_PROVENANCE`. :func:`run_capture_chain` has NO
+provenance parameter. A fake-backed OR arbitrary-string-declaring run therefore can NEVER mint a
+"genuine TxLINE" pack — the exact failure this task prevents (a demo passing a fake pack off as live
+TxLINE). :func:`is_genuine_pack` requires hash-verification FIRST, then a coherent genuine state, and
+a legacy v1 pack (authority not hash-bound) can never read genuine.
 
 Trust-path module (``ingest/`` is import-audited): NO LLM SDK imports; ``httpx`` is imported
 lazily inside :meth:`LiveCaptureSource.stream_client` only (CON-010 async-shell split).
@@ -34,19 +39,89 @@ from veridex.ingest.feed_health import DEFAULT_STALE_AFTER_S, FeedState, derive_
 from veridex.ingest.live_client import build_auth_headers
 from veridex.ingest.marketstate import parse_sse_line
 from veridex.ingest.recorder import SessionMeta, envelope_line, finalize_meta
-from veridex.ingest.replay_pack import ReplayPack, pack_from_session
+from veridex.ingest.replay_pack import ReplayPack, pack_from_session, verify_content_hash
+from veridex.provenance import EvidenceRung
 
-#: Positive provenance for a pack captured from the REAL TxLINE feed. Reachable ONLY through
-#: :attr:`LiveCaptureSource.provenance`; there is no parameter that lets any other path mint it.
+#: Positive provenance for a pack captured from the REAL TxLINE feed. Reachable ONLY through the
+#: CLOSED producer set (:func:`_authority_for_source` / the genuine authority builders); no parameter
+#: and no source-supplied string lets any other path mint it.
 GENUINE_TXLINE_PROVENANCE = "genuine-txline"
-#: Provenance a recording-fake capture self-declares — a TEST pack, never a genuine feed capture.
+#: Provenance a recording-fake / unknown capture is assigned — a TEST pack, never a genuine capture.
 TEST_FAKE_PROVENANCE = "test-fake-recording"
+#: Provenance for SYNTHETIC illustrative odds (the shipped demo tape) — visibly non-genuine.
+SYNTHETIC_PROVENANCE = "synthetic-illustrative"
 #: Fail-safe label for a pack whose ``capture`` block declares NO provenance: we can never assert
 #: it was genuinely captured, so it reads "unknown" — an unmarked pack NEVER means genuine.
 UNKNOWN_PROVENANCE = "unknown-provenance"
 
+#: Capture-method labels — how a pack's records were obtained. The two GENUINE methods are the only
+#: ones an ``is_genuine_pack`` pack may carry; the others are honest non-genuine markers.
+LIVE_SSE_CAPTURE_METHOD = "live-sse-stream"
+BACKFILL_CAPTURE_METHOD = "odds-updates-backfill"
+SYNTHETIC_CAPTURE_METHOD = "synthetic-tape"
+RECORDING_FAKE_CAPTURE_METHOD = "recording-fake"
+
+#: The ONLY evidence rungs / capture methods a genuine-TxLINE pack may carry (both distinct, honest
+#: genuine paths: a live SSE recording vs a verified REST backfill). Any other value fails-safe.
+_GENUINE_EVIDENCE_RUNGS: frozenset[str] = frozenset(
+    {EvidenceRung.RECORDED_LIVE_QUOTE.value, EvidenceRung.BACKFILLED_PRICE_HISTORY.value}
+)
+_GENUINE_CAPTURE_METHODS: frozenset[str] = frozenset({LIVE_SSE_CAPTURE_METHOD, BACKFILL_CAPTURE_METHOD})
+
 #: Default TxLINE odds SSE endpoint path appended to the base URL.
 _ODDS_STREAM_PATH = "/odds/stream"
+
+
+def genuine_live_sse_authority() -> dict[str, Any]:
+    """CLOSED-set authority for a GENUINE pack captured from the live ``/odds/stream`` SSE feed.
+
+    The ONLY genuine-live producer; takes NO caller-supplied provenance string. Its distinct
+    ``recorded-live-quote`` rung separates it from the verified-backfill genuine path.
+    """
+    return {
+        "provenance": GENUINE_TXLINE_PROVENANCE,
+        "test_capture": False,
+        "synthetic": False,
+        "evidence_rung": EvidenceRung.RECORDED_LIVE_QUOTE.value,
+        "capture_method": LIVE_SSE_CAPTURE_METHOD,
+    }
+
+
+def genuine_backfill_authority() -> dict[str, Any]:
+    """CLOSED-set authority for a GENUINE pack curated from the verified ``/odds/updates`` backfill.
+
+    The ONLY genuine-backfill producer; takes NO caller-supplied provenance string. Its distinct
+    ``backfilled-price-history`` rung separates it from the live-SSE genuine path.
+    """
+    return {
+        "provenance": GENUINE_TXLINE_PROVENANCE,
+        "test_capture": False,
+        "synthetic": False,
+        "evidence_rung": EvidenceRung.BACKFILLED_PRICE_HISTORY.value,
+        "capture_method": BACKFILL_CAPTURE_METHOD,
+    }
+
+
+def synthetic_authority() -> dict[str, Any]:
+    """CLOSED-set authority for a SYNTHETIC illustrative pack (the shipped demo tape) — non-genuine."""
+    return {
+        "provenance": SYNTHETIC_PROVENANCE,
+        "test_capture": False,
+        "synthetic": True,
+        "evidence_rung": EvidenceRung.SYNTHETIC.value,
+        "capture_method": SYNTHETIC_CAPTURE_METHOD,
+    }
+
+
+def test_fake_authority() -> dict[str, Any]:
+    """CLOSED-set authority for a recording-fake / unknown-source capture — a TEST pack, non-genuine."""
+    return {
+        "provenance": TEST_FAKE_PROVENANCE,
+        "test_capture": True,
+        "synthetic": False,
+        "evidence_rung": None,
+        "capture_method": RECORDING_FAKE_CAPTURE_METHOD,
+    }
 
 
 def _scrub(text: str, *secrets: str) -> str:
@@ -64,16 +139,13 @@ def _scrub(text: str, *secrets: str) -> str:
 
 @runtime_checkable
 class CaptureSource(Protocol):
-    """A source of TxLINE capture I/O whose ``provenance`` is fixed to its own identity.
+    """A source of TxLINE capture I/O — an OPEN protocol of just the I/O seam (creds + stream).
 
-    ``provenance`` is a read-only property (not a constructor argument) — this is what makes
-    the honesty invariant structural: a source cannot be *asked* to lie about its provenance.
+    Deliberately carries NO ``provenance`` (MAJOR-1): a source can no longer DECLARE its own
+    authority, so a custom/hostile implementation cannot mint genuine by exposing a magic string.
+    Authority is derived structurally from a CLOSED set of controller-owned producer types in
+    :func:`_authority_for_source` — never from anything the source says about itself.
     """
-
-    @property
-    def provenance(self) -> str:
-        """This source's fixed provenance label (genuine vs test)."""
-        ...
 
     def credentials(self) -> tuple[str, str]:
         """Return ``(jwt, api_token)`` for the stream, or FAIL CLOSED (raise) if unavailable."""
@@ -101,22 +173,20 @@ class CaptureResult:
 
 
 class LiveCaptureSource:
-    """The REAL TxLINE capture seam — genuine provenance, creds resolved FAIL-CLOSED.
+    """The REAL TxLINE capture seam — the ONLY concrete producer that maps to genuine authority.
 
-    Credentials come from :func:`veridex.live_recorder.sources.require_live_creds` over the
-    process environment (``JWT`` + ``TXLINE_X_API_TOKEN``); the guard raises BEFORE any network
-    I/O when either is absent. R-0b drives this live path; R-0a only builds/wires it.
+    It declares NO ``provenance`` of its own (MAJOR-1); its genuine authority is assigned by
+    :func:`_authority_for_source` purely from its CONCRETE TYPE, so a look-alike that merely exposes
+    a ``provenance`` attribute cannot impersonate it. Credentials come from
+    :func:`veridex.live_recorder.sources.require_live_creds` over the process environment
+    (``JWT`` + ``TXLINE_X_API_TOKEN``); the guard raises BEFORE any network I/O when either is
+    absent. R-0b drives this live path; R-0a only builds/wires it.
     """
 
     def __init__(self, env: Any = None) -> None:
         import os
 
         self._env = os.environ if env is None else env
-
-    @property
-    def provenance(self) -> str:
-        """Always :data:`GENUINE_TXLINE_PROVENANCE` — the ONLY source that declares it."""
-        return GENUINE_TXLINE_PROVENANCE
 
     def credentials(self) -> tuple[str, str]:
         """Resolve real creds fail-closed via ``require_live_creds`` (never weakened)."""
@@ -133,18 +203,17 @@ class LiveCaptureSource:
         return httpx.AsyncClient(timeout=httpx.Timeout(30.0, read=None))
 
 
-def stamp_pack_provenance(pack_dir: Path, provenance: str, *, test_capture: bool) -> None:
-    """Stamp ``provenance`` + a ``test_capture`` flag INTO the pack's ``capture`` block.
+def _authority_for_source(source: CaptureSource) -> dict[str, Any]:
+    """Derive a pack's authority from a CLOSED set of controller-owned producer TYPES (MAJOR-1).
 
-    Mirrors ``scripts/demo_phase2d.py``: the markers ride in ``capture`` metadata, which
-    ``content_hash`` does NOT cover (it hashes the DATA files), so the pack's ``content_hash`` is
-    unchanged. Provenance therefore travels WITH the pack and can never be separated from it.
+    This is the honesty core: authority is keyed off the concrete producer, NEVER off anything the
+    source declares about itself. Only :class:`LiveCaptureSource` (the real live seam) maps to the
+    genuine live-SSE authority; every other/unknown/custom source — including one that hardcodes a
+    ``provenance='genuine-txline'`` attribute — maps to the fail-safe test/unknown authority.
     """
-    pack_path = pack_dir / "pack.json"
-    pack_doc = json.loads(pack_path.read_text())
-    pack_doc["capture"]["provenance"] = provenance
-    pack_doc["capture"]["test_capture"] = bool(test_capture)
-    pack_path.write_text(json.dumps(pack_doc))
+    if isinstance(source, LiveCaptureSource):
+        return genuine_live_sse_authority()
+    return test_fake_authority()
 
 
 def read_pack_provenance(pack_dir: Path) -> str:
@@ -162,17 +231,35 @@ def read_pack_provenance(pack_dir: Path) -> str:
 
 
 def is_genuine_pack(pack_dir: Path) -> bool:
-    """True ONLY for a pack positively stamped genuine AND not flagged ``test_capture``.
+    """True ONLY for a hash-verified v2 pack whose authority is a COHERENT genuine state (MAJOR-1).
 
-    Fail-safe: an unmarked pack, or one flagged ``test_capture``, is never genuine.
+    Fail-safe on every gate, in order:
+
+    1. ``pack_version >= 2`` — a legacy v1 pack's authority is NOT hash-bound, so it can never read
+       genuine (its provenance could be relabeled without changing its data-only hash);
+    2. :func:`~veridex.ingest.replay_pack.verify_content_hash` passes — the authority declaration is
+       intact and unchanged since it was hashed (a post-build relabel fails here);
+    3. a coherent genuine state — ``provenance == genuine-txline``, ``test_capture is False``,
+       ``synthetic is not True``, an allowed genuine ``evidence_rung`` AND ``capture_method``.
+
+    ANY missing, contradictory, or unrecognized field → False.
     """
     try:
-        capture = json.loads((pack_dir / "pack.json").read_text()).get("capture", {})
+        manifest = json.loads((pack_dir / "pack.json").read_text())
     except (FileNotFoundError, json.JSONDecodeError):
         return False
-    if capture.get("test_capture") is True:
-        return False
-    return str(capture.get("provenance", "")).strip() == GENUINE_TXLINE_PROVENANCE
+    if int(manifest.get("pack_version", 1)) < 2:
+        return False  # v1 authority is not hash-bound -> never genuine (fail-safe)
+    if not verify_content_hash(pack_dir):
+        return False  # hash (incl. the authority block) must verify FIRST
+    capture = manifest.get("capture", {})
+    return (
+        str(capture.get("provenance", "")).strip() == GENUINE_TXLINE_PROVENANCE
+        and capture.get("test_capture") is False
+        and capture.get("synthetic") is not True
+        and str(capture.get("evidence_rung", "")) in _GENUINE_EVIDENCE_RUNGS
+        and str(capture.get("capture_method", "")) in _GENUINE_CAPTURE_METHODS
+    )
 
 
 async def run_capture_chain(
@@ -186,12 +273,14 @@ async def run_capture_chain(
 ) -> CaptureResult:
     """Run the full ingest→normalize→record→pack chain over *source*, returning a CaptureResult.
 
-    NOTE the DELIBERATE absence of a ``provenance`` parameter: provenance is read solely from
-    ``source.provenance`` and stamped into the pack. This is the honesty invariant — a caller
-    cannot inject "genuine" for a fake source.
+    NOTE the DELIBERATE absence of a ``provenance`` parameter: authority is derived from the CLOSED
+    producer set (:func:`_authority_for_source`) purely by the source's concrete TYPE and folded into
+    the pack's v2 ``content_hash``. This is the honesty invariant — neither a caller nor a source can
+    inject "genuine" for a fake/unknown producer.
 
     Args:
-        source: The capture seam (live or recording-fake). Its ``provenance`` is stamped as-is.
+        source: The capture seam (live or recording-fake). Only :class:`LiveCaptureSource` maps to
+            genuine authority; every other source maps to the fail-safe test/unknown authority.
         session_dir: Directory to write the intermediate recorder session into.
         out_dir: Directory to write the produced ReplayPack into.
         base_url: TxLINE API base URL; ``/odds/stream`` is appended.
@@ -202,6 +291,9 @@ async def run_capture_chain(
         A :class:`CaptureResult`. ``pack``/``pack_dir`` are ``None`` when no odds records were
         captured (a heartbeat-only stream mints no market-data pack).
     """
+    # Authority is derived from the CLOSED producer set BY TYPE, never from the source's own words.
+    authority = _authority_for_source(source)
+    provenance = str(authority["provenance"])
     jwt, token = source.credentials()  # fail-closed for the live source — raises BEFORE any I/O
     headers = build_auth_headers(jwt, token)
     url = f"{base_url}{_ODDS_STREAM_PATH}"
@@ -262,20 +354,20 @@ async def run_capture_chain(
         return CaptureResult(
             pack=None,
             pack_dir=None,
-            provenance=source.provenance,
+            provenance=provenance,
             feed_state=feed_state,
             odds_records=odds_records,
             heartbeats=heartbeats,
         )
 
-    pack = pack_from_session(session_dir, out_dir)
-    # Stamp provenance FROM the source's fixed identity — a fake seam therefore stamps TEST, never
-    # genuine, and no parameter can override it.
-    stamp_pack_provenance(out_dir, source.provenance, test_capture=source.provenance != GENUINE_TXLINE_PROVENANCE)
+    # Build the pack WITH the closed-set authority folded into its v2 content_hash — a fake seam
+    # therefore produces a TEST pack whose test authority is hash-bound, and no parameter or
+    # source-declared string can override it.
+    pack = pack_from_session(session_dir, out_dir, authority=authority)
     return CaptureResult(
         pack=pack,
         pack_dir=out_dir,
-        provenance=source.provenance,
+        provenance=provenance,
         feed_state=feed_state,
         odds_records=odds_records,
         heartbeats=heartbeats,

@@ -1,15 +1,19 @@
-"""I-10 — the banked REAL World Cup demo ReplayPack: pinned, tamper-evident, provenance-honest.
+"""I-10 + Foundation-gate MAJOR-1 — the banked REAL demo pack: pinned, tamper-evident, PROVENANCE-HONEST.
 
-The trust surface is PROVENANCE HONESTY: the banked demo pack is a curated slice of GENUINE
-TxLINE odds (real FIFA World Cup 2026 quarter-final fixtures, backfilled from the real TxLINE
-``/odds/updates`` endpoint), so it reads ``genuine-txline`` through R-0a's honesty machinery. The
-retained synthetic fallback can NEVER read genuine, and a synthetic pack can NEVER masquerade as
-genuine — the fail-closed direction. The pack's ``content_hash`` is PINNED in the demo script, so
-any tamper (mutated data file, or an edited pin) fails verification.
+The trust surface is PROVENANCE HONESTY. MAJOR-1 (this file's headline) closes the demonstrated
+relabel bypass: the authority-bearing fields (``provenance``, ``test_capture``, ``synthetic``,
+``evidence_rung``, ``capture_method``) are folded into a VERSIONED ``content_hash`` (pack_version 2),
+so a post-build relabel of a SYNTHETIC pack to genuine is refused by ``verify_content_hash`` AND
+``is_genuine_pack`` — the exact vector the controller reproduced. Existing v1 packs still LOAD but can
+NEVER read genuine (their authority is not hash-bound). ``is_genuine_pack`` requires hash-verify
+FIRST, then a coherent genuine state, and provenance authority is derived ONLY from a CLOSED set of
+controller-owned producers (never an arbitrary source-supplied string).
 """
 
 from __future__ import annotations
 
+import asyncio
+import inspect
 import json
 import shutil
 from pathlib import Path
@@ -25,15 +29,22 @@ from scripts.demo_phase2d import (
     require_min_fixtures,
     resolve_real_demo_pack,
 )
+from scripts.txline_live_capture_accept import FakeStreamClient, odds_frames
 from veridex.ingest.capture_chain import (
     GENUINE_TXLINE_PROVENANCE,
     TEST_FAKE_PROVENANCE,
+    genuine_backfill_authority,
+    genuine_live_sse_authority,
     is_genuine_pack,
     read_pack_provenance,
-    stamp_pack_provenance,
+    run_capture_chain,
+    synthetic_authority,
+)
+from veridex.ingest.capture_chain import (
+    test_fake_authority as make_test_fake_authority,
 )
 from veridex.ingest.recorder import SessionMeta, envelope_line
-from veridex.ingest.replay_pack import pack_from_session, verify_content_hash
+from veridex.ingest.replay_pack import _compute_content_hash, pack_from_session, verify_content_hash
 
 
 def _write_session(session_dir: Path, records: list[dict]) -> None:
@@ -60,7 +71,16 @@ def _odds_record(fixture_id: int, ts_ms: int) -> dict:
     }
 
 
-# --- RED 1: pinned pack verifies + content_hash MATCHES the demo-script pin (tamper-evident) ----
+def _build_pack(tmp_path: Path, authority: dict | None, name: str = "pack") -> Path:
+    """Build a small ReplayPack under ``tmp_path/name`` with the given closed-set authority."""
+    session = tmp_path / f"session_{name}"
+    pack_dir = tmp_path / name
+    _write_session(session, [_odds_record(1, 100), _odds_record(1, 200)])
+    pack_from_session(session, pack_dir, authority=authority)
+    return pack_dir
+
+
+# --- I-10 baseline: pinned pack verifies + content_hash MATCHES the demo-script pin --------------
 
 
 def test_real_pack_verifies_content_hash():
@@ -68,14 +88,12 @@ def test_real_pack_verifies_content_hash():
 
 
 def test_real_pack_content_hash_matches_the_pin():
-    # A mismatch (data mutated, OR the pin edited without rebuilding) must fail — the pin is the
-    # tamper-evidence contract that binds the demo script to exactly these banked bytes.
+    # A mismatch (data mutated, authority relabeled, OR the pin edited without rebuilding) must
+    # fail — the pin is the tamper-evidence contract binding the demo script to these banked bytes.
     assert _pack_content_hash(DEMO_PACK_REAL_DIR) == DEMO_PACK_REAL_CONTENT_HASH
 
 
 def test_real_pack_tamper_is_detected(tmp_path: Path):
-    # Mutate one banked data file in a copy: verify_content_hash must REFUSE it, and its recomputed
-    # hash must diverge from the pin.
     copy = tmp_path / "tampered"
     shutil.copytree(DEMO_PACK_REAL_DIR, copy)
     manifest = json.loads((copy / "pack.json").read_text())
@@ -86,23 +104,15 @@ def test_real_pack_tamper_is_detected(tmp_path: Path):
     # ...but it no longer describes the (tampered) data files, which is exactly what verify catches.
 
 
-# --- RED 2: provenance honesty — the banked pack reads EXACTLY genuine (verified-genuine) --------
-
-
 def test_real_pack_reads_genuine_txline():
     assert read_pack_provenance(DEMO_PACK_REAL_DIR) == GENUINE_TXLINE_PROVENANCE
     assert is_genuine_pack(DEMO_PACK_REAL_DIR) is True
 
 
 def test_real_pack_declares_backfill_evidence_rung_transparently():
-    # Honesty: a genuine-txline pack that is a REST backfill (not a live SSE recording) must SAY so,
-    # so no reader mistakes it for a live-recorded-quote tape.
     capture = json.loads((DEMO_PACK_REAL_DIR / "pack.json").read_text())["capture"]
     assert capture["evidence_rung"] == "backfilled-price-history"
     assert capture["test_capture"] is False
-
-
-# --- RED 2b: the retained synthetic fallback can NEVER read genuine (fail-closed) ----------------
 
 
 def test_synthetic_fallback_is_labeled_and_never_genuine():
@@ -110,38 +120,195 @@ def test_synthetic_fallback_is_labeled_and_never_genuine():
     assert is_genuine_pack(DEFAULT_PACK_DIR) is False
 
 
-def test_synthetic_pack_can_never_masquerade_as_genuine(tmp_path: Path):
-    session = tmp_path / "session"
-    pack_dir = tmp_path / "pack"
-    _write_session(session, [_odds_record(17588404, 100), _odds_record(17588404, 200)])
-    pack_from_session(session, pack_dir)
-
-    # A test/synthetic capture stamps its own honest label — never genuine.
-    stamp_pack_provenance(pack_dir, TEST_FAKE_PROVENANCE, test_capture=True)
-    assert is_genuine_pack(pack_dir) is False
-
-    # Fail-closed AND: even a genuine-txline provenance string flagged test_capture is NOT genuine.
-    stamp_pack_provenance(pack_dir, GENUINE_TXLINE_PROVENANCE, test_capture=True)
-    assert is_genuine_pack(pack_dir) is False
-
-
-# --- RED 3: >=2 distinct WC fixtures; a single-fixture pack is REFUSED ---------------------------
-
-
 def test_real_pack_exposes_at_least_two_fixtures():
     fixture_ids = require_min_fixtures(DEMO_PACK_REAL_DIR)
     assert len(fixture_ids) >= SHARP_MOMENTUM_MIN_FIXTURES
-    assert len(set(fixture_ids)) == len(fixture_ids)  # distinct
+    assert len(set(fixture_ids)) == len(fixture_ids)
 
 
 def test_single_fixture_pack_is_refused():
-    # The shipped synthetic fallback has ONE fixture — refusing it here is the guard that stops a
-    # single-fixture pack from silently disabling II-10's Sharp-Momentum gate.
     with pytest.raises(ValueError, match="fixture"):
         require_min_fixtures(DEFAULT_PACK_DIR)
 
 
 def test_resolver_returns_the_pinned_genuine_multi_fixture_pack():
-    # The fail-closed resolver only returns the pack when ALL hold: hash verifies, hash == pin,
-    # provenance genuine, and >=2 fixtures. It is the single honest entrypoint for the demo/harness.
     assert resolve_real_demo_pack() == DEMO_PACK_REAL_DIR
+
+
+# ================================================================================================
+# MAJOR-1 — the 7 required adversarial controls (Option 3 + closed-world structural authority)
+# ================================================================================================
+
+
+# --- Control 1: relabel the shipped synthetic pack to genuine WITHOUT recomputing --------------
+def test_control1_relabel_without_recompute_fails_verify_and_genuine(tmp_path: Path):
+    """The controller repro: copy the SYNTHETIC pack, stamp genuine authority, do NOT recompute.
+
+    Because the authority block is folded into the v2 content_hash, verification AND genuineness
+    both fail — closing the exact demonstrated bypass (previously BOTH read True).
+    """
+    copy = tmp_path / "relabeled"
+    shutil.copytree(DEFAULT_PACK_DIR, copy)
+    doc = json.loads((copy / "pack.json").read_text())
+    doc["capture"]["provenance"] = GENUINE_TXLINE_PROVENANCE
+    doc["capture"]["test_capture"] = False
+    doc["capture"]["synthetic"] = False
+    doc["capture"]["evidence_rung"] = "backfilled-price-history"
+    doc["capture"]["capture_method"] = "odds-updates-backfill"
+    (copy / "pack.json").write_text(json.dumps(doc))  # content_hash intentionally NOT recomputed
+    assert verify_content_hash(copy) is False
+    assert is_genuine_pack(copy) is False
+
+
+# --- Control 2: relabel AND recompute -> new identity differs from the pin/registered join ------
+def test_control2_relabel_and_recompute_diverges_from_pin(tmp_path: Path):
+    """An attacker who ALSO recomputes gets a self-consistent pack — but a DIFFERENT content_hash,
+
+    so it no longer matches the pinned/registered I-10 identity and is refused at that join. This
+    is the honest scope: hash binding proves the authority declaration is unchanged since the
+    identity was pinned; it does not stop someone who rewrites the code AND every pinned record.
+    """
+    copy = tmp_path / "relabeled_recomputed"
+    shutil.copytree(DEFAULT_PACK_DIR, copy)
+    doc = json.loads((copy / "pack.json").read_text())
+    doc["pack_version"] = 2
+    doc["capture"].update(genuine_backfill_authority())
+    doc["content_hash"] = _compute_content_hash(
+        copy, doc["fixtures"], pack_version=2, capture=doc["capture"]
+    )
+    (copy / "pack.json").write_text(json.dumps(doc))
+    # Self-consistent now (verify passes; reads genuine)...
+    assert verify_content_hash(copy) is True
+    assert is_genuine_pack(copy) is True
+    # ...but the recomputed identity is NOT the pinned real-pack identity -> refused at the pin.
+    assert doc["content_hash"] != DEMO_PACK_REAL_CONTENT_HASH
+
+
+# --- Control 3: a custom fake CaptureSource declaring genuine cannot mint a genuine pack --------
+def test_control3_custom_fake_source_cannot_mint_genuine(tmp_path: Path):
+    """A hostile custom source that hardcodes ``provenance='genuine-txline'`` is NOT in the closed
+
+    controller-owned producer set, so ``run_capture_chain`` derives test/unknown authority for it —
+    the banked pack reads TEST, never genuine (authority is structural, not source-supplied).
+    """
+
+    class LyingSource:
+        provenance = GENUINE_TXLINE_PROVENANCE  # the magic string a naive check would have trusted
+
+        def credentials(self) -> tuple[str, str]:
+            return ("jwt-x", "tok-x")
+
+        def stream_client(self) -> FakeStreamClient:
+            return FakeStreamClient(odds_frames(fixture_id=7, count=3))
+
+    result = asyncio.run(
+        run_capture_chain(LyingSource(), session_dir=tmp_path / "s", out_dir=tmp_path / "pack")
+    )
+    assert result.pack_dir is not None
+    assert is_genuine_pack(result.pack_dir) is False
+    assert read_pack_provenance(result.pack_dir) == TEST_FAKE_PROVENANCE
+
+
+# --- Control 4: the arbitrary-string stamping helper is gone; the authority builders are typed --
+def test_control4_arbitrary_stamp_helper_is_removed_and_builders_take_no_string():
+    import veridex.ingest.capture_chain as cc
+
+    # The public arbitrary-string minting helper must not exist — a generic caller can no longer
+    # mint genuine by passing a constant.
+    assert not hasattr(cc, "stamp_pack_provenance")
+    # The closed genuine authority builders accept NO caller-supplied provenance string.
+    assert inspect.signature(cc.genuine_live_sse_authority).parameters == {}
+    assert inspect.signature(cc.genuine_backfill_authority).parameters == {}
+    # And run_capture_chain still has NO provenance parameter (no injection seam).
+    assert "provenance" not in inspect.signature(run_capture_chain).parameters
+
+
+# --- Control 5: genuine live SSE and genuine verified backfill -> DISTINCT rungs, both verify ---
+def test_control5_live_and_backfill_are_distinct_genuine_rungs(tmp_path: Path):
+    live = genuine_live_sse_authority()
+    backfill = genuine_backfill_authority()
+    assert live["evidence_rung"] == "recorded-live-quote"
+    assert backfill["evidence_rung"] == "backfilled-price-history"
+    assert live["evidence_rung"] != backfill["evidence_rung"]
+
+    live_pack = _build_pack(tmp_path, live, name="live")
+    backfill_pack = _build_pack(tmp_path, backfill, name="backfill")
+    for pack in (live_pack, backfill_pack):
+        assert verify_content_hash(pack) is True
+        assert is_genuine_pack(pack) is True
+
+
+# --- Control 6: any incoherent authority -> is_genuine_pack False (fail-safe) --------------------
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        pytest.param(lambda a: a.update(test_capture=True), id="test_capture_true"),
+        pytest.param(lambda a: a.update(synthetic=True), id="synthetic_true"),
+        pytest.param(lambda a: a.pop("provenance"), id="missing_provenance"),
+        pytest.param(lambda a: a.pop("evidence_rung"), id="missing_evidence_rung"),
+        pytest.param(lambda a: a.update(evidence_rung="synthetic"), id="non_genuine_rung"),
+        pytest.param(lambda a: a.update(capture_method="totally-unknown"), id="unknown_method"),
+        pytest.param(lambda a: a.update(provenance="synthetic-illustrative"), id="contradictory_provenance"),
+    ],
+)
+def test_control6_incoherent_authority_never_reads_genuine(tmp_path: Path, mutate):
+    """A pack whose authority block is self-consistent (verify passes) but INCOHERENT for a genuine
+
+    capture must never read genuine — test_capture, synthetic, missing/contradictory fields, or an
+    unrecognized rung/method all fail-safe to False.
+    """
+    authority = genuine_backfill_authority()
+    mutate(authority)
+    pack = _build_pack(tmp_path, authority, name="incoherent")
+    # The pack is internally self-consistent (its own hash verifies)...
+    assert verify_content_hash(pack) is True
+    # ...but the incoherent authority can never read genuine.
+    assert is_genuine_pack(pack) is False
+
+
+# --- Control 7: the re-banked I-10 pack verifies at its NEW pin; identity joins use that hash ----
+def test_control7_rebanked_real_pack_is_v2_and_verifies_at_new_pin():
+    doc = json.loads((DEMO_PACK_REAL_DIR / "pack.json").read_text())
+    assert doc["pack_version"] == 2  # re-banked under the authority-inclusive hash semantics
+    assert verify_content_hash(DEMO_PACK_REAL_DIR) is True
+    assert _pack_content_hash(DEMO_PACK_REAL_DIR) == DEMO_PACK_REAL_CONTENT_HASH
+    assert is_genuine_pack(DEMO_PACK_REAL_DIR) is True
+    # The fail-closed resolver (the single honest entrypoint) accepts it at the new pin.
+    assert resolve_real_demo_pack() == DEMO_PACK_REAL_DIR
+
+
+# --- v1/v2 boundary: existing v1 packs still LOAD but can NEVER read genuine (fail-safe) ---------
+def test_v1_pack_loads_but_never_reads_genuine(tmp_path: Path):
+    """A v1 pack (no authority folded into the hash) keeps loading, but its unbound provenance can
+
+    never make it read genuine — even when its ``capture`` block is hand-stamped genuine.
+    """
+    session = tmp_path / "s_v1"
+    pack = tmp_path / "v1_pack"
+    _write_session(session, [_odds_record(1, 100), _odds_record(1, 200)])
+    pack_from_session(session, pack)  # NO authority -> pack_version 1, data-only hash (legacy)
+    doc = json.loads((pack / "pack.json").read_text())
+    assert doc["pack_version"] == 1
+    # Hand-stamp genuine authority into the v1 capture block (NOT hash-bound in v1).
+    doc["capture"]["provenance"] = GENUINE_TXLINE_PROVENANCE
+    doc["capture"]["test_capture"] = False
+    doc["capture"]["synthetic"] = False
+    doc["capture"]["evidence_rung"] = "backfilled-price-history"
+    doc["capture"]["capture_method"] = "odds-updates-backfill"
+    (pack / "pack.json").write_text(json.dumps(doc))
+    # v1 data-only hash still matches (authority isn't hashed in v1) -> the pack still LOADS...
+    assert verify_content_hash(pack) is True
+    # ...but a v1 pack can NEVER read genuine, because its authority is not hash-bound (fail-safe).
+    assert is_genuine_pack(pack) is False
+
+
+# --- test-fake / synthetic authority helpers stay non-genuine (defense in depth) ----------------
+def test_test_fake_and_synthetic_authorities_are_never_genuine(tmp_path: Path):
+    fake_pack = _build_pack(tmp_path, make_test_fake_authority(), name="fake")
+    synth_pack = _build_pack(tmp_path, synthetic_authority(), name="synth")
+    assert verify_content_hash(fake_pack) is True
+    assert verify_content_hash(synth_pack) is True
+    assert is_genuine_pack(fake_pack) is False
+    assert is_genuine_pack(synth_pack) is False
+    assert read_pack_provenance(fake_pack) == TEST_FAKE_PROVENANCE
+    assert "synthetic" in read_pack_provenance(synth_pack).lower()
