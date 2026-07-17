@@ -61,7 +61,7 @@ describe('MakerProofCardScreen — verdict honesty + configuration identity (I-R
     expect(within(screen.getByTestId('maker-proof-verdict')).getByText('Inverted')).toBeInTheDocument();
     expect(screen.queryByText(/txline-fair separated|separated from the naive control/i)).toBeNull();
     expect(screen.queryByText(/whole ci above zero/i)).toBeNull();
-    expect(screen.getByText(/reliably more toxic|reliably worse/i)).toBeInTheDocument();
+    expect(screen.getAllByText(/reliably more toxic|reliably worse/i).length).toBeGreaterThan(0);
   });
 
   it('M3: the exact sealed config_hash renders in the header (short-hash text, full hash visible)', () => {

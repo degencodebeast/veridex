@@ -3,16 +3,25 @@ import { Badge } from '@/components/ui/Badge';
 import { Num } from '@/components/ui/Num';
 import { InfoTip } from '@/components/ui/InfoTip';
 import { GLOSSARY } from '@/lib/glossary';
+import { shortHash } from '@/lib/format';
+import { MAKER_AGENT_META } from '@/lib/fixtures/maker';
+import { deriveMakerVerdict } from '@/lib/makerVerdict';
 import type { MakerArenaResultView } from '@/lib/contracts';
 import styles from './MakerProofCardScreen.module.css';
 
 // Maker Proof Card (MM-R1) — a deep-link route reached from any maker row's PROOF → (Leaderboard
 // / Agents / Duel), mirroring ProofCardScreen. SEC-005: reads ONLY MakerArenaResultView — never
-// ProofArtifact / adaptProofArtifact. Leads with the falsification verdict + CI (the claim), not
-// a mean; always shows the n=18 small-sample caveat; MM-R1 only — no invented R1.5/R2 UI.
+// ProofArtifact / adaptProofArtifact. Leads with the three-state falsification verdict + CI (the
+// claim, derived via deriveMakerVerdict — never a boolean shortcut, I-R M1), not a mean; carries
+// the sealed config_hash identity in the header (I-R M3); always shows the n=18 small-sample
+// caveat; MM-R1 only — no invented R1.5/R2 UI.
 export function MakerProofCardScreen({ result, agentId }: { result: MakerArenaResultView; agentId: string }) {
   const card = result.proof_card;
-  const separated = card.falsification.verdict === 'SEPARATED';
+  const candidate = result.leaderboard.find((r) => MAKER_AGENT_META[r.agent_id]?.role === 'candidate') ?? result.leaderboard[0];
+  const control = result.leaderboard.find((r) => MAKER_AGENT_META[r.agent_id]?.role === 'control') ?? result.leaderboard[1];
+  const verdict = deriveMakerVerdict(card.falsification, {
+    candidate: candidate.agent_id, control: control.agent_id,
+  });
 
   return (
     <article className={styles.proof}>
@@ -24,7 +33,11 @@ export function MakerProofCardScreen({ result, agentId }: { result: MakerArenaRe
             <Badge variant="mm-r1" />
             <span className={`${styles.meta} mono`}>{agentId} · MM-R1</span>
           </div>
-          <div className={`${styles.subMeta} mono`}>maker-arena-v1 · forward-markout quote-quality falsification · {result.source_mode}</div>
+          <div className={`${styles.subMeta} mono`}>
+            maker-arena-v1 · forward-markout quote-quality falsification · {result.source_mode} · config{' '}
+            <span title={result.config_hash} data-testid="maker-proof-config-hash">{shortHash(result.config_hash)}</span>
+            <InfoTip label={GLOSSARY.maker_config_hash.label}>{GLOSSARY.maker_config_hash.definition}</InfoTip>
+          </div>
         </div>
         <Badge variant="small-n">n={card.n_fixtures} · SMALL SAMPLE</Badge>
       </header>
@@ -38,10 +51,10 @@ export function MakerProofCardScreen({ result, agentId }: { result: MakerArenaRe
         </div>
         <div className={styles.leadBody}>
           <div className={styles.leadClaim}>
-            <span data-testid="maker-proof-verdict"><Badge variant={separated ? 'separated' : 'inconclusive'} /></span>
+            <span data-testid="maker-proof-verdict"><Badge variant={verdict.badge}>{verdict.badgeText}</Badge></span>
             <div>
-              <div className={styles.leadHeadline}>TxLINE-fair separated from the naive control on quote quality</div>
-              <div className={styles.leadSub}>{card.falsification.headline} · whole CI above zero</div>
+              <div className={styles.leadHeadline}>{verdict.headline}</div>
+              <div className={styles.leadSub}>{card.falsification.headline} · {verdict.ciSub}</div>
             </div>
           </div>
           <div className={styles.leadStats}>

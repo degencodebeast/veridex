@@ -178,7 +178,7 @@ describe('LeaderboardScreen — Maker verdict honesty + proof links (I-R M1, Min
     expect(screen.queryByText('Separated')).toBeNull();
     expect(screen.queryByText(/separated from the naive control/i)).toBeNull();
     expect(screen.queryByText(/whole ci above zero/i)).toBeNull();
-    expect(screen.getByText(/reliably more toxic|reliably worse/i)).toBeInTheDocument();
+    expect(screen.getAllByText(/reliably more toxic|reliably worse/i).length).toBeGreaterThan(0);
   });
 
   it('Min5: the visible PROOF affordance is a real accessible link to the maker proof route', async () => {

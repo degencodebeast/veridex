@@ -24,7 +24,9 @@
 .laneNote { font-size: 10px; color: var(--text-3); flex: 1; min-width: 200px; }
 .makerSortNote { display: flex; align-items: center; gap: var(--space-1); font-size: 10px; color: var(--text-3); }
 .diagnostic { color: var(--text-3); }
-.proofLink { text-align: right; color: var(--accent-2); font-weight: 600; font-size: 10px; }
+.proofLink { text-align: right; font-size: 10px; }
+.proofLinkAnchor { color: var(--accent-2); font-weight: 600; text-decoration: none; }
+.proofLinkAnchor:hover, .proofLinkAnchor:focus-visible { color: var(--accent-hi); text-decoration: underline; }
 .tableFoot { display: flex; align-items: center; justify-content: space-between; gap: var(--space-3); padding: var(--space-2) var(--pad-panel); border-top: 1px solid var(--border); flex-wrap: wrap; }
 .footNote { font-size: 10px; color: var(--text-3); }
 .footCount { font-size: 10px; color: var(--text-3); }

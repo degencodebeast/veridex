@@ -80,11 +80,15 @@ export const GLOSSARY = {
   },
   falsification: {
     label: 'Falsification',
-    definition: 'pairwise bootstrap test of the Δ between two agents; SEPARATED = whole 95% CI above zero, INCONCLUSIVE = CI spans zero.',
+    definition: 'pairwise bootstrap test of the Δ between two agents; SEPARATED = whole 95% CI above zero, INCONCLUSIVE = CI spans zero, INVERTED = whole CI below zero (the candidate is reliably worse).',
   },
   maker_small_n: {
     label: 'Maker small-n',
     definition: 'the Maker Arena result is scored on a small fixture universe (n=18); always shown as a caveat, never hidden or rounded away.',
+  },
+  maker_config_hash: {
+    label: 'Config Hash',
+    definition: 'hash of the exact sealed maker-arena configuration that produced this result — identifies which configuration was scored, never a performance claim.',
   },
 } as const satisfies Record<string, GlossaryEntry>;
 

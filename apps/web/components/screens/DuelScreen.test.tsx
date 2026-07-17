@@ -145,7 +145,7 @@ describe('DuelScreen — Maker duel verdict/anchor/count honesty (I-R M1, M2, M4
     // the candidate card must NOT be presented as the less-toxic side
     expect(within(cardOf('txline-fair-mm')).queryByText(/less toxic/i)).toBeNull();
     // the inverted headline must state the candidate is reliably worse, not separated/safer
-    expect(within(result).getByText(/reliably more toxic|reliably worse|inverted/i)).toBeInTheDocument();
+    expect(within(result).getAllByText(/reliably more toxic|reliably worse|inverted/i).length).toBeGreaterThan(0);
     expect(within(result).queryByText(/txline-fair-mm is less toxic/i)).toBeNull();
   });
 

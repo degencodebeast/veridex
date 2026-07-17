@@ -144,6 +144,9 @@ export interface MakerArenaResultView {
   rank_axis: string;             // "avg_toxicity_loss_bps"
   rank_axis_direction: string;   // "asc"
   rung: string;
+  // The sealed configuration identity (wire result.config_hash) — preserved verbatim so the
+  // Maker Proof Card can show WHICH exact configuration produced this result (I-R M3).
+  config_hash: string;
   fixture_universe_n: number;
   small_n_flag: boolean;
   real_executable_edge_bps: null; // top-level: always null

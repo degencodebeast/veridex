@@ -232,6 +232,7 @@ export function adaptMakerArenaResult(w: W.MakerArenaResultResponseWire): MakerA
     rank_axis: w.rank_axis,
     rank_axis_direction: w.rank_axis_direction,
     rung: w.result.rung,
+    config_hash: w.result.config_hash, // sealed configuration identity, verbatim (I-R M3)
     fixture_universe_n: w.result.fixture_universe_n,
     small_n_flag: w.result.small_n_flag,
     real_executable_edge_bps: null,

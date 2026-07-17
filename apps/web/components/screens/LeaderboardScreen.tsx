@@ -8,7 +8,8 @@ import { SegmentedControl } from '@/components/ui/SegmentedControl';
 import { InfoTip } from '@/components/ui/InfoTip';
 import { rankByAvgClv, isEligible } from '@/lib/derive';
 import { LEADERBOARD_ROWS } from '@/lib/fixtures/catalog';
-import { MAKER_ARENA_RESULT } from '@/lib/fixtures/maker';
+import { MAKER_ARENA_RESULT, MAKER_AGENT_META } from '@/lib/fixtures/maker';
+import { deriveMakerVerdict } from '@/lib/makerVerdict';
 import { GLOSSARY } from '@/lib/glossary';
 import { useLane, type Lane } from '@/hooks/useLane';
 import type { LeaderboardRow } from '@/lib/catalog';
@@ -130,6 +131,11 @@ function MakerLeaderboard({ result }: { result: MakerArenaResultView }) {
     [result],
   );
   const f = result.falsification;
+  // Badge, headline, and CI copy all derive from the REAL three-state verdict (I-R M1) —
+  // an INCONCLUSIVE or INVERTED seal must never render as a separated candidate win.
+  const candidate = ranked.find((r) => MAKER_AGENT_META[r.agent_id]?.role === 'candidate') ?? ranked[0];
+  const control = ranked.find((r) => MAKER_AGENT_META[r.agent_id]?.role === 'control') ?? ranked[1];
+  const verdict = deriveMakerVerdict(f, { candidate: candidate.agent_id, control: control.agent_id });
 
   return (
     <>
@@ -138,11 +144,11 @@ function MakerLeaderboard({ result }: { result: MakerArenaResultView }) {
         Two different lanes, different agents. No fill / PnL / executable-edge claim — <span className="mono">real_executable_edge_bps</span> is null by construction.
       </p>
 
-      <div className={styles.falsificationStrip}>
-        <Badge variant={f.verdict === 'SEPARATED' ? 'separated' : 'inconclusive'} />
+      <div className={styles.falsificationStrip} data-verdict={verdict.kind.toLowerCase()}>
+        <Badge variant={verdict.badge}>{verdict.badgeText}</Badge>
         <div className={styles.falsificationBody}>
-          <div className={styles.falsificationHeadline}>TxLINE-fair separated from the naive control on quote quality</div>
-          <div className={styles.falsificationSub}>pairwise bootstrap falsification · SEPARATED = whole CI above zero</div>
+          <div className={styles.falsificationHeadline}>{verdict.headline}</div>
+          <div className={styles.falsificationSub}>pairwise bootstrap falsification · {verdict.ciSub}</div>
         </div>
         <div className={styles.falsificationStats}>
           <div className={styles.stat}>
@@ -185,7 +191,12 @@ function MakerLeaderboard({ result }: { result: MakerArenaResultView }) {
                 <td className={styles.num}>{r.abstained}</td>
                 <td className={`${styles.num} mono`} data-testid="lb-maker-edge">{String(r.real_executable_edge_bps)}</td>
                 <td><Badge variant="mm-r1" /></td>
-                <td className={styles.proofLink}>PROOF →</td>
+                {/* A real, keyboard-reachable link — never dead arrow text (I-R Min5). */}
+                <td className={styles.proofLink}>
+                  <Link href={`/proof/maker/${r.agent_id}`} className={styles.proofLinkAnchor} aria-label={`Proof card for ${r.agent_id}`}>
+                    PROOF →
+                  </Link>
+                </td>
               </tr>
             ))}
           </tbody>

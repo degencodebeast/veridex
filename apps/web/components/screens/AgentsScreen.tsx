@@ -138,7 +138,12 @@ function MakerAgentsTable({ result }: { result: MakerArenaResultView }) {
                   <td className={`${styles.num} ${styles.diagnostic}`}>{r.avg_markout_bps}</td>
                   <td className={styles.num}>{r.quote_count.toLocaleString()}</td>
                   <td><Badge variant="mm-r1" /></td>
-                  <td className={styles.proofLink}>PROOF →</td>
+                  {/* A real, keyboard-reachable link — never dead arrow text (I-R Min5). */}
+                  <td className={styles.proofLink}>
+                    <Link href={`/proof/maker/${r.agent_id}`} className={styles.proofLinkAnchor} aria-label={`Proof card for ${r.agent_id}`}>
+                      PROOF →
+                    </Link>
+                  </td>
                 </tr>
               );
             })}

@@ -6,6 +6,7 @@ import { SegmentedControl } from '@/components/ui/SegmentedControl';
 import { isEligible } from '@/lib/derive';
 import { AGENTS } from '@/lib/fixtures/catalog';
 import { MAKER_ARENA_RESULT, MAKER_AGENT_META } from '@/lib/fixtures/maker';
+import { deriveMakerVerdict } from '@/lib/makerVerdict';
 import { useLane, type Lane } from '@/hooks/useLane';
 import type { AgentSummary } from '@/lib/catalog';
 import type { MakerArenaResultView, MakerLeaderboardRow } from '@/lib/contracts';
@@ -113,28 +114,36 @@ export function DuelScreen({
 
 // Maker Arena lane (MM-R1) — the FIXED naive-mm vs txline-fair-mm pairing (no picker; only one
 // maker pairing exists, SEC-005: a separate render path + data source). Headline metric is
-// toxicity loss; DUEL RESULT is the SEPARATED/INCONCLUSIVE falsification verdict + Δ + CI, never
+// toxicity loss; DUEL RESULT is the three-state SEPARATED/INCONCLUSIVE/INVERTED falsification
+// verdict + Δ + CI (derived via deriveMakerVerdict — never a boolean shortcut, I-R M1), never
 // a CLV point-delta. The per-quote panel is honest-empty — no fabricated per-tick quote pairs.
 function MakerDuel({ result }: { result: MakerArenaResultView }) {
   const ranked = [...result.leaderboard].sort((a, b) => a.avg_toxicity_loss_bps - b.avg_toxicity_loss_bps);
   const candidate = ranked.find((r) => MAKER_AGENT_META[r.agent_id]?.role === 'candidate') ?? ranked[0];
   const control = ranked.find((r) => MAKER_AGENT_META[r.agent_id]?.role === 'control') ?? ranked[1];
+  const verdict = deriveMakerVerdict(result.falsification, {
+    candidate: candidate.agent_id, control: control.agent_id,
+  });
   const f = result.falsification;
-  const separated = f.verdict === 'SEPARATED';
 
   function MakerCard({ row, kind }: { row: MakerLeaderboardRow; kind: 'candidate' | 'control' }) {
     const meta = MAKER_AGENT_META[row.agent_id];
+    // Winner treatment derives from the REAL verdict (I-R M1): the candidate only when
+    // SEPARATED, the control only when INVERTED, nobody when INCONCLUSIVE/unknown.
+    const isLessToxic = verdict.winner === kind;
     return (
-      <div className={`${styles.card} ${kind === 'candidate' ? styles.cardWinner : ''}`} data-testid="duel-maker-card">
+      <div className={`${styles.card} ${isLessToxic ? styles.cardWinner : ''}`} data-testid="duel-maker-card">
         <div className={styles.makerCardHead}>
           <span className={styles.name}>{row.agent_id}</span>
-          <Badge variant={kind === 'candidate' ? 'separated' : 'mm-r1'}>{kind === 'candidate' ? 'LESS TOXIC' : 'CONTROL'}</Badge>
+          <Badge variant="mm-r1">{kind === 'candidate' ? 'CANDIDATE' : 'CONTROL'}</Badge>
+          {isLessToxic ? <Badge variant={verdict.badge}>LESS TOXIC</Badge> : null}
         </div>
         <span className={styles.side}>{meta?.caption ?? kind} · MM-R1</span>
         <div className={styles.kv}><span>Toxicity loss ↓</span><span data-testid="duel-maker-toxicity"><Num value={row.avg_toxicity_loss_bps} kind="bps" /></span></div>
         <div className={styles.kv}><span>Markout <span className={styles.diagnosticTag}>ⓘ diagnostic</span></span><span className="mono">{row.avg_markout_bps}</span></div>
         <div className={styles.kv}><span>Quotes</span><span className="mono">{row.quote_count.toLocaleString()}</span></div>
-        <div className={styles.kv}><span>Abstained · Scored</span><span className="mono">{row.abstained} · {result.fixture_universe_n}</span></div>
+        {/* Per-agent scored count — row.scored, NEVER the fixture-universe size (I-R M4). */}
+        <div className={styles.kv}><span>Abstained · Scored</span><span className="mono" data-testid="duel-maker-scored">{row.abstained} · {row.scored.toLocaleString()}</span></div>
         <div className={styles.kv}><span>Exec edge</span><span className="mono" data-testid="duel-maker-edge">{String(row.real_executable_edge_bps)}</span></div>
         <div className={styles.kv}><span>Rung</span><Badge variant="mm-r1" /></div>
       </div>
@@ -143,10 +152,13 @@ function MakerDuel({ result }: { result: MakerArenaResultView }) {
 
   return (
     <>
+      {/* A sealed tape is replay/verify identity, NOT external anchoring — the maker result
+          carries no authoritative anchor_status, so this renders the honest not-anchored
+          state and never a clickable/implied external-anchor claim (I-R M2). */}
       <div className={styles.evidence} data-testid="evidence-hash">
-        <Badge variant="anchored" />
+        <Badge variant="not-anchored" />
         <span className={`mono ${styles.evidenceText}`}>
-          Fixed falsification pairing on the sealed maker tape · {result.fixture_universe_n} fixtures · n={result.fixture_universe_n}. Only one maker pairing exists — no agent picker.
+          Fixed falsification pairing on the sealed maker tape · {result.fixture_universe_n} fixtures · n={result.fixture_universe_n}. Sealed tape identity only — no external anchor for this result. Only one maker pairing exists — no agent picker.
         </span>
         <Badge variant="small-n">n={result.fixture_universe_n} · small sample</Badge>
       </div>
@@ -156,24 +168,18 @@ function MakerDuel({ result }: { result: MakerArenaResultView }) {
         <MakerCard row={control} kind="control" />
       </div>
 
-      <div className={styles.duelResult} data-testid="duel-result">
-        <Badge variant={separated ? 'separated' : 'inconclusive'} />
+      <div className={styles.duelResult} data-testid="duel-result" data-verdict={verdict.kind.toLowerCase()}>
+        <Badge variant={verdict.badge}>{verdict.badgeText}</Badge>
         <div className={styles.falsificationBody}>
-          <div className={styles.falsificationHeadline}>
-            {separated
-              ? 'txline-fair-mm is less toxic than the naive control'
-              : 'No separation between txline-fair-mm and the naive control'}
-          </div>
-          <div className={styles.falsificationSub}>
-            {separated ? 'whole 95% CI above zero → difference is real' : 'CI spans zero → difference is not distinguishable from noise'}
-          </div>
+          <div className={styles.falsificationHeadline}>{verdict.headline}</div>
+          <div className={styles.falsificationSub}>{verdict.ciSub}</div>
         </div>
         <div className={styles.falsificationStats}>
           <div className={styles.stat}><span className={styles.statLabel}>Δ QUOTE QUALITY</span><Num value={f.delta_bps} kind="bps" /></div>
           <div className={styles.stat}><span className={styles.statLabel}>95% CI</span><span className="mono">[{f.ci_low_bps}, {f.ci_high_bps}]</span></div>
         </div>
       </div>
-      <p className={styles.divergence}>The CI is the point — a maker duel asks &quot;is the difference real?&quot;, not &quot;who scored more&quot;. A winner is only crowned when the verdict is SEPARATED; an INCONCLUSIVE result shows no winner.</p>
+      <p className={styles.divergence}>The CI is the point — a maker duel asks &quot;is the difference real?&quot;, not &quot;who scored more&quot;. A less-toxic side is only crowned when the CI excludes zero (SEPARATED, or INVERTED for the control); an INCONCLUSIVE result shows no winner.</p>
 
       <div className={styles.card}>
         <span className={styles.side}>PER-QUOTE DIVERGENCE</span>
