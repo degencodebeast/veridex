@@ -178,6 +178,60 @@ async def test_sigkill_after_ack_replays_wal_and_dedups(tmp_path: Path) -> None:
     assert len({r.event_uuid for r in rows_after}) == n
 
 
+class _RaisingWal:
+    """A WAL handle stand-in whose ``write`` raises — simulates a single transient WAL-write failure."""
+
+    def write(self, *_: object) -> int:
+        raise OSError("simulated WAL write failure")
+
+    def flush(self) -> None:
+        raise OSError("simulated WAL write failure")
+
+
+async def test_wal_write_failure_does_not_inflate_cursor_and_drop_later_event(tmp_path: Path) -> None:
+    """A WAL-write failure (in-memory-only event) must NOT inflate the durable WAL-line cursor.
+
+    Review MAJOR-1 regression: the durable cursor is a WAL-LINE index (``recover`` reads
+    ``wal_rows[cursor:]``), so committing an in-memory-only event (one whose WAL append failed) must
+    advance the cursor by ZERO — otherwise the cursor over-counts, a later crash skips a real WAL
+    line, and a WAL-durable-but-uncommitted event is SILENTLY DROPPED (violating I-4's "a
+    process/container crash loses nothing"). Deterministic, offline (no live Postgres).
+    """
+    store = InMemoryStore()
+    dstore = DurableRuntimeEventStore(store=store, wal_dir=tmp_path)
+
+    def _ev(tag: str) -> Any:
+        return runtime_event(RuntimeEventType.ACTION_EMITTED, agent_id="g", tag=tag)
+
+    # A: WAL write succeeds (WAL line 0).
+    dstore.enqueue(_ev("A"))
+    # B: WAL write FAILS -> in-memory-only. degraded surfaces; B is still queued (never dropped).
+    real_wal = dstore._wal
+    dstore._wal = _RaisingWal()  # type: ignore[assignment]
+    dstore.enqueue(_ev("B"))
+    dstore._wal = real_wal  # type: ignore[assignment]
+    assert dstore.degraded is True
+    assert dstore.pending == 2  # A + B both queued; the in-memory-only B was not lost
+
+    # Flush [A, B]: the in-memory-only B is still delivered at-least-once to the store.
+    await dstore.drain()
+    assert {r.payload["tag"] for r in await store.list_runtime_events("g")} == {"A", "B"}
+    assert dstore.degraded is False  # fully drained -> visibly recovered
+
+    # C, D: fresh WAL-durable events, then CRASH before they commit.
+    dstore.enqueue(_ev("C"))
+    dstore.enqueue(_ev("D"))
+    del dstore  # SIGKILL: no drain of C, D
+
+    # Restart: recover must replay BOTH C and D. A cursor inflated by the earlier WAL-write failure
+    # would skip one WAL line and silently DROP C — the guarantee-violating bug this test guards.
+    restarted = DurableRuntimeEventStore(store=store, wal_dir=tmp_path)
+    restarted.recover()
+    await restarted.drain()
+    tags = {r.payload["tag"] for r in await store.list_runtime_events("g")}
+    assert tags == {"A", "B", "C", "D"}, f"WAL-durable event silently dropped after crash: {sorted(tags)}"
+
+
 @pytest.mark.skipif(
     not (os.getenv("DATABASE_URL")),
     reason="live-Postgres WAL replay/dedup: set DATABASE_URL (never faked)",

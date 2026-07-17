@@ -28,11 +28,25 @@ import tempfile
 import threading
 import uuid
 from collections import deque
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TextIO
 
 from veridex.runtime.runtime_events import RuntimeEvent, RuntimeEventSink
 from veridex.store import RuntimeEventRow, Store
+
+
+@dataclass(frozen=True)
+class _PendingEntry:
+    """One queued event plus whether its WAL append actually succeeded.
+
+    ``wal_backed`` is the crux of the durable-cursor invariant: the cursor is a WAL-LINE index, so
+    committing an in-memory-only entry (WAL append failed) must advance it by ZERO — otherwise the
+    cursor over-counts vs the WAL and a later crash skips a real WAL line (silent loss).
+    """
+
+    row: RuntimeEventRow
+    wal_backed: bool
 
 
 class RuntimeEventStore:
@@ -138,7 +152,7 @@ class DurableRuntimeEventStore:
         self._wal: TextIO | None = None
 
         self._lock = threading.Lock()  # guards WAL writes + the in-memory queue
-        self._pending: deque[RuntimeEventRow] = deque()
+        self._pending: deque[_PendingEntry] = deque()
         self._committed_lines: int = self._read_cursor()
         self._degraded = False
         self._flush_failures = 0
@@ -180,15 +194,19 @@ class DurableRuntimeEventStore:
             default=str,
         )
         with self._lock:
+            wal_backed = True
             try:
                 if self._wal is None:
                     self._wal = self._wal_path.open("a", encoding="utf-8")
                 self._wal.write(line + "\n")
                 self._wal.flush()  # userspace → OS page cache (SIGKILL-safe); fsync is per-BATCH
             except OSError:
+                # In-memory-only: NOT WAL-durable. Degrade visibly, still queue (never drop), and mark
+                # it so committing it advances the WAL-line cursor by ZERO (else the cursor over-counts).
+                wal_backed = False
                 self._degraded = True
                 self._flush_failures += 1
-            self._pending.append(row)
+            self._pending.append(_PendingEntry(row=row, wal_backed=wal_backed))
 
     def sink(self) -> RuntimeEventSink:
         """Return :meth:`enqueue` as a ``RuntimeEventSink`` — the ONE shared sink II-2 threads too."""
@@ -216,7 +234,7 @@ class DurableRuntimeEventStore:
                     os.fsync(self._wal.fileno())
 
         try:
-            await self._store.append_runtime_events(batch)
+            await self._store.append_runtime_events([entry.row for entry in batch])
         except Exception:  # noqa: BLE001 — a transient store/DB outage must never crash the flusher.
             with self._lock:
                 self._pending.extendleft(reversed(batch))  # re-queue at the front (already WAL-durable)
@@ -226,7 +244,9 @@ class DurableRuntimeEventStore:
                 await asyncio.sleep(self._max_backoff_s)
             return 0
 
-        self._committed_lines += len(batch)
+        # Advance the durable cursor by the count of WAL-BACKED rows only — the cursor is a WAL-line
+        # index, and an in-memory-only entry (WAL append failed) has no WAL line to skip on replay.
+        self._committed_lines += sum(1 for entry in batch if entry.wal_backed)
         self._persist_cursor(self._committed_lines)
         with self._lock:
             if not self._pending:
@@ -246,9 +266,9 @@ class DurableRuntimeEventStore:
         """Replay the WAL tail beyond the durable cursor into the in-memory queue (restart path)."""
         cursor = self._read_cursor()
         self._committed_lines = cursor
-        tail = self._read_wal_rows()[cursor:]
+        tail = self._read_wal_rows()[cursor:]  # every replayed row IS a WAL line -> wal_backed
         with self._lock:
-            self._pending.extend(tail)
+            self._pending.extend(_PendingEntry(row=row, wal_backed=True) for row in tail)
 
     async def replay_all(self) -> None:
         """Re-queue EVERY WAL line, ignoring the cursor (forced re-drive; DB dedup makes it safe).
@@ -256,9 +276,9 @@ class DurableRuntimeEventStore:
         Used for a full re-replay (e.g. verifying ``ON CONFLICT`` dedup). It does not mix with fresh
         ``enqueue`` traffic — treat the store as fully drained afterward.
         """
-        rows = self._read_wal_rows()
+        rows = self._read_wal_rows()  # every WAL line is durable -> wal_backed
         with self._lock:
-            self._pending.extend(rows)
+            self._pending.extend(_PendingEntry(row=row, wal_backed=True) for row in rows)
 
     # --- lifecycle ----------------------------------------------------------------------------
 
