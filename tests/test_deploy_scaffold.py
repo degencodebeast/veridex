@@ -110,9 +110,19 @@ class TestComposeSkeleton:
         assert not missing, f"api-runtime missing volume mounts: {sorted(missing)}"
 
     def test_curated_seed_packs_mounted_read_only(self) -> None:
+        # Not just "some :ro mount exists" — the curated seed-pack TARGET path
+        # (resolved via REPLAY_PACK_ROOT at D-1) must itself be the :ro mount.
+        curated_target = "/var/lib/veridex/replay-packs/curated"
         svc = _load_compose()["services"]["api-runtime"]
-        ro_mounts = [str(v) for v in svc.get("volumes", []) if str(v).endswith(":ro")]
-        assert ro_mounts, "api-runtime must mount curated seed packs read-only (:ro)"
+        ro_targets = {
+            str(v).rsplit(":", 1)[0].split(":", 1)[1]
+            for v in svc.get("volumes", [])
+            if str(v).endswith(":ro") and str(v).count(":") >= 2
+        }
+        assert curated_target in ro_targets, (
+            f"api-runtime must mount curated seed packs read-only at "
+            f"{curated_target!r}; :ro targets found: {sorted(ro_targets)}"
+        )
 
     def test_api_runtime_references_i5_owned_dockerfile_placeholder(self) -> None:
         build = _load_compose()["services"]["api-runtime"]["build"]
@@ -191,9 +201,18 @@ class TestProvisioningInventory:
 
     def test_no_secret_values_committed(self) -> None:
         # Names/ownership only — never VALUES. Applies to every D-0 doc artifact.
+        # Fail LOUD on a missing file: silently skipping would let the secrets
+        # tripwire pass vacuously against an artifact that was never scanned.
         for path in (INVENTORY, RUNBOOK, COMPOSE):
-            if not path.is_file():
-                continue
+            assert path.is_file(), (
+                f"secrets tripwire cannot scan missing artifact "
+                f"{path.relative_to(ROOT)}"
+            )
             text = path.read_text(encoding="utf-8")
-            for marker in ("BEGIN PRIVATE KEY", "BEGIN RSA", "BEGIN EC"):
+            for marker in (
+                "BEGIN PRIVATE KEY",
+                "BEGIN RSA",
+                "BEGIN EC",
+                "BEGIN OPENSSH PRIVATE KEY",
+            ):
                 assert marker not in text, f"{path.name} contains key material"
