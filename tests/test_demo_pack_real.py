@@ -317,9 +317,10 @@ def test_control4c_object_new_bypass_is_refused(tmp_path: Path):
     """``object.__new__(PackAuthority)`` constructs a REAL ``PackAuthority`` WITHOUT running
     ``__init__``/``__post_init__`` — the seal is never checked, and genuine field values can be forced
     on via ``object.__setattr__`` (frozen dataclasses only block the NORMAL ``__setattr__`` path). This
-    passes the exact-type check but must fail the second guard: PROVEN seal possession (``_sealed``,
-    set ONLY inside ``__post_init__``) is absent here.
-    (RED before this fix: minted ``hash_verifies=True, is_genuine=True``.)
+    passes the exact-type check but must fail the second guard: the ``_seal_token`` attribute (set ONLY
+    inside ``__post_init__`` to whatever ``seal`` value was passed) is entirely ABSENT here — the
+    identity check ``getattr(authority, "_seal_token", None) is not _AUTHORITY_SEAL`` sees ``None``.
+    (RED before the first D-residual fix: minted ``hash_verifies=True, is_genuine=True``.)
     """
     forged = object.__new__(PackAuthority)
     for field, value in _FORGED_GENUINE_FIELDS.items():
@@ -331,6 +332,37 @@ def test_control4c_object_new_bypass_is_refused(tmp_path: Path):
     with pytest.raises(PermissionError):
         pack_from_session(session, pack_dir, authority=forged)
     assert is_genuine_pack(pack_dir) is False
+
+
+# --- Control 4e (D-residual write boundary, 2nd Codex re-review): forging the seal marker itself ---
+def test_control4e_forged_seal_marker_is_refused(tmp_path: Path):
+    """Codex's SECOND adversarial re-review of the D-residual fix at commit 8a14357: the write-boundary
+    guard's second check used to be a derived BOOLEAN (``_sealed``) — but a boolean is a VALUE an
+    attacker can ALSO forge via the SAME ``object.__setattr__`` primitive that forges the genuine field
+    values in Control 4c, one more line: ``object.__setattr__(forged, "_sealed", True)`` minted a
+    genuine pack (``hash_verifies=True, is_genuine=True``) even though ``__post_init__`` never ran.
+
+    The fix stores the SEAL OBJECT ITSELF (``_seal_token``) and compares it by IDENTITY (``is``)
+    against the module-private ``_AUTHORITY_SEAL`` sentinel. An attacker can still forge
+    ``_seal_token`` to SOME value via ``object.__setattr__`` — this control proves that whatever they
+    forge it to (``True``, a fresh ``object()`` masquerading as a seal, or anything else that is not
+    the REAL sentinel), the identity check still refuses it, because obtaining the real
+    ``_AUTHORITY_SEAL`` object requires importing an underscore-private module global — out-of-scope
+    internals abuse.
+    (RED before this fix: ``object_new_forged_sealed`` minted ``hash_verifies=True, is_genuine=True``.)
+    """
+    for i, forged_token in enumerate((True, object(), "sealed", None)):
+        forged = object.__new__(PackAuthority)
+        for field, value in _FORGED_GENUINE_FIELDS.items():
+            object.__setattr__(forged, field, value)
+        object.__setattr__(forged, "_seal_token", forged_token)  # forge the marker, NOT the real sentinel
+
+        session = tmp_path / f"session_forged_seal_{i}"
+        _write_session(session, [_odds_record(1, 100), _odds_record(1, 200)])
+        pack_dir = tmp_path / f"pack_forged_seal_{i}"
+        with pytest.raises(PermissionError):
+            pack_from_session(session, pack_dir, authority=forged)
+        assert is_genuine_pack(pack_dir) is False
 
 
 # --- Control 4d (D-residual write boundary): a `_claims_genuine`-override subclass is refused -----
