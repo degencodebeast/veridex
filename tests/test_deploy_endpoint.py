@@ -356,7 +356,7 @@ async def test_deploy_response_is_narrow() -> None:
         async with _transport(app) as client:
             resp = await client.post("/agents/deploy", json=_VALID)
         body = resp.json()
-        assert set(body.keys()) == {"instance_id", "config_hash", "policy_hash", "run_id"}
+        assert set(body.keys()) == {"instance_id", "config_hash", "policy_hash", "run_id", "owner"}
         # Every exposed value is a plain string identity/hash — never a nested handle/task/trace.
         assert all(isinstance(v, str) for v in body.values())
         forbidden = ("task", "trace", "secret", "keypair", "adapter", "envelope", "stream", "anchor_fn")

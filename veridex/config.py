@@ -15,9 +15,16 @@ Usage in the async shell layer::
 from __future__ import annotations
 
 import functools
+from typing import Literal
 
-from pydantic import Field
+from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+# Only these EXPLICIT values are treated as non-production for the auth-boundary guard. Any other
+# value — including ``prod``, ``production``, ``staging``, typos, or unknown envs — is treated as
+# PRODUCTION (strict, fail-closed default) so a misspelled ``APP_ENV`` can never silently re-enable
+# the ``AUTH_MODE=dev`` bypass in a live deployment.
+_NON_PRODUCTION_APP_ENVS = frozenset({"development", "dev", "test", "local"})
 
 
 class Settings(BaseSettings):
@@ -85,9 +92,51 @@ class Settings(BaseSettings):
     operator_id: str | None = Field(default=None, validation_alias="OPERATOR_ID")
 
     # ------------------------------------------------------------------
+    # Privy access-token auth boundary (POST /agents/deploy; I-1, auth-contract@1)
+    # ------------------------------------------------------------------
+    # Deployment environment gate. ``production`` HARD-REFUSES the ``dev`` auth bypass (below) and
+    # requires the Privy verifier material to be present (see the model validator).
+    app_env: str = Field(default="development", validation_alias="APP_ENV")
+    # ``privy`` verifies a real Privy ES256 access token on every deploy; ``dev`` is the local-dev
+    # bypass (refused in production). Fail-closed default is ``dev`` only OUTSIDE production.
+    auth_mode: Literal["privy", "dev"] = Field(default="dev", validation_alias="AUTH_MODE")
+    # This deployment's Privy app id — asserted as the ``aud`` claim of the access token.
+    privy_app_id: str | None = Field(default=None, validation_alias="PRIVY_APP_ID")
+    # The static SPKI/PEM ES256 verification key copied from the Privy dashboard (no network/JWKS).
+    privy_verification_key: str | None = Field(default=None, validation_alias="PRIVY_VERIFICATION_KEY")
+
+    # ------------------------------------------------------------------
     # Tuning
     # ------------------------------------------------------------------
     decision_timeout_s: float = 30.0
+
+    @property
+    def is_production(self) -> bool:
+        """True unless ``app_env`` is an EXPLICIT non-production value (fail-closed for the auth guard).
+
+        ``app_env`` is normalized (``strip().casefold()``) and matched against
+        :data:`_NON_PRODUCTION_APP_ENVS`; ANY other/unrecognized value — ``prod``, ``production``,
+        ``staging``, trailing whitespace, typos — is treated as production so the ``AUTH_MODE=dev``
+        bypass can never leak into a live deployment through a misspelled env.
+        """
+        return self.app_env.strip().casefold() not in _NON_PRODUCTION_APP_ENVS
+
+    @model_validator(mode="after")
+    def _enforce_production_auth_boundary(self) -> Settings:
+        """Fail-closed startup guard: ``production`` refuses the dev bypass and missing Privy creds.
+
+        ``AUTH_MODE=dev`` MUST NOT run in a production-equivalent ``APP_ENV`` (it would deploy without
+        verifying a real Privy token), and a production + ``privy`` config MUST carry both the Privy
+        app id and the verification key (else every deploy would fail closed at request time). Both
+        raise at construction time so a misconfigured production process refuses to start rather than
+        degrade. "Production-equivalent" is decided fail-closed by :attr:`is_production`.
+        """
+        if self.is_production:
+            if self.auth_mode == "dev":
+                raise ValueError("AUTH_MODE=dev is refused when APP_ENV is production (fail-closed auth boundary)")
+            if self.privy_app_id is None or self.privy_verification_key is None:
+                raise ValueError("A production APP_ENV requires PRIVY_APP_ID and PRIVY_VERIFICATION_KEY")
+        return self
 
     # ------------------------------------------------------------------
     # SX Bet venue adapter (async shell; CON-010)

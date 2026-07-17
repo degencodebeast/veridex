@@ -1328,7 +1328,7 @@ def create_app(
     if resolved_deploy_deps is None:
         anchor_fn = anchor_memo if resolved_settings.solana_keypair_path is not None else None
         resolved_deploy_deps = DeployDeps(anchor_fn=anchor_fn)
-    register_deploy_routes(app, store=resolved_store, deploy_deps=resolved_deploy_deps)
+    register_deploy_routes(app, store=resolved_store, settings=resolved_settings, deploy_deps=resolved_deploy_deps)
 
     # --- GET /maker/arena-result (read-only maker-UI bridge; SEC-005 isolated lane) ----
     # Separate namespace over the SEALED maker arena artifact — never re-runs the arena, never

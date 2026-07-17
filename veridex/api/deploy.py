@@ -24,9 +24,10 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException
 from pydantic import BaseModel
 
+from veridex.api.auth_privy import PrivyPrincipal, make_require_principal
 from veridex.api.demo_fixtures import build_demo_ticks
 from veridex.chain.anchor import anchor_memo
 from veridex.deploy.instance import AgentInstance, DeployFailureReason, DeployStatus
@@ -39,6 +40,7 @@ from veridex_agent.config import AgentRunConfig, build_agent
 from veridex_agent.run import standalone_run
 
 if TYPE_CHECKING:
+    from veridex.config import Settings
     from veridex.store import Store
 
 logger = logging.getLogger(__name__)
@@ -62,12 +64,15 @@ class DeployResponse(BaseModel):
         config_hash: Pinned config hash.
         policy_hash: Pinned policy-envelope hash.
         run_id: The launched run id (returned WITHOUT awaiting the seal).
+        owner: The SERVER-DERIVED owner identity — the authenticated Privy principal's DID
+            (``did:privy:...``). Derived from the verified access token, NEVER the request body.
     """
 
     instance_id: str
     config_hash: str
     policy_hash: str
     run_id: str
+    owner: str
 
 
 # ---------------------------------------------------------------------------
@@ -168,16 +173,23 @@ def _build_window(config: DeployConfig) -> RunWindow:
 # ---------------------------------------------------------------------------
 
 
-def register_deploy_routes(app: FastAPI, *, store: Store, deploy_deps: DeployDeps | None = None) -> None:
+def register_deploy_routes(
+    app: FastAPI, *, store: Store, settings: Settings, deploy_deps: DeployDeps | None = None
+) -> None:
     """Mount ``POST /agents/deploy`` and its background-task lifecycle on ``app``.
 
     Args:
         app: The FastAPI application to mount on.
         store: The shared async store — the deployed run is persisted here (under the pre-known
             ``run_id``) at seal time so ``/runs/{id}/verify`` can load it (one flow to proof).
+        settings: Resolved settings carrying the Privy auth boundary (``auth_mode`` + verifier
+            material) used to build the ``require_principal`` dependency (I-1).
         deploy_deps: Injected offline dependencies (tests); ``None`` → the real live path.
     """
     deps = deploy_deps if deploy_deps is not None else DeployDeps()
+    # I-1 auth boundary: a valid Privy access token is required (in ``privy`` mode) BEFORE the deploy
+    # body handler runs, so a 401 precedes every persistence/wallet/runtime side effect.
+    require_principal = make_require_principal(settings)
 
     # app.state holds ONLY the live background run-task handles (cancellable on shutdown) — the
     # cancellation bookkeeping. The durable AgentInstance record is the STORE's job (source of
@@ -198,9 +210,7 @@ def register_deploy_routes(app: FastAPI, *, store: Store, deploy_deps: DeployDep
             return list(deps.marketstates)
         return build_demo_ticks()
 
-    async def _launch(
-        config: DeployConfig, run_id: str, instance_id: str, marketstates: list[MarketState]
-    ) -> None:
+    async def _launch(config: DeployConfig, run_id: str, instance_id: str, marketstates: list[MarketState]) -> None:
         """Run the deployed agent through the SINGLE seam, durably tracking the instance status.
 
         Advances the STORED instance ``running`` → ``sealed`` (clean seal, run persisted under
@@ -267,18 +277,28 @@ def register_deploy_routes(app: FastAPI, *, store: Store, deploy_deps: DeployDep
         await store.update_agent_instance_status(instance_id, DeployStatus.SEALED, updated_at=_now_iso())
 
     @app.post("/agents/deploy", response_model=DeployResponse)
-    async def deploy_agent(config: DeployConfig) -> DeployResponse:
+    async def deploy_agent(
+        config: DeployConfig,
+        principal: PrivyPrincipal = Depends(require_principal),  # noqa: B008
+    ) -> DeployResponse:
         """Preflight, pin the instance, and launch the run asynchronously (fail-closed).
+
+        The ``require_principal`` dependency resolves BEFORE this body — an unauthenticated or
+        bad-token request 401s before any preflight, persistence, or run launch. ``principal.did``
+        is the SERVER-DERIVED owner; a client-supplied owner (which ``DeployConfig`` drops anyway)
+        is never trusted.
 
         Args:
             config: The typed, submitted Studio config (bad types are rejected 422 by pydantic).
+            principal: The authenticated Privy principal (injected by ``require_principal``).
 
         Returns:
-            A :class:`DeployResponse` with the pinned instance + the launched ``run_id`` — returned
-            WITHOUT awaiting the window seal.
+            A :class:`DeployResponse` with the pinned instance, the launched ``run_id``, and the
+            server-derived ``owner`` — returned WITHOUT awaiting the window seal.
 
         Raises:
-            HTTPException: 422 naming every failing preflight check; NO run starts on failure.
+            HTTPException: 401 before any side effect if auth fails; 422 naming every failing
+                preflight check; NO run starts on failure.
         """
         envelope = config.to_policy_envelope()
         # MODE-AWARE source resolution: a replay deploy resolves its SOURCE (bundled/injected pack)
@@ -370,6 +390,7 @@ def register_deploy_routes(app: FastAPI, *, store: Store, deploy_deps: DeployDep
             config_hash=instance.config_hash,
             policy_hash=instance.policy_hash,
             run_id=run_id,
+            owner=principal.did,
         )
 
 
