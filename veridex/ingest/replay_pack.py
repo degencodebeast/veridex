@@ -125,10 +125,15 @@ def pack_from_session(
     input is gone, so an arbitrary caller can no longer smuggle genuine field VALUES into a pack. A
     GENUINE capability is constructible ONLY by the CLOSED producer paths (live capture + the
     verified-backfill banker); the ordinary/public builder can only ever receive a non-genuine
-    (synthetic/test) capability, so it can NEVER mint a genuine pack from arbitrary records. When a
-    capability is supplied, its five authority fields are merged into the ``capture`` block AND folded
-    into a ``pack_version=2`` ``content_hash`` (tamper-evident). When ``authority`` is ``None`` the
-    pack stays legacy ``pack_version=1`` with a DATA-ONLY hash — such a pack can never read genuine.
+    (synthetic/test) capability, so it can NEVER mint a genuine pack from arbitrary records. THE SEAL
+    IS RE-CHECKED HERE — the actual write/mint point — via
+    :func:`~veridex.ingest.capture_chain._assert_authority_mintable`, not just at ``PackAuthority``
+    construction: a duck-typed object exposing ``as_capture_fields()``, an ``object.__new__`` bypass of
+    ``__post_init__``, or a subclass overriding a construction-time check all fail closed HERE (exact
+    type membership + proven seal possession — see that function's docstring). When a capability is
+    supplied, its five authority fields are merged into the ``capture`` block AND folded into a
+    ``pack_version=2`` ``content_hash`` (tamper-evident). When ``authority`` is ``None`` the pack stays
+    legacy ``pack_version=1`` with a DATA-ONLY hash — such a pack can never read genuine.
     """
     meta, records, gaps = read_session(session_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -170,6 +175,14 @@ def pack_from_session(
 
     pack_version = 1
     if authority is not None:
+        # D-residual (write-boundary enforcement, Codex re-review): the seal must be re-checked HERE —
+        # the actual mint point — not only at PackAuthority construction, which a duck-typed object,
+        # an `object.__new__` bypass, or a subclass overriding `_claims_genuine` can all dodge. Lazy
+        # import (mirrors this module's other deferred seam imports) avoids a capture_chain <->
+        # replay_pack import cycle (capture_chain imports `pack_from_session` at module load time).
+        from veridex.ingest.capture_chain import _assert_authority_mintable  # noqa: PLC0415
+
+        _assert_authority_mintable(authority)
         # Merge ONLY the recognized authority fields (the closed set that the v2 hash binds) from the
         # sealed capability, so a caller cannot smuggle extra unhashed keys into the authority region.
         fields = authority.as_capture_fields()

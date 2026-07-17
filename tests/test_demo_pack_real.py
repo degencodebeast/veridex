@@ -279,6 +279,86 @@ def test_control4_public_builder_cannot_mint_genuine_from_arbitrary_records(tmp_
     assert is_genuine_pack(synth_pack) is False
 
 
+#: The five genuine field VALUES an attacker wants folded into a pack's capture block — shared by the
+#: three write-boundary bypass controls below (Codex re-review of the D-residual fix at 1adac64).
+_FORGED_GENUINE_FIELDS: dict = {
+    "provenance": GENUINE_TXLINE_PROVENANCE,
+    "test_capture": False,
+    "synthetic": False,
+    "evidence_rung": "backfilled-price-history",
+    "capture_method": "odds-updates-backfill",
+}
+
+
+# --- Control 4b (D-residual write boundary): a duck-typed object is refused ----------------------
+def test_control4b_duck_typed_authority_object_is_refused(tmp_path: Path):
+    """Codex re-review of the D-residual fix at commit 1adac64: the seal guarded ``PackAuthority``
+    CONSTRUCTION but not the actual mint point. An arbitrary object exposing only
+    ``as_capture_fields()`` — never a ``PackAuthority`` at all, so ``__post_init__``/the seal check
+    never run — fed through ``pack_from_session`` must be refused OUTRIGHT (exact-type check).
+    (RED before this fix: minted ``hash_verifies=True, is_genuine=True``.)
+    """
+
+    class DuckAuth:
+        def as_capture_fields(self) -> dict:
+            return dict(_FORGED_GENUINE_FIELDS)
+
+    session = tmp_path / "session_duck"
+    _write_session(session, [_odds_record(1, 100), _odds_record(1, 200)])
+    pack_dir = tmp_path / "pack_duck"
+    with pytest.raises(TypeError):
+        pack_from_session(session, pack_dir, authority=DuckAuth())  # type: ignore[arg-type]
+    # No pack.json was ever written -> is_genuine_pack fails safe (FileNotFoundError -> False).
+    assert is_genuine_pack(pack_dir) is False
+
+
+# --- Control 4c (D-residual write boundary): an object.__new__ bypass is refused -----------------
+def test_control4c_object_new_bypass_is_refused(tmp_path: Path):
+    """``object.__new__(PackAuthority)`` constructs a REAL ``PackAuthority`` WITHOUT running
+    ``__init__``/``__post_init__`` — the seal is never checked, and genuine field values can be forced
+    on via ``object.__setattr__`` (frozen dataclasses only block the NORMAL ``__setattr__`` path). This
+    passes the exact-type check but must fail the second guard: PROVEN seal possession (``_sealed``,
+    set ONLY inside ``__post_init__``) is absent here.
+    (RED before this fix: minted ``hash_verifies=True, is_genuine=True``.)
+    """
+    forged = object.__new__(PackAuthority)
+    for field, value in _FORGED_GENUINE_FIELDS.items():
+        object.__setattr__(forged, field, value)
+
+    session = tmp_path / "session_forged"
+    _write_session(session, [_odds_record(1, 100), _odds_record(1, 200)])
+    pack_dir = tmp_path / "pack_forged"
+    with pytest.raises(PermissionError):
+        pack_from_session(session, pack_dir, authority=forged)
+    assert is_genuine_pack(pack_dir) is False
+
+
+# --- Control 4d (D-residual write boundary): a `_claims_genuine`-override subclass is refused -----
+def test_control4d_claims_genuine_override_subclass_is_refused(tmp_path: Path):
+    """A ``PackAuthority`` SUBCLASS overriding ``_claims_genuine`` to always return ``False`` neuters a
+    construction-time-only check (``__post_init__`` calls ``self._claims_genuine()``, which dynamically
+    dispatches to the override) while still carrying genuine field values. The write-boundary guard's
+    EXACT-type membership (``type(authority) is PackAuthority``, mirroring the F-residual fix) rejects
+    ANY subclass outright — the overridden method is never even consulted for a non-exact type.
+    (RED before this fix: minted ``hash_verifies=True, is_genuine=True``.)
+    """
+
+    class Sneaky(PackAuthority):
+        def _claims_genuine(self) -> bool:
+            return False
+
+    # Construction itself succeeds (the override defeats the construction-time check) — proving the
+    # write boundary, not construction, must be the authoritative gate.
+    sneaky = Sneaky(**_FORGED_GENUINE_FIELDS)
+
+    session = tmp_path / "session_sneaky"
+    _write_session(session, [_odds_record(1, 100), _odds_record(1, 200)])
+    pack_dir = tmp_path / "pack_sneaky"
+    with pytest.raises(TypeError):
+        pack_from_session(session, pack_dir, authority=sneaky)
+    assert is_genuine_pack(pack_dir) is False
+
+
 # --- Control 5: genuine live SSE and genuine verified backfill -> DISTINCT rungs, both verify ---
 def test_control5_live_and_backfill_are_distinct_genuine_rungs(tmp_path: Path):
     # The two CLOSED genuine producers (sealed capabilities) — reached via the module-private

@@ -101,14 +101,26 @@ class PackAuthority:
     seal: InitVar[object | None] = None
 
     def __post_init__(self, seal: object | None) -> None:
-        if self._claims_genuine() and seal is not _AUTHORITY_SEAL:
+        # `_sealed` is derived DIRECTLY from `seal is _AUTHORITY_SEAL` — never from a method call — so
+        # its value cannot be influenced by a subclass override (defense in depth for the write-boundary
+        # re-check in :func:`_assert_authority_mintable`, which is the ACTUAL enforcement point).
+        sealed = seal is _AUTHORITY_SEAL
+        if self._claims_genuine() and not sealed:
             raise PermissionError(
                 "a genuine PackAuthority can be minted only by a closed producer path "
                 "(live capture or the verified-backfill banker), never via the public API"
             )
+        object.__setattr__(self, "_sealed", sealed)
 
     def _claims_genuine(self) -> bool:
-        """True if ANY field carries a genuine marker — the whole capability is then seal-gated."""
+        """True if ANY field carries a genuine marker — the whole capability is then seal-gated.
+
+        NOTE: this is a construction-time, DEFENSE-IN-DEPTH check only. The AUTHORITATIVE enforcement
+        is :func:`_assert_authority_mintable`, called from the actual write boundary
+        (:func:`~veridex.ingest.replay_pack.pack_from_session`) — construction-time checks alone are
+        bypassable (``object.__new__`` skips ``__post_init__`` entirely; a hostile subclass could
+        override this very method to always return ``False``).
+        """
         return (
             self.provenance == GENUINE_TXLINE_PROVENANCE
             or str(self.evidence_rung) in _GENUINE_EVIDENCE_RUNGS
@@ -124,6 +136,50 @@ class PackAuthority:
             "evidence_rung": self.evidence_rung,
             "capture_method": self.capture_method,
         }
+
+
+def _assert_authority_mintable(authority: PackAuthority) -> None:
+    """WRITE-BOUNDARY guard (D-residual, Codex re-review) — the ACTUAL enforcement point for the
+    genuine-provenance seal, called from :func:`~veridex.ingest.replay_pack.pack_from_session` (the
+    real mint point) rather than trusting :class:`PackAuthority` construction alone. Three proven
+    bypasses of a construction-only gate, closed together here:
+
+    1. **Duck-typed object**: an arbitrary object exposing an ``as_capture_fields()`` method (never a
+       :class:`PackAuthority` at all) skips ``__post_init__`` entirely.
+    2. **``object.__new__(PackAuthority)``**: constructs a real ``PackAuthority`` instance WITHOUT
+       calling ``__init__``/``__post_init__``, so the seal check never runs; genuine field values can
+       then be forced onto it via ``object.__setattr__`` (frozen dataclasses only block the *normal*
+       ``__setattr__`` path).
+    3. **A ``PackAuthority`` subclass overriding ``_claims_genuine``** to always return ``False``,
+       neutering the construction-time check while still carrying genuine field values.
+
+    Two checks together close all three (mirrors the F-residual fix: exact-type membership, not
+    ``isinstance``):
+
+    * EXACT type membership — ``type(authority) is PackAuthority`` — rejects the duck-typed object
+      (1) AND any subclass (3), since ``type(subclass_instance) is PackAuthority`` is always ``False``.
+    * Once exact-type is confirmed (so ``_claims_genuine`` CANNOT be an override — the type is exactly
+      ``PackAuthority``, not a subclass), a genuine claim requires PROVEN seal possession: ``_sealed``,
+      a flag set ONLY inside ``__post_init__`` when the real :data:`_AUTHORITY_SEAL` was presented.
+      This catches (2): ``object.__new__`` never runs ``__post_init__``, so ``_sealed`` is absent
+      (``getattr`` default ``False``).
+
+    Raises:
+        TypeError: If ``authority`` is not an exact :class:`PackAuthority` instance.
+        PermissionError: If ``authority`` claims a genuine marker but was never sealed by a closed
+            producer path.
+    """
+    if type(authority) is not PackAuthority:
+        raise TypeError(
+            "pack_from_session authority must be an exact veridex.ingest.capture_chain.PackAuthority "
+            f"instance, got {type(authority).__name__!r} — duck-typed and subclassed authority "
+            "objects are refused"
+        )
+    if authority._claims_genuine() and not getattr(authority, "_sealed", False):
+        raise PermissionError(
+            "authority claims a genuine marker but was not minted through a closed, sealed producer "
+            "path (live capture or the verified-backfill banker) — refusing to emit a genuine-claiming pack"
+        )
 
 
 def _genuine_live_sse_authority() -> PackAuthority:
