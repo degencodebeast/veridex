@@ -1,14 +1,13 @@
-"""Runtime-events ops store + serving endpoint — OPS channel only, never sealed (SEC-003)."""
+"""Runtime-events ring-buffer ops store — OPS channel only, never sealed (SEC-003).
+
+The DURABLE OPS spool + its OWNER-SCOPED serving route (I-4) live in ``test_runtime_events_durable``;
+this module covers the lightweight in-memory :class:`RuntimeEventStore` (the I-4 cut-fallback).
+"""
 
 from __future__ import annotations
 
-from fastapi.testclient import TestClient
-
-from veridex.api.router import create_app
-from veridex.api.schemas import RuntimeEventsResponse
 from veridex.runtime.runtime_events import RuntimeEventType, runtime_event
 from veridex.runtime.runtime_store import RuntimeEventStore
-from veridex.store import InMemoryStore
 
 
 def test_store_records_per_agent_and_filters_since_and_limit() -> None:
@@ -45,23 +44,3 @@ def test_ops_store_is_separate_from_evidence_seal() -> None:
     # the buffered events carry none of the fields the evidence path requires
     dumped = store.list_for_agent("a")[0].model_dump()
     assert "sequence_no" not in dumped and "evidence" not in dumped and "payload_hash" not in dumped
-
-
-def test_runtime_events_endpoint_serves_recorded_ops() -> None:
-    rt_store = RuntimeEventStore()
-    app = create_app(store=InMemoryStore(), runtime_event_store=rt_store)
-    rt_store.record(runtime_event(RuntimeEventType.RUN_STARTED, agent_id="agent-x", run_id="r"))
-    client = TestClient(app)
-
-    resp = client.get("/agents/agent-x/runtime-events")
-    assert resp.status_code == 200
-    body = resp.json()
-    RuntimeEventsResponse.model_validate(body)
-    assert set(body) == {"events"}  # single-field object wrapper (mirrors LeaderboardResponse{rows})
-    assert len(body["events"]) == 1
-    assert body["events"][0]["type"] == "run_started"
-    assert body["events"][0]["channel"] == "OPS"
-
-    # unknown agent → empty list, NOT 404 (graceful degradation, REQ-031)
-    empty = client.get("/agents/none/runtime-events")
-    assert empty.status_code == 200 and empty.json()["events"] == []

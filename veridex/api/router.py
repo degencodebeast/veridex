@@ -45,6 +45,7 @@ from typing import Any
 from fastapi import Depends, FastAPI, Header, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 
+from veridex.api.auth_privy import PrivyPrincipal, make_require_principal
 from veridex.api.demo_fixtures import (
     build_agents_from_roster,
     build_demo_ticks,
@@ -111,7 +112,8 @@ from veridex.runtime.competition import (
     run_demo_competition,
 )
 from veridex.runtime.orchestrator import deterministic_agent
-from veridex.runtime.runtime_store import RuntimeEventStore
+from veridex.runtime.runtime_events import RuntimeEvent, RuntimeEventType
+from veridex.runtime.runtime_store import DurableRuntimeEventStore
 from veridex.runtime.window import RunWindow
 from veridex.scoring import score_run
 from veridex.store import InMemoryStore, Store
@@ -214,7 +216,7 @@ def _build_execution_attachment(records: list[ExecutionRecord]) -> dict[str, Any
 def create_app(
     store: Store | None = None,
     settings: Settings | None = None,
-    runtime_event_store: RuntimeEventStore | None = None,
+    runtime_events: DurableRuntimeEventStore | None = None,
     deploy_deps: DeployDeps | None = None,
 ) -> FastAPI:
     """Create the Veridex demo FastAPI application.
@@ -227,9 +229,10 @@ def create_app(
             module-level ``_default_store`` (an :class:`~veridex.store.InMemoryStore`).
         settings: Optional :class:`~veridex.config.Settings` override carrying the operator
             control-plane credentials.  Defaults to :func:`~veridex.config.get_settings`.
-        runtime_event_store: Optional :class:`~veridex.runtime.runtime_store.RuntimeEventStore`
-            override — the OPS-channel buffer the Agent Ops drawer reads (SEC-003). Defaults to a
-            fresh per-app store. Distinct from the evidence/competition log.
+        runtime_events: Optional :class:`~veridex.runtime.runtime_store.DurableRuntimeEventStore`
+            override — the crash-safe OPS-channel spool (I-4) whose sink the deploy/runtime path emits
+            through and whose durable rows the owner-scoped drawer route reads (SEC-003). Defaults to a
+            fresh per-app store over ``resolved_store`` + ``WAL_DIR``. Distinct from the evidence log.
 
     Returns:
         A configured :class:`fastapi.FastAPI` application: the Phase-1 demo trio, the six
@@ -239,14 +242,21 @@ def create_app(
     """
     resolved_store: Store = store if store is not None else _default_store
     resolved_settings: Settings = settings if settings is not None else get_settings()
-    resolved_runtime_store: RuntimeEventStore = (
-        runtime_event_store if runtime_event_store is not None else RuntimeEventStore()
+    # ONE durable OPS spool shared across the app: its sink is threaded into the deploy/runtime path
+    # (below) so events are actually PRODUCED, and its durable rows back the owner-scoped read route —
+    # NEVER a fresh per-app store that nothing writes (the "empty drawer" bug this task prevents).
+    resolved_runtime_events: DurableRuntimeEventStore = (
+        runtime_events if runtime_events is not None else DurableRuntimeEventStore(store=resolved_store)
     )
+    # I-1 Privy auth boundary reused for the owner-scoped drawer route (instance owner == principal.did).
+    require_principal = make_require_principal(resolved_settings)
 
     @contextlib.asynccontextmanager
     async def _lifespan(app_: FastAPI) -> AsyncIterator[None]:
-        """App lifespan — on shutdown, cancel any tracked background deploy-run tasks (T21)."""
+        """App lifespan — start the durable OPS flusher; on shutdown drain it + cancel deploy tasks."""
+        await resolved_runtime_events.start()
         yield
+        await resolved_runtime_events.aclose()
         await cancel_deploy_tasks(app_)
 
     app = FastAPI(
@@ -1119,29 +1129,63 @@ def create_app(
         except KeyError:
             raise HTTPException(status_code=404, detail=f"execution {execution_id!r} not found") from None
 
-    # --- GET /agents/{agent_id}/runtime-events (OPS channel; read-only) ----
+    # --- GET /agents/instances/{instance_id}/runtime-events (OPS channel; OWNER-SCOPED) ----
 
-    @app.get("/agents/{agent_id}/runtime-events", response_model=RuntimeEventsResponse)
-    async def get_runtime_events(  # noqa: B008
-        agent_id: str,
+    @app.get("/agents/instances/{instance_id}/runtime-events", response_model=RuntimeEventsResponse)
+    async def get_instance_runtime_events(  # noqa: B008
+        instance_id: str,
         since: int = Query(default=0),  # noqa: B008
         limit: int | None = Query(default=None),  # noqa: B008
+        principal: PrivyPrincipal = Depends(require_principal),  # noqa: B008
+        dep_store: Store = Depends(_get_store),  # noqa: B008
     ) -> RuntimeEventsResponse:
-        """Serve an agent's OPS-channel RuntimeEvents (Agent Ops drawer feed — SEC-003 / REQ-030).
+        """Serve the caller's OWN durable OPS-channel RuntimeEvents for a deployed instance (I-4).
 
-        Read-only, runtime-neutral (SEC-010). Unknown agents return an empty list, never 404, so a
-        minimal/just-started runtime renders a clean empty drawer (REQ-031).
+        REPLACES the former PUBLIC ``/agents/{id}/runtime-events`` — a trust boundary: ownership is
+        resolved SERVER-SIDE from the persisted instance (never the request), and the durable feed is
+        read through the store's ``BIGSERIAL`` cursor. Fail-closed exactly like the sibling
+        ``GET /agents/instances/{id}`` (I-2): 404 for absent OR unowned/legacy (no existence leak),
+        403 for owned-by-another. Channel-pure (SEC-003): the rows carry no evidence fields.
 
         Args:
-            agent_id: The agent whose OPS-channel telemetry to read.
-            since: ``ts`` lower bound (ms); ``0`` returns everything retained.
-            limit: When set, return only the most-recent ``limit`` matching events.
+            instance_id: The deployed instance whose OPS telemetry to read.
+            since: The last consumed durable ``id`` (exclusive cursor); ``0`` returns from the start.
+            limit: When set, the FIRST ``limit`` events after ``since`` (forward paging).
+            principal: The authenticated Privy principal (injected by ``require_principal``).
+            dep_store: Injected store dependency.
 
         Returns:
-            A :class:`~veridex.api.schemas.RuntimeEventsResponse` wrapping the ``events`` list.
+            A :class:`~veridex.api.schemas.RuntimeEventsResponse` wrapping the ``events`` list (each a
+            RuntimeEvent dict plus its durable ``id`` cursor).
+
+        Raises:
+            HTTPException: 401 (unauthenticated), 404 (absent or unowned — no leak), 403 (wrong owner).
         """
-        events = resolved_runtime_store.list_for_agent(agent_id, since=since, limit=limit)
-        return RuntimeEventsResponse(events=[e.model_dump(mode="json") for e in events])
+        try:
+            instance = await dep_store.get_agent_instance(instance_id)
+        except KeyError:
+            raise HTTPException(status_code=404, detail="agent instance not found") from None
+        # Fail-closed: an unowned / legacy row is never inherited — hide it as if it does not exist.
+        if instance.operator_id is None:
+            raise HTTPException(status_code=404, detail="agent instance not found")
+        if instance.operator_id != principal.did:
+            raise HTTPException(status_code=403, detail="principal does not own this agent instance")
+        rows = await dep_store.list_runtime_events(instance.agent_id, since=since, limit=limit)
+        events: list[dict[str, Any]] = []
+        for row in rows:
+            # Reconstruct through RuntimeEvent so the served shape is channel-pure by construction
+            # (RuntimeEvent has NO sequence_no / payload_hash), then attach the durable read cursor.
+            payload = RuntimeEvent(
+                type=RuntimeEventType(row.event_type),
+                agent_id=row.agent_id,
+                run_id=row.run_id,
+                session_id=row.session_id,
+                ts=row.ts,
+                payload=row.payload,
+            ).model_dump(mode="json")
+            payload["id"] = row.id
+            events.append(payload)
+        return RuntimeEventsResponse(events=events)
 
     # --- POST /competitions/{competition_id}/kill-switch (auth) -----------
 
@@ -1356,7 +1400,13 @@ def create_app(
     if resolved_deploy_deps is None:
         anchor_fn = anchor_memo if resolved_settings.solana_keypair_path is not None else None
         resolved_deploy_deps = DeployDeps(anchor_fn=anchor_fn)
-    register_deploy_routes(app, store=resolved_store, settings=resolved_settings, deploy_deps=resolved_deploy_deps)
+    register_deploy_routes(
+        app,
+        store=resolved_store,
+        settings=resolved_settings,
+        deploy_deps=resolved_deploy_deps,
+        runtime_event_sink=resolved_runtime_events.sink(),
+    )
 
     # --- GET /maker/arena-result (read-only maker-UI bridge; SEC-005 isolated lane) ----
     # Separate namespace over the SEALED maker arena artifact — never re-runs the arena, never

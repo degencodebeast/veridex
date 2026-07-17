@@ -36,6 +36,7 @@ from veridex.deploy.preflight import DeployConfig, PreflightCheck, run_deploy_pr
 from veridex.ingest.feed_health import FeedHealthReport
 from veridex.ingest.marketstate import MarketState
 from veridex.runtime.orchestrator import Agent
+from veridex.runtime.runtime_events import RuntimeEventSink
 from veridex.runtime.window import RunWindow
 from veridex_agent.config import AgentRunConfig, build_agent
 from veridex_agent.run import standalone_run
@@ -175,7 +176,12 @@ def _build_window(config: DeployConfig) -> RunWindow:
 
 
 def register_deploy_routes(
-    app: FastAPI, *, store: Store, settings: Settings, deploy_deps: DeployDeps | None = None
+    app: FastAPI,
+    *,
+    store: Store,
+    settings: Settings,
+    deploy_deps: DeployDeps | None = None,
+    runtime_event_sink: RuntimeEventSink | None = None,
 ) -> None:
     """Mount ``POST /agents/deploy`` and its background-task lifecycle on ``app``.
 
@@ -186,6 +192,9 @@ def register_deploy_routes(
         settings: Resolved settings carrying the Privy auth boundary (``auth_mode`` + verifier
             material) used to build the ``require_principal`` dependency (I-1).
         deploy_deps: Injected offline dependencies (tests); ``None`` → the real live path.
+        runtime_event_sink: The ONE shared OPS-channel sink (I-4) the launched ``standalone_run``
+            emits lifecycle/decision telemetry through — durably spooled by the app's
+            :class:`~veridex.runtime.runtime_store.DurableRuntimeEventStore`. ``None`` emits nothing.
     """
     deps = deploy_deps if deploy_deps is not None else DeployDeps()
     # I-1 auth boundary: a valid Privy access token is required (in ``privy`` mode) BEFORE the deploy
@@ -245,6 +254,7 @@ def register_deploy_routes(
                     config_hash=config_hash,
                     run_id=run_id,
                     store=store,
+                    runtime_event_sink=runtime_event_sink,
                     anchor_fn=deps.anchor_fn,
                 )
             else:
@@ -258,6 +268,7 @@ def register_deploy_routes(
                     config_hash=config_hash,
                     run_id=run_id,
                     store=store,
+                    runtime_event_sink=runtime_event_sink,
                     anchor_fn=deps.anchor_fn,
                 )
         except asyncio.CancelledError:

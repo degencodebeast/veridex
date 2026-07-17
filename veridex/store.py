@@ -164,6 +164,48 @@ class PreSubmitLedgerRow:
 
 
 # ---------------------------------------------------------------------------
+# Runtime-event row (I-4 / AC-13/14/15 — durable OPS-channel telemetry, INSERT-only + dedup)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class RuntimeEventRow:
+    """One durable OPS-channel :class:`~veridex.runtime.runtime_events.RuntimeEvent` (I-4).
+
+    The persistent backing for the Agent-Ops drawer feed. INSERT-only and de-duplicated at the DB
+    by the client-generated ``event_uuid`` (``UNIQUE(event_uuid)`` + ``ON CONFLICT DO NOTHING``), so
+    the durable spool's at-least-once replay lands each event exactly once. The read cursor clients
+    page on is the DB-assigned ``BIGSERIAL`` ``id`` — a monotonic commit-order sequence, NOT any
+    evidence ``sequence_no``.
+
+    SEC-003 by construction: the row carries NO ``sequence_no`` / ``payload_hash`` / ``evidence``
+    column, so an OPS event can never masquerade as a sealed RunEvent / CompetitionEvent — exactly
+    the three fields the evidence path requires are structurally absent.
+
+    Attributes:
+        id: DB-assigned monotonic commit-order cursor (``BIGSERIAL``); ``0`` before persistence.
+        event_uuid: Client-generated idempotency key (the dedup identity; never a venue/evidence key).
+        agent_id: The agent this telemetry is about (the owner-scoped read filters on it).
+        run_id: Correlation id for the run, when known.
+        session_id: Runtime session id, when known.
+        event_type: The :class:`~veridex.runtime.runtime_events.RuntimeEventType` value.
+        ts: Wall-clock emit time (ms) — NON-deterministic, precisely why it is never sealed.
+        channel: Always ``"OPS"``.
+        payload: Free-form, secret-free telemetry detail.
+    """
+
+    id: int
+    event_uuid: str
+    agent_id: str
+    run_id: str | None
+    session_id: str | None
+    event_type: str
+    ts: int
+    channel: str
+    payload: dict[str, Any]
+
+
+# ---------------------------------------------------------------------------
 # Protocol
 # ---------------------------------------------------------------------------
 
@@ -411,6 +453,39 @@ class Store(Protocol):
         """
         ...
 
+    async def append_runtime_events(self, rows: list[RuntimeEventRow]) -> int:
+        """INSERT durable OPS-channel runtime events, de-duplicated by ``event_uuid`` (I-4).
+
+        The durable spool delivers at-least-once and relies on the STORE to dedup: each row is
+        inserted ``ON CONFLICT (event_uuid) DO NOTHING`` (never client-side alone), so a WAL replay
+        of an already-committed batch is a no-op. INSERT-only — rows are never updated or deleted.
+
+        Args:
+            rows: The events to append. Their ``id`` is ignored (DB-assigned ``BIGSERIAL``).
+
+        Returns:
+            The number of rows NEWLY inserted (duplicates skipped).
+        """
+        ...
+
+    async def list_runtime_events(
+        self, agent_id: str, *, since: int = 0, limit: int | None = None
+    ) -> list[RuntimeEventRow]:
+        """Return one agent's durable OPS events with ``id > since``, ascending commit order (I-4).
+
+        Cursor paging: ``since`` is the last ``id`` the client consumed (``0`` returns everything);
+        the durable ``BIGSERIAL`` ``id`` guarantees no loss / no duplication across a reconnect.
+
+        Args:
+            agent_id: The agent whose OPS telemetry to read.
+            since: The last consumed ``id`` (exclusive lower bound); ``0`` returns from the start.
+            limit: When set, cap to the FIRST ``limit`` rows after ``since`` (forward paging).
+
+        Returns:
+            Matching :class:`RuntimeEventRow` objects, sorted by ``id`` ascending.
+        """
+        ...
+
     async def persist_agent_instance(self, instance: AgentInstance) -> None:
         """Persist a deployed :class:`~veridex.deploy.instance.AgentInstance` (source of truth).
 
@@ -588,6 +663,11 @@ class InMemoryStore:
         # Append-only pre-submit ledger + its monotonic unique-seq counter (IDM-005).
         self._presubmit_rows: list[PreSubmitLedgerRow] = []
         self._presubmit_seq: int = 0
+        # Durable OPS-channel runtime events (I-4) + monotonic id + the event_uuid dedup set that
+        # mirrors the Postgres UNIQUE(event_uuid) + ON CONFLICT DO NOTHING at-least-once contract.
+        self._runtime_events: list[RuntimeEventRow] = []
+        self._runtime_event_id: int = 0
+        self._runtime_event_uuids: set[str] = set()
 
     # --- run methods (Phase-1, unchanged) ---
 
@@ -921,6 +1001,61 @@ class InMemoryStore:
         """
         return [row for row in sorted(self._presubmit_rows, key=lambda r: r.seq) if row.session_id == session_id]
 
+    # --- runtime-event methods (I-4 — durable OPS channel, INSERT-only + event_uuid dedup) ---
+
+    async def append_runtime_events(self, rows: list[RuntimeEventRow]) -> int:
+        """Append durable OPS events, skipping any whose ``event_uuid`` was already stored.
+
+        Mirrors the Postgres ``ON CONFLICT (event_uuid) DO NOTHING`` dedup: a WAL replay of an
+        already-committed batch inserts nothing. A monotonic ``id`` is assigned to each NEW row.
+
+        Args:
+            rows: The events to append (their input ``id`` is ignored; a fresh one is assigned).
+
+        Returns:
+            The number of rows newly inserted.
+        """
+        inserted = 0
+        for row in rows:
+            if row.event_uuid in self._runtime_event_uuids:
+                continue  # ON CONFLICT DO NOTHING — at-least-once replay is idempotent
+            self._runtime_event_uuids.add(row.event_uuid)
+            self._runtime_event_id += 1
+            self._runtime_events.append(
+                RuntimeEventRow(
+                    id=self._runtime_event_id,
+                    event_uuid=row.event_uuid,
+                    agent_id=row.agent_id,
+                    run_id=row.run_id,
+                    session_id=row.session_id,
+                    event_type=row.event_type,
+                    ts=row.ts,
+                    channel=row.channel,
+                    payload=copy.deepcopy(row.payload),
+                )
+            )
+            inserted += 1
+        return inserted
+
+    async def list_runtime_events(
+        self, agent_id: str, *, since: int = 0, limit: int | None = None
+    ) -> list[RuntimeEventRow]:
+        """Return this agent's durable OPS events with ``id > since``, ascending, capped at ``limit``.
+
+        Args:
+            agent_id: The agent whose OPS telemetry to read.
+            since: The last consumed ``id`` (exclusive); ``0`` returns from the start.
+            limit: When set, the FIRST ``limit`` rows after ``since`` (forward cursor paging).
+
+        Returns:
+            Matching :class:`RuntimeEventRow` objects, sorted by ``id`` ascending.
+        """
+        rows = [row for row in self._runtime_events if row.agent_id == agent_id and row.id > since]
+        rows.sort(key=lambda r: r.id)
+        if limit is not None:
+            rows = rows[:limit]
+        return rows
+
     # --- agent-instance methods (Phase-2D deploy — REQ-2D-701A) ---
 
     async def persist_agent_instance(self, instance: AgentInstance) -> None:
@@ -1250,6 +1385,31 @@ class PostgresStore:
             )
             await cur.execute(
                 "CREATE INDEX IF NOT EXISTS idx_presubmit_ledger_session ON presubmit_ledger(session_id)"
+            )
+
+            # --- durable runtime-event spool (I-4 / AC-13/14/15 — OPS channel, INSERT-only + dedup) ---
+            # BIGSERIAL id is the client-facing read cursor (monotonic commit order); the durable WAL
+            # spool delivers at-least-once and dedups HERE via UNIQUE(event_uuid) + ON CONFLICT DO
+            # NOTHING (never client-side alone). SEC-003 by construction: NO sequence_no / payload_hash
+            # column, so an OPS event can never masquerade as a sealed RunEvent / CompetitionEvent.
+            await cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS runtime_events (
+                    id BIGSERIAL PRIMARY KEY,
+                    event_uuid TEXT NOT NULL,
+                    agent_id TEXT NOT NULL,
+                    run_id TEXT,
+                    session_id TEXT,
+                    event_type TEXT NOT NULL,
+                    ts BIGINT NOT NULL,
+                    channel TEXT NOT NULL DEFAULT 'OPS',
+                    payload_json TEXT NOT NULL,
+                    CONSTRAINT uq_runtime_events_uuid UNIQUE (event_uuid)
+                )
+                """
+            )
+            await cur.execute(
+                "CREATE INDEX IF NOT EXISTS idx_runtime_events_agent_id ON runtime_events(agent_id, id)"
             )
 
             # --- deployment-attempt ledger (I-3 — durable idempotency claim, INSERT-only) ---
@@ -1837,6 +1997,92 @@ class PostgresStore:
                 integrity_commitment_hash=r[2],
                 venue_order_key=r[3],
                 captured_id=r[4],
+            )
+            for r in rows
+        ]
+
+    # --- runtime-event methods (I-4 — durable OPS channel, INSERT-only + event_uuid dedup) ---
+
+    async def append_runtime_events(self, rows: list[RuntimeEventRow]) -> int:
+        """INSERT durable OPS events in ONE transaction, de-duplicated by ``event_uuid``.
+
+        ``INSERT … ON CONFLICT (event_uuid) DO NOTHING`` makes the durable spool's at-least-once
+        replay idempotent at the DB — re-flushing an already-committed batch inserts nothing. The
+        DB assigns the ``BIGSERIAL`` id (the read cursor). All SQL is parameterized; psycopg stays
+        lazy.
+
+        Args:
+            rows: The events to append (their input ``id`` is ignored).
+
+        Returns:
+            The number of rows newly inserted (conflicts skipped).
+        """
+        if not rows:
+            return 0
+        conn = await self._connect()
+        try:
+            inserted = 0
+            async with conn.transaction(), conn.cursor() as cur:
+                for row in rows:
+                    await cur.execute(
+                        "INSERT INTO runtime_events "
+                        "(event_uuid, agent_id, run_id, session_id, event_type, ts, channel, payload_json) "
+                        "VALUES (%s, %s, %s, %s, %s, %s, %s, %s) ON CONFLICT (event_uuid) DO NOTHING",
+                        (
+                            row.event_uuid,
+                            row.agent_id,
+                            row.run_id,
+                            row.session_id,
+                            row.event_type,
+                            row.ts,
+                            row.channel,
+                            json.dumps(row.payload, default=str),
+                        ),
+                    )
+                    inserted += cur.rowcount
+        finally:
+            await self._release(conn)
+        return inserted
+
+    async def list_runtime_events(
+        self, agent_id: str, *, since: int = 0, limit: int | None = None
+    ) -> list[RuntimeEventRow]:
+        """Return this agent's durable OPS events with ``id > since``, ascending, capped at ``limit``.
+
+        Args:
+            agent_id: The agent whose OPS telemetry to read.
+            since: The last consumed ``id`` (exclusive); ``0`` returns from the start.
+            limit: When set, the FIRST ``limit`` rows after ``since`` (forward cursor paging).
+
+        Returns:
+            Reconstructed :class:`RuntimeEventRow` objects, sorted by ``id`` ascending.
+        """
+        sql = (
+            "SELECT id, event_uuid, agent_id, run_id, session_id, event_type, ts, channel, payload_json "
+            "FROM runtime_events WHERE agent_id = %s AND id > %s ORDER BY id"
+        )
+        params: tuple[Any, ...] = (agent_id, since)
+        if limit is not None:
+            sql += " LIMIT %s"
+            params = (agent_id, since, limit)
+        conn = await self._connect()
+        try:
+            async with conn.cursor() as cur:
+                await cur.execute(sql, params)
+                rows = await cur.fetchall()
+        finally:
+            await self._release(conn)
+        return [
+            RuntimeEventRow(
+                id=int(r[0]),
+                event_uuid=r[1],
+                agent_id=r[2],
+                run_id=r[3],
+                session_id=r[4],
+                event_type=r[5],
+                ts=int(r[6]),
+                channel=r[7],
+                payload=json.loads(r[8]),
             )
             for r in rows
         ]
