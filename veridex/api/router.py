@@ -36,12 +36,14 @@ from __future__ import annotations
 
 import contextlib
 import json
+import os
 import time
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query
+from fastapi.middleware.cors import CORSMiddleware
 
 from veridex.api.demo_fixtures import (
     build_agents_from_roster,
@@ -129,6 +131,17 @@ def get_store() -> Store:
         The module-level :class:`~veridex.store.InMemoryStore` instance.
     """
     return _default_store
+
+
+def _cors_origins_from_env() -> list[str]:
+    """Parse the ``CORS_ORIGINS`` env (comma-separated exact origins) into an allow-list.
+
+    Fail-closed default: an unset/blank value yields an EMPTY allow-list, so no cross-origin request
+    is granted ``access-control-allow-origin`` (same-origin still works). The public entrypoint
+    (``veridex.api.server``) additionally REQUIRES this env before it will serve.
+    """
+    raw = os.environ.get("CORS_ORIGINS", "")
+    return [origin.strip() for origin in raw.split(",") if origin.strip()]
 
 
 def _derive_leaderboard(events: list[CompetitionEvent]) -> list[CompetitionLeaderboardRow]:
@@ -242,6 +255,21 @@ def create_app(
         version="0.1.0",
         lifespan=_lifespan,
     )
+
+    # I-5: browser reach from the web origin. Exact-origin allow-list from ``CORS_ORIGINS`` (never a
+    # wildcard with credentials — Starlette would silently disable ``*`` under allow_credentials).
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=_cors_origins_from_env(),
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+
+    @app.get("/healthz")
+    async def healthz() -> dict[str, str]:
+        """Generic liveness probe (I-5): always 200, never gated on auth or the DB."""
+        return {"status": "ok"}
 
     # Per-app registry: run_id → {anchor_status, source_mode}.
     # Populated by POST /demo/run; consumed by GET /leaderboard.

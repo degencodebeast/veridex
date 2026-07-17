@@ -18,7 +18,9 @@ include = ["veridex*", "veridex_agent*"]
 
 [project.optional-dependencies]
 # Postgres persistence (PostgresStore) — lazy-imported; not needed for the offline suite.
-postgres = ["psycopg[binary]>=3"]
+# psycopg-pool: the AsyncConnectionPool the public entrypoint (veridex.api.server) wires into the
+# store for durable pooled connections (I-5). Also lazily imported (inside the server's pool factory).
+postgres = ["psycopg[binary]>=3", "psycopg-pool>=3"]
 # LLM agent layer (Agno via OpenRouter, OpenAI-compatible) — lazy-imported behind a seam;
 # not needed for the offline suite. openai is the client Agno's OpenRouter model uses.
 agent = ["agno", "openai"]

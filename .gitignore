@@ -16,6 +16,9 @@
 !/apps/
 !/docs/
 !/Dockerfile.agent
+# I-5 public-deploy API scaffold: production API image + env template (no real secrets in the example)
+!/Dockerfile.api
+!/.env.example
 # D-0 static Coolify/VPS packaging scaffold
 !/compose.coolify.yml
 !/deploy/

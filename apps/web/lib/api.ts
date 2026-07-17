@@ -31,6 +31,23 @@ import type {
 
 export const API_BASE = process.env.NEXT_PUBLIC_API_BASE ?? '';
 
+// Resolve a request URL against the configured API base. The base is read at CALL TIME (Next inlines
+// NEXT_PUBLIC_* into the client bundle, and it is a live env read on the server), so SSR fetches
+// resolve to an ABSOLUTE URL. Fail-closed on the server: a missing base is a boot error because a
+// relative URL cannot be fetched in Node — never silently hit the wrong origin. In the browser a
+// same-origin relative path is correct, so an unset base falls through to the bare path.
+function resolveApiUrl(path: string): string {
+  const base = process.env.NEXT_PUBLIC_API_BASE ?? '';
+  if (base) return `${base}${path}`;
+  if (typeof window === 'undefined') {
+    throw new Error(
+      'NEXT_PUBLIC_API_BASE is required for server-side rendering: set it to the absolute API origin ' +
+        '(e.g. https://api.example.com). A relative URL cannot be fetched during SSR.',
+    );
+  }
+  return path;
+}
+
 // Centralized path map — the C1 binding points. A route change is a one-line edit.
 export const PATHS = {
   // The backend serves the ProofArtifact at GET /runs/{id} (no /proof suffix — pinned by
@@ -68,7 +85,7 @@ export class ApiError extends Error {
 async function authedFetch(path: string, body: unknown): Promise<Response> {
   const token = await getAuthToken();
   const doFetch = (bearer: string | null) =>
-    fetch(`${API_BASE}${path}`, {
+    fetch(resolveApiUrl(path), {
       method: 'POST',
       headers: {
         'content-type': 'application/json',
@@ -86,13 +103,13 @@ async function authedFetch(path: string, body: unknown): Promise<Response> {
 }
 
 async function getJson<T>(path: string): Promise<T> {
-  const res = await fetch(`${API_BASE}${path}`, { headers: { accept: 'application/json' } });
+  const res = await fetch(resolveApiUrl(path), { headers: { accept: 'application/json' } });
   if (!res.ok) throw new ApiError(res.status, `GET ${path} failed: ${res.status}`);
   return (await res.json()) as T;
 }
 
 async function postJson<T>(path: string, body?: unknown): Promise<T> {
-  const res = await fetch(`${API_BASE}${path}`, {
+  const res = await fetch(resolveApiUrl(path), {
     method: 'POST',
     headers: { 'content-type': 'application/json', accept: 'application/json' },
     body: body === undefined ? undefined : JSON.stringify(body),

@@ -1052,22 +1052,30 @@ class PostgresStore:
 
     DSN resolution: the explicit ``dsn`` argument, else ``require_database_url(get_settings())``.
 
-    Connection lifecycle: each method opens a FRESH ``AsyncConnection`` and closes it before
-    returning — there is NO connection pooling. This is an INTENTIONAL Phase-1 simplicity
-    choice (low write volume, no long-lived service), not an oversight.
+    Connection lifecycle: when a ``pool`` (``psycopg_pool.AsyncConnectionPool``) is supplied the
+    store ACQUIRES a connection from it per method and RETURNS it to the pool afterwards (the
+    long-lived-service path wired by ``veridex.api.server``). Without a pool it falls back to the
+    Phase-1 behaviour: open a FRESH ``AsyncConnection`` per method and close it (used by the gated
+    Postgres tests, which pass a bare ``dsn``). ``psycopg``/``psycopg_pool`` are never imported at
+    module level — the pool is created by the caller and passed in.
 
     Setup asymmetry: ``init_db(conn)`` is a one-time DDL step that takes a CALLER-supplied
     connection, whereas the DML methods self-connect; ``persist_run`` assumes ``init_db`` has
     already created the schema.
     """
 
-    def __init__(self, *, dsn: str | None = None) -> None:
+    def __init__(self, *, dsn: str | None = None, pool: Any = None) -> None:
         """Configure the store.
 
         Args:
             dsn: Optional Postgres DSN; resolved from config at use-time when omitted.
+            pool: Optional ``psycopg_pool.AsyncConnectionPool`` (duck-typed: ``getconn`` /
+                ``putconn``). When present, every method acquires from / returns to it instead of
+                opening a fresh connection per call. Its lifecycle (open / init_db / close) is
+                owned by the caller (``veridex.api.server``), not this store.
         """
         self._dsn = dsn
+        self._pool = pool
 
     def _resolve_dsn(self) -> str:
         """Return the configured DSN or fall back to the config-derived ``DATABASE_URL``."""
@@ -1076,10 +1084,19 @@ class PostgresStore:
         return require_database_url(get_settings())
 
     async def _connect(self) -> Any:
-        """Open a fresh async connection (imports ``psycopg`` lazily)."""
+        """Acquire a connection: from the pool when configured, else open a fresh one (lazy psycopg)."""
+        if self._pool is not None:
+            return await self._pool.getconn()
         import psycopg
 
         return await psycopg.AsyncConnection.connect(self._resolve_dsn())
+
+    async def _release(self, conn: Any) -> None:
+        """Release a connection back to the pool when pooled, else close it (mirror of ``_connect``)."""
+        if self._pool is not None:
+            await self._pool.putconn(conn)
+        else:
+            await conn.close()
 
     async def init_db(self, conn: Any) -> None:
         """Create all five tables + indices + unique constraints (idempotent).
@@ -1297,7 +1314,7 @@ class PostgresStore:
                     ],
                 )
         finally:
-            await conn.close()
+            await self._release(conn)
 
     async def load_run(self, run_id: str) -> RunResult:
         """Reconstruct a run from the three Phase-1 tables.
@@ -1337,7 +1354,7 @@ class PostgresStore:
                 )
                 score_rows_raw = await cur.fetchall()
         finally:
-            await conn.close()
+            await self._release(conn)
 
         run_events = [dict(zip(_RUN_EVENT_COLUMNS, row, strict=True)) for row in event_rows]
         score_rows = [json.loads(row[0]) for row in score_rows_raw]
@@ -1387,7 +1404,7 @@ class PostgresStore:
                         raise ValueError(f"competition already exists: {competition.competition_id!r}") from exc
                     raise
         finally:
-            await conn.close()
+            await self._release(conn)
 
     async def get_competition(self, competition_id: str) -> Competition:
         """Fetch and reconstruct a competition by id.
@@ -1411,7 +1428,7 @@ class PostgresStore:
                 )
                 row = await cur.fetchone()
         finally:
-            await conn.close()
+            await self._release(conn)
 
         if row is None:
             raise KeyError(f"no competition with competition_id={competition_id!r}")
@@ -1444,7 +1461,7 @@ class PostgresStore:
                     (serialize_payload(entries), competition_id),
                 )
         finally:
-            await conn.close()
+            await self._release(conn)
 
     async def update_competition_status(self, competition_id: str, status: CompetitionStatus) -> None:
         """Update the status column for a competition.
@@ -1466,7 +1483,7 @@ class PostgresStore:
                 if cur.rowcount == 0:
                     raise KeyError(f"no competition persisted with competition_id={competition_id!r}")
         finally:
-            await conn.close()
+            await self._release(conn)
 
     async def update_competition_run_id(self, competition_id: str, run_id: str) -> None:
         """Set the run_id column for a competition.
@@ -1488,7 +1505,7 @@ class PostgresStore:
                 if cur.rowcount == 0:
                     raise KeyError(f"no competition persisted with competition_id={competition_id!r}")
         finally:
-            await conn.close()
+            await self._release(conn)
 
     async def update_competition_config(self, competition_id: str, config: CompetitionConfig) -> None:
         """Overwrite the config_json column for a competition.
@@ -1510,7 +1527,7 @@ class PostgresStore:
                 if cur.rowcount == 0:
                     raise KeyError(f"no competition persisted with competition_id={competition_id!r}")
         finally:
-            await conn.close()
+            await self._release(conn)
 
     async def append_competition_events(self, competition_id: str, events: list[CompetitionEvent]) -> None:
         """Batch-insert competition events in one transaction (append-only).
@@ -1539,7 +1556,7 @@ class PostgresStore:
                     ],
                 )
         finally:
-            await conn.close()
+            await self._release(conn)
 
     async def list_competition_events(self, competition_id: str, since_seq: int = 0) -> list[CompetitionEvent]:
         """Return events with ``seq > since_seq``, ordered by ``seq`` ascending.
@@ -1563,7 +1580,7 @@ class PostgresStore:
                 )
                 rows = await cur.fetchall()
         finally:
-            await conn.close()
+            await self._release(conn)
 
         return [CompetitionEvent.model_validate(json.loads(row[0])) for row in rows]
 
@@ -1589,7 +1606,7 @@ class PostgresStore:
                     )
                 rows = await cur.fetchall()
         finally:
-            await conn.close()
+            await self._release(conn)
 
         return [_build_competition(*row) for row in rows]
 
@@ -1630,7 +1647,7 @@ class PostgresStore:
                     ),
                 )
         finally:
-            await conn.close()
+            await self._release(conn)
 
     async def get_execution_record(self, execution_id: str) -> ExecutionRecord:
         """Fetch and reconstruct an execution record by id.
@@ -1653,7 +1670,7 @@ class PostgresStore:
                 )
                 row = await cur.fetchone()
         finally:
-            await conn.close()
+            await self._release(conn)
 
         if row is None:
             raise KeyError(f"no execution record with execution_id={execution_id!r}")
@@ -1678,7 +1695,7 @@ class PostgresStore:
                 )
                 rows = await cur.fetchall()
         finally:
-            await conn.close()
+            await self._release(conn)
 
         return [ExecutionRecord.model_validate(json.loads(row[0])) for row in rows]
 
@@ -1719,7 +1736,7 @@ class PostgresStore:
                 )
                 row = await cur.fetchone()
         finally:
-            await conn.close()
+            await self._release(conn)
         return int(row[0])
 
     async def list_realized_fills(self, session_id: str) -> list[RealizedFillLedgerRow]:
@@ -1741,7 +1758,7 @@ class PostgresStore:
                 )
                 rows = await cur.fetchall()
         finally:
-            await conn.close()
+            await self._release(conn)
         return [
             RealizedFillLedgerRow(
                 seq=int(r[0]),
@@ -1790,7 +1807,7 @@ class PostgresStore:
                 )
                 row = await cur.fetchone()
         finally:
-            await conn.close()
+            await self._release(conn)
         return int(row[0])
 
     async def list_presubmit(self, session_id: str) -> list[PreSubmitLedgerRow]:
@@ -1812,7 +1829,7 @@ class PostgresStore:
                 )
                 rows = await cur.fetchall()
         finally:
-            await conn.close()
+            await self._release(conn)
         return [
             PreSubmitLedgerRow(
                 seq=int(r[0]),
@@ -1861,7 +1878,7 @@ class PostgresStore:
                     ),
                 )
         finally:
-            await conn.close()
+            await self._release(conn)
 
     async def get_agent_instance(self, instance_id: str) -> AgentInstance:
         """Fetch and reconstruct a deployed instance by id.
@@ -1884,7 +1901,7 @@ class PostgresStore:
                 )
                 row = await cur.fetchone()
         finally:
-            await conn.close()
+            await self._release(conn)
 
         if row is None:
             raise KeyError(f"no agent instance with instance_id={instance_id!r}")
@@ -1933,7 +1950,7 @@ class PostgresStore:
                     (status.value, serialize_payload(record.model_dump(mode="json")), instance_id),
                 )
         finally:
-            await conn.close()
+            await self._release(conn)
 
     async def list_agent_instances(self) -> list[AgentInstance]:
         """Reconstruct every deployed instance from its ``record_json`` blob (no owner filter here).
@@ -1951,7 +1968,7 @@ class PostgresStore:
                 await cur.execute("SELECT record_json FROM agent_instances")
                 rows = await cur.fetchall()
         finally:
-            await conn.close()
+            await self._release(conn)
         return [AgentInstance.model_validate(json.loads(row[0])) for row in rows]
 
     # --- deployment-attempt ledger methods (I-3 — write-once idempotency claim) ---
@@ -2001,7 +2018,7 @@ class PostgresStore:
                         ) from exc
                     raise
         finally:
-            await conn.close()
+            await self._release(conn)
 
     async def get_deployment_attempt_by_key(
         self, operator_id: str, idempotency_key: str
@@ -2027,7 +2044,7 @@ class PostgresStore:
                 )
                 row = await cur.fetchone()
         finally:
-            await conn.close()
+            await self._release(conn)
 
         if row is None:
             return None
