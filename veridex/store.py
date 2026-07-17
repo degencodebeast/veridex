@@ -463,6 +463,19 @@ class Store(Protocol):
         """
         ...
 
+    async def list_agent_instances(self) -> list[AgentInstance]:
+        """Return every persisted deployed instance (a dumb enumerator — no owner filtering here).
+
+        Owner-scoping is deliberately NOT applied at this layer: the owner-scoped route
+        (:mod:`veridex.api.deploy`) applies the fail-closed owner filter so the trust boundary lives
+        in one reviewable place. An UNOWNED / legacy row (``operator_id is None``) is therefore
+        returned here but excluded by the route from every caller's listing.
+
+        Returns:
+            All :class:`~veridex.deploy.instance.AgentInstance` records (any order).
+        """
+        ...
+
 
 # ---------------------------------------------------------------------------
 # Private reconstruction helpers
@@ -927,6 +940,14 @@ class InMemoryStore:
         if last_failure_reason is not None:
             stored.last_failure_reason = last_failure_reason
         stored.updated_at = updated_at
+
+    async def list_agent_instances(self) -> list[AgentInstance]:
+        """Return deep copies of every stored deployed instance (owner filtering is the route's job).
+
+        Returns:
+            Deep copies of all :class:`~veridex.deploy.instance.AgentInstance` records (any order).
+        """
+        return [inst.model_copy(deep=True) for inst in self._agent_instances.values()]
 
 
 # ---------------------------------------------------------------------------
@@ -1824,3 +1845,22 @@ class PostgresStore:
                 )
         finally:
             await conn.close()
+
+    async def list_agent_instances(self) -> list[AgentInstance]:
+        """Reconstruct every deployed instance from its ``record_json`` blob (no owner filter here).
+
+        A plain ``SELECT record_json`` over the existing table — ``operator_id`` / ``runtime_handle``
+        ride inside the blob (ZERO DDL, no dedicated column). The owner-scoped route applies the
+        fail-closed owner filter, so an UNOWNED / legacy row is returned here but never listed.
+
+        Returns:
+            All :class:`~veridex.deploy.instance.AgentInstance` records (any order).
+        """
+        conn = await self._connect()
+        try:
+            async with conn.cursor() as cur:
+                await cur.execute("SELECT record_json FROM agent_instances")
+                rows = await cur.fetchall()
+        finally:
+            await conn.close()
+        return [AgentInstance.model_validate(json.loads(row[0])) for row in rows]

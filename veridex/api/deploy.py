@@ -350,6 +350,12 @@ def register_deploy_routes(
             preflight_checks=list(checks),
             status=DeployStatus.PENDING,
             last_failure_reason=None,
+            # AC-18: persist the SERVER-DERIVED owner (the verified token's DID). A client-supplied
+            # owner/operator_id in the body is never read — DeployConfig drops it and we never look.
+            operator_id=principal.did,
+            # runtime_handle is minted LATER by the runtime infra (replaceable, re-mintable under the
+            # same run_id) — None at deploy time; it is never the ownership/result authority.
+            runtime_handle=None,
             created_at=now,
             updated_at=now,
         )
@@ -392,6 +398,59 @@ def register_deploy_routes(
             run_id=run_id,
             owner=principal.did,
         )
+
+    @app.get("/agents/instances", response_model=list[AgentInstance])
+    async def list_agent_instances(
+        principal: PrivyPrincipal = Depends(require_principal),  # noqa: B008
+    ) -> list[AgentInstance]:
+        """List the AUTHENTICATED caller's own deployed instances (owner-scoped, fail-closed).
+
+        The ``require_principal`` dependency 401s an unauthenticated request before this body. Only
+        instances whose SERVER-PERSISTED ``operator_id`` equals ``principal.did`` are returned — an
+        UNOWNED / legacy row (``operator_id is None``) is NEVER inherited by any caller (fail-closed).
+
+        Args:
+            principal: The authenticated Privy principal (injected by ``require_principal``).
+
+        Returns:
+            The caller's own :class:`AgentInstance` records (possibly empty), newest-order-agnostic.
+        """
+        instances = await store.list_agent_instances()
+        return [inst for inst in instances if inst.operator_id is not None and inst.operator_id == principal.did]
+
+    @app.get("/agents/instances/{instance_id}", response_model=AgentInstance)
+    async def get_agent_instance(
+        instance_id: str,
+        principal: PrivyPrincipal = Depends(require_principal),  # noqa: B008
+    ) -> AgentInstance:
+        """Fetch ONE deployed instance the caller owns (owner resolved server-side, fail-closed).
+
+        Ownership is derived from the STORED ``operator_id`` (never the request): a missing instance,
+        an UNOWNED / legacy row (``operator_id is None`` — never inherited), or a mismatch each refuses
+        access. A 404 is returned for "absent or not yours" so a non-owner cannot even probe existence;
+        a genuinely owned-by-another row 403s.
+
+        Args:
+            instance_id: The instance to load.
+            principal: The authenticated Privy principal (injected by ``require_principal``).
+
+        Returns:
+            The caller's :class:`AgentInstance`.
+
+        Raises:
+            HTTPException: 404 if absent or UNOWNED (fail-closed, no existence leak); 403 if owned by
+                another principal.
+        """
+        try:
+            instance = await store.get_agent_instance(instance_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="agent instance not found") from exc
+        # Fail-closed: an unowned / legacy row is never inherited — hide it as if it does not exist.
+        if instance.operator_id is None:
+            raise HTTPException(status_code=404, detail="agent instance not found")
+        if instance.operator_id != principal.did:
+            raise HTTPException(status_code=403, detail="principal does not own this agent instance")
+        return instance
 
 
 async def cancel_deploy_tasks(app: FastAPI) -> None:

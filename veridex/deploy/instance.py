@@ -102,6 +102,17 @@ class AgentInstance(BaseModel):
         status: Lifecycle state (:class:`DeployStatus`); durably updated by the background task.
         last_failure_reason: Controlled :class:`DeployFailureReason` set only when ``status ==
             FAILED``; else ``None``. Never a raw trace.
+        operator_id: The SERVER-DERIVED owner identity (the authenticated Privy principal's
+            ``did:privy:...``), persisted by the deploy path (AC-18). **Optional** — legacy rows
+            persisted before this field existed lack it, and the store validates stored
+            ``record_json`` into the CURRENT model on read (``store.py``), so a REQUIRED field would
+            raise on those rows; it MUST default to ``None``. Fail-closed: ``None`` means UNOWNED —
+            such a row is never listed for, or inherited by, any caller.
+        runtime_handle: Provider-neutral pointer to the REPLACEABLE runtime infra
+            (``{runtime_kind, runtime_agent_id, session_id, run_id}``; ``runtime_kind="agentos"``
+            today, ``"inprocess"`` for the fallback). Created AFTER the instance and may be re-minted
+            on restart under the SAME ``run_id`` — it is NEVER the ownership / result / Gate-B
+            authority. ``run_id`` remains the authoritative Veridex result/evidence identity.
         created_at: ISO-8601 UTC timestamp the record was persisted.
         updated_at: ISO-8601 UTC timestamp of the last durable write.
     """
@@ -121,5 +132,8 @@ class AgentInstance(BaseModel):
     preflight_checks: list[PreflightCheck] = Field(default_factory=list)
     status: DeployStatus = DeployStatus.PENDING
     last_failure_reason: DeployFailureReason | None = None
+    # Optional so legacy record_json (pre-field) still validates on read; None == UNOWNED (fail-closed).
+    operator_id: str | None = None
+    runtime_handle: dict[str, Any] | None = None
     created_at: str
     updated_at: str
