@@ -2725,10 +2725,8 @@ agent = [
 ]
 api = [
     { name = "fastapi" },
-    { name = "uvicorn" },
-]
-auth = [
     { name = "pyjwt", extra = ["crypto"] },
+    { name = "uvicorn" },
 ]
 chain = [
     { name = "solana" },
@@ -2777,13 +2775,13 @@ requires-dist = [
     { name = "py-order-utils", marker = "extra == 'polymarket'" },
     { name = "pydantic", specifier = ">=2" },
     { name = "pydantic-settings", specifier = ">=2" },
-    { name = "pyjwt", extras = ["crypto"], marker = "extra == 'auth'", specifier = ">=2,<3" },
+    { name = "pyjwt", extras = ["crypto"], marker = "extra == 'api'", specifier = ">=2,<3" },
     { name = "solana", marker = "extra == 'chain'" },
     { name = "solders", marker = "extra == 'chain'" },
     { name = "uvicorn", marker = "extra == 'api'", specifier = ">=0.30" },
     { name = "web3", marker = "extra == 'polymarket'" },
 ]
-provides-extras = ["postgres", "agent", "live", "api", "auth", "polymarket", "chain"]
+provides-extras = ["postgres", "agent", "live", "api", "polymarket", "chain"]
 
 [package.metadata.requires-dev]
 dev = [

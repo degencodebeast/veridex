@@ -25,11 +25,13 @@ agent = ["agno", "openai"]
 # Live TxLINE SSE client (B2) — async HTTP.
 live = ["httpx>=0.27"]
 # FastAPI serving layer (B11 demo surface) — async read + trigger endpoints over the Store.
-api = ["fastapi>=0.115", "uvicorn>=0.30"]
-# Privy ES256 access-token auth boundary (POST /agents/deploy; I-1, auth-contract@1) — PyJWT with
-# the crypto extra (installs `cryptography` for the ECDSA/ES256 verify path). No network/JWKS: the
-# static SPKI/PEM public key is passed straight to `jwt.decode(..., algorithms=["ES256"])`.
-auth = ["pyjwt[crypto]>=2,<3"]
+# Includes the Privy ES256 access-token auth boundary (POST /agents/deploy; I-1, auth-contract@1):
+# `veridex.api.deploy` unconditionally imports `veridex.api.auth_privy`, which does a top-level
+# `import jwt`, so PyJWT is on the API import path and MUST ship with the api extra (dec-crit-i1-003,
+# amends dec-crit-i1-002). PyJWT with the crypto extra installs `cryptography` for the ECDSA/ES256
+# verify path. No network/JWKS: the static SPKI/PEM public key is passed straight to
+# `jwt.decode(..., algorithms=["ES256"])`.
+api = ["fastapi>=0.115", "uvicorn>=0.30", "pyjwt[crypto]>=2,<3"]
 # Vendored Polymarket CLOB client (veridex/venues/_vendor/polymarket_clob/) — signing, HTTP,
 # and orderbook deps the vendored code imports (T12/REQ-2D-201).
 polymarket = [
