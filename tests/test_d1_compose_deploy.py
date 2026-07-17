@@ -274,6 +274,77 @@ class TestReplayPackCatalogProbe:
         probe = make_replay_pack_probe(str(tmp_path))
         assert await probe() is False
 
+    async def test_hashvalid_but_unloadable_pack_is_not_ready(self, tmp_path: Path) -> None:
+        """Foundation-gate MAJOR-2: a pack whose ``content_hash`` is correct but whose ``records``
+        file is NOT valid JSONL must read NOT-ready — the hash alone is insufficient; readiness must
+        prove the pack loads through the real runtime loader, else /readyz fails open (a judge's
+        replay then fails to start on a pack /readyz advertised as ready).
+        """
+        from veridex.api.readiness import make_replay_pack_probe
+        from veridex.ingest.replay_pack import _compute_content_hash, verify_content_hash
+
+        pack_dir = tmp_path / "poison"
+        pack_dir.mkdir()
+        # A records file the runtime loader can NOT parse (json.loads raises), yet whose bytes are
+        # faithfully covered by a correctly-computed content_hash.
+        (pack_dir / "odds_1.jsonl").write_text("not-json\n", encoding="utf-8")
+        fixtures = [{"fixture_id": 1, "records": "odds_1.jsonl"}]
+        content_hash = _compute_content_hash(pack_dir, fixtures)
+        (pack_dir / "pack.json").write_text(
+            json.dumps(
+                {
+                    "pack_version": 1,
+                    "capture": {},
+                    "fixtures": fixtures,
+                    "closing_policy": "con-040_last_pre_inrunning",
+                    "content_hash": content_hash,
+                }
+            ),
+            encoding="utf-8",
+        )
+        # The hash check PASSES for this pack — proving hash verification alone does not catch it.
+        assert verify_content_hash(pack_dir) is True
+        # ...but the runtime loader cannot parse the records, so readiness must fail closed.
+        probe = make_replay_pack_probe(str(pack_dir))
+        assert await probe() is False
+
+    async def test_genuine_pinned_pack_still_loadable(self) -> None:
+        """No-regression guard: the real pinned pack still reads loadable through the tightened check
+        (the fix must not reject a genuinely-loadable pack).
+        """
+        from veridex.api.readiness import make_replay_pack_probe
+
+        probe = make_replay_pack_probe(str(PINNED_PACK))
+        assert await probe() is True
+
+    async def test_hash_mismatch_pack_is_not_ready(self, tmp_path: Path) -> None:
+        """A pack whose declared ``content_hash`` does not match its data is NOT loadable — the
+        verified runtime loader refuses it (fail-closed).
+        """
+        from veridex.api.readiness import make_replay_pack_probe
+        from veridex.ingest.replay_pack import verify_content_hash
+
+        pack_dir = tmp_path / "tampered"
+        pack_dir.mkdir()
+        # A well-formed, parseable records file — but a declared content_hash that does NOT match.
+        (pack_dir / "odds_1.jsonl").write_text(json.dumps({"FixtureId": 1}) + "\n", encoding="utf-8")
+        fixtures = [{"fixture_id": 1, "records": "odds_1.jsonl"}]
+        (pack_dir / "pack.json").write_text(
+            json.dumps(
+                {
+                    "pack_version": 1,
+                    "capture": {},
+                    "fixtures": fixtures,
+                    "closing_policy": "con-040_last_pre_inrunning",
+                    "content_hash": "0" * 64,
+                }
+            ),
+            encoding="utf-8",
+        )
+        assert verify_content_hash(pack_dir) is False
+        probe = make_replay_pack_probe(str(pack_dir))
+        assert await probe() is False
+
 
 class TestReadyzRoute:
     def _client(self, *, ready: bool):

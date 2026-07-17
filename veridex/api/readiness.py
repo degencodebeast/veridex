@@ -29,6 +29,8 @@ from typing import Any
 from fastapi import APIRouter
 from fastapi.responses import JSONResponse
 
+from veridex.ingest.replay_pack import load_pack_marketstates
+
 #: A single readiness check: an async, argument-free callable returning ``True`` when its subsystem
 #: is ready. Raising is permitted and is treated as not-ready (fail-closed) by :func:`check_readiness`.
 ReadinessProbe = Callable[[], Awaitable[bool]]
@@ -146,10 +148,18 @@ def make_session_db_probe(get_pool: PoolSupplier) -> ReadinessProbe:
 
 
 def _catalog_has_loadable_pack(root: Path) -> bool:
-    """Return ``True`` iff ``root`` holds at least one well-formed, loadable ReplayPack.
+    """Return ``True`` iff ``root`` holds at least one ReplayPack the replay RUNTIME can load.
 
-    "Loadable" = a ``pack.json`` (at the root or one level down) that parses and declares at least one
-    fixture whose record file is present on disk. A malformed/empty catalog is NOT ready.
+    Loadability is proven the way the runtime actually consumes a pack, NOT by mere file existence:
+    for at least one declared fixture the records are read through the SAME verified loader the
+    replay path uses (:func:`load_pack_marketstates`, ``verify=True`` — the runtime default), and a
+    NON-EMPTY MarketState result is required. This is fail-closed — a pack whose ``records`` file is
+    unparseable, whose schema is wrong, or whose stored ``content_hash`` no longer matches its data
+    all make the loader raise, so such a pack is NOT loadable and ``/readyz`` reports not-ready
+    rather than advertising a pack a judge's replay would then fail to start.
+
+    A missing/empty/JSON-unparseable ``pack.json`` (at the root or one level down), or a manifest
+    with no fixture that loads to a non-empty result, is likewise not-ready.
     """
     if not root.is_dir():
         return False
@@ -166,8 +176,17 @@ def _catalog_has_loadable_pack(root: Path) -> bool:
             continue
         pack_dir = manifest.parent
         for fixture in fixtures:
-            record = fixture.get("records") if isinstance(fixture, dict) else None
-            if isinstance(record, str) and (pack_dir / record).is_file():
+            fixture_id = fixture.get("fixture_id") if isinstance(fixture, dict) else None
+            if not isinstance(fixture_id, int):
+                continue
+            try:
+                # Load ONE declared fixture through the verified runtime loader — this parses,
+                # normalizes, and hash-verifies exactly as live replay does. One genuinely-loaded
+                # fixture proves loadability; we do not walk every fixture of a large pinned pack.
+                marketstates = load_pack_marketstates(pack_dir, fixture_id, verify=True)
+            except Exception:  # noqa: BLE001 — any load failure == not-loadable (fail-closed).
+                continue
+            if marketstates:
                 return True
     return False
 
