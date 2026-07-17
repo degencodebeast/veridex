@@ -139,13 +139,17 @@ Beyond make/take, the roster carries FV-only directional strategies (`Cumulative
   - **But selection-driven and unproven:** the OU edge is carried entirely by drift's trend-selection
     gate on a *mean-reverting* base, over **n≈18 fixture clusters** with **post-hoc family selection** —
     the shape of a post-selection artifact, indistinguishable from a real trend-catcher without
-    out-of-sample data (`.omc/research/drift-autocorrelation-closer.md`).
+    out-of-sample data — and the first genuinely out-of-sample (OOS) test (frozen OU-only, N≈4 predeclared →
+    **N=2 finished**) did **not** reproduce it: *falsifying* on the circular metric (+162 → −254 bps
+    clustered), **NULL on independent settled outcomes** (≈0), confirming nothing either way at N=2
+    (`.omc/research/drift-autocorrelation-closer.md`, `drift-oos-test.md`).
   - **And not monetizable even if real:** drift is a pre-match/minutes signal, and the pre-match venue
     is *frozen* (§7) → no execution surface.
 
-**Honest label (retained for judges):** *candidate rung-1 CLV signal, not proven executable alpha*, with
-a predeclared out-of-sample promotion protocol (OU-only frozen policy, genuinely-new fixtures,
-independent tradeable close + settled-outcome calibration, fixture-clustered) filed as future work. This
+**Honest label (retained for judges):** *candidate rung-1 CLV signal, not proven executable alpha* — the
+predeclared out-of-sample promotion protocol (OU-only frozen policy, genuinely-new fixtures,
+independent tradeable close + settled-outcome calibration, fixture-clustered) was **run and did not
+promote it** (N=2 finished; a genuinely-new N≥4 extension remains future work). This
 is the platform thesis again: a positive-looking in-sample number, disclosed with exactly what it is and
 isn't, rather than sold as alpha.
 
