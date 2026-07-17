@@ -1,0 +1,60 @@
+# compose.coolify.yml — D-0 STATIC Coolify/VPS packaging skeleton (Wave 0).
+#
+# This file is a packaging CONTRACT, not a runnable deployment:
+#   - NO env values are injected here. Env injection + `:?` required-var
+#     guards land in D-1 (operator sets values in Coolify, never in git).
+#   - NO healthcheck / db-init wiring (D-1).
+#   - NO ports published to real domains — Coolify's "Ports Exposes" +
+#     Traefik own public exposure (see deploy/coolify/runbook.md).
+# Canonical host: Coolify on a VPS (discipline modeled on
+# agent-rank/scripts/v2_infra.md; all names/domains here are placeholders).
+
+services:
+  # ── api-runtime ──────────────────────────────────────────────────────
+  # AgentOS is mounted IN this service per II-4 — it is NOT a separate
+  # container. One process tree serves the API and the agent runtime.
+  api-runtime:
+    build:
+      context: .
+      # PLACEHOLDER: Dockerfile.api is OWNED BY I-5 (Critical lane) and does
+      # not exist yet. D-1 (deps: D-0 + I-5) wires the real build. D-0 must
+      # not author it.
+      dockerfile: Dockerfile.api
+    volumes:
+      # WAL_DIR — durable event spool (I-4 spool, AC-13). Named volume so the
+      # WAL survives container replacement.
+      - wal-spool:/var/lib/veridex/wal
+      # Writable ReplayPack capture root (R-0b/R-2) — live captures are
+      # written here and must survive redeploys.
+      - replay-capture:/var/lib/veridex/replay-packs/capture
+      # Curated seed packs — READ-ONLY. The runtime resolves this path via
+      # REPLAY_PACK_ROOT (env value injected in D-1, not here). Operator
+      # provisions /srv/veridex/replay-packs/curated on the VPS.
+      - /srv/veridex/replay-packs/curated:/var/lib/veridex/replay-packs/curated:ro
+    # environment: — intentionally absent. DATABASE_URL, WAL_DIR,
+    # REPLAY_PACK_ROOT etc. are injected via Coolify in D-1 with `:?` guards.
+
+  # ── web ──────────────────────────────────────────────────────────────
+  # Next.js frontend (apps/web). Build context is the app dir itself, so
+  # apps/web/.dockerignore governs what enters this image.
+  web:
+    build:
+      context: ./apps/web
+      dockerfile: Dockerfile
+    # NEXT_PUBLIC_* build args are wired in D-1.
+
+  # ── postgres ─────────────────────────────────────────────────────────
+  # Pinned official image — never a floating tag in a trust-path deployment.
+  postgres:
+    image: postgres:16.6-alpine
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    # POSTGRES_* credentials are Coolify-injected in D-1 — never committed.
+
+volumes:
+  # Postgres data directory.
+  postgres-data:
+  # WAL_DIR spool (I-4/AC-13).
+  wal-spool:
+  # Writable ReplayPack capture root (R-0b/R-2).
+  replay-capture:

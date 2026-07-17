@@ -8,6 +8,23 @@
 veridex/.env
 veridex/.env.local
 
+# D-0: key + wallet material — excluded BEFORE any broad COPY, for every
+# image built from this root context (Dockerfile.agent today, Dockerfile.api
+# at D-1). See deploy/coolify/provisioning-inventory.md for the relocation
+# record of the one .pem that used to live in-tree.
+**/*.pem
+**/*.key
+**/*.p12
+**/*.pfx
+**/id_rsa*
+**/id_ed25519*
+# Wallet material = keypair JSON files (Solana CLI style) — NOT source code
+# (veridex/dust_execution/wallet_binding.py must still enter the image).
+**/*wallet*.json
+**/*keypair*.json
+**/id.json
+**/*.keystore
+
 # VCS + caches + build artifacts (slim image).
 .git
 .gitignore

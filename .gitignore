@@ -16,6 +16,9 @@
 !/apps/
 !/docs/
 !/Dockerfile.agent
+# D-0 static Coolify/VPS packaging scaffold
+!/compose.coolify.yml
+!/deploy/
 
 # planning/spec docs stay LOCAL — never pushed (per project decision)
 spec/
