@@ -33,6 +33,7 @@ from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 from veridex.competition.events import CompetitionEvent
 from veridex.competition.models import AgentEntry, Competition, CompetitionConfig, CompetitionStatus
 from veridex.config import get_settings, require_database_url
+from veridex.deploy.attempt import DeploymentAttempt, DuplicateAttemptError
 from veridex.deploy.instance import AgentInstance, DeployFailureReason, DeployStatus
 from veridex.execution.models import ExecutionRecord
 from veridex.runtime.evidence import serialize_payload
@@ -476,6 +477,35 @@ class Store(Protocol):
         """
         ...
 
+    async def persist_deployment_attempt(self, attempt: DeploymentAttempt) -> None:
+        """INSERT a durable deployment-attempt claim (the deploy-saga idempotency backbone).
+
+        The attempt is persisted BEFORE any deploy side effect, into an append-only ledger table with
+        ``UNIQUE(operator_id, idempotency_key)``: a second INSERT for an already-claimed pair is the
+        idempotency signal, surfaced as :class:`~veridex.deploy.attempt.DuplicateAttemptError`.
+
+        Args:
+            attempt: The write-once claim to persist (keyed by ``(operator_id, idempotency_key)``).
+
+        Raises:
+            DuplicateAttemptError: If ``(operator_id, idempotency_key)`` is already claimed.
+        """
+        ...
+
+    async def get_deployment_attempt_by_key(
+        self, operator_id: str, idempotency_key: str
+    ) -> DeploymentAttempt | None:
+        """Load the deployment-attempt claim for ``(operator_id, idempotency_key)``, if any.
+
+        Args:
+            operator_id: The SERVER-DERIVED owner the claim is scoped to.
+            idempotency_key: The caller-scoped idempotency key.
+
+        Returns:
+            The recorded :class:`~veridex.deploy.attempt.DeploymentAttempt`, or ``None`` if unclaimed.
+        """
+        ...
+
 
 # ---------------------------------------------------------------------------
 # Private reconstruction helpers
@@ -549,6 +579,9 @@ class InMemoryStore:
         self._competition_events: dict[str, list[CompetitionEvent]] = {}
         self._execution_records: dict[str, ExecutionRecord] = {}
         self._agent_instances: dict[str, AgentInstance] = {}
+        # Append-only deployment-attempt ledger, keyed by (operator_id, idempotency_key) — the
+        # in-code mirror of the Postgres UNIQUE(operator_id, idempotency_key) claim (I-3).
+        self._deployment_attempts: dict[tuple[str, str], DeploymentAttempt] = {}
         # Append-only realized-fill ledger + its monotonic unique-seq counter (SAF-002b/c).
         self._realized_fills: list[RealizedFillLedgerRow] = []
         self._realized_fill_seq: int = 0
@@ -949,6 +982,41 @@ class InMemoryStore:
         """
         return [inst.model_copy(deep=True) for inst in self._agent_instances.values()]
 
+    # --- deployment-attempt ledger methods (I-3 — write-once idempotency claim) ---
+
+    async def persist_deployment_attempt(self, attempt: DeploymentAttempt) -> None:
+        """Store a deep copy of the attempt, enforcing the ``(operator_id, idempotency_key)`` claim.
+
+        Mirrors the Postgres ``UNIQUE(operator_id, idempotency_key)`` in code: a second persist for an
+        already-claimed pair raises :class:`~veridex.deploy.attempt.DuplicateAttemptError`.
+
+        Args:
+            attempt: The write-once claim to persist.
+
+        Raises:
+            DuplicateAttemptError: If ``(operator_id, idempotency_key)`` is already claimed.
+        """
+        key = (attempt.operator_id, attempt.idempotency_key)
+        if key in self._deployment_attempts:
+            raise DuplicateAttemptError(f"deployment attempt already claimed: {key!r}")
+        self._deployment_attempts[key] = attempt.model_copy(deep=True)
+
+    async def get_deployment_attempt_by_key(
+        self, operator_id: str, idempotency_key: str
+    ) -> DeploymentAttempt | None:
+        """Return a deep copy of the recorded attempt for ``(operator_id, idempotency_key)``, or None.
+
+        Args:
+            operator_id: The owner the claim is scoped to.
+            idempotency_key: The caller-scoped idempotency key.
+
+        Returns:
+            A fresh deep copy of the recorded :class:`~veridex.deploy.attempt.DeploymentAttempt`, or
+            ``None`` if the pair is unclaimed.
+        """
+        recorded = self._deployment_attempts.get((operator_id, idempotency_key))
+        return recorded.model_copy(deep=True) if recorded is not None else None
+
 
 # ---------------------------------------------------------------------------
 # PostgresStore column helpers
@@ -1165,6 +1233,27 @@ class PostgresStore:
             )
             await cur.execute(
                 "CREATE INDEX IF NOT EXISTS idx_presubmit_ledger_session ON presubmit_ledger(session_id)"
+            )
+
+            # --- deployment-attempt ledger (I-3 — durable idempotency claim, INSERT-only) ---
+            # One row per (operator_id, idempotency_key) claim, written ONCE before any deploy side
+            # effect; the UNIQUE constraint is the idempotency guarantee (a duplicate INSERT is the
+            # signal a retry / concurrent duplicate must reconcile on, NOT mint a second instance).
+            # Business columns (NOT a record_json blob): the recovery state is these explicit fields.
+            await cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS deployment_attempts (
+                    attempt_id TEXT PRIMARY KEY,
+                    operator_id TEXT NOT NULL,
+                    idempotency_key TEXT NOT NULL,
+                    config_fingerprint TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    instance_id TEXT,
+                    external_id TEXT,
+                    CONSTRAINT uq_deployment_attempts_operator_key UNIQUE (operator_id, idempotency_key)
+                )
+                """
             )
         await conn.commit()
 
@@ -1864,3 +1953,91 @@ class PostgresStore:
         finally:
             await conn.close()
         return [AgentInstance.model_validate(json.loads(row[0])) for row in rows]
+
+    # --- deployment-attempt ledger methods (I-3 — write-once idempotency claim) ---
+
+    async def persist_deployment_attempt(self, attempt: DeploymentAttempt) -> None:
+        """INSERT one deployment-attempt row (append-only); the UNIQUE claim signals a duplicate.
+
+        Maps the Postgres ``UniqueViolation`` on ``UNIQUE(operator_id, idempotency_key)`` to
+        :class:`~veridex.deploy.attempt.DuplicateAttemptError` — the same contract as
+        :class:`InMemoryStore` — so the deploy route reconciles on ONE backend-agnostic signal. All
+        SQL is parameterized; psycopg stays lazy.
+
+        Args:
+            attempt: The write-once claim to persist.
+
+        Raises:
+            DuplicateAttemptError: If ``(operator_id, idempotency_key)`` is already claimed.
+        """
+        conn = await self._connect()
+        try:
+            async with conn.transaction(), conn.cursor() as cur:
+                try:
+                    await cur.execute(
+                        "INSERT INTO deployment_attempts "
+                        "(attempt_id, operator_id, idempotency_key, config_fingerprint, status, "
+                        "created_at, instance_id, external_id) "
+                        "VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
+                        (
+                            attempt.attempt_id,
+                            attempt.operator_id,
+                            attempt.idempotency_key,
+                            attempt.config_fingerprint,
+                            attempt.status.value,
+                            attempt.created_at,
+                            attempt.instance_id,
+                            attempt.external_id,
+                        ),
+                    )
+                except Exception as exc:
+                    # psycopg is already in sys.modules (imported inside _connect).
+                    import psycopg.errors  # noqa: PLC0415 (lazy, not at module level)
+
+                    if isinstance(exc, psycopg.errors.UniqueViolation):
+                        raise DuplicateAttemptError(
+                            f"deployment attempt already claimed: "
+                            f"({attempt.operator_id!r}, {attempt.idempotency_key!r})"
+                        ) from exc
+                    raise
+        finally:
+            await conn.close()
+
+    async def get_deployment_attempt_by_key(
+        self, operator_id: str, idempotency_key: str
+    ) -> DeploymentAttempt | None:
+        """Fetch and reconstruct the deployment-attempt claim for the ``(operator_id, key)`` pair.
+
+        Args:
+            operator_id: The owner the claim is scoped to.
+            idempotency_key: The caller-scoped idempotency key.
+
+        Returns:
+            The reconstructed :class:`~veridex.deploy.attempt.DeploymentAttempt`, or ``None`` if the
+            pair is unclaimed.
+        """
+        conn = await self._connect()
+        try:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "SELECT attempt_id, operator_id, idempotency_key, config_fingerprint, status, "
+                    "created_at, instance_id, external_id "
+                    "FROM deployment_attempts WHERE operator_id = %s AND idempotency_key = %s",
+                    (operator_id, idempotency_key),
+                )
+                row = await cur.fetchone()
+        finally:
+            await conn.close()
+
+        if row is None:
+            return None
+        return DeploymentAttempt(
+            attempt_id=row[0],
+            operator_id=row[1],
+            idempotency_key=row[2],
+            config_fingerprint=row[3],
+            status=row[4],
+            created_at=row[5],
+            instance_id=row[6],
+            external_id=row[7],
+        )

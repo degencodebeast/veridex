@@ -24,12 +24,13 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
-from fastapi import Depends, FastAPI, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException
 from pydantic import BaseModel
 
 from veridex.api.auth_privy import PrivyPrincipal, make_require_principal
 from veridex.api.demo_fixtures import build_demo_ticks
 from veridex.chain.anchor import anchor_memo
+from veridex.deploy.attempt import AttemptStatus, DeploymentAttempt, DuplicateAttemptError
 from veridex.deploy.instance import AgentInstance, DeployFailureReason, DeployStatus
 from veridex.deploy.preflight import DeployConfig, PreflightCheck, run_deploy_preflight
 from veridex.ingest.feed_health import FeedHealthReport
@@ -280,6 +281,7 @@ def register_deploy_routes(
     async def deploy_agent(
         config: DeployConfig,
         principal: PrivyPrincipal = Depends(require_principal),  # noqa: B008
+        idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),  # noqa: B008
     ) -> DeployResponse:
         """Preflight, pin the instance, and launch the run asynchronously (fail-closed).
 
@@ -291,6 +293,9 @@ def register_deploy_routes(
         Args:
             config: The typed, submitted Studio config (bad types are rejected 422 by pydantic).
             principal: The authenticated Privy principal (injected by ``require_principal``).
+            idempotency_key: The optional ``Idempotency-Key`` header — a caller-scoped key that makes
+                the deploy idempotent (same key ⇒ same instance, never a duplicate). Absent ⇒ a fresh
+                per-request key is minted (each call is a distinct deploy — the prior behavior).
 
         Returns:
             A :class:`DeployResponse` with the pinned instance, the launched ``run_id``, and the
@@ -298,7 +303,8 @@ def register_deploy_routes(
 
         Raises:
             HTTPException: 401 before any side effect if auth fails; 422 naming every failing
-                preflight check; NO run starts on failure.
+                preflight check; 409 if the idempotency key is reused with a different config or the
+                recorded attempt is unrecoverable; NO run starts on failure.
         """
         envelope = config.to_policy_envelope()
         # MODE-AWARE source resolution: a replay deploy resolves its SOURCE (bundled/injected pack)
@@ -329,11 +335,77 @@ def register_deploy_routes(
                 },
             )
 
+        # ATTEMPT-FIRST saga backbone (I-3): persist a durable DeploymentAttempt BEFORE the instance
+        # side effect. The attempt CLAIMS (operator_id, idempotency_key) under a UNIQUE constraint and
+        # pre-allocates the deterministic instance_id it targets — so a retry (or a concurrent
+        # duplicate) reconciles to the SAME instance via the recorded state, never a blind re-execute.
+        operator_id = principal.did
+        idem_key = idempotency_key if idempotency_key is not None else uuid.uuid4().hex
+        config_fingerprint = config.config_hash()
+        now = _now_iso()
+        attempt_id = uuid.uuid4().hex
+        instance_id = f"inst_{attempt_id}"
+        try:
+            await store.persist_deployment_attempt(
+                DeploymentAttempt(
+                    attempt_id=attempt_id,
+                    operator_id=operator_id,
+                    idempotency_key=idem_key,
+                    config_fingerprint=config_fingerprint,
+                    status=AttemptStatus.PENDING,
+                    created_at=now,
+                    instance_id=instance_id,
+                    external_id=None,
+                )
+            )
+        except DuplicateAttemptError:
+            # The key is already claimed (a prior deploy or a concurrent duplicate) — reconcile to the
+            # recorded attempt; NEVER mint a second instance for the same logical deploy.
+            recorded = await store.get_deployment_attempt_by_key(operator_id, idem_key)
+            assert recorded is not None  # the UNIQUE claim we just collided with exists
+            if recorded.config_fingerprint != config_fingerprint:
+                # Same key, different config → refuse (never silently reuse or overwrite).
+                raise HTTPException(
+                    status_code=409,
+                    detail={"error": "idempotency_key_conflict", "idempotency_key": idem_key},
+                ) from None
+            # Fail-closed: a claim with no pre-allocated target instance (never produced by this
+            # route) cannot be safely reconciled — refuse rather than guess.
+            target_instance_id = recorded.instance_id
+            if target_instance_id is None:
+                raise HTTPException(
+                    status_code=409,
+                    detail={"error": "deployment_attempt_unrecoverable", "status": recorded.status.value},
+                ) from None
+            try:
+                existing = await store.get_agent_instance(target_instance_id)
+            except KeyError:
+                existing = None
+            if existing is not None:
+                # The side effect already completed — return the SAME instance (idempotent replay /
+                # crash-recovered), launching NO second run.
+                return DeployResponse(
+                    instance_id=existing.instance_id,
+                    config_hash=existing.config_hash,
+                    policy_hash=existing.policy_hash,
+                    run_id=existing.run_id,
+                    owner=operator_id,
+                )
+            # No instance yet. Fail-closed: only re-drive from the known-safe PENDING claim; any other
+            # recorded state is treated as unrecoverable and NEVER auto-retries a side effect.
+            if recorded.status is not AttemptStatus.PENDING:
+                raise HTTPException(
+                    status_code=409,
+                    detail={"error": "deployment_attempt_unrecoverable", "status": recorded.status.value},
+                ) from None
+            # Re-drive under the recorded attempt: reuse its write-once deterministic instance_id so
+            # the idempotent (upsert) instance write reconciles to exactly ONE instance.
+            instance_id = target_instance_id
+
         # Preflight passed → pin config_hash (only now) + policy_hash into the AgentInstance.
         run_id = uuid.uuid4().hex
-        now = _now_iso()
         instance = AgentInstance(
-            instance_id=f"inst_{uuid.uuid4().hex}",
+            instance_id=instance_id,
             template_id=config.template_id,
             agent_id=config.agent_id,
             submitted_config=config.model_dump(mode="json"),
