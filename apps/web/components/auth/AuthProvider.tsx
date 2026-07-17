@@ -22,8 +22,10 @@ function TokenSeamWiring() {
  *
  * No `NEXT_PUBLIC_PRIVY_APP_ID` configured (e.g. local/CI without secrets) → render children
  * directly, no PrivyProvider mount. The seam then stays at its fail-closed default (no provider
- * wired ⇒ getAuthToken() resolves null), so owner-scoped calls still refuse to fire — only the
- * login UI/session wiring is skipped, never the fail-closed guarantee.
+ * wired ⇒ getAuthToken() resolves null), so owner-scoped calls fire WITHOUT an Authorization
+ * header rather than fabricating one — only the login UI/session wiring is skipped. The actual
+ * "never fires unauthenticated" guarantee comes from wrapping the owner-scoped action in
+ * {@link AuthGate} plus the backend's 401-before-any-side-effect boundary (auth-contract@1).
  */
 export function AuthProvider({ children }: { children: ReactNode }) {
   // auth-contract@1: env NEXT_PUBLIC_PRIVY_APP_ID (frontend). See .env.example. Read per-render

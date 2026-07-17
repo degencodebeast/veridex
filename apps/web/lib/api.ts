@@ -521,8 +521,10 @@ export class DeployPreflightError extends Error {
  * bare status. The 200 body is the pinned instance + the launched ``run_id`` (returned WITHOUT
  * awaiting the seal).
  *
- * auth-contract@1: owner-scoped — carries the bearer from lib/auth.ts, fails closed with no
- * token, and retries once on a 401 (see authedFetch).
+ * auth-contract@1: owner-scoped — carries the bearer from lib/auth.ts when the seam has a token
+ * (never fabricates one when it doesn't), and retries once on a 401 (see authedFetch). The
+ * fail-closed "no token → never fires" guarantee is enforced at the UI layer by wrapping the
+ * calling affordance in {@link AuthGate}, not by this function refusing to fetch.
  */
 export async function deployAgent(payload: DeployAgentPayload): Promise<DeployAgentResult> {
   const res = await authedFetch('/agents/deploy', payload);

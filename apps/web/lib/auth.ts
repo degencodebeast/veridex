@@ -3,8 +3,11 @@
 // network, no real Privy SDK in unit tests.
 //
 // The default provider resolves null — fail-closed BY CONSTRUCTION: until something wires a real
-// provider (or a test injects a fake one), every owner-scoped call sees "no token" and refuses to
-// fire (see lib/api.ts AuthRequiredError).
+// provider (or a test injects a fake one), every owner-scoped call sees "no token". lib/api.ts's
+// authedFetch then fires the request WITHOUT an Authorization header (it never fabricates a
+// bearer) — the actual "never fires unauthenticated" guarantee is enforced at the UI layer by
+// components/auth/AuthGate (which must be wired around an owner-scoped action, e.g. Studio
+// deploy) plus the backend's 401-before-any-side-effect boundary (auth-contract@1).
 export type AuthTokenProvider = () => Promise<string | null>;
 
 const NO_TOKEN: AuthTokenProvider = async () => null;
