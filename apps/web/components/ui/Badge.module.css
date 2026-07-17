@@ -26,3 +26,12 @@
 .eligible { color: var(--accent-hi); background: var(--accent-bg-soft); }
 .notEligible { color: var(--warning-hi); background: var(--warning-bg); }
 .llm { color: var(--warning); background: var(--warning-bg); }
+
+/* Maker Arena lane (MM-R1) */
+.mmR1 { color: var(--text-2-alt); border-color: var(--border-strong); background: transparent; }
+.separated { color: var(--positive); background: var(--positive-bg); }
+.inconclusive { color: var(--text-2-alt); border-color: var(--border-strong); background: transparent; }
+.inverted { color: var(--negative); background: var(--negative-bg); }
+.uncalibrated { color: var(--warning-hi); background: var(--warning-bg); }
+.smallN { color: var(--warning-hi); background: var(--warning-bg); }
+.tradesNotFills { color: var(--warning-hi); background: var(--warning-bg); }
