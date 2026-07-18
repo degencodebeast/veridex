@@ -1,0 +1,1 @@
+{"pack_version": 1, "capture": {"started_ts": 1783628916920, "ended_ts": 1783629162234, "endpoints": ["/odds/updates"], "tool": "pmxt-txline-tape-slice/1", "gaps": []}, "fixtures": [{"fixture_id": 18209181, "records": "odds_18209181.jsonl"}], "closing_policy": "con-040_last_pre_inrunning", "content_hash": "db35985c2c4121f3ee8488c1d69b66a56753bf9a9d8e5259ca731edfcd6f8e2a"}
