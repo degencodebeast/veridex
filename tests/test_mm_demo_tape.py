@@ -1,40 +1,31 @@
-"""fu-ii5-demo-tape — the ``txline-mm-18213979-v1`` HYBRID maker replay tape banked into MM_TAPE_CATALOG.
+"""fu-ii5-demo-tape — the ``txline-mm-18213979-v1`` HYBRID maker builder, a DEREGISTERED research artifact.
 
-Proves the load-bearing claims (A8 honesty): (1) the builder's events PASS ``run_cadence``
-field-for-field authentication; (2) the PRODUCTION catalog resolves ``txline-mm-18213979-v1`` and its
-content hash re-verifies (every other key still fails closed); (3) the tape is SELF-WARMING — folded
-from a COLD ``StrategyState()`` (NO injected seed) the warm state EMERGES from real rows and the run
-produces at least one REAL quote OR an honest abstention; (4) a real ``replay`` + ``dry_run`` deploy
-that resolves the tape THROUGH the catalog (no injected resolver) + the DEFAULT cold seed emits >= 1 OPS
-event AND >= 1 dry-run receipt with an ATTEMPTED leg; (5) provenance is the real SX fixture 18213979,
-NEVER the synthetic TEAM-A/YES ``fixture_id=1`` canned fixture.
+The SX hybrid is retained as an isolated RESEARCH ARTIFACT (module + bounded data intact) but is NO
+LONGER banked in the production ``MM_TAPE_CATALOG`` — the deployability allowlist — per Codex
+OPTION_2_MINIMAL_DEREGISTRATION. Proves the load-bearing claims (A8 honesty): (1) the builder's events
+PASS ``run_cadence`` field-for-field authentication; (2) the builder is deterministic +
+content-hash-verifiable IN ISOLATION, yet its key is DEREGISTERED — ``default_mm_tape_resolver`` fails
+closed on it and the production catalog banks only the reviewed PMXT tape; (3) the tape is
+SELF-WARMING — folded from a COLD ``StrategyState()`` (NO injected seed) the warm state EMERGES from real
+rows and the run produces at least one REAL quote OR an honest abstention; (4) provenance is the real SX
+fixture 18213979, NEVER the synthetic TEAM-A/YES ``fixture_id=1`` canned fixture.
 """
 
 from __future__ import annotations
 
-import asyncio
 import json
 from pathlib import Path
-from typing import Any
 
-import httpx
 import pytest
-from fastapi import FastAPI
-from httpx import ASGITransport
 
-from veridex.api.deploy import DeployDeps, register_deploy_routes
-from veridex.config import Settings
-from veridex.deploy.instance import DeployStatus
 from veridex.live_recorder.contracts import LiveRecorderSessionMeta
 from veridex.live_recorder.recorder import LiveRecorder
-from veridex.mm_strategy import demo_tape
+from veridex.mm_strategy import demo_tape, pmxt_tape
 from veridex.mm_strategy import session_factory as sf
 from veridex.mm_strategy.assembler import FvArrival, ObservationTick, run_cadence
 from veridex.mm_strategy.config import StrategyConfig
 from veridex.mm_strategy.contracts import StrategyState
 from veridex.mm_strategy.core import decide
-from veridex.mm_strategy.offline_proposer import OfflineRecordingProposer
-from veridex.runtime.runtime_events import RuntimeEvent, RuntimeEventType
 
 _GUARD_OFF = StrategyConfig(guard_enabled=False, tif="GTC")
 
@@ -76,20 +67,35 @@ def test_tape_events_pass_run_cadence_authentication(tmp_path: Path) -> None:
     assert all(obs.guard_fv is None for obs in run.observations)
 
 
-# --- (2) catalog resolution + content-hash re-verification -------------------------------------
+# --- (2) isolation content-hash re-verification + catalog DEREGISTRATION -----------------------
 
 
-def test_catalog_resolves_and_hash_reverifies() -> None:
-    # the PRODUCTION catalog (not an injected resolver) banks the honest fixture key.
+def test_sx_builder_hash_reverifies_in_isolation() -> None:
+    # the SX hybrid is retained as a RESEARCH ARTIFACT: built DIRECTLY (never through the production
+    # catalog) it is still deterministic + content-hash-verifiable.
     assert demo_tape.TAPE_REF == "txline-mm-18213979-v1"
-    assert demo_tape.TAPE_REF in sf.MM_TAPE_CATALOG
-    tape = sf.default_mm_tape_resolver(demo_tape.TAPE_REF)
+    tape = demo_tape.build_txline_mm_tape()
     assert isinstance(tape, sf.MakerReplayTape)
     assert tape.tape_ref == demo_tape.TAPE_REF
-    # the pinned hash equals a fresh recomputation (what reconstruct_mm_session step 7 enforces).
+    # the pinned hash equals a fresh recomputation (the tape's self-consistency property).
     assert tape.content_hash == sf.compute_tape_content_hash(tape.events)
     # deterministic: a rebuild reproduces the identical content hash.
     assert demo_tape.build_txline_mm_tape().content_hash == tape.content_hash
+
+
+def test_sx_key_is_deregistered_from_production_catalog() -> None:
+    # OPTION_2 deregistration: the SX key was removed from MM_TAPE_CATALOG — the deployability
+    # allowlist — so it is NO LONGER production-resolvable (an authenticated caller cannot deploy it).
+    assert demo_tape.TAPE_REF not in sf.MM_TAPE_CATALOG
+    with pytest.raises(sf.MMTapeNotFoundError):
+        sf.default_mm_tape_resolver(demo_tape.TAPE_REF)
+
+
+def test_production_catalog_contains_pmxt_excludes_sx() -> None:
+    # regression: the production catalog banks ONLY the reviewed PMXT demo tape; the deregistered SX
+    # hybrid is excluded. The catalog IS the deployability allowlist.
+    assert pmxt_tape.TAPE_REF in sf.MM_TAPE_CATALOG
+    assert demo_tape.TAPE_REF not in sf.MM_TAPE_CATALOG
 
 
 def test_unknown_ref_still_fails_closed() -> None:
@@ -168,73 +174,9 @@ def test_provenance_matches_fixture_registry_and_is_in_play() -> None:
     assert 40 < minutes_in < 60  # first-half in-play window (~51'), not pre-match
 
 
-# --- (5, full pipeline) deploy through the catalog -> OPS + dry-run receipt with attempted leg -
-
-
-def _mm_payload(**overrides: Any) -> dict[str, Any]:
-    payload: dict[str, Any] = {
-        "template_id": "quoteguard-mm-template",
-        "agent_id": "studio-mm-agent",
-        "strategy": "quoteguard-mm",
-        "source_mode": "replay",
-        "execution_mode": "dry_run",
-        "market_allowlist": [demo_tape.TOKEN_ID],
-        "venue_allowlist": ["sx"],
-        "min_edge_bps": 10,
-        "max_stake": 5.0,
-        "mm": {"tape_ref": demo_tape.TAPE_REF, "guard_enabled": False},
-    }
-    payload.update(overrides)
-    return payload
-
-
-def _transport(app: FastAPI) -> httpx.AsyncClient:
-    return httpx.AsyncClient(transport=ASGITransport(app=app), base_url="http://test")
-
-
-async def _drain(app: FastAPI) -> None:
-    tasks = list(getattr(app.state, "deploy_background_tasks", set()))
-    if tasks:
-        await asyncio.gather(*tasks, return_exceptions=True)
-
-
-def _receipt_events(events: list[RuntimeEvent]) -> list[RuntimeEvent]:
-    return [e for e in events if e.type == RuntimeEventType.TOOL_CALL and "legs" in e.payload]
-
-
-@pytest.mark.asyncio
-async def test_deploy_through_catalog_produces_ops_and_attempted_receipt() -> None:
-    from veridex.store import InMemoryStore
-
-    events: list[RuntimeEvent] = []
-    store = InMemoryStore()
-    app = FastAPI()
-    # mm_tape_resolver=None -> resolves THROUGH the production catalog; mm_seed_state=None -> the tape
-    # SELF-WARMS from the default cold seed (the demo's real, no-injected-seed path).
-    deps = DeployDeps(
-        anchor_fn=None,
-        mm_tape_resolver=None,
-        mm_proposer=OfflineRecordingProposer(),
-        mm_seed_state=None,
-    )
-    register_deploy_routes(
-        app,
-        store=store,
-        settings=Settings(AUTH_MODE="dev"),
-        deploy_deps=deps,
-        runtime_event_sink=events.append,
-    )
-    async with _transport(app) as client:
-        resp = await client.post("/agents/deploy", json=_mm_payload())
-    assert resp.status_code == 200, resp.text
-    body = resp.json()
-    await _drain(app)
-
-    instance = await store.get_agent_instance(body["instance_id"])
-    assert instance.status == DeployStatus.SEALED, instance.last_failure_reason
-    assert events, "expected OPS telemetry"
-    receipts = _receipt_events(events)
-    assert receipts, "replay+dry_run over the self-warming tape must produce >= 1 dry-run receipt"
-    assert any(
-        leg.get("attempted") for e in receipts for leg in e.payload.get("legs", [])
-    ), "the self-warming tape must produce >= 1 ATTEMPTED leg once warm"
+# --- deregistration note ------------------------------------------------------------------------
+# The prior `test_deploy_through_catalog_produces_ops_and_attempted_receipt` exercised a full deploy
+# that resolved the SX tape THROUGH the production catalog (`mm_tape_resolver=None`). It was REMOVED
+# with the OPTION_2 deregistration: production catalog admission of the SX key is no longer a valid
+# acceptance criterion (the key is deregistered). The self-warming fold-from-cold-seed behaviour it
+# also touched is covered directly by `test_tape_self_warms_from_cold_state_and_quotes_or_abstains`.

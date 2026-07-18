@@ -10,15 +10,16 @@ adapter or receipt proposer ever runs. The 9-step chain is documented on
 
 The tape and the dry-run proposer arrive through an INJECTABLE, SERVER-SIDE seam (mirrors
 `veridex.api.deploy.DeployDeps`) — never a request field. The production tape catalog
-(`MM_TAPE_CATALOG`) banks exactly ONE entry — `txline-mm-18213979-v1`, the `fu-ii5-demo-tape`
-follow-up — a HYBRID tape of VERBATIM recorded SX Bet in-play order-book + TxLINE fair-value rows (FIFA
-World Cup Norway v England, fixture 18213979, ~51' in-play) with deterministically-set orchestration
-scaffolding (see
-`veridex.mm_strategy.demo_tape` for the full field-provenance table). Its content hash is re-verified at
-resolve time; it is SELF-WARMING (the deploy's default cold seed folds its real warmup prefix — no
-injected seed). Every OTHER `tape_ref` still fails closed: `default_mm_tape_resolver` raises a clear,
-honest error naming the missing catalog entry — it NEVER fabricates a tape. Tests / operators may still
-inject a real tape through `DeployDeps.mm_tape_resolver`.
+(`MM_TAPE_CATALOG`) banks exactly ONE reviewed entry — `pmxt-txline-mm-18209181-v1`, the
+provenance-correct REAL-DATA tape (REAL Polymarket 10-level depth + REAL TxLINE 1X2 fair value, France v
+Morocco fixture 18209181 — see `veridex.mm_strategy.pmxt_tape`), banked by `_register_pmxt_txline_tape()`.
+This is the Studio demo path. Its content hash is re-verified at resolve time; it is SELF-WARMING (the
+deploy's default cold seed folds its real warmup prefix — no injected seed). The parked SX hybrid
+`txline-mm-18213979-v1` (`veridex.mm_strategy.demo_tape`) is DEREGISTERED — retained as an isolated
+research artifact, it is NOT banked and NOT production-resolvable. Every OTHER `tape_ref` still fails
+closed: `default_mm_tape_resolver` raises a clear, honest error naming the missing catalog entry — it
+NEVER fabricates a tape. Tests / operators may still inject a real tape through
+`DeployDeps.mm_tape_resolver`.
 """
 
 from __future__ import annotations
@@ -34,7 +35,6 @@ from typing import TYPE_CHECKING, Any
 from veridex.deploy.preflight import DeployConfig, MakerDeployConfig
 from veridex.dust_execution.manifest import StrategyExperimentManifest
 from veridex.live_recorder.contracts import LiveRecorderSessionMeta
-from veridex.mm_strategy import demo_tape
 from veridex.mm_strategy.composition import MakerInstanceConfig
 from veridex.mm_strategy.config import StrategyConfig
 from veridex.mm_strategy.contracts import StrategyState
@@ -145,18 +145,17 @@ def compute_tape_content_hash(events: tuple[Any, ...]) -> str:
     return hashlib.sha256(serialize_payload(rows).encode("utf-8")).hexdigest()
 
 
-#: The production tape catalog. Two distinct, immutable keys with visible provenance:
-#:  - `txline-mm-18213979-v1` — the parked `fu-ii5-demo-tape` SX HYBRID (real recorded SX book +
-#:    TxLINE fair-value rows + derived session metadata — see `veridex.mm_strategy.demo_tape`).
+#: The production tape catalog — the deployability allowlist. Banks exactly ONE reviewed, immutable key
+#: with visible provenance:
 #:  - `pmxt-txline-mm-18209181-v1` — the provenance-correct REAL-DATA tape (REAL Polymarket 10-level
 #:    depth + REAL TxLINE 1X2 fair value, France v Morocco fixture 18209181 — see
 #:    `veridex.mm_strategy.pmxt_tape`), added by `_register_pmxt_txline_tape()` below. This is the
 #:    Studio demo path.
-#: Each tape's content hash is re-verified at resolve time (step 7 of `reconstruct_mm_session`). Any
-#: other key fails closed.
-MM_TAPE_CATALOG: dict[str, Callable[[], MakerReplayTape]] = {
-    demo_tape.TAPE_REF: demo_tape.build_txline_mm_tape,
-}
+#: The parked SX hybrid `txline-mm-18213979-v1` (`veridex.mm_strategy.demo_tape`) is DEREGISTERED —
+#: retained as an isolated research artifact, it is NOT banked here and NOT production-resolvable.
+#: The banked tape's content hash is re-verified at resolve time (step 7 of `reconstruct_mm_session`).
+#: Any other key fails closed.
+MM_TAPE_CATALOG: dict[str, Callable[[], MakerReplayTape]] = {}
 
 
 def _register_pmxt_txline_tape() -> None:
@@ -174,14 +173,16 @@ def default_mm_tape_resolver(tape_ref: str) -> MakerReplayTape:
     """Resolve `tape_ref` against the production catalog — fails CLOSED, never fabricates a tape.
 
     Raises:
-        MMTapeNotFoundError: `tape_ref` has no catalog entry (today: always, until `fu-ii5-demo-tape`
-            bank a verified production tape).
+        MMTapeNotFoundError: `tape_ref` has no entry in the production catalog (which banks the
+            reviewed `pmxt-txline-mm-18209181-v1` real-data tape). Callers may inject
+            `DeployDeps.mm_tape_resolver` to supply a different tape.
     """
     factory = MM_TAPE_CATALOG.get(tape_ref)
     if factory is None:
         raise MMTapeNotFoundError(
             f"no production replay tape banked for tape_ref={tape_ref!r} "
-            "(fu-ii5-demo-tape is the tracked follow-up; inject DeployDeps.mm_tape_resolver to supply one)"
+            "(the production catalog banks the reviewed pmxt-txline-mm-18209181-v1 tape and fails "
+            "closed on any other key; inject DeployDeps.mm_tape_resolver to supply one)"
         )
     return factory()
 
