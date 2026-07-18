@@ -35,6 +35,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from veridex.ingest.marketstate import MarketState
+from veridex.law.recompute import REPLAY, recompute
 from veridex.runtime.llm_checkpoint import (
     AWAITING_CONFIRMATION,
     COMPLETED_FRESH,
@@ -63,6 +64,17 @@ from veridex.strategies.sharp_stats import logit
 #: Stable contestant identifiers (folded into every emitted event and the report rows).
 DET_DRIFT_CONTESTANT = "det-drift"
 LLM_DRIFT_CONTESTANT = "llm-drift"
+
+
+class ArenaDrainError(RuntimeError):
+    """Fail-closed non-convergence: the end-of-tape drain could NOT settle the final in-flight LLM
+    call to an audited terminal outcome within the bounded confirmation window.
+
+    Raised rather than returning a comparison report that would falsely claim every physical model
+    call reached a terminal outcome while one remains occupied/unaudited (the one-call
+    terminal-accounting guarantee, addendum §3). A provider handle that delays or suppresses
+    cancellation confirmation triggers this instead of a silent "complete" report.
+    """
 
 
 # ---------------------------------------------------------------------------
@@ -342,6 +354,11 @@ class ArenaComparison:
 
         self.events: list[ArenaCheckpointEvent] = []
         self._fixture_ids: set[int] = set()
+        # Retain the replay tape so scoreability can be established through the DETERMINISTIC LAW
+        # (recompute) — a decision is bound to the entry snapshot at its checkpoint ts and the final
+        # closing snapshot, NOT judged by a bare truthy market_key/side (M2).
+        self._marketstates: list[MarketState] = []
+        self._state_by_ts: dict[int, MarketState] = {}
 
     # --- per-tick drive ----------------------------------------------------
 
@@ -350,6 +367,9 @@ class ArenaComparison:
         ts = int(getattr(market_state, "ts", 0))
         self._clock.set(ts)
         self._fixture_ids.add(int(getattr(market_state, "fixture_id", 0)))
+        # Record the tape for law-based scoreability (entry-by-ts + closing = last snapshot).
+        self._marketstates.append(market_state)
+        self._state_by_ts[ts] = market_state
 
         proj = self.projector.project(market_state)  # THE ONE shared projection this tick
         snapshot = proj.snapshot if proj is not None else None
@@ -504,6 +524,16 @@ class ArenaComparison:
             if outcome.status in (CONFIRMED_TERMINATED, COMPLETED_STALE, FAILED) or not self._guard.busy:
                 return
             await asyncio.sleep(0)
+        # FAIL CLOSED — after the bounded confirmation window the guard is STILL busy: the physical
+        # model call never confirmed termination (a cancellation-resistant / stalled provider handle).
+        # Raising here (rather than returning) prevents a comparison report that would falsely claim
+        # every physical call reached a terminal outcome while one remains occupied/unaudited.
+        if self._guard.busy:
+            raise ArenaDrainError(
+                "arena drain did not converge: the final in-flight LLM call "
+                f"(evidence {self._guard.evidence_coordinate()!r}) never confirmed termination "
+                f"within the bounded window (max_yields={max_yields})"
+            )
 
     # --- audit-trail readers ----------------------------------------------
 
@@ -520,21 +550,37 @@ class ArenaComparison:
         """A decision event that emitted a NON-WAIT action (regardless of whether it is scoreable)."""
         return e.kind == "decision" and e.action_type != SportsActionType.WAIT.value
 
-    @staticmethod
-    def _is_scoreable(e: ArenaCheckpointEvent) -> bool:
-        """Whether a decision event is a SCOREABLE decision — AUTHORITATIVE, not a bare non-WAIT count.
+    def _is_scoreable(self, e: ArenaCheckpointEvent) -> bool:
+        """Whether a decision event is a SCOREABLE decision — AUTHORITATIVE via the DETERMINISTIC LAW.
 
-        A non-WAIT action is scoreable ONLY when it names a valid ``(market_key, side)`` target the law
-        can actually score against a closing snapshot. A schema-valid but law-invalid non-WAIT (empty
-        params / missing market or side) is NOT scoreable — counting it would overstate a contestant's
-        usable actions and collapse the required actions-vs-scoreable distinction (addendum §3).
+        A non-WAIT action is scoreable ONLY when the deterministic law (:func:`recompute`) can actually
+        score it: its ``(market_key, side)`` target must EXIST in the entry snapshot (unsuspended, side
+        present) AND have a valid closing snapshot. A schema-valid but law-invalid non-WAIT — empty
+        params (``market_key``/``side`` missing), an INVENTED coordinate absent from the entry snapshot
+        (``entry_market_absent``), a suspended market, a missing side, or a market lacking a valid
+        closing — is NOT scoreable. A bare ``bool(market_key) and bool(side)`` truthy check would count
+        invented nonempty coordinates as authoritative, overstating a contestant's usable actions and
+        collapsing the required actions-vs-scoreable distinction (addendum §3, Codex M2).
+
+        The decision is bound to the entry snapshot at its ``checkpoint_ts`` and the FINAL tape snapshot
+        as the closing line, then scored in ``replay`` mode (the arena replays a completed fixture, so a
+        missing closing is genuinely invalid). ``actions`` (the raw non-WAIT count) is tallied SEPARATELY
+        and is unaffected by this check.
         """
-        return (
-            e.kind == "decision"
-            and e.action_type != SportsActionType.WAIT.value
-            and bool(e.market_key)
-            and bool(e.side)
-        )
+        if e.kind != "decision" or e.action_type == SportsActionType.WAIT.value:
+            return False
+        entry = self._state_by_ts.get(e.checkpoint_ts)
+        closing = self._marketstates[-1] if self._marketstates else None
+        if entry is None or closing is None:
+            # No entry/closing evidence to score against → cannot establish law-validity → fail closed.
+            return False
+        try:
+            action_type = SportsActionType(e.action_type) if e.action_type is not None else SportsActionType.WAIT
+        except ValueError:
+            return False
+        action = AgentAction(type=action_type, params={"market_key": e.market_key, "side": e.side})
+        verdict = recompute(entry, action, closing=closing, source_mode=REPLAY)
+        return bool(verdict["valid"])
 
     def _tallies(self, contestant: str) -> dict[str, int]:
         eligible = len(self.opportunities(contestant))

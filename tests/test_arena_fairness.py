@@ -24,6 +24,8 @@ from __future__ import annotations
 
 from typing import Any
 
+import pytest
+
 from veridex.ingest.marketstate import MarketState
 from veridex.runtime.arena_comparison import (
     DET_DRIFT_CONTESTANT,
@@ -57,7 +59,14 @@ class FakeCallHandle:
         return self._done
 
     def cancel(self) -> None:
-        pass
+        # A WELL-BEHAVED handle confirms termination once cancelled — mirroring a real
+        # ``asyncio.Task`` that becomes done+cancelled after the loop processes the cancel. This is
+        # what lets the end-of-tape drain settle a launched-but-never-completed call to an AUDITED
+        # terminal outcome (CONFIRMED_TERMINATED) rather than leaving it silently in flight. A
+        # cancellation-RESISTANT handle (whose ``cancel`` never confirms) is modelled separately
+        # (``_CancelResistantHandle``) to exercise the fail-closed drain path.
+        self._cancelled = True
+        self._done = True
 
     def cancelled(self) -> bool:
         return self._cancelled
@@ -387,6 +396,41 @@ async def test_scoreable_decisions_excludes_law_invalid_non_wait_actions() -> No
     assert report.scoreable_decisions == det["scoreable_decisions"]
 
 
+async def test_scoreable_decisions_excludes_law_invalid_nonexistent_market() -> None:
+    """MAJOR 2 (Codex narrow re-gate) — a schema-valid but LAW-INVALID non-WAIT naming a coordinate
+    that does NOT EXIST in the entry snapshot (``NO_SUCH_MARKET``/``NO_SUCH_SIDE``) is NOT scoreable.
+
+    The prior fix only excluded EMPTY params (falsy ``market_key``/``side``). Codex reproduced the
+    remaining half: ``FOLLOW_MOMENTUM`` with NONEMPTY-but-invented strings passed the bare truthy
+    check and was counted authoritative. ``scoreable_decisions`` must instead run the deterministic
+    law (``recompute`` -> ``entry_market_absent``), never a ``bool(market_key) and bool(side)`` count.
+    """
+    from veridex.runtime.schemas import AgentAction, SportsActionType
+
+    tape = _rising_tape()  # the only market on this tape is "M"
+    invented = AgentAction(
+        type=SportsActionType.FOLLOW_MOMENTUM,
+        params={"market_key": "NO_SUCH_MARKET", "side": "NO_SUCH_SIDE"},
+    )
+    arena = await run_arena_comparison(tape, model=_DoneLauncher(invented), det_policy=_policy(), **_DET_KW)
+    report = arena.report()
+
+    llm = report.contestants[LLM_DRIFT_CONTESTANT]
+    assert llm["actions"] >= 1, "the LLM emitted at least one non-WAIT action"
+    assert llm["scoreable_decisions"] == 0, (
+        "a non-WAIT naming a market absent from the entry snapshot is NOT scoreable "
+        "(the law returns entry_market_absent)"
+    )
+
+    # det-Drift names a REAL coordinate ("M"/"home") present + unsuspended in entry AND closing → law-valid.
+    det = report.contestants[DET_DRIFT_CONTESTANT]
+    assert det["actions"] >= 1
+    assert det["scoreable_decisions"] == det["actions"]
+
+    # The authoritative run-level total excludes the invented LLM coordinate.
+    assert report.scoreable_decisions == det["scoreable_decisions"]
+
+
 # ---------------------------------------------------------------------------
 # MAJOR 3 RED — replay yields to a real async model task + drains the guard at end-of-tape
 # ---------------------------------------------------------------------------
@@ -441,6 +485,60 @@ async def test_replay_settles_async_model_call_and_drains_guard() -> None:
     llm = arena.report().contestants[LLM_DRIFT_CONTESTANT]
     assert llm["actions"] >= 1, "the async model task must complete and produce a decision (not all-WAIT)"
     assert arena.guard_busy is False, "end-of-tape drain must leave no call unobserved / in flight"
+
+
+class _CancelResistantHandle:
+    """A pathological handle that NEVER confirms termination: ``cancel()`` is a true no-op, ``done()``
+    stays ``False`` forever, ``cancelled()`` stays ``False``. Models a provider task that delays or
+    suppresses cancellation confirmation — the guard can request cancel but can never observe it land."""
+
+    def done(self) -> bool:
+        return False
+
+    def cancel(self) -> None:
+        pass  # never confirms — done()/cancelled() stay False
+
+    def cancelled(self) -> bool:
+        return False
+
+    def exception(self) -> BaseException | None:
+        return None
+
+    def result(self) -> object:
+        return None
+
+
+class _CancelResistantLauncher:
+    """A model seam whose every launch returns a cancellation-resistant handle."""
+
+    def launch(self, prompt: str) -> _CancelResistantHandle:
+        return _CancelResistantHandle()
+
+
+async def test_drain_fails_closed_when_cancellation_never_confirms() -> None:
+    """MAJOR 3 (Codex narrow re-gate) — after the bounded confirmation window the drain must FAIL
+    CLOSED (raise) if a physical call is STILL in flight, never return a "complete" report while the
+    guard is busy.
+
+    Codex reproduced the still-open defect: a valid handle whose ``cancel()`` does not confirm
+    termination made ``await arena.drain(max_yields=1)`` return NORMALLY with ``guard_busy is True`` —
+    a completed arena/report while a physical model call remained occupied and unaudited. The drain
+    must instead raise an explicit non-convergence error. (The normal ``asyncio.Task`` completion path
+    still drains cleanly — asserted by ``test_replay_settles_async_model_call_and_drains_guard``.)
+    """
+    from veridex.runtime.arena_comparison import ArenaComparison, ArenaDrainError
+
+    tape = _rising_tape()
+    arena = ArenaComparison(model=_CancelResistantLauncher(), det_policy=_policy(), **_DET_KW)
+    for ms in tape:
+        await arena.step(ms)
+
+    # A physical LLM call was launched on the first checkpoint and never completes.
+    assert arena.guard_busy is True
+
+    # After the bounded window the call is STILL in flight → drain fails closed (does NOT return).
+    with pytest.raises(ArenaDrainError):
+        await arena.drain(max_yields=1)
 
 
 # ---------------------------------------------------------------------------

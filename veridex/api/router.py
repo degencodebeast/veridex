@@ -107,18 +107,21 @@ from veridex.execution.runner import resolve_approval
 from veridex.explainer import GLOSSARY_DEFINITIONS, explain_proof
 from veridex.ingest.feed_health import feed_health
 from veridex.leaderboard import leaderboard as _build_leaderboard
+from veridex.runtime.arena_comparison import run_arena_comparison
 from veridex.runtime.competition import (
     DEFAULT_CLUSTER,
     SCHEMA_VERSIONS,
     read_path_check_block,
     run_demo_competition,
 )
+from veridex.runtime.llm_checkpoint import CheckpointPolicy
 from veridex.runtime.orchestrator import deterministic_agent
 from veridex.runtime.runtime_events import RuntimeEvent, RuntimeEventType
 from veridex.runtime.runtime_store import DurableRuntimeEventStore
 from veridex.runtime.window import RunWindow
 from veridex.scoring import score_run
 from veridex.store import InMemoryStore, Store
+from veridex.strategies.llm_drift import default_model_launcher
 from veridex.venues.sx_bet import FakeVenueAdapter, SXBetAdapter
 from veridex.verifier.proof_card import proof_card_from_run_result
 from veridex.verifier.recompute import verify_run as _verify_run_core
@@ -220,6 +223,7 @@ def create_app(
     settings: Settings | None = None,
     runtime_events: DurableRuntimeEventStore | None = None,
     deploy_deps: DeployDeps | None = None,
+    arena_model_launcher: Any | None = None,
 ) -> FastAPI:
     """Create the Veridex demo FastAPI application.
 
@@ -252,6 +256,12 @@ def create_app(
     )
     # I-1 Privy auth boundary reused for the owner-scoped drawer route (instance owner == principal.did).
     require_principal = make_require_principal(resolved_settings)
+    # II-9 arena model seam: the owner-scoped arena endpoint drives det-Drift vs LLM-Drift over this
+    # launcher. Defaults to the lazy production Agno launcher (agno-free at import; a network call
+    # happens only on ``launch``); tests inject a hand-controlled offline fake so no LLM/network runs.
+    resolved_arena_model_launcher: Any = (
+        arena_model_launcher if arena_model_launcher is not None else default_model_launcher()
+    )
 
     @contextlib.asynccontextmanager
     async def _lifespan(app_: FastAPI) -> AsyncIterator[None]:
@@ -1042,6 +1052,64 @@ def create_app(
             status=finalized.status.value,
             run_id=finalized.run_id,
         )
+
+    # --- POST /competitions/{competition_id}/arena ------------------------
+
+    @app.post("/competitions/{competition_id}/arena")
+    async def run_competition_arena_endpoint(
+        competition_id: str,
+        principal: PrivyPrincipal = Depends(require_principal),  # noqa: B008
+        dep_store: Store = Depends(_get_store),  # noqa: B008
+    ) -> dict[str, Any]:
+        """Run the II-9 checkpointed det-Drift vs LLM-Drift arena comparison for an OWNED competition.
+
+        This is the AUTHENTICATED, owner-scoped surface that makes the II-9 fairness/accounting payload
+        REACHABLE and OBSERVABLE over HTTP (Codex M1). It is deliberately SEPARATE from the legacy
+        unauthenticated ``POST /demo/run`` (an offline deterministic/contrarian demo — the wrong roster
+        and authority surface) and does not perturb the golden ``POST /start`` scored lifecycle.
+
+        Auth (fail-closed, AC-27/AC-29 preserved): an anonymous caller is refused 401 (``require_principal``
+        rejects a missing/invalid Privy bearer BEFORE any work), and only the Privy competition OWNER may
+        run it (``_require_competition_owner`` → 403 for a non-owner or an unowned/legacy competition). An
+        unknown competition is 404.
+
+        The comparison drives det-Drift AND LLM-Drift at the SAME pinned checkpoints from the SAME shared
+        snapshot over the bundled demo tape, using the injected offline-testable model launcher
+        (``arena_model_launcher``; the lazy production Agno launcher by default). The response carries the
+        HONEST :class:`~veridex.runtime.arena_comparison.ArenaComparisonReport` payload — eligible
+        checkpoints, per-contestant actions-vs-WAITs, AUTHORITATIVE scoreable decisions, fixture count,
+        clustered uncertainty, and the identical-opportunity flag — NEVER a bare average CLV (addendum §3).
+
+        Args:
+            competition_id: The owned competition to run the arena comparison for.
+            principal: The authenticated Privy principal (injected by ``require_principal``; 401 if absent).
+            dep_store: Injected store dependency.
+
+        Returns:
+            A JSON object ``{"competition_id", "arena_comparison"}`` where ``arena_comparison`` is the
+            honest report payload (never ``None``).
+
+        Raises:
+            HTTPException: 404 (unknown competition), 401 (anonymous), 403 (non-owner / unowned).
+        """
+        try:
+            competition = await dep_store.get_competition(competition_id)
+        except KeyError:
+            raise HTTPException(status_code=404, detail=f"competition {competition_id!r} not found") from None
+
+        # Owner-scoping (fail-closed): only the Privy owner may run their competition's arena comparison
+        # (a non-owner or an unowned/legacy competition is refused 403 — mirror the start/kill lifecycle).
+        _require_competition_owner(competition, principal.did)
+
+        # Drive the checkpointed det-Drift vs LLM-Drift comparison over the demo tape. det-Drift and
+        # LLM-Drift are the arena's two intrinsic contestants (§3); the roster declares them and the
+        # comparison is produced HERE (not a test-harness leaf), then exposed over HTTP.
+        ticks = build_demo_ticks()
+        det_policy = CheckpointPolicy(cadence_s=1.0, evidence_age_limit_s=100_000.0)
+        arena = await run_arena_comparison(
+            ticks, model=resolved_arena_model_launcher, det_policy=det_policy
+        )
+        return {"competition_id": competition_id, "arena_comparison": arena.report().to_payload()}
 
     # --- GET /competitions/{competition_id} -------------------------------
 
