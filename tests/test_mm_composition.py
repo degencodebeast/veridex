@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import dataclasses
 import importlib
 import inspect
 from dataclasses import dataclass, field
@@ -31,6 +32,8 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
 
 from tests.mm_strategy_ablation_harness import (
     arm_configs,
@@ -44,17 +47,21 @@ from tests.test_mm_strategy_adapter import (
     _result,
 )
 from tests.test_mm_strategy_integration import _session_meta, _warm_seed_state
+from veridex.api.maker_router import build_live_ab_projection, register_maker_routes
 from veridex.dust_execution.facade import (
     MMExecutionToolRequest,
     MMExecutionToolResult,
     propose_mm_execution,
 )
 from veridex.mm_strategy.composition import (
+    GUARD_ABLATION_LABEL,
     MakerInstanceConfig,
     ModeRejectedError,
     SessionSummary,
+    run_guard_ablation,
     run_market_maker,
 )
+from veridex.mm_strategy.contracts import StrategyState
 from veridex.mm_strategy.orchestration import FacadeDeps, StopSignal
 from veridex.runtime.runtime_events import RuntimeEvent, RuntimeEventType
 
@@ -518,3 +525,239 @@ def test_facade_deps_bound_matches_propose_mm_execution_signature() -> None:
     assert bound_keys <= params, f"bound() supplies non-parameters: {sorted(bound_keys - params)}"
     # Non-vacuous: bound() actually threads the session authorities.
     assert {"manifest", "envelope", "adapter", "signer"} <= bound_keys
+
+
+# =====================================================================================
+# II-3 — the guard ON/OFF biting beat: a JUDGE-FACING behavior ABLATION (NOT a rank).
+# =====================================================================================
+# ``run_guard_ablation`` runs ``run_market_maker`` TWICE on the SAME pinned tape — the SAME strategy
+# with the guard OFF then ON (only the guard arm differs) — and returns the two arms' decision streams
+# + the pinned-frame divergence. It DEMONSTRATES that TxLINE changes maker behavior; it EMITS NO rank /
+# toxicity / performance ordering / winner (that would be a false-edge honesty violation, conflating a
+# behavior-change with the sealed HISTORICAL maker leaderboard). Reuses the E6 divergence fixtures.
+
+#: Field/key names that would smuggle a rank / performance ordering into the honest ablation surface. The
+#: ablation carries the two arms' BEHAVIOR (decisions) + divergence ONLY — never any of these.
+_BANNED_RANK_TOKENS = (
+    "rank",
+    "toxic",
+    "winner",
+    "ordering",
+    "score",
+    "leaderboard",
+    "edge",
+    "pnl",
+    "clv",
+    "better",
+    "worst",
+    "best",
+)
+
+
+def _control_overrides() -> dict[str, Any]:
+    """The E6 control overrides: compact warmup so the guard is genuinely LIVE by the trigger frame.
+
+    ``ref_min_samples=2`` / ``basis_min_samples=2`` let the 4-tick canned divergence tapes warm BOTH
+    the venue references and the guarded basis, so arm B really saw a fair value at the trigger.
+    ``guard_enabled`` is NOT set here — :func:`run_guard_ablation` flips ONLY that knob between the arms.
+    """
+    return {**load_base_config_overrides(), "ref_min_samples": 2, "basis_min_samples": 2}
+
+
+def _ablation_cfg(*, session_dir: Path, arm: Any) -> MakerInstanceConfig:
+    """A maker instance bound to ``arm`` from a FRESH ``StrategyState`` seed (the E6 replay_arm idiom).
+
+    The divergence tapes carry their own byte-identical warmup prefix and warm the references from cold
+    under the control overrides, so the seed MUST be a fresh ``StrategyState()`` (a warm seed would
+    pre-warm the references and change the warmup disposition). ``run_guard_ablation`` derives BOTH arms
+    from this one config by flipping ``guard_enabled`` — the arm passed here is only the base strategy.
+    """
+    manifest = _pinned_manifest()
+    envelope = _pinned_envelope()
+    deps = _make_deps(manifest, envelope, _RecordingProposer(), _ListFreezeSink())
+    return MakerInstanceConfig(
+        strategy_config=arm,
+        request_config=_pinned_config(),
+        manifest=manifest,
+        envelope=envelope,
+        facade_deps=deps,
+        seed_state=StrategyState(),
+        session_meta_factory=lambda tape: _session_meta(arm, tape.identity.fixture_id),
+        session_dir=session_dir,
+        agent_id="mm-ablation-test",
+        run_id="run-1",
+        session_id="sess-1",
+    )
+
+
+def _collect_keys(obj: Any) -> set[str]:
+    """Every mapping KEY reachable in a (possibly nested) JSON-ish structure (dicts/lists)."""
+    keys: set[str] = set()
+    if isinstance(obj, dict):
+        for key, value in obj.items():
+            keys.add(key)
+            keys |= _collect_keys(value)
+    elif isinstance(obj, (list, tuple)):
+        for value in obj:
+            keys |= _collect_keys(value)
+    return keys
+
+
+# --- RED #1 — the guard flip CHANGES the decision on the pinned adversarial trigger frame ------
+
+
+@pytest.mark.parametrize(
+    "health,on_kind,on_reasons",
+    [
+        ("divergence_extreme", "NO_QUOTE", ("residual_extreme",)),
+        ("divergence_pull", "QUOTE_ONE_SIDED", ("residual_pull_ask",)),
+        ("divergence_stale", "NO_QUOTE", ("txline_stale",)),
+    ],
+)
+def test_guard_flip_changes_decision(
+    tmp_path: Path, health: str, on_kind: str, on_reasons: tuple[str, ...]
+) -> None:
+    """Guard OFF vs ON diverge on the PINNED trigger frame ONLY; the quiescent warmup stretch matches.
+
+    The SAME strategy on the SAME pinned tape, guard OFF then ON, produces a DIFFERENT decision on the
+    last (pinned adversarial) frame — arm A is FV-blind and quotes both sides, arm B takes the guarded
+    action. The divergence is asserted ONLY on that pinned frame (the warmup prefix is byte-identical):
+    honest — a behavior-change on the trigger, never a promise the guard always changes the decision.
+    Zero wire primitives (``replay`` mode; no dry-run bridge, no placement).
+    """
+    arm = arm_configs(_control_overrides()).baseline
+    cfg = _ablation_cfg(session_dir=tmp_path / "sess", arm=arm)
+    result = asyncio.run(
+        run_guard_ablation(cfg, load_tape(health), mode="replay", event_sink=[].append)
+    )
+
+    off = result.guard_off.decisions
+    on = result.guard_on.decisions
+    # The two arms folded the SAME tape → the same frame count (a real, non-trivial stream).
+    assert len(off) == len(on) >= 2, health
+    assert result.guard_off.guard_enabled is False and result.guard_on.guard_enabled is True
+
+    # Divergence is EXACTLY the pinned trigger frame (the last tick) — the warmup prefix is identical.
+    pinned = len(off) - 1
+    assert result.divergent_frame_indices == (pinned,), health
+    assert result.diverges is True
+
+    # The pinned frame: arm A (guard OFF) quotes BOTH sides; arm B (guard ON) takes the guarded action.
+    assert off[pinned].kind == "QUOTE_TWO_SIDED" and off[pinned].reason_codes == (), health
+    assert on[pinned].kind == on_kind, health
+    assert on[pinned].reason_codes == on_reasons, health
+
+    # Honest: divergence is NOT promised globally — every warmup frame's substance matches across arms.
+    for i in range(pinned):
+        assert off[i].kind == on[i].kind, (health, i)
+        assert off[i].reason_codes == on[i].reason_codes, (health, i)
+
+
+def test_guard_flip_leaves_quiescent_tape_identical(tmp_path: Path) -> None:
+    """Honesty counterweight: on a no-trigger tape the guard (genuinely LIVE) changes NOTHING.
+
+    The quiescent tape keeps the guard ON and fresh but the FV agrees with the venue mid (residual 0),
+    so the guard fires on nothing — the two arms' decisions match and there is NO divergence frame. This
+    is why divergence is only ever asserted on the pinned adversarial fixture, never promised globally.
+    """
+    arm = arm_configs(_control_overrides()).baseline
+    cfg = _ablation_cfg(session_dir=tmp_path / "sess", arm=arm)
+    result = asyncio.run(
+        run_guard_ablation(cfg, load_tape("quiescent"), mode="replay", event_sink=[].append)
+    )
+
+    assert result.divergent_frame_indices == ()
+    assert result.diverges is False
+    # Non-vacuous: the guard arm was genuinely live (it saw a fair value) yet changed nothing.
+    assert result.guard_on.guard_enabled is True and result.guard_off.guard_enabled is False
+    assert len(result.guard_on.decisions) >= 2
+    assert any(d.kind == "QUOTE_TWO_SIDED" for d in result.guard_on.decisions)
+
+
+# --- RED #2 — the ablation result + the /maker/live-ab projection emit NO rank -----------------
+
+
+def test_ablation_result_and_projection_emit_no_rank(tmp_path: Path) -> None:
+    """The ``GuardAblationResult`` + the ``/maker/live-ab`` projection carry NO rank/ordering/winner.
+
+    This is the make-or-break honesty rule: the ablation demonstrates a BEHAVIOR change (guard on vs
+    off), never a maker ranking / performance ordering / proven edge. Asserted structurally — no field
+    or JSON key anywhere on the result or its projection names a rank/toxicity/ordering/edge/winner.
+    """
+    arm = arm_configs(_control_overrides()).baseline
+    cfg = _ablation_cfg(session_dir=tmp_path / "sess", arm=arm)
+    result = asyncio.run(
+        run_guard_ablation(cfg, load_tape("divergence_extreme"), mode="replay", event_sink=[].append)
+    )
+
+    # (a) the result dataclass (and the SessionSummary arms it carries) expose NO rank-bearing field.
+    field_names = {f.name for f in dataclasses.fields(result)}
+    field_names |= {f.name for f in dataclasses.fields(result.guard_off)}
+    field_names |= {f.name for f in dataclasses.fields(result.guard_on)}
+    for name in field_names:
+        assert not any(tok in name.lower() for tok in _BANNED_RANK_TOKENS), name
+
+    # It is LABELED a behavior ablation (guard on vs off), never a winner/ranking.
+    assert result.ablation_label == GUARD_ABLATION_LABEL
+    assert "ablation" in GUARD_ABLATION_LABEL
+
+    # (b) the /maker/live-ab projection carries NO rank key ANYWHERE in its (nested) envelope.
+    projection = build_live_ab_projection(result, instance_id="inst-1").model_dump()
+    for key in _collect_keys(projection):
+        assert not any(tok in key.lower() for tok in _BANNED_RANK_TOKENS), key
+    assert projection["is_ablation"] is True
+    assert projection["panel"] == "guard_on_off_ablation"
+
+
+def test_live_ab_route_projects_ablation_no_rank(tmp_path: Path) -> None:
+    """The read-only ``GET /maker/live-ab/{instance_id}`` route surfaces the ablation (no rank), 404s absent."""
+    arm = arm_configs(_control_overrides()).baseline
+    cfg = _ablation_cfg(session_dir=tmp_path / "sess", arm=arm)
+    result = asyncio.run(
+        run_guard_ablation(cfg, load_tape("divergence_extreme"), mode="replay", event_sink=[].append)
+    )
+
+    app = FastAPI()
+    register_maker_routes(
+        app, live_ab_provider=lambda iid: result if iid == "inst-1" else None
+    )
+    client = TestClient(app)
+
+    resp = client.get("/maker/live-ab/inst-1")
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["is_ablation"] is True
+    assert body["diverges"] is True
+    for key in _collect_keys(body):
+        assert not any(tok in key.lower() for tok in _BANNED_RANK_TOKENS), key
+
+    # Read-only projection: no ablation for an unknown instance → 404 (never a fabricated result).
+    assert client.get("/maker/live-ab/unknown").status_code == 404
+
+
+# --- RED #3 — the paired run is deterministic (same tape → identical ablation) -----------------
+
+
+def test_guard_ablation_is_deterministic(tmp_path: Path) -> None:
+    """The SAME pinned tape run through ``run_guard_ablation`` twice yields the identical ablation."""
+    arm = arm_configs(_control_overrides()).baseline
+    a = asyncio.run(
+        run_guard_ablation(
+            _ablation_cfg(session_dir=tmp_path / "a", arm=arm),
+            load_tape("divergence_extreme"),
+            mode="replay",
+            event_sink=[].append,
+        )
+    )
+    b = asyncio.run(
+        run_guard_ablation(
+            _ablation_cfg(session_dir=tmp_path / "b", arm=arm),
+            load_tape("divergence_extreme"),
+            mode="replay",
+            event_sink=[].append,
+        )
+    )
+    assert a.guard_off.decisions == b.guard_off.decisions
+    assert a.guard_on.decisions == b.guard_on.decisions
+    assert a.divergent_frame_indices == b.divergent_frame_indices
+    assert a.digest() == b.digest()

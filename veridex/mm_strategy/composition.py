@@ -40,7 +40,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any
 
 from veridex.mm_strategy.inventory_stub import synthetic_inventory, synthetic_inventory_event
@@ -76,11 +76,21 @@ if TYPE_CHECKING:
     from veridex.policy.envelope import PolicyEnvelope
 
 __all__ = [
+    "GUARD_ABLATION_LABEL",
+    "GuardAblationResult",
     "MakerInstanceConfig",
     "ModeRejectedError",
     "SessionSummary",
+    "run_guard_ablation",
     "run_market_maker",
 ]
+
+#: The honest label the guard ON/OFF paired run wears everywhere. This is a BEHAVIOR ablation — the SAME
+#: strategy with the guard off vs on, on the SAME pinned evidence — NOT a maker leaderboard / rank /
+#: performance ordering. A ranked maker result requires full accounting (identical tape/opportunities/
+#: horizons + toxicity/abstentions/quote-counts) and is a SEPARATE, sealed HISTORICAL artifact; conflating
+#: the two would be a false-edge honesty violation, so this surface emits NO rank/toxicity/ordering/winner.
+GUARD_ABLATION_LABEL = "guard_on_off_behavior_ablation"
 
 #: OPS-boundary logger for CONTAINED sink failures on the composition's OWN emissions (distinct from
 #: the runtime seam's logger). Composition OPS telemetry is best-effort: a throwing sink can never
@@ -184,6 +194,56 @@ class SessionSummary:
             "freezes": [(f.reason, f.possibly_live, f.error_repr) for f in self.freezes],
         }
         canonical = json.dumps(payload, sort_keys=True, default=str)
+        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+@dataclass(frozen=True)
+class GuardAblationResult:
+    """The paired guard ON/OFF ablation over ONE pinned tape — a BEHAVIOR ablation, NEVER a rank.
+
+    :func:`run_guard_ablation` runs :func:`run_market_maker` TWICE on the SAME pinned tape — the SAME
+    strategy with the guard OFF then ON (only the guard arm differs) — and captures the two arms' decision
+    streams here plus the frames on which their SUBSTANTIVE decision diverges. It DEMONSTRATES that the
+    TxLINE QuoteGuard changes maker behavior; it carries NO rank / toxicity / performance ordering /
+    winner field (see :data:`GUARD_ABLATION_LABEL`). Divergence is honest — it is whatever the two arms
+    actually did on this tape (possible on an adversarial trigger frame, empty on a quiescent stretch),
+    never a promise the guard always changes the decision.
+
+    Attributes:
+        mode: The replay/dry-run mode both arms ran under (identical for the two arms).
+        guard_off: The ``guard_enabled=False`` arm's :class:`SessionSummary`.
+        guard_on: The ``guard_enabled=True`` arm's :class:`SessionSummary`.
+        divergent_frame_indices: The frame indices where the two arms' SUBSTANTIVE decision differs
+            (kind + reason codes + priced legs — the per-arm identity stamp, which necessarily differs
+            because ``config_hash`` differs, is excluded). Empty when the guard changed nothing.
+        ablation_label: The pinned honesty label — this is a behavior ablation, not a ranking.
+    """
+
+    mode: str
+    guard_off: SessionSummary
+    guard_on: SessionSummary
+    divergent_frame_indices: tuple[int, ...]
+    ablation_label: str = GUARD_ABLATION_LABEL
+
+    @property
+    def diverges(self) -> bool:
+        """Whether the guard flip changed the substantive decision on at least one frame of this tape."""
+        return bool(self.divergent_frame_indices)
+
+    def digest(self) -> str:
+        """A byte-deterministic digest of the paired ablation (the determinism artifact).
+
+        Combines each arm's own deterministic :meth:`SessionSummary.digest` with the divergence marker,
+        so the SAME pinned tape run through :func:`run_guard_ablation` twice produces an IDENTICAL digest.
+        """
+        payload = {
+            "mode": self.mode,
+            "ablation_label": self.ablation_label,
+            "guard_off": self.guard_off.digest(),
+            "guard_on": self.guard_on.digest(),
+            "divergent_frame_indices": list(self.divergent_frame_indices),
+        }
+        canonical = json.dumps(payload, sort_keys=True)
         return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
@@ -518,4 +578,96 @@ async def run_market_maker(
         terminal_reason=terminal_reason,
         observations_consumed=consumed,
         ops_events_emitted=counted.count,
+    )
+
+
+def _decision_signature(decision: StrategyDecision) -> tuple[Any, ...]:
+    """The SUBSTANTIVE decision the guard actually shapes — kind + closed reason codes + priced legs.
+
+    EXCLUDES the per-arm identity stamp (``config_hash`` / ``decision_id`` / the causal hashes / per-leg
+    ``client_order_id``), which necessarily differs between the guard-off and guard-on arms purely
+    because ``guard_enabled`` differs. Comparing this signature isolates the behavior the guard changed
+    from the identity noise (the same axis the E6-T2 arm-contrast compares on).
+    """
+    legs = tuple(
+        (leg.kind, leg.leg_role, leg.price, leg.post_only) for leg in decision.intent_plan
+    )
+    return (decision.kind, decision.reason_codes, legs)
+
+
+def _divergent_frames(
+    guard_off: tuple[StrategyDecision, ...], guard_on: tuple[StrategyDecision, ...]
+) -> tuple[int, ...]:
+    """The frame indices where the two arms' SUBSTANTIVE decision differs (honest — observed, not promised).
+
+    Compares frame-for-frame over the shared length; any trailing frames from a length mismatch (e.g. an
+    arm that halted early) are divergent too. Empty when the guard changed nothing on this tape.
+    """
+    shared = min(len(guard_off), len(guard_on))
+    indices = [
+        i
+        for i in range(shared)
+        if _decision_signature(guard_off[i]) != _decision_signature(guard_on[i])
+    ]
+    indices.extend(range(shared, max(len(guard_off), len(guard_on))))
+    return tuple(indices)
+
+
+async def run_guard_ablation(
+    instance_cfg: MakerInstanceConfig,
+    tape: Any,
+    *,
+    mode: str,
+    event_sink: RuntimeEventSink,
+) -> GuardAblationResult:
+    """Run the SAME strategy on the SAME pinned tape with the guard OFF then ON — the biting-beat ABLATION.
+
+    Calls :func:`run_market_maker` TWICE — ``guard_enabled=False`` then ``=True`` — with the SAME tape,
+    manifest, envelope, and dry-run deps; only the guard arm differs (the two configs are derived from
+    ``instance_cfg.strategy_config`` by flipping ONLY ``guard_enabled``, so every OTHER knob is identical
+    by construction). Returns the two arms' decision streams + the frames on which their substantive
+    decision diverges. This DEMONSTRATES the guard changes maker behavior; it emits NO rank / toxicity /
+    ordering / winner (:data:`GUARD_ABLATION_LABEL`) — a behavior-change is not a proven edge or a
+    ranked maker result. The existing ``run_market_maker`` loop is called unchanged.
+
+    Args:
+        instance_cfg: The SESSION-layer authority bundle; its ``strategy_config`` supplies the base
+            strategy both arms share (its ``guard_enabled`` is overridden per arm).
+        tape: The pinned replay tape both arms fold (the SAME evidence — the honest ablation invariant).
+        mode: The replay/dry-run mode both arms run under (any live mode is rejected fail-closed by
+            :func:`run_market_maker`).
+        event_sink: The R4-A OPS ``RuntimeEvent`` sink; BOTH arms' telemetry is emitted to it.
+
+    Returns:
+        A :class:`GuardAblationResult` with the two arms' summaries and the pinned-frame divergence.
+    """
+    base_config = instance_cfg.strategy_config
+    off_config = base_config.model_copy(update={"guard_enabled": False})
+    on_config = base_config.model_copy(update={"guard_enabled": True})
+
+    off_cfg = replace(instance_cfg, strategy_config=off_config)
+    on_cfg = replace(instance_cfg, strategy_config=on_config)
+
+    guard_off = await run_market_maker(
+        off_cfg,
+        tape,
+        mode=mode,
+        guard_enabled=False,
+        event_sink=event_sink,
+        stop=StopSignal(),
+    )
+    guard_on = await run_market_maker(
+        on_cfg,
+        tape,
+        mode=mode,
+        guard_enabled=True,
+        event_sink=event_sink,
+        stop=StopSignal(),
+    )
+
+    return GuardAblationResult(
+        mode=mode,
+        guard_off=guard_off,
+        guard_on=guard_on,
+        divergent_frame_indices=_divergent_frames(guard_off.decisions, guard_on.decisions),
     )
