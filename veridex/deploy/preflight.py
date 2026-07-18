@@ -22,11 +22,15 @@ from __future__ import annotations
 import hashlib
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from veridex.ingest.feed_health import FeedHealthReport
 from veridex.policy.envelope import PolicyEnvelope
 from veridex.runtime.evidence import serialize_payload
+
+#: The quoteguard-mm deploy-family discriminator (II-5). Dispatch on THIS typed field only — never
+#: template_id / agent_id / a frontend archetype label (Codex req 5, fail-closed family dispatch).
+MM_STRATEGY_FAMILY: Literal["quoteguard-mm"] = "quoteguard-mm"
 
 # ---------------------------------------------------------------------------
 # Bounded-knob spec: (field, low, high, low_inclusive, high_inclusive)
@@ -52,6 +56,43 @@ _NUMERIC_BOUNDS: tuple[_NumericBound, ...] = (
     ("fixture_id", 0.0, 1_000_000_000_000.0, True, True),
     ("min_clv_horizon_s", 0.0, 1_000_000_000.0, True, True),
 )
+
+
+# ---------------------------------------------------------------------------
+# Bounded MM ("quoteguard-mm") config subset (II-5) — a SEPARATE, extra="forbid" substructure so an
+# unknown MM knob is rejected at the wire boundary (Codex req 3 step 2: "unknown fields FORBIDDEN").
+# ---------------------------------------------------------------------------
+
+
+class MakerDeployConfig(BaseModel):
+    """The bounded, typed `quoteguard-mm` config subset (II-5) — carried on `DeployConfig.mm`.
+
+    `extra="forbid"` at the wire boundary; numeric bounds are enforced by the named `mm_family`
+    preflight check (mirrors the top-level `_NUMERIC_BOUNDS` convention — a legible reason on
+    failure rather than a silently-rejected weird instance). `tape_ref` is a bounded catalog KEY
+    ONLY (never a path/fixture) — its resolvability is verified later, server-side, by the session
+    factory (fail-closed there too if unresolvable).
+
+    Attributes:
+        tape_ref: The server-owned replay-tape catalog key this deploy resolves its tape from.
+        guard_enabled: The TxLINE QuoteGuard ablation arm (REQUIRED choice — mirrors
+            `StrategyConfig.guard_enabled`, no implicit default).
+        tif: The pinned maker time-in-force (`GTC` | `GTD` — a resting quote is never a taker).
+        max_orders_per_run / max_orders_per_session / max_orders_per_day: Maker order caps (bounded;
+            NEVER the directional single-order `to_policy_envelope()` cap of 1).
+        max_session_loss / max_daily_loss: Fee-inclusive realized-loss ceilings (`<= 0` disables).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    tape_ref: str
+    guard_enabled: bool = True
+    tif: Literal["GTC", "GTD"] = "GTC"
+    max_orders_per_run: int = 3
+    max_orders_per_session: int = 10
+    max_orders_per_day: int = 20
+    max_session_loss: float = 0.0
+    max_daily_loss: float = 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -89,7 +130,9 @@ class DeployConfig(BaseModel):
 
     template_id: str
     agent_id: str
-    strategy: Literal["baseline", "momentum", "momentum-sharp", "cumulative-drift", "value-vs-venue", "llm"] = "momentum-sharp"
+    strategy: Literal[
+        "baseline", "momentum", "momentum-sharp", "cumulative-drift", "value-vs-venue", "llm", "quoteguard-mm"
+    ] = "momentum-sharp"
     source_mode: Literal["replay", "live"] = "live"
     execution_mode: Literal["paper", "dry_run", "live_guarded"] = "paper"
     market_allowlist: list[str] = Field(default_factory=list)
@@ -112,6 +155,10 @@ class DeployConfig(BaseModel):
     lookback: int = 64
     scale_floor: float = 0.02
     persistence_logit: float = 0.06
+    # quoteguard-mm (II-5) — REQUIRED iff strategy == "quoteguard-mm" (enforced by the mm_family
+    # preflight check, never by a pydantic requiredness flip, so a missing/invalid mm block gets a
+    # NAMED, legible preflight reason rather than a raw 422).
+    mm: MakerDeployConfig | None = None
 
     def config_hash(self) -> str:
         """SHA-256 over the canonical serialization of this (non-secret) config.
@@ -277,6 +324,51 @@ def _check_policy(config: DeployConfig, envelope: PolicyEnvelope) -> PreflightCh
     return PreflightCheck(name="policy_limits", ok=True, detail="policy limits are sane")
 
 
+def _check_mm(config: DeployConfig) -> PreflightCheck:
+    """The ``quoteguard-mm`` family-driven, fail-closed named check (Codex req 5 / AC-9).
+
+    Not applicable (``ok=None``) for a directional strategy. For ``quoteguard-mm``: requires a bound
+    ``mm`` block; rejects ``live`` / ``live_guarded`` BEFORE any attempt/instance/lease/run side
+    effect (AC-9 — this check runs as part of the SAME pure preflight every deploy calls, so a
+    failure here 422s before the attempt-first saga even starts); requires a non-empty
+    ``market_allowlist`` (the manifest's ``market``/``universe`` need a concrete target in every
+    mode, including ``paper``); and bounds every ``mm`` numeric knob.
+    """
+    if config.strategy != MM_STRATEGY_FAMILY:
+        return PreflightCheck(name="mm_family", ok=None, detail="not applicable (directional strategy)")
+
+    if config.mm is None:
+        return PreflightCheck(name="mm_family", ok=False, detail="quoteguard-mm requires a bound 'mm' config block")
+
+    offenders: list[str] = []
+    if config.source_mode == "live":
+        offenders.append("source_mode='live' is not supported by quoteguard-mm in II-5 (fail-closed)")
+    if config.execution_mode == "live_guarded":
+        offenders.append("execution_mode='live_guarded' is not supported by quoteguard-mm in II-5 (fail-closed)")
+    if not config.market_allowlist:
+        offenders.append("quoteguard-mm requires a non-empty market_allowlist in every mode")
+    if not (1 <= len(config.mm.tape_ref) <= 128):
+        offenders.append(f"mm.tape_ref length out of bounds: {len(config.mm.tape_ref)}")
+    mm_bounds: tuple[_NumericBound, ...] = (
+        ("max_orders_per_run", 1.0, 1_000.0, True, True),
+        ("max_orders_per_session", 1.0, 1_000.0, True, True),
+        ("max_orders_per_day", 1.0, 1_000.0, True, True),
+        ("max_session_loss", 0.0, 1_000_000_000.0, True, True),
+        ("max_daily_loss", 0.0, 1_000_000_000.0, True, True),
+    )
+    mm_dumped = config.mm.model_dump()
+    for field, low, high, low_incl, high_incl in mm_bounds:
+        value = mm_dumped[field]
+        if not isinstance(value, (int, float)) or not _bound_ok(float(value), low, high, low_incl, high_incl):
+            lo_b = "[" if low_incl else "("
+            hi_b = "]" if high_incl else ")"
+            offenders.append(f"mm.{field}={value} out of range {lo_b}{low:g}, {high:g}{hi_b}")
+
+    if offenders:
+        return PreflightCheck(name="mm_family", ok=False, detail="; ".join(offenders))
+    return PreflightCheck(name="mm_family", ok=True, detail="quoteguard-mm config within bounds")
+
+
 def run_deploy_preflight(
     config: DeployConfig,
     *,
@@ -299,12 +391,19 @@ def run_deploy_preflight(
             Ignored for a ``live`` deploy, which is gated by ``feed_report``.
 
     Returns:
-        The ordered list of :class:`PreflightCheck` verdicts (``config``, ``feed_health``,
-        ``market_mapped``, ``policy_limits``). The caller treats any ``ok is False`` as fail-closed.
+        The ordered list of :class:`PreflightCheck` verdicts: ``config``, ``feed_health``,
+        ``market_mapped``, ``policy_limits`` — PLUS ``mm_family`` iff ``config.strategy ==
+        "quoteguard-mm"`` (unlike ``market_mapped``, which conditionally applies to every strategy,
+        ``mm_family`` is entirely strategy-scoped, so a directional deploy's check set stays exactly
+        the four directional names — no "not applicable" placeholder). The caller treats any
+        ``ok is False`` as fail-closed.
     """
-    return [
+    checks = [
         _check_config(config),
         _check_feed(config, feed_report, source_resolved),
         _check_market(config, market_resolved),
         _check_policy(config, envelope),
     ]
+    if config.strategy == MM_STRATEGY_FAMILY:
+        checks.insert(3, _check_mm(config))
+    return checks

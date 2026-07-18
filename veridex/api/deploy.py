@@ -32,9 +32,11 @@ from veridex.api.demo_fixtures import build_demo_ticks
 from veridex.chain.anchor import anchor_memo
 from veridex.deploy.attempt import AttemptStatus, DeploymentAttempt, DuplicateAttemptError
 from veridex.deploy.instance import AgentInstance, DeployFailureReason, DeployStatus
-from veridex.deploy.preflight import DeployConfig, PreflightCheck, run_deploy_preflight
+from veridex.deploy.preflight import MM_STRATEGY_FAMILY, DeployConfig, PreflightCheck, run_deploy_preflight
 from veridex.ingest.feed_health import FeedHealthReport
 from veridex.ingest.marketstate import MarketState
+from veridex.mm_strategy.session_factory import build_maker_policy_envelope, reconstruct_mm_session
+from veridex.runtime.mm_agent_adapter import VeridexAgentAdapter, build_market_maker_driver
 from veridex.runtime.orchestrator import Agent
 from veridex.runtime.runtime_events import RuntimeEventSink
 from veridex.runtime.window import RunWindow
@@ -42,7 +44,13 @@ from veridex_agent.config import AgentRunConfig, build_agent
 from veridex_agent.run import standalone_run
 
 if TYPE_CHECKING:
+    from pathlib import Path
+
     from veridex.config import Settings
+    from veridex.dust_execution.facade import MMExecutionToolResult
+    from veridex.mm_strategy.contracts import StrategyState
+    from veridex.mm_strategy.session_factory import MakerReplayTape
+    from veridex.runtime.mm_agent_adapter import RunContext
     from veridex.store import Store
 
 logger = logging.getLogger(__name__)
@@ -99,6 +107,15 @@ class DeployDeps:
         adapter: Injected venue adapter for the dry_run execution lane; ``None`` → picked by mode.
         anchor_fn: ``async (manifest_hash) -> signature``; defaults to the real on-chain anchor.
             Tests pass ``None`` to skip anchoring (offline).
+        mm_tape_resolver: SERVER-SIDE injectable ``tape_ref -> MakerReplayTape`` seam for the
+            ``quoteguard-mm`` session factory (II-5 requirement 3) — NEVER a request field. ``None``
+            → the production catalog resolver (``fu-ii5-demo-tape`` owed; fails closed until banked).
+        mm_proposer: SERVER-SIDE injectable dry-run R4-A proposer. ``None`` → the production
+            :class:`~veridex.mm_strategy.offline_proposer.OfflineRecordingProposer` (offline, no wire).
+        mm_seed_state: SERVER-SIDE injectable warm ``StrategyState`` the maker fold starts from.
+            ``None`` → a fresh (cold-start) state — the honest default for a brand-new deploy.
+        mm_session_dir: SERVER-SIDE injectable durable recorder session directory. ``None`` → a
+            per-run temp directory.
     """
 
     feed_report: FeedHealthReport | None = None
@@ -108,6 +125,10 @@ class DeployDeps:
     marketstates: list[MarketState] | None = None
     adapter: Any | None = None
     anchor_fn: Callable[[str], Awaitable[str]] | None = field(default=anchor_memo)
+    mm_tape_resolver: Callable[[str], MakerReplayTape] | None = None
+    mm_proposer: Callable[..., Awaitable[MMExecutionToolResult]] | None = None
+    mm_seed_state: StrategyState | None = None
+    mm_session_dir: Path | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -288,6 +309,74 @@ def register_deploy_routes(
         # Clean seal: the run is persisted under run_id — durably mark the instance SEALED.
         await store.update_agent_instance_status(instance_id, DeployStatus.SEALED, updated_at=_now_iso())
 
+    async def _launch_mm(instance: AgentInstance) -> None:
+        """Run the ``quoteguard-mm`` deployed instance through the SHARED start service (II-5).
+
+        Family-driven, fail-closed dispatch (req 5): NEVER calls :func:`_build_agent` /
+        :func:`standalone_run` — a fresh :class:`VeridexAgentAdapter` is wired to a session factory
+        that reconstructs the run's authority ONLY from ``instance`` (never a request field, II-5
+        req 3), then driven through the SAME :func:`~veridex.runtime.agentos_service.
+        start_owned_instance_run` the II-4 wrapper uses (req 1) — with NO in-process HTTP call to
+        that wrapper route. The ONE authoritative ``run_id`` is ``instance.run_id`` — the SAME
+        identity already persisted on the instance/lease/response (req 2). This is a Veridex-owned
+        background coroutine that calls the shared service INLINE (req 6) — the AgentOS call is not
+        a separately "detached" background task.
+        """
+        # Lazy import (breaks the deploy -> agentos_service -> router -> deploy module cycle; mirrors
+        # the existing lazy-import convention used at composition.py / mm_agent_adapter.py boundaries).
+        from veridex.runtime.agentos_service import start_owned_instance_run  # noqa: PLC0415
+
+        await store.update_agent_instance_status(instance.instance_id, DeployStatus.RUNNING, updated_at=_now_iso())
+        # Controlled failure taxonomy (never a raw trace): failing before the shared service starts
+        # (session-factory authority mismatch, unresolved tape, duplicate lease) is a RUNTIME_ERROR;
+        # once the shared service is driving the adapter it is a SEAL_FAILED.
+        phase = DeployFailureReason.RUNTIME_ERROR
+        try:
+
+            def _session_factory(ctx: RunContext) -> tuple[Any, Any, str, bool]:
+                return reconstruct_mm_session(
+                    instance,
+                    ctx,
+                    tape_resolver=deps.mm_tape_resolver,
+                    proposer=deps.mm_proposer,
+                    seed_state=deps.mm_seed_state,
+                    session_dir=deps.mm_session_dir,
+                )
+
+            adapter = VeridexAgentAdapter(
+                run_driver=build_market_maker_driver(_session_factory),
+                id=f"veridex-mm-{instance.instance_id}",
+                event_sink=runtime_event_sink,
+            )
+            session_id = f"sess_{uuid.uuid4().hex}"
+
+            phase = DeployFailureReason.SEAL_FAILED
+            await start_owned_instance_run(
+                store,
+                adapter,
+                instance=instance,
+                run_id=instance.run_id,
+                session_id=session_id,
+                input=None,
+                event_sink=runtime_event_sink,
+            )
+        except asyncio.CancelledError:
+            # Shutdown cancellation is neither a seal nor a failure — leave the record RUNNING.
+            raise
+        except Exception:
+            # Pre-seal failure (mismatch/tape/duplicate-lease/adapter): durably mark FAILED with the
+            # CONTROLLED reason (no raw trace, no legacy fallback), then re-raise so the done-callback
+            # surfaces the FULL diagnostic on the server log.
+            await store.update_agent_instance_status(
+                instance.instance_id,
+                DeployStatus.FAILED,
+                last_failure_reason=phase,
+                updated_at=_now_iso(),
+            )
+            raise
+        # Clean seal: durably mark the instance SEALED.
+        await store.update_agent_instance_status(instance.instance_id, DeployStatus.SEALED, updated_at=_now_iso())
+
     @app.post("/agents/deploy", response_model=DeployResponse)
     async def deploy_agent(
         config: DeployConfig,
@@ -317,7 +406,14 @@ def register_deploy_routes(
                 preflight check; 409 if the idempotency key is reused with a different config or the
                 recorded attempt is unrecoverable; NO run starts on failure.
         """
-        envelope = config.to_policy_envelope()
+        # Family-driven envelope selection (req 5): quoteguard-mm NEVER reuses the directional
+        # single-order ``to_policy_envelope()`` — it gets its own bounded, multi-order maker envelope.
+        # A missing ``mm`` block falls back to the inert directional envelope ONLY so this call never
+        # crashes; the ``mm_family`` preflight check independently fails closed on ``mm is None``.
+        if config.strategy == MM_STRATEGY_FAMILY and config.mm is not None:
+            envelope = build_maker_policy_envelope(config, config.mm)
+        else:
+            envelope = config.to_policy_envelope()
         # MODE-AWARE source resolution: a replay deploy resolves its SOURCE (bundled/injected pack)
         # BEFORE preflight, so the named feed_health check verifies the replay source resolves
         # (non-empty) rather than a live feed. Live resolves nothing here — it is gated fail-closed
@@ -415,12 +511,20 @@ def register_deploy_routes(
 
         # Preflight passed → pin config_hash (only now) + policy_hash into the AgentInstance.
         run_id = uuid.uuid4().hex
+        # Family-driven effective_config (req 5): quoteguard-mm's effective config is EXACTLY its
+        # bounded ``mm`` block (the session factory re-parses it with ``extra="forbid"``) — never the
+        # directional AgentRunConfig normalization, and never _build_agent/standalone_run's shape.
+        if config.strategy == MM_STRATEGY_FAMILY:
+            assert config.mm is not None  # preflight's mm_family check already fails closed on None
+            effective_config = config.mm.model_dump(mode="json")
+        else:
+            effective_config = _build_run_config(config).model_dump(mode="json")
         instance = AgentInstance(
             instance_id=instance_id,
             template_id=config.template_id,
             agent_id=config.agent_id,
             submitted_config=config.model_dump(mode="json"),
-            effective_config=_build_run_config(config).model_dump(mode="json"),
+            effective_config=effective_config,
             config_hash=config.config_hash(),
             policy_hash=envelope.policy_hash(),
             source_mode=config.source_mode,
@@ -448,9 +552,13 @@ def register_deploy_routes(
         await store.persist_agent_instance(instance)
 
         # Launch ASYNCHRONOUSLY: track the task + auto-discard on completion (cancellable on shutdown).
-        task: asyncio.Task[None] = asyncio.create_task(
-            _launch(config, run_id, instance.instance_id, replay_marketstates)
-        )
+        # Family-driven dispatch (req 5): quoteguard-mm launches through the SHARED AgentOS start
+        # service (_launch_mm); every directional family launches through the UNCHANGED single seam.
+        task: asyncio.Task[None]
+        if config.strategy == MM_STRATEGY_FAMILY:
+            task = asyncio.create_task(_launch_mm(instance))
+        else:
+            task = asyncio.create_task(_launch(config, run_id, instance.instance_id, replay_marketstates))
         background_tasks.add(task)
 
         def _on_done(finished: asyncio.Task[None], *, launched_run_id: str = run_id) -> None:

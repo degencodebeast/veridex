@@ -311,6 +311,97 @@ async def _load_owned_instance(store: Store, instance_id: str, principal: PrivyP
     return instance
 
 
+async def start_owned_instance_run(
+    store: Store,
+    adapter: VeridexAgentAdapter,
+    *,
+    instance: Any,
+    run_id: str,
+    session_id: str,
+    input: Any = None,
+    event_sink: RuntimeEventSink | None = None,
+) -> Any:
+    """The SHARED lease + runtime_handle + adapter-drive service (II-5 req 1).
+
+    Owns exactly the sequence the II-4 wrapper originally inlined: atomically claim the
+    single-active-run lease (STARTING) → persist the instance ``runtime_handle`` → advance the lease
+    to ACTIVE → drive the adapter inline → terminal lease transition (RELEASED on success, FAILED on
+    any exception — cancellation-safe). BOTH the owner-scoped wrapper route
+    (``POST /agents/instances/{instance_id}/runs``) and the ``quoteguard-mm`` deploy dispatch call
+    THIS function — never an in-process HTTP call to the wrapper, never a cloned lease state machine.
+
+    Takes an EXPLICIT ``run_id`` / ``session_id`` — this function mints NEITHER (the requirement-2
+    fix at the shared-logic level: the caller is the sole run-identity authority). The wrapper route
+    mints its own per-call ids (unchanged II-4 behavior); the deploy dispatch passes the persisted
+    ``AgentInstance.run_id`` so instance/lease/runtime_handle/RunContext/OPS/receipt/response all
+    share ONE authoritative identity (II-5 requirement 2).
+
+    Args:
+        store: The Veridex store (instance + lease persistence).
+        adapter: The hosted :class:`VeridexAgentAdapter` to drive the run through.
+        instance: The ALREADY owner-verified, persisted ``AgentInstance`` (ownership resolution is the
+            caller's job — the wrapper's ``Depends``-gated owner check, or the deploy saga's
+            server-derived principal; this function trusts ``instance.operator_id`` as given).
+        run_id / session_id: The caller-supplied, server-pre-allocated run identity.
+        input: Opaque run input forwarded to the adapter (never an ownership signal).
+        event_sink: OPS sink for this run.
+
+    Returns:
+        Whatever the adapter's :meth:`~VeridexAgentAdapter.start_run` returns.
+
+    Raises:
+        DuplicateLeaseError: The instance already holds an active lease (the caller maps this to a
+            409 at an HTTP boundary, or a controlled failure status in a background saga).
+    """
+    import contextlib
+
+    runtime_agent_id = adapter.get_id()
+    now = _now_iso()
+
+    # (1) Atomically claim the single-active-run lease in STARTING (INSERT-only, UNIQUE(instance_id)).
+    lease = InstanceLease(
+        instance_id=instance.instance_id,
+        runtime_agent_id=runtime_agent_id,
+        session_id=session_id,
+        run_id=run_id,
+        status=LeaseStatus.STARTING,
+        operator_id=instance.operator_id,  # AUDIT only — authority stays on the instance
+        created_at=now,
+        updated_at=now,
+    )
+    # Let DuplicateLeaseError propagate — the caller maps it to its own boundary's semantics
+    # (409 for the wrapper's HTTP request; a controlled FAILED status for a background saga).
+    await store.acquire_instance_lease(lease)
+
+    # (2)+(3) Persist the runtime_handle + advance the lease to ACTIVE, then drive the run inline.
+    try:
+        instance.runtime_handle = {
+            "runtime_kind": "agentos",
+            "runtime_agent_id": runtime_agent_id,
+            "session_id": session_id,
+            "run_id": run_id,
+        }
+        await store.persist_agent_instance(instance)
+        await store.release_instance_lease(instance.instance_id, LeaseStatus.ACTIVE, updated_at=_now_iso())
+        result = await adapter.start_run(
+            run_id=run_id,
+            session_id=session_id,
+            runtime_agent_id=runtime_agent_id,
+            owner_did=instance.operator_id,
+            input=input,
+            event_sink=event_sink,
+        )
+    except BaseException:
+        # (4) Cancellation-safe fail: a client disconnect (CancelledError) or error never leaves an
+        # unclassified lease. Idempotent CAS makes this safe even if a later RELEASED also runs.
+        with contextlib.suppress(Exception):
+            await store.release_instance_lease(instance.instance_id, LeaseStatus.FAILED, updated_at=_now_iso())
+        raise
+    # (4) Success: idempotent RELEASED.
+    await store.release_instance_lease(instance.instance_id, LeaseStatus.RELEASED, updated_at=_now_iso())
+    return result
+
+
 def _register_wrapper_routes(
     app: FastAPI,
     *,
@@ -331,61 +422,28 @@ def _register_wrapper_routes(
 
         Ownership comes ONLY from the PERSISTED ``AgentInstance.operator_id`` (never the request). The
         lease's ``UNIQUE(instance_id)`` guarantees exactly one active run — a concurrent/duplicate
-        starter gets 409 and NEVER launches a second run.
+        starter gets 409 and NEVER launches a second run. Delegates the lease/handle/adapter sequence
+        to the SHARED :func:`start_owned_instance_run` service (II-5 req 1).
         """
-        import contextlib
-
         instance = await _load_owned_instance(store, instance_id, principal)
 
-        # (1) SERVER-pre-allocate the run identity — never caller-supplied.
+        # SERVER-pre-allocate the run identity — never caller-supplied.
         run_id = f"run_{uuid4().hex}"
         session_id = f"sess_{uuid4().hex}"
-        runtime_agent_id = adapter.get_id()
-        now = _now_iso()
 
-        # (2) Atomically claim the single-active-run lease in STARTING (INSERT-only, UNIQUE(instance_id)).
-        lease = InstanceLease(
-            instance_id=instance_id,
-            runtime_agent_id=runtime_agent_id,
-            session_id=session_id,
-            run_id=run_id,
-            status=LeaseStatus.STARTING,
-            operator_id=instance.operator_id,  # AUDIT only — authority stays on the instance
-            created_at=now,
-            updated_at=now,
-        )
         try:
-            await store.acquire_instance_lease(lease)
-        except DuplicateLeaseError as exc:
-            # Already running (or mid-STARTING after a crash): NEVER a second run — 409, bounded.
-            raise HTTPException(status_code=409, detail="instance already has an active run") from exc
-
-        # (3)+(4) Persist the runtime_handle + advance the lease to ACTIVE, then drive the run inline.
-        try:
-            instance.runtime_handle = {
-                "runtime_kind": "agentos",
-                "runtime_agent_id": runtime_agent_id,
-                "session_id": session_id,
-                "run_id": run_id,
-            }
-            await store.persist_agent_instance(instance)
-            await store.release_instance_lease(instance_id, LeaseStatus.ACTIVE, updated_at=_now_iso())
-            await adapter.start_run(
+            await start_owned_instance_run(
+                store,
+                adapter,
+                instance=instance,
                 run_id=run_id,
                 session_id=session_id,
-                runtime_agent_id=runtime_agent_id,
-                owner_did=instance.operator_id,
                 input=body.input if body is not None else None,
                 event_sink=event_sink,
             )
-        except BaseException:
-            # (5) Cancellation-safe fail: a client disconnect (CancelledError) or error never leaves an
-            # unclassified lease. Idempotent CAS makes this safe even if a later RELEASED also runs.
-            with contextlib.suppress(Exception):
-                await store.release_instance_lease(instance_id, LeaseStatus.FAILED, updated_at=_now_iso())
-            raise
-        # (5) Success: idempotent RELEASED.
-        await store.release_instance_lease(instance_id, LeaseStatus.RELEASED, updated_at=_now_iso())
+        except DuplicateLeaseError as exc:
+            # Already running (or mid-STARTING after a crash): NEVER a second run — 409, bounded.
+            raise HTTPException(status_code=409, detail="instance already has an active run") from exc
         return StartRunResponse(
             instance_id=instance_id, run_id=run_id, session_id=session_id, status="completed"
         )
