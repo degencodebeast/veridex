@@ -37,9 +37,17 @@ from veridex.deploy.preflight import MM_STRATEGY_FAMILY, DeployConfig, Preflight
 from veridex.ingest.feed_health import FeedHealthReport
 from veridex.ingest.marketstate import MarketState
 from veridex.mm_strategy.session_factory import build_maker_policy_envelope, reconstruct_mm_session
-from veridex.runtime.mm_agent_adapter import VeridexAgentAdapter, build_market_maker_driver
+from veridex.runtime.mm_agent_adapter import (
+    OwnerMismatchError,
+    VeridexAgentAdapter,
+    build_market_maker_driver,
+)
 from veridex.runtime.orchestrator import Agent
-from veridex.runtime.runtime_events import RuntimeEventSink
+from veridex.runtime.runtime_events import (
+    RuntimeEventSink,
+    RuntimeEventType,
+    runtime_event,
+)
 from veridex.runtime.window import RunWindow
 from veridex_agent.config import AgentRunConfig, build_agent
 from veridex_agent.run import standalone_run
@@ -51,7 +59,7 @@ if TYPE_CHECKING:
     from veridex.dust_execution.facade import MMExecutionToolResult
     from veridex.mm_strategy.contracts import StrategyState
     from veridex.mm_strategy.session_factory import MakerReplayTape
-    from veridex.runtime.mm_agent_adapter import RunContext
+    from veridex.runtime.mm_agent_adapter import RunContext, RunDriver
     from veridex.store import Store
 
 logger = logging.getLogger(__name__)
@@ -108,6 +116,46 @@ class DeployResponse(BaseModel):
     owner: str
 
 
+class InstanceStatusResponse(BaseModel):
+    """Owner-scoped run/lease status view for a deployed instance (II-6).
+
+    Attributes:
+        instance_id: The instance this status is about.
+        run_id: The authoritative Veridex run id (the instance's scalar run).
+        run_state: The HEADLINE run/lease state — ``running`` while the hosted run is ACTIVE,
+            ``cancelled`` once an owner kill engaged (durable across the run settling, via the
+            in-process kill ledger), else the settled adapter phase or the durable instance status
+            (``sealed`` / ``failed`` / ``pending``).
+        killed: Whether an owner kill engaged the exactly-once cancel for this run.
+        status: The DURABLE :class:`~veridex.deploy.instance.DeployStatus` value (persisted record).
+        lease_status: The current :class:`~veridex.store.LeaseStatus` value, or ``None`` if no lease.
+    """
+
+    instance_id: str
+    run_id: str
+    run_state: str
+    killed: bool
+    status: str
+    lease_status: str | None = None
+
+
+class KillResponse(BaseModel):
+    """Result of an owner kill (II-6 / AC-16).
+
+    Attributes:
+        instance_id: The instance the kill targeted.
+        run_id: The run the kill targeted.
+        phase: The run's :class:`~veridex.runtime.mm_agent_adapter.RunPhase` value after this call.
+        engaged: ``True`` ONLY for the single caller that engaged the exactly-once cancel; a repeat /
+            already-settled kill returns ``False`` without re-engaging (no resume, no double-cancel).
+    """
+
+    instance_id: str
+    run_id: str
+    phase: str
+    engaged: bool
+
+
 # ---------------------------------------------------------------------------
 # Dependency injection (defaults = real live path; tests inject offline fakes)
 # ---------------------------------------------------------------------------
@@ -144,6 +192,12 @@ class DeployDeps:
             (the II-5 behavior). Provisioning ALSO requires the operator-pinned custody config
             (:func:`~veridex.config.require_privy_provisioning`); either absent → no wallet is
             provisioned. NEVER a live Privy client here, and NEVER a request field.
+        mm_run_driver: SERVER-SIDE injectable ``quoteguard-mm`` run driver (the II-6 testability seam,
+            mirroring ``mm_proposer`` / ``mm_tape_resolver``). ``None`` → the production driver
+            (:func:`~veridex.runtime.mm_agent_adapter.build_market_maker_driver` over the session
+            factory). Tests inject a driver that cooperatively parks on the run's ``StopSignal`` so a
+            deployed run stays live across an owner kill (exercises the exactly-once cancel). NEVER a
+            request field — a client can never choose the run driver.
     """
 
     feed_report: FeedHealthReport | None = None
@@ -158,6 +212,7 @@ class DeployDeps:
     mm_seed_state: StrategyState | None = None
     mm_session_dir: Path | None = None
     provisioning_provider: Any | None = None
+    mm_run_driver: RunDriver | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -294,6 +349,20 @@ def register_deploy_routes(
     # truth), NOT app.state: it survives a process restart and an app.state clear.
     background_tasks: set[asyncio.Task[None]] = set()
     app.state.deploy_background_tasks = background_tasks
+
+    # II-6 owner-kill wiring (in-process, like ``background_tasks`` — the durable record stays the
+    # store's job). ``mm_run_adapters`` maps a live instance to the hosted ``VeridexAgentAdapter`` so an
+    # owner kill can reach the SAME exactly-once ``acancel_run`` (AC-16) the II-4 wrapper uses — there
+    # is no new cancel primitive. ``killed_instances`` is the exactly-once kill ledger (only the winner
+    # that engaged the cancel records here, so a repeat kill is a durable-in-process no-op and the
+    # status view reports ``cancelled`` even after the run settles). ``last_run_phase`` snapshots the
+    # adapter's terminal :class:`~veridex.runtime.mm_agent_adapter.RunPhase` at deregistration so the
+    # status view keeps a truthful run/lease state after the live adapter is gone.
+    mm_run_adapters: dict[str, VeridexAgentAdapter] = {}
+    killed_instances: dict[str, str] = {}
+    last_run_phase: dict[str, str] = {}
+    app.state.deploy_mm_run_adapters = mm_run_adapters
+    app.state.deploy_killed_instances = killed_instances
 
     # MAJOR-3: expose the async custody-readiness probe on app.state so an app lifespan/startup CAN
     # fail closed on provider error or drift (an integrator wires it into the boot sequence), and mount
@@ -477,23 +546,35 @@ def register_deploy_routes(
                     session_dir=deps.mm_session_dir,
                 )
 
+            # The run driver is the injectable II-6 seam (tests park on the StopSignal); production
+            # wires the frozen II-2 composition through the session factory (byte-identical default).
+            run_driver = deps.mm_run_driver if deps.mm_run_driver is not None else build_market_maker_driver(_session_factory)
             adapter = VeridexAgentAdapter(
-                run_driver=build_market_maker_driver(_session_factory),
+                run_driver=run_driver,
                 id=f"veridex-mm-{instance.instance_id}",
                 event_sink=runtime_event_sink,
             )
             session_id = f"sess_{uuid.uuid4().hex}"
 
-            phase = DeployFailureReason.SEAL_FAILED
-            await start_owned_instance_run(
-                store,
-                adapter,
-                instance=instance,
-                run_id=instance.run_id,
-                session_id=session_id,
-                input=None,
-                event_sink=runtime_event_sink,
-            )
+            # Publish the live adapter so an owner kill can reach ``acancel_run`` while the run is
+            # ACTIVE; snapshot its terminal phase + deregister on settle (the run is no longer live).
+            mm_run_adapters[instance.instance_id] = adapter
+            try:
+                phase = DeployFailureReason.SEAL_FAILED
+                await start_owned_instance_run(
+                    store,
+                    adapter,
+                    instance=instance,
+                    run_id=instance.run_id,
+                    session_id=session_id,
+                    input=None,
+                    event_sink=runtime_event_sink,
+                )
+            finally:
+                settled_phase = adapter.run_phase(instance.run_id)
+                if settled_phase is not None:
+                    last_run_phase[instance.instance_id] = settled_phase.value
+                mm_run_adapters.pop(instance.instance_id, None)
         except asyncio.CancelledError:
             # Shutdown cancellation is neither a seal nor a failure — leave the record RUNNING.
             raise
@@ -832,6 +913,157 @@ def register_deploy_routes(
         if instance.operator_id != principal.did:
             raise HTTPException(status_code=403, detail="principal does not own this agent instance")
         return instance
+
+    async def _load_owned_instance(instance_id: str, principal: PrivyPrincipal) -> AgentInstance:
+        """Owner-gate an instance the SAME way :func:`get_agent_instance` does (fail-closed).
+
+        A missing instance or an UNOWNED / legacy row (``operator_id is None`` — never inherited) is a
+        404 (no existence leak); a row owned by another principal is a 403. Ownership resolves from the
+        STORED ``operator_id`` only — the caller's supplied identity is never trusted.
+        """
+        try:
+            instance = await store.get_agent_instance(instance_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="agent instance not found") from exc
+        if instance.operator_id is None:
+            raise HTTPException(status_code=404, detail="agent instance not found")
+        if instance.operator_id != principal.did:
+            raise HTTPException(status_code=403, detail="principal does not own this agent instance")
+        return instance
+
+    #: How a live/settled adapter :class:`RunPhase` maps onto the status view's headline ``run_state``.
+    _PHASE_TO_STATE: dict[str, str] = {
+        "active": "running",
+        "cancelling": "cancelled",
+        "cancelled": "cancelled",
+        "completed": "sealed",
+        "failed": "failed",
+    }
+
+    def _derive_run_state(instance: AgentInstance) -> str:
+        """Compose the truthful headline run/lease state for an instance's status view.
+
+        Priority: an engaged owner kill (``cancelled``, durable across the run settling) → the LIVE
+        adapter phase (``running`` while ACTIVE) → the settled phase snapshot → the durable
+        :class:`~veridex.deploy.instance.DeployStatus`. This is a read-only projection — it never
+        mutates the durable record (a ``cancelled`` run still seals its window honestly).
+        """
+        if instance.instance_id in killed_instances:
+            return "cancelled"
+        adapter = mm_run_adapters.get(instance.instance_id)
+        if adapter is not None:
+            live = adapter.run_phase(instance.run_id)
+            if live is not None:
+                return _PHASE_TO_STATE.get(live.value, live.value)
+        settled = last_run_phase.get(instance.instance_id)
+        if settled is not None:
+            return _PHASE_TO_STATE.get(settled, settled)
+        return instance.status.value
+
+    def _emit_cancelled_ops(instance: AgentInstance, run_id: str) -> None:
+        """Emit the TERMINAL cancelled OPS event for an engaged kill (best-effort; exactly once).
+
+        Routed through the SAME durable OPS sink as the rest of deploy.py. The adapter's own terminal
+        STATUS_CHANGED maps a cancelled run to completed/failed, so this is the ONE event that names
+        the owner-kill outcome. Called ONLY on the exactly-once winner, so a repeat kill never emits a
+        second terminal event. Inert when no sink is wired.
+        """
+        if runtime_event_sink is None:
+            return
+        handle = instance.runtime_handle or {}
+        runtime_event_sink(
+            runtime_event(
+                RuntimeEventType.STATUS_CHANGED,
+                agent_id=handle.get("runtime_agent_id", instance.agent_id),
+                run_id=run_id,
+                session_id=handle.get("session_id"),
+                status="cancelled",
+                reason="owner_kill",
+            )
+        )
+
+    @app.get("/agents/instances/{instance_id}/status", response_model=InstanceStatusResponse)
+    async def get_instance_status(
+        instance_id: str,
+        principal: PrivyPrincipal = Depends(require_principal),  # noqa: B008
+    ) -> InstanceStatusResponse:
+        """Owner-scoped run/lease status for a deployed instance (II-6; run-level state view).
+
+        Surfaces the run-level state (``running`` / ``cancelled`` / ``sealed`` / ``failed``) the raw
+        durable ``AgentInstance`` record cannot express — reflecting a live owner kill as ``cancelled``
+        even though the scalar ``DeployStatus`` has no cancelled value. Read-only; owner-gated exactly
+        like :func:`get_agent_instance`.
+        """
+        instance = await _load_owned_instance(instance_id, principal)
+        lease = await store.get_instance_lease(instance_id)
+        return InstanceStatusResponse(
+            instance_id=instance.instance_id,
+            run_id=instance.run_id,
+            run_state=_derive_run_state(instance),
+            killed=instance.instance_id in killed_instances,
+            status=instance.status.value,
+            lease_status=lease.status.value if lease is not None else None,
+        )
+
+    @app.post("/agents/instances/{instance_id}/kill", response_model=KillResponse)
+    async def kill_instance(
+        instance_id: str,
+        principal: PrivyPrincipal = Depends(require_principal),  # noqa: B008
+    ) -> KillResponse:
+        """Owner-gated, EXACTLY-ONCE kill for a deployed instance's live run (II-6 / AC-16).
+
+        Owner-gated from server-owned state (never the caller's identity). Acts THROUGH the instance's
+        live runtime handle — the hosted :class:`VeridexAgentAdapter`'s inherited
+        :meth:`~VeridexAgentAdapter.acancel_run` (owner-first exactly-once ``ACTIVE -> CANCELLING``
+        ``StopSignal`` trip) — never a new cancel primitive. The single winner engages the cancel,
+        records the kill ledger, and emits the terminal cancelled OPS event; a repeat kill returns
+        ``engaged=False`` with NO resume and NO second cancel. There is NO owner-RESTART (a re-arm is
+        deferred to Gate P; it stays fail-closed here).
+
+        Raises:
+            HTTPException: 404 absent/unowned, 403 owned-by-another (both before any effect); 409 if no
+                run was ever minted (``runtime_handle is None``) or the run is not live in this process
+                and was never killed (fail-closed, honest — no crash, no resume).
+        """
+        instance = await _load_owned_instance(instance_id, principal)
+        run_id = instance.run_id
+
+        # Fail-closed: a run that was never minted (no runtime_handle) has nothing to kill.
+        if instance.runtime_handle is None and instance_id not in killed_instances:
+            raise HTTPException(
+                status_code=409, detail={"error": "no_active_run", "instance_id": instance_id}
+            )
+
+        adapter = mm_run_adapters.get(instance_id)
+        if adapter is None:
+            # Not live in THIS process. A previously-engaged kill is an idempotent no-op (never a
+            # resume); anything else fails closed honestly (the run already settled or lives elsewhere).
+            if instance_id in killed_instances:
+                return KillResponse(instance_id=instance_id, run_id=run_id, phase="cancelled", engaged=False)
+            raise HTTPException(
+                status_code=409, detail={"error": "run_not_active", "instance_id": instance_id}
+            )
+
+        try:
+            result = await adapter.acancel_run(run_id, owner_did=instance.operator_id)
+        except KeyError:
+            # The adapter no longer tracks this run (it settled between lookup and cancel). A prior
+            # engaged kill is idempotent; otherwise fail closed (no crash).
+            if instance_id in killed_instances:
+                return KillResponse(instance_id=instance_id, run_id=run_id, phase="cancelled", engaged=False)
+            raise HTTPException(
+                status_code=409, detail={"error": "run_not_active", "instance_id": instance_id}
+            ) from None
+        except OwnerMismatchError as exc:  # defense in depth — the outer gate already owner-checked.
+            raise HTTPException(status_code=403, detail="principal does not own this run") from exc
+
+        if result.engaged:
+            # Exactly-once winner: record the kill ledger + emit the ONE terminal cancelled OPS event.
+            killed_instances[instance_id] = run_id
+            _emit_cancelled_ops(instance, run_id)
+        return KillResponse(
+            instance_id=instance_id, run_id=run_id, phase=result.phase.value, engaged=result.engaged
+        )
 
 
 async def cancel_deploy_tasks(app: FastAPI) -> None:
