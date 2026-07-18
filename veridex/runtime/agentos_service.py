@@ -39,7 +39,7 @@ from veridex.runtime.mm_agent_adapter import OwnerMismatchError, VeridexAgentAda
 from veridex.store import DuplicateLeaseError, InstanceLease, LeaseStatus
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Sequence
 
     from veridex.api.auth_privy import _Verifier
     from veridex.config import Settings
@@ -564,18 +564,25 @@ def build_agentos_app(
     verifier: _Verifier = verify_privy_token,
     event_sink: RuntimeEventSink | None = None,
     enforce_contract: bool = True,
+    extra_agents: Sequence[VeridexAgentAdapter] | None = None,
 ) -> Any:
-    """Compose the guarded AgentOS app: veridex routes + adapter + deny-by-default boundary.
+    """Compose the guarded AgentOS app: veridex routes + adapter(s) + deny-by-default boundary.
 
     Args:
         store: The Veridex :class:`~veridex.store.Store` (instance records + leases).
         settings: Resolved settings (auth mode + Privy verifier material).
-        adapter: The hosted :class:`VeridexAgentAdapter` (already wired with a run driver).
+        adapter: The PRIMARY hosted :class:`VeridexAgentAdapter` (the MM adapter; the owner-scoped
+            wrapper routes drive THIS adapter).
         owner_db: The agno owner-scoped db injected into AgentOS (e.g. ``agno.db.in_memory.InMemoryDb``).
         verifier: Privy token verifier (injectable for tests).
         event_sink: Optional OPS sink threaded into runs.
         enforce_contract: When ``True`` (default) run the AC-29 deployed-surface contract and FAIL
             (raise) on drift. Tests toggle it to observe drift explicitly.
+        extra_agents: ADDITIVE (II-8b) — further hosted adapters (the directional contestants) added
+            to the ``AgentOS(agents=[...])`` composition so their agno-native run/cancel routes exist
+            behind the SAME deny-by-default boundary. Agno's agent routes are templated by
+            ``{agent_id}``, so extra agents add NO new route templates — the AC-29 native surface is
+            unchanged. Each is contract-checked. Defaults to ``None`` (byte-identical to before).
 
     Returns:
         The OUTERMOST :class:`DenyByDefaultGuard` ASGI app wrapping the composed FastAPI app.
@@ -585,11 +592,14 @@ def build_agentos_app(
     """
     from agno.os import AgentOS
 
+    hosted_agents: list[VeridexAgentAdapter] = [adapter, *(extra_agents or [])]
+
     # (1) veridex routes FIRST.
     veridex_app = create_app(store=store, settings=settings)
     require_principal = make_require_principal(settings, verifier)
 
-    # (2) owner-scoped wrapper routes on the base app (BEFORE composition).
+    # (2) owner-scoped wrapper routes on the base app (BEFORE composition). The wrapper drives the
+    # PRIMARY adapter only; directional contestants are hosted via agno-native routes + start_run.
     _register_wrapper_routes(
         veridex_app, store=store, adapter=adapter, require_principal=require_principal, event_sink=event_sink
     )
@@ -601,9 +611,9 @@ def build_agentos_app(
     # (4) compose + get_app() ONCE (preserve_base_app keeps the veridex routes authoritative).
     os_app = AgentOS(
         id="veridex-agentos",
-        # agno's BaseExternalAgent types ``id`` as Optional[str]; our adapter always sets it (and
-        # __post_init__ guarantees non-None), so it structurally satisfies AgentProtocol at runtime.
-        agents=[adapter],  # type: ignore[list-item]
+        # agno's BaseExternalAgent types ``id`` as Optional[str]; our adapters always set it (and
+        # __post_init__ guarantees non-None), so they structurally satisfy AgentProtocol at runtime.
+        agents=hosted_agents,  # type: ignore[arg-type]
         db=owner_db,
         base_app=veridex_app,
         on_route_conflict="preserve_base_app",
@@ -613,7 +623,8 @@ def build_agentos_app(
 
     # (5) AC-29 — fail-closed on any agno-surface drift (never a silent custom-route fallback).
     if enforce_contract:
-        assert_adapter_contract(adapter)
+        for hosted in hosted_agents:
+            assert_adapter_contract(hosted)
         assert_agentos_contract()
         assert_agno_surface(composed, veridex_templates)
 
