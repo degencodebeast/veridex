@@ -38,7 +38,8 @@ from veridex.ingest.marketstate import MarketState
 from veridex.runtime.agent import AGENT_ACTION_SCHEMA_VERSION, agent_config_hash
 from veridex.runtime.orchestrator import PROOF_MODE_REPRODUCIBLE, Agent
 from veridex.runtime.schemas import AgentAction, SportsActionType
-from veridex.strategies.sharp_stats import ewma, logit
+from veridex.strategies.drift_features import DriftFeatureParams, drift_features
+from veridex.strategies.sharp_stats import logit
 
 
 class CumulativeDriftStrategy:
@@ -103,22 +104,28 @@ class CumulativeDriftStrategy:
         if key not in self._ts_first:
             self._ts_first[key] = ts
 
-        # --- gates, cheap -> expensive ---
-        if len(series) < self._min_tick_count:
+        # Project the (still-accruing) state into the SHARED, pure feature snapshot, then apply the
+        # decision gates on its fields. The math lives in one place (drift_features) so the LLM-Drift
+        # contestant decides from the identical snapshot; the gates/decision stay here.
+        snap = drift_features(
+            series,
+            self._ts_first[key],
+            ts,
+            DriftFeatureParams(ewma_slope_alpha=self._ewma_slope_alpha),
+        )
+
+        # --- gates, cheap -> expensive (same order as the pre-projector inline computation) ---
+        if snap.tick_count < self._min_tick_count:
             return None  # thin-data guard: not enough observations yet
-        if ts - self._ts_first[key] < self._min_horizon_s:
+        if snap.horizon_s < self._min_horizon_s:
             return None  # thin-data guard: observation horizon too short
-        cumulative_drift = series[-1] - series[0]
-        if cumulative_drift < self._cum_drift_logit_min:
+        if snap.cum_logit_drift < self._cum_drift_logit_min:
             return None  # proposer follows RISING sides only; drift too small (or falling)
-        # EWMA-slope trend strength: EWMA of the per-tick drift DIRECTION (+1 up / -1 down / 0 flat).
-        directions = [_direction(series[i] - series[i - 1]) for i in range(1, len(series))]
-        if not directions:
-            return None
-        trend_strength = ewma(directions, self._ewma_slope_alpha)
-        if trend_strength < self._trend_strength_min:
+        if snap.tick_count < 2:
+            return None  # no per-tick direction yet ⇒ no trend to confirm (mirrors "not directions")
+        if snap.trend_strength < self._trend_strength_min:
             return None  # not a smooth, sustained trend (choppy / random-walk-ish)
-        return cumulative_drift
+        return snap.cum_logit_drift
 
     def _observe_and_rank(self, market_state: MarketState) -> list[tuple[float, str, str]]:
         """Fold this tick into state and return firing ``(drift, market_key, side)`` candidates."""
@@ -179,15 +186,6 @@ class CumulativeDriftStrategy:
     async def adecide(self, market_state: MarketState) -> AgentAction:
         """Async wrapper over :meth:`decide` (the orchestrator gathers ``async`` deciders)."""
         return self.decide(market_state)
-
-
-def _direction(delta: float) -> float:
-    """Sign of a per-tick logit move: ``+1`` up, ``-1`` down, ``0`` flat (the drift-trend indicator)."""
-    if delta > 0.0:
-        return 1.0
-    if delta < 0.0:
-        return -1.0
-    return 0.0
 
 
 def cumulative_drift_agent(
