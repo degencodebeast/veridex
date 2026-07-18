@@ -69,6 +69,11 @@ class CompetitionResult:
         signature: The Solana tx signature when anchored, else ``None``.
         proof_card: The judge-visible proof-card JSON (lineage + checks + anchor).
         leaderboard: The ranked cross-run leaderboard rows for this single run.
+        arena_comparison: The OPTIONAL II-9 checkpointed arena-comparison payload (eligible
+            checkpoints, per-contestant actions-vs-WAITs, scoreable decisions, fixture count,
+            clustered uncertainty, and the identical-opportunity flag). ADDITIVE: defaults to
+            ``None`` for every existing (non-arena) run, so current callers are unaffected. It is
+            NEVER a bare average CLV (addendum §3) — attach it via :func:`attach_arena_comparison`.
     """
 
     run: RunResult
@@ -79,6 +84,7 @@ class CompetitionResult:
     signature: str | None
     proof_card: dict[str, Any]
     leaderboard: list[dict[str, Any]]
+    arena_comparison: dict[str, Any] | None = None
 
 
 def _fixture_or_window_id(marketstates: list[MarketState]) -> str:
@@ -238,3 +244,33 @@ async def run_demo_competition(
         proof_card=proof_card,
         leaderboard=leaderboard_rows,
     )
+
+
+def attach_arena_comparison(
+    result: CompetitionResult, comparison: dict[str, Any]
+) -> CompetitionResult:
+    """Return a COPY of ``result`` carrying the II-9 arena-comparison payload (additive, non-mutating).
+
+    The payload is the honest :meth:`~veridex.runtime.arena_comparison.ArenaComparisonReport.to_payload`
+    dict — eligible checkpoints, per-contestant actions-vs-WAITs, scoreable decisions, fixture count,
+    clustered uncertainty, and the identical-opportunity flag; NEVER a bare average CLV (addendum §3).
+    Each leaderboard row is additively tagged with the run-level ``identical_opportunities`` flag and
+    ``arena_scoreable_decisions`` so the ranked view carries the honest context without dropping or
+    reshaping any existing field. The input ``result`` is left untouched (``CompetitionResult`` is frozen).
+
+    Args:
+        result: The completed competition result to enrich.
+        comparison: The arena-comparison payload to attach (from ``ArenaComparisonReport.to_payload``).
+
+    Returns:
+        A new :class:`CompetitionResult` with ``arena_comparison`` set and the tagged leaderboard rows.
+    """
+    from dataclasses import replace
+
+    identical = comparison.get("identical_opportunities")
+    scoreable = comparison.get("scoreable_decisions")
+    tagged_rows = [
+        {**row, "identical_opportunities": identical, "arena_scoreable_decisions": scoreable}
+        for row in result.leaderboard
+    ]
+    return replace(result, arena_comparison=dict(comparison), leaderboard=tagged_rows)
