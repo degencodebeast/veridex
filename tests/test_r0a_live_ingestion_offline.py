@@ -182,3 +182,192 @@ def test_live_source_fails_closed_without_creds():
     source = LiveCaptureSource(env={})  # no JWT / TXLINE_X_API_TOKEN
     with pytest.raises(ValueError, match="live creds missing"):
         source.credentials()
+
+
+# =================================================================================================
+# R-0b — GRACEFUL BOUNDED STOP (eligibility-critical): a live SSE stream never ends on its own, so
+# without a bounded stop an operator can only kill the process mid-stream (SIGTERM) which cancels
+# BEFORE the post-loop mint -> NO pack. These RED tests drive a clean BREAK of the `async for` loop
+# on any of three conditions (records_target / duration_s / a stop-requested callable for SIGINT),
+# after which the UNCHANGED finalize+mint path runs and finalizes a pack from the records seen so
+# far. The honesty guards (authority-by-type, content-hash, scrub, heartbeat->no-pack) stay intact.
+# =================================================================================================
+
+
+class _DelayedResponse:
+    """A streaming response whose deadline is driven by an INJECTED monotonic clock (deterministic).
+
+    The stream itself yields frames instantly; the ``duration_s`` branch reads ``run_capture_chain``'s
+    injected ``_clock`` seam, so the elapsed-time stop is tested WITHOUT wall-clock sleeps (no CI
+    flakiness — a slow tick can never break before the first record).
+    """
+
+    def __init__(self, frames):
+        self._frames = list(frames)
+        self.status_code = 200
+
+    async def aiter_lines(self):
+        for line in self._frames:
+            yield line
+
+
+class _DelayedCtx:
+    def __init__(self, frames):
+        self._resp = _DelayedResponse(frames)
+
+    async def __aenter__(self):
+        return self._resp
+
+    async def __aexit__(self, *exc):
+        return False
+
+
+class _DelayedClient:
+    def __init__(self, frames):
+        self._frames = list(frames)
+
+    def stream(self, method, url, *, headers=None):
+        return _DelayedCtx(self._frames)
+
+
+class DurationFakeSource(RecordingFakeSource):
+    """A recording-fake whose stream is consumed under an injected clock (still TEST authority).
+
+    Subclassing ``RecordingFakeSource`` (NOT ``LiveCaptureSource``) keeps it on the fail-safe TEST
+    authority path — the exact-type gate maps it to ``test-fake-recording``, never genuine.
+    """
+
+    def stream_client(self) -> _DelayedClient:
+        return _DelayedClient(self._frames)
+
+
+def _make_clock(values):
+    """A deterministic monotonic-clock stand-in: pops each value, then repeats the last one."""
+    seq = list(values)
+
+    def clock() -> float:
+        return seq.pop(0) if len(seq) > 1 else seq[0]
+
+    return clock
+
+
+# --- RED (R-0b-1): records_target bounded stop mints a pack from the records seen so far -----------
+def test_records_target_bounded_stop_mints_pack(tmp_path):
+    # A 5-odds-record stream (plus a leading heartbeat); a bound of 2 must BREAK after 2 records.
+    source = RecordingFakeSource(odds_frames(fixture_id=5, count=5))
+    result = asyncio.run(
+        run_capture_chain(
+            source,
+            session_dir=tmp_path / "session",
+            out_dir=tmp_path / "pack",
+            records_target=2,
+        )
+    )
+
+    # The loop stopped exactly at the target, and the UNCHANGED post-loop mint produced a valid pack.
+    assert result.odds_records == 2
+    assert result.pack is not None
+    assert result.pack_dir is not None
+    assert verify_content_hash(result.pack_dir) is True
+    marketstates = load_pack_marketstates(result.pack_dir, 5)
+    assert [ms.tick_seq for ms in marketstates] == [0, 1]
+    # Bounding the stream does NOT change provenance: a fake seam is still a TEST pack, never genuine.
+    assert read_pack_provenance(result.pack_dir) == TEST_FAKE_PROVENANCE
+    assert is_genuine_pack(result.pack_dir) is False
+
+
+# --- RED (R-0b-2): duration_s bounded stop mints a pack from the records seen so far ---------------
+def test_duration_bounded_stop_mints_pack(tmp_path):
+    # Clock reads: connect=0 (deadline=10); heartbeat check=1 (<10, no stop); rec1 check=20 (>=10 ->
+    # BREAK). So exactly ONE odds record is captured before the elapsed-time stop fires.
+    source = DurationFakeSource(odds_frames(fixture_id=7, count=3))
+    result = asyncio.run(
+        run_capture_chain(
+            source,
+            session_dir=tmp_path / "session",
+            out_dir=tmp_path / "pack",
+            duration_s=10.0,
+            _clock=_make_clock([0.0, 1.0, 20.0]),
+        )
+    )
+
+    assert result.odds_records == 1
+    assert result.pack is not None
+    assert result.pack_dir is not None
+    assert verify_content_hash(result.pack_dir) is True
+    assert read_pack_provenance(result.pack_dir) == TEST_FAKE_PROVENANCE
+    assert is_genuine_pack(result.pack_dir) is False
+
+
+# --- RED (R-0b-3): a bound on a HEARTBEAT-ONLY stream still mints NO pack (guard intact) -----------
+def test_bounded_stop_heartbeat_only_still_no_pack(tmp_path):
+    # Heartbeats never count toward records_target (they are not odds records), so the target is
+    # never reached; the stream ends with 0 odds records and the :487 guard mints NO pack.
+    result = _run_chain_bounded(
+        RecordingFakeSource(heartbeat_only_frames(count=4)), tmp_path, records_target=2
+    )
+
+    assert result.pack is None
+    assert result.pack_dir is None
+    assert result.odds_records == 0
+    assert result.heartbeats == 4
+
+
+# --- RED (R-0b-4): SIGINT seam — a stop-requested callable breaks the loop cleanly, then mints -----
+def test_stop_requested_bounded_stop_mints_pack(tmp_path):
+    # Models the SIGINT signal handler: the callable returns True on its 2nd poll (after the leading
+    # heartbeat + the first odds record), requesting a clean stop mid-stream.
+    calls = {"n": 0}
+
+    def stop_requested() -> bool:
+        calls["n"] += 1
+        return calls["n"] >= 2
+
+    source = RecordingFakeSource(odds_frames(fixture_id=8, count=4))
+    result = asyncio.run(
+        run_capture_chain(
+            source,
+            session_dir=tmp_path / "session",
+            out_dir=tmp_path / "pack",
+            stop_requested=stop_requested,
+        )
+    )
+
+    assert result.odds_records == 1
+    assert result.pack is not None
+    assert result.pack_dir is not None
+    assert verify_content_hash(result.pack_dir) is True
+    assert read_pack_provenance(result.pack_dir) == TEST_FAKE_PROVENANCE
+
+
+# --- RED (R-0b-5): a bounded stop preserves the authority/hash/scrub honesty guards ----------------
+def test_bounded_stop_preserves_authority_hash_and_scrub_guards(tmp_path, capsys):
+    # A genuine-typed source still maps to genuine authority (structural, unchanged by bounding).
+    assert _authority_for_source(LiveCaptureSource()).provenance == GENUINE_TXLINE_PROVENANCE
+    # A fake still maps to TEST authority even under a bound.
+    assert _authority_for_source(RecordingFakeSource()).provenance == TEST_FAKE_PROVENANCE
+
+    source = RecordingFakeSource(odds_frames(fixture_id=6, count=5))
+    jwt, token = source.credentials()
+    assert SENTINEL_SECRET in jwt and SENTINEL_SECRET in token
+    result = _run_chain_bounded(source, tmp_path, records_target=3)
+
+    # Bounding changed only WHEN the stream ends — not provenance, not the hash, not secret hygiene.
+    assert result.odds_records == 3
+    assert result.pack_dir is not None
+    assert verify_content_hash(result.pack_dir) is True
+    assert is_genuine_pack(result.pack_dir) is False
+    captured = capsys.readouterr()
+    assert SENTINEL_SECRET not in captured.out and SENTINEL_SECRET not in captured.err
+    for path in sorted(tmp_path.rglob("*")):
+        if path.is_file():
+            body = path.read_bytes().decode("utf-8", "replace")
+            assert SENTINEL_SECRET not in body, f"sentinel secret leaked into {path}"
+
+
+def _run_chain_bounded(source, tmp_path, **bounds):
+    return asyncio.run(
+        run_capture_chain(
+            source, session_dir=tmp_path / "session", out_dir=tmp_path / "pack", **bounds
+        )
+    )

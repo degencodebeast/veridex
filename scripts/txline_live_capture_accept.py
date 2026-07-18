@@ -23,6 +23,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import signal
 import sys
 import tempfile
 from collections.abc import AsyncIterator, Iterable
@@ -155,16 +156,45 @@ async def _run_offline(out_root: Path) -> CaptureResult:
     return result
 
 
-async def _run_live() -> CaptureResult:
-    """R-0b live path: fail-closed real creds, then capture a GENUINE pack from the deployed feed."""
+async def _run_live(
+    *, duration_s: float | None = None, records_target: int | None = None
+) -> CaptureResult:
+    """R-0b live path: fail-closed real creds, then capture a GENUINE pack from the deployed feed.
+
+    A live SSE stream never ends on its own, so the operator supplies a GRACEFUL BOUNDED STOP —
+    ``--duration-s`` and/or ``--records-target``, and/or Ctrl-C (SIGINT). Each cleanly BREAKS the
+    capture loop so the genuine pack is minted from the records seen so far. The bounds only shorten
+    the stream; the genuine authority/hash/scrub guards inside ``run_capture_chain`` are untouched.
+    """
     source = LiveCaptureSource()
     jwt, token = source.credentials()  # require_live_creds — raises here if creds are absent
     out_root = Path(tempfile.mkdtemp(prefix="txline-live-capture-"))
-    result = await run_capture_chain(
-        source,
-        session_dir=out_root / "session",
-        out_dir=out_root / "pack",
-    )
+
+    # SIGINT (Ctrl-C) -> request a CLEAN stop (break the loop, then mint), never an abrupt cancel.
+    stop_flag = {"stop": False}
+    loop = asyncio.get_running_loop()
+    signal_installed = False
+    try:
+        loop.add_signal_handler(signal.SIGINT, lambda: stop_flag.__setitem__("stop", True))
+        signal_installed = True
+    except (NotImplementedError, RuntimeError):
+        # add_signal_handler is unavailable on some platforms / non-main threads; the other bounds
+        # (duration_s / records_target) still apply.
+        pass
+
+    try:
+        result = await run_capture_chain(
+            source,
+            session_dir=out_root / "session",
+            out_dir=out_root / "pack",
+            duration_s=duration_s,
+            records_target=records_target,
+            stop_requested=lambda: stop_flag["stop"],
+        )
+    finally:
+        if signal_installed:
+            loop.remove_signal_handler(signal.SIGINT)
+
     if result.pack_dir is None or not is_genuine_pack(result.pack_dir):
         raise SystemExit("live accept FAILED: no genuine pack produced")
     print(_scrub(f"live accept OK: GENUINE pack {result.pack_dir}", jwt, token))
@@ -177,10 +207,22 @@ def main(argv: list[str] | None = None) -> None:
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--offline", action="store_true", help="recording-fakes, no network (R-0a / CI)")
     mode.add_argument("--live", action="store_true", help="real creds fail-closed (R-0b / operator)")
+    parser.add_argument(
+        "--duration-s",
+        type=float,
+        default=None,
+        help="live only: stop the capture cleanly after this many seconds (graceful bounded stop)",
+    )
+    parser.add_argument(
+        "--records-target",
+        type=int,
+        default=None,
+        help="live only: stop the capture cleanly after this many odds records (>=1 finalizes R-0b)",
+    )
     args = parser.parse_args(argv)
 
     if args.live:
-        asyncio.run(_run_live())
+        asyncio.run(_run_live(duration_s=args.duration_s, records_target=args.records_target))
     else:
         with tempfile.TemporaryDirectory(prefix="txline-offline-accept-") as tmp:
             asyncio.run(_run_offline(Path(tmp)))

@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import json
 import time
+from collections.abc import Callable
 from dataclasses import InitVar, dataclass
 from pathlib import Path
 from typing import Any, Final, Protocol, runtime_checkable
@@ -404,6 +405,10 @@ async def run_capture_chain(
     base_url: str = "https://txline-dev.txodds.com/api",
     tool_version: str = "capture_chain/1",
     stale_after_s: int = DEFAULT_STALE_AFTER_S,
+    duration_s: float | None = None,
+    records_target: int | None = None,
+    stop_requested: Callable[[], bool] | None = None,
+    _clock: Callable[[], float] = time.monotonic,
 ) -> CaptureResult:
     """Run the full ingest→normalize→record→pack chain over *source*, returning a CaptureResult.
 
@@ -411,6 +416,23 @@ async def run_capture_chain(
     producer set (:func:`_authority_for_source`) purely by the source's concrete TYPE and folded into
     the pack's v2 ``content_hash``. This is the honesty invariant — neither a caller nor a source can
     inject "genuine" for a fake/unknown producer.
+
+    GRACEFUL BOUNDED STOP (R-0b): a live SSE stream never ends on its own, so ``run_capture_chain``
+    would otherwise loop until the server closes — and killing the process mid-stream (SIGTERM)
+    cancels BEFORE the post-loop mint, yielding NO pack. Any of three optional bounds cleanly BREAKS
+    the ``async for`` loop so the UNCHANGED finalize+mint path below runs and finalizes a pack from
+    whatever real records were captured; whichever bound fires first wins:
+
+    * ``records_target`` — stop once this many NON-heartbeat odds records have been recorded (>=1 is
+      enough for R-0b);
+    * ``duration_s`` — stop once this many seconds have elapsed since the stream connected (measured
+      on the monotonic ``_clock``);
+    * ``stop_requested`` — a poll the loop checks each iteration; the ``--live`` CLI wires a SIGINT
+      handler to it so Ctrl-C requests a clean stop rather than an abrupt cancel.
+
+    A bounded stop ONLY ends the stream sooner: it does NOT touch the genuine-authority derivation,
+    the content-hash, the secret scrub, or the heartbeat-vs-record distinction. A heartbeat-only
+    stream still mints NO pack (the 0-records guard below), regardless of any bound.
 
     Args:
         source: The capture seam (live or recording-fake). Only :class:`LiveCaptureSource` maps to
@@ -420,6 +442,12 @@ async def run_capture_chain(
         base_url: TxLINE API base URL; ``/odds/stream`` is appended.
         tool_version: Recorded ``tool_version`` for the session meta.
         stale_after_s: Staleness budget passed to :func:`~veridex.ingest.feed_health.derive_feed_state`.
+        duration_s: Optional wall-clock bound (seconds since connect) after which the loop stops.
+        records_target: Optional bound on the number of odds records after which the loop stops.
+        stop_requested: Optional per-iteration poll (returns ``True`` to request a clean stop) — the
+            SIGINT seam.
+        _clock: Injectable monotonic clock for the ``duration_s`` deadline (test seam; defaults to
+            :func:`time.monotonic`).
 
     Returns:
         A :class:`CaptureResult`. ``pack``/``pack_dir`` are ``None`` when no odds records were
@@ -449,6 +477,9 @@ async def run_capture_chain(
                 # Scrubbed connect diagnostic — the raw creds are ALWAYS redacted, never logged.
                 status = getattr(resp, "status_code", "?")
                 print(_scrub(f"[capture] {url} connected: HTTP {status}", jwt, token))
+                # GRACEFUL BOUNDED STOP — the monotonic deadline is anchored at CONNECT (first frame
+                # yet to arrive), so ``duration_s`` measures elapsed time on the live stream.
+                deadline = _clock() + duration_s if duration_s is not None else None
                 async for line in resp.aiter_lines():
                     record = parse_sse_line(line)
                     if record is not None:
@@ -463,6 +494,15 @@ async def run_capture_chain(
                         # A heartbeat proves liveness but carries no market data.
                         heartbeats += 1
                         last_frame_ts = int(time.time())
+                    # GRACEFUL BOUNDED STOP — break the loop CLEANLY (never cancel) on whichever bound
+                    # fires first, so the UNCHANGED finalize+mint path below runs on the records seen.
+                    # ``records_target`` counts only NON-heartbeat odds records (``odds_records``).
+                    if records_target is not None and odds_records >= records_target:
+                        break
+                    if deadline is not None and _clock() >= deadline:
+                        break
+                    if stop_requested is not None and stop_requested():
+                        break
     finally:
         aclose = getattr(client, "aclose", None)
         if aclose is not None:
