@@ -381,12 +381,31 @@ class _ReplayedHandle:
         return self._raw
 
 
+class SealedEvidenceMismatch(BaseException):
+    """A sealed transcript was replayed against evidence it was NOT sealed on — FAIL CLOSED.
+
+    Deliberately a :class:`BaseException` (not :class:`Exception`): the LLM checkpoint runner's
+    ``step`` degrades any launch ``Exception`` to a fail-closed WAIT, which would silently LAUNDER an
+    evidence-integrity violation into an abstention. A ``BaseException`` bypasses that ``except
+    Exception`` and propagates out of :meth:`VeridexLLMAgentAdapter.replay`, so a transcript can only
+    ever reproduce against its ORIGINATING evidence — a mismatch (or an unconsumed/missing entry) hard
+    fails rather than emitting a stale response against the wrong snapshot.
+    """
+
+
 class _ReplayingLauncher:
     """Serves the SEALED transcript in launch order — NEVER invokes the underlying model.
 
     Because the sealed run has a single physical call in flight at a time (the ``InflightGuard``
     one-in-flight invariant), launch order equals completion order, so consuming the transcript as an
     ordered queue reproduces the canonical response for each checkpoint without any model call.
+
+    SEALED-EVIDENCE INTEGRITY (II-8b): each launch's ``prompt`` — the deterministic evidence coordinate
+    the model was sealed on (it embeds the snapshot + ``evidence_hash``) — is compared to the sealed
+    entry's stored prompt. ANY divergence raises :class:`SealedEvidenceMismatch` (fail closed), and a
+    replay that does not consume EXACTLY the sealed entries (an over-run, or leftover entries at
+    completion) fails closed too — so a transcript is bound to, and consumed exactly against, the
+    evidence it originated from.
     """
 
     def __init__(self, transcript: tuple[TranscriptEntry, ...]) -> None:
@@ -395,10 +414,25 @@ class _ReplayingLauncher:
 
     def launch(self, prompt: str) -> CallHandle:
         if self._index >= len(self._queue):
-            raise RuntimeError("replay exhausted the sealed transcript (unexpected extra model call)")
+            raise SealedEvidenceMismatch(
+                "replay over-ran the sealed transcript: a checkpoint has NO sealed entry (missing evidence)"
+            )
         entry = self._queue[self._index]
+        if prompt != entry.prompt:
+            raise SealedEvidenceMismatch(
+                "replay evidence mismatch: this checkpoint's prompt/evidence coordinate differs from the "
+                "sealed entry — the transcript was not sealed on this tape's snapshot"
+            )
         self._index += 1
         return _ReplayedHandle(entry.raw)
+
+    def assert_fully_consumed(self) -> None:
+        """At completion, every sealed entry must have been consumed exactly (no leftovers)."""
+        if self._index != len(self._queue):
+            raise SealedEvidenceMismatch(
+                f"replay left {len(self._queue) - self._index} sealed transcript entr(y/ies) unconsumed — "
+                "the tape did not replay the exact sealed evidence sequence"
+            )
 
 
 class VeridexLLMAgentAdapter(VeridexAgentAdapter):
@@ -468,4 +502,6 @@ class VeridexLLMAgentAdapter(VeridexAgentAdapter):
         hosted, _ = await _drive_agent_over_tape(
             agent, tape, _replay_context(self.get_id()), StopSignal(), clock=clock
         )
+        # Fail closed if the tape did not consume EXACTLY the sealed entries (leftover/missing evidence).
+        launcher.assert_fully_consumed()
         return tuple(hosted)

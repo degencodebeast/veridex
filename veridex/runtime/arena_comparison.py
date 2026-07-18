@@ -29,6 +29,7 @@ identical-opportunity claim (the flag flips) rather than silently averaging.
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
@@ -43,6 +44,7 @@ from veridex.runtime.llm_checkpoint import (
     IN_FLIGHT,
     CheckpointPolicy,
     InflightGuard,
+    ServiceOutcome,
 )
 from veridex.runtime.schemas import AgentAction, SportsActionType
 from veridex.strategies.drift_features import (
@@ -150,8 +152,12 @@ class ArenaSharedProjector:
                 snap = drift_features(
                     series, self._ts_first[key], ts, DriftFeatureParams(ewma_slope_alpha=self._ewma_slope_alpha)
                 )
-                # Strongest RISING cumulative drift wins; ties broken by (market_key, side) ascending.
-                if best is None or (snap.cum_logit_drift, key) > (best.snapshot.cum_logit_drift, (best.market_key, best.side)):
+                # Strongest RISING cumulative drift wins; ties broken by (market_key, side) ASCENDING
+                # (smallest key), MIRRORING standalone det-Drift (drift.py) + DefaultDriftProjector
+                # (llm_drift.py) so arena det-Drift targets the SAME tied market as standalone.
+                if best is None or (snap.cum_logit_drift, (best.market_key, best.side)) > (
+                    best.snapshot.cum_logit_drift, key
+                ):
                     best = SharedProjection(snapshot=snap, market_key=market_key, side=side)
         return best
 
@@ -243,8 +249,12 @@ class ArenaComparisonReport:
             ``(checkpoint_ts, evidence_hash)`` sequence; otherwise the claim is DROPPED.
         eligible_checkpoints: The count of shared eligible checkpoints when identical, else ``0``.
         fixture_count: Number of distinct fixtures/windows compared in this run.
-        contestants: Per-contestant tallies ``{actions, waits, scoreable_decisions, eligible_checkpoints}``.
-        scoreable_decisions: Total scoreable (non-WAIT) decisions across both contestants.
+        contestants: Per-contestant tallies ``{actions, waits, scoreable_decisions, eligible_checkpoints}``
+            — ``actions`` counts EVERY non-WAIT emission; ``scoreable_decisions`` is the AUTHORITATIVE
+            subset (only law-valid, targeted non-WAITs), so the two are a real, distinct pair.
+        scoreable_decisions: Total AUTHORITATIVE scoreable decisions across both contestants — only
+            law-valid non-WAIT actions that name a real ``(market_key, side)`` target (a bare non-WAIT
+            with no market/side is NOT scoreable), never a raw ``action_type != WAIT`` count.
         clustered_uncertainty: An honesty caveat — decisions cluster on few checkpoints/markets, so
             CLV samples are correlated, NOT independent (why no bare average is reported).
         shared_checkpoints: The shared ``(checkpoint_ts, evidence_hash)`` sequence when identical, else ``[]``.
@@ -406,18 +416,7 @@ class ArenaComparison:
         # then LAUNCH only if the slot is free AND this tick opens a checkpoint (the §3 order).
         outcome = self._guard.service()
         if outcome.status == COMPLETED_FRESH:
-            try:
-                action = _revalidate_action(outcome.raw)
-            except Exception:
-                action = _wait()  # fail-closed: malformed / over-powered output → WAIT
-            self.events.append(
-                ArenaCheckpointEvent(
-                    contestant=LLM_DRIFT_CONTESTANT, kind="decision",
-                    checkpoint_ts=ts, evidence_hash=outcome.evidence_hash or "",
-                    action_type=action.type.value,
-                    market_key=action.params.get("market_key"), side=action.params.get("side"),
-                )
-            )
+            self._emit_llm_decision(ts, outcome)
             return
         if outcome.status in (IN_FLIGHT, AWAITING_CONFIRMATION):
             if is_cp and snapshot is not None:
@@ -445,6 +444,67 @@ class ArenaComparison:
                 )
             )
 
+    def _emit_llm_decision(self, ts: int, outcome: ServiceOutcome) -> None:
+        """Emit the ONE scored LLM decision for a freshly-completed call (typed-revalidated, fail-closed).
+
+        Shared by the per-tick service path (:meth:`_step_llm`) and the end-of-tape :meth:`drain`, so a
+        call that completes fresh ON the final checkpoint is emitted with the SAME typed-revalidation
+        and fail-closed-WAIT discipline as one that completes mid-tape.
+        """
+        try:
+            action = _revalidate_action(outcome.raw)
+        except Exception:
+            action = _wait()  # fail-closed: malformed / over-powered output → WAIT
+        self.events.append(
+            ArenaCheckpointEvent(
+                contestant=LLM_DRIFT_CONTESTANT, kind="decision",
+                checkpoint_ts=ts, evidence_hash=outcome.evidence_hash or "",
+                action_type=action.type.value,
+                market_key=action.params.get("market_key"), side=action.params.get("side"),
+            )
+        )
+
+    @property
+    def guard_busy(self) -> bool:
+        """Whether an LLM physical call still occupies the single in-flight slot (drain check)."""
+        return self._guard.busy
+
+    async def drain(self, *, max_yields: int = 256) -> None:
+        """End-of-tape: settle the final in-flight LLM call to an AUDITED terminal outcome.
+
+        A production launcher backs each model call with an ``asyncio.Task`` that advances ONLY when
+        the event loop runs. The replay loop yields once per tick so an in-flight call is serviced on a
+        following tick, but a call LAUNCHED on the FINAL checkpoint has no following tick. This gives
+        that last call a bounded chance to complete under the (frozen snapshot-ts) clock — emitting its
+        decision if it lands fresh — and otherwise deterministically CANCELS it via the guard's OWN
+        expiry machinery and confirms termination, so every physical call reaches an audited terminal
+        outcome (completed-fresh / completed-stale / failed / confirmed-terminated) rather than being
+        left silently in flight. One-in-flight + expiry-confirmation are preserved (the guard is the
+        SAME §3 machine); no new projection is taken (the tape is exhausted).
+        """
+        if not self._guard.busy:
+            return
+        ts = int(self._clock())
+        # Phase 1 — let a launched-but-unfinished task finish under the snapshot-ts clock.
+        for _ in range(max_yields):
+            await asyncio.sleep(0)
+            outcome = self._guard.service()
+            if outcome.status == COMPLETED_FRESH:
+                self._emit_llm_decision(ts, outcome)
+                return
+            if outcome.status in (COMPLETED_STALE, FAILED, CONFIRMED_TERMINATED):
+                return  # terminal, non-fresh: audited, nothing to emit
+            if not self._guard.busy:
+                return
+        # Phase 2 — still in flight after the bounded window: force expiry via the guard's own cancel
+        # path (advance the clock past the pinned evidence-age limit), then confirm termination.
+        self._clock.set(float(ts) + self._llm_policy.evidence_age_limit_s + 1.0)
+        for _ in range(max_yields):
+            outcome = self._guard.service()
+            if outcome.status in (CONFIRMED_TERMINATED, COMPLETED_STALE, FAILED) or not self._guard.busy:
+                return
+            await asyncio.sleep(0)
+
     # --- audit-trail readers ----------------------------------------------
 
     def opportunities(self, contestant: str) -> list[tuple[int, str]]:
@@ -455,17 +515,35 @@ class ArenaComparison:
             if e.contestant == contestant and e.kind == "opportunity"
         ]
 
+    @staticmethod
+    def _is_non_wait(e: ArenaCheckpointEvent) -> bool:
+        """A decision event that emitted a NON-WAIT action (regardless of whether it is scoreable)."""
+        return e.kind == "decision" and e.action_type != SportsActionType.WAIT.value
+
+    @staticmethod
+    def _is_scoreable(e: ArenaCheckpointEvent) -> bool:
+        """Whether a decision event is a SCOREABLE decision — AUTHORITATIVE, not a bare non-WAIT count.
+
+        A non-WAIT action is scoreable ONLY when it names a valid ``(market_key, side)`` target the law
+        can actually score against a closing snapshot. A schema-valid but law-invalid non-WAIT (empty
+        params / missing market or side) is NOT scoreable — counting it would overstate a contestant's
+        usable actions and collapse the required actions-vs-scoreable distinction (addendum §3).
+        """
+        return (
+            e.kind == "decision"
+            and e.action_type != SportsActionType.WAIT.value
+            and bool(e.market_key)
+            and bool(e.side)
+        )
+
     def _tallies(self, contestant: str) -> dict[str, int]:
         eligible = len(self.opportunities(contestant))
-        actions = sum(
-            1
-            for e in self.events
-            if e.contestant == contestant and e.kind == "decision" and e.action_type != SportsActionType.WAIT.value
-        )
+        actions = sum(1 for e in self.events if e.contestant == contestant and self._is_non_wait(e))
+        scoreable = sum(1 for e in self.events if e.contestant == contestant and self._is_scoreable(e))
         return {
-            "actions": actions,
+            "actions": actions,  # every non-WAIT emission (may include law-invalid ones)
             "waits": max(eligible - actions, 0),
-            "scoreable_decisions": actions,
+            "scoreable_decisions": scoreable,  # AUTHORITATIVE: only law-valid, targeted non-WAITs
             "eligible_checkpoints": eligible,
         }
 
@@ -481,17 +559,10 @@ class ArenaComparison:
         scoreable = det_tally["scoreable_decisions"] + llm_tally["scoreable_decisions"]
 
         # Clustered-uncertainty honesty caveat: decisions cluster on few checkpoints/markets, so the
-        # CLV samples are CORRELATED — an average across them is not an independent-sample mean.
-        distinct_markets = {
-            e.market_key
-            for e in self.events
-            if e.kind == "decision" and e.action_type != SportsActionType.WAIT.value and e.market_key
-        }
-        distinct_checkpoints = {
-            e.checkpoint_ts
-            for e in self.events
-            if e.kind == "decision" and e.action_type != SportsActionType.WAIT.value
-        }
+        # CLV samples are CORRELATED — an average across them is not an independent-sample mean. Scoped
+        # to AUTHORITATIVE scoreable decisions (law-valid targets), consistent with ``scoreable`` above.
+        distinct_markets = {e.market_key for e in self.events if self._is_scoreable(e)}
+        distinct_checkpoints = {e.checkpoint_ts for e in self.events if self._is_scoreable(e)}
         clustered_uncertainty = {
             "scoreable_decisions": scoreable,
             "distinct_markets": len(distinct_markets),
@@ -556,6 +627,12 @@ async def run_arena_comparison(
     )
     for market_state in marketstates:
         await arena.step(market_state)
+        # Yield so a production launcher's asyncio.Task can progress before the next tick's service —
+        # a call launched this tick can then complete/settle under the snapshot-ts clock (not left in
+        # flight because the replay loop never released the event loop).
+        await asyncio.sleep(0)
+    # Deterministically settle/cancel the final in-flight call so every physical call is audited.
+    await arena.drain()
     return arena
 
 

@@ -10,28 +10,27 @@ the stable contract II-8 (LLM-Drift) consumes, so its snapshot shape + signature
 
 from __future__ import annotations
 
-from veridex.ingest.marketstate import replay_marketstates
+from veridex.ingest.marketstate import MarketState, replay_marketstates
 from veridex.strategies.drift import CumulativeDriftStrategy, cumulative_drift_agent
 from veridex.strategies.drift_features import (
     DriftFeatureParams,
     DriftFeatureSnapshot,
     drift_features,
 )
-from veridex.ingest.marketstate import MarketState
 from veridex.strategies.sharp_stats import logit
 
 FIXTURE = "tests/fixtures/wd2_momentum_replay.json"
 
 # Discriminating params so the 4-tick fixture actually exercises firing (a meaningful golden, not an
 # all-abstain one). SAME kwargs were used to capture the pre-refactor golden below.
-_GOLDEN_KW = dict(
-    min_tick_count=3,
-    min_horizon_s=0,
-    cum_drift_logit_min=0.05,
-    trend_strength_min=0.5,
-    cooldown_ticks=0,
-    close_quality_required=True,
-)
+_GOLDEN_KW = {
+    "min_tick_count": 3,
+    "min_horizon_s": 0,
+    "cum_drift_logit_min": 0.05,
+    "trend_strength_min": 0.5,
+    "cooldown_ticks": 0,
+    "close_quality_required": True,
+}
 
 # The pre-refactor decision sequence, captured by replaying the fixture through the CURRENT
 # (pre-refactor) ``CumulativeDriftStrategy`` under ``_GOLDEN_KW``. Committed as literals — the byte

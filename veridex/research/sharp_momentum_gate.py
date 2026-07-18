@@ -64,8 +64,7 @@ class FixtureCandidate:
 
 
 #: The GENUINE fixture ids banked in :data:`DEMO_PACK_REAL_DIR` (FIFA WC 2026 quarter-finals). Written
-#: as explicit literals so the pin is a visible, reviewable constant — pinned BEFORE any outcome is
-#: read (:func:`_assert_pin_matches_pack` guards that these still match the pack's manifest).
+#: as explicit literals so the pin is a visible, reviewable constant — pinned BEFORE any outcome is read.
 _GENUINE_FIXTURE_IDS: tuple[int, ...] = (18209181, 18213979, 18218149, 18222446)
 #: The shipped SYNTHETIC demo-pack fixture, pinned as a NON-GENUINE control: the harness classifies it
 #: non-genuine and excludes it from admission no matter how many actions it produces.

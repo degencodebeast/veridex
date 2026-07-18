@@ -317,9 +317,14 @@ class VeridexAgentAdapter(BaseExternalAgent):
         reason = getattr(result, "terminal_reason", None)
         failed = reason == "frozen"
         if entry.phase is RunPhase.CANCELLING:
+            # A cancel engaged (owner-kill). The ONE genuinely-terminal `cancelled` STATUS_CHANGED was
+            # already emitted by the cancel path (the deploy kill route). Emitting a later
+            # `completed`/`failed` here would OVERWRITE that terminal status for a latest-status
+            # consumer — rendering a killed run as normally completed — so a cancelled run SUPPRESSES
+            # the adapter terminal emit. The non-cancel completion path below is byte-unchanged.
             entry.phase = RunPhase.CANCELLED
-        else:
-            entry.phase = RunPhase.FAILED if failed else RunPhase.COMPLETED
+            return result
+        entry.phase = RunPhase.FAILED if failed else RunPhase.COMPLETED
         self._emit_terminal(sink, ctx, failed=failed)
         return result
 

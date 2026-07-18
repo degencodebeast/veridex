@@ -264,6 +264,38 @@ async def test_status_reflects_run_state_before_and_after_kill() -> None:
         assert settled.json()["killed"] is True
 
 
+def _status_changed(events: list[RuntimeEvent]) -> list[RuntimeEvent]:
+    """Every durable STATUS_CHANGED OPS event, in emission order."""
+    return [e for e in events if e.type == RuntimeEventType.STATUS_CHANGED]
+
+
+async def test_owner_kill_last_durable_status_is_cancelled_not_completed() -> None:
+    """MAJOR 5 — after an owner-kill the LAST durable STATUS_CHANGED is ``cancelled``.
+
+    The adapter must NOT emit a later ``completed`` that overwrites the terminal ``cancelled`` for a
+    latest-status consumer (Agent Ops): a killed run must never render as normally completed.
+    """
+    driver = _ParkingDriver()
+    events: list[RuntimeEvent] = []
+    app, store = _build_app(driver=driver, events=events)
+
+    async with _transport(app) as client:
+        body = await _deploy_and_park(client, driver)
+        instance_id = body["instance_id"]
+
+        kill = await client.post(f"/agents/instances/{instance_id}/kill")
+        assert kill.status_code == 200, kill.text
+        assert kill.json()["engaged"] is True
+
+        await _drain(app)
+        assert driver.stopped.is_set(), "the owner kill tripped the StopSignal and stopped the loop"
+
+    statuses = [e.payload.get("status") for e in _status_changed(events)]
+    assert statuses, "a killed run emits at least one terminal STATUS_CHANGED"
+    assert statuses[-1] == "cancelled", f"the LAST durable status must be cancelled, got {statuses}"
+    assert "completed" not in statuses, f"a killed run must NOT render as completed: {statuses}"
+
+
 async def test_status_non_owner_is_hidden() -> None:
     """Owner-gating parity: a non-owner status probe is refused (403), never leaked."""
     app, store = _build_app()

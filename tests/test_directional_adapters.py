@@ -445,6 +445,43 @@ async def test_red6_llm_replay_consumes_sealed_transcript_never_reinvokes() -> N
     assert result.scored_actions, "at least one canonical hosted action was scored"
 
 
+async def test_major4_sealed_transcript_fails_closed_on_evidence_mismatch() -> None:
+    """MAJOR 4 — a sealed LLM transcript replays ONLY against its ORIGINATING evidence.
+
+    A tape whose per-tick snapshot (evidence coordinate) differs from the sealed entry FAILS CLOSED
+    (raises), never emitting the stale response against the wrong evidence; a matching tape still
+    replays canonically with NO model re-invoke; and leftover/unconsumed entries fail closed too.
+    """
+    from veridex.runtime.directional_agent_adapters import SealedEvidenceMismatch
+
+    tape_a = _drift_tape(6)
+    base = _CountingLauncher([_llm_action("home"), _llm_action("away"), _llm_action("draw")])
+    adapter = _llm_adapter(base, tape_a)
+    result = await adapter.start_run(
+        run_id="run-seal", session_id="s", runtime_agent_id=adapter.get_id(), owner_did=OWNER_A
+    )
+    assert result.sealed_transcript, "the hosted run sealed a transcript"
+    hosted_calls = base.calls
+
+    # A DIFFERENT tape → different per-tick evidence coordinate (the projector keys on tick_seq) →
+    # the sealed prompt/evidence differs from what this replay would decide on → FAIL CLOSED.
+    tape_b = [_ms(3000 + i * 160, tick_seq=i + 50) for i in range(6)]
+    with pytest.raises(SealedEvidenceMismatch):
+        await adapter.replay(tape_b, result.sealed_transcript)
+    assert base.calls == hosted_calls, "a rejected replay must NEVER invoke the model"
+
+    # The MATCHING tape still replays canonically (no re-invoke; byte-identical).
+    replay = await adapter.replay(tape_a, result.sealed_transcript)
+    assert base.calls == hosted_calls, "a matching replay consumes the sealed transcript, no re-invoke"
+    assert _serialize(result.actions) == _serialize(replay)
+
+    # Leftover / unconsumed sealed entries fail closed at completion.
+    with pytest.raises(SealedEvidenceMismatch):
+        await adapter.replay(
+            tape_a, (*result.sealed_transcript, TranscriptEntry(prompt="UNUSED", raw=_llm_action("home")))
+        )
+
+
 async def test_red6_zero_construct_side_effects() -> None:
     """AC-26 (inherited): constructing either adapter starts NO run and touches NO model."""
     base = _CountingLauncher([_llm_action("home")])
