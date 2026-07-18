@@ -10,12 +10,15 @@ adapter or receipt proposer ever runs. The 9-step chain is documented on
 
 The tape and the dry-run proposer arrive through an INJECTABLE, SERVER-SIDE seam (mirrors
 `veridex.api.deploy.DeployDeps`) — never a request field. The production tape catalog
-(`MM_TAPE_CATALOG`) is intentionally EMPTY: banking + content-hash-persisting a receipt-shaped
-production demo tape is carried as the tracked follow-up `fu-ii5-demo-tape` (a genuinely receipt-
-producing tape needs careful warm-state tuning verified against the real cadence engine — rushing one
-in here risks a silently-wrong money-adjacent fixture, which A8 honesty forbids). `default_mm_tape_
-resolver` therefore fails closed with a clear, honest error naming the missing catalog entry — it
-NEVER fabricates a tape. Tests / operators inject a real tape through `DeployDeps.mm_tape_resolver`.
+(`MM_TAPE_CATALOG`) banks exactly ONE entry — `txline-mm-18213979-v1`, the `fu-ii5-demo-tape`
+follow-up — a HYBRID tape of VERBATIM recorded SX Bet in-play order-book + TxLINE fair-value rows (FIFA
+World Cup Norway v England, fixture 18213979, ~51' in-play) with deterministically-set orchestration
+scaffolding (see
+`veridex.mm_strategy.demo_tape` for the full field-provenance table). Its content hash is re-verified at
+resolve time; it is SELF-WARMING (the deploy's default cold seed folds its real warmup prefix — no
+injected seed). Every OTHER `tape_ref` still fails closed: `default_mm_tape_resolver` raises a clear,
+honest error naming the missing catalog entry — it NEVER fabricates a tape. Tests / operators may still
+inject a real tape through `DeployDeps.mm_tape_resolver`.
 """
 
 from __future__ import annotations
@@ -31,6 +34,7 @@ from typing import TYPE_CHECKING, Any
 from veridex.deploy.preflight import DeployConfig, MakerDeployConfig
 from veridex.dust_execution.manifest import StrategyExperimentManifest
 from veridex.live_recorder.contracts import LiveRecorderSessionMeta
+from veridex.mm_strategy import demo_tape
 from veridex.mm_strategy.composition import MakerInstanceConfig
 from veridex.mm_strategy.config import StrategyConfig
 from veridex.mm_strategy.contracts import StrategyState
@@ -141,10 +145,13 @@ def compute_tape_content_hash(events: tuple[Any, ...]) -> str:
     return hashlib.sha256(serialize_payload(rows).encode("utf-8")).hexdigest()
 
 
-#: The production tape catalog. Intentionally EMPTY — banking a receipt-shaped, content-hash-pinned
-#: production demo tape is `fu-ii5-demo-tape` (see module docstring). Populate as
-#: `{"tape-ref-key": lambda: MakerReplayTape(...)}` once a verified tape is banked.
-MM_TAPE_CATALOG: dict[str, Callable[[], MakerReplayTape]] = {}
+#: The production tape catalog. Banks the ONE `fu-ii5-demo-tape` entry (`txline-mm-18213979-v1`, a
+#: HYBRID of real recorded SX book + TxLINE fair-value rows + derived session metadata — see
+#: `veridex.mm_strategy.demo_tape`); its content hash is re-verified at resolve time (step 7 of
+#: `reconstruct_mm_session`). Any other key fails closed.
+MM_TAPE_CATALOG: dict[str, Callable[[], MakerReplayTape]] = {
+    demo_tape.TAPE_REF: demo_tape.build_txline_mm_tape,
+}
 
 
 def default_mm_tape_resolver(tape_ref: str) -> MakerReplayTape:
