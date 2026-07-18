@@ -11,6 +11,24 @@ import { GLOSSARY } from '@/lib/glossary';
 import { deployAgent, DeployPreflightError, type DeployAgentPayload } from '@/lib/api';
 import styles from './StudioScreen.module.css';
 
+// The QuoteGuard/MM template id — the deploy discriminator for the MM family (decision 2). Driving
+// the MM payload off the SELECTED TEMPLATE (not the archetype) is deliberate: quoteguard_mm reuses
+// the `baseline` archetype, so mapping by archetype alone would hijack every manual baseline pick.
+const MM_TEMPLATE_ID = 'quoteguard_mm';
+
+// The MM tape catalog KEY (NOT a path/fixture). This key resolves a CLEARLY-LABELED SYNTHETIC /
+// canned MM-mechanism replay tape via the server-side mm_tape_resolver seam — it is NOT a real
+// market recording, and (A8 honesty) the key must NOT imply a real event provenance the tape lacks.
+// fu-ii5-demo-tape registers this key into the backend catalog; until then a LIVE deploy fail-closes
+// on mm_family, and the frontend tests mock fetch so they pass without the tape.
+const DEMO_MM_TAPE_REF = 'synthetic-mm-mechanism-v1';
+
+// Clamp any execution mode to what the MM family permits: the backend fail-closes MM on
+// execution_mode == 'live_guarded', so the MM card only ever emits paper | dry_run.
+function mmExecutionMode(exec: ExecutionMode): 'paper' | 'dry_run' {
+  return exec === 'dry_run' ? 'dry_run' : 'paper';
+}
+
 // Map the Studio archetype + mode onto a backend strategy family (deploy launches this agent).
 function toStrategy(archetype: Archetype, mode: StudioMode): string {
   if (mode === 'llm') return 'llm';
@@ -23,9 +41,41 @@ function toStrategy(archetype: Archetype, mode: StudioMode): string {
 // source_mode is the OPERATOR's choice (never hardcoded 'live'): the demo defaults to a working
 // REPLAY deploy (recorded pack, proof-only). A 'live' deploy stays fail-closed on the backend
 // (named feed_health 422) until a live feed is wired — the honest live path is T20b/operator.
+//
+// fu-ii5: when the SELECTED TEMPLATE is quoteguard_mm, emit the frozen `quoteguard-mm` MM family
+// (strategy discriminator + an `mm` MakerDeployConfig subset), pinned to replay + paper/dry_run so
+// the backend fail-closed MM preflight (_check_mm) accepts it. Every other selection keeps the
+// existing directional behavior UNCHANGED (a manual `baseline` archetype still → directional).
 function buildDeployPayload(
   archetype: Archetype, mode: StudioMode, exec: ExecutionMode, source: SourceMode,
+  templateId: string | null,
 ): DeployAgentPayload {
+  if (templateId === MM_TEMPLATE_ID) {
+    return {
+      template_id: MM_TEMPLATE_ID,
+      agent_id: `studio-${MM_TEMPLATE_ID}`,
+      strategy: 'quoteguard-mm',
+      source_mode: 'replay', // MM allowed ONLY in replay (backend rejects source_mode=='live')
+      execution_mode: mmExecutionMode(exec), // paper | dry_run only (no live_guarded)
+      market_allowlist: DEFAULT_POLICY_ENVELOPE.market_allowlist, // non-empty (empty → MM reject)
+      venue_allowlist: DEFAULT_POLICY_ENVELOPE.venue_allowlist,
+      min_edge_bps: DEFAULT_POLICY_ENVELOPE.min_edge_bps,
+      max_stake: DEFAULT_POLICY_ENVELOPE.max_stake,
+      window_id: `studio-${MM_TEMPLATE_ID}`,
+      fixture_id: 1,
+      end_rule: 'pre_match',
+      mm: {
+        tape_ref: DEMO_MM_TAPE_REF,
+        guard_enabled: true,
+        tif: 'GTC',
+        max_orders_per_run: 3,
+        max_orders_per_session: 10,
+        max_orders_per_day: 20,
+        max_session_loss: 0,
+        max_daily_loss: 0,
+      },
+    };
+  }
   return {
     template_id: archetype,
     agent_id: `studio-${archetype}`,
@@ -66,6 +116,10 @@ export function StudioScreen({
   const [archetype, setArchetype] = useState<Archetype>('value_clv');
   const [mode, setMode] = useState<StudioMode>('numeric');
   const [exec, setExec] = useState<ExecutionMode>('paper');
+  // fu-ii5: the SELECTED template id — the deploy discriminator for the MM family. null once the
+  // operator hand-edits archetype/mode (a manual edit is no longer a template-driven deploy), which
+  // keeps a manual `baseline` pick on the directional path instead of hijacking it into MM.
+  const [templateId, setTemplateId] = useState<string | null>(null);
   // Demo-safe default: a working REPLAY deploy (recorded pack). 'live' stays fail-closed on the
   // backend until a live feed is wired — never dressed up as live/real-money from the demo.
   const [source, setSource] = useState<SourceMode>('replay');
@@ -82,20 +136,33 @@ export function StudioScreen({
   const [deploying, setDeploying] = useState(false);
 
   const modes = availableModes(archetype);
+  // fu-ii5: the MM template is restricted to the fail-closed-safe modes — the source/exec selectors
+  // must not offer live / live_guarded for it (an operator cannot pick a mode the backend rejects).
+  const isMM = templateId === MM_TEMPLATE_ID;
 
-  // AC-007 snap-back: whenever archetype changes, re-resolve the current mode.
+  // AC-007 snap-back: whenever archetype changes, re-resolve the current mode. A manual archetype/
+  // mode edit clears the selected template — the deploy reverts to the directional path (fu-ii5).
   function onArchetype(next: Archetype) {
     setArchetype(next);
     setMode((m) => resolveMode(next, m));
+    setTemplateId(null);
   }
   function onMode(next: StudioMode) {
     setMode(resolveMode(archetype, next));
+    setTemplateId(null);
   }
   // Selecting a BUILT template applies its archetype + default mode through the existing coupling
-  // (snap-back preserved). Heavy-extension (Phase-3) templates are not selectable.
+  // (snap-back preserved) and tracks the template id as the deploy discriminator. Locked heavy
+  // extensions (Arb/Spread) are not selectable; the deployable MM template is. For the MM template
+  // the source/exec are clamped to the fail-closed-safe MM modes (replay + paper/dry_run).
   function applyTemplate(t: StrategyTemplate) {
     setArchetype(t.archetype);
     setMode(resolveMode(t.archetype, t.defaultMode));
+    setTemplateId(t.id);
+    if (t.id === MM_TEMPLATE_ID) {
+      setSource('replay');
+      setExec((e) => (e === 'live_guarded' ? 'paper' : e));
+    }
   }
 
   // #4 reviewable diff: current draft vs last-pinned baseline (a structured before→after patch).
@@ -115,7 +182,7 @@ export function StudioScreen({
     setPreflightFailure(null);
     setRunId(null);
     try {
-      const result = await deployAgent(buildDeployPayload(archetype, mode, exec, source));
+      const result = await deployAgent(buildDeployPayload(archetype, mode, exec, source, templateId));
       setRunId(result.run_id);
     } catch (err) {
       if (err instanceof DeployPreflightError) setPreflightFailure(err.failedChecks);
@@ -149,18 +216,27 @@ export function StudioScreen({
           <Section n="01" title="Identity & archetype">
             <div className={styles.cards} data-testid="strategy-cards">
               {STRATEGY_TEMPLATES.map((t) => {
-                const phase3 = t.complexity === 'heavy-extension';
+                // fu-ii5: a heavy extension is LOCKED unless it is per-template `deployable`. Only
+                // quoteguard_mm is deployable, so Arb/Spread stays Phase-3-locked and the MM card
+                // becomes selectable with an HONEST label (no "Phase-3", no implied live trading).
+                const locked = t.complexity === 'heavy-extension' && !t.deployable;
+                // HONEST source label: the deployable MM card is a SIMULATED / SYNTHETIC REPLAY of a
+                // canned MM-mechanism fixture — never live TxLINE, never a real match. No "live",
+                // no "genuine", no event/team branding.
+                const complexityLabel = t.deployable
+                  ? 'synthetic replay (simulated) · dry-run · live-money disabled'
+                  : COMPLEXITY_LABEL[t.complexity];
                 return (
                   <button
                     key={t.id}
                     type="button"
-                    className={`${styles.card} ${phase3 ? styles.cardPhase3 : ''}`}
-                    disabled={phase3 || running}
-                    aria-disabled={phase3 || undefined}
-                    onClick={() => { if (!phase3) applyTemplate(t); }}
+                    className={`${styles.card} ${locked ? styles.cardPhase3 : ''}`}
+                    disabled={locked || running}
+                    aria-disabled={locked || undefined}
+                    onClick={() => { if (!locked) applyTemplate(t); }}
                   >
                     <span className={styles.cardLabel}>{t.label}</span>
-                    <span className={styles.cardComplexity}>{COMPLEXITY_LABEL[t.complexity]}</span>
+                    <span className={styles.cardComplexity}>{complexityLabel}</span>
                     <span className={styles.cardBlurb}>{t.blurb}</span>
                   </button>
                 );
@@ -222,7 +298,9 @@ export function StudioScreen({
               ) : (
                 <SegmentedControl<SourceMode>
                   ariaLabel="Source mode" value={source} onChange={setSource}
-                  options={[{ value: 'replay', label: 'Replay' }, { value: 'live', label: 'Live' }]}
+                  options={isMM
+                    ? [{ value: 'replay', label: 'Replay' }] // MM: replay only (backend rejects live)
+                    : [{ value: 'replay', label: 'Replay' }, { value: 'live', label: 'Live' }]}
                 />
               )}
             </label>
@@ -242,7 +320,9 @@ export function StudioScreen({
               ) : (
                 <SegmentedControl<ExecutionMode>
                   ariaLabel="Execution mode" value={exec} onChange={setExec}
-                  options={[{ value: 'paper', label: 'Paper' }, { value: 'dry_run', label: 'Dry Run' }, { value: 'live_guarded', label: 'Live Guarded' }]}
+                  options={isMM
+                    ? [{ value: 'paper', label: 'Paper' }, { value: 'dry_run', label: 'Dry Run' }] // MM: no live_guarded
+                    : [{ value: 'paper', label: 'Paper' }, { value: 'dry_run', label: 'Dry Run' }, { value: 'live_guarded', label: 'Live Guarded' }]}
                 />
               )}
             </label>
@@ -310,6 +390,15 @@ export function StudioScreen({
 
             {/* Disclaimer — verbatim, single-sourced from lib/studio/preflight (codex-pinned). */}
             <p className={styles.disclaimer} data-testid="preflight-disclaimer">{PREFLIGHT_DISCLAIMER}</p>
+
+            {/* HONEST provenance for the MM family: the queued run is a SIMULATED synthetic replay of
+                a canned MM-mechanism fixture — never live TxLINE, never a real match/team. */}
+            {isMM ? (
+              <p className={styles.hint} data-testid="mm-synthetic-note">
+                QuoteGuard/MM runs a SIMULATED synthetic replay of a canned MM-mechanism fixture —
+                no live TxLINE, no real match, no real-money execution.
+              </p>
+            ) : null}
 
             {running ? (
               <p className={styles.roBanner} data-testid="run-readonly">Config is read-only during a scored run (SEC-006). Edits create a new version, never a live mutation.</p>

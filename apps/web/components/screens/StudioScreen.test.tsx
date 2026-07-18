@@ -96,21 +96,141 @@ describe('StudioScreen (REQ-018 / AC-007 / SEC-006/007/009)', () => {
     }
   });
 
-  it('renders six strategy cards — Arb/Spread and QuoteGuard/MM are Phase-3 disabled (honesty / #T19)', async () => {
+  it('renders six strategy cards — only Arb/Spread stays Phase-3 locked; QuoteGuard/MM is now deployable (fu-ii5)', async () => {
     const user = userEvent.setup();
     render(<StudioScreen />);
     const gallery = screen.getByTestId('strategy-cards');
     for (const label of ['Value-vs-Venue', 'Stale-Line', 'Momentum', 'Contrarian/Fade', 'Arb/Spread', 'QuoteGuard/MM']) {
       expect(within(gallery).getByRole('button', { name: new RegExp(label) })).toBeInTheDocument();
     }
-    expect(within(gallery).getAllByText(/heavy extension \(phase-3\)/i).length).toBe(2);
-    // Phase-3 cards must be disabled and must not change archetype on click
+    // Only ONE Phase-3-locked card remains (Arb/Spread); the MM card no longer reads "Phase-3".
+    expect(within(gallery).getAllByText(/heavy extension \(phase-3\)/i).length).toBe(1);
     const arb = within(gallery).getByRole('button', { name: /Arb\/Spread/ });
     const mm = within(gallery).getByRole('button', { name: /QuoteGuard\/MM/ });
+    // Arb/Spread stays disabled and Phase-3-labeled.
     expect(arb).toBeDisabled();
-    expect(mm).toBeDisabled();
+    expect(arb).toHaveTextContent(/heavy extension \(phase-3\)/i);
+    // HONEST LABEL: the now-deployable MM card must NOT imply it is Phase-3 locked.
+    expect(mm).not.toBeDisabled();
+    expect(mm).not.toHaveTextContent(/phase-3/i);
+    // Clicking the MM card applies its (baseline) archetype — it is a real, selectable template now.
     await user.click(mm);
-    expect(screen.getByLabelText(/archetype/i)).toHaveValue('value_clv'); // unchanged
+    expect(screen.getByLabelText(/archetype/i)).toHaveValue('baseline');
+  });
+
+  // ── fu-ii5: QuoteGuard/MM template deploys through the MM family ─────────────
+  describe('QuoteGuard/MM template → quoteguard-mm family deploy (fu-ii5)', () => {
+    async function selectMM(user: ReturnType<typeof userEvent.setup>) {
+      await user.click(within(screen.getByTestId('strategy-cards')).getByRole('button', { name: /QuoteGuard\/MM/ }));
+    }
+
+    it('POSTs strategy:"quoteguard-mm" with a well-formed mm object and surfaces the run_id', async () => {
+      const user = userEvent.setup();
+      const fetchMock = vi.fn(async () => okDeploy());
+      vi.stubGlobal('fetch', fetchMock);
+      render(<StudioScreen />);
+
+      await selectMM(user);
+      await user.click(screen.getByRole('button', { name: /pin config & queue run/i }));
+
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      const [url, init] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
+      expect(url).toMatch(/\/agents\/deploy$/);
+      expect(init.method).toBe('POST');
+      const body = JSON.parse(init.body as string);
+      // Dispatch discriminator + fail-closed-safe modes.
+      expect(body.strategy).toBe('quoteguard-mm');
+      expect(body.source_mode).toBe('replay');
+      expect(['paper', 'dry_run']).toContain(body.execution_mode);
+      expect(body.market_allowlist).toEqual(DEFAULT_POLICY_ENVELOPE.market_allowlist);
+      expect(body.market_allowlist.length).toBeGreaterThan(0);
+      // The MakerDeployConfig subset.
+      expect(body.mm).toBeTruthy();
+      expect(body.mm.tape_ref).toBe('synthetic-mm-mechanism-v1'); // neutral catalog KEY — no real-event provenance
+      expect(body.mm.guard_enabled).toBe(true);
+      expect(body.mm.tif).toBe('GTC');
+      expect(body.mm.max_orders_per_run).toBe(3);
+      expect(body.mm.max_orders_per_session).toBe(10);
+      expect(body.mm.max_orders_per_day).toBe(20);
+      expect(body.mm.max_session_loss).toBe(0);
+      expect(body.mm.max_daily_loss).toBe(0);
+
+      expect(await screen.findByTestId('deploy-run-id')).toHaveTextContent('run_deadbeefcafe');
+    });
+
+    it('labels the MM source honestly as a SIMULATED / SYNTHETIC replay — never live/genuine, no event branding (A8)', async () => {
+      const user = userEvent.setup();
+      render(<StudioScreen />);
+      const gallery = screen.getByTestId('strategy-cards');
+      const mm = within(gallery).getByRole('button', { name: /QuoteGuard\/MM/ });
+      // The card reads as a simulated/synthetic replay with live-money disabled — never "genuine",
+      // never a real match/team, and (honesty) never "Phase-3" for the now-deployable card.
+      expect(mm).toHaveTextContent(/synthetic/i);
+      expect(mm).toHaveTextContent(/simulated/i);
+      expect(mm).toHaveTextContent(/live-money (execution )?disabled/i);
+      expect(mm).not.toHaveTextContent(/\bgenuine\b/i);
+      expect(mm).not.toHaveTextContent(/phase-3/i);
+      // The queued/deploy panel carries the same honest provenance once the MM template is selected.
+      await user.click(mm);
+      expect(screen.getByTestId('mm-synthetic-note')).toHaveTextContent(/simulated synthetic replay/i);
+    });
+
+    it('exposes NO live source_mode / live_guarded execution affordance for the MM card (fail-closed by construction)', async () => {
+      const user = userEvent.setup();
+      render(<StudioScreen />);
+      await selectMM(user);
+      // Source: Replay only — no Live radio for the MM template.
+      expect(screen.getByRole('radio', { name: /^Replay$/i })).toBeInTheDocument();
+      expect(screen.queryByRole('radio', { name: /^Live$/i })).toBeNull();
+      // Execution: paper / dry_run only — no Live Guarded.
+      expect(screen.queryByRole('radio', { name: /Live Guarded/i })).toBeNull();
+    });
+
+    it('surfaces the fail-closed mm_family preflight failure (422) with no run_id', async () => {
+      const user = userEvent.setup();
+      vi.stubGlobal('fetch', vi.fn(async () => failClosedDeploy('mm_family')));
+      render(<StudioScreen />);
+
+      await selectMM(user);
+      await user.click(screen.getByRole('button', { name: /pin config & queue run/i }));
+
+      const err = await screen.findByTestId('deploy-preflight-error');
+      expect(err).toHaveTextContent(/mm_family/);
+      expect(screen.queryByTestId('deploy-run-id')).toBeNull();
+    });
+  });
+
+  // ── fu-ii5: decision 2 must NOT hijack the directional deploy path ───────────
+  describe('directional deploys stay directional (fu-ii5 regression guard)', () => {
+    it('the default (value_clv) deploy carries NO mm object and a non-MM strategy', async () => {
+      const user = userEvent.setup();
+      const fetchMock = vi.fn(async () => okDeploy());
+      vi.stubGlobal('fetch', fetchMock);
+      render(<StudioScreen />);
+
+      await user.click(screen.getByRole('button', { name: /pin config & queue run/i }));
+
+      const [, init] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
+      const body = JSON.parse(init.body as string);
+      expect(body.mm).toBeUndefined();
+      expect(body.strategy).not.toBe('quoteguard-mm');
+    });
+
+    it('a MANUALLY-picked baseline archetype still deploys directional "baseline" with NO mm (drives off template, not archetype)', async () => {
+      const user = userEvent.setup();
+      const fetchMock = vi.fn(async () => okDeploy());
+      vi.stubGlobal('fetch', fetchMock);
+      render(<StudioScreen />);
+
+      // Pick baseline via the archetype select — NOT via the MM template card.
+      await user.selectOptions(screen.getByLabelText(/archetype/i), 'baseline');
+      await user.click(screen.getByRole('button', { name: /pin config & queue run/i }));
+
+      const [, init] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
+      const body = JSON.parse(init.body as string);
+      expect(body.strategy).toBe('baseline'); // directional, NOT quoteguard-mm
+      expect(body.mm).toBeUndefined();
+    });
   });
 
   it('an edit produces a REVIEWABLE before→after diff, never a silent live mutation (#4 / SEC-009)', async () => {

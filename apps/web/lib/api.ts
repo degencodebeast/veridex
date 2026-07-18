@@ -503,6 +503,19 @@ export interface DeployAgentPayload {
   window_id: string;
   fixture_id: number;
   end_rule: 'pre_match' | 'fixed_duration' | 'manual_stop';
+  // fu-ii5: the maker/quote-guard subset, present ONLY for the `quoteguard-mm` MM family (the
+  // backend dispatches on `strategy == "quoteguard-mm"`). Mirrors MakerDeployConfig (extra="forbid"),
+  // so no unknown fields. `tape_ref` is a bounded catalog KEY (never a path/fixture).
+  mm?: {
+    tape_ref: string;
+    guard_enabled?: boolean;
+    tif?: 'GTC' | 'GTD';
+    max_orders_per_run?: number;
+    max_orders_per_session?: number;
+    max_orders_per_day?: number;
+    max_session_loss?: number;
+    max_daily_loss?: number;
+  };
 }
 
 /** The pinned-instance handle the deploy endpoint returns (run_id known BEFORE the seal). */
