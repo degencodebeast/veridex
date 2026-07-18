@@ -6,7 +6,7 @@ import { availableModes, resolveMode, type StudioMode } from '@/lib/studio/coupl
 import { ARCHETYPES, SPORTS_ACTION_TYPES, type Archetype, type ExecutionMode, type SourceMode } from '@/lib/catalog';
 import { STRATEGY_TEMPLATES, COMPLEXITY_LABEL, type StrategyTemplate } from '@/lib/studio/templates';
 import { buildPreflightPreview, PREFLIGHT_DISCLAIMER } from '@/lib/studio/preflight';
-import { DEFAULT_POLICY_ENVELOPE } from '@/lib/fixtures/catalog';
+import { DEFAULT_POLICY_ENVELOPE, MM_POLICY_ENVELOPE } from '@/lib/fixtures/catalog';
 import { GLOSSARY } from '@/lib/glossary';
 import { deployAgent, DeployPreflightError, type DeployAgentPayload } from '@/lib/api';
 import styles from './StudioScreen.module.css';
@@ -16,12 +16,27 @@ import styles from './StudioScreen.module.css';
 // the `baseline` archetype, so mapping by archetype alone would hijack every manual baseline pick.
 const MM_TEMPLATE_ID = 'quoteguard_mm';
 
-// The MM tape catalog KEY (NOT a path/fixture). This key resolves a CLEARLY-LABELED SYNTHETIC /
-// canned MM-mechanism replay tape via the server-side mm_tape_resolver seam — it is NOT a real
-// market recording, and (A8 honesty) the key must NOT imply a real event provenance the tape lacks.
-// fu-ii5-demo-tape registers this key into the backend catalog; until then a LIVE deploy fail-closes
-// on mm_family, and the frontend tests mock fetch so they pass without the tape.
-const DEMO_MM_TAPE_REF = 'synthetic-mm-mechanism-v1';
+// The MM tape catalog KEY (NOT a path/fixture) resolved server-side via the mm_tape_resolver seam.
+// This is the REAL-DATA maker replay tape registered in the production catalog
+// (veridex.mm_strategy.session_factory): REAL Polymarket 10-level order-book depth + REAL TxLINE 1X2
+// fair value for FIFA World Cup France v Morocco (fixture 18209181), replayed dry-run. It is
+// research-grade recorded data (v1 pack, NOT R3-sealed / cryptographically-genuine) — the label
+// stays honest to that (see the card/preflight copy below). Wiring the demo to this key is what
+// makes the real Studio click path RESOLVE (the parked `synthetic-mm-mechanism-v1` key was never
+// registered, so the actual UI deploy fail-closed with MMTapeNotFoundError).
+const MM_TAPE_REF = 'pmxt-txline-mm-18209181-v1';
+const MM_FIXTURE_ID = 18209181;
+
+// Honest judge-facing provenance for the deployable QuoteGuard/MM card. This is a SIMULATED REPLAY
+// (dry-run, no live money) of REAL recorded in-play data — Polymarket 10-level depth + TxLINE 1X2
+// fair value, FIFA World Cup France v Morocco — research-grade (v1 pack, NOT R3-sealed / genuine).
+// The blurb OVERRIDES the template's own stale "synthetic canned fixture" text at the render layer
+// (the template catalog is not wired to the real tape); event/team branding is now CORRECT because
+// this is genuinely recorded France v Morocco data, not a canned/synthetic fixture.
+const MM_CARD_PROVENANCE =
+  'Polymarket depth + TxLINE FV · France v Morocco · simulated replay (real recorded data, research-grade) · dry-run · live-money disabled';
+const MM_CARD_BLURB =
+  'Market-making / quote-guard rules with inventory + two-sided quoting. Runs the quoteguard-mm family as a SIMULATED REPLAY of REAL recorded in-play data — Polymarket 10-level order-book depth + TxLINE 1X2 fair value, FIFA World Cup France v Morocco (fixture 18209181) — dry-run only (no live money); research-grade v1 pack (not R3-sealed).';
 
 // Clamp any execution mode to what the MM family permits: the backend fail-closes MM on
 // execution_mode == 'live_guarded', so the MM card only ever emits paper | dry_run.
@@ -46,7 +61,7 @@ function toStrategy(archetype: Archetype, mode: StudioMode): string {
 // (strategy discriminator + an `mm` MakerDeployConfig subset), pinned to replay + paper/dry_run so
 // the backend fail-closed MM preflight (_check_mm) accepts it. Every other selection keeps the
 // existing directional behavior UNCHANGED (a manual `baseline` archetype still → directional).
-function buildDeployPayload(
+export function buildDeployPayload(
   archetype: Archetype, mode: StudioMode, exec: ExecutionMode, source: SourceMode,
   templateId: string | null,
 ): DeployAgentPayload {
@@ -57,15 +72,18 @@ function buildDeployPayload(
       strategy: 'quoteguard-mm',
       source_mode: 'replay', // MM allowed ONLY in replay (backend rejects source_mode=='live')
       execution_mode: mmExecutionMode(exec), // paper | dry_run only (no live_guarded)
-      market_allowlist: DEFAULT_POLICY_ENVELOPE.market_allowlist, // non-empty (empty → MM reject)
-      venue_allowlist: DEFAULT_POLICY_ENVELOPE.venue_allowlist,
-      min_edge_bps: DEFAULT_POLICY_ENVELOPE.min_edge_bps,
-      max_stake: DEFAULT_POLICY_ENVELOPE.max_stake,
+      // The PMXT-coherent MM envelope (poly / the real home-win token) — NOT the directional
+      // DEFAULT_POLICY_ENVELOPE (sxbet / 1X2). The backend pins manifest.market = market_allowlist[0]
+      // and the tape's book quotes on that token, so this identity is REQUIRED for an ATTEMPTED leg.
+      market_allowlist: MM_POLICY_ENVELOPE.market_allowlist, // non-empty (empty → MM reject)
+      venue_allowlist: MM_POLICY_ENVELOPE.venue_allowlist,
+      min_edge_bps: MM_POLICY_ENVELOPE.min_edge_bps,
+      max_stake: MM_POLICY_ENVELOPE.max_stake,
       window_id: `studio-${MM_TEMPLATE_ID}`,
-      fixture_id: 1,
+      fixture_id: MM_FIXTURE_ID, // the REAL Polymarket/TxLINE fixture (France v Morocco)
       end_rule: 'pre_match',
       mm: {
-        tape_ref: DEMO_MM_TAPE_REF,
+        tape_ref: MM_TAPE_REF,
         guard_enabled: true,
         tif: 'GTC',
         max_orders_per_run: 3,
@@ -161,7 +179,10 @@ export function StudioScreen({
     setTemplateId(t.id);
     if (t.id === MM_TEMPLATE_ID) {
       setSource('replay');
-      setExec((e) => (e === 'live_guarded' ? 'paper' : e));
+      // Default the MM card to Dry Run: replay+paper mints OPS telemetry ONLY, while replay+dry_run
+      // is the mode that produces a dry-run receipt with an ATTEMPTED leg — so the headline MM click
+      // path is receipt-producing by default (the operator may still switch to Paper). No live_guarded.
+      setExec('dry_run');
     }
   }
 
@@ -220,12 +241,13 @@ export function StudioScreen({
                 // quoteguard_mm is deployable, so Arb/Spread stays Phase-3-locked and the MM card
                 // becomes selectable with an HONEST label (no "Phase-3", no implied live trading).
                 const locked = t.complexity === 'heavy-extension' && !t.deployable;
-                // HONEST source label: the deployable MM card is a SIMULATED / SYNTHETIC REPLAY of a
-                // canned MM-mechanism fixture — never live TxLINE, never a real match. No "live",
-                // no "genuine", no event/team branding.
-                const complexityLabel = t.deployable
-                  ? 'synthetic replay (simulated) · dry-run · live-money disabled'
-                  : COMPLEXITY_LABEL[t.complexity];
+                // HONEST source label: the deployable MM card is a SIMULATED REPLAY (dry-run, no live
+                // money) of REAL recorded in-play data — Polymarket depth + TxLINE fair value, France v
+                // Morocco — research-grade (NOT R3-sealed / genuine). No "live", no "genuine".
+                const complexityLabel = t.deployable ? MM_CARD_PROVENANCE : COMPLEXITY_LABEL[t.complexity];
+                // Override the template's stale "synthetic canned fixture" blurb with the honest
+                // real-recorded-data provenance for the now-wired deployable MM card.
+                const cardBlurb = t.deployable ? MM_CARD_BLURB : t.blurb;
                 return (
                   <button
                     key={t.id}
@@ -237,7 +259,7 @@ export function StudioScreen({
                   >
                     <span className={styles.cardLabel}>{t.label}</span>
                     <span className={styles.cardComplexity}>{complexityLabel}</span>
-                    <span className={styles.cardBlurb}>{t.blurb}</span>
+                    <span className={styles.cardBlurb}>{cardBlurb}</span>
                   </button>
                 );
               })}
@@ -391,12 +413,14 @@ export function StudioScreen({
             {/* Disclaimer — verbatim, single-sourced from lib/studio/preflight (codex-pinned). */}
             <p className={styles.disclaimer} data-testid="preflight-disclaimer">{PREFLIGHT_DISCLAIMER}</p>
 
-            {/* HONEST provenance for the MM family: the queued run is a SIMULATED synthetic replay of
-                a canned MM-mechanism fixture — never live TxLINE, never a real match/team. */}
+            {/* HONEST provenance for the MM family: the queued run is a SIMULATED REPLAY (dry-run, no
+                live money) of REAL recorded in-play data — Polymarket depth + TxLINE fair value, France
+                v Morocco — research-grade recorded data, NOT a live feed and NOT R3-sealed/genuine. */}
             {isMM ? (
-              <p className={styles.hint} data-testid="mm-synthetic-note">
-                QuoteGuard/MM runs a SIMULATED synthetic replay of a canned MM-mechanism fixture —
-                no live TxLINE, no real match, no real-money execution.
+              <p className={styles.hint} data-testid="mm-provenance-note">
+                QuoteGuard/MM replays REAL recorded in-play data — Polymarket 10-level depth + TxLINE 1X2
+                fair value, France v Morocco (fixture 18209181) — as a simulated dry-run replay: no live
+                TxLINE feed, no live-money execution; research-grade recorded data (not R3-sealed).
               </p>
             ) : null}
 

@@ -1,10 +1,34 @@
+import { readFileSync, existsSync } from 'node:fs';
+import { dirname, resolve } from 'node:path';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { render, screen, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
-import { StudioScreen } from '@/components/screens/StudioScreen';
+import { StudioScreen, buildDeployPayload } from '@/components/screens/StudioScreen';
 import { PREFLIGHT_DISCLAIMER } from '@/lib/studio/preflight';
-import { DEFAULT_POLICY_ENVELOPE } from '@/lib/fixtures/catalog';
+import { DEFAULT_POLICY_ENVELOPE, MM_POLICY_ENVELOPE } from '@/lib/fixtures/catalog';
 import { GLOSSARY } from '@/lib/glossary';
+
+// THE canonical Studio MM deploy payload — the ONE shared, committed contract fixture BOTH this
+// frontend test and the backend E2E (tests/test_pmxt_txline_tape.py) consume, so the real UI payload
+// and the backend it drives can NEVER drift. It is what `buildDeployPayload(...)` MUST emit for the
+// QuoteGuard/MM template (Dry Run), and the exact body the backend resolves to a SEALED run with an
+// ATTEMPTED-leg receipt through the PRODUCTION catalog.
+// Resolve the repo-root shared fixture by walking up from cwd (vitest runs from apps/web) until the
+// contracts/fixtures/ path exists — independent of the module URL scheme under vite's transform.
+function readSharedFixture(rel: string): unknown {
+  let dir = process.cwd();
+  for (let i = 0; i < 8; i += 1) {
+    const candidate = resolve(dir, rel);
+    if (existsSync(candidate)) return JSON.parse(readFileSync(candidate, 'utf-8'));
+    const parent = dirname(dir);
+    if (parent === dir) break;
+    dir = parent;
+  }
+  throw new Error(`shared fixture not found walking up from ${process.cwd()}: ${rel}`);
+}
+const CANONICAL_MM_DEPLOY_PAYLOAD = readSharedFixture(
+  'contracts/fixtures/studio_mm_deploy_payload.json',
+) as Record<string, unknown>;
 
 // A resolved deploy response (the pinned instance + the async run_id). run_id is a REAL server hex
 // handle (never a fabricated 0x-prefixed digest — the honesty doctrine still holds).
@@ -124,6 +148,24 @@ describe('StudioScreen (REQ-018 / AC-007 / SEC-006/007/009)', () => {
       await user.click(within(screen.getByTestId('strategy-cards')).getByRole('button', { name: /QuoteGuard\/MM/ }));
     }
 
+    // ── frontend↔backend contract (Major 1): buildDeployPayload(MM) is the canonical payload ──
+    // The real Studio click path emits EXACTLY the committed canonical fixture; the backend E2E drives
+    // that SAME fixture through the production catalog. Pinning the whole object here means a change to
+    // the emitted MM payload breaks this test AND is force-reflected into the backend (one source of
+    // truth), so the click path and the backend can never silently drift (the parked defect: the UI
+    // emitted `synthetic-mm-mechanism-v1` + sxbet/1X2, which the production catalog cannot resolve).
+    it('buildDeployPayload(QuoteGuard/MM) emits EXACTLY the canonical shared MM deploy payload', () => {
+      // Dry Run is the MM card default (the receipt-producing mode); the MM branch ignores the
+      // archetype/mode/source args (it hardcodes replay + the MM envelope), so only exec is load-bearing.
+      const payload = buildDeployPayload('baseline', 'rule', 'dry_run', 'replay', 'quoteguard_mm');
+      expect(payload).toEqual(CANONICAL_MM_DEPLOY_PAYLOAD);
+      // And it is the PMXT real-data tape key + coherent identity — never the unresolvable synthetic key.
+      expect(payload.mm?.tape_ref).toBe('pmxt-txline-mm-18209181-v1');
+      expect(payload.mm?.tape_ref).not.toBe('synthetic-mm-mechanism-v1');
+      expect(payload.fixture_id).toBe(18209181);
+      expect(payload.mm?.guard_enabled).toBe(true);
+    });
+
     it('POSTs strategy:"quoteguard-mm" with a well-formed mm object and surfaces the run_id', async () => {
       const user = userEvent.setup();
       const fetchMock = vi.fn(async () => okDeploy());
@@ -138,15 +180,21 @@ describe('StudioScreen (REQ-018 / AC-007 / SEC-006/007/009)', () => {
       expect(url).toMatch(/\/agents\/deploy$/);
       expect(init.method).toBe('POST');
       const body = JSON.parse(init.body as string);
-      // Dispatch discriminator + fail-closed-safe modes.
+      // Dispatch discriminator + fail-closed-safe modes. Selecting the MM card defaults execution to
+      // Dry Run (the only mode that yields a dry-run receipt / ATTEMPTED leg — replay+paper mints OPS
+      // only), so the headline click path is receipt-producing by construction.
       expect(body.strategy).toBe('quoteguard-mm');
       expect(body.source_mode).toBe('replay');
-      expect(['paper', 'dry_run']).toContain(body.execution_mode);
-      expect(body.market_allowlist).toEqual(DEFAULT_POLICY_ENVELOPE.market_allowlist);
+      expect(body.execution_mode).toBe('dry_run');
+      // The MM path uses the PMXT-coherent envelope (poly / the real home-win token), NOT the shared
+      // directional envelope (sxbet / 1X2) — the tape's book quotes on market_allowlist[0].
+      expect(body.market_allowlist).toEqual(MM_POLICY_ENVELOPE.market_allowlist);
+      expect(body.market_allowlist).toEqual(['pmxt:18209181:home_win']);
+      expect(body.venue_allowlist).toEqual(['poly']);
       expect(body.market_allowlist.length).toBeGreaterThan(0);
-      // The MakerDeployConfig subset.
+      // The MakerDeployConfig subset — the REAL-DATA tape catalog KEY the production catalog resolves.
       expect(body.mm).toBeTruthy();
-      expect(body.mm.tape_ref).toBe('synthetic-mm-mechanism-v1'); // neutral catalog KEY — no real-event provenance
+      expect(body.mm.tape_ref).toBe('pmxt-txline-mm-18209181-v1'); // real recorded PMXT/TxLINE tape key
       expect(body.mm.guard_enabled).toBe(true);
       expect(body.mm.tif).toBe('GTC');
       expect(body.mm.max_orders_per_run).toBe(3);
@@ -158,21 +206,27 @@ describe('StudioScreen (REQ-018 / AC-007 / SEC-006/007/009)', () => {
       expect(await screen.findByTestId('deploy-run-id')).toHaveTextContent('run_deadbeefcafe');
     });
 
-    it('labels the MM source honestly as a SIMULATED / SYNTHETIC replay — never live/genuine, no event branding (A8)', async () => {
+    it('labels the MM source honestly as a SIMULATED REPLAY of REAL recorded data — never live/genuine/R3-sealed (A8)', async () => {
       const user = userEvent.setup();
       render(<StudioScreen />);
       const gallery = screen.getByTestId('strategy-cards');
       const mm = within(gallery).getByRole('button', { name: /QuoteGuard\/MM/ });
-      // The card reads as a simulated/synthetic replay with live-money disabled — never "genuine",
-      // never a real match/team, and (honesty) never "Phase-3" for the now-deployable card.
-      expect(mm).toHaveTextContent(/synthetic/i);
-      expect(mm).toHaveTextContent(/simulated/i);
+      // The card now reads as a SIMULATED REPLAY of REAL recorded in-play data (Polymarket + TxLINE,
+      // France v Morocco), dry-run with live-money disabled — honest event branding is now CORRECT
+      // because this is real recorded data, NOT a canned/synthetic fixture. It must NOT overclaim
+      // ("genuine" / R3-sealed) and must NOT read "Phase-3" for the now-deployable card.
+      expect(mm).toHaveTextContent(/simulated replay/i);
+      expect(mm).toHaveTextContent(/real recorded/i);
       expect(mm).toHaveTextContent(/live-money (execution )?disabled/i);
+      // No longer "synthetic": calling real recorded data synthetic would be an honesty regression.
+      expect(mm).not.toHaveTextContent(/\bsynthetic\b/i);
       expect(mm).not.toHaveTextContent(/\bgenuine\b/i);
       expect(mm).not.toHaveTextContent(/phase-3/i);
       // The queued/deploy panel carries the same honest provenance once the MM template is selected.
       await user.click(mm);
-      expect(screen.getByTestId('mm-synthetic-note')).toHaveTextContent(/simulated synthetic replay/i);
+      const note = screen.getByTestId('mm-provenance-note');
+      expect(note).toHaveTextContent(/simulated .*replay/i);
+      expect(note).toHaveTextContent(/real recorded/i);
     });
 
     it('exposes NO live source_mode / live_guarded execution affordance for the MM card (fail-closed by construction)', async () => {

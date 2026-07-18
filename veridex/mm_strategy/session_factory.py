@@ -145,13 +145,29 @@ def compute_tape_content_hash(events: tuple[Any, ...]) -> str:
     return hashlib.sha256(serialize_payload(rows).encode("utf-8")).hexdigest()
 
 
-#: The production tape catalog. Banks the ONE `fu-ii5-demo-tape` entry (`txline-mm-18213979-v1`, a
-#: HYBRID of real recorded SX book + TxLINE fair-value rows + derived session metadata — see
-#: `veridex.mm_strategy.demo_tape`); its content hash is re-verified at resolve time (step 7 of
-#: `reconstruct_mm_session`). Any other key fails closed.
+#: The production tape catalog. Two distinct, immutable keys with visible provenance:
+#:  - `txline-mm-18213979-v1` — the parked `fu-ii5-demo-tape` SX HYBRID (real recorded SX book +
+#:    TxLINE fair-value rows + derived session metadata — see `veridex.mm_strategy.demo_tape`).
+#:  - `pmxt-txline-mm-18209181-v1` — the provenance-correct REAL-DATA tape (REAL Polymarket 10-level
+#:    depth + REAL TxLINE 1X2 fair value, France v Morocco fixture 18209181 — see
+#:    `veridex.mm_strategy.pmxt_tape`), added by `_register_pmxt_txline_tape()` below. This is the
+#:    Studio demo path.
+#: Each tape's content hash is re-verified at resolve time (step 7 of `reconstruct_mm_session`). Any
+#: other key fails closed.
 MM_TAPE_CATALOG: dict[str, Callable[[], MakerReplayTape]] = {
     demo_tape.TAPE_REF: demo_tape.build_txline_mm_tape,
 }
+
+
+def _register_pmxt_txline_tape() -> None:
+    """Bank the real-data `pmxt-txline-mm-18209181-v1` tape (lazy import avoids a load-time cycle:
+    `pmxt_tape` imports this module's `MakerReplayTape` / `compute_tape_content_hash`)."""
+    from veridex.mm_strategy import pmxt_tape
+
+    MM_TAPE_CATALOG[pmxt_tape.TAPE_REF] = pmxt_tape.build_pmxt_txline_tape
+
+
+_register_pmxt_txline_tape()
 
 
 def default_mm_tape_resolver(tape_ref: str) -> MakerReplayTape:
