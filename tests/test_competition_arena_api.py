@@ -253,3 +253,92 @@ async def test_arena_run_unknown_competition_is_404() -> None:
             assert resp.status_code == 404, resp.text
     finally:
         await _drain(app)
+
+
+# ---------------------------------------------------------------------------
+# RED 5 (Codex 2nd re-gate M1) — an owned competition whose frozen roster does NOT declare the arena
+# contestants (EMPTY roster) must FAIL CLOSED — never an authenticated det-vs-LLM label substitution.
+# ---------------------------------------------------------------------------
+
+
+async def test_empty_roster_arena_run_fails_closed() -> None:
+    store = InMemoryStore()
+    app = create_app(store=store, settings=_privy_settings(), arena_model_launcher=_OfflineArenaLauncher())
+    try:
+        async with _transport(app) as client:
+            comp_id = await _create(client, _DID_ALICE)  # owned, but ZERO registered entries
+            resp = await client.post(f"/competitions/{comp_id}/arena", headers=_bearer(_DID_ALICE))
+            # No roster declaring det-Drift + LLM-Drift → the endpoint must NOT return a comparison.
+            assert resp.status_code == 409, resp.text
+            assert "arena_comparison" not in resp.json()
+
+            # And nothing was persisted: no label-substituted run_id / event stamped on the competition.
+            state = await client.get(f"/competitions/{comp_id}")
+            assert state.status_code == 200, state.text
+            assert state.json()["run_id"] is None
+            assert state.json()["status"] == "draft"
+    finally:
+        await _drain(app)
+
+
+# ---------------------------------------------------------------------------
+# RED 6 (M1) — a roster that declares UNRELATED contestants (neither det-Drift nor LLM-Drift) also
+# fails closed: the arena contestants must be DECLARED, not assumed.
+# ---------------------------------------------------------------------------
+
+
+async def test_unrelated_roster_arena_run_fails_closed() -> None:
+    store = InMemoryStore()
+    app = create_app(store=store, settings=_privy_settings(), arena_model_launcher=_OfflineArenaLauncher())
+    try:
+        async with _transport(app) as client:
+            comp_id = await _create(client, _DID_ALICE)
+            for agent_id, strategy in (("a", "baseline"), ("b", "momentum")):
+                reg = await client.post(
+                    f"/competitions/{comp_id}/agents", json=_entry(agent_id, strategy), headers=_bearer(_DID_ALICE)
+                )
+                assert reg.status_code == 200, reg.text
+            resp = await client.post(f"/competitions/{comp_id}/arena", headers=_bearer(_DID_ALICE))
+            assert resp.status_code == 409, resp.text
+            assert "arena_comparison" not in resp.json()
+    finally:
+        await _drain(app)
+
+
+# ---------------------------------------------------------------------------
+# RED 7 (M1) — a successful declared-roster arena run is OBSERVABLE from canonical competition state
+# (GET /competitions/{id} carries a real run_id; GET .../events carries the arena comparison payload),
+# not ONLY the one POST response body.
+# ---------------------------------------------------------------------------
+
+
+async def test_owner_arena_run_is_observable_from_competition_state() -> None:
+    store = InMemoryStore()
+    app = create_app(store=store, settings=_privy_settings(), arena_model_launcher=_OfflineArenaLauncher())
+    try:
+        comp_id = await _seed_drift_roster(store, app, _DID_ALICE)
+        async with _transport(app) as client:
+            post = await client.post(f"/competitions/{comp_id}/arena", headers=_bearer(_DID_ALICE))
+            assert post.status_code == 200, post.text
+            posted = post.json()["arena_comparison"]
+            assert posted is not None
+
+            # (1) The competition now carries a REAL run_id in canonical state (not None / not draft-only).
+            state = await client.get(f"/competitions/{comp_id}")
+            assert state.status_code == 200, state.text
+            body = state.json()
+            assert body["run_id"] is not None, "the arena run must persist a real run_id"
+            assert body["latest_seq"] >= 1, "the arena run must append canonical events"
+
+            # (2) The arena comparison is observable from the canonical EVENT STREAM (not only the POST body).
+            events = await client.get(f"/competitions/{comp_id}/events")
+            assert events.status_code == 200, events.text
+            arena_events = [
+                e for e in events.json() if isinstance(e.get("payload"), dict) and "arena_comparison" in e["payload"]
+            ]
+            assert arena_events, "the arena comparison must be persisted as a canonical competition event"
+            persisted = arena_events[0]["payload"]["arena_comparison"]
+            assert persisted["identical_opportunities"] == posted["identical_opportunities"]
+            assert persisted["scoreable_decisions"] == posted["scoreable_decisions"]
+    finally:
+        await _drain(app)

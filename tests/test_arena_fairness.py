@@ -431,6 +431,63 @@ async def test_scoreable_decisions_excludes_law_invalid_nonexistent_market() -> 
     assert report.scoreable_decisions == det["scoreable_decisions"]
 
 
+def _ms_key(ts: int, bps: int, *, market_key: str, side: str = "home", fixture_id: int = 42) -> MarketState:
+    """A single-market tick carrying an arbitrary ``market_key`` (for a multi-market/fixture close)."""
+    return MarketState(
+        fixture_id=fixture_id,
+        tick_seq=0,
+        ts=ts,
+        phase=1,
+        markets={market_key: {"stable_prob_bps": {side: bps}, "suspended": False}},
+        scores={},
+    )
+
+
+async def test_scoreability_uses_per_market_close_not_final_global_row() -> None:
+    """MAJOR 2 (Codex 2nd re-gate) — a decision on market ``M`` with a later valid ``M`` close but a
+    final tape row carrying only a DIFFERENT market ``N`` MUST be scored against ``M``'s AUTHORITATIVE
+    close (the last tick carrying ``M``, the orchestrator's canonical rule), NOT the final GLOBAL row.
+
+    Using ``self._marketstates[-1]`` (the ``N`` row) mis-rejects the ``M`` decision as
+    ``closing_market_absent`` and under-counts scoreable decisions on any multi-market/fixture tape.
+    """
+    from veridex.law.recompute import REPLAY, recompute
+    from veridex.runtime.schemas import AgentAction, SportsActionType
+
+    # A rising "M" tape (det-Drift fires valid "M"/home decisions), THEN a final row carrying only "N".
+    m_tape = _rising_tape()
+    n_only_final = _ms_key(m_tape[-1].ts + 100, 6000, market_key="N")
+    tape = [*m_tape, n_only_final]
+
+    arena = await run_arena_comparison(tape, model=FakeModelLauncher(), det_policy=_policy(), **_DET_KW)
+
+    # det-Drift's non-WAIT decisions target the real market "M".
+    m_decisions = [
+        e
+        for e in arena.events
+        if e.contestant == DET_DRIFT_CONTESTANT
+        and e.kind == "decision"
+        and e.action_type != SportsActionType.WAIT.value
+        and e.market_key == "M"
+    ]
+    assert m_decisions, "det-Drift should emit at least one non-WAIT decision on market 'M'"
+
+    e = m_decisions[0]
+    entry = arena._state_by_ts[e.checkpoint_ts]
+    action = AgentAction(
+        type=SportsActionType(e.action_type), params={"market_key": e.market_key, "side": e.side}
+    )
+
+    # The bug's mechanism: scoring "M" against the FINAL GLOBAL row (only "N") is law-INVALID.
+    assert recompute(entry, action, closing=tape[-1], source_mode=REPLAY)["valid"] is False
+    # But "M" has a genuine later close (the last "M"-carrying tick) → the law says valid.
+    assert recompute(entry, action, closing=m_tape[-1], source_mode=REPLAY)["valid"] is True
+
+    # Scoreability MUST use "M"'s per-market close → the decision is scoreable, not mis-rejected.
+    assert arena._is_scoreable(e) is True
+    assert arena.report().scoreable_decisions >= 1, "the per-market close keeps 'M' decisions scoreable"
+
+
 # ---------------------------------------------------------------------------
 # MAJOR 3 RED — replay yields to a real async model task + drains the guard at end-of-tape
 # ---------------------------------------------------------------------------

@@ -83,7 +83,12 @@ from veridex.checks.build import (
     build_performance_metrics,
     check_results_to_proof_block,
 )
-from veridex.competition.events import CompetitionEvent, EventType
+from veridex.competition.events import (
+    CompetitionEvent,
+    EventType,
+    build_competition_started_event,
+    event_payload_hash,
+)
 from veridex.competition.models import (
     AgentEntry,
     Competition,
@@ -149,6 +154,12 @@ def _cors_origins_from_env() -> list[str]:
     """
     raw = os.environ.get("CORS_ORIGINS", "")
     return [origin.strip() for origin in raw.split(",") if origin.strip()]
+
+
+#: The strategy labels the FROZEN roster must DECLARE for an arena run — det-Drift (``cumulative-drift``)
+#: and LLM-Drift (``llm``). The owner-scoped ``POST /competitions/{id}/arena`` FAILS CLOSED unless both
+#: are present, so the comparison genuinely BELONGS to the declared competition (never a label swap, M1).
+_ARENA_CONTESTANT_STRATEGIES: frozenset[str] = frozenset({"cumulative-drift", "llm"})
 
 
 def _derive_leaderboard(events: list[CompetitionEvent]) -> list[CompetitionLeaderboardRow]:
@@ -1068,17 +1079,28 @@ def create_app(
         unauthenticated ``POST /demo/run`` (an offline deterministic/contrarian demo — the wrong roster
         and authority surface) and does not perturb the golden ``POST /start`` scored lifecycle.
 
+        The endpoint genuinely OPERATES ON the owned competition — it is NOT authenticated label
+        substitution (Codex M1). It FAILS CLOSED unless the competition's FROZEN roster DECLARES the
+        arena contestants (det-Drift = ``cumulative-drift`` + LLM-Drift = ``llm``): an empty or unrelated
+        roster is refused 409, never a det-vs-LLM report stamped with a competition the owner never
+        declared. The contestants are DERIVED from server-owned state via :func:`build_agents_from_roster`
+        (the SAME roster machinery ``POST /competitions/{id}/start`` uses — fail-closed on an unknown
+        strategy / a missing-or-drifted deployed instance), and the honest report is PERSISTED as a
+        canonical :class:`~veridex.competition.events.CompetitionEvent` under a real ``run_id`` so it is
+        OBSERVABLE from ``GET /competitions/{id}`` (state + event stream), not only this POST body.
+
         Auth (fail-closed, AC-27/AC-29 preserved): an anonymous caller is refused 401 (``require_principal``
         rejects a missing/invalid Privy bearer BEFORE any work), and only the Privy competition OWNER may
         run it (``_require_competition_owner`` → 403 for a non-owner or an unowned/legacy competition). An
-        unknown competition is 404.
+        unknown competition is 404. A competition that has already run (RUNNING/FINALIZED) is 409 (the
+        arena run seals canonical events + a run_id exactly once — mirror ``start_competition``).
 
         The comparison drives det-Drift AND LLM-Drift at the SAME pinned checkpoints from the SAME shared
-        snapshot over the bundled demo tape, using the injected offline-testable model launcher
-        (``arena_model_launcher``; the lazy production Agno launcher by default). The response carries the
-        HONEST :class:`~veridex.runtime.arena_comparison.ArenaComparisonReport` payload — eligible
-        checkpoints, per-contestant actions-vs-WAITs, AUTHORITATIVE scoreable decisions, fixture count,
-        clustered uncertainty, and the identical-opportunity flag — NEVER a bare average CLV (addendum §3).
+        snapshot over the competition's configured (offline demo) tape, using the injected model launcher
+        (``arena_model_launcher``; the lazy production Agno launcher by default). The payload is the HONEST
+        :class:`~veridex.runtime.arena_comparison.ArenaComparisonReport` — eligible checkpoints,
+        per-contestant actions-vs-WAITs, AUTHORITATIVE scoreable decisions, fixture count, clustered
+        uncertainty, and the identical-opportunity flag — NEVER a bare average CLV (addendum §3).
 
         Args:
             competition_id: The owned competition to run the arena comparison for.
@@ -1086,11 +1108,13 @@ def create_app(
             dep_store: Injected store dependency.
 
         Returns:
-            A JSON object ``{"competition_id", "arena_comparison"}`` where ``arena_comparison`` is the
-            honest report payload (never ``None``).
+            A JSON object ``{"competition_id", "run_id", "arena_comparison"}`` where ``arena_comparison``
+            is the honest report payload (never ``None``) and ``run_id`` is the persisted run identifier.
 
         Raises:
-            HTTPException: 404 (unknown competition), 401 (anonymous), 403 (non-owner / unowned).
+            HTTPException: 404 (unknown competition / rostered instance absent), 401 (anonymous),
+                403 (non-owner / unowned / unowned instance), 409 (already run / roster does not declare
+                the arena contestants / rostered deployed instance missing), 400 (unknown strategy / drift).
         """
         try:
             competition = await dep_store.get_competition(competition_id)
@@ -1101,15 +1125,90 @@ def create_app(
         # (a non-owner or an unowned/legacy competition is refused 403 — mirror the start/kill lifecycle).
         _require_competition_owner(competition, principal.did)
 
-        # Drive the checkpointed det-Drift vs LLM-Drift comparison over the demo tape. det-Drift and
-        # LLM-Drift are the arena's two intrinsic contestants (§3); the roster declares them and the
-        # comparison is produced HERE (not a test-harness leaf), then exposed over HTTP.
+        # Idempotency (mirror start_competition): the arena comparison seals canonical events + a run_id
+        # exactly ONCE. A competition that has already run is refused rather than double-appending seqs.
+        if competition.status in (CompetitionStatus.RUNNING, CompetitionStatus.FINALIZED):
+            raise HTTPException(status_code=409, detail="competition already run")
+
+        # FAIL CLOSED unless the FROZEN roster DECLARES the arena contestants (det-Drift + LLM-Drift).
+        # An empty or unrelated roster MUST NOT yield an authenticated det-vs-LLM report stamped with a
+        # competition the owner never declared/ran (Codex M1 — "authenticated label substitution").
+        declared_strategies = {entry.strategy for entry in competition.entries}
+        missing = _ARENA_CONTESTANT_STRATEGIES - declared_strategies
+        if missing:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "competition roster does not declare the arena contestants "
+                    f"(missing strategies {sorted(missing)}; "
+                    f"required {sorted(_ARENA_CONTESTANT_STRATEGIES)})"
+                ),
+            )
+
+        # DERIVE the contestants from server-owned state — build the DECLARED roster through the SAME
+        # machinery start_competition uses, fail-closed on an unknown strategy / a missing-or-drifted
+        # deployed instance (never a same-named reconstruction, never a silent substitution).
+        try:
+            agents = await build_agents_from_roster(
+                competition.entries, get_instance=dep_store.get_agent_instance
+            )
+        except RosterInstanceNotOwnedError:
+            raise HTTPException(status_code=403, detail="principal does not own this agent instance") from None
+        except RosterInstanceNotFoundError:
+            raise HTTPException(status_code=404, detail="agent instance not found") from None
+        except KeyError as exc:
+            raise HTTPException(status_code=409, detail=f"rostered deployed instance not found: {exc}") from None
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from None
+
+        # Derive the tape from the competition's configured (offline) source — the SAME source
+        # start_competition drives the scored lifecycle over. Drive the checkpointed comparison HERE.
         ticks = build_demo_ticks()
         det_policy = CheckpointPolicy(cadence_s=1.0, evidence_age_limit_s=100_000.0)
         arena = await run_arena_comparison(
             ticks, model=resolved_arena_model_launcher, det_policy=det_policy
         )
-        return {"competition_id": competition_id, "arena_comparison": arena.report().to_payload()}
+        report = arena.report().to_payload()
+
+        # PERSIST the comparison through canonical competition state so it is OBSERVABLE from
+        # GET /competitions/{id} (a real run_id) and the canonical event stream — not ONLY this POST
+        # body (Codex M1). Mirror start_competition's finalize: pre-generate the run_id, emit the seq=0
+        # COMPETITION_STARTED, append a derived event carrying the honest report, then FINALIZE. The
+        # arena comparison is checkpoint-based (not the scored orchestrator), so it produces no
+        # SCORE_UPDATE rows — the leaderboard stays empty, never a fabricated ranking.
+        run_id = uuid4().hex
+        base_ts = int(ticks[0].ts) if ticks else 0
+        agent_ids = [agent.agent_id for agent in agents]
+        started = build_competition_started_event(
+            competition_id=competition_id,
+            run_id=run_id,
+            source_mode=competition.config.source_mode,
+            agent_ids=agent_ids,
+            base_ts=base_ts,
+        )
+        arena_payload: dict[str, Any] = {
+            "competition_id": competition_id,
+            "run_id": run_id,
+            "agent_ids": agent_ids,
+            "arena_comparison": report,
+        }
+        arena_event = CompetitionEvent(
+            competition_id=competition_id,
+            run_id=run_id,
+            seq=1,
+            event_type=EventType.COMPETITION_FINALIZED,
+            event_ts=base_ts,
+            evidence=False,
+            source_sequence_no=None,
+            derived_from=[f"arena_comparison:{run_id}"],
+            payload=arena_payload,
+            payload_hash=event_payload_hash(arena_payload),
+        )
+        await dep_store.append_competition_events(competition_id, [started, arena_event])
+        await dep_store.update_competition_run_id(competition_id, run_id)
+        await dep_store.update_competition_status(competition_id, CompetitionStatus.FINALIZED)
+
+        return {"competition_id": competition_id, "run_id": run_id, "arena_comparison": report}
 
     # --- GET /competitions/{competition_id} -------------------------------
 

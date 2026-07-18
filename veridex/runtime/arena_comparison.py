@@ -47,6 +47,7 @@ from veridex.runtime.llm_checkpoint import (
     InflightGuard,
     ServiceOutcome,
 )
+from veridex.runtime.orchestrator import _closing_snapshots
 from veridex.runtime.schemas import AgentAction, SportsActionType
 from veridex.strategies.drift_features import (
     DriftFeatureParams,
@@ -550,7 +551,30 @@ class ArenaComparison:
         """A decision event that emitted a NON-WAIT action (regardless of whether it is scoreable)."""
         return e.kind == "decision" and e.action_type != SportsActionType.WAIT.value
 
-    def _is_scoreable(self, e: ArenaCheckpointEvent) -> bool:
+    def _closing_by_market(self) -> dict[tuple[int, str], MarketState]:
+        """Map ``(fixture_id, market_key)`` to that market's AUTHORITATIVE closing snapshot.
+
+        The canonical run law closes each market against the last tick CONTAINING it, NOT the final
+        GLOBAL row (:func:`veridex.runtime.orchestrator._closing_snapshots`). This mirrors that rule but
+        is FIXTURE-AWARE: a single arena run may replay multiple fixtures sharing market keys, so the
+        canonical per-market selection is applied PER FIXTURE (grouping ``self._marketstates`` by
+        ``fixture_id``) and keyed by ``(fixture_id, market_key)``. Without this, a later fixture's tick
+        carrying the same market key could hijack an earlier fixture's close, and a market absent from
+        the final global row would be mis-rejected — under-counting scoreable decisions (Codex M2).
+        """
+        by_fixture: dict[int, list[MarketState]] = {}
+        for state in self._marketstates:
+            by_fixture.setdefault(int(getattr(state, "fixture_id", 0)), []).append(state)
+        closing: dict[tuple[int, str], MarketState] = {}
+        for fixture_id, states in by_fixture.items():
+            # REUSE the orchestrator's canonical "last tick carrying each market" rule per fixture.
+            for market_key, snapshot in _closing_snapshots(states).items():
+                closing[(fixture_id, market_key)] = snapshot
+        return closing
+
+    def _is_scoreable(
+        self, e: ArenaCheckpointEvent, closing_by_market: dict[tuple[int, str], MarketState] | None = None
+    ) -> bool:
         """Whether a decision event is a SCOREABLE decision — AUTHORITATIVE via the DETERMINISTIC LAW.
 
         A non-WAIT action is scoreable ONLY when the deterministic law (:func:`recompute`) can actually
@@ -562,18 +586,25 @@ class ArenaComparison:
         invented nonempty coordinates as authoritative, overstating a contestant's usable actions and
         collapsing the required actions-vs-scoreable distinction (addendum §3, Codex M2).
 
-        The decision is bound to the entry snapshot at its ``checkpoint_ts`` and the FINAL tape snapshot
-        as the closing line, then scored in ``replay`` mode (the arena replays a completed fixture, so a
-        missing closing is genuinely invalid). ``actions`` (the raw non-WAIT count) is tallied SEPARATELY
-        and is unaffected by this check.
+        The decision is bound to the entry snapshot at its ``checkpoint_ts`` and to that market's
+        AUTHORITATIVE per-market close — the last tick carrying the action's market IN ITS FIXTURE
+        (``closing_by_market``), NOT the final GLOBAL row — then scored in ``replay`` mode. Using the
+        final global row would mis-reject any decision whose market is absent from the last tick,
+        under-counting valid decisions on a multi-market/fixture tape (Codex M2). ``actions`` (the raw
+        non-WAIT count) is tallied SEPARATELY and is unaffected by this check.
         """
         if e.kind != "decision" or e.action_type == SportsActionType.WAIT.value:
             return False
+        if closing_by_market is None:
+            closing_by_market = self._closing_by_market()
         entry = self._state_by_ts.get(e.checkpoint_ts)
-        closing = self._marketstates[-1] if self._marketstates else None
-        if entry is None or closing is None:
-            # No entry/closing evidence to score against → cannot establish law-validity → fail closed.
+        if entry is None:
+            # No entry evidence to score against → cannot establish law-validity → fail closed.
             return False
+        fixture_id = int(getattr(entry, "fixture_id", 0))
+        closing = closing_by_market.get((fixture_id, e.market_key)) if e.market_key is not None else None
+        # A market never carried by the tape (in this fixture) has no authoritative close → the law
+        # returns closing_missing (replay) → not scoreable. Passing closing=None is the honest signal.
         try:
             action_type = SportsActionType(e.action_type) if e.action_type is not None else SportsActionType.WAIT
         except ValueError:
@@ -582,10 +613,12 @@ class ArenaComparison:
         verdict = recompute(entry, action, closing=closing, source_mode=REPLAY)
         return bool(verdict["valid"])
 
-    def _tallies(self, contestant: str) -> dict[str, int]:
+    def _tallies(self, contestant: str, closing_by_market: dict[tuple[int, str], MarketState]) -> dict[str, int]:
         eligible = len(self.opportunities(contestant))
         actions = sum(1 for e in self.events if e.contestant == contestant and self._is_non_wait(e))
-        scoreable = sum(1 for e in self.events if e.contestant == contestant and self._is_scoreable(e))
+        scoreable = sum(
+            1 for e in self.events if e.contestant == contestant and self._is_scoreable(e, closing_by_market)
+        )
         return {
             "actions": actions,  # every non-WAIT emission (may include law-invalid ones)
             "waits": max(eligible - actions, 0),
@@ -599,16 +632,19 @@ class ArenaComparison:
         llm_opps = self.opportunities(LLM_DRIFT_CONTESTANT)
         identical = det_opps == llm_opps and bool(det_opps)
 
-        det_tally = self._tallies(DET_DRIFT_CONTESTANT)
-        llm_tally = self._tallies(LLM_DRIFT_CONTESTANT)
+        # Build the AUTHORITATIVE per-market (fixture-aware) closing map ONCE and thread it through every
+        # scoreability check, so each decision is scored against its own market's real close (Codex M2).
+        closing_by_market = self._closing_by_market()
+        det_tally = self._tallies(DET_DRIFT_CONTESTANT, closing_by_market)
+        llm_tally = self._tallies(LLM_DRIFT_CONTESTANT, closing_by_market)
         contestants = {DET_DRIFT_CONTESTANT: det_tally, LLM_DRIFT_CONTESTANT: llm_tally}
         scoreable = det_tally["scoreable_decisions"] + llm_tally["scoreable_decisions"]
 
         # Clustered-uncertainty honesty caveat: decisions cluster on few checkpoints/markets, so the
         # CLV samples are CORRELATED — an average across them is not an independent-sample mean. Scoped
         # to AUTHORITATIVE scoreable decisions (law-valid targets), consistent with ``scoreable`` above.
-        distinct_markets = {e.market_key for e in self.events if self._is_scoreable(e)}
-        distinct_checkpoints = {e.checkpoint_ts for e in self.events if self._is_scoreable(e)}
+        distinct_markets = {e.market_key for e in self.events if self._is_scoreable(e, closing_by_market)}
+        distinct_checkpoints = {e.checkpoint_ts for e in self.events if self._is_scoreable(e, closing_by_market)}
         clustered_uncertainty = {
             "scoreable_decisions": scoreable,
             "distinct_markets": len(distinct_markets),
