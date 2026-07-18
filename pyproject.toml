@@ -23,7 +23,10 @@ include = ["veridex*", "veridex_agent*"]
 postgres = ["psycopg[binary]>=3", "psycopg-pool>=3"]
 # LLM agent layer (Agno via OpenRouter, OpenAI-compatible) — lazy-imported behind a seam;
 # not needed for the offline suite. openai is the client Agno's OpenRouter model uses.
-agent = ["agno", "openai"]
+# PINNED to the I-9-validated version (fu-i9-pin-agno): II-4 hosts run_market_maker inside AgentOS and
+# the AC-29 deployed-surface contract is calibrated against agno==2.7.3's exact native route table, so a
+# future `uv lock` must never silently drift off the reviewed surface.
+agent = ["agno==2.7.3", "openai"]
 # Live TxLINE SSE client (B2) — async HTTP.
 live = ["httpx>=0.27"]
 # FastAPI serving layer (B11 demo surface) — async read + trigger endpoints over the Store.

@@ -2774,7 +2774,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "agno", marker = "extra == 'agent'" },
+    { name = "agno", marker = "extra == 'agent'", specifier = "==2.7.3" },
     { name = "aiohttp", marker = "extra == 'polymarket'" },
     { name = "eth-account", marker = "extra == 'polymarket'" },
     { name = "fastapi", marker = "extra == 'api'", specifier = ">=0.115" },

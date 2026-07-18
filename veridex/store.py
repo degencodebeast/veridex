@@ -27,7 +27,8 @@ from __future__ import annotations
 
 import copy
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from enum import Enum
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 from veridex.competition.events import CompetitionEvent
@@ -89,6 +90,89 @@ _EXECUTION_STATUS_VALUES: tuple[str, ...] = (
 # Values MUST stay in DeployStatus enum-definition order; the drift-guard test asserts exact
 # equality with veridex.deploy.instance.deploy_status_values().
 _INSTANCE_STATUS_VALUES: tuple[str, ...] = ("pending", "running", "sealed", "failed")
+
+
+# ---------------------------------------------------------------------------
+# Runtime instance-lease (II-4 / AC-25 — crash-safe single-active-run exclusivity)
+# ---------------------------------------------------------------------------
+
+
+class DuplicateLeaseError(Exception):
+    """Raised when acquiring a lease whose ``instance_id`` is already claimed (the exclusivity signal).
+
+    The single, store-agnostic "one run per instance" signal: :class:`PostgresStore` maps the Postgres
+    ``UniqueViolation`` on ``UNIQUE(instance_id)`` to this, and :class:`InMemoryStore` raises it in code
+    from the same collision — so the AgentOS wrapper route reconciles on ONE contract regardless of
+    backend and NEVER launches a second run (mirrors :class:`~veridex.deploy.attempt.DuplicateAttemptError`).
+    """
+
+
+class LeaseStatus(str, Enum):
+    """Forward-only lifecycle of an :class:`InstanceLease` (crash-safe single-active-run exclusivity).
+
+    ``STARTING`` is claimed (unique-insert) BEFORE the AgentOS run is attached; ``ACTIVE`` marks the
+    run attached and the instance ``runtime_handle`` persisted; ``RELEASED`` / ``FAILED`` are the two
+    terminal outcomes. The state machine only ever advances (STARTING -> ACTIVE -> RELEASED|FAILED):
+    a crash that leaves the lease in ``STARTING`` is recoverable/boundedly-conflicting under the SAME
+    pre-allocated ids, never a second run.
+    """
+
+    STARTING = "starting"
+    ACTIVE = "active"
+    RELEASED = "released"
+    FAILED = "failed"
+
+
+# CHECK-constraint literal tuple for instance_leases.status. Values MUST stay in LeaseStatus
+# enum-definition order; the drift-guard test asserts exact equality with lease_status_values().
+_LEASE_STATUS_VALUES: tuple[str, ...] = tuple(m.value for m in LeaseStatus)
+
+# Forward-only rank: a lease may only advance to a STRICTLY-later rank (or stay idempotently on the
+# SAME terminal). Both terminals share rank 2, so a RELEASED lease can never flip to FAILED (or vice
+# versa) and nothing rewinds out of a terminal — the crash-safety invariant.
+_LEASE_STATUS_RANK: dict[LeaseStatus, int] = {
+    LeaseStatus.STARTING: 0,
+    LeaseStatus.ACTIVE: 1,
+    LeaseStatus.RELEASED: 2,
+    LeaseStatus.FAILED: 2,
+}
+
+
+def lease_status_values() -> tuple[str, ...]:
+    """Return the full set of valid ``instance_leases.status`` strings (enum-definition order)."""
+    return tuple(member.value for member in LeaseStatus)
+
+
+@dataclass
+class InstanceLease:
+    """The DURABLE single-active-run exclusivity claim for one deployed ``AgentInstance`` (II-4 / AC-25).
+
+    Inserted (once) under ``UNIQUE(instance_id)`` BEFORE an AgentOS run is attached; the unique
+    violation IS the "already running" signal (:class:`DuplicateLeaseError`). The SERVER pre-allocates
+    ``runtime_agent_id`` / ``session_id`` / ``run_id`` and pins them here, so a duplicate/recovery
+    starter reconciles under the SAME ids and never mints a second run.
+
+    Attributes:
+        instance_id: The owning :class:`~veridex.deploy.instance.AgentInstance` (the UNIQUE key —
+            one live run per instance for the scalar-run hackathon model; P-8 relaxes this).
+        runtime_agent_id: SERVER-pre-allocated AgentOS agent id the run is attached under.
+        session_id: SERVER-pre-allocated AgentOS session id.
+        run_id: SERVER-pre-allocated Veridex run id (the authoritative result/evidence identity).
+        status: Forward-only :class:`LeaseStatus`.
+        operator_id: The owning instance's ``operator_id`` — DUPLICATED here for AUDIT only; it is
+            NEVER the ownership authority (authority stays ``AgentInstance.operator_id``).
+        created_at: ISO-8601 UTC timestamp the lease was claimed.
+        updated_at: ISO-8601 UTC timestamp of the last status transition.
+    """
+
+    instance_id: str
+    runtime_agent_id: str
+    session_id: str
+    run_id: str
+    status: LeaseStatus
+    operator_id: str
+    created_at: str
+    updated_at: str
 
 
 # ---------------------------------------------------------------------------
@@ -581,6 +665,59 @@ class Store(Protocol):
         """
         ...
 
+    # --- runtime instance-lease methods (II-4 — crash-safe single-active-run exclusivity) ---
+
+    async def acquire_instance_lease(self, lease: InstanceLease) -> None:
+        """Atomically claim the single-active-run lease for ``lease.instance_id`` (INSERT-only).
+
+        The lease is inserted in ``STARTING`` under ``UNIQUE(instance_id)`` BEFORE an AgentOS run is
+        attached: a second acquire for an already-claimed instance is the "already running" signal,
+        surfaced as :class:`DuplicateLeaseError` — the caller must NEVER launch a second run.
+
+        Args:
+            lease: The pre-allocated claim to persist (keyed by ``instance_id``).
+
+        Raises:
+            DuplicateLeaseError: If ``instance_id`` already holds a lease.
+        """
+        ...
+
+    async def get_instance_lease(self, instance_id: str) -> InstanceLease | None:
+        """Load the current lease for ``instance_id``, if any.
+
+        Args:
+            instance_id: The instance whose lease to load.
+
+        Returns:
+            The recorded :class:`InstanceLease`, or ``None`` if the instance holds no lease.
+        """
+        ...
+
+    async def release_instance_lease(
+        self, instance_id: str, status: LeaseStatus, *, updated_at: str
+    ) -> InstanceLease:
+        """Advance the lease forward-only to ``status`` (idempotent compare-and-set).
+
+        The single transition primitive: ``STARTING -> ACTIVE`` (run attached + ``runtime_handle``
+        persisted) and ``ACTIVE|STARTING -> RELEASED|FAILED`` (terminal) both route here. The move is
+        forward-only and idempotent — re-releasing an already-terminal lease is a no-op (so a
+        cancellation-safe ``finally`` is safe), and a terminal lease NEVER flips to the other terminal
+        or rewinds.
+
+        Args:
+            instance_id: The instance whose lease to transition.
+            status: The target :class:`LeaseStatus` (must not rank earlier than the current status).
+            updated_at: ISO-8601 UTC timestamp of this transition.
+
+        Returns:
+            The transitioned (or unchanged, if idempotent) :class:`InstanceLease`.
+
+        Raises:
+            KeyError: If no lease exists for ``instance_id``.
+            ValueError: If ``status`` would rewind, or flip one terminal to the other.
+        """
+        ...
+
 
 # ---------------------------------------------------------------------------
 # Private reconstruction helpers
@@ -683,6 +820,10 @@ class InMemoryStore:
         # Append-only deployment-attempt ledger, keyed by (operator_id, idempotency_key) — the
         # in-code mirror of the Postgres UNIQUE(operator_id, idempotency_key) claim (I-3).
         self._deployment_attempts: dict[tuple[str, str], DeploymentAttempt] = {}
+        # Runtime single-active-run leases, keyed by instance_id — the in-code mirror of the Postgres
+        # UNIQUE(instance_id) claim (II-4). Atomic check/insert (no await between) makes acquire
+        # race-free under the single-threaded asyncio loop.
+        self._instance_leases: dict[str, InstanceLease] = {}
         # Append-only realized-fill ledger + its monotonic unique-seq counter (SAF-002b/c).
         self._realized_fills: list[RealizedFillLedgerRow] = []
         self._realized_fill_seq: int = 0
@@ -1178,6 +1319,72 @@ class InMemoryStore:
         recorded = self._deployment_attempts.get((operator_id, idempotency_key))
         return recorded.model_copy(deep=True) if recorded is not None else None
 
+    # --- runtime instance-lease methods (II-4 — crash-safe single-active-run exclusivity) ---
+
+    async def acquire_instance_lease(self, lease: InstanceLease) -> None:
+        """Atomically claim the lease for ``lease.instance_id`` (mirrors the Postgres UNIQUE claim).
+
+        The check + insert run with NO ``await`` between them, so under the single-threaded asyncio
+        loop two concurrent acquires cannot both succeed — exactly one wins, the other raises.
+
+        Args:
+            lease: The pre-allocated claim to persist.
+
+        Raises:
+            DuplicateLeaseError: If ``instance_id`` already holds a lease.
+        """
+        if lease.instance_id in self._instance_leases:
+            raise DuplicateLeaseError(f"instance already holds a run lease: {lease.instance_id!r}")
+        self._instance_leases[lease.instance_id] = copy.deepcopy(lease)
+
+    async def get_instance_lease(self, instance_id: str) -> InstanceLease | None:
+        """Return a deep copy of the current lease for ``instance_id``, or ``None`` if unclaimed."""
+        recorded = self._instance_leases.get(instance_id)
+        return copy.deepcopy(recorded) if recorded is not None else None
+
+    async def release_instance_lease(
+        self, instance_id: str, status: LeaseStatus, *, updated_at: str
+    ) -> InstanceLease:
+        """Advance the in-memory lease forward-only to ``status`` (idempotent compare-and-set).
+
+        Args:
+            instance_id: The instance whose lease to transition.
+            status: The target :class:`LeaseStatus`.
+            updated_at: ISO-8601 UTC timestamp of this transition.
+
+        Returns:
+            A deep copy of the transitioned (or unchanged) lease.
+
+        Raises:
+            KeyError: If no lease exists for ``instance_id``.
+            ValueError: If ``status`` would rewind, or flip one terminal to the other.
+        """
+        current = self._instance_leases.get(instance_id)
+        if current is None:
+            raise KeyError(f"no run lease for instance_id={instance_id!r}")
+        updated = _lease_transition(current, status, updated_at)
+        self._instance_leases[instance_id] = updated
+        return copy.deepcopy(updated)
+
+
+def _lease_transition(current: InstanceLease, status: LeaseStatus, updated_at: str) -> InstanceLease:
+    """Return ``current`` advanced forward-only to ``status`` (idempotent; raises on rewind/terminal-flip).
+
+    Shared by both stores so the forward-only CAS rule lives in ONE place. Idempotent re-release of an
+    already-terminal lease returns it unchanged; a backward move or a terminal->other-terminal flip is
+    a :class:`ValueError` (the crash-safety invariant — a lease never un-terminates or launches twice).
+    """
+    cur_rank = _LEASE_STATUS_RANK[current.status]
+    new_rank = _LEASE_STATUS_RANK[status]
+    if status == current.status:
+        return replace(current)  # idempotent no-op (re-release in a finally is safe)
+    if new_rank <= cur_rank:
+        raise ValueError(
+            f"illegal lease transition {current.status.value!r} -> {status.value!r} for instance "
+            f"{current.instance_id!r} (leases are forward-only and never flip a terminal)"
+        )
+    return replace(current, status=status, updated_at=updated_at)
+
 
 # ---------------------------------------------------------------------------
 # PostgresStore column helpers
@@ -1455,6 +1662,27 @@ class PostgresStore:
                     instance_id TEXT,
                     external_id TEXT,
                     CONSTRAINT uq_deployment_attempts_operator_key UNIQUE (operator_id, idempotency_key)
+                )
+                """
+            )
+
+            # --- runtime instance-lease (II-4 — crash-safe single-active-run exclusivity, INSERT-only) ---
+            # One row per instance_id, written ONCE in STARTING before an AgentOS run is attached; the
+            # UNIQUE(instance_id) constraint is the "one run per instance" guarantee (a duplicate INSERT
+            # is the DuplicateLeaseError signal a concurrent/duplicate starter reconciles on, NEVER a
+            # second run). Business columns hold the SERVER-pre-allocated ids the run is pinned to.
+            lease_status_in = ", ".join(f"'{v}'" for v in _LEASE_STATUS_VALUES)
+            await cur.execute(
+                f"""
+                CREATE TABLE IF NOT EXISTS instance_leases (
+                    instance_id TEXT PRIMARY KEY,
+                    runtime_agent_id TEXT NOT NULL,
+                    session_id TEXT NOT NULL,
+                    run_id TEXT NOT NULL,
+                    status TEXT NOT NULL CHECK (status IN ({lease_status_in})),
+                    operator_id TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
                 )
                 """
             )
@@ -2339,3 +2567,128 @@ class PostgresStore:
             instance_id=row[6],
             external_id=row[7],
         )
+
+    # --- runtime instance-lease methods (II-4 — crash-safe single-active-run exclusivity) ---
+
+    async def acquire_instance_lease(self, lease: InstanceLease) -> None:
+        """INSERT one instance-lease row (INSERT-only); the UNIQUE(instance_id) claim signals a duplicate.
+
+        Maps the Postgres ``UniqueViolation`` on the ``instance_leases`` primary key to
+        :class:`DuplicateLeaseError` — the same contract as :class:`InMemoryStore` — so the wrapper
+        route reconciles on ONE backend-agnostic "already running" signal. All SQL is parameterized;
+        psycopg stays lazy.
+
+        Args:
+            lease: The pre-allocated claim to persist.
+
+        Raises:
+            DuplicateLeaseError: If ``instance_id`` already holds a lease.
+        """
+        conn = await self._connect()
+        try:
+            async with conn.transaction(), conn.cursor() as cur:
+                try:
+                    await cur.execute(
+                        "INSERT INTO instance_leases "
+                        "(instance_id, runtime_agent_id, session_id, run_id, status, operator_id, "
+                        "created_at, updated_at) "
+                        "VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
+                        (
+                            lease.instance_id,
+                            lease.runtime_agent_id,
+                            lease.session_id,
+                            lease.run_id,
+                            lease.status.value,
+                            lease.operator_id,
+                            lease.created_at,
+                            lease.updated_at,
+                        ),
+                    )
+                except Exception as exc:
+                    # psycopg is already in sys.modules (imported inside _connect).
+                    import psycopg.errors  # noqa: PLC0415 (lazy, not at module level)
+
+                    if isinstance(exc, psycopg.errors.UniqueViolation):
+                        raise DuplicateLeaseError(
+                            f"instance already holds a run lease: {lease.instance_id!r}"
+                        ) from exc
+                    raise
+        finally:
+            await self._release(conn)
+
+    async def get_instance_lease(self, instance_id: str) -> InstanceLease | None:
+        """Fetch and reconstruct the current lease for ``instance_id``, or ``None`` if unclaimed."""
+        conn = await self._connect()
+        try:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "SELECT instance_id, runtime_agent_id, session_id, run_id, status, operator_id, "
+                    "created_at, updated_at FROM instance_leases WHERE instance_id = %s",
+                    (instance_id,),
+                )
+                row = await cur.fetchone()
+        finally:
+            await self._release(conn)
+
+        if row is None:
+            return None
+        return InstanceLease(
+            instance_id=row[0],
+            runtime_agent_id=row[1],
+            session_id=row[2],
+            run_id=row[3],
+            status=LeaseStatus(row[4]),
+            operator_id=row[5],
+            created_at=row[6],
+            updated_at=row[7],
+        )
+
+    async def release_instance_lease(
+        self, instance_id: str, status: LeaseStatus, *, updated_at: str
+    ) -> InstanceLease:
+        """Read-modify-write the lease forward-only to ``status`` in one ``FOR UPDATE`` transaction.
+
+        Loads the row ``FOR UPDATE`` (serializing concurrent transitions), applies the shared
+        forward-only CAS rule (:func:`_lease_transition`), and writes the new status + timestamp.
+
+        Args:
+            instance_id: The instance whose lease to transition.
+            status: The target :class:`LeaseStatus`.
+            updated_at: ISO-8601 UTC timestamp of this transition.
+
+        Returns:
+            The transitioned (or unchanged, if idempotent) :class:`InstanceLease`.
+
+        Raises:
+            KeyError: If no lease exists for ``instance_id``.
+            ValueError: If ``status`` would rewind, or flip one terminal to the other.
+        """
+        conn = await self._connect()
+        try:
+            async with conn.transaction(), conn.cursor() as cur:
+                await cur.execute(
+                    "SELECT instance_id, runtime_agent_id, session_id, run_id, status, operator_id, "
+                    "created_at, updated_at FROM instance_leases WHERE instance_id = %s FOR UPDATE",
+                    (instance_id,),
+                )
+                row = await cur.fetchone()
+                if row is None:
+                    raise KeyError(f"no run lease for instance_id={instance_id!r}")
+                current = InstanceLease(
+                    instance_id=row[0],
+                    runtime_agent_id=row[1],
+                    session_id=row[2],
+                    run_id=row[3],
+                    status=LeaseStatus(row[4]),
+                    operator_id=row[5],
+                    created_at=row[6],
+                    updated_at=row[7],
+                )
+                updated = _lease_transition(current, status, updated_at)
+                await cur.execute(
+                    "UPDATE instance_leases SET status = %s, updated_at = %s WHERE instance_id = %s",
+                    (updated.status.value, updated.updated_at, instance_id),
+                )
+        finally:
+            await self._release(conn)
+        return updated
