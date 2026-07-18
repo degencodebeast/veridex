@@ -109,14 +109,36 @@ def test_fv_time_semantics_are_correct() -> None:
 
 
 def test_fv_dedup_collapses_repeated_snapshots() -> None:
-    # The committed sub-pack carries MORE 1X2 FV records than the deduped FvArrivals the tape emits:
-    # repeated identical fair values do NOT masquerade as new TxLINE updates.
+    # NQ-3: ISOLATE dedup from the unrelated "side unpriced on this tick -> skip" path. Rebuild the
+    # PRICED part1 fair-value series (bps not None) WITHOUT dedup, mirroring _load_fv_arrivals minus
+    # the M3 collapse, so `priced` ALREADY excludes the None-skips. The drop we then assert can ONLY be
+    # explained by dedup — a bare `len(fvs) < len(states)` would also pass on None-skips alone.
     states = load_pack_marketstates(pmxt_tape.pack_dir(), pmxt_tape.FIXTURE_ID, verify=True)
-    n_records = len(states)
+    priced: list[float] = []
+    for state in states:
+        market = state.markets.get(pmxt_tape._TXLINE_1X2_FULL_MARKET_KEY)
+        if not market:
+            continue
+        bps = (market.get("stable_prob_bps") or {}).get(pmxt_tape.TXLINE_SIDE)
+        if bps is None:
+            continue  # unpriced side — the skip path we must NOT count as a dedup collapse
+        priced.append(bps / 1e4)
+    # consecutive-duplicate PRICED records are exactly what dedup MUST drop.
+    collapses = sum(
+        1 for prev, cur in zip(priced, priced[1:], strict=False) if round(prev, 6) == round(cur, 6)
+    )
+    assert collapses >= 1, (
+        "test precondition: the committed pack must contain >=1 consecutive-duplicate PRICED "
+        "fair value, else this test cannot isolate dedup from the unpriced-skip path"
+    )
+
     events = pmxt_tape.build_tape_events()
     fvs = [e for e in events if isinstance(e, FvArrival)]
-    assert len(fvs) < n_records, (
-        f"M3: dedup must drop redundant snapshots — got {len(fvs)} arrivals from {n_records} records"
+    # dedup drops EXACTLY the consecutive-duplicate priced records — arrivals == priced - collapses.
+    # (`priced` already excludes unpriced ticks, so this delta is attributable to dedup ALONE.)
+    assert len(fvs) == len(priced) - collapses, (
+        f"M3: dedup must drop exactly the {collapses} consecutive-duplicate priced snapshot(s): "
+        f"{len(fvs)} arrivals vs {len(priced)} priced - {collapses} collapses"
     )
     # every consecutive emitted arrival differs from its predecessor in value (a real change).
     for prev, cur in zip(fvs, fvs[1:], strict=False):
@@ -212,18 +234,39 @@ def test_catalog_resolves_and_hash_reverifies() -> None:
     assert pmxt_tape.build_pmxt_txline_tape().content_hash == tape.content_hash
 
 
-# --- no-look-ahead join: a book tick only ever sees an FV that arrived at or before it ---------
+# --- as-of join: within the SEALED merged sequence the selected FV is no-look-ahead on the DERIVED
+# --- recv_ts. This is NOT a strict cross-clock causal-arrival guarantee — the book pmxt-recorder
+# --- arrival clock and the FV source-``Ts`` clock are independent with no calibrated offset (see
+# --- pmxt_tape "THE JOIN" / honesty boundaries). ----------------------------------------------
 
 
-def test_join_has_no_look_ahead(tmp_path: Path) -> None:
+def test_join_is_no_look_ahead_on_derived_recv_ts(tmp_path: Path) -> None:
+    """The as-of selection is deterministic + no-look-ahead ON THE DERIVED ``recv_ts`` clock.
+
+    This pins the property the construction ACTUALLY supports: within the sealed global
+    ``(recv_ts, sequence_no)`` sequence a book tick only ever pairs with an FV whose (derived) arrival
+    ``recv_ts`` is at-or-before its own decision clock — never future-dated on that clock, and
+    reproducible across a rebuild of the sealed events.
+
+    It deliberately does NOT assert a strict cross-clock causal ordering (book pmxt-recorder-arrival
+    vs FV source-``Ts``): those are independent recorder clocks with no calibrated offset, so "the
+    TxLINE value physically arrived before the book decision" is NOT a property this tape can prove.
+    (The former cross-clock ``fv_source_ts <= book_recv_ts//1000 + 1`` assertion — with its +1 fudge —
+    is REMOVED: it implied exactly that unsupported causal ordering. The real guarantee is the
+    derived-clock ``fv_recv_ts <= as_of_ts`` check below. Brief Major 2 / NQ-2.)
+    """
     _events, run = _fold(tmp_path, guard_enabled=True)
     guarded = [obs for obs in run.observations if obs.guard_fv is not None]
     assert guarded, "guard-on run must project at least one FV leg to check"
     for obs in guarded:
-        # the projected FV's arrival (ms) is at or before the decision clock — never future-dated.
+        # THE guarantee: the projected FV's (derived) arrival is at-or-before the book decision clock
+        # in the sealed merged sequence — never future-dated on the derived recv_ts.
         assert obs.guard_fv.fv_recv_ts <= obs.as_of_ts
-        # and the FV source time (s) is at or before the book's own receive second (no look-ahead).
-        assert obs.guard_fv.fv_source_ts <= obs.book_recv_ts // 1000 + 1
+    # deterministic/reproducible: rebuilding the sealed events yields the identical guarded projection
+    # (the selection is a pure function of the sealed sequence, not of wall-clock arrival).
+    _events2, run2 = _fold(tmp_path / "rebuild", guard_enabled=True)
+    rebuilt = [obs.guard_fv.fv_recv_ts for obs in run2.observations if obs.guard_fv is not None]
+    assert rebuilt == [obs.guard_fv.fv_recv_ts for obs in guarded]
 
 
 # --- M1: matched guard-OFF vs guard-ON behavior over the SAME tape (report the difference) -----
@@ -281,19 +324,31 @@ def test_guard_on_abstains_on_stale_txline_fv(tmp_path: Path) -> None:
 # --- M5: real Studio guard-ON payload E2E through the PRODUCTION catalog -----------------------
 
 
+#: THE ONE shared canonical Studio MM deploy payload — the SAME committed fixture the frontend contract
+#: test (``apps/web/components/screens/StudioScreen.test.tsx``) pins ``buildDeployPayload(...)`` against.
+#: Driving this backend E2E off the SAME file means the real UI click path and the backend it resolves
+#: cannot drift (the parked Major-1 defect: the UI emitted a facsimile — ``synthetic-mm-mechanism-v1``
+#: + sxbet/1X2 — that no UI actually emits and the production catalog cannot resolve).
+_CANONICAL_MM_PAYLOAD_PATH = (
+    Path(pmxt_tape.__file__).resolve().parents[2]
+    / "contracts"
+    / "fixtures"
+    / "studio_mm_deploy_payload.json"
+)
+
+
 def _mm_payload(**overrides: Any) -> dict[str, Any]:
-    payload: dict[str, Any] = {
-        "template_id": "quoteguard-mm-template",
-        "agent_id": "studio-mm-agent",
-        "strategy": "quoteguard-mm",
-        "source_mode": "replay",
-        "execution_mode": "dry_run",
-        "market_allowlist": [pmxt_tape.TOKEN_ID],
-        "venue_allowlist": ["poly"],
-        "min_edge_bps": 10,
-        "max_stake": 5.0,
-        "mm": {"tape_ref": pmxt_tape.TAPE_REF, "guard_enabled": True},
-    }
+    """The canonical Studio MM deploy payload the REAL UI emits (shared fixture), plus test overrides.
+
+    Loaded verbatim from the committed contract fixture — NOT a Python facsimile. It carries the
+    PMXT-coherent identity (``market_allowlist[0] == pmxt:18209181:home_win`` on venue ``poly``) and
+    the real-data tape key ``pmxt-txline-mm-18209181-v1``, so it resolves through the PRODUCTION catalog.
+    """
+    payload: dict[str, Any] = json.loads(_CANONICAL_MM_PAYLOAD_PATH.read_text())
+    # Sanity: the fixture IS the real UI identity (guards against an accidental fixture edit that would
+    # silently decouple this E2E from the shipped click path).
+    assert payload["mm"]["tape_ref"] == pmxt_tape.TAPE_REF
+    assert payload["market_allowlist"] == [pmxt_tape.TOKEN_ID]
     payload.update(overrides)
     return payload
 

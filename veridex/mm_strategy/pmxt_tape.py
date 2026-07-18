@@ -9,8 +9,9 @@ HONEST LABEL (converge on this exact string; nothing here overclaims):
 
     "Real recorded in-play market data — Polymarket 10-level order-book depth + TxLINE 1X2 fair value
     — FIFA World Cup France v Morocco (fixture 18209181), replayed dry-run (no live money);
-    cross-recorder-clock alignment seconds-scale (no sub-2s claim); research-grade v1 pack (not
-    R3-sealed)."
+    cross-recorder-clock alignment seconds-scale (no sub-2s claim, and NO strict cross-clock causal
+    join — the as-of join is deterministic only on the DERIVED arrival clock); research-grade v1 pack
+    (not R3-sealed)."
 
 VERDICT: **RESEARCH-GRADE REAL DATA** (not GENUINE-sealed, not a fabricated HYBRID). Both legs are
 verbatim recorded rows; the join and the orchestration scaffolding are DERIVED by explicit, disclosed
@@ -30,16 +31,32 @@ TWO REAL LEGS
   sizes, and a REAL :data:`level_count_in_band` counted from the actual 10-level ladder — never a
   gate-clearing constant.
 
-THE JOIN (no look-ahead)
-------------------------
-FvArrival + book ObservationTick events are MERGED by their real receive time (ms) and folded through
-:func:`veridex.mm_strategy.assembler.run_cadence`, whose ``project_guard_fv`` selects the FV visible at
-each book tick's SEALED global ``(recv_ts, sequence_no)`` mint boundary via
+THE JOIN (deterministic as-of on the DERIVED arrival clock — NOT a strict cross-clock causal join)
+--------------------------------------------------------------------------------------------------
+FvArrival + book ObservationTick events are MERGED into ONE ordered stream by their ``recv_ts`` (ms)
+and folded through :func:`veridex.mm_strategy.assembler.run_cadence`, whose ``project_guard_fv``
+selects the FV visible at each book tick's SEALED global ``(recv_ts, sequence_no)`` mint boundary via
 :func:`veridex.live_recorder.alignment.eligible_fv_pair` — the recorder-clock sibling of the proven
 ``veridex/maker/tape.py::_aligned_mid`` bisect join (most-recent-at-or-before, abstain when nothing is
-visible, NEVER imputed). A book tick can therefore only ever see an FV that truly arrived at or before
-it. The freshness bound is the strategy's own ``fv_freshness_ms`` (10 s), which — combined with the
-seconds-scale cross-clock skew — is why the guard honestly abstains (``txline_stale``) on some frames.
+visible, NEVER imputed).
+
+Scope of the guarantee (read carefully — this is a DELIBERATELY DOWNGRADED, honest claim):
+
+* WITHIN the sealed global ``(recv_ts, sequence_no)`` sequence the selection is deterministic and
+  no-look-ahead ON THE DERIVED ``recv_ts``: a book tick only ever pairs with an FV whose ``recv_ts``
+  is at-or-before its own, and the mint order is sealed — so the join is reproducible and never
+  future-dated on that clock.
+* It is NOT a strict causal as-of ordering ACROSS the two independent recorder clocks. The book
+  ``ObservationTick.recv_ts`` is a REAL pmxt-recorder ARRIVAL time, whereas ``FvArrival.recv_ts`` is
+  SYNTHESIZED from the provider ``Ts`` (the FV's own SOURCE clock — see the field table below), not a
+  recorder-arrival stamp. Sorting the two clocks' raw numbers as one arrival clock is a COARSE
+  cross-clock PROJECTION: an earlier ``recv_ts`` means only "numerically-earlier ``Ts``", NOT a
+  measured proof that the TxLINE value had physically ARRIVED at the decision host before the book
+  decision. No cross-clock offset bound is calibrated here, so "truly arrived before" is NOT claimed.
+
+The freshness bound is the strategy's own ``fv_freshness_ms`` (10 s); it bounds the AGE of the paired
+FV (and, combined with the seconds-scale cross-clock skew, is why the guard honestly abstains,
+``txline_stale``, on some frames) — it does NOT repair cross-clock ORDERING.
 
 FIELD-PROVENANCE CLASSIFICATION (every FvArrival / ObservationTick field)
 -------------------------------------------------------------------------
@@ -59,11 +76,15 @@ UNAVAILABLE = no such datum exists in this artifact.
     * identity.market_ref   DERIVED    — label built from the registry event slug (no round/stage).
     * identity.token_id     DERIVED    — stable stream key ``pmxt:18209181:home_win``.
     * message_id            CAPTURED   — the real pack ``MessageId`` (present on every record).
-    * proof_status          DERIVED    — ``"absent"``: a real ``message_id`` anchor EXISTS (so NOT the
-                                         ``unavailable_no_message_id`` sentinel), but NO Merkle inclusion
-                                         proof was resolved — the v1 pack carries no proof evidence and
-                                         this offline replay issues no ``/odds/validation`` query. This
-                                         deliberately does NOT claim ``"proven"`` (see honesty boundary).
+    * proof_status          DERIVED    — ``"absent"``: a real ``message_id`` (a proof-ADDRESSABLE
+                                         message reference) EXISTS, so this is NOT the
+                                         ``unavailable_no_message_id`` sentinel — but NO inclusion proof
+                                         was resolved, so per ``veridex/ingest/odds_proof.py`` the proof
+                                         itself is ABSENT ("no proof exists for this record"): the v1
+                                         pack carries no proof evidence and this offline replay issues no
+                                         ``/odds/validation`` query. ``message_id`` is the addressable
+                                         reference, NOT an external anchor/attestation; this deliberately
+                                         does NOT claim ``"proven"`` (see honesty boundary).
   ObservationTick (+ the observation its ``build`` factory assembles):
     * bid / ask             CAPTURED   — row ``best_bid`` / ``best_ask`` (real top-of-book).
     * bid_size / ask_size   CAPTURED   — row ``bids[0][1]`` / ``asks[0][1]`` (real top-level sizes).
@@ -97,9 +118,13 @@ UNAVAILABLE = no such datum exists in this artifact.
 HONESTY BOUNDARIES (hard)
 -------------------------
 * **v1 pack.** The FV sub-pack is data-only-hashed (v1). No sealed / genuine evidence-rung claim is set.
-* **Cross-recorder clocks.** The Polymarket depth (pmxt recorder clock) and the TxLINE FV (pack source
-  clock) are DIFFERENT clocks; alignment is SECONDS-SCALE. This tape NEVER claims a sub-2s lead/lag nor
-  a single-clock causal latency. The conservative ``fv_freshness_ms`` bound absorbs the skew.
+* **Cross-recorder clocks — no strict causal as-of join.** The Polymarket depth (pmxt recorder clock)
+  and the TxLINE FV (pack source ``Ts`` clock) are DIFFERENT clocks; alignment is SECONDS-SCALE. The
+  as-of join is deterministic / no-look-ahead only on the DERIVED ``recv_ts`` WITHIN the sealed
+  sequence (see "THE JOIN") — it is a COARSE cross-clock PROJECTION, NOT a proof that the FV physically
+  arrived before the book decision. This tape NEVER claims a sub-2s lead/lag, a single-clock causal
+  latency, nor a strict cross-clock causal ordering. The conservative ``fv_freshness_ms`` bound absorbs
+  the skew — it bounds FV AGE, not cross-clock ORDERING.
 * **No economic claim.** The matched guard-OFF/ON test REPORTS the behavior difference (the guard
   abstains on stale FV) only — there is no matched markout/PnL accounting, so no edge is claimed.
 
@@ -139,26 +164,21 @@ TAPE_REF = "pmxt-txline-mm-18209181-v1"
 FIXTURE_ID = 18209181
 #: Registry event slug (``fifwc`` = FIFA World Cup) — teams + competition ARE substantiated there.
 EVENT_SLUG = "fifwc-fra-mar-2026-07-09"
-COMPETITION = "FIFA World Cup"
 HOME_TEAM = "France"
 AWAY_TEAM = "Morocco"
 #: Verified kickoff (registry ``kickoff_ts``, seconds). The committed slices are entirely POST-kickoff.
 KICKOFF_TS = 1783627200
-#: The book venue (order book) and the fair-value signal.
-VENUE = "Polymarket"
-FV_SOURCE = "TxLINE 1X2 fair value"
-#: The quoted outcome: the 1X2 HOME line (France to win, mid ~0.60) — the TxLINE ``part1`` side.
-ROLE = "home"
+#: The quoted outcome: the 1X2 HOME line (France to win, mid ~0.60) — the TxLINE ``part1`` side (the
+#: fair-value signal read from the TxLINE 1X2 market, replayed on the Polymarket order book).
 TXLINE_SIDE = "part1"
 
 #: Stream identifiers. ``market_ref`` names the REAL match via the registry event slug (no round/stage).
 MARKET_REF = "pmxt:fifwc-fra-mar-2026-07-09:1x2"
 SIDE = "home"
 TOKEN_ID = "pmxt:18209181:home_win"
-#: The REAL Polymarket market/outcome references recorded on every depth row (verbatim provenance).
+#: The REAL Polymarket market/outcome reference (the venue-native ``condition_id``) recorded on every
+#: depth row (verbatim provenance) — bound onto each observation's ``venue_market_ref``.
 VENUE_MARKET_REF = "0xc09537a0976d0927901432859fbb6dfe5d23d1d69bb4e8355253e7b142a44e83"  # condition_id
-CONDITION_ID = "0xc09537a0976d0927901432859fbb6dfe5d23d1d69bb4e8355253e7b142a44e83"
-ASSET_ID = "59376244379747988336832016917908236721650516433890704080422157946407884434153"
 
 #: The TxLINE 1X2 full-match market key the FV is read under (the SAME key the normalizer emits).
 _TXLINE_1X2_FULL_MARKET_KEY = "1X2_PARTICIPANT_RESULT||"
@@ -169,6 +189,13 @@ _DECISION_LATENCY_MS = 10
 #: The symmetric price band (native prob) the real ladder's ``level_count_in_band`` is counted within.
 #: Disclosed constant (matches the default ``half_spread``); the COUNT itself is data-derived per row.
 _LEVEL_BAND = 0.02
+
+#: Decimal places at which two fair values are treated as EQUAL for M3 dedup — an explicit
+#: FLOAT-EQUALITY comparison tolerance. Fair values are probability fractions (``bps / 1e4``), so 6 dp
+#: distinguishes a genuine TxLINE change from float-representation noise without collapsing distinct
+#: ticks. NOT a rounding of the STORED value (arrivals keep the full-precision ``value``) — only the
+#: dedup comparison is tolerance-quantized.
+_FV_EQUALITY_DECIMALS = 6
 
 #: Committed, byte-preserved real slices (next to this module).
 _DATA_DIR = Path(__file__).parent / "pmxt_tape_data"
@@ -236,8 +263,12 @@ def _load_fv_arrivals() -> list[FvArrival]:
         if bps is None:
             continue  # side unpriced on this tick — skip (never impute FV)
         value = bps / 1e4
-        if last_value is not None and round(value, 6) == round(last_value, 6):
-            continue  # M3 dedup: identical fair value is not a new TxLINE update
+        # M3 dedup: an identical fair value is not a new TxLINE update. Compare at the explicit
+        # float-equality tolerance (_FV_EQUALITY_DECIMALS) — the stored ``value`` stays full-precision.
+        if last_value is not None and round(value, _FV_EQUALITY_DECIMALS) == round(
+            last_value, _FV_EQUALITY_DECIMALS
+        ):
+            continue
         last_value = value
         message_id = record.get("MessageId")
         arrivals.append(
@@ -250,8 +281,10 @@ def _load_fv_arrivals() -> list[FvArrival]:
                 source_epoch=1,
                 identity=identity,
                 message_id=message_id,
-                # message_id is present ⇒ NOT the "unavailable" sentinel; "absent" == a real anchor with
-                # no resolved Merkle proof (v1 pack, offline replay). Never claims "proven".
+                # message_id present ⇒ NOT the "unavailable" sentinel. "absent" == the proof itself is
+                # ABSENT (odds_proof.py: "no proof exists for this record"): a proof-ADDRESSABLE message
+                # reference exists but no inclusion proof was resolved (v1 pack, offline replay).
+                # message_id is the reference, NOT an external anchor/attestation. Never claims "proven".
                 proof_status="absent" if message_id is not None else "unavailable_no_message_id",
             )
         )
@@ -380,9 +413,11 @@ def _tick(row: dict[str, Any], identity: StreamIdentity) -> ObservationTick | No
 def build_tape_events() -> tuple[FvArrival | ObservationTick, ...]:
     """Merge the real TxLINE FV arrivals + real Polymarket book ticks into the ordered cadence stream.
 
-    Events are ordered by their real receive time (ms); ties place the FV arrival BEFORE the book tick
-    so ``run_cadence``'s sealed-pair ``eligible_fv_pair`` selection realizes a no-look-ahead as-of join
-    (the recorder-clock sibling of ``_aligned_mid``). Deterministic order + values keep
+    Events are ordered by their ``recv_ts`` (ms); ties place the FV arrival BEFORE the book tick so
+    ``run_cadence``'s sealed-pair ``eligible_fv_pair`` selection is a deterministic, no-look-ahead
+    as-of join ON THE DERIVED ``recv_ts`` (the recorder-clock sibling of ``_aligned_mid``) — a COARSE
+    cross-clock PROJECTION, NOT a strict causal ordering across the two recorder clocks (see the module
+    docstring, "THE JOIN"). Deterministic order + values keep
     :func:`veridex.mm_strategy.session_factory.compute_tape_content_hash` stable.
     """
     identity = tape_identity()
