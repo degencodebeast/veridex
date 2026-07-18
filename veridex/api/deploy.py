@@ -30,6 +30,7 @@ from pydantic import BaseModel
 from veridex.api.auth_privy import PrivyPrincipal, make_require_principal
 from veridex.api.demo_fixtures import build_demo_ticks
 from veridex.chain.anchor import anchor_memo
+from veridex.config import require_privy_provisioning
 from veridex.deploy.attempt import AttemptStatus, DeploymentAttempt, DuplicateAttemptError
 from veridex.deploy.instance import AgentInstance, DeployFailureReason, DeployStatus
 from veridex.deploy.preflight import MM_STRATEGY_FAMILY, DeployConfig, PreflightCheck, run_deploy_preflight
@@ -54,6 +55,28 @@ if TYPE_CHECKING:
     from veridex.store import Store
 
 logger = logging.getLogger(__name__)
+
+#: The states in which an MM deploy's wallet-provisioning saga is INCOMPLETE (II-5b). A duplicate/retry
+#: deploy for such an attempt must re-drive provisioning recovery (reconcile by the recorded external_id)
+#: rather than returning the instance as if it were complete. ``PENDING`` is included: a crash AFTER the
+#: instance is persisted but BEFORE ``_launch_mm``'s first provisioning advance leaves the attempt at
+#: ``PENDING`` with no external_id yet — and ``provision_execution_wallet`` derives + persists the
+#: external_id before its first provider mutation, so re-entering from ``PENDING`` is safe (MAJOR-1).
+_INCOMPLETE_PROVISIONING_STATES: frozenset[AttemptStatus] = frozenset(
+    {
+        AttemptStatus.PENDING,
+        AttemptStatus.WALLET_REQUESTED,
+        AttemptStatus.WALLET_CREATE_UNCERTAIN,
+        AttemptStatus.WALLET_CREATED,
+        AttemptStatus.WALLET_BOUND,
+        AttemptStatus.BINDING_PERSIST_FAILED,
+    }
+)
+
+#: Bounded re-entries for a provisioning CAS loss to a CONCURRENT coherent driver (same attempt). The
+#: attempt status advances monotonically through a small fixed set of states, so a coherent race
+#: converges in a handful of re-entries; exhausting them fails closed.
+_PROVISION_CAS_MAX_REENTRIES: int = 8
 
 
 def _now_iso() -> str:
@@ -116,6 +139,11 @@ class DeployDeps:
             ``None`` → a fresh (cold-start) state — the honest default for a brand-new deploy.
         mm_session_dir: SERVER-SIDE injectable durable recorder session directory. ``None`` → a
             per-run temp directory.
+        provisioning_provider: SERVER-SIDE injectable II-5b Privy execution-wallet provisioning
+            provider (a recording fake at Levels 1-2). ``None`` → provisioning is not attempted
+            (the II-5 behavior). Provisioning ALSO requires the operator-pinned custody config
+            (:func:`~veridex.config.require_privy_provisioning`); either absent → no wallet is
+            provisioned. NEVER a live Privy client here, and NEVER a request field.
     """
 
     feed_report: FeedHealthReport | None = None
@@ -129,6 +157,7 @@ class DeployDeps:
     mm_proposer: Callable[..., Awaitable[MMExecutionToolResult]] | None = None
     mm_seed_state: StrategyState | None = None
     mm_session_dir: Path | None = None
+    provisioning_provider: Any | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -191,6 +220,35 @@ def _build_window(config: DeployConfig) -> RunWindow:
     )
 
 
+async def check_provisioning_readiness(settings: Settings, provider: Any | None) -> None:
+    """Async II-5b custody READINESS probe (MAJOR-3): verify the LIVE policy + quorum, not just presence.
+
+    When provisioning is ENABLED, this fetches the pinned policy AND key quorum from the provider and
+    admits them against the pinned custody contract (:func:`~veridex.dust_execution.privy_provisioning.
+    admit_policy_and_quorum`) — so an unreachable provider or a drifted policy/quorum is caught at
+    readiness rather than only on the first deploy. Fully INERT when provisioning is disabled (returns
+    immediately; no probe, no behavior change). Fails CLOSED (raises) on a missing provider, provider
+    error, or drift, so a readiness surface / startup can refuse to advertise ready.
+
+    Args:
+        settings: Resolved settings (the pinned custody contract is read from here).
+        provider: The injected provisioning provider (``None`` when not wired).
+
+    Raises:
+        RuntimeError: If provisioning is enabled but no provider is wired.
+        ProvisioningError: (or a subclass) if the provider is unreachable or the live policy/quorum
+            drifted from the pinned contract.
+    """
+    pinned = require_privy_provisioning(settings)
+    if pinned is None:
+        return  # provisioning disabled → inert, no probe
+    if provider is None:
+        raise RuntimeError("PRIVY provisioning is enabled but no provisioning provider is wired (readiness fail closed)")
+    from veridex.dust_execution.privy_provisioning import admit_policy_and_quorum  # noqa: PLC0415
+
+    await admit_policy_and_quorum(provider, pinned, request_auth=pinned.request_auth())
+
+
 # ---------------------------------------------------------------------------
 # Route registration
 # ---------------------------------------------------------------------------
@@ -218,6 +276,15 @@ def register_deploy_routes(
             :class:`~veridex.runtime.runtime_store.DurableRuntimeEventStore`. ``None`` emits nothing.
     """
     deps = deploy_deps if deploy_deps is not None else DeployDeps()
+    # Composition/readiness fail-closed (MAJOR-3): in a production-equivalent env, enabling II-5b
+    # provisioning REQUIRES the production provider to be wired — refuse to compose the app otherwise so
+    # a "enabled but no provider" process cannot start and silently skip custody. (require_privy_provisioning
+    # itself raises if enabled with pins absent.) In dev/test the app still composes so the per-deploy
+    # fail-closed guard in _launch_mm is exercised.
+    if require_privy_provisioning(settings) is not None and deps.provisioning_provider is None and settings.is_production:
+        raise RuntimeError(
+            "PRIVY provisioning is enabled but no provisioning provider is wired (fail closed at composition)"
+        )
     # I-1 auth boundary: a valid Privy access token is required (in ``privy`` mode) BEFORE the deploy
     # body handler runs, so a 401 precedes every persistence/wallet/runtime side effect.
     require_principal = make_require_principal(settings)
@@ -227,6 +294,33 @@ def register_deploy_routes(
     # truth), NOT app.state: it survives a process restart and an app.state clear.
     background_tasks: set[asyncio.Task[None]] = set()
     app.state.deploy_background_tasks = background_tasks
+
+    # MAJOR-3: expose the async custody-readiness probe on app.state so an app lifespan/startup CAN
+    # fail closed on provider error or drift (an integrator wires it into the boot sequence), and mount
+    # a fail-closed readiness route below. Inert when provisioning is disabled.
+    async def _provisioning_readiness() -> None:
+        await check_provisioning_readiness(settings, deps.provisioning_provider)
+
+    app.state.check_provisioning_readiness = _provisioning_readiness
+
+    @app.get("/agents/provisioning/readyz")
+    async def provisioning_readyz() -> dict[str, Any]:
+        """Fail-closed II-5b custody readiness (MAJOR-3): 200 only if the live policy/quorum admit.
+
+        Unauthenticated readiness surface (like a container ``/readyz``). When provisioning is enabled
+        it re-admits the LIVE policy + quorum against the pinned contract; an unreachable provider or a
+        drifted policy/quorum returns 503 so an orchestrator never advertises this pod as ready while
+        custody is unverifiable. When provisioning is disabled it is inert (``provisioning: false``).
+        """
+        enabled = require_privy_provisioning(settings) is not None
+        try:
+            await check_provisioning_readiness(settings, deps.provisioning_provider)
+        except Exception as exc:  # noqa: BLE001 — any custody-readiness failure must fail closed (503)
+            raise HTTPException(
+                status_code=503,
+                detail={"error": "provisioning_not_ready", "provisioning_enabled": enabled},
+            ) from exc
+        return {"status": "ok", "provisioning_enabled": enabled}
 
     def _resolve_replay_marketstates() -> list[MarketState]:
         """Resolve the REPLAY source ticks: injected fakes (tests) or the in-code demo fixture.
@@ -332,6 +426,46 @@ def register_deploy_routes(
         # once the shared service is driving the adapter it is a SEAL_FAILED.
         phase = DeployFailureReason.RUNTIME_ERROR
         try:
+            # II-5b — provision ONE idempotent, policy-bound, keyless Privy execution wallet BEFORE the
+            # run starts (fail-closed). Gated twice: a server-injected provisioning provider AND the
+            # operator-pinned custody config (require_privy_provisioning). With either absent this is a
+            # no-op and the launch is exactly the II-5 behavior. The wallet CLAIM stays WITHHELD — this
+            # only persists the binding + immutable record (R4-A only); it never arms live execution,
+            # and any custody violation raises here → the instance is marked FAILED and NO run starts.
+            pinned = require_privy_provisioning(settings)
+            if pinned is not None:
+                # FAIL CLOSED (MAJOR-3): provisioning is ENABLED, so a missing provider is a
+                # misconfiguration — never a silent skip that seals the run with no wallet binding.
+                if deps.provisioning_provider is None:
+                    raise RuntimeError(
+                        "PRIVY provisioning is enabled but no provisioning provider is wired (fail closed)"
+                    )
+                from veridex.dust_execution.privy_provisioning import provision_execution_wallet  # noqa: PLC0415
+                from veridex.store import DeploymentAttemptTransitionError  # noqa: PLC0415
+
+                # A concurrent recovery driver for the SAME attempt (a duplicate-deploy retry) may WIN a
+                # status CAS while this original launch is mid-provisioning, surfacing as a
+                # DeploymentAttemptTransitionError. Because the external_id + provider idempotency key are
+                # DETERMINISTIC from the attempt id, a same-attempt concurrent advance is COHERENT by
+                # construction (never a second wallet / run) — so treat it as IDEMPOTENT RE-ENTRY: resume
+                # the resumable saga, which reconciles from the winner's verified state (its own admission
+                # / wallet / record checks still fail closed on a genuinely incompatible state). Do NOT
+                # mark the shared instance FAILED for a coherent CAS loss; then proceed to seal the run.
+                for _reentry in range(_PROVISION_CAS_MAX_REENTRIES):
+                    try:
+                        await provision_execution_wallet(
+                            store=store,
+                            provider=deps.provisioning_provider,
+                            instance=instance,
+                            pinned=pinned,
+                            request_auth=pinned.request_auth(),
+                            now_fn=lambda: datetime.now(tz=UTC),
+                        )
+                        break
+                    except DeploymentAttemptTransitionError:
+                        continue  # a concurrent coherent driver advanced this attempt — resume from its state
+                else:
+                    raise RuntimeError("execution-wallet provisioning did not converge under concurrent recovery")
 
             def _session_factory(ctx: RunContext) -> tuple[Any, Any, str, bool]:
                 return reconstruct_mm_session(
@@ -376,6 +510,46 @@ def register_deploy_routes(
             raise
         # Clean seal: durably mark the instance SEALED.
         await store.update_agent_instance_status(instance.instance_id, DeployStatus.SEALED, updated_at=_now_iso())
+
+    def _discard_recovery_task(finished: asyncio.Task[None]) -> None:
+        """Discard a finished provisioning-recovery task and surface any failure to the server log."""
+        from veridex.store import DeploymentAttemptTransitionError  # noqa: PLC0415
+
+        background_tasks.discard(finished)
+        if finished.cancelled():
+            return
+        exc = finished.exception()
+        if exc is None:
+            return
+        if isinstance(exc, DeploymentAttemptTransitionError):
+            # BENIGN: this recovery LOST a status CAS to the concurrent original launch (which is the
+            # coherent winner and completes provisioning itself) — informational, not a failure.
+            logger.info("mm provisioning recovery lost a CAS to the concurrent launch (benign): %s", exc)
+            return
+        logger.error("mm provisioning recovery task failed", exc_info=exc)
+
+    async def _recover_mm_provisioning(instance: AgentInstance) -> None:
+        """Re-drive ONLY the wallet-provisioning recovery for an MM instance whose saga is incomplete.
+
+        MAJOR-2: the real HTTP retry path must reach the external-id reconciliation. This is
+        PROVISIONING-ONLY — it never starts a run (a run, if owed, is governed separately by the II-4
+        lease). Reconciliation is idempotent and driven through the store's atomic CAS forward-transition,
+        which prevents an inconsistent concurrent advance. Gated exactly like ``_launch_mm``: a no-op if
+        provisioning is disabled or no provider is wired.
+        """
+        pinned = require_privy_provisioning(settings)
+        if pinned is None or deps.provisioning_provider is None:
+            return
+        from veridex.dust_execution.privy_provisioning import provision_execution_wallet  # noqa: PLC0415
+
+        await provision_execution_wallet(
+            store=store,
+            provider=deps.provisioning_provider,
+            instance=instance,
+            pinned=pinned,
+            request_auth=pinned.request_auth(),
+            now_fn=lambda: datetime.now(tz=UTC),
+        )
 
     @app.post("/agents/deploy", response_model=DeployResponse)
     async def deploy_agent(
@@ -489,6 +663,22 @@ def register_deploy_routes(
             except KeyError:
                 existing = None
             if existing is not None:
+                # An MM deploy whose provisioning saga is INCOMPLETE (PENDING or any nonterminal wallet
+                # state) must RE-DRIVE the owned provisioning recovery in the background — reconciling by
+                # the recorded external_id — rather than returning as if complete. It starts NO second run
+                # (the II-4 lease governs that); the store CAS guards against inconsistent concurrent
+                # advance if the original _launch_mm is still mid-flight. A COMPLETE instance (provisioning
+                # done/terminal, or provisioning not applicable) returns unchanged, and directional
+                # (non-MM) idempotent replay is untouched.
+                if (
+                    config.strategy == MM_STRATEGY_FAMILY
+                    and recorded.status in _INCOMPLETE_PROVISIONING_STATES
+                    and require_privy_provisioning(settings) is not None
+                    and deps.provisioning_provider is not None
+                ):
+                    recovery_task = asyncio.create_task(_recover_mm_provisioning(existing))
+                    background_tasks.add(recovery_task)
+                    recovery_task.add_done_callback(_discard_recovery_task)
                 # The side effect already completed — return the SAME instance (idempotent replay /
                 # crash-recovered), launching NO second run.
                 return DeployResponse(

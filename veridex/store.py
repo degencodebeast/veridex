@@ -34,8 +34,9 @@ from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 from veridex.competition.events import CompetitionEvent
 from veridex.competition.models import AgentEntry, Competition, CompetitionConfig, CompetitionStatus
 from veridex.config import get_settings, require_database_url
-from veridex.deploy.attempt import DeploymentAttempt, DuplicateAttemptError
+from veridex.deploy.attempt import AttemptStatus, DeploymentAttempt, DuplicateAttemptError
 from veridex.deploy.instance import AgentInstance, DeployFailureReason, DeployStatus
+from veridex.dust_execution.provisioning_record import ExecutionWalletProvisioningRecord
 from veridex.execution.models import ExecutionRecord
 from veridex.runtime.evidence import serialize_payload
 
@@ -104,6 +105,19 @@ class DuplicateLeaseError(Exception):
     ``UniqueViolation`` on ``UNIQUE(instance_id)`` to this, and :class:`InMemoryStore` raises it in code
     from the same collision — so the AgentOS wrapper route reconciles on ONE contract regardless of
     backend and NEVER launches a second run (mirrors :class:`~veridex.deploy.attempt.DuplicateAttemptError`).
+    """
+
+
+class DeploymentAttemptTransitionError(Exception):
+    """Raised when an atomic deployment-attempt CAS forward-transition cannot be applied safely (II-5b).
+
+    The single, store-agnostic signal for a REFUSED provisioning-saga transition — a compare-and-set
+    whose observed status did not equal the caller's ``expected`` (a concurrent worker already
+    advanced it), or a write-once ``external_id`` collision (a different external id than the one
+    already pinned). Both :class:`InMemoryStore` and :class:`PostgresStore` raise it from the same
+    conditions so the saga reconciles on ONE contract and NEVER advances two workers inconsistently.
+    A backwards/rewind target is a :class:`ValueError` from
+    :meth:`~veridex.deploy.attempt.DeploymentAttempt.transition` (forward-only), surfaced unchanged.
     """
 
 
@@ -665,6 +679,74 @@ class Store(Protocol):
         """
         ...
 
+    # --- II-5b execution-wallet provisioning saga (atomic CAS forward-transition + record) ---
+
+    async def get_deployment_attempt(self, attempt_id: str) -> DeploymentAttempt | None:
+        """Load a deployment-attempt claim by its primary ``attempt_id`` (the provisioning-saga key).
+
+        The provisioning saga (:mod:`veridex.dust_execution.privy_provisioning`) addresses the attempt
+        by ``attempt_id`` (derived from ``instance_id``), independent of the ``(operator, key)`` pair.
+
+        Args:
+            attempt_id: The durable attempt identifier.
+
+        Returns:
+            The recorded :class:`~veridex.deploy.attempt.DeploymentAttempt`, or ``None`` if absent.
+        """
+        ...
+
+    async def advance_deployment_attempt(
+        self,
+        attempt_id: str,
+        *,
+        expected: AttemptStatus,
+        new: AttemptStatus,
+        external_id: str | None = None,
+    ) -> DeploymentAttempt:
+        """Atomically advance an attempt's status ONLY if it currently equals ``expected`` (CAS; II-5b).
+
+        The crash-safe forward-transition the provisioning saga drives: it advances ``status`` only
+        when the observed status equals ``expected`` (else refuses), preserves the WRITE-ONCE
+        ``external_id`` (a different value is refused; the same value is idempotent), rejects rewinds
+        (forward-only), and prevents two workers from advancing the same attempt inconsistently
+        (InMemory: no ``await`` between check and write; Postgres: ``... WHERE status = expected``).
+
+        Args:
+            attempt_id: The attempt to advance.
+            expected: The status the caller believes is current (the compare half of the CAS).
+            new: The strictly-forward status to set (the swap half).
+            external_id: The deterministic recovery id to pin write-once (``None`` leaves it unchanged).
+
+        Returns:
+            The updated :class:`~veridex.deploy.attempt.DeploymentAttempt`.
+
+        Raises:
+            KeyError: If no attempt with ``attempt_id`` exists.
+            DeploymentAttemptTransitionError: On a CAS conflict (``current != expected``) or a
+                write-once ``external_id`` collision.
+            ValueError: If ``new`` is not strictly forward of the current status (a rewind).
+        """
+        ...
+
+    async def persist_provisioning_record(self, record: ExecutionWalletProvisioningRecord) -> None:
+        """Persist the immutable execution-wallet provisioning record (idempotent; write-once by hash).
+
+        Keyed by ``record.instance_id``. Re-persisting an IDENTICAL record (same
+        ``provisioning_record_hash``) is a no-op; a DIFFERENT record for the same instance is refused
+        (the record is immutable — a substituted policy/quorum/wallet must never overwrite it).
+
+        Args:
+            record: The immutable provisioning record to persist.
+
+        Raises:
+            ValueError: If a DIFFERENT record already exists for ``record.instance_id``.
+        """
+        ...
+
+    async def get_provisioning_record(self, instance_id: str) -> ExecutionWalletProvisioningRecord | None:
+        """Load the execution-wallet provisioning record for ``instance_id`` (or ``None`` if absent)."""
+        ...
+
     # --- runtime instance-lease methods (II-4 — crash-safe single-active-run exclusivity) ---
 
     async def acquire_instance_lease(self, lease: InstanceLease) -> None:
@@ -820,6 +902,8 @@ class InMemoryStore:
         # Append-only deployment-attempt ledger, keyed by (operator_id, idempotency_key) — the
         # in-code mirror of the Postgres UNIQUE(operator_id, idempotency_key) claim (I-3).
         self._deployment_attempts: dict[tuple[str, str], DeploymentAttempt] = {}
+        # II-5b immutable execution-wallet provisioning records, keyed by instance_id (write-once).
+        self._provisioning_records: dict[str, ExecutionWalletProvisioningRecord] = {}
         # Runtime single-active-run leases, keyed by instance_id — the in-code mirror of the Postgres
         # UNIQUE(instance_id) claim (II-4). Atomic check/insert (no await between) makes acquire
         # race-free under the single-threaded asyncio loop.
@@ -1319,6 +1403,75 @@ class InMemoryStore:
         recorded = self._deployment_attempts.get((operator_id, idempotency_key))
         return recorded.model_copy(deep=True) if recorded is not None else None
 
+    # --- II-5b execution-wallet provisioning saga (atomic CAS forward-transition + record) ---
+
+    def _find_attempt_key(self, attempt_id: str) -> tuple[str, str] | None:
+        """Return the ``(operator_id, idempotency_key)`` map key of the attempt with ``attempt_id``."""
+        for key, attempt in self._deployment_attempts.items():
+            if attempt.attempt_id == attempt_id:
+                return key
+        return None
+
+    async def get_deployment_attempt(self, attempt_id: str) -> DeploymentAttempt | None:
+        """Return a deep copy of the attempt with ``attempt_id`` (primary key), or ``None``."""
+        key = self._find_attempt_key(attempt_id)
+        if key is None:
+            return None
+        return self._deployment_attempts[key].model_copy(deep=True)
+
+    async def advance_deployment_attempt(
+        self,
+        attempt_id: str,
+        *,
+        expected: AttemptStatus,
+        new: AttemptStatus,
+        external_id: str | None = None,
+    ) -> DeploymentAttempt:
+        """Atomic CAS forward-transition (check + write with NO ``await`` between, so it is race-free).
+
+        Under the single-threaded asyncio loop, doing the compare and the swap without an intervening
+        ``await`` makes two concurrent advances impossible to interleave — exactly one observes
+        ``expected`` and wins; a later caller sees the advanced status and raises.
+        """
+        key = self._find_attempt_key(attempt_id)
+        if key is None:
+            raise KeyError(f"no deployment attempt with attempt_id={attempt_id!r}")
+        current = self._deployment_attempts[key]
+        if current.status != expected:
+            raise DeploymentAttemptTransitionError(
+                f"CAS conflict for attempt {attempt_id!r}: expected {expected.value!r}, "
+                f"found {current.status.value!r}"
+            )
+        # Forward-only: transition() raises ValueError on a rewind / same-state target.
+        advanced = current.transition(new)
+        # Write-once external_id: a different value is refused; the same value is idempotent.
+        if external_id is not None and current.external_id is not None and current.external_id != external_id:
+            raise DeploymentAttemptTransitionError(
+                f"external_id is write-once for attempt {attempt_id!r} "
+                f"({current.external_id!r} -> {external_id!r})"
+            )
+        pinned_external = current.external_id if current.external_id is not None else external_id
+        advanced = advanced.model_copy(update={"external_id": pinned_external})
+        self._deployment_attempts[key] = advanced.model_copy(deep=True)
+        return advanced.model_copy(deep=True)
+
+    async def persist_provisioning_record(self, record: ExecutionWalletProvisioningRecord) -> None:
+        """Persist the immutable record (idempotent by hash; a different record is refused)."""
+        existing = self._provisioning_records.get(record.instance_id)
+        if existing is not None:
+            if existing.provisioning_record_hash() != record.provisioning_record_hash():
+                raise ValueError(
+                    f"provisioning record for instance {record.instance_id!r} is immutable; "
+                    "a different record may not overwrite it"
+                )
+            return
+        self._provisioning_records[record.instance_id] = record.copy()
+
+    async def get_provisioning_record(self, instance_id: str) -> ExecutionWalletProvisioningRecord | None:
+        """Return a deep copy of the provisioning record for ``instance_id`` (or ``None``)."""
+        record = self._provisioning_records.get(instance_id)
+        return record.copy() if record is not None else None
+
     # --- runtime instance-lease methods (II-4 — crash-safe single-active-run exclusivity) ---
 
     async def acquire_instance_lease(self, lease: InstanceLease) -> None:
@@ -1662,6 +1815,21 @@ class PostgresStore:
                     instance_id TEXT,
                     external_id TEXT,
                     CONSTRAINT uq_deployment_attempts_operator_key UNIQUE (operator_id, idempotency_key)
+                )
+                """
+            )
+
+            # --- execution-wallet provisioning records (II-5b — immutable, one row per instance) ---
+            # One additive, immutable record per deployed instance: the exact pinned policy/quorum ids
+            # + the reviewed binding + hashes. ``record_hash`` is the immutability guard — a re-persist
+            # with a DIFFERENT hash is refused in code (the record may never be silently substituted).
+            # Holds ONLY non-secret ids/addresses/hashes (never a bearer token / signature / key).
+            await cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS provisioning_records (
+                    instance_id TEXT PRIMARY KEY,
+                    record_hash TEXT NOT NULL,
+                    record_json TEXT NOT NULL
                 )
                 """
             )
@@ -2567,6 +2735,146 @@ class PostgresStore:
             instance_id=row[6],
             external_id=row[7],
         )
+
+    # --- II-5b execution-wallet provisioning saga (atomic CAS forward-transition + record) ---
+
+    async def get_deployment_attempt(self, attempt_id: str) -> DeploymentAttempt | None:
+        """Fetch and reconstruct a deployment-attempt claim by its primary ``attempt_id``."""
+        conn = await self._connect()
+        try:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "SELECT attempt_id, operator_id, idempotency_key, config_fingerprint, status, "
+                    "created_at, instance_id, external_id "
+                    "FROM deployment_attempts WHERE attempt_id = %s",
+                    (attempt_id,),
+                )
+                row = await cur.fetchone()
+        finally:
+            await self._release(conn)
+        if row is None:
+            return None
+        return DeploymentAttempt(
+            attempt_id=row[0],
+            operator_id=row[1],
+            idempotency_key=row[2],
+            config_fingerprint=row[3],
+            status=row[4],
+            created_at=row[5],
+            instance_id=row[6],
+            external_id=row[7],
+        )
+
+    async def advance_deployment_attempt(
+        self,
+        attempt_id: str,
+        *,
+        expected: AttemptStatus,
+        new: AttemptStatus,
+        external_id: str | None = None,
+    ) -> DeploymentAttempt:
+        """Atomic CAS forward-transition via ``SELECT ... FOR UPDATE`` + a guarded ``UPDATE`` in one txn.
+
+        The row is locked ``FOR UPDATE`` so a concurrent worker blocks until this transition commits;
+        the ``UPDATE`` additionally carries ``WHERE status = expected`` so the compare is enforced at
+        the database even under the lock. Forward-only + write-once ``external_id`` mirror
+        :class:`InMemoryStore`.
+        """
+        conn = await self._connect()
+        try:
+            async with conn.transaction(), conn.cursor() as cur:
+                await cur.execute(
+                    "SELECT attempt_id, operator_id, idempotency_key, config_fingerprint, status, "
+                    "created_at, instance_id, external_id "
+                    "FROM deployment_attempts WHERE attempt_id = %s FOR UPDATE",
+                    (attempt_id,),
+                )
+                row = await cur.fetchone()
+                if row is None:
+                    raise KeyError(f"no deployment attempt with attempt_id={attempt_id!r}")
+                current = DeploymentAttempt(
+                    attempt_id=row[0],
+                    operator_id=row[1],
+                    idempotency_key=row[2],
+                    config_fingerprint=row[3],
+                    status=row[4],
+                    created_at=row[5],
+                    instance_id=row[6],
+                    external_id=row[7],
+                )
+                if current.status != expected:
+                    raise DeploymentAttemptTransitionError(
+                        f"CAS conflict for attempt {attempt_id!r}: expected {expected.value!r}, "
+                        f"found {current.status.value!r}"
+                    )
+                # Forward-only: transition() raises ValueError on a rewind / same-state target.
+                advanced = current.transition(new)
+                if (
+                    external_id is not None
+                    and current.external_id is not None
+                    and current.external_id != external_id
+                ):
+                    raise DeploymentAttemptTransitionError(
+                        f"external_id is write-once for attempt {attempt_id!r} "
+                        f"({current.external_id!r} -> {external_id!r})"
+                    )
+                pinned_external = current.external_id if current.external_id is not None else external_id
+                advanced = advanced.model_copy(update={"external_id": pinned_external})
+                await cur.execute(
+                    "UPDATE deployment_attempts SET status = %s, external_id = %s "
+                    "WHERE attempt_id = %s AND status = %s",
+                    (advanced.status.value, advanced.external_id, attempt_id, expected.value),
+                )
+                if cur.rowcount != 1:
+                    # The guarded UPDATE matched no row → a racing worker advanced past ``expected``.
+                    raise DeploymentAttemptTransitionError(
+                        f"CAS conflict for attempt {attempt_id!r}: status changed under the transition"
+                    )
+        finally:
+            await self._release(conn)
+        return advanced
+
+    async def persist_provisioning_record(self, record: ExecutionWalletProvisioningRecord) -> None:
+        """INSERT the immutable record; a DIFFERENT record for the same instance is refused."""
+        record_hash = record.provisioning_record_hash()
+        conn = await self._connect()
+        try:
+            async with conn.transaction(), conn.cursor() as cur:
+                await cur.execute(
+                    "SELECT record_hash FROM provisioning_records WHERE instance_id = %s FOR UPDATE",
+                    (record.instance_id,),
+                )
+                row = await cur.fetchone()
+                if row is not None:
+                    if row[0] != record_hash:
+                        raise ValueError(
+                            f"provisioning record for instance {record.instance_id!r} is immutable; "
+                            "a different record may not overwrite it"
+                        )
+                    return
+                await cur.execute(
+                    "INSERT INTO provisioning_records (instance_id, record_hash, record_json) "
+                    "VALUES (%s, %s, %s)",
+                    (record.instance_id, record_hash, serialize_payload(record.to_json_dict())),
+                )
+        finally:
+            await self._release(conn)
+
+    async def get_provisioning_record(self, instance_id: str) -> ExecutionWalletProvisioningRecord | None:
+        """Fetch and reconstruct the immutable provisioning record for ``instance_id`` (or ``None``)."""
+        conn = await self._connect()
+        try:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "SELECT record_json FROM provisioning_records WHERE instance_id = %s",
+                    (instance_id,),
+                )
+                row = await cur.fetchone()
+        finally:
+            await self._release(conn)
+        if row is None:
+            return None
+        return ExecutionWalletProvisioningRecord.from_json_dict(json.loads(row[0]))
 
     # --- runtime instance-lease methods (II-4 — crash-safe single-active-run exclusivity) ---
 

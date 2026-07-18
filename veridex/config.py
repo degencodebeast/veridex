@@ -15,7 +15,10 @@ Usage in the async shell layer::
 from __future__ import annotations
 
 import functools
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
+
+if TYPE_CHECKING:
+    from veridex.dust_execution.privy_provisioning import PinnedProvisioningConfig
 
 from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -106,6 +109,42 @@ class Settings(BaseSettings):
     privy_verification_key: str | None = Field(default=None, validation_alias="PRIVY_VERIFICATION_KEY")
 
     # ------------------------------------------------------------------
+    # Privy execution-wallet provisioning (II-5b; CODE_READY / CLAIM_WITHHELD)
+    # ------------------------------------------------------------------
+    # Master gate. OFF by default: with provisioning disabled the deploy saga behaves exactly as
+    # II-5 (no wallet is provisioned). The wallet CLAIM stays withheld until the operator supplies
+    # the pinned policy/quorum config below AND runs Level-3 acceptance (with the II-5c adapter).
+    privy_provisioning_enabled: bool = Field(default=False, validation_alias="PRIVY_PROVISIONING_ENABLED")
+    # The EXACT operator-reviewed Privy policy + key-quorum resource ids the binding is admitted
+    # against (non-secret ids). Values are operator-supplied — never invented in code.
+    privy_execution_policy_id: str | None = Field(default=None, validation_alias="PRIVY_EXECUTION_POLICY_ID")
+    privy_execution_quorum_id: str | None = Field(default=None, validation_alias="PRIVY_EXECUTION_QUORUM_ID")
+    # The pinned content hashes (PrivyWalletPolicy.content_hash / AuthorizationQuorum.content_hash) +
+    # threshold the live resources must match exactly (drift → fail closed).
+    privy_execution_policy_content_hash: str | None = Field(
+        default=None, validation_alias="PRIVY_EXECUTION_POLICY_CONTENT_HASH"
+    )
+    # OPTIONAL full-fidelity policy hash (covers per-field policy conditions the coarse content hash
+    # cannot see). Once the operator authors a real policy with field-level conditions they SHOULD pin
+    # this for full-fidelity drift detection; absent, admission relies on the coarse hash + reject-unmodeled.
+    privy_execution_policy_full_content_hash: str | None = Field(
+        default=None, validation_alias="PRIVY_EXECUTION_POLICY_FULL_CONTENT_HASH"
+    )
+    privy_execution_quorum_content_hash: str | None = Field(
+        default=None, validation_alias="PRIVY_EXECUTION_QUORUM_CONTENT_HASH"
+    )
+    privy_execution_quorum_threshold: int | None = Field(
+        default=None, validation_alias="PRIVY_EXECUTION_QUORUM_THRESHOLD"
+    )
+    # The wallet owner id (the pinned quorum); defaults to the quorum id when omitted.
+    privy_execution_owner_id: str | None = Field(default=None, validation_alias="PRIVY_EXECUTION_OWNER_ID")
+    # A NON-SECRET reference to the request-authorization key. The P-256 key material itself lives
+    # ONLY in the secret manager and is consumed by the II-5c HTTP adapter — never here.
+    privy_execution_authorization_key_id: str | None = Field(
+        default=None, validation_alias="PRIVY_EXECUTION_AUTHORIZATION_KEY_ID"
+    )
+
+    # ------------------------------------------------------------------
     # Tuning
     # ------------------------------------------------------------------
     decision_timeout_s: float = 30.0
@@ -136,6 +175,35 @@ class Settings(BaseSettings):
                 raise ValueError("AUTH_MODE=dev is refused when APP_ENV is production (fail-closed auth boundary)")
             if self.privy_app_id is None or self.privy_verification_key is None:
                 raise ValueError("A production APP_ENV requires PRIVY_APP_ID and PRIVY_VERIFICATION_KEY")
+        return self
+
+    @model_validator(mode="after")
+    def _enforce_provisioning_pins(self) -> Settings:
+        """Fail-closed STARTUP guard: enabling II-5b provisioning requires the FULL pinned custody config.
+
+        Without this, ``PRIVY_PROVISIONING_ENABLED=true`` could be accepted with pins absent and the
+        custody contract would only be checked later at launch — an "enabled but unpinned" fail-open
+        window. Validating at construction makes a misconfigured process refuse to start. Mirrors the
+        fail-closed intent of :meth:`require_privy_provisioning` (kept as defense-in-depth at resolution).
+        """
+        if not self.privy_provisioning_enabled:
+            return self
+        required = {
+            "PRIVY_EXECUTION_POLICY_ID": self.privy_execution_policy_id,
+            "PRIVY_EXECUTION_QUORUM_ID": self.privy_execution_quorum_id,
+            "PRIVY_EXECUTION_POLICY_CONTENT_HASH": self.privy_execution_policy_content_hash,
+            "PRIVY_EXECUTION_POLICY_FULL_CONTENT_HASH": self.privy_execution_policy_full_content_hash,
+            "PRIVY_EXECUTION_QUORUM_CONTENT_HASH": self.privy_execution_quorum_content_hash,
+            "PRIVY_EXECUTION_QUORUM_THRESHOLD": self.privy_execution_quorum_threshold,
+            "PRIVY_EXECUTION_AUTHORIZATION_KEY_ID": self.privy_execution_authorization_key_id,
+        }
+        missing = [name for name, value in required.items() if value is None]
+        if missing:
+            raise ValueError(
+                f"PRIVY_PROVISIONING_ENABLED requires the pinned custody config; missing: {', '.join(missing)}"
+            )
+        if self.privy_execution_owner_id is not None and self.privy_execution_owner_id != self.privy_execution_quorum_id:
+            raise ValueError("PRIVY_EXECUTION_OWNER_ID must equal PRIVY_EXECUTION_QUORUM_ID (the wallet owner is the verified quorum)")
         return self
 
     # ------------------------------------------------------------------
@@ -206,6 +274,81 @@ def require_txline_subscribe(settings: Settings) -> tuple[str, str]:
     if settings.solana_keypair_path is None or settings.txline_subscribe_program_id is None:
         raise ValueError("subscribe creds missing: set SOLANA_KEYPAIR_PATH and TXLINE_SUBSCRIBE_PROGRAM_ID")
     return settings.solana_keypair_path, settings.txline_subscribe_program_id
+
+
+def require_privy_provisioning(settings: Settings) -> PinnedProvisioningConfig | None:
+    """Resolve the pinned II-5b provisioning config, or ``None`` when provisioning is DISABLED.
+
+    Fail-closed: when ``privy_provisioning_enabled`` is true, EVERY pinned value must be present —
+    a missing policy id / quorum id / content hash / threshold / authorization-key ref raises rather
+    than provisioning against an incomplete custody contract. When the gate is off, returns ``None``
+    (the deploy saga then provisions no wallet — exactly the II-5 behavior).
+
+    Args:
+        settings: Application settings instance.
+
+    Returns:
+        A ``PinnedProvisioningConfig`` when enabled + fully configured, else ``None``.
+
+    Raises:
+        ValueError: If provisioning is enabled but any pinned value is absent.
+    """
+    if not settings.privy_provisioning_enabled:
+        return None
+    # Lazy import keeps ``config`` free of a hard dependency on the dust-execution package at import
+    # time (the shell may load settings without the provisioning core present).
+    from veridex.dust_execution.privy_provisioning import PinnedProvisioningConfig  # noqa: PLC0415
+
+    policy_id = settings.privy_execution_policy_id
+    quorum_id = settings.privy_execution_quorum_id
+    policy_hash = settings.privy_execution_policy_content_hash
+    quorum_hash = settings.privy_execution_quorum_content_hash
+    threshold = settings.privy_execution_quorum_threshold
+    auth_key_id = settings.privy_execution_authorization_key_id
+    # The full-fidelity policy hash is REQUIRED when provisioning is enabled — it is the only gate that
+    # catches a field-level policy substitution the coarse content hash cannot see, so leaving it opt-in
+    # would keep that hole open. Treat it like every other pinned value: fail closed if absent.
+    full_hash = settings.privy_execution_policy_full_content_hash
+    missing = [
+        name
+        for name, value in (
+            ("PRIVY_EXECUTION_POLICY_ID", policy_id),
+            ("PRIVY_EXECUTION_QUORUM_ID", quorum_id),
+            ("PRIVY_EXECUTION_POLICY_CONTENT_HASH", policy_hash),
+            ("PRIVY_EXECUTION_POLICY_FULL_CONTENT_HASH", full_hash),
+            ("PRIVY_EXECUTION_QUORUM_CONTENT_HASH", quorum_hash),
+            ("PRIVY_EXECUTION_QUORUM_THRESHOLD", threshold),
+            ("PRIVY_EXECUTION_AUTHORIZATION_KEY_ID", auth_key_id),
+        )
+        if value is None
+    ]
+    if missing:
+        raise ValueError(
+            "PRIVY_PROVISIONING_ENABLED is set but the pinned custody config is incomplete; "
+            f"missing: {', '.join(missing)}"
+        )
+    assert policy_id is not None and quorum_id is not None and policy_hash is not None
+    assert quorum_hash is not None and threshold is not None and auth_key_id is not None
+    # MAJOR-1 (custody invariant): the wallet OWNER must be THE pinned key quorum whose threshold /
+    # keys / content-hash we verify — our Model-1 (agent-controlled, developer-owned) wallet has no
+    # legitimate reason to be owned by any other quorum. Fail CLOSED if an operator pins a divergent
+    # owner id, so the wallet is never admitted as owned by a quorum we never verified.
+    owner_id = settings.privy_execution_owner_id
+    if owner_id is not None and owner_id != quorum_id:
+        raise ValueError(
+            "PRIVY_EXECUTION_OWNER_ID must equal PRIVY_EXECUTION_QUORUM_ID (the wallet must be owned "
+            f"by the pinned, verified quorum); got owner={owner_id!r} quorum={quorum_id!r}"
+        )
+    return PinnedProvisioningConfig(
+        policy_id=policy_id,
+        quorum_id=quorum_id,
+        owner_id=owner_id or quorum_id,
+        policy_content_hash=policy_hash,
+        quorum_content_hash=quorum_hash,
+        quorum_threshold=threshold,
+        authorization_key_id=auth_key_id,
+        policy_full_content_hash=full_hash,
+    )
 
 
 def require_database_url(settings: Settings) -> str:
