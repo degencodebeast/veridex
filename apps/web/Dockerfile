@@ -20,7 +20,12 @@ RUN corepack enable && corepack prepare pnpm@9.15.4 --activate
 # ── deps: install with the lockfile only, for layer-cache stability ──────
 FROM base AS deps
 COPY package.json pnpm-lock.yaml .npmrc ./
-RUN pnpm install --frozen-lockfile
+# Native addons (keccak, bufferutil, utf-8-validate) ship no Node-22 prebuilds, so pnpm
+# compiles them via node-gyp — which needs Python3 + a C toolchain absent from node:22-alpine.
+# Install the toolchain as a virtual package and drop it in the SAME layer so the image stays lean.
+RUN apk add --no-cache --virtual .build-deps python3 make g++ \
+ && pnpm install --frozen-lockfile \
+ && apk del .build-deps
 
 # ── build: compile the Next.js app ───────────────────────────────────────
 FROM base AS build
@@ -35,7 +40,11 @@ FROM base AS runner
 ENV NODE_ENV=production
 ENV NEXT_TELEMETRY_DISABLED=1
 COPY package.json pnpm-lock.yaml .npmrc ./
-RUN pnpm install --frozen-lockfile --prod
+# Same native-addon compile need as the deps stage (keccak et al. are production deps) — the prod
+# install also runs node-gyp; add+drop the toolchain in one layer so the runtime image stays lean.
+RUN apk add --no-cache --virtual .build-deps python3 make g++ \
+ && pnpm install --frozen-lockfile --prod \
+ && apk del .build-deps
 # --chown: Next writes .next/cache at runtime (ISR / image optimization);
 # a root-owned .next would EACCES under USER node.
 COPY --from=build --chown=node:node /app/.next ./.next
