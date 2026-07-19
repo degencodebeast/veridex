@@ -65,6 +65,10 @@ export const PATHS = {
   runtimeEvents: (agentId: string) => `/agents/${agentId}/runtime-events`,
   // MAKER lane: the sealed maker_arena_result.v1 envelope (quote-quality, toxicity-ranked).
   makerArenaResult: () => `/maker/arena-result`,
+  // I-2 owner-scoped deployed instances. Bearer-authed GETs; the backend 401s anon
+  // (require_principal), returns ONLY the caller's own rows, and 403/404s a non-owner.
+  agentInstances: () => `/agents/instances`,
+  agentInstance: (instanceId: string) => `/agents/instances/${instanceId}`,
 } as const;
 
 export class ApiError extends Error {
@@ -82,24 +86,44 @@ export class ApiError extends Error {
 // bearer and never silently eats a 401. On a 401 it re-acquires the token (re-auth) and retries
 // EXACTLY ONCE — never an infinite loop; the final response is returned as-is for the caller to
 // inspect, so a persistent 401 always surfaces (via the existing !res.ok → ApiError check).
-async function authedFetch(path: string, body: unknown): Promise<Response> {
+// Shared owner-scoped transport core: acquire the seam's bearer, fire the request, and on a 401
+// re-acquire the token (re-auth) and retry EXACTLY ONCE. Both the POST (deploy) and the GET
+// (owner-scoped reads) helpers below share this identical bearer + 401-retry contract, so the
+// honesty posture (never fabricate a bearer; never silently eat a 401) lives in one place.
+async function authedRequest(path: string, buildInit: (bearer: string | null) => RequestInit): Promise<Response> {
   const token = await getAuthToken();
-  const doFetch = (bearer: string | null) =>
-    fetch(resolveApiUrl(path), {
-      method: 'POST',
-      headers: {
-        'content-type': 'application/json',
-        accept: 'application/json',
-        ...(bearer ? { authorization: `Bearer ${bearer}` } : {}),
-      },
-      body: JSON.stringify(body),
-    });
+  const doFetch = (bearer: string | null) => fetch(resolveApiUrl(path), buildInit(bearer));
   let res = await doFetch(token);
   if (res.status === 401) {
     const retryToken = await getAuthToken(); // re-auth: re-acquire token / re-login
     if (retryToken) res = await doFetch(retryToken);
   }
   return res;
+}
+
+async function authedFetch(path: string, body: unknown): Promise<Response> {
+  return authedRequest(path, (bearer) => ({
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      accept: 'application/json',
+      ...(bearer ? { authorization: `Bearer ${bearer}` } : {}),
+    },
+    body: JSON.stringify(body),
+  }));
+}
+
+// Owner-scoped authed GET (auth-contract@1): same bearer + 401-retry as authedFetch, no body.
+// A no-token call fires WITHOUT an Authorization header — it never fabricates a bearer; the
+// backend then 401s (require_principal) before returning any owner-private data (fail-closed).
+async function authedGet(path: string): Promise<Response> {
+  return authedRequest(path, (bearer) => ({
+    method: 'GET',
+    headers: {
+      accept: 'application/json',
+      ...(bearer ? { authorization: `Bearer ${bearer}` } : {}),
+    },
+  }));
 }
 
 async function getJson<T>(path: string): Promise<T> {
@@ -566,6 +590,133 @@ export async function deployAgent(payload: DeployAgentPayload): Promise<DeployAg
   }
   if (!res.ok) throw new ApiError(res.status, `POST /agents/deploy failed: ${res.status}`);
   return (await res.json()) as DeployAgentResult;
+}
+
+// ---- Owner-scoped deployed instances (I-2 · F-3) ----
+//
+// The DURABLE deployed-instance record — the OWNER-scoped deployment identity, distinct from the
+// PUBLIC /agents strategy profile. Mirrors the frozen backend `AgentInstance`
+// (veridex/deploy/instance.py): `run_id` is the AUTHORITATIVE Veridex evidence identity;
+// `runtime_handle.session_id` is a REPLACEABLE AgentOS handle (re-minted on restart under the same
+// run_id) — never the result/ownership authority. `operator_id` is the SERVER-DERIVED owner.
+
+/** The runtime infra pointer — replaceable; NEVER the ownership/result authority (run_id is). */
+export interface InstanceRuntimeHandle {
+  runtime_kind: string;
+  runtime_agent_id: string;
+  session_id: string | null;
+  run_id: string;
+}
+
+/** Wire shape of a deployed instance as served by GET /agents/instances[/{id}] (frozen contract). */
+export interface AgentInstanceWire {
+  instance_id: string;
+  template_id: string;
+  agent_id: string;
+  config_hash: string;
+  policy_hash: string;
+  source_mode: string;
+  execution_mode: string;
+  market_allowlist: string[];
+  venue_allowlist: string[];
+  run_id: string;
+  status: string; // DeployStatus value: pending | running | sealed | failed
+  last_failure_reason: string | null;
+  operator_id: string | null;
+  runtime_handle: InstanceRuntimeHandle | null;
+  created_at: string;
+  updated_at: string; // durable last-write timestamp (present on the contract; not surfaced today)
+}
+
+/** View-model of a deployed instance (owner-scoped identity the instance page + dashboard render). */
+export interface DeployedInstance {
+  instance_id: string;
+  template_id: string;
+  agent_id: string;
+  run_id: string;
+  status: string; // preserved VERBATIM — never coerced to a rosier lifecycle state (honesty)
+  source_mode: SourceMode;
+  execution_mode: string;
+  config_hash: string;
+  policy_hash: string;
+  operator_id: string | null;
+  runtime_handle: InstanceRuntimeHandle | null;
+  last_failure_reason: string | null;
+  market_allowlist: string[];
+  venue_allowlist: string[];
+  created_at: string;
+}
+
+export function adaptAgentInstance(w: AgentInstanceWire): DeployedInstance {
+  const rh = w.runtime_handle;
+  return {
+    instance_id: w.instance_id,
+    template_id: w.template_id,
+    agent_id: w.agent_id,
+    run_id: w.run_id, // authoritative evidence identity — carried through 1:1
+    status: w.status, // verbatim (SEC honesty: a failed/pending instance never reads as sealed)
+    source_mode: toSourceMode(w.source_mode),
+    execution_mode: w.execution_mode,
+    config_hash: w.config_hash,
+    policy_hash: w.policy_hash,
+    operator_id: w.operator_id ?? null,
+    runtime_handle: rh
+      ? {
+          runtime_kind: String(rh.runtime_kind ?? ''),
+          runtime_agent_id: String(rh.runtime_agent_id ?? ''),
+          session_id: rh.session_id ?? null, // replaceable handle, null-honest
+          run_id: String(rh.run_id ?? ''),
+        }
+      : null,
+    last_failure_reason: w.last_failure_reason ?? null,
+    market_allowlist: w.market_allowlist ?? [],
+    venue_allowlist: w.venue_allowlist ?? [],
+    created_at: w.created_at,
+  };
+}
+
+// DEMO instances for MOCK MODE only (source REPLAY — never rendered under a LIVE badge; the app-wide
+// "DEMO DATA · MOCK MODE" indicator makes this honest). Live (mock off) NEVER falls back to these.
+const MOCK_INSTANCES: DeployedInstance[] = [
+  {
+    instance_id: 'inst_demo_value_clv', template_id: 'value_clv', agent_id: 'studio-value_clv',
+    run_id: 'run_demo_esp_ned', status: 'sealed', source_mode: 'replay', execution_mode: 'paper',
+    config_hash: 'c'.repeat(64), policy_hash: 'p'.repeat(64), operator_id: 'did:privy:demo-operator',
+    runtime_handle: { runtime_kind: 'agentos', runtime_agent_id: 'aos_demo_1', session_id: 'sess_demo_1', run_id: 'run_demo_esp_ned' },
+    last_failure_reason: null, market_allowlist: ['moneyline'], venue_allowlist: ['polymarket'],
+    created_at: '2026-07-15T12:00:00Z',
+  },
+  {
+    instance_id: 'inst_demo_momentum', template_id: 'momentum', agent_id: 'studio-momentum',
+    run_id: 'run_demo_fra_bra', status: 'running', source_mode: 'replay', execution_mode: 'paper',
+    config_hash: 'd'.repeat(64), policy_hash: 'q'.repeat(64), operator_id: 'did:privy:demo-operator',
+    runtime_handle: { runtime_kind: 'agentos', runtime_agent_id: 'aos_demo_2', session_id: 'sess_demo_2', run_id: 'run_demo_fra_bra' },
+    last_failure_reason: null, market_allowlist: ['moneyline'], venue_allowlist: ['polymarket'],
+    created_at: '2026-07-16T09:30:00Z',
+  },
+];
+
+// GET /agents/instances — the caller's OWN deployed instances (owner-scoped, bearer-authed). Mock
+// ⇒ the DEMO set (replay). Live ⇒ authedGet; a non-ok (401/403/5xx) throws so the caller can render
+// an honest empty/error state — it NEVER silently falls back to a fixture (T-2 fixture prohibition).
+export async function getInstances(): Promise<DeployedInstance[]> {
+  if (isMockEnabled()) return MOCK_INSTANCES.map((i) => ({ ...i, source_mode: demote(i.source_mode) }));
+  const res = await authedGet(PATHS.agentInstances());
+  if (!res.ok) throw new ApiError(res.status, `GET ${PATHS.agentInstances()} failed: ${res.status}`);
+  return ((await res.json()) as AgentInstanceWire[]).map(adaptAgentInstance);
+}
+
+// GET /agents/instances/{id} — ONE instance the caller owns. A 403 (owned by another) / 404 (absent
+// or unowned legacy row) throws ApiError so the page renders an honest unauthorized/not-found state,
+// never a fabricated instance.
+export async function getInstance(instanceId: string): Promise<DeployedInstance> {
+  if (isMockEnabled()) {
+    const found = MOCK_INSTANCES.find((i) => i.instance_id === instanceId) ?? MOCK_INSTANCES[0];
+    return { ...found, source_mode: demote(found.source_mode) };
+  }
+  const res = await authedGet(PATHS.agentInstance(instanceId));
+  if (!res.ok) throw new ApiError(res.status, `GET ${PATHS.agentInstance(instanceId)} failed: ${res.status}`);
+  return adaptAgentInstance((await res.json()) as AgentInstanceWire);
 }
 
 // MOCK status-bar seed (sync): when mock is on, the status bar populates app-wide from the mock

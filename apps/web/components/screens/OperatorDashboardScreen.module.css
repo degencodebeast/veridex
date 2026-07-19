@@ -20,6 +20,16 @@
 .runtimeBtn:hover { border-color: var(--accent); }
 .amount { font-size: 11px; color: var(--text-2); }
 .failed { font-size: 10px; text-transform: uppercase; letter-spacing: 0.04em; color: var(--negative); border: 1px solid var(--negative); border-radius: var(--radius-badge); padding: 1px 6px; }
+/* Your Agents states — honest loading / empty / error, never a fixture fallback. */
+.hint { margin: 0; padding: 4px 0; color: var(--text-3); font-size: 11px; }
+.inlineLink { color: var(--accent-hi); text-decoration: none; }
+.inlineLink:hover { text-decoration: underline; }
+/* Instance lifecycle pill — colored from the REAL status (failed is never rosy). */
+.status { font-size: 9px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.04em; padding: 1px 6px; border-radius: var(--radius-badge); border: 1px solid var(--border-strong); color: var(--text-2); background: var(--panel-2); }
+.status[data-status='running'] { color: var(--accent-hi); border-color: var(--accent); background: var(--accent-bg-soft); }
+.status[data-status='sealed'] { color: var(--positive); border-color: var(--positive); background: var(--positive-bg); }
+.status[data-status='pending'] { color: var(--warning-hi); border-color: var(--warning); background: var(--warning-bg); }
+.status[data-status='failed'] { color: var(--negative); border-color: var(--negative); background: var(--negative-bg); }
 .alert { padding: 6px 4px; border-bottom: 1px solid var(--border-soft); font-size: 11px; color: var(--text-2); }
 .kill { color: var(--negative); }
 .deny { color: var(--warning-hi); }
