@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+from types import SimpleNamespace
 from typing import Any
 
 import httpx
@@ -30,9 +31,13 @@ from cryptography.hazmat.primitives.asymmetric import ec
 from httpx import ASGITransport
 
 from veridex.api.router import create_app
+from veridex.competition.models import AgentEntry
+from veridex.competition.service import declared_config_hash
 from veridex.config import Settings
+from veridex.runtime.agent import DEFAULT_MODEL_ID
 from veridex.runtime.schemas import AgentAction, SportsActionType
 from veridex.store import InMemoryStore
+from veridex.strategies.llm_drift import default_model_launcher
 
 _APP_ID = "test-privy-app-id"
 _DID_ALICE = "did:privy:ALICE"
@@ -539,10 +544,12 @@ def _entry_model(agent_id: str, strategy: str, model: str | None) -> dict[str, A
 
 
 async def test_registration_after_arena_claim_cannot_mutate_frozen_roster() -> None:
-    """M1 RED — once the arena atomically claims the competition, a subsequent owner registration is
-    refused (409): the canonical roster stays EXACTLY the two contestants the report ran; never the
-    Codex-reproduced ``[det-drift, llm-drift, extra-x]`` canonical vs ``[det-drift, llm-drift]`` report
-    divergence. A 3-slot roster makes capacity a non-factor — only the status freeze blocks the append."""
+    """M1 regression guard (POST-claim status freeze, NOT the pre-claim window) — once the arena has
+    claimed the competition, a subsequent owner registration is refused (409): the canonical roster stays
+    EXACTLY the two contestants the report ran. This exercises the status-freeze admission guard closed in
+    an earlier fix; it PASSES on the pre-fix base and is honestly NOT a pre-claim-window race RED (the
+    genuine forced-interleave TOCTOU RED lives in the ``_PreClaimRegisterStore`` test below). A 3-slot
+    roster makes capacity a non-factor — only the status freeze blocks the append."""
     store = InMemoryStore()
     app = create_app(store=store, settings=_privy_settings(), arena_model_launcher=_OfflineArenaLauncher())
     try:
@@ -575,11 +582,49 @@ async def test_registration_after_arena_claim_cannot_mutate_frozen_roster() -> N
         await _drain(app)
 
 
+class _PreClaimRegisterStore(InMemoryStore):
+    """DETERMINISTICALLY forces the M1 pre-claim-window TOCTOU: a concurrent owner registration commits an
+    EXTRA roster entry in the window BETWEEN the arena's pre-claim contract check and the atomic
+    DRAFT->RUNNING claim. ``register_agent`` may LEGALLY append while status is still DRAFT, so overriding
+    ``claim_competition_run`` to append-then-delegate reproduces the exact interleave the flaky
+    ``asyncio.gather`` variant could not force: the pre-claim check already validated ``[det, llm]``; the
+    extra entry lands just before the claim freezes the roster at RUNNING."""
+
+    def __init__(self, extra: AgentEntry) -> None:
+        super().__init__()
+        self._extra = extra
+        self.injected = False
+
+    async def claim_competition_run(
+        self, competition_id: str, *, expected: Any, new: Any, run_id: str
+    ) -> None:
+        if not self.injected:
+            # The racing registration commits in the pre-claim window (status still DRAFT).
+            self._competitions[competition_id].entries.append(self._extra.model_copy(deep=True))
+            self.injected = True
+        await super().claim_competition_run(competition_id, expected=expected, new=new, run_id=run_id)
+
+
 async def test_registration_arena_start_race_never_diverges_roster() -> None:
-    """M1 RED (adversarial concurrent interleave) — a registration and an arena start fired CONCURRENTLY
-    must never leave a finalized comparison whose canonical roster differs from the report's contestants,
-    regardless of which wins (atomic status-guarded admission + atomic claim)."""
-    store = InMemoryStore()
+    """M1 RED (GENUINE pre-claim-window TOCTOU) — a registration that commits in the window BETWEEN the
+    arena's pre-claim contract check and the atomic claim must NEVER produce a finalized comparison whose
+    canonical roster diverges from the report's contestants. Deterministically forced via
+    ``_PreClaimRegisterStore`` (appends ``extra-x`` inside the claim — the exact interleave). The arena
+    must FAIL CLOSED: re-verify the POST-claim roster, recover the claim (RUNNING->DRAFT, run_id cleared),
+    and refuse — never a run over ``[det, llm, extra-x]`` while the report attests ``[det, llm]``. This
+    FAILS on 087c768 (no post-claim re-verify: the claim succeeds and the arena finalizes 200 with the
+    canonical roster diverged from the report) and passes after the post-claim re-verify (RESIDUAL-2)."""
+    extra = AgentEntry(
+        agent_id="extra-x",
+        owner="team",
+        strategy="cumulative-drift",
+        model=None,
+        proof_mode="reproducible",
+        config_hash=declared_config_hash(
+            agent_id="extra-x", strategy="cumulative-drift", model=None, proof_mode="reproducible"
+        ),
+    )
+    store = _PreClaimRegisterStore(extra)
     app = create_app(store=store, settings=_privy_settings(), arena_model_launcher=_OfflineArenaLauncher())
     try:
         async with _transport(app) as client:
@@ -593,24 +638,23 @@ async def test_registration_arena_start_race_never_diverges_roster() -> None:
                 )
                 assert reg.status_code == 200, reg.text
 
-            _reg_resp, arena_resp = await asyncio.gather(
-                client.post(
-                    f"/competitions/{comp_id}/agents",
-                    json=_entry("extra-x", "cumulative-drift"),
-                    headers=_bearer(_DID_ALICE),
-                ),
-                client.post(f"/competitions/{comp_id}/arena", headers=_bearer(_DID_ALICE)),
-            )
+            resp = await client.post(f"/competitions/{comp_id}/arena", headers=_bearer(_DID_ALICE))
+            # Fail closed on the post-claim roster divergence — a controlled refusal, never a finalized run.
+            assert resp.status_code == 409, resp.text
+            assert "arena_comparison" not in resp.json()
 
+            # RECOVERED: rolled back to draft, run_id cleared, ZERO canonical events — never a run whose
+            # report attests a roster different from the one frozen at RUNNING.
+            state = await client.get(f"/competitions/{comp_id}")
+            assert state.json()["status"] == "draft", "must not strand RUNNING over a mutated roster"
+            assert state.json()["run_id"] is None
+            events = await client.get(f"/competitions/{comp_id}/events?since_seq=-1")
+            assert events.json() == [], "no finalized comparison over the divergent [det, llm, extra-x] roster"
+
+        # The racing registration DID commit (the TOCTOU is real); the arena simply refused to run over it.
+        assert store.injected is True
         canonical_ids = [e.agent_id for e in (await store.get_competition(comp_id)).entries]
-        if arena_resp.status_code == 200:
-            # The arena finalized a run → the racing registration must have been refused: roster == report.
-            report_ids = list(arena_resp.json()["arena_comparison"]["contestants"].keys())
-            assert set(canonical_ids) == set(report_ids)
-            assert "extra-x" not in canonical_ids
-        else:
-            # The arena lost/aborted; it must NOT have silently finalized a substituted run.
-            assert arena_resp.status_code in (409, 503), arena_resp.text
+        assert "extra-x" in canonical_ids
     finally:
         await _drain(app)
 
@@ -735,5 +779,86 @@ async def test_post_claim_drain_failure_recovers_and_is_retryable() -> None:
             # RETRYABLE: a second attempt re-enters the run path (fails the same way) — NOT a permanent 409.
             resp2 = await client.post(f"/competitions/{comp_id}/arena", headers=_bearer(_DID_ALICE))
             assert resp2.status_code == 503, resp2.text
+    finally:
+        await _drain(app)
+
+
+# ===========================================================================
+# ROUND 6 — RESIDUAL M2: the DEFAULT production launcher must attest the REAL model slug it runs.
+# ===========================================================================
+
+
+class _FakeWaitAgent:
+    """Offline stand-in for an Agno agent: every ``arun`` returns a WAIT ``AgentAction`` (no network).
+
+    Lets the REAL ``_TaskLauncher`` built by :func:`default_model_launcher` drive the arena end-to-end
+    OFFLINE (the launcher's documented ``model`` / ``agent_factory`` seams) while still carrying the true
+    ``model_id`` binding, so the arena folds + attests the ACTUAL model identity it ran."""
+
+    def __init__(self, **_: Any) -> None:
+        pass
+
+    async def arun(self, prompt: str) -> Any:
+        return SimpleNamespace(content=AgentAction(type=SportsActionType.WAIT))
+
+
+def _offline_default_launcher() -> Any:
+    """The REAL production launcher (:func:`default_model_launcher`, so it carries the true ``model_id``
+    = ``DEFAULT_MODEL_ID``), with the model/agent seams stubbed offline — no Agno, no network."""
+    return default_model_launcher(model=object(), agent_factory=lambda **_: _FakeWaitAgent())
+
+
+async def test_default_wiring_arena_attests_actual_model_slug() -> None:
+    """R1 RED — the DEFAULT production launcher runs a REAL model (``DEFAULT_MODEL_ID``); the arena must
+    fold + attest that ACTUAL slug, never null. A roster declaring the TRUE slug is ADMITTED, and both the
+    started event AND the report's ``contestant_config`` attest it. FAILS on 087c768 (the launcher exposes
+    no ``model_id`` -> the arena folds ``model=None`` -> the true-slug roster is 409'd and null attested)."""
+    launcher = _offline_default_launcher()
+    assert launcher.model_id == DEFAULT_MODEL_ID  # the launcher surfaces the REAL identity it runs
+    store = InMemoryStore()
+    app = create_app(store=store, settings=_privy_settings(), arena_model_launcher=launcher)
+    try:
+        async with _transport(app) as client:
+            comp_id = await _create(client, _DID_ALICE)
+            for body in (
+                _entry_model("det-drift", "cumulative-drift", None),
+                _entry_model("llm-drift", "llm", DEFAULT_MODEL_ID),  # the TRUE slug the launcher runs
+            ):
+                reg = await client.post(f"/competitions/{comp_id}/agents", json=body, headers=_bearer(_DID_ALICE))
+                assert reg.status_code == 200, reg.text
+            resp = await client.post(f"/competitions/{comp_id}/arena", headers=_bearer(_DID_ALICE))
+            assert resp.status_code == 200, resp.text  # the true-slug roster is ADMITTED, not 409'd
+            cfg = resp.json()["arena_comparison"]["contestant_config"]
+            assert cfg["llm-drift"]["model"] == DEFAULT_MODEL_ID  # attests the ACTUAL model, not null
+            assert cfg["det-drift"]["model"] is None
+
+            events = await client.get(f"/competitions/{comp_id}/events?since_seq=-1")
+            started = next(e for e in events.json() if e["event_type"] == "competition_started")
+            assert started["payload"]["contestant_config"]["llm-drift"]["model"] == DEFAULT_MODEL_ID
+    finally:
+        await _drain(app)
+
+
+async def test_default_wiring_rejects_null_model_roster() -> None:
+    """R1 RED — with the DEFAULT launcher (runs ``DEFAULT_MODEL_ID``), a roster whose llm-drift declares
+    ``model=None`` no longer matches the intrinsic identity and MUST be refused 409 — the discriminating
+    case. FAILS on 087c768 (the arena folds ``model=None``, so the null-model roster is wrongly ADMITTED
+    and the run attests a null model that is NOT what ran)."""
+    launcher = _offline_default_launcher()
+    store = InMemoryStore()
+    app = create_app(store=store, settings=_privy_settings(), arena_model_launcher=launcher)
+    try:
+        async with _transport(app) as client:
+            comp_id = await _create(client, _DID_ALICE)
+            for body in (
+                _entry_model("det-drift", "cumulative-drift", None),
+                _entry_model("llm-drift", "llm", None),  # null model no longer matches the real identity
+            ):
+                await client.post(f"/competitions/{comp_id}/agents", json=body, headers=_bearer(_DID_ALICE))
+            resp = await client.post(f"/competitions/{comp_id}/arena", headers=_bearer(_DID_ALICE))
+            assert resp.status_code == 409, resp.text
+            assert "arena_comparison" not in resp.json()
+            state = await client.get(f"/competitions/{comp_id}")
+            assert state.json()["run_id"] is None and state.json()["status"] == "draft"
     finally:
         await _drain(app)

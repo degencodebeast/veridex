@@ -306,10 +306,18 @@ class LLMDriftCheckpointRunner:
 
 
 class _TaskLauncher:
-    """Wraps the Agno call as an ``asyncio.Task`` so the guard can poll/cancel it across ticks."""
+    """Wraps the Agno call as an ``asyncio.Task`` so the guard can poll/cancel it across ticks.
 
-    def __init__(self, coro_factory: Callable[[str], Any]) -> None:
+    ``model_id`` SURFACES the real model identity this launcher's ``_call`` actually runs (the same slug
+    ``default_model_launcher`` resolved). It is the launcher's HONEST identity commitment: the arena reads
+    ``getattr(launcher, "model_id", None)`` to fold the ACTUAL model into the intrinsic-arena config_hash
+    and to attest it in the started event + report — so a fail-closed run never attests a ``null`` model
+    while executing a real one (Codex M2 attestation honesty).
+    """
+
+    def __init__(self, coro_factory: Callable[[str], Any], *, model_id: str | None = None) -> None:
         self._coro_factory = coro_factory
+        self.model_id = model_id
 
     def launch(self, prompt: str) -> CallHandle:
         # ``ensure_future`` schedules the coroutine on the running loop; the returned Task natively
@@ -347,7 +355,9 @@ def default_model_launcher(
         response = await agent.arun(prompt)
         return getattr(response, "content", None)
 
-    return _TaskLauncher(_call)
+    # Bind the launcher's HONEST model identity to the SAME slug ``_call`` runs (``resolved_model_id``),
+    # so the arena folds + attests the ACTUAL model rather than ``None`` (Codex M2 attestation honesty).
+    return _TaskLauncher(_call, model_id=resolved_model_id)
 
 
 # ---------------------------------------------------------------------------

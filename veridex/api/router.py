@@ -180,6 +180,78 @@ _ARENA_CONTESTANT_CONTRACT: dict[str, str] = {
 _ARENA_PROOF_MODE = "reproducible"
 
 
+class _ArenaRosterContractError(Exception):
+    """A strict intrinsic-arena roster contract violation, carrying the HTTP status + detail to surface.
+
+    Raised by :func:`_verify_intrinsic_arena_roster` so the SAME strict contract can run BOTH pre-claim
+    (translated to an ``HTTPException`` before any claim) AND post-claim (caught so the claim is recovered
+    and the run fails closed) — never a run over a roster different from the one frozen at RUNNING.
+    """
+
+    def __init__(self, status_code: int, detail: str) -> None:
+        super().__init__(detail)
+        self.status_code = status_code
+        self.detail = detail
+
+
+def _verify_intrinsic_arena_roster(
+    entries: list[AgentEntry], *, expected_models: dict[str, str | None]
+) -> dict[str, dict[str, Any]]:
+    """FAIL CLOSED unless ``entries`` declares EXACTLY the intrinsic arena contestants at the pinned
+    model/config identity; return the per-contestant config on success (Codex M1/M2).
+
+    The strict contract binds THREE things so the roster the report attests is provably the roster that
+    ran: (1) EXACTLY the two intrinsic ids -> strategies (cardinality 2, no extras, no substitution),
+    (2) each entry's pinned ``config_hash`` equals the EXPECTED hash for that intrinsic identity (folding
+    ``expected_models`` + ``_ARENA_PROOF_MODE``), and (3) no entry carries a deployed-instance binding the
+    intrinsic arena does not run. Any mismatch raises :class:`_ArenaRosterContractError` (409).
+
+    Args:
+        entries: The roster snapshot to validate (pre-claim, or the post-claim frozen roster).
+        expected_models: The pinned intrinsic model identity per contestant id (det-Drift -> ``None``,
+            LLM-Drift -> the arena launcher's real ``model_id``).
+
+    Returns:
+        ``{agent_id: {"strategy", "model", "proof_mode", "config_hash"}}`` for the two contestants.
+
+    Raises:
+        _ArenaRosterContractError: 409 on any cardinality / id / config / instance-binding mismatch.
+    """
+    declared = {entry.agent_id: entry.strategy for entry in entries}
+    if len(entries) != len(_ARENA_CONTESTANT_CONTRACT) or declared != _ARENA_CONTESTANT_CONTRACT:
+        raise _ArenaRosterContractError(
+            409,
+            "competition roster must declare EXACTLY the intrinsic arena contestants "
+            f"(required {sorted(_ARENA_CONTESTANT_CONTRACT.items())}; got {sorted(declared.items())})",
+        )
+    contestant_config: dict[str, dict[str, Any]] = {}
+    for entry in entries:
+        strategy = _ARENA_CONTESTANT_CONTRACT[entry.agent_id]  # safe: declared == contract above
+        model = expected_models[entry.agent_id]
+        expected_hash = declared_config_hash(
+            agent_id=entry.agent_id, strategy=strategy, model=model, proof_mode=_ARENA_PROOF_MODE
+        )
+        if entry.instance_id is not None:
+            raise _ArenaRosterContractError(
+                409,
+                f"roster entry {entry.agent_id!r} carries an incompatible instance binding; the "
+                "intrinsic arena runs no deployed instance",
+            )
+        if entry.config_hash != expected_hash:
+            raise _ArenaRosterContractError(
+                409,
+                f"roster entry {entry.agent_id!r} pins a model/config identity the intrinsic arena "
+                f"does not run (expected config_hash {expected_hash}, got {entry.config_hash})",
+            )
+        contestant_config[entry.agent_id] = {
+            "strategy": strategy,
+            "model": model,
+            "proof_mode": _ARENA_PROOF_MODE,
+            "config_hash": expected_hash,
+        }
+    return contestant_config
+
+
 async def _recover_arena_claim(store: Store, competition_id: str) -> None:
     """Fail-closed recovery after a post-claim arena failure (Codex M3).
 
@@ -1193,62 +1265,26 @@ def create_app(
         if competition.status in (CompetitionStatus.RUNNING, CompetitionStatus.FINALIZED):
             raise HTTPException(status_code=409, detail="competition already run")
 
-        # FAIL CLOSED unless the FROZEN roster declares EXACTLY the intrinsic arena contestants — the
-        # STRICT intrinsic-arena contract (Codex M2). The arena runs the intrinsic det-Drift + LLM-Drift
-        # pair; requiring the roster to declare EXACTLY them (exact ids -> strategies, cardinality 2, no
-        # extras) makes the started event's agent_ids BY CONSTRUCTION the report's contestant ids — never
-        # a run that reports one identity while the roster/event claims another. An empty, unrelated,
-        # mismatched-id (e.g. desk-rules-v7), or extra-entry roster is refused 409, never a substitution.
-        declared = {entry.agent_id: entry.strategy for entry in competition.entries}
-        if len(competition.entries) != len(_ARENA_CONTESTANT_CONTRACT) or declared != _ARENA_CONTESTANT_CONTRACT:
-            raise HTTPException(
-                status_code=409,
-                detail=(
-                    "competition roster must declare EXACTLY the intrinsic arena contestants "
-                    f"(required {sorted(_ARENA_CONTESTANT_CONTRACT.items())}; "
-                    f"got {sorted(declared.items())})"
-                ),
-            )
-
         # BIND the pinned MODEL/CONFIG identity, not just id -> strategy (Codex M2). id/strategy labels
         # ALONE are insufficient: the declared-entry ``config_hash`` folds ``model`` + ``proof_mode``, and
         # an instance-bound entry pins an entire deployed ``effective_config`` the intrinsic arena does not
         # run. The intrinsic arena runs det-Drift (no model) + LLM-Drift over the injected launcher whose
-        # model identity is ``arena_model_id``; each entry's pinned ``config_hash`` MUST equal the EXPECTED
-        # hash for that intrinsic identity, and no entry may carry an instance binding. A roster whose
-        # LLM entry pins a DIFFERENT model has a different config_hash and is refused 409 (fail-closed) —
-        # so two different-model rosters can never both be accepted and produce byte-identical reports.
+        # model identity is ``arena_model_id`` (its HONEST ``model_id``, ``None`` only for a launcher that
+        # exposes none). ``expected_models`` pins each contestant's intrinsic model identity.
         arena_model_id = getattr(resolved_arena_model_launcher, "model_id", None)
         expected_models: dict[str, str | None] = {DET_DRIFT_CONTESTANT: None, LLM_DRIFT_CONTESTANT: arena_model_id}
-        contestant_config: dict[str, dict[str, Any]] = {}
-        for entry in competition.entries:
-            strategy = _ARENA_CONTESTANT_CONTRACT[entry.agent_id]  # safe: declared == contract above
-            model = expected_models[entry.agent_id]
-            expected_hash = declared_config_hash(
-                agent_id=entry.agent_id, strategy=strategy, model=model, proof_mode=_ARENA_PROOF_MODE
-            )
-            if entry.instance_id is not None:
-                raise HTTPException(
-                    status_code=409,
-                    detail=(
-                        f"roster entry {entry.agent_id!r} carries an incompatible instance binding; the "
-                        "intrinsic arena runs no deployed instance"
-                    ),
-                )
-            if entry.config_hash != expected_hash:
-                raise HTTPException(
-                    status_code=409,
-                    detail=(
-                        f"roster entry {entry.agent_id!r} pins a model/config identity the intrinsic arena "
-                        f"does not run (expected config_hash {expected_hash}, got {entry.config_hash})"
-                    ),
-                )
-            contestant_config[entry.agent_id] = {
-                "strategy": strategy,
-                "model": model,
-                "proof_mode": _ARENA_PROOF_MODE,
-                "config_hash": expected_hash,
-            }
+
+        # FAIL CLOSED (pre-claim) unless the FROZEN roster snapshot declares EXACTLY the intrinsic arena
+        # contestants at the pinned model/config identity — the STRICT intrinsic-arena contract (Codex M2).
+        # Requiring EXACTLY them (exact ids -> strategies, cardinality 2, no extras, config_hash bound, no
+        # instance binding) makes the started event's agent_ids BY CONSTRUCTION the report's contestant ids.
+        # An empty, unrelated, mismatched-id (e.g. desk-rules-v7), extra-entry, wrong-model, or
+        # instance-bound roster is refused 409, never a substitution. RE-RUN post-claim (below) closes the
+        # pre-claim TOCTOU window — this snapshot may be stale by the time the claim freezes the roster.
+        try:
+            _verify_intrinsic_arena_roster(competition.entries, expected_models=expected_models)
+        except _ArenaRosterContractError as exc:
+            raise HTTPException(status_code=exc.status_code, detail=exc.detail) from None
 
         # VALIDATE the declared roster through the SAME machinery start_competition uses — fail-closed on
         # an unknown strategy / a missing-or-drifted deployed instance (never a same-named reconstruction,
@@ -1275,6 +1311,27 @@ def create_app(
             )
         except CompetitionStatusClaimError:
             raise HTTPException(status_code=409, detail="competition already run") from None
+
+        # POST-CLAIM ROSTER RE-VERIFY (Codex M1 pre-claim TOCTOU). The strict contract above ran against
+        # the roster snapshot fetched BEFORE the claim; between that check and the claim a concurrent
+        # ``register_agent`` can LEGALLY commit an extra entry (status still DRAFT) — so the claim could
+        # freeze a roster (e.g. ``[det, llm, extra-x]``) DIFFERENT from the one the report attests
+        # (``[det, llm]``). RE-FETCH the now-frozen roster and RE-RUN the SAME strict contract against it;
+        # on ANY mismatch FAIL CLOSED — recover the claim (``_recover_arena_claim`` CAS-rolls RUNNING ->
+        # DRAFT and clears the run_id since no events landed yet) and refuse 409, never a run over a mutated
+        # roster. The post-claim result is the AUTHORITATIVE ``contestant_config``: it attests EXACTLY the
+        # roster frozen at RUNNING. (The claim freezes the roster, so this is the last possible mutation.)
+        try:
+            claimed = await dep_store.get_competition(competition_id)
+            contestant_config = _verify_intrinsic_arena_roster(
+                claimed.entries, expected_models=expected_models
+            )
+        except _ArenaRosterContractError as exc:
+            await _recover_arena_claim(dep_store, competition_id)
+            raise HTTPException(status_code=exc.status_code, detail=exc.detail) from None
+        except KeyError:
+            await _recover_arena_claim(dep_store, competition_id)
+            raise HTTPException(status_code=404, detail=f"competition {competition_id!r} not found") from None
 
         # FAIL-CLOSED post-claim recovery (Codex M3): wrap model execution + report construction + event
         # persistence so ANY failure (run_arena_comparison, ArenaDrainError, report/append error) RECOVERS
