@@ -16,8 +16,8 @@ Build and deploy sports-trading agents, compete them head-to-head on identical *
 
 </div>
 
-> `[SCREENSHOT / GIF — Agent Studio → Arena leaderboard → Decision Inspector → Proof Card]`
-> *(replace with a real capture from the running app before submission)*
+> `[Agent Studio → Arena leaderboard → Decision Inspector → Proof Card]`
+> ![alt text](image.png)
 
 ---
 
