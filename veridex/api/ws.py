@@ -253,6 +253,9 @@ async def _run_arena(
     overflow_signal = manager._overflow_signal(queue)
     child_errors: list[Exception] = []
     body_errors: list[Exception] = []
+    route_task = asyncio.current_task()
+    assert route_task is not None
+    cancelling_at_entry = route_task.cancelling()
     try:
         try:
             async with asyncio.TaskGroup() as group:
@@ -296,6 +299,11 @@ async def _run_arena(
         except* _ArenaChildTerminated:
             pass
 
+        # Python 3.11 TaskGroup can consume a simultaneous external cancellation while handling
+        # its private child-failure wake-up. Preserve every cancellation accepted by the route
+        # after entry instead of treating the suppressed private exception as proof of origin.
+        if route_task.cancelling() > cancelling_at_entry:
+            raise asyncio.CancelledError
         if body_errors:
             raise body_errors[0]
         if child_errors:
