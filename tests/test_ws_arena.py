@@ -146,6 +146,35 @@ class _BlockedReceiveRaisingWebSocket:
         raise AssertionError("unreachable")
 
 
+class _GatedReceiveRaisingWebSocket:
+    """Hold receive cleanup open so an external cancel can race a terminal sender."""
+
+    def __init__(self) -> None:
+        self.send_attempted = asyncio.Event()
+        self.receive_cleanup_started = asyncio.Event()
+        self.receive_cleanup_release = asyncio.Event()
+        self.receive_cleanup_finished = asyncio.Event()
+
+    async def accept(self) -> None:
+        return None
+
+    async def send_json(self, data: dict) -> None:
+        del data
+        self.send_attempted.set()
+        raise RuntimeError("socket closed")
+
+    async def receive(self) -> dict:
+        try:
+            await asyncio.Event().wait()
+        finally:
+            self.receive_cleanup_started.set()
+            try:
+                await self.receive_cleanup_release.wait()
+            finally:
+                self.receive_cleanup_finished.set()
+        raise AssertionError("unreachable")
+
+
 class _ControlledArenaWebSocket:
     """Route-level WebSocket fake that can become slow after a bounded number of sends."""
 
@@ -471,4 +500,51 @@ async def test_route_finishes_when_live_send_terminates_with_receive_blocked(sen
                 await task
 
     assert ws.receive_cancelled.is_set()
+    assert cid not in manager._clients
+
+
+async def test_external_cancel_propagates_after_terminal_child_wakes_blocked_receive() -> None:
+    """An independent route cancellation cannot be mistaken for a child-completion wake-up."""
+    store = InMemoryStore()
+    manager = ArenaConnectionManager()
+    cid = "c_child_external_cancel_race"
+    ws = _GatedReceiveRaisingWebSocket()
+    route = asyncio.create_task(_run_arena(ws, store=store, manager=manager, competition_id=cid, since_seq=0))
+    children: set[asyncio.Task] = set()
+    propagated_cancel = False
+
+    try:
+        await _wait_until(lambda: cid in manager._clients)
+
+        def arena_children() -> set[asyncio.Task]:
+            return {
+                task
+                for task in asyncio.all_tasks()
+                if task is not route
+                and getattr(task.get_coro(), "__name__", "") in {"_close_on_overflow", "_forward_live"}
+            }
+
+        await _wait_until(lambda: len(arena_children()) == 2)
+        children = arena_children()
+        await manager.broadcast(cid, _make_event(cid, seq=1))
+        await asyncio.wait_for(ws.send_attempted.wait(), timeout=1)
+        await asyncio.wait_for(ws.receive_cleanup_started.wait(), timeout=1)
+
+        assert any(task.done() for task in children)
+
+        assert route.cancel() is True
+        try:
+            await route
+        except asyncio.CancelledError:
+            propagated_cancel = True
+    finally:
+        ws.receive_cleanup_release.set()
+        if not route.done():
+            route.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await route
+
+    assert propagated_cancel is True
+    assert ws.receive_cleanup_finished.is_set()
+    assert all(task.done() for task in children)
     assert cid not in manager._clients
