@@ -262,9 +262,8 @@ def test_m2_served_wrapper_denies_without_corrupting_the_instance() -> None:
 
         gc.collect()
 
-    # (a) a CLEAN deny (never a 500-with-corruption).
-    assert resp.status_code != 500, resp.status_code
-    assert resp.status_code in (403, 409), resp.status_code
+    # (a) a CLEAN, EXACT deny — the surface-only host refuses with 409 before any mutation (never 500).
+    assert resp.status_code == 409, resp.status_code
 
     instance = asyncio.run(store.get_agent_instance("inst-A"))
     # (b) runtime_handle is UNCHANGED (no durable identity corruption).
@@ -292,6 +291,45 @@ def test_m2_served_wrapper_denies_without_corrupting_the_instance() -> None:
     assert lease is not None and lease.run_id == "run-legit"
     refreshed = asyncio.run(store.get_agent_instance("inst-A"))
     assert refreshed.runtime_handle["run_id"] == "run-legit"
+
+
+def test_m2_served_wrapper_cancel_denies_without_corrupting_the_instance() -> None:
+    """MAJOR 2 (cancel arm): authed owner POST to the served CANCEL wrapper -> clean 409, ZERO mutation.
+
+    Symmetric to the start-route test: the surface-only served host registers the cancel wrapper (so the
+    AC-29 native surface stays byte-identical) but must DENY before any effect — the deny-before-mutation
+    contract has to hold on BOTH mutating wrapper routes, not just the start route. Proves a served cancel
+    leaves the durable instance identity + lease untouched (no 500, no partial mutation).
+    """
+    import asyncio
+    import warnings
+
+    guard, client = _served()
+    store: InMemoryStore = guard.app.state.store
+    _persist_owned_instance(store)
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        resp = client.post(
+            "/agents/instances/inst-A/runs/run-authoritative/cancel", headers=_auth("tokenA"), json={}
+        )
+        import gc
+
+        gc.collect()
+
+    # (a) a CLEAN, EXACT deny — the surface-only host refuses with 409 before any effect (never 500).
+    assert resp.status_code == 409, resp.status_code
+
+    instance = asyncio.run(store.get_agent_instance("inst-A"))
+    # (b) runtime_handle + run_id are UNCHANGED (no durable identity corruption).
+    assert instance.runtime_handle == {"runtime_kind": "seed", "run_id": "run-authoritative"}
+    assert instance.run_id == "run-authoritative"
+    # (c) no lease was consumed/created/FAILED by the denied cancel.
+    assert asyncio.run(store.get_instance_lease("inst-A")) is None
+    # (d) NO coroutine-never-awaited warning (the deny is a plain HTTPException, nothing left un-awaited).
+    assert not any(
+        issubclass(w.category, RuntimeWarning) and "never awaited" in str(w.message) for w in caught
+    ), [str(w.message) for w in caught]
 
 
 def test_m2_served_mm_session_factory_is_sync_fail_closed() -> None:
