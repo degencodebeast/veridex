@@ -1315,6 +1315,21 @@ def create_app(
                 pack_id=resolved.pack_id, fixture_id=resolved.fixture_id, content_hash=resolved.content_hash
             )
                 )
+                # The persist is an only-if-unbound CAS: it is a NO-OP if a CONCURRENT unbound start froze
+                # the binding first. That concurrent winner — not necessarily this start — owns the
+                # AUTHORITATIVE identity and may WIN the run claim below. Re-read the persisted binding and
+                # replay/report THAT, never this start's local resolution, so the tape LOADED and the
+                # identity SURFACED both match the single persisted authority (the mirror of the clobber the
+                # CAS closed: the honesty invariant that GET never reports an identity the run did not replay).
+                authoritative = await dep_store.get_competition(competition_id)
+                if authoritative.replay_binding is not None:
+                    resolved = ResolvedReplaySource(
+                        pack_id=authoritative.replay_binding.pack_id,
+                        fixture_id=authoritative.replay_binding.fixture_id,
+                        content_hash=authoritative.replay_binding.content_hash,
+                        provenance="",  # observability-only; not part of the frozen identity triple
+                        is_genuine=False,
+                    )
             ticks = load_resolved_marketstates(app.state.replay_catalog, resolved)
         except ReplayResolutionError as exc:
             raise HTTPException(

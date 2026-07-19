@@ -443,3 +443,47 @@ def test_fold3_recomputed_disk_hash_must_match_frozen_binding(tmp_path: Path) ->
     with pytest.raises(ReplayResolutionError) as exc:
         load_resolved_marketstates(catalog, stale)
     assert exc.value.reason == "content_hash_drift"
+
+
+def test_fold_start_binding_aligns_to_persisted_authority_under_freeze_race(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # MINOR 1 mirror (honesty): freeze-order vs claim-order residual race. The unbound-start persist is
+    # an only-if-unbound CAS, so a start can LOSE the freeze (a concurrent unbound start froze first) yet
+    # still WIN the run claim. If the caller keeps its OWN local ``resolved`` for the tape LOAD and the
+    # response after a CAS no-op, the run replays one identity while GET reports the persisted winner's —
+    # the exact mirror of the clobber the CAS closed. The fix re-reads the AUTHORITATIVE persisted binding
+    # and replays/reports THAT, so the response identity, the replayed tape, and GET all agree.
+    fixtures = sorted(int(f["fixture_id"]) for f in _MANIFEST["fixtures"])
+    winner_fixture = fixtures[-1]  # a DIFFERENT valid fixture than the unnamed (min) auto-resolution
+    assert winner_fixture != SEED_MIN_FIXTURE
+
+    store = InMemoryStore()
+    client = _client(_seed_catalog(), store=store)
+    comp_id = client.post("/competitions", json=_CONFIG).json()["competition_id"]  # UNNAMED, unbound DRAFT
+    _register_roster(client, comp_id)
+
+    import veridex.api.router as router_mod
+
+    real_resolve = router_mod.resolve_replay_source
+
+    def _resolve_then_concurrent_freeze(catalog: Any, *, pack_id: Any, fixture_id: Any) -> Any:
+        # Simulate a CONCURRENT unbound start that WON the freeze between this handler's read and its CAS:
+        # commit a DIFFERENT (winner) binding straight into the store BEFORE this start's CAS runs, so the
+        # CAS is a no-op and this start becomes the persist-LOSER (which nonetheless wins the run claim).
+        resolved = real_resolve(catalog, pack_id=pack_id, fixture_id=fixture_id)
+        store._competitions[comp_id].replay_binding = ReplayBinding(
+            pack_id=SEED_PACK_ID, fixture_id=winner_fixture, content_hash=SEED_HASH
+        )
+        return resolved
+
+    monkeypatch.setattr(router_mod, "resolve_replay_source", _resolve_then_concurrent_freeze)
+
+    start = client.post(f"/competitions/{comp_id}/start")
+    assert start.status_code == 200, start.text
+
+    persisted = client.get(f"/competitions/{comp_id}").json()["replay_binding"]
+    assert persisted["fixture_id"] == winner_fixture  # the concurrent winner owns the authoritative identity
+    # Honesty invariant: GET never reports an identity the run did not replay. The response identity (what
+    # the run replayed) MUST equal the persisted authority — not this start's local (min) resolution.
+    assert start.json()["replay_binding"] == persisted
