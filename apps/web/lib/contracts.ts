@@ -477,7 +477,9 @@ export interface InspectorRecord {
   is_live: boolean;
   market_state: MarketState;
   agent_action: AgentAction;
-  recompute: { recomputed_edge_bps: number; clv_bps: number; valid: boolean };
+  // clv_bps is `number | null`: the deterministic recompute echo preserves the backend "pending"
+  // sentinel as null (an honest "not scored yet"), never a fabricated 0 — this echo is a trust surface.
+  recompute: { recomputed_edge_bps: number; clv_bps: number | null; valid: boolean };
   clv_explanation: ClvExplanation;
   untrusted_llm: UntrustedLlmMetadata | null;
 }

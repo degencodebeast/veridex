@@ -555,10 +555,10 @@ export function adaptInspector(w: W.InspectorRecord): InspectorRecord {
     is_live: false, // GAP
     market_state: w.market_state as unknown as InspectorRecord['market_state'],
     agent_action: w.agent_action as unknown as InspectorRecord['agent_action'],
-    // The recompute echo is a numeric view-model field; a "pending" sentinel folds to the same coerced
-    // `clv` (0) that the pending flag above gates — the CLV explanation is the trust surface that shows
-    // PENDING, this secondary deterministic echo never presents the sentinel string as a number.
-    recompute: { recomputed_edge_bps: rec.recomputed_edge_bps ?? 0, clv_bps: typeof rec.clv_bps === 'number' ? rec.clv_bps : clv, valid: rec.valid ?? false },
+    // The recompute echo is a TRUST SURFACE (a judge verifies the deterministic recompute here): a
+    // non-numeric "pending" sentinel is preserved as null (honest "not scored yet"), NEVER the coerced
+    // 0 — consistent with the D2 headline PENDING treatment and F-5/R-globalclv's null-preservation.
+    recompute: { recomputed_edge_bps: rec.recomputed_edge_bps ?? 0, clv_bps: typeof rec.clv_bps === 'number' ? rec.clv_bps : null, valid: rec.valid ?? false },
     // GAP: the wire InspectorRecord carries no doctrine quantities (fair value,
     // executable edge, venue price, mispricing gap, stake) → null = honest "not in proof
     // artifact" (rendered as "—"), NOT a plausible 0. CLV (the real score) is carried through.

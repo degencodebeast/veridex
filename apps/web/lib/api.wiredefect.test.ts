@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { adaptLeaderboard, adaptExecutionReceipts } from '@/lib/api';
+import { adaptLeaderboard, adaptExecutionReceipts, adaptInspector } from '@/lib/api';
 import type * as W from '@/lib/wire';
 
 // II-W · Wire-defect RED controls (adapter surface). Each `it` reproduces ONE distinct frontend↔
@@ -67,6 +67,34 @@ describe('II-W defect 5 · adaptLeaderboard: eligibility is the backend (anchor-
   it('an unproven row renders `not-eligible` (the backend value, not a proof_mode guess)', () => {
     const rows = adaptLeaderboard({ rows: [wireRow({ eligibility_badge: 'unproven', proof_mode: 'verified' })] });
     expect(rows[0].eligibility_badge).toBe('not-eligible');
+  });
+});
+
+describe('II-W fold · adaptInspector: a PENDING recompute clv_bps is preserved as null, NEVER a fabricated 0', () => {
+  it('the Deterministic Recompute echo (a trust surface) keeps "pending" as null, not the coerced 0', () => {
+    // The recompute echo exists so a judge can verify the deterministic recompute — showing `0` where
+    // the backend recompute produced the "pending" sentinel (router.py:796-799; clv_bps: int|str,
+    // schemas.py:290) misrepresents it. Consistent with the D2 headline treatment + F-5/R-globalclv's
+    // null-preservation pattern (this is the 4th instance of pending/unscored → fabricated-0).
+    const wire = {
+      run_id: 'run_p', agent_id: 'agent_p', tick_seq: 5,
+      market_state: {}, agent_action: { type: 'WAIT', params: {} },
+      recompute: { recomputed_edge_bps: 0, clv_bps: 'pending', valid: true },
+      clv_bps: 'pending', untrusted_llm_metadata: {},
+    } as unknown as W.InspectorRecord;
+    const rec = adaptInspector(wire);
+    expect(rec.recompute.clv_bps).toBeNull();      // preserved, never the coerced 0
+    expect(rec.recompute.clv_bps).not.toBe(0);
+  });
+
+  it('a numeric recompute clv_bps still passes through verbatim (no regression on scored recomputes)', () => {
+    const wire = {
+      run_id: 'run_s', agent_id: 'agent_s', tick_seq: 5,
+      market_state: {}, agent_action: { type: 'FLAG_VALUE', params: {} },
+      recompute: { recomputed_edge_bps: 22, clv_bps: 18, valid: true },
+      clv_bps: 18, untrusted_llm_metadata: {},
+    } as unknown as W.InspectorRecord;
+    expect(adaptInspector(wire).recompute.clv_bps).toBe(18);
   });
 });
 
