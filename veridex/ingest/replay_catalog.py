@@ -107,8 +107,10 @@ def _build_verified_entry(pack_dir: Path) -> CatalogEntry | None:
     """Hash-verify ``pack_dir`` and, if verified, build its :class:`CatalogEntry`; else ``None``.
 
     Fail-closed at every gate: an unverified content_hash (tampered/corrupt), a malformed/missing
-    manifest, or a manifest declaring NO fixtures all return ``None`` (the pack is excluded — never
-    served). Provenance is derived HONESTLY: genuine only when :func:`is_genuine_pack` proves a
+    manifest, a manifest declaring NO fixtures, OR a manifest whose fixture list contains a malformed /
+    non-int / boolean fixture id all return ``None`` (the pack is excluded — never served, and the
+    catalog never silently under-reports a pack's fixtures). Provenance is derived HONESTLY: genuine
+    only when :func:`is_genuine_pack` proves a
     coherent genuine state; a pack that merely *declares* ``genuine-txline`` without that coherent
     state is downgraded to ``unknown-provenance`` (a non-verified pack is NEVER surfaced as genuine).
     """
@@ -125,8 +127,13 @@ def _build_verified_entry(pack_dir: Path) -> CatalogEntry | None:
     fixture_ids: list[int] = []
     for entry in fixtures_raw:
         fid = entry.get("fixture_id") if isinstance(entry, dict) else None
-        if isinstance(fid, int):
-            fixture_ids.append(fid)
+        # A valid fixture id is a real int — NEVER a JSON bool (``bool`` subclasses ``int``, so a
+        # bare ``isinstance(fid, int)`` would admit ``true``/``false`` as fixture ids 1/0). A
+        # malformed/non-int fixture entry EXCLUDES the whole pack (fail-closed, consistent with the
+        # module's posture): the catalog must not silently UNDER-report a pack's declared fixtures.
+        if not isinstance(fid, int) or isinstance(fid, bool):
+            return None
+        fixture_ids.append(fid)
     if not fixture_ids:
         return None
     content_hash = manifest.get("content_hash")
@@ -178,6 +185,8 @@ class ReplayCatalog:
         self._entries: dict[str, CatalogEntry] = dict(entries)
         self._lock = threading.Lock()
         self._curated_root = curated_root
+        # reserved for R-3 must-be-under-capture-root enforcement (a registered pack must live under
+        # the writable capture root); today only _curated_root is read (the read-only boundary guard).
         self._capture_root = capture_root
 
     # -- lock-free reads (single atomic reference read of self._entries) --
@@ -275,6 +284,10 @@ class ReplayCatalog:
             resolved = path.resolve()
             curated = self._curated_root.resolve()
         except OSError:
+            # Fail-OPEN here is intentional and safe: an unresolvable path is treated as NOT-under-curated
+            # so it does not trip the read-only boundary guard. It is NOT a trust bypass — the pack still
+            # goes through verify-before-promote (hash-verification) and the curated-seed collision guard;
+            # this only decides whether the under-curated-root SHORTCUT refusal applies.
             return False
         return resolved == curated or curated in resolved.parents
 
@@ -297,8 +310,9 @@ def build_catalog(
         capture_root: Optional SEPARATE writable capture root to also scan at startup.
 
     Returns:
-        A :class:`ReplayCatalog` carrying only hash-verified packs; it retains both roots so
-        :meth:`ReplayCatalog.register_pack` can enforce the read-only-curated boundary.
+        A :class:`ReplayCatalog` carrying only hash-verified packs. It retains the curated root so
+        :meth:`ReplayCatalog.register_pack` can enforce the read-only-curated boundary; the capture root
+        is retained as a reserved seam for R-3's must-be-under-capture-root enforcement (not read today).
     """
     curated = Path(curated_root) if curated_root else None
     capture = Path(capture_root) if capture_root else None

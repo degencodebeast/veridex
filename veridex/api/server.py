@@ -319,7 +319,9 @@ def create_server_app(
     # path (``catalog.register_pack``) atomically promotes freshly-captured deployed packs at runtime
     # (no restart), and NEVER writes the read-only curated root. This is additive: it does NOT alter the
     # II-5f served composition (the guard return / deny-by-default / /readyz gate set are unchanged).
-    replay_catalog = build_catalog(pack_root, capture_root=resolved_env.get("REPLAY_CAPTURE_ROOT", "") or None)
+    replay_catalog = build_catalog(
+        pack_root, capture_root=resolved_env.get("REPLAY_CAPTURE_ROOT", "") or None
+    )
 
     primary, extra_agents = _build_served_hosting_adapters()
     guard = build_agentos_app(

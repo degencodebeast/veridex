@@ -23,6 +23,9 @@ RUN pip install --no-cache-dir ".[api,postgres,live,agent]"
 # mode), and the packs are ~600KB — negligible bloat. This layer is READ-ONLY at runtime (curated =
 # read-only); R-0b's freshly-captured packs go to the SEPARATE writable capture volume, never here. In
 # compose, REPLAY_PACK_ROOT is overridden to the operator's provisioned :ro curated mount.
+# NOTE: the catalog derives pack_id from the leaf dir name, so this seed catalogs as pack_id="curated".
+# That id is STABLE across both the image-bake path and the compose :ro mount (both leaf-named "curated"),
+# so R-3's pack-bound competition identity references the same id in either deployment.
 COPY scripts/fixtures/demo_pack_real /opt/veridex/replay-packs/curated
 ENV REPLAY_PACK_ROOT=/opt/veridex/replay-packs/curated
 

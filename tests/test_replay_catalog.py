@@ -84,7 +84,7 @@ def _tamper_data_file(pack_dir: Path) -> None:
 
 
 def _dir_fingerprint(root: Path) -> dict[str, tuple[int, bytes]]:
-    """Map each file under ``root`` -> (mtime_ns, sha-ish bytes) to prove the tree is untouched."""
+    """Map each file under ``root`` -> (mtime_ns, raw file bytes) to prove the tree is untouched."""
     out: dict[str, tuple[int, bytes]] = {}
     for p in sorted(root.rglob("*")):
         if p.is_file():
@@ -126,6 +126,43 @@ def test_red_a_malformed_manifest_excluded(tmp_path: Path) -> None:
 
     assert catalog.pack_ids() == ["good"]
     assert "broken" not in catalog
+
+
+def _reseal_manifest_fixture_id(pack_dir: Path, new_fixture_id: object) -> None:
+    """Set fixtures[0].fixture_id to ``new_fixture_id`` and RE-SEAL content_hash so verify still PASSES.
+
+    The record file list (``records`` filenames) is unchanged, so the recomputed hash matches — this
+    isolates the honesty gate (a bool/non-int fixture id), NOT tamper-evidence, as the reason for exclusion.
+    """
+    manifest = json.loads((pack_dir / "pack.json").read_text())
+    manifest["fixtures"][0]["fixture_id"] = new_fixture_id
+    manifest["content_hash"] = _compute_content_hash(
+        pack_dir, manifest["fixtures"], pack_version=int(manifest["pack_version"]), capture=manifest["capture"]
+    )
+    (pack_dir / "pack.json").write_text(json.dumps(manifest))
+
+
+@pytest.mark.parametrize("bad_fixture_id", [True, False, "5", 5.0, None])
+def test_red_bool_or_nonint_fixture_id_excludes_pack_fail_closed(
+    tmp_path: Path, bad_fixture_id: object
+) -> None:
+    """A JSON bool (or any non-int) fixture id must NOT be admitted as a fixture id (bool subclasses int),
+    and a malformed fixture entry EXCLUDES the whole pack (fail-closed) rather than silently under-reporting
+    its fixtures. A hash-VALID sibling pack is still catalogued, proving the exclusion is entry-specific."""
+    curated = tmp_path / "curated"
+    curated.mkdir()
+    _make_synthetic_pack(tmp_path, "curated/good", fixture_id=5)
+    bad = _make_synthetic_pack(tmp_path, "curated/bad", fixture_id=7)
+    _reseal_manifest_fixture_id(bad, bad_fixture_id)
+    assert verify_content_hash(bad) is True  # hash verifies — the reject is the fixture-id honesty gate
+
+    catalog = build_catalog(curated)
+
+    assert "bad" not in catalog  # malformed fixture entry -> whole pack excluded (fail-closed)
+    assert catalog.pack_ids() == ["good"]  # the valid sibling is unaffected
+    # And a bool never sneaks in as fixture id 0/1 anywhere in the catalog.
+    for entry in catalog.snapshot().values():
+        assert all(type(fid) is int for fid in entry.fixtures)
 
 
 # ---------------------------------------------------------------------------
