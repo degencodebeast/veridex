@@ -19,6 +19,7 @@ import asyncio
 import contextlib
 
 import pytest
+from fastapi import WebSocketDisconnect
 from fastapi.testclient import TestClient
 
 from veridex.api.router import create_app
@@ -118,6 +119,104 @@ class _RaisingArenaWebSocket:
         await self._send_attempted.wait()
         await asyncio.sleep(0)  # let the forwarder finish failing before teardown
         return {"type": "websocket.disconnect"}
+
+
+class _BlockedReceiveRaisingWebSocket:
+    """Fake whose receive never finishes while its first live send terminates."""
+
+    def __init__(self, exc: Exception) -> None:
+        self._exc = exc
+        self.accepted = False
+        self.send_attempted = asyncio.Event()
+        self.receive_cancelled = asyncio.Event()
+
+    async def accept(self) -> None:
+        self.accepted = True
+
+    async def send_json(self, data: dict) -> None:
+        del data
+        self.send_attempted.set()
+        raise self._exc
+
+    async def receive(self) -> dict:
+        try:
+            await asyncio.Event().wait()
+        finally:
+            self.receive_cancelled.set()
+        raise AssertionError("unreachable")
+
+
+class _GatedReceiveRaisingWebSocket:
+    """Hold receive cleanup open so an external cancel can race a terminal sender."""
+
+    def __init__(self) -> None:
+        self.send_attempted = asyncio.Event()
+        self.receive_cleanup_started = asyncio.Event()
+        self.receive_cleanup_release = asyncio.Event()
+        self.receive_cleanup_finished = asyncio.Event()
+
+    async def accept(self) -> None:
+        return None
+
+    async def send_json(self, data: dict) -> None:
+        del data
+        self.send_attempted.set()
+        raise RuntimeError("socket closed")
+
+    async def receive(self) -> dict:
+        try:
+            await asyncio.Event().wait()
+        finally:
+            self.receive_cleanup_started.set()
+            try:
+                await self.receive_cleanup_release.wait()
+            finally:
+                self.receive_cleanup_finished.set()
+        raise AssertionError("unreachable")
+
+
+class _ControlledArenaWebSocket:
+    """Route-level WebSocket fake that can become slow after a bounded number of sends."""
+
+    def __init__(self, *, block_after: int | None = None, disconnect_after: int | None = None) -> None:
+        self.sent: list[dict] = []
+        self.accepted = False
+        self.closed = asyncio.Event()
+        self.send_blocked = asyncio.Event()
+        self._block_after = block_after
+        self._disconnect_after = disconnect_after
+        self._disconnect_ready = asyncio.Event()
+        self._never_unblock = asyncio.Event()
+
+    async def accept(self) -> None:
+        self.accepted = True
+
+    async def send_json(self, data: dict) -> None:
+        if self._block_after is not None and len(self.sent) >= self._block_after:
+            self.send_blocked.set()
+            await self._never_unblock.wait()
+        self.sent.append(data)
+        if self._disconnect_after is not None and len(self.sent) >= self._disconnect_after:
+            self._disconnect_ready.set()
+
+    async def receive(self) -> dict:
+        disconnects = [asyncio.create_task(self.closed.wait())]
+        if self._disconnect_after is not None:
+            disconnects.append(asyncio.create_task(self._disconnect_ready.wait()))
+        try:
+            done, _ = await asyncio.wait(disconnects, return_when=asyncio.FIRST_COMPLETED)
+            for task in done:
+                await task
+        finally:
+            for task in disconnects:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*disconnects, return_exceptions=True)
+        return {"type": "websocket.disconnect"}
+
+    async def close(self, *, code: int = 1000, reason: str | None = None) -> None:
+        del code, reason
+        self.closed.set()
 
 
 async def _wait_until(predicate, *, timeout: float = 1.0) -> None:
@@ -244,6 +343,100 @@ async def test_manager_backpressure_drops_for_full_client_only() -> None:
     assert slow.qsize() == 2  # slow client capped — surplus dropped, no exception
 
 
+async def test_route_overflow_closes_slow_socket_without_affecting_healthy_client() -> None:
+    """Overflow is observable on the slow socket while a healthy route receives every event."""
+    store = InMemoryStore()
+    manager = ArenaConnectionManager(max_queue_size=1)
+    cid = "c_overflow_close"
+    slow = _ControlledArenaWebSocket(block_after=0)
+    healthy = _ControlledArenaWebSocket(disconnect_after=3)
+    slow_task = asyncio.create_task(_run_arena(slow, store=store, manager=manager, competition_id=cid, since_seq=0))
+    healthy_task = asyncio.create_task(
+        _run_arena(healthy, store=store, manager=manager, competition_id=cid, since_seq=0)
+    )
+
+    try:
+        await _wait_until(lambda: len(manager._clients.get(cid, ())) == 2)
+        first = _make_event(cid, 1)
+        await store.append_competition_events(cid, [first])
+        await manager.broadcast(cid, first)
+        await asyncio.wait_for(slow.send_blocked.wait(), timeout=1)
+        await _wait_until(lambda: [event["seq"] for event in healthy.sent] == [1])
+
+        for seq in (2, 3):
+            event = _make_event(cid, seq)
+            await store.append_competition_events(cid, [event])
+            await manager.broadcast(cid, event)
+            await _wait_until(lambda expected=seq: healthy.sent[-1]["seq"] == expected)
+
+        await asyncio.wait_for(healthy_task, timeout=1)
+        await asyncio.wait_for(slow.closed.wait(), timeout=1)
+        await asyncio.wait_for(slow_task, timeout=1)
+    finally:
+        for task in (slow_task, healthy_task):
+            if not task.done():
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
+
+    assert [event["seq"] for event in healthy.sent] == [1, 2, 3]
+    assert cid not in manager._clients
+
+
+async def test_overflow_reconnect_since_seq_replays_exact_missing_tail() -> None:
+    """A client closed on overflow can replay seq > last_seen with no gap or duplicate."""
+    store = InMemoryStore()
+    manager = ArenaConnectionManager(max_queue_size=1)
+    cid = "c_overflow_reconnect"
+    first_socket = _ControlledArenaWebSocket(block_after=1)
+    first_task = asyncio.create_task(
+        _run_arena(first_socket, store=store, manager=manager, competition_id=cid, since_seq=0)
+    )
+
+    try:
+        await _wait_until(lambda: cid in manager._clients)
+        first = _make_event(cid, 1)
+        await store.append_competition_events(cid, [first])
+        await manager.broadcast(cid, first)
+        await _wait_until(lambda: [event["seq"] for event in first_socket.sent] == [1])
+
+        second = _make_event(cid, 2)
+        await store.append_competition_events(cid, [second])
+        await manager.broadcast(cid, second)
+        await asyncio.wait_for(first_socket.send_blocked.wait(), timeout=1)
+
+        for seq in (3, 4):
+            event = _make_event(cid, seq)
+            await store.append_competition_events(cid, [event])
+            await manager.broadcast(cid, event)
+
+        await asyncio.wait_for(first_socket.closed.wait(), timeout=1)
+        await asyncio.wait_for(first_task, timeout=1)
+    finally:
+        if not first_task.done():
+            first_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await first_task
+
+    last_seen = first_socket.sent[-1]["seq"]
+    reconnect = _ControlledArenaWebSocket(disconnect_after=3)
+    await asyncio.wait_for(
+        _run_arena(
+            reconnect,
+            store=store,
+            manager=manager,
+            competition_id=cid,
+            since_seq=last_seen,
+        ),
+        timeout=1,
+    )
+
+    replayed = [event["seq"] for event in reconnect.sent]
+    assert last_seen == 1
+    assert replayed == [2, 3, 4]
+    assert len(replayed) == len(set(replayed))
+
+
 def test_manager_disconnect_cleans_up() -> None:
     """After disconnect the queue/registry entry is gone; an emptied competition key is dropped."""
     manager = ArenaConnectionManager()
@@ -280,3 +473,74 @@ async def test_route_cleanup_runs_even_if_forwarder_raises() -> None:
 
     assert cid not in manager._clients  # queue removed despite the raise — no leak
     assert ws.accepted is True
+
+
+@pytest.mark.parametrize(
+    "send_error",
+    [RuntimeError("socket closed"), WebSocketDisconnect(code=1006)],
+    ids=["runtime-error", "websocket-disconnect"],
+)
+async def test_route_finishes_when_live_send_terminates_with_receive_blocked(send_error: Exception) -> None:
+    """A terminal live sender wakes the blocked receive path and unregisters its queue."""
+    store = InMemoryStore()
+    manager = ArenaConnectionManager()
+    cid = "c_send_terminal"
+    ws = _BlockedReceiveRaisingWebSocket(send_error)
+    task = asyncio.create_task(_run_arena(ws, store=store, manager=manager, competition_id=cid, since_seq=0))
+
+    try:
+        await _wait_until(lambda: cid in manager._clients)
+        await manager.broadcast(cid, _make_event(cid, seq=1))
+        await asyncio.wait_for(ws.send_attempted.wait(), timeout=1)
+        await asyncio.wait_for(task, timeout=0.1)
+    finally:
+        if not task.done():
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+
+    assert ws.receive_cancelled.is_set()
+    assert cid not in manager._clients
+
+
+async def test_external_cancel_propagates_after_terminal_child_wakes_blocked_receive() -> None:
+    """An independent route cancellation cannot be mistaken for a child-completion wake-up."""
+    store = InMemoryStore()
+    manager = ArenaConnectionManager()
+    cid = "c_child_external_cancel_race"
+    ws = _GatedReceiveRaisingWebSocket()
+    preexisting_tasks = asyncio.all_tasks()
+    route = asyncio.create_task(_run_arena(ws, store=store, manager=manager, competition_id=cid, since_seq=0))
+    children: set[asyncio.Task] = set()
+    propagated_cancel = False
+
+    try:
+        await _wait_until(lambda: cid in manager._clients)
+
+        def arena_children() -> set[asyncio.Task]:
+            return asyncio.all_tasks() - preexisting_tasks - {route}
+
+        await _wait_until(lambda: len(arena_children()) == 2)
+        children = arena_children()
+        await manager.broadcast(cid, _make_event(cid, seq=1))
+        await asyncio.wait_for(ws.send_attempted.wait(), timeout=1)
+        await asyncio.wait_for(ws.receive_cleanup_started.wait(), timeout=1)
+
+        assert any(task.done() for task in children)
+
+        assert route.cancel() is True
+        try:
+            await route
+        except asyncio.CancelledError:
+            propagated_cancel = True
+    finally:
+        ws.receive_cleanup_release.set()
+        if not route.done():
+            route.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await route
+
+    assert propagated_cancel is True
+    assert ws.receive_cleanup_finished.is_set()
+    assert all(task.done() for task in children)
+    assert cid not in manager._clients

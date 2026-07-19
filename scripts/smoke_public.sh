@@ -19,6 +19,11 @@
 #                            POST /demo/run  — router.py:520-559, unauthenticated, persists a
 #                            source_mode="replay" run through the durable store
 #                            GET  /leaderboard — router.py:563-594, asserts the run is visible
+#   5. public WebSocket      WS /competitions/{id}/arena — when WS_COMPETITION_ID identifies a
+#                            finalized competition with at least two canonical events, proves the
+#                            reverse-proxy Upgrade plus disconnect/reconnect from since_seq with an
+#                            exact, duplicate-free missing tail. Without that operator-provided id,
+#                            reports OPERATOR_ACCEPTANCE_PENDING rather than claiming acceptance.
 #
 # AC-13 restart-durability (separate BINARY GATE — run explicitly, not part of the default pass):
 #   `GET /runs/{run_id}` (router.py:694-735) loads straight from the durable store
@@ -41,25 +46,27 @@
 #   exists to probe); prefer --ac13-pre / --ac13-post around a restart you have verified yourself.
 #
 # Usage (default smoke):
-#   BASE_URL=https://api.example.com ./scripts/smoke_public.sh
+#   BASE_URL=https://api.example.com WS_COMPETITION_ID=c_... ./scripts/smoke_public.sh
 #   (defaults to http://localhost:8000 — the LOCAL compose stack's API_HOST_PORT; see
 #   compose.coolify.yml:77, .env.example:71, README.md:250-252)
 #
 # Fail-closed: an unreachable host aborts loudly (non-zero) before any checks run. BASE_URL always
 # has a value — it defaults to http://localhost:8000 rather than requiring one. Never reads or
 # prints a bearer token — every request here is deliberately UNAUTHENTICATED (that is what checks
-# 3 and AC-13 are proving).
+# 3 and AC-13 are proving). BASE_URL values containing embedded credentials are refused before the
+# target is printed.
 set -uo pipefail
 
 usage() {
   cat <<'EOF'
 Usage: smoke_public.sh [BASE_URL] [--ac13 | --ac13-pre | --ac13-post]
-  (no flag)    run the default smoke: liveness, readiness, deploy-auth, replay-visible
+  (no flag)    run liveness, readiness, deploy-auth, replay-visible, and configured WebSocket smoke
   --ac13-pre   AC-13 step 1: record a durable run_id (operator restarts the container next)
   --ac13-post  AC-13 step 2: verify the SAME run_id survived the restart
   --ac13       AC-13 single-shot: requires RESTART_CMD env (e.g. 'docker compose restart api-runtime')
 
-Env: BASE_URL (default http://localhost:8000), AC13_STATE_FILE, RESTART_CMD
+Env: BASE_URL (default http://localhost:8000), WS_COMPETITION_ID (enables WebSocket acceptance),
+     WS_TIMEOUT_SECONDS (default 15), PYTHON_BIN (default python3), AC13_STATE_FILE, RESTART_CMD
 EOF
 }
 
@@ -77,6 +84,10 @@ for arg in "$@"; do
   esac
 done
 BASE_URL="${BASE_URL:-http://localhost:8000}"
+case "$BASE_URL" in
+  *://*@*) abort_message="BASE_URL must not contain embedded credentials" ;;
+  *) abort_message="" ;;
+esac
 
 CURL_TIMEOUT=15
 BODY_FILE="$(mktemp)"
@@ -89,6 +100,8 @@ abort() {
   echo "SMOKE ABORT: $1" >&2
   exit 2
 }
+
+[ -z "$abort_message" ] || abort "$abort_message"
 
 pass() { printf '  PASS  %-10s %s\n' "$1" "$2"; }
 fail() { printf '  FAIL  %-10s %s\n' "$1" "$2" >&2; FAILURES=$((FAILURES + 1)); }
@@ -241,6 +254,24 @@ if [ "$HTTP_CODE" = "200" ]; then
   fi
 else
   fail replay-run "POST /demo/run expected 200, got $HTTP_CODE"
+fi
+
+# 5) Public WebSocket Upgrade + reconnect replay. A competition id is intentionally explicit:
+#    /demo/run does not create a competition-scoped canonical event log, and this smoke never uses
+#    or prints production credentials to create one. CI without a deployed target reports pending.
+if [ -n "${WS_COMPETITION_ID:-}" ]; then
+  PYTHON_BIN="${PYTHON_BIN:-python3}"
+  WS_TIMEOUT_SECONDS="${WS_TIMEOUT_SECONDS:-15}"
+  command -v "$PYTHON_BIN" >/dev/null 2>&1 || abort "${PYTHON_BIN} is required for WebSocket acceptance"
+  SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+  if "$PYTHON_BIN" "$SCRIPT_DIR/smoke_public_ws.py" \
+    "$BASE_URL" "$WS_COMPETITION_ID" --timeout "$WS_TIMEOUT_SECONDS"; then
+    pass websocket "public Upgrade + canonical reconnect tail verified"
+  else
+    fail websocket "public Upgrade or canonical reconnect-tail verification failed"
+  fi
+else
+  echo "OPERATOR_ACCEPTANCE_PENDING websocket: set WS_COMPETITION_ID for a finalized competition with at least two canonical events"
 fi
 
 echo "---"

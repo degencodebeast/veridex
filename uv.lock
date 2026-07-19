@@ -2749,6 +2749,7 @@ api = [
     { name = "fastapi" },
     { name = "pyjwt", extra = ["crypto"] },
     { name = "uvicorn" },
+    { name = "websockets" },
 ]
 chain = [
     { name = "solana" },
@@ -2805,6 +2806,7 @@ requires-dist = [
     { name = "solders", marker = "extra == 'chain'" },
     { name = "uvicorn", marker = "extra == 'api'", specifier = ">=0.30" },
     { name = "web3", marker = "extra == 'polymarket'" },
+    { name = "websockets", marker = "extra == 'api'", specifier = ">=15,<16" },
 ]
 provides-extras = ["postgres", "agent", "live", "api", "polymarket", "chain"]
 
