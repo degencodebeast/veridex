@@ -583,7 +583,15 @@ doctored `clv_bps` fails `metrics_recomputed` even with an intact seal
   I/O. One Memo per run, not per tick. Offline runs are honest: `anchor_status="not_anchored"`,
   the ANCHOR check reads `not_applicable` (replay) or `pending` (live), and the explorer URL
   helper returns `None` rather than a dead link (`anchor.py:53-72`). A real anchored run confirmed
-  in ~1.3 s on devnet (`README.md:108-110`).
+  in ~1.3 s on devnet. Only runs with a confirmed transaction are shown as *anchored*; others read
+  *not anchored*. Solana is **devnet**, not mainnet — mainnet anchoring is listed as next scope
+  (§17 Q4), not claimed.
+- **Scope of the commitment — stated honestly.** The anchor commits to the **run-manifest hash**
+  (run_id + evidence root + score root + proof-mode map + per-domain Merkle root-forest). Production
+  replay loads the *selected* verified pack's bytes and fixture or fails closed (§2.5), but the
+  resolved pack triple — `pack_id` + `fixture_id` + `content_hash` — is **not yet sealed into the
+  manifest / Proof Card**. Binding the selected pack identity into the anchored commitment is tracked
+  follow-up work; it is not claimed here.
 
 ### 5.4 `POST /runs/{id}/verify` — recompute fresh, report honestly
 
@@ -598,7 +606,7 @@ delegates to the trust-path core `verify_run` (`veridex/verifier/recompute.py:17
    `recompute.py:10-14`), so the reconstructed `manifest_hash` is byte-identical to the anchored
    Memo payload;
 4. fails closed: a malformed/tampered run that raises anywhere yields a structured
-   `verified=False` report with the error captured — never a 500 on the flagship endpoint
+   `verified=False` report with the error captured — never a 500 on the verify endpoint
    (`recompute.py:217-219`).
 
 The response semantics are deliberately layered: top-level `verified` reflects **evidence-prefix
@@ -1069,6 +1077,13 @@ never a pass.
 
 ## 10. Strategies — Momentum v1 and Sharp Momentum v2
 
+The product center is the provable Arena + the replay/trust core, not any single strategy. Sharp
+Momentum v2 is **one strategy in a roster**, documented here in depth because its pipeline exercises
+the propose-only contract most fully. It is not the platform's flagship — the roster also includes
+the `CumulativeDriftAgent` (the agent behind the featured 18-fixture real-data result, §12.6), the
+market-making / QuoteGuard maker, and LLM-proposer variants. Every one of them only *proposes*; the
+law scores them all the same way.
+
 ### 10.1 The strategy contract: propose, never grade
 
 Every strategy is an `Agent` with an async `decide(market_state) -> AgentAction`
@@ -1085,7 +1100,7 @@ deterministic tie-breaking (`select_momentum_action`, `momentum.py:49-92`). It i
 naive — it false-positives on ordinary volatility that merely ends higher than it started
 (`momentum.py:185-188`) — and it stays the golden-pinned baseline (§10.6).
 
-### 10.3 Sharp Momentum v2 — the flagship pipeline
+### 10.3 Sharp Momentum v2 — the sharp line-movement detector
 
 `SharpMomentumStrategy` (`momentum.py:251-433`) is a **false-positive-controlled line-movement
 shock detector**, not an oracle. Per `(market_key, side)`, each tick flows through six stages
@@ -1152,7 +1167,7 @@ Two structural properties are proven, not asserted: **determinism** (same ticks 
 `[:k+1]` equals the tick-k decision on the full tape (`test_momentum_v2.py:190-196`). Prefix
 invariance is the precise statement that no decision ever depended on a future tick.
 
-### 10.5 Proposer-only, even for the flagship
+### 10.5 Proposer-only, even for the sharpest detector
 
 v2's z-scores and `claimed_edge_bps` (`int(round(z*100))`, `momentum.py:427`) are **untrusted UX
 metadata** like any agent's claims — surfaced in the Inspector's fenced block, never scored
@@ -1167,7 +1182,7 @@ v1 remains the default and keeps its agent id (`momentum`); v2 is a separate age
 fixtures pin sealed bytes that include v1's config-hash inputs — renaming or replacing v1 would
 have invalidated the byte-for-byte baseline that guards the *seal path* during exactly the period
 when the runtime was being rebuilt. Deliberate choice: **the byte-pinned goldens outrank naming
-purity.** The flagship demo runs v2 explicitly (`scripts/demo_phase2d.py:45, 58`).
+purity.** The offline demo runs v2 explicitly (`scripts/demo_phase2d.py:45, 58`).
 
 ---
 
@@ -1290,7 +1305,7 @@ fabricated number (`report.py:17-20, 169-170`).
 
 ### 12.2 The real-data experiment — design
 
-After the synthetic pipeline was proven, the flagship was pointed at reality exactly once
+After the synthetic pipeline was proven, Sharp Momentum v2 was pointed at reality exactly once
 (task T22-real; the public account is `README.md:68-81` and `docs/submission.md:47-57`):
 
 - **Data**: the full real TxLINE odds history for a finished World Cup fixture — **USA v Bosnia,
@@ -1299,8 +1314,9 @@ After the synthetic pipeline was proven, the flagship was pointed at reality exa
   `docs/txline-feedback.md:11-14, 21-32`).
 - **Packaging**: a content-hashed ReplayPack via the same `pack_from_session` transform (§2.5).
 - **Protocol**: run Sharp Momentum v2 through the sealed pipeline **once — no tuning, no fixture
-  shopping**. The raw vendor odds stay local (licensed data, not redistributed;
-  `docs/submission.md:72`); what ships is the pipeline, the fixes, and the sealed-proof
+  shopping**. The bounded curated genuine ReplayPack (a 400-record prefix per fixture) is
+  included with TxODDS's confirmation; the full multi-GB raw capture stays local (see
+  `docs/submission.md`). What ships is the pipeline, the fixes, and the sealed-proof
   discipline.
 
 ### 12.3 What happened — in three honest parts
@@ -1338,8 +1354,8 @@ the leaderboard and report surfaces the same day (§4.5).
 
 It would have been trivial to impute a close, count WAITs as confidence sample, or lead with the
 synthetic demo's rosy number. Instead the run surfaced two real bugs, both were fixed, the
-pipeline was re-run once, and the result was reported as the data said it. **You cannot fake a win
-on Veridex — and Veridex didn't fake its own.** A platform whose whole thesis is "agents can't
+pipeline was re-run once, and the result was reported as the data said it. **A win on Veridex has to
+be earned from sealed evidence — and Veridex held its own agent to that bar.** A platform whose whole thesis is "agents can't
 grade themselves" must be willing to publish its own agent's honest zero.
 
 ### 12.5 The predeclared strategy roadmap
@@ -1359,9 +1375,8 @@ are what happens.
 
 ### 12.6 Run-001 & Run-002 — the roadmap executed (18-fixture strategy results)
 
-The §12.5 roadmap was then run. Both results are recorded cold in the research record
-(`.omc/research/run-001-run-note.md`, `run-002-run-note.md`); the honest framing below is the same
-one the docs and UI carry.
+The §12.5 roadmap was then run. Both results are recorded cold in the research record;
+the honest framing below is the same one the docs and UI carry.
 
 **Run-001 — candidate rung-1 CLV signal.** Across **18 finished World Cup fixtures** (market-quality-filtered
 eligible universe, pre-kickoff decisions, CLV vs the CON-040 kickoff close), the `CumulativeDriftAgent`
@@ -1374,7 +1389,7 @@ effective *n* ≈ 18 fixtures (the ~19.7k drift picks are autocorrelated intra-m
 taken **out-of-sample (OOS)** — did **not** reproduce it: on the circular TxLINE-close metric the sign flipped
 hard negative (in-sample +162 → OOS −254 bps, fixture-clustered) and on **independent settled outcomes**
 it was **NULL** (≈0), at only **N=2 effective fixtures** (the ~800 OU picks collapse to two match totals),
-so it is kept as a benchmark, not a promoted edge (`.omc/research/drift-oos-test.md`). The runner
+so it is kept as a benchmark, not a promoted edge. The runner
 self-verifies against a pre-run stamp and
 reproduced the committed eligible-universe hash exactly (`universe_verified: True`).
 
@@ -1396,7 +1411,7 @@ ends of the seam; only the real run exercised the correspondence.
 Polymarket normalization (the decisive test — if the ramp collapses, much of it was a scale artifact);
 measure divergence over *all* matched decisions (not just drift's fired picks); a later-price
 convergence test; bid/ask/depth instead of mids; a larger fixture sample. The instrument did its job —
-it built the venue lane, priced the decisions, and made it impossible to mistake a structural artifact
+it built the venue lane, priced the decisions, and made it hard to mistake a structural artifact
 for alpha; the rung-2 verdict is a sober *not-demonstrated*, with a well-posed falsifiable question
 left on the ledger.
 
@@ -1586,7 +1601,7 @@ sheet.
 
 Likely hostile questions, with the honest answers and the code behind them.
 
-**Q1. Your flagship made zero picks on real data — why should we care?**
+**Q1. Sharp Momentum v2 made zero picks on real data — why should we care?**
 Because that null is the product working. Veridex's claim is not "our strategy has edge" — it is
 "you can *verify* what an agent did." On real data the platform (a) correctly declined to fire a
 shock detector on smooth drift (max z 1.13 vs a 2.5 gate), (b) exposed and fixed two real bugs (a
@@ -1695,7 +1710,7 @@ You should — and the system makes sure you do. True CLV needs the real closing
 `pre_match` window (with a complete reconstructed close) has. Any other window closes on the
 in-play line at window end, so its value is measured against a *different* reference — it's named
 `window_clv_bps`, physically replaces `clv_bps` on the row, aggregates separately, and never
-enters the rank axis (§3.2, §4.4). The mode label can't lie because the field name can't.
+enters the rank axis (§3.2, §4.4). The label is structural: the field name *is* the metric, so a window value can't be shown as if it were a true closing-line CLV.
 
 **Q16. Why Polymarket, and why is the client vendored?**
 Polymarket is a real, liquid, programmatically-accessible venue with World Cup markets — the
