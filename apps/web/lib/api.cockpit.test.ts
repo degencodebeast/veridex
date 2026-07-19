@@ -109,6 +109,23 @@ describe('F-5 · adaptCompetitionState binds the competition-scoped leaderboard 
     expect(s.receipts[0].settled_at).toBeNull();        // honest null preserved
   });
 
+  it('maps a human-blocked receipt (awaiting_human) to a pre-approval status — NEVER overstates approval', () => {
+    // Backend lifecycle (veridex/execution/models.py): law_approved → awaiting_human → policy_approved.
+    // `awaiting_human` is BLOCKED waiting for a human — strictly BEFORE policy_approved. Rendering it as
+    // policy_approved (or anything downstream) would claim an approval that has not happened.
+    const s = adaptCompetitionState(wireWith({
+      execution: {
+        receipts: [{
+          execution_id: 'exec-h', venue: 'sxbet', market_ref: '1X2:FRA', side: 'back',
+          requested_size: 10, filled_size: 0, price: 1.5, status: 'awaiting_human',
+          venue_order_id: null, mode: 'paper', submitted_at: null, settled_at: null,
+        }],
+      } as unknown as Record<string, unknown>,
+    }));
+    expect(s.receipts[0].status).not.toBe('policy_approved'); // never overstate the human gate
+    expect(s.receipts[0].status).toBe('law_approved');        // last provably-reached state pre-human
+  });
+
   it('T-2 honest-empty: no leaderboard rows + null execution ⇒ empty, never a fixture', () => {
     const s = adaptCompetitionState(wireWith({ leaderboard: [], execution: null }));
     expect(s.leaderboard).toEqual([]);

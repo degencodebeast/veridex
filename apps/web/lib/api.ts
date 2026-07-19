@@ -195,7 +195,10 @@ function toReceiptStatus(s: string): ReceiptStatus {
       return s;
     case 'accepted': case 'partial': return 'submitted';
     case 'settled': return 'filled';
-    case 'awaiting_human': return 'policy_approved';
+    // awaiting_human is BLOCKED waiting for a human, strictly BEFORE policy_approved (models.py
+    // transition graph: law_approved → awaiting_human → policy_approved). Render its last provably-
+    // reached state, law_approved — NEVER policy_approved, which would claim an approval not yet given.
+    case 'awaiting_human': return 'law_approved';
     case 'expired': case 'voided': case 'unresolved': return 'cancelled';
     default: return 'proposed';
   }
