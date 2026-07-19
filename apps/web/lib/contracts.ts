@@ -140,6 +140,17 @@ export interface MakerProofCard {
   falsification: MakerFalsification;
 }
 
+// AC-30/AC-31 (Gate-B REQ-026/027/052/053) — a displayed historical entry/exit capacity claim. It is
+// ALWAYS a third-party print or a recomputed counterfactual ceiling: `capacity_usd` is BOUNDED by
+// `matched_observed_liquidity_usd` and can NEVER render as our own fill / receipt / PnL / rank /
+// Gate-B authority. Absent (undefined/null) on the sealed MM-R1 arena result — no such claim exists
+// there — so the maker surfaces render exactly as before unless a claim is explicitly present.
+export interface MakerCapacityClaim {
+  kind: 'observed_market_print' | 'counterfactual';
+  capacity_usd: number;                  // the raw wanted/printed size — a wish, not a fill
+  matched_observed_liquidity_usd: number; // the observed ceiling the display is bounded DOWN to
+}
+
 // The assembled MAKER snapshot the (future) maker screen would render — Maker-prefixed, never routed
 // through the taker/CLV LeaderboardRow adapter.
 export interface MakerArenaResultView {
@@ -165,6 +176,9 @@ export interface MakerArenaResultView {
     avg_toxicity_loss_bps_label: string;
     real_executable_edge_bps_label: string;
   };
+  // AC-30/AC-31: an OPTIONAL historical entry/exit capacity claim. Always a bounded, LABELED
+  // counterfactual — never our fill/PnL/rank. Null/absent on the sealed MM-R1 fixture.
+  historical_capacity?: MakerCapacityClaim | null;
 }
 
 // ── QuoteGuard Behavior Ablation (F-8 · maker_live_ab.v1) ───────────────────────────────────────
