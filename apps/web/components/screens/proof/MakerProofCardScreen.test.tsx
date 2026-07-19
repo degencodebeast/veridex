@@ -37,6 +37,14 @@ describe('MakerProofCardScreen (Maker Arena MM-R1)', () => {
     expect(screen.getByRole('link', { name: /maker leaderboard/i })).toHaveAttribute('href', '/leaderboard?lane=maker');
   });
 
+  it('F-8: offers a QuoteGuard behavior-ablation entry point (deep-link, keyed by identity, not a rank)', () => {
+    render(<MakerProofCardScreen result={MAKER_ARENA_RESULT} agentId="txline-fair-mm" />);
+    const entry = screen.getByTestId('maker-proof-ablation-entry');
+    expect(entry).toHaveAttribute('href', '/proof/maker-ablation/txline-fair-mm');
+    expect(entry).toHaveTextContent(/behavior ablation/i);
+    expect(entry).toHaveTextContent(/not rank or profit/i);
+  });
+
   it('SEC-005: never imports/reuses the directional CLV ProofArtifact type', () => {
     const src = readFileSync(resolve(__dirname, './MakerProofCardScreen.tsx'), 'utf8');
     const importLines = src.split('\n').filter((l) => l.trim().startsWith('import'));

@@ -25,6 +25,7 @@ import { VERIFIER_VERSION, type StatusBarState } from '@/lib/status';
 import type * as W from '@/lib/wire';
 import type {
   AnchorInfo, AnchorStatus, CheckResult, CockpitState, ExecutionMode, FeedHealthState,
+  GuardAblationArm, GuardAblationDecision, GuardAblationLeg, GuardAblationView,
   InspectorRecord, LeaderboardRow, MakerArenaResultView, MakerLeaderboardRow, MatchState,
   PerformanceMetrics, ProofArtifact, ProofMode, SourceMode, VerifyResult,
 } from '@/lib/contracts';
@@ -69,6 +70,13 @@ export const PATHS = {
     `/agents/instances/${instanceId}/runtime-events?since=${since}` + (limit != null ? `&limit=${limit}` : ''),
   // MAKER lane: the sealed maker_arena_result.v1 envelope (quote-quality, toxicity-ranked).
   makerArenaResult: () => `/maker/arena-result`,
+  // F-8 QuoteGuard behavior ablation (maker_live_ab.v1). Read-only, public, per-instance. 404s
+  // (honest "no ablation for this instance") until an ablation provider is wired for the instance.
+  makerLiveAb: (instanceId: string) => `/maker/live-ab/${encodeURIComponent(instanceId)}`,
+  // F-4 competition lifecycle (owner-scoped POSTs): create → register roster entry → start.
+  competitions: () => `/competitions`,
+  competitionAgents: (id: string) => `/competitions/${id}/agents`,
+  competitionStart: (id: string) => `/competitions/${id}/start`,
   // I-2 owner-scoped deployed instances. Bearer-authed GETs; the backend 401s anon
   // (require_principal), returns ONLY the caller's own rows, and 403/404s a non-owner.
   agentInstances: () => `/agents/instances`,
@@ -492,6 +500,139 @@ export async function getLeaderboard(competitionId?: string): Promise<Leaderboar
   return adaptLeaderboard(await getJson<W.LeaderboardResponse>(PATHS.leaderboard(competitionId)));
 }
 
+// ---- QuoteGuard behavior ablation (F-8 · maker_live_ab.v1) ----
+//
+// The guard OFF vs ON behavior ablation for a maker instance. It is a BEHAVIOR comparison (does the
+// guard change the decision on the same recorded tape?), NEVER a rank / toxicity / edge / winner —
+// the wire envelope carries no such field and this adapter never synthesizes one. 404 is a REAL,
+// honest state ("no recorded ablation for this instance"), distinct from a transport error: the
+// reader returns `null` on 404 and THROWS on any other non-ok so the screen renders the two states
+// differently (unavailable vs error+retry), never a fabricated ablation (T-2 fixture prohibition).
+
+/** Wire shape of one ablation arm (guard_off / guard_on) — the backend `_project_arm` dict. */
+interface GuardAblationArmWire {
+  guard_enabled?: boolean;
+  terminal_reason?: string | null;
+  observations_consumed?: number;
+  decisions?: {
+    index?: number;
+    kind?: string;
+    reason_codes?: string[];
+    legs?: { kind?: string; role?: string; price?: number | null; post_only?: boolean }[];
+  }[];
+}
+
+/** Wire shape of the `GET /maker/live-ab/{instance_id}` envelope (LiveGuardAblationResponse). */
+interface GuardAblationResponseWire {
+  schema_version?: string;
+  lane?: string;
+  panel?: string;
+  is_ablation?: boolean;
+  instance_id: string;
+  mode: string;
+  guard_off: GuardAblationArmWire;
+  guard_on: GuardAblationArmWire;
+  divergent_frame_indices?: number[];
+  diverges?: boolean;
+  labels?: Record<string, string>;
+}
+
+function adaptGuardAblationLeg(l: NonNullable<NonNullable<GuardAblationArmWire['decisions']>[number]['legs']>[number]): GuardAblationLeg {
+  return {
+    kind: String(l.kind ?? ''),
+    role: String(l.role ?? ''),
+    // price is honest: a real number when priced, null otherwise — NEVER coerced to 0 (a 0 odds
+    // would be a fabricated quote). typeof-guard so a wire null/undefined stays null.
+    price: typeof l.price === 'number' ? l.price : null,
+    post_only: l.post_only === true,
+  };
+}
+
+function adaptGuardAblationArm(a: GuardAblationArmWire): GuardAblationArm {
+  return {
+    guard_enabled: a.guard_enabled === true,
+    terminal_reason: a.terminal_reason ?? null, // null = honest "no terminal reason", never invented
+    observations_consumed: a.observations_consumed ?? 0,
+    decisions: (a.decisions ?? []).map((d): GuardAblationDecision => ({
+      index: d.index ?? 0,
+      kind: String(d.kind ?? ''),
+      reason_codes: d.reason_codes ?? [],
+      legs: (d.legs ?? []).map(adaptGuardAblationLeg),
+    })),
+  };
+}
+
+export function adaptGuardAblation(w: GuardAblationResponseWire): GuardAblationView {
+  return {
+    schema_version: w.schema_version ?? 'maker_live_ab.v1',
+    lane: w.lane ?? 'maker',
+    panel: w.panel ?? 'guard_on_off_ablation',
+    is_ablation: w.is_ablation !== false,
+    instance_id: w.instance_id,
+    mode: w.mode,
+    guard_off: adaptGuardAblationArm(w.guard_off),
+    guard_on: adaptGuardAblationArm(w.guard_on),
+    divergent_frame_indices: w.divergent_frame_indices ?? [],
+    diverges: w.diverges === true,
+    labels: w.labels ?? {},
+  };
+}
+
+// DEMO ablation for MOCK MODE only (recorded replay — never a live claim; the app-wide "DEMO DATA ·
+// MOCK MODE" indicator makes this honest). Divergent example: the guard suppresses a toxic quote on
+// three frames. Live (mock off) NEVER falls back to this — it 404s → null (unavailable) honestly.
+const MOCK_GUARD_ABLATION: GuardAblationView = {
+  schema_version: 'maker_live_ab.v1', lane: 'maker', panel: 'guard_on_off_ablation', is_ablation: true,
+  instance_id: 'mm-inst-0f74a4', mode: 'replay',
+  guard_off: {
+    guard_enabled: false, terminal_reason: 'tape_exhausted', observations_consumed: 1024,
+    decisions: [
+      { index: 211, kind: 'QUOTE', reason_codes: ['spread_ok'], legs: [
+        { kind: 'BID', role: 'maker', price: 2.34, post_only: true },
+        { kind: 'ASK', role: 'maker', price: 2.51, post_only: true }] },
+      { index: 212, kind: 'QUOTE', reason_codes: ['wide_ok', 'inv_room'], legs: [
+        { kind: 'BID', role: 'maker', price: 2.34, post_only: true },
+        { kind: 'ASK', role: 'maker', price: 2.51, post_only: true }] },
+      { index: 213, kind: 'QUOTE', reason_codes: ['wide_ok'], legs: [
+        { kind: 'BID', role: 'maker', price: 2.30, post_only: true }] },
+      { index: 214, kind: 'QUOTE', reason_codes: ['spread_ok'], legs: [] },
+      { index: 640, kind: 'QUOTE', reason_codes: ['wide_ok'], legs: [
+        { kind: 'BID', role: 'maker', price: 1.98, post_only: true }] },
+    ],
+  },
+  guard_on: {
+    guard_enabled: true, terminal_reason: 'guard_halt', observations_consumed: 1024,
+    decisions: [
+      { index: 211, kind: 'QUOTE', reason_codes: ['spread_ok'], legs: [
+        { kind: 'BID', role: 'maker', price: 2.34, post_only: true },
+        { kind: 'ASK', role: 'maker', price: 2.51, post_only: true }] },
+      { index: 212, kind: 'SUPPRESS', reason_codes: ['guard_toxicity_block'], legs: [] },
+      { index: 213, kind: 'SUPPRESS', reason_codes: ['guard_cooldown'], legs: [] },
+      { index: 214, kind: 'QUOTE', reason_codes: ['spread_ok'], legs: [] },
+      { index: 640, kind: 'SUPPRESS', reason_codes: ['guard_toxicity_block'], legs: [] },
+    ],
+  },
+  divergent_frame_indices: [212, 213, 640], diverges: true,
+  labels: {
+    panel_kind: 'behavior_ablation_guard_off_vs_on',
+    comparison_basis: 'same strategy, same pinned tape — only the QuoteGuard arm differs',
+    panel_disclaimer: 'this demonstrates the guard CHANGES behavior; it is NOT a rank / toxicity / performance ordering / winner and is never conflated with the sealed historical maker leaderboard',
+    divergence_scope: 'divergence is what the two arms actually did on this tape — expected on the pinned adversarial trigger frame, may be empty on a quiescent stretch; never a promise the guard always diverges',
+  },
+};
+
+// GET /maker/live-ab/{instanceId} → the guard behavior ablation, or `null` when the backend has no
+// recorded ablation for the instance (404 — an honest "unavailable" state, NOT an error). Any other
+// non-ok THROWS ApiError so the screen shows its error/retry state with no fabricated values. Mock ⇒
+// the DEMO ablation (recorded replay). The route is public (read-only), so a plain accept-JSON GET.
+export async function getMakerLiveAb(instanceId: string): Promise<GuardAblationView | null> {
+  if (isMockEnabled()) return MOCK_GUARD_ABLATION;
+  const res = await fetch(resolveApiUrl(PATHS.makerLiveAb(instanceId)), { headers: { accept: 'application/json' } });
+  if (res.status === 404) return null; // honest "no recorded ablation for this instance"
+  if (!res.ok) throw new ApiError(res.status, `GET ${PATHS.makerLiveAb(instanceId)} failed: ${res.status}`);
+  return adaptGuardAblation((await res.json()) as GuardAblationResponseWire);
+}
+
 // GET /maker/arena-result → maker view-model (SEC-005: never routed through the CLV leaderboard).
 // Mock ⇒ the canonical maker fixture (REPLAY, never LIVE), through the SAME adapter.
 export async function getMakerArenaResult(): Promise<MakerArenaResultView> {
@@ -856,6 +997,78 @@ export async function armCompetitionKillSwitch(competitionId: string): Promise<K
   const res = await authedFetch(path, undefined); // POST, no body
   if (!res.ok) throw new ApiError(res.status, `POST ${path} failed: ${res.status}`);
   return (await res.json()) as KillSwitchResult;
+}
+
+// ---- Competition lifecycle (F-4 · create → register roster → start) ----
+//
+// The Create-Competition wizard's launch flow. All three are OWNER-scoped POSTs (auth-contract@1):
+// the bearer is attached when the seam has a token (never fabricated) and the request retries once
+// on a 401 (authedFetch). The backend derives the owner from the verified Privy principal — a
+// client-supplied owner cannot reach it. Roster entries are INSTANCE-BOUND: each entry references a
+// Studio-deployed instance via `instance_id`, and the arena runs the ACTUAL deployed contestant
+// (pinned config_hash), never a same-named reconstruction. These bind `POST /competitions` →
+// `POST /competitions/{id}/agents` (one entry per instance) → `POST /competitions/{id}/start`, NOT
+// the separate strict intrinsic-arena endpoint (which rejects instance-bound entries).
+
+/** The CompetitionConfig POST /competitions freezes (mirrors veridex CompetitionConfig, create subset). */
+export interface CompetitionConfigPayload {
+  competition_type: string;
+  source_mode: 'replay' | 'live';
+  execution_mode: ExecutionMode;
+  market_scope: string;
+  scoring_window: string | null;
+  roster_size: number; // ge=2 (backend Field constraint) — the wizard guards this before firing
+}
+
+/** One instance-bound roster entry POST /competitions/{id}/agents registers (mirrors AgentEntry). */
+export interface RosterEntryPayload {
+  agent_id: string;
+  owner: string;
+  strategy: string;
+  model: string | null;
+  proof_mode: string; // backend re-normalises to the two canonical values; sent advisory
+  config_hash: string | null; // pins the referenced instance's config identity (I-7)
+  execution_eligibility: boolean;
+  instance_id: string | null; // the deployed-instance binding — the roster trust core
+}
+
+/** POST /competitions response (CompetitionCreateResponse). */
+export interface CompetitionCreateResult { competition_id: string; status: string }
+/** POST /competitions/{id}/agents response (AgentRegisterResponse). */
+export interface AgentRegisterResult { agent_id: string; config_hash: string | null; proof_mode: string }
+/** POST /competitions/{id}/start response (CompetitionStartResponse). */
+export interface CompetitionStartResult { competition_id: string; status: string; run_id: string | null }
+
+/** Create a DRAFT competition owned by the authenticated principal. Throws ApiError on non-ok. */
+export async function createCompetition(config: CompetitionConfigPayload): Promise<CompetitionCreateResult> {
+  const res = await authedFetch(PATHS.competitions(), config);
+  if (!res.ok) throw new ApiError(res.status, `POST ${PATHS.competitions()} failed: ${res.status}`);
+  return (await res.json()) as CompetitionCreateResult;
+}
+
+/**
+ * Register ONE instance-bound roster entry. Throws ApiError carrying the real status so the launch
+ * progression can distinguish a per-instance failure (403 not-owner / 404 absent / 409 roster
+ * frozen-or-full / 400 domain) and offer retry-that-one or start-with-the-rest — never a fabricated
+ * success. The backend fail-closes each of those before any roster mutation.
+ */
+export async function registerRosterAgent(
+  competitionId: string, entry: RosterEntryPayload,
+): Promise<AgentRegisterResult> {
+  const res = await authedFetch(PATHS.competitionAgents(competitionId), entry);
+  if (!res.ok) throw new ApiError(res.status, `POST ${PATHS.competitionAgents(competitionId)} failed: ${res.status}`);
+  return (await res.json()) as AgentRegisterResult;
+}
+
+/**
+ * Start the competition (freezes scoring law, source mode, roster, execution mode for the run) and
+ * return the finalized handle. Throws ApiError on non-ok (404 unknown / 409 already started / 401/403
+ * control-plane for non-paper / 501 live venue disabled) — the caller surfaces it, never fakes a run.
+ */
+export async function startCompetition(competitionId: string): Promise<CompetitionStartResult> {
+  const res = await authedFetch(PATHS.competitionStart(competitionId), undefined);
+  if (!res.ok) throw new ApiError(res.status, `POST ${PATHS.competitionStart(competitionId)} failed: ${res.status}`);
+  return (await res.json()) as CompetitionStartResult;
 }
 
 // MOCK status-bar seed (sync): when mock is on, the status bar populates app-wide from the mock

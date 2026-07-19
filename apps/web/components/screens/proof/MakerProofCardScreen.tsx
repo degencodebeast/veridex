@@ -112,6 +112,20 @@ export function MakerProofCardScreen({ result, agentId }: { result: MakerArenaRe
         </div>
       </section>
 
+      {/* QuoteGuard behavior ablation entry (F-8) — a contextual deep-link to the guard OFF vs ON
+          BEHAVIOR comparison. It is not a rank/profit surface; the link is keyed by the card's
+          identity and honestly resolves to "no recorded ablation" until one exists for the instance. */}
+      <Link href={`/proof/maker-ablation/${agentId}`} className={styles.ablationEntry} data-testid="maker-proof-ablation-entry">
+        <div className={styles.ablationText}>
+          <div className={styles.ablationTitleRow}>
+            <span className={styles.ablationTitle}>QuoteGuard behavior ablation</span>
+            <Badge variant="behavior-ablation">BEHAVIOR ABLATION</Badge>
+          </div>
+          <span className={styles.ablationBlurb}>same strategy &amp; tape, guard OFF vs ON — behavior only, not rank or profit</span>
+        </div>
+        <span className={styles.ablationOpen}>OPEN →</span>
+      </Link>
+
       {/* Honest-empty future rungs (MM-R1 only — no invented R1.5/R2 UI). */}
       <div className={styles.futureGrid}>
         <div className={styles.futureCard} data-testid="maker-proof-empty-rung">

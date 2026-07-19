@@ -90,6 +90,22 @@ export const GLOSSARY = {
     label: 'Config Hash',
     definition: 'hash of the exact sealed maker-arena configuration that produced this result — identifies which configuration was scored, never a performance claim.',
   },
+  quoteguard_ablation: {
+    label: 'QuoteGuard ablation',
+    definition: 'same strategy on the same recorded tape with QuoteGuard OFF then ON; shows whether the guard changes behavior — never a rank, toxicity ordering, PnL, edge, or winner.',
+  },
+  divergent_frame: {
+    label: 'Divergent frame',
+    definition: 'a frame index where the guard OFF and guard ON arms took a different decision on the same observation; empty when the guard never changed a decision on this tape.',
+  },
+  terminal_reason: {
+    label: 'Terminal reason',
+    definition: 'why an arm stopped consuming the tape (e.g. tape_exhausted, guard_halt); descriptive of the run\'s end, never a score or verdict.',
+  },
+  post_only_leg: {
+    label: 'post_only leg',
+    definition: 'a quote leg posted as maker-only (never crosses the spread); a behavior attribute of the decision, not a fill or an edge claim.',
+  },
 } as const satisfies Record<string, GlossaryEntry>;
 
 export type GlossaryTerm = keyof typeof GLOSSARY;
