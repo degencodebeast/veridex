@@ -492,3 +492,32 @@ def test_m2_startup_folded_capture_pack_is_immutable_but_curated_is_not_copied(t
     assert verify_content_hash(served.pack_dir) is True
     assert is_genuine_pack(served.pack_dir) is True
     assert served.is_genuine is True
+
+
+def test_startup_fold_refuses_directory_symlink_escape_out_of_capture_root(tmp_path: Path) -> None:
+    """Codex R-2 re-gate PoC: a directory SYMLINK inside the capture root pointing to a valid pack in a
+    SIBLING ``outside/`` dir must be EXCLUDED at STARTUP (the startup equivalent of the M1 escape) —
+    ``_iter_pack_dirs`` would otherwise follow the symlink out of the writable capture volume. The
+    confinement is symmetric with the runtime ``register_pack`` path (resolve → must be under capture)."""
+    curated = tmp_path / "curated"
+    curated.mkdir()
+    _copy_real_pack(curated / "seed")  # a curated seed — admitted via the curated path, unaffected
+    capture = tmp_path / "capture"
+    capture.mkdir()
+    _make_synthetic_pack(tmp_path, "capture/genuine", fixture_id=31)  # genuinely under capture -> admitted
+
+    # A valid pack in a SIBLING outside dir, reachable via a DIRECTORY symlink INSIDE the capture root.
+    outside_real = _make_synthetic_pack(tmp_path, "outside/real", fixture_id=44)
+    os.symlink(outside_real, capture / "escaped")  # dir symlink escaping the capture volume
+    assert (capture / "escaped").resolve() == outside_real.resolve()
+    assert verify_content_hash(outside_real) is True  # the escaped target is itself a valid pack
+    assert capture.resolve() not in outside_real.resolve().parents  # source resolves OUTSIDE capture
+
+    catalog = build_catalog(curated, capture_root=capture)
+
+    # The symlink-escaped pack is EXCLUDED (fail-closed, skipped — the scan does not admit it).
+    assert "escaped" not in catalog
+    assert catalog.get("escaped") is None
+    # The genuinely-under-capture pack IS admitted; the curated seed still admits.
+    assert "genuine" in catalog
+    assert catalog.get("seed") is not None

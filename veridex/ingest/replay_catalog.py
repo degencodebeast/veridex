@@ -406,6 +406,12 @@ class ReplayCatalog:
             # capture pack never costs an owned-copy write.
             if source_dir.name in self._entries:
                 continue
+            # Capture-root confinement (symmetric with register_pack's _require_within_capture_root): a
+            # DIRECTORY SYMLINK in the capture root that _iter_pack_dirs followed OUT of the volume
+            # resolves outside the capture root — EXCLUDE it (fail-closed, skip). A startup scan drops a
+            # bad/escaping pack rather than aborting the whole catalog, so it is never owned/served.
+            if not self._resolves_under_capture(source_dir):
+                continue
             entry = self._own_and_verify(source_dir)
             if entry is not None:
                 self._entries[entry.pack_id] = entry
@@ -424,6 +430,23 @@ class ReplayCatalog:
             # this only decides whether the under-curated-root SHORTCUT refusal applies.
             return False
         return resolved == curated or curated in resolved.parents
+
+    def _resolves_under_capture(self, path: Path) -> bool:
+        """Return ``True`` iff ``path`` is the writable capture root or lives beneath it (resolve-following).
+
+        The boolean form of the runtime :meth:`_require_within_capture_root` confinement, used by the
+        startup fold to EXCLUDE (rather than raise on) a capture-root candidate that resolves outside the
+        volume — e.g. a directory symlink escape. ``.resolve()`` follows symlinks; an unresolvable path or
+        an unconfigured capture root is fail-closed to ``False`` (not provably under the capture root).
+        """
+        if self._capture_root is None:
+            return False
+        try:
+            resolved = path.resolve()
+            capture = self._capture_root.resolve()
+        except OSError:
+            return False
+        return resolved == capture or capture in resolved.parents
 
 
 def build_catalog(
