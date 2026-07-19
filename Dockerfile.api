@@ -14,7 +14,7 @@ WORKDIR /app
 COPY pyproject.toml ./
 COPY veridex ./veridex
 COPY veridex_agent ./veridex_agent
-RUN pip install --no-cache-dir ".[api,postgres,live]"
+RUN pip install --no-cache-dir ".[api,postgres,live,agent]"
 
 # Network binding (overridable). The process is the isolation boundary, so bind all interfaces.
 ENV HOST=0.0.0.0 \
