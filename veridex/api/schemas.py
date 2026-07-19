@@ -14,7 +14,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, StrictInt
 
 
 class ExplainRequest(BaseModel):
@@ -360,6 +360,11 @@ class BacktestRunRequest(BaseModel):
     Attributes:
         pack_id: The R-2 catalog key of the ReplayPack to replay (resolved SERVER-side; unknown -> 404).
         fixture_id: The fixture within the pack to replay (must be catalogued for the pack; else 422).
+            STRICT (``StrictInt``): a JSON bool is REJECTED (422), never coerced. A coercive ``int`` would
+            normalize ``true``/``false`` to ``1``/``0``, and since ``True == 1`` / ``False == 0`` the
+            catalog-membership guard would then admit the bool as the requested fixture identity — the
+            exact bool-as-fixture-id alias R-2 excludes from the catalog, reintroduced at the browser
+            boundary. Strictness rejects it BEFORE the identity is claimed to be catalog-validated.
         window_id: Stable id for the coverage window (echoed onto the report).
         market_allowlist: Market-key prefixes the window scores (the report's ``market_universe``).
         end_rule: Window close rule — ``"pre_match"`` (default), ``"fixed_duration"``, or ``"manual_stop"``.
@@ -370,7 +375,9 @@ class BacktestRunRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     pack_id: str
-    fixture_id: int
+    # StrictInt so a JSON bool (``true``/``false``) is a hard 422 at the request boundary — never coerced
+    # to 1/0 and aliased into a catalogued fixture id (identity-admission defect; Codex R-3 gate).
+    fixture_id: StrictInt
     window_id: str
     market_allowlist: list[str]
     end_rule: str = "pre_match"

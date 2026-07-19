@@ -207,3 +207,63 @@ def test_backtest_fixture_not_in_pack_is_422(tmp_path: Path) -> None:
         },
     )
     assert resp.status_code == 422, resp.text
+
+
+# --- (e) fixture_id is STRICT — a JSON bool is REJECTED at the request boundary --
+#
+# Codex R-3 gate PoC: a COERCIVE Pydantic ``int`` normalizes JSON ``true``/``false`` to ``1``/``0``,
+# and (since ``True == 1`` / ``False == 0``) the catalog-membership guard would then admit the bool as
+# the requested fixture identity — the exact bool-as-fixture-id alias R-2 excludes from the catalog,
+# reintroduced at the BROWSER boundary. Building the catalog with fixtures {0, 1} present means MEMBERSHIP
+# alone would accept the coerced bool, so it is the STRICTNESS (not the membership guard) that must reject.
+
+
+def _build_pack_with_fixtures(tmp_path: Path, fixture_ids: tuple[int, ...]) -> Path:
+    """Build one hashed ReplayPack whose catalogued fixtures are exactly ``fixture_ids``."""
+    session_dir = tmp_path / "session"
+    session_dir.mkdir()
+    lines: list[str] = []
+    seq = 100
+    for fid in fixture_ids:
+        base_ts = 100_000 + fid * 1_000_000  # distinct ts range per fixture (no cross-fixture collision)
+        for i in range(6):
+            rec = _ou_record(base_ts + i * 10_000, 60.0 + i * 0.5)
+            rec["FixtureId"] = fid
+            lines.append(envelope_line(rec, seq))
+            seq += 10
+    (session_dir / "records.jsonl").write_text("\n".join(lines) + "\n")
+    (session_dir / "meta.json").write_text(
+        SessionMeta(started_ts=99, endpoints=["/odds/stream"], tool_version="t").model_dump_json()
+    )
+    out_dir = tmp_path / "curated"
+    pack_from_session(session_dir, out_dir)
+    return out_dir
+
+
+def _post_fixture(client: TestClient, pack_id: str, fixture_id: object) -> int:
+    return client.post(
+        "/backtests",
+        json={
+            "pack_id": pack_id,
+            "fixture_id": fixture_id,
+            "window_id": "w_api",
+            "market_allowlist": ["OU"],
+            "end_rule": "pre_match",
+            "min_clv_horizon_s": 0,
+        },
+    ).status_code
+
+
+def test_backtest_fixture_id_json_true_false_rejected_even_with_catalog_1_and_0(tmp_path: Path) -> None:
+    pack_dir = _build_pack_with_fixtures(tmp_path, (0, 1))
+    catalog = build_catalog(str(pack_dir))
+    # Precondition: fixtures 0 AND 1 are catalogued — so membership alone would admit coerced True/False.
+    assert set(catalog.get(pack_dir.name).fixtures) >= {0, 1}
+    client = TestClient(create_app(store=InMemoryStore(), replay_catalog=catalog))
+
+    # JSON bool must be rejected at the boundary (422) — NOT coerced to 1/0 and admitted (pre-fix: 200).
+    assert _post_fixture(client, pack_dir.name, True) == 422
+    assert _post_fixture(client, pack_dir.name, False) == 422
+    # An ordinary int fixture id genuinely in the pack is STILL accepted.
+    assert _post_fixture(client, pack_dir.name, 1) == 200
+    assert _post_fixture(client, pack_dir.name, 0) == 200
