@@ -8,10 +8,11 @@ import { SegmentedControl } from '@/components/ui/SegmentedControl';
 import { InfoTip } from '@/components/ui/InfoTip';
 import { rankByAvgClv } from '@/lib/derive';
 import { LEADERBOARD_ROWS } from '@/lib/fixtures/catalog';
-import { MAKER_ARENA_RESULT, MAKER_AGENT_META } from '@/lib/fixtures/maker';
+import { MAKER_AGENT_META } from '@/lib/fixtures/maker';
 import { deriveMakerVerdict } from '@/lib/makerVerdict';
 import { GLOSSARY } from '@/lib/glossary';
 import { useLane, type Lane } from '@/hooks/useLane';
+import { useMakerArenaResult } from '@/hooks/useMakerArenaResult';
 import type { LeaderboardRow } from '@/lib/catalog';
 import type { MakerArenaResultView, MakerLeaderboardRow } from '@/lib/contracts';
 import styles from './LeaderboardScreen.module.css';
@@ -20,13 +21,14 @@ type Filter = 'ALL' | 'REPLAY' | 'LIVE';
 
 export function LeaderboardScreen({
   rows = LEADERBOARD_ROWS,
-  makerResult = MAKER_ARENA_RESULT,
+  makerResult,
 }: {
   rows?: LeaderboardRow[];
   makerResult?: MakerArenaResultView;
 }) {
   const [lane, setLane] = useLane();
   const [filter, setFilter] = useState<Filter>('ALL');
+  const makerState = useMakerArenaResult(lane === 'maker', makerResult);
 
   const ranked = useMemo(() => {
     const scoped = filter === 'ALL'
@@ -121,7 +123,15 @@ export function LeaderboardScreen({
           </div>
         </>
       ) : (
-        <MakerLeaderboard result={makerResult} />
+        makerState.status === 'loading' || makerState.status === 'idle' ? (
+          <p className={styles.empty} data-testid="maker-loading" aria-live="polite">Loading maker result…</p>
+        ) : makerState.status === 'unavailable' ? (
+          <p className={styles.empty} data-testid="maker-unavailable" role="alert">Maker data unavailable.</p>
+        ) : makerState.result.leaderboard.length === 0 ? (
+          <p className={styles.empty} data-testid="maker-empty">No maker results available.</p>
+        ) : (
+          <MakerLeaderboard result={makerState.result} />
+        )
       )}
     </section>
   );

@@ -6,9 +6,10 @@ import { Num } from '@/components/ui/Num';
 import { SegmentedControl } from '@/components/ui/SegmentedControl';
 import { InfoTip } from '@/components/ui/InfoTip';
 import { AGENTS } from '@/lib/fixtures/catalog';
-import { MAKER_ARENA_RESULT, MAKER_AGENT_META } from '@/lib/fixtures/maker';
+import { MAKER_AGENT_META } from '@/lib/fixtures/maker';
 import { GLOSSARY } from '@/lib/glossary';
 import { useLane, type Lane } from '@/hooks/useLane';
+import { useMakerArenaResult } from '@/hooks/useMakerArenaResult';
 import type { AgentSummary } from '@/lib/catalog';
 import type { MakerArenaResultView, MakerLeaderboardRow } from '@/lib/contracts';
 import styles from './AgentsScreen.module.css';
@@ -17,7 +18,7 @@ type Sort = 'clv' | 'runs';
 
 export function AgentsScreen({
   agents = AGENTS,
-  makerResult = MAKER_ARENA_RESULT,
+  makerResult,
 }: {
   agents?: AgentSummary[];
   makerResult?: MakerArenaResultView;
@@ -25,6 +26,7 @@ export function AgentsScreen({
   const [lane, setLane] = useLane();
   const [q, setQ] = useState('');
   const [sort, setSort] = useState<Sort>('clv');
+  const makerState = useMakerArenaResult(lane === 'maker', makerResult);
 
   const shown = useMemo(() => {
     const filtered = agents.filter((a) => a.agent_name.toLowerCase().includes(q.toLowerCase()));
@@ -96,7 +98,15 @@ export function AgentsScreen({
           )}
         </>
       ) : (
-        <MakerAgentsTable result={makerResult} />
+        makerState.status === 'loading' || makerState.status === 'idle' ? (
+          <p className={styles.empty} data-testid="maker-loading" aria-live="polite">Loading maker result…</p>
+        ) : makerState.status === 'unavailable' ? (
+          <p className={styles.empty} data-testid="maker-unavailable" role="alert">Maker data unavailable.</p>
+        ) : makerState.result.leaderboard.length === 0 ? (
+          <p className={styles.empty} data-testid="maker-empty">No maker results available.</p>
+        ) : (
+          <MakerAgentsTable result={makerState.result} />
+        )
       )}
     </section>
   );

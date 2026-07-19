@@ -1,12 +1,20 @@
-import { describe, it, expect, afterEach } from 'vitest';
+import { describe, it, expect, afterEach, beforeEach, vi } from 'vitest';
 import { render, screen, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { LeaderboardScreen } from '@/components/screens/LeaderboardScreen';
+import { getMakerArenaResult } from '@/lib/api';
 import { LEADERBOARD_ROWS } from '@/lib/fixtures/catalog';
 import { MAKER_ARENA_RESULT } from '@/lib/fixtures/maker';
 import { MAKER_INCONCLUSIVE, MAKER_INVERTED } from '../../__tests__/fixtures/makerVariants';
 import type { MakerArenaResultView } from '@/lib/contracts';
 import type { LeaderboardRow } from '@/lib/catalog';
+
+vi.mock('@/lib/api', async (importOriginal) => ({
+  ...await importOriginal<typeof import('@/lib/api')>(),
+  getMakerArenaResult: vi.fn(),
+}));
+
+const getMakerArenaResultMock = vi.mocked(getMakerArenaResult);
 
 function mk(p: Partial<LeaderboardRow>): LeaderboardRow {
   return {
@@ -114,6 +122,11 @@ describe('LeaderboardScreen (REQ-013 / AC-005 / WD-7)', () => {
 });
 
 describe('LeaderboardScreen — Maker Arena lane (MM-R1)', () => {
+  beforeEach(() => {
+    getMakerArenaResultMock.mockReset();
+    getMakerArenaResultMock.mockResolvedValue(MAKER_ARENA_RESULT);
+  });
+
   afterEach(() => {
     window.history.replaceState(null, '', '/'); // reset any ?lane= query between tests
   });
@@ -182,6 +195,10 @@ describe('LeaderboardScreen — Maker Arena lane (MM-R1)', () => {
 // I-R remediation (M1 / Min5): the falsification strip must derive its badge, headline, and CI
 // copy from the REAL verdict, and the visible PROOF affordance must be a working link.
 describe('LeaderboardScreen — Maker verdict honesty + proof links (I-R M1, Min5)', () => {
+  beforeEach(() => {
+    getMakerArenaResultMock.mockReset();
+  });
+
   afterEach(() => {
     window.history.replaceState(null, '', '/'); // reset any ?lane= query between tests
   });
@@ -218,5 +235,61 @@ describe('LeaderboardScreen — Maker verdict honesty + proof links (I-R M1, Min
       expect(link.getAttribute('href')).toMatch(/^\/proof\/maker\/(txline-fair-mm|naive-mm)$/);
       expect(link).toHaveTextContent(/proof/i);
     }
+  });
+});
+
+describe('LeaderboardScreen — live maker result loading (F-9)', () => {
+  beforeEach(() => {
+    getMakerArenaResultMock.mockReset();
+  });
+
+  afterEach(() => {
+    window.history.replaceState(null, '', '/');
+  });
+
+  it('loads the maker leaderboard through the API only after Maker mode opens', async () => {
+    const liveResult = structuredClone(MAKER_ARENA_RESULT);
+    liveResult.leaderboard[0].avg_toxicity_loss_bps = 7;
+    getMakerArenaResultMock.mockResolvedValue(liveResult);
+    const user = userEvent.setup();
+
+    render(<LeaderboardScreen />);
+    expect(getMakerArenaResultMock).not.toHaveBeenCalled();
+    await user.click(screen.getByRole('radio', { name: 'Maker' }));
+
+    expect(await screen.findByText('+7.0 bps')).toBeInTheDocument();
+    expect(getMakerArenaResultMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('renders an honest unavailable state with zero maker rows when the API rejects', async () => {
+    getMakerArenaResultMock.mockRejectedValue(new Error('maker endpoint offline'));
+    const user = userEvent.setup();
+
+    render(<LeaderboardScreen />);
+    await user.click(screen.getByRole('radio', { name: 'Maker' }));
+
+    expect(await screen.findByTestId('maker-unavailable')).toHaveTextContent(/maker data unavailable/i);
+    expect(screen.queryAllByTestId('lb-maker-row')).toHaveLength(0);
+  });
+
+  it('renders an honest empty state when the API leaderboard has no maker agents', async () => {
+    getMakerArenaResultMock.mockResolvedValue({ ...MAKER_ARENA_RESULT, leaderboard: [] });
+    const user = userEvent.setup();
+
+    render(<LeaderboardScreen />);
+    await user.click(screen.getByRole('radio', { name: 'Maker' }));
+
+    expect(await screen.findByTestId('maker-empty')).toHaveTextContent(/no maker results available/i);
+    expect(screen.queryAllByTestId('lb-maker-row')).toHaveLength(0);
+  });
+
+  it('uses an explicitly injected maker result without making an API request', async () => {
+    const user = userEvent.setup();
+    render(<LeaderboardScreen makerResult={MAKER_ARENA_RESULT} />);
+
+    await user.click(screen.getByRole('radio', { name: 'Maker' }));
+
+    expect(screen.getAllByTestId('lb-maker-row')).toHaveLength(2);
+    expect(getMakerArenaResultMock).not.toHaveBeenCalled();
   });
 });

@@ -1,8 +1,18 @@
-import { describe, it, expect, afterEach } from 'vitest';
+import { readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
+import { describe, it, expect, afterEach, beforeEach, vi } from 'vitest';
 import { render, screen, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { AgentsScreen } from '@/components/screens/AgentsScreen';
+import { getMakerArenaResult } from '@/lib/api';
 import { MAKER_ARENA_RESULT } from '@/lib/fixtures/maker';
+
+vi.mock('@/lib/api', async (importOriginal) => ({
+  ...await importOriginal<typeof import('@/lib/api')>(),
+  getMakerArenaResult: vi.fn(),
+}));
+
+const getMakerArenaResultMock = vi.mocked(getMakerArenaResult);
 
 describe('AgentsScreen (REQ-017)', () => {
   it('links Compare Two -> Duel and Create Agent -> Studio', () => {
@@ -33,6 +43,11 @@ describe('AgentsScreen (REQ-017)', () => {
 });
 
 describe('AgentsScreen — Maker Arena lane (MM-R1)', () => {
+  beforeEach(() => {
+    getMakerArenaResultMock.mockReset();
+    getMakerArenaResultMock.mockResolvedValue(MAKER_ARENA_RESULT);
+  });
+
   afterEach(() => {
     window.history.replaceState(null, '', '/'); // reset any ?lane= query between tests
   });
@@ -91,6 +106,74 @@ describe('AgentsScreen — Maker Arena lane (MM-R1)', () => {
     for (const link of proofLinks) {
       expect(link.getAttribute('href')).toMatch(/^\/proof\/maker\/(txline-fair-mm|naive-mm)$/);
       expect(link).toHaveTextContent(/proof/i);
+    }
+  });
+});
+
+describe('AgentsScreen — live maker result loading (F-9)', () => {
+  beforeEach(() => {
+    getMakerArenaResultMock.mockReset();
+  });
+
+  afterEach(() => {
+    window.history.replaceState(null, '', '/');
+  });
+
+  it('loads the maker result through the API only after Maker mode opens', async () => {
+    const liveResult = structuredClone(MAKER_ARENA_RESULT);
+    liveResult.leaderboard[0].avg_toxicity_loss_bps = 7;
+    getMakerArenaResultMock.mockResolvedValue(liveResult);
+    const user = userEvent.setup();
+
+    render(<AgentsScreen />);
+    expect(getMakerArenaResultMock).not.toHaveBeenCalled();
+    await user.click(screen.getByRole('radio', { name: 'Maker' }));
+
+    expect(await screen.findByText('+7.0 bps')).toBeInTheDocument();
+    expect(getMakerArenaResultMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('renders an honest unavailable state with zero maker rows when the API rejects', async () => {
+    getMakerArenaResultMock.mockRejectedValue(new Error('maker endpoint offline'));
+    const user = userEvent.setup();
+
+    render(<AgentsScreen />);
+    await user.click(screen.getByRole('radio', { name: 'Maker' }));
+
+    expect(await screen.findByTestId('maker-unavailable')).toHaveTextContent(/maker data unavailable/i);
+    expect(screen.queryAllByTestId('maker-agent-row')).toHaveLength(0);
+  });
+
+  it('renders an honest empty state when the API leaderboard has no maker agents', async () => {
+    getMakerArenaResultMock.mockResolvedValue({ ...MAKER_ARENA_RESULT, leaderboard: [] });
+    const user = userEvent.setup();
+
+    render(<AgentsScreen />);
+    await user.click(screen.getByRole('radio', { name: 'Maker' }));
+
+    expect(await screen.findByTestId('maker-empty')).toHaveTextContent(/no maker results available/i);
+    expect(screen.queryAllByTestId('maker-agent-row')).toHaveLength(0);
+  });
+
+  it('uses an explicitly injected maker result without making an API request', async () => {
+    const user = userEvent.setup();
+    render(<AgentsScreen makerResult={MAKER_ARENA_RESULT} />);
+
+    await user.click(screen.getByRole('radio', { name: 'Maker' }));
+
+    expect(screen.getAllByTestId('maker-agent-row')).toHaveLength(2);
+    expect(getMakerArenaResultMock).not.toHaveBeenCalled();
+  });
+
+  it('prohibits direct sealed-fixture imports and defaults in all three production screens', () => {
+    const sources = [
+      'AgentsScreen.tsx',
+      'DuelScreen.tsx',
+      'LeaderboardScreen.tsx',
+    ].map((file) => readFileSync(resolve(process.cwd(), 'components/screens', file), 'utf8'));
+
+    for (const source of sources) {
+      expect(source).not.toContain('MAKER_ARENA_RESULT');
     }
   });
 });
