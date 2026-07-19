@@ -26,8 +26,8 @@ import type * as W from '@/lib/wire';
 import type {
   AnchorInfo, AnchorStatus, CheckResult, CockpitState, ExecutionMode, FeedHealthState,
   GuardAblationArm, GuardAblationDecision, GuardAblationLeg, GuardAblationView,
-  InspectorRecord, LeaderboardRow, MakerArenaResultView, MakerLeaderboardRow, MatchState,
-  PerformanceMetrics, ProofArtifact, ProofMode, SourceMode, VerifyResult,
+  ExecutionReceipt, InspectorRecord, LeaderboardRow, MakerArenaResultView, MakerLeaderboardRow, MatchState,
+  PerformanceMetrics, ProofArtifact, ProofMode, ReceiptStatus, SourceMode, VerifyResult,
 } from '@/lib/contracts';
 
 export const API_BASE = process.env.NEXT_PUBLIC_API_BASE ?? '';
@@ -180,6 +180,35 @@ function toProofMode(s: string): ProofMode {
 function toSourceMode(s: string): SourceMode {
   return s === 'live' ? 'live' : 'replay';
 }
+function toExecutionMode(s: string): ExecutionMode {
+  return s === 'dry_run' || s === 'live_guarded' ? s : 'paper';
+}
+// The backend ExecutionStatus enum (veridex/execution/models.py) is a SUPERSET of the frontend
+// ReceiptStatus lane. Map the seven lane values 1:1; fold the extras onto the CLOSEST lane stage
+// that never OVERSTATES progress (accepted/partial → submitted, settled → filled), route awaiting_human
+// to policy_approved, and treat expired/voided/unresolved as a terminal-negative (cancelled). Unknown
+// ⇒ the most conservative 'proposed' — never a fabricated later stage.
+function toReceiptStatus(s: string): ReceiptStatus {
+  switch (s) {
+    case 'proposed': case 'law_approved': case 'policy_approved':
+    case 'submitted': case 'filled': case 'rejected': case 'cancelled':
+      return s;
+    case 'accepted': case 'partial': return 'submitted';
+    case 'settled': return 'filled';
+    case 'awaiting_human': return 'policy_approved';
+    case 'expired': case 'voided': case 'unresolved': return 'cancelled';
+    default: return 'proposed';
+  }
+}
+// Receipt timestamps arrive as ISO strings on the wire (backend ExecutionReceipt.submitted_at: str|None);
+// the view-model carries epoch seconds. Preserve null verbatim (honest "not yet"), parse an ISO string
+// faithfully, and fail an unparseable value to null — understating, never fabricating, progress.
+function toEpochSeconds(v: unknown): number | null {
+  if (v == null) return null;
+  if (typeof v === 'number') return v;
+  const ms = Date.parse(String(v));
+  return Number.isNaN(ms) ? null : Math.floor(ms / 1000);
+}
 
 // wire rules are arbitrary records (e.g. {all_metrics_match: true}); represent each
 // as a label/result pair for display (the trust signal is the parent check result).
@@ -307,6 +336,69 @@ export function adaptLeaderboard(w: W.LeaderboardResponse): LeaderboardRow[] {
   }));
 }
 
+// The competition-scoped leaderboard row (backend CompetitionLeaderboardRow, GET /competitions/{id}).
+// SMALLER than the cross-run wire LeaderboardRow: it carries ONLY the CLV rank axis + identity, no
+// per-agent sim_pnl/brier/max_drawdown/action_count/valid_pct/agent_name.
+interface CompetitionLeaderboardRowWire {
+  rank: number;
+  agent_id: string;
+  total_clv_bps: number;
+  mean_clv_bps: number | null;
+  valid_count: number;
+  proof_mode: string | null;
+}
+
+// F-5: bind the BACKEND-AUTHORITATIVE competition leaderboard into the cockpit view-model. The rows
+// arrive already ranked + ordered by the server (CON-203, ranked by mean_clv_bps desc) — this maps
+// them 1:1 and NEVER re-sorts (a client CLV re-sort would silently disagree with the sealed board).
+// Metrics the competition contract does not carry are null (honest "—"), never a fabricated 0.
+export function adaptCompetitionLeaderboard(
+  rows: CompetitionLeaderboardRowWire[], sourceMode: SourceMode, anchorStatus: AnchorStatus,
+): LeaderboardRow[] {
+  return rows.map((r) => {
+    const proof_mode = toProofMode(r.proof_mode ?? '');
+    return {
+      rank: r.rank,                         // backend rank, verbatim
+      agent_id: r.agent_id,
+      agent_name: r.agent_id,               // GAP: competition row has no display name — fall back to id
+      agent_kind: '',                       // GAP: not in the competition contract
+      runs: 0,                              // GAP: single sealed run, not a cross-run count
+      avg_clv_bps: r.mean_clv_bps ?? 0,     // mean_clv_bps → avg_clv_bps (null mean ⇒ ranked last by server)
+      total_clv_bps: r.total_clv_bps,
+      sim_pnl: null, brier: null, max_drawdown: null, action_count: null, valid_pct: null, // ABSENT ⇒ "—"
+      proof_mode,
+      // eligibility = proof completeness (REQ-006), NEVER a rank input (SEC-005). Derived, not fabricated.
+      eligibility_badge: proof_mode === 'reproducible' || proof_mode === 'verified' ? 'eligible' : 'not-eligible',
+      anchor_status: anchorStatus,          // competition-level anchor status, applied verbatim
+      source_mode: sourceMode,
+      valid_count: r.valid_count,           // real count from the competition contract
+      clv_confidence: '',                   // GAP: not classified per-agent in the competition contract
+      low_sample: false,                    // GAP: not classified — display-only, never a rank input (SEC-005)
+    };
+  });
+}
+
+// F-5: project the sealed decision receipts from the NON-SCORING execution attachment (REQ-2B-20 —
+// off-chain venue artifact, separate from the Phase-1 Memo anchor), field-for-field. Empty when the
+// competition has no execution records (honest-empty, never a fixture).
+export function adaptExecutionReceipts(execution: Record<string, unknown> | null | undefined): ExecutionReceipt[] {
+  const raw = (execution?.receipts as Array<Record<string, unknown>> | undefined) ?? [];
+  return raw.map((r) => ({
+    execution_id: String(r.execution_id ?? ''),
+    venue: String(r.venue ?? ''),
+    market_ref: String(r.market_ref ?? ''),
+    side: String(r.side ?? ''),
+    requested_size: Number(r.requested_size ?? 0),
+    filled_size: Number(r.filled_size ?? 0),
+    price: Number(r.price ?? 0),
+    status: toReceiptStatus(String(r.status ?? '')),
+    venue_order_id: r.venue_order_id == null ? null : String(r.venue_order_id),
+    mode: toExecutionMode(String(r.mode ?? 'paper')),
+    submitted_at: toEpochSeconds(r.submitted_at),
+    settled_at: toEpochSeconds(r.settled_at),
+  }));
+}
+
 // MAKER lane adapter (SEC-005): a SEPARATE path — it does NOT reuse adaptLeaderboard /
 // adaptProofArtifact and never touches any directional CLV type. The maker lane ranks on
 // `avg_toxicity_loss_bps` (asc — lower is better). `real_executable_edge_bps` is carried through as
@@ -395,14 +487,20 @@ export function adaptCompetitionState(w: W.CompetitionStateResponse): CockpitSta
       // Fall back to the canonical const only when the competition has no sealed run yet.
       verifier_version: w.proof_card?.verifier_version ?? VERIFIER_VERSION,
     },
-    // GAPs: the cockpit's trace/match/events/receipts/policy/kill_armed and the rich
-    // leaderboard are NOT in GET /competitions/{id}; the cockpit screen assembles them
-    // from the WS stream (useArenaStream) + GET /leaderboard.
+    // GAPs (WS-filled): trace/match/events/policy/kill_armed are NOT in GET /competitions/{id};
+    // useArenaStream projects them from the live canonical stream.
     trace: [],
     match: emptyMatch(),
-    leaderboard: [],
+    // F-5: the leaderboard + receipts ARE on the competition-scoped response — bind them here so the
+    // cockpit centerpiece populates from the real backend (backend-authoritative rank; sealed receipts),
+    // and a SCORE_UPDATE refetch keeps them live. NEVER the global cross-run /leaderboard.
+    leaderboard: adaptCompetitionLeaderboard(
+      (w.leaderboard as unknown as CompetitionLeaderboardRowWire[]) ?? [],
+      toSourceMode(String(cfg.source_mode ?? 'replay')),
+      toAnchorStatus(w.anchor_status),
+    ),
     events: [],
-    receipts: [],
+    receipts: adaptExecutionReceipts(w.execution),
     policy: [],
     kill_armed: false,
   };

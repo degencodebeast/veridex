@@ -1,7 +1,7 @@
 'use client';
 import { useEffect, useRef, useState } from 'react';
 import { ArenaSocket } from '@/lib/ws';
-import { API_BASE } from '@/lib/api';
+import { API_BASE, getCockpitState } from '@/lib/api';
 import type { CanonicalEvent, CockpitState, FeedHealthState, WsStatus } from '@/lib/contracts';
 
 // Apply one canonical event to the cockpit projection. Pure + exported for reuse. A `policy_result`
@@ -42,6 +42,10 @@ export function useArenaStream(
   competitionId: string,
   initial: CockpitState,
   initialFeedHealth?: FeedHealthState,
+  // Injectable competition-scoped state fetch (GET /competitions/{id}); defaults to the real reader.
+  // A SCORE_UPDATE drives a refetch so the cockpit's leaderboard + receipts stay backend-authoritative
+  // (F-5) — NEVER the global cross-run /leaderboard, and never a local re-sort.
+  fetchState: (id: string) => Promise<CockpitState> = getCockpitState,
 ): { state: CockpitState; wsStatus: WsStatus; feedHealth: FeedHealthState } {
   const [state, setState] = useState<CockpitState>(initial);
   const [wsStatus, setWsStatus] = useState<WsStatus>('connecting');
@@ -64,6 +68,19 @@ export function useArenaStream(
     let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
     let cancelled = false;
 
+    // Refetch the competition-scoped state and project ONLY the backend-authoritative leaderboard +
+    // sealed receipts (the live event stream/policy/trace remain WS-driven, never clobbered). A
+    // failed refetch keeps the prior board verbatim — honest: never fabricate or blank on error.
+    const refetchBoard = async (): Promise<void> => {
+      try {
+        const fresh = await fetchState(competitionId);
+        if (cancelled) return; // a competition switch tore this subscription down — drop the stale result
+        setState((prev) => ({ ...prev, leaderboard: fresh.leaderboard, receipts: fresh.receipts }));
+      } catch {
+        /* keep the prior projection — no fabrication, no blanking */
+      }
+    };
+
     const scheduleReconnect = () => {
       if (cancelled || reconnectTimer !== null) return;
       // Visible + honest: never a frozen stale-as-live view while we wait to resubscribe.
@@ -79,6 +96,11 @@ export function useArenaStream(
         onEvent: (event) => {
           lastSeqRef.current = event.seq;
           setState((prev) => applyEvent(prev, event));
+          if (event.type === 'score_update') {
+            // A score landed — the backend leaderboard just changed. Refetch it (competition-scoped,
+            // backend-authoritative) rather than re-deriving a rank client-side (CON-203 / SEC-005).
+            void refetchBoard();
+          }
           if (event.type === 'MARKET_TICK') {
             // A live tick is the freshest possible proof of liveness — clear stale here (never
             // in onStatus('connected'), which fires before any tick has actually been seen).

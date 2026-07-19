@@ -79,11 +79,13 @@ export interface LeaderboardRow {
   runs: number;
   avg_clv_bps: number;
   total_clv_bps: number;
-  sim_pnl: number;
-  brier: number;
-  max_drawdown: number;
-  action_count: number;
-  valid_pct: number; // PERCENT 0-100 (1:1 from the wire LeaderboardRow)
+  // These proxy metrics are carried by the CROSS-RUN wire LeaderboardRow but are ABSENT from the
+  // competition-scoped CompetitionLeaderboardRow (F-5). null = honestly absent ("—"), never a fake 0.
+  sim_pnl: number | null;
+  brier: number | null;
+  max_drawdown: number | null;
+  action_count: number | null;
+  valid_pct: number | null; // PERCENT 0-100 from the cross-run row; null on a competition-scoped row
   proof_mode: ProofMode;
   eligibility_badge: 'eligible' | 'not-eligible';
   anchor_status: AnchorStatus;

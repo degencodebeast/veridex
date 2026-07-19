@@ -95,11 +95,13 @@ export function LeaderboardScreen({
                     <td className={styles.num}>{r.runs}</td>
                     <td className={styles.num} data-testid="lb-clv"><Num value={r.avg_clv_bps} kind="bps" /></td>
                     <td className={styles.num}><Num value={r.total_clv_bps} kind="bps" /></td>
-                    <td className={styles.num}><Num value={r.sim_pnl} /></td>
-                    <td className={styles.num}>{r.brier.toFixed(2)}</td>
-                    <td className={styles.num}><Num value={r.max_drawdown} /></td>
-                    <td className={styles.num}>{r.action_count}</td>
-                    <td className={styles.num}>{r.valid_pct.toFixed(1)}%</td>
+                    {/* The cross-run board always carries these proxy metrics; the `— ` guards are
+                        defensive for the shared LeaderboardRow whose competition variant omits them. */}
+                    <td className={styles.num}>{r.sim_pnl === null ? '—' : <Num value={r.sim_pnl} />}</td>
+                    <td className={styles.num}>{r.brier === null ? '—' : r.brier.toFixed(2)}</td>
+                    <td className={styles.num}>{r.max_drawdown === null ? '—' : <Num value={r.max_drawdown} />}</td>
+                    <td className={styles.num}>{r.action_count === null ? '—' : r.action_count}</td>
+                    <td className={styles.num}>{r.valid_pct === null ? '—' : `${r.valid_pct.toFixed(1)}%`}</td>
                     <td><ConfBar validCount={r.valid_count} /></td>
                     <td><Badge variant={r.proof_mode} /></td>
                     <td><Badge variant={isEligible(r.proof_mode) ? 'eligible' : 'not-eligible'} /></td>

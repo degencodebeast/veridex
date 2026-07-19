@@ -11,6 +11,7 @@
 // (stat-keys 1-8 + 19-phase enum → MarketState.scores/phase) to turn goals/cards/corners/phase from
 // demo into real on-chain-verifiable data.
 import { LEADERBOARD_ROWS } from '@/lib/fixtures/catalog';
+import { rankByAvgClv } from '@/lib/derive';
 import type { CockpitState } from '@/lib/contracts';
 
 export type CockpitProjectionBody = Pick<
@@ -42,7 +43,12 @@ export const COCKPIT_DEMO: CockpitProjectionBody = {
   // total_clv_bps, mean_clv_bps (NOT avg_clv_bps), valid_count, proof_mode} — SMALLER than the
   // cross-run LeaderboardRow view-model this demo reuses. Wire→view is an adapter GAP to bridge when
   // the cockpit leaderboard is wired live.
-  leaderboard: LEADERBOARD_ROWS.map((r) => ({ ...r, source_mode: r.source_mode === 'live' ? 'replay' : r.source_mode })),
+  // Pre-rank + pre-order the demo board exactly as the backend would (rank 1..n by Avg CLV desc):
+  // ClvLeaderboard renders `rank` + order VERBATIM now (F-5 — no local re-sort), so the fixture, like
+  // the real competition-scoped response, must carry the authoritative rank rather than rely on the view.
+  leaderboard: rankByAvgClv(
+    LEADERBOARD_ROWS.map((r) => ({ ...r, source_mode: r.source_mode === 'live' ? 'replay' : r.source_mode })),
+  ),
   // Canonical event stream (seq desc). `evidence` = sealed-evidence prefix (AGENT_ACTION / law) vs
   // the derived non-scoring tail (scores / receipts / anchor). Mirrors CanonicalEvent's contract.
   events: [
