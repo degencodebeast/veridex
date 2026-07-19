@@ -12,7 +12,7 @@ beforeEach(() => {
 });
 
 describe('Badge (PAT-002: one component, full vocabulary)', () => {
-  it('covers the full 13-variant status vocabulary plus the Maker Arena (MM-R1) additions', () => {
+  it('covers the full 13-variant status vocabulary plus the Maker Arena (MM-R1) + QuoteGuard ablation additions', () => {
     expect([...BADGE_VARIANTS].sort()).toEqual(
       [
         'anchored', 'eligible', 'invalid', 'live', 'llm', 'not-anchored',
@@ -20,6 +20,9 @@ describe('Badge (PAT-002: one component, full vocabulary)', () => {
         'valid', 'verified',
         // Maker Arena lane (MM-R1) — falsification verdicts + rung/caveat chips.
         'mm-r1', 'separated', 'inconclusive', 'inverted', 'uncalibrated', 'small-n', 'trades-not-fills',
+        // QuoteGuard behavior ablation (F-8) — behavior-comparison labels, never a rank/winner.
+        'behavior-ablation', 'not-a-leaderboard', 'recorded-replay', 'same-strategy-tape',
+        'diverges-true', 'diverges-false', 'guard-on', 'guard-off',
       ].sort(),
     );
   });

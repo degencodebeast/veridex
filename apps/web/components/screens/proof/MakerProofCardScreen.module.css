@@ -36,6 +36,14 @@
 .caveatRow:last-child { border-bottom: none; }
 .caveatRow p { margin: 0; color: var(--text-2); font-size: 11px; line-height: 1.6; }
 
+/* QuoteGuard behavior ablation entry (F-8) — contextual deep-link, not a rank/profit surface. */
+.ablationEntry { display: flex; align-items: center; justify-content: space-between; gap: var(--space-3); background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius-panel); padding: 12px 14px; text-decoration: none; }
+.ablationEntry:hover { border-color: rgba(59, 130, 246, 0.4); }
+.ablationTitleRow { display: flex; align-items: center; gap: var(--space-2); flex-wrap: wrap; }
+.ablationTitle { font-size: 11.5px; font-weight: 600; color: var(--text-1); }
+.ablationBlurb { display: block; font-family: var(--font-mono), monospace; font-size: 9.5px; line-height: 1.4; color: var(--text-3); margin-top: 4px; }
+.ablationOpen { font-family: var(--font-mono), monospace; font-size: 10px; font-weight: 600; color: var(--accent-2); white-space: nowrap; }
+
 .futureGrid { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: var(--space-3); }
 @media (max-width: 720px) { .futureGrid { grid-template-columns: 1fr; } }
 .futureCard { background: var(--bg-bar); border: 1px dashed var(--border-strong); border-radius: var(--radius-panel); padding: var(--pad-panel); }

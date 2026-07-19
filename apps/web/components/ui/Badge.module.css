@@ -35,3 +35,14 @@
 .uncalibrated { color: var(--warning-hi); background: var(--warning-bg); }
 .smallN { color: var(--warning-hi); background: var(--warning-bg); }
 .tradesNotFills { color: var(--warning-hi); background: var(--warning-bg); }
+
+/* QuoteGuard behavior ablation (F-8). Amber = the ablation frame (attention, not a verdict); the
+   guard-on/off + same-strategy chips are neutral/accent — they name an arm, never a winner. */
+.behaviorAblation { color: var(--warning); background: var(--warning-bg); border-color: rgba(200, 154, 58, 0.28); }
+.notALeaderboard { color: var(--text-2-alt); border-color: var(--border-strong); background: transparent; }
+.recordedReplay { color: var(--text-2-alt); border-color: var(--border-strong); background: transparent; }
+.sameStrategyTape { color: var(--positive); background: var(--positive-bg); }
+.divergesTrue { color: var(--warning-hi); background: var(--warning-bg); }
+.divergesFalse { color: var(--positive); background: var(--positive-bg); }
+.guardOff { color: var(--text-2-alt); border-color: var(--border-strong); background: transparent; }
+.guardOn { color: var(--accent-2); background: var(--accent-bg-soft); }
