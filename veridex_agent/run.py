@@ -28,6 +28,7 @@ DRY_RUN/PAPER launch path (T20): ``dry_run`` routes through the lane with a dete
 
 from __future__ import annotations
 
+import contextlib
 from collections.abc import AsyncIterator, Awaitable, Callable
 from typing import TYPE_CHECKING, Any
 
@@ -42,6 +43,7 @@ from veridex.policy.envelope import PolicyEnvelope
 from veridex.runtime.competition import DEFAULT_CLUSTER, SCHEMA_VERSIONS
 from veridex.runtime.live_runner import run_live_window
 from veridex.runtime.orchestrator import Agent, RunResult, run_competition
+from veridex.runtime.runtime_events import RuntimeEvent, RuntimeEventSink, RuntimeEventType
 from veridex.runtime.window import RunWindow
 from veridex.scoring import score_run
 from veridex.store import InMemoryStore
@@ -346,6 +348,7 @@ async def standalone_run(
     run_id: str | None = None,
     store: Store | None = None,
     event_sink: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
+    runtime_event_sink: RuntimeEventSink | None = None,
     anchor_fn: Callable[[str], Awaitable[str]] | None = anchor_memo,
 ) -> StandaloneRunResult:
     """Run ONE agent through the full spine and return a self-verified, optionally-anchored proof.
@@ -381,12 +384,34 @@ async def standalone_run(
         store: Optional async store the sealed run is persisted to at seal/finalize time (T21 deploy)
             so ``/runs/{id}/verify`` can load it; ``None`` → no persistence (the CLI default).
         event_sink: Optional async observer forwarded to the live runner (projection only).
+        runtime_event_sink: Optional OPS-channel :class:`~veridex.runtime.runtime_events.RuntimeEventSink`
+            (I-4) for the DIRECTIONAL agent — lifecycle/decision events are emitted through it (durably
+            spooled by the shared :class:`~veridex.runtime.runtime_store.DurableRuntimeEventStore`).
+            NON-SCORING telemetry: emitting NEVER touches the seal (SEC-003), and a sink exception is
+            isolated so it can never vaporize the built/anchored proof. The MM-composition path (II-2)
+            threads this SAME sink later; ``None`` (the CLI/arena default) emits nothing.
         anchor_fn: Injectable ``async (manifest_hash) -> signature``; ``None`` skips anchoring.
             Defaults to the real :func:`~veridex.chain.anchor.anchor_memo`.
 
     Returns:
         The :class:`StandaloneRunResult` bundle.
     """
+
+    def _emit(event_type: RuntimeEventType, *, run_id_: str | None, **payload: Any) -> None:
+        """Emit ONE OPS-channel RuntimeEvent, fully isolated from the seal (never crashes the run).
+
+        Fail-closed doctrine (same as the downstream execution lane): telemetry is best-effort and
+        NON-SCORING, so a sink exception must never vaporize the already-built/anchored proof.
+        """
+        if runtime_event_sink is None:
+            return
+        with contextlib.suppress(Exception):
+            runtime_event_sink(
+                RuntimeEvent(type=event_type, agent_id=agent.agent_id, run_id=run_id_, payload=payload)
+            )
+
+    _emit(RuntimeEventType.RUN_STARTED, run_id_=run_id, source_mode=source_mode)
+
     if window is not None:
         sealed = await _seal_live(
             window,
@@ -404,6 +429,16 @@ async def standalone_run(
             marketstates, agent, source_mode=source_mode, anchor_fn=anchor_fn, run_id=run_id, store=store
         )
         report = verify_run(sealed.run)
+
+    # DIRECTIONAL decision telemetry (OPS): the sealed run produced exactly one ranked score row —
+    # surface it as an ACTION_EMITTED so the drawer shows the agent decided (never the sealed action).
+    _emit(
+        RuntimeEventType.ACTION_EMITTED,
+        run_id_=sealed.run.run_id,
+        kind="decision",
+        source_mode=sealed.source_mode,
+        score_rows=len(sealed.scores),
+    )
 
     # --- opt-in EXECUTION LANE — downstream of the seal, NON-SCORING (SEC-004 / SEC-2D-401) -------
     # A paper run (or one without an envelope) is proof-only: no lane, no receipts, and the reported
@@ -432,6 +467,15 @@ async def standalone_run(
             ops["execution_lane_error"] = f"{type(exc).__name__}: {exc}"
     effective_execution_mode = execution_mode if ran_lane else _PAPER
 
+    # NON-SCORING receipt telemetry (OPS): one event per emitted execution receipt (empty in paper).
+    for receipt in receipts:
+        _emit(
+            RuntimeEventType.ACTION_EMITTED,
+            run_id_=sealed.run.run_id,
+            kind="receipt",
+            mode=receipt.get("mode"),
+        )
+
     # --- agent-instance pin (NON-SCORING) — config_hash + policy_hash + window + modes -----------
     run_manifest = {
         "config_hash": config_hash,
@@ -440,6 +484,14 @@ async def standalone_run(
         "source_mode": sealed.source_mode,
         "window": _window_pin(window),
     }
+
+    _emit(
+        RuntimeEventType.RUN_COMPLETED,
+        run_id_=sealed.run.run_id,
+        verified=report.verified,
+        anchor_status=sealed.anchor_status,
+        execution_mode=effective_execution_mode,
+    )
 
     return StandaloneRunResult(
         run_id=sealed.run.run_id,

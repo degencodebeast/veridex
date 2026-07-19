@@ -76,7 +76,7 @@ cd veridex-arena/apps/web && pnpm dev           # http://localhost:3000
 
 **[SCREEN: README real-data section ("We ran it on real World Cup data. Here's the truth.") — the Run-001 / Run-002 story.]**
 
-**[SAY]** "And here's what happened on real data — eighteen finished World Cup fixtures. Our drift agent averaged **plus sixty-one basis points of closing-line value**, beating all three deterministic baselines — a *candidate* signal, recomputed by the law, not self-reported. Then we tested whether it survived at a real venue. The Polymarket lane priced ninety-five percent of its decisions — and the estimated edge came out as a clean longshot ramp: six hundred basis points on the longshots, thirty on the favorites. That's not tradeable edge, that's a structural divergence — so Veridex called it exactly that. Estimated mids, not fills; no executable-edge claim. Most demos ask you to trust the bot. A trustworthy **'no executable edge yet'** is the product. **You can't fake a win on Veridex.**"
+**[SAY]** "And here's what happened on real data — eighteen finished World Cup fixtures. Our drift agent averaged **plus sixty-one basis points of closing-line value**, beating all three deterministic baselines — a *candidate* signal, recomputed by the law, not self-reported. We even tested it out-of-sample — and it didn't hold up (null on independent outcomes, just two effective fixtures) — so we keep it as a benchmark, not a claimed edge. Then we tested whether it survived at a real venue. The Polymarket lane priced ninety-five percent of its decisions — and the estimated edge came out as a clean longshot ramp: six hundred basis points on the longshots, thirty on the favorites. That's not tradeable edge, that's a structural divergence — so Veridex called it exactly that. Estimated mids, not fills; no executable-edge claim. Most demos ask you to trust the bot. A trustworthy **'no executable edge yet'** is the product. **You can't fake a win on Veridex.**"
 
 **[SCREEN: end card — repo URL + access link + "Agents can trade. They can't grade themselves."]**
 
@@ -92,7 +92,7 @@ cd veridex-arena/apps/web && pnpm dev           # http://localhost:3000
 | 4 | 2:05–2:50 | Cockpit + Inspector: the untrusted-LLM fence |
 | 5 | 2:50–3:35 | Proof Card → Verify recompute → Solana anchor → tamper story |
 | 6 | 3:35–4:15 | TxLINE: StablePrice fair value, SSE live, 65k-update history → ReplayPacks, judges-can-rerun |
-| 7 | 4:15–4:45 | Run-001 candidate CLV signal (+61 bps, hook) → Run-002 longshot-ramp = no executable edge (trust moat) + kicker |
+| 7 | 4:15–4:45 | Run-001 candidate CLV signal (+61 bps, hook; failed OOS — null on independent outcomes, N=2 — kept as benchmark) → Run-002 longshot-ramp = no executable edge (trust moat) + kicker |
 
 ## If something breaks on camera
 Don't hide it — Veridex's states are honest by design. A failed preflight shows a *named* reason; an unverified proof shows "⚠ NOT verified." Narrate it ("that's the fail-closed behavior") and retake if needed. Never edit the footage to fake a green state.

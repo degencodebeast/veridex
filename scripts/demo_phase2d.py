@@ -38,8 +38,9 @@ from typing import Any
 
 from veridex.backtest import mode_ladder_label
 from veridex.backtest.runner import run_backtest
+from veridex.ingest.capture_chain import SYNTHETIC_PROVENANCE, is_genuine_pack, synthetic_authority
 from veridex.ingest.recorder import SessionMeta, envelope_line
-from veridex.ingest.replay_pack import load_pack_marketstates, pack_from_session
+from veridex.ingest.replay_pack import load_pack_marketstates, pack_from_session, verify_content_hash
 from veridex.runtime.window import RunWindow
 from veridex.store import InMemoryStore, Store
 from veridex.strategies.momentum import SHARP_MOMENTUM_V2_LABEL, sharp_momentum_agent
@@ -48,8 +49,21 @@ from veridex_agent.run import standalone_run
 # --- demo defaults ----------------------------------------------------------
 #: The demo fixture id (shared with the Phase-1 demo fixture for continuity).
 DEFAULT_FIXTURE_ID = 17588404
-#: The banked ReplayPack that SHIPS with the repo — the offline demo default.
+#: The banked SYNTHETIC ReplayPack that SHIPS with the repo — the offline demo default + CI fallback
+#: (VISIBLY labeled ``synthetic-illustrative``; can NEVER read ``genuine`` and stays a single fixture).
 DEFAULT_PACK_DIR = Path(__file__).parent / "fixtures" / "demo_pack"
+#: The banked REAL World Cup demo pack (I-10): a curated slice of GENUINE TxLINE odds (real FIFA WC
+#: 2026 quarter-final fixtures, backfilled from ``/odds/updates``). This is the judge replay
+#: experience and the Sharp-Momentum (II-10) gate input. Reads ``genuine-txline`` through R-0a's
+#: honesty machinery; self-declares the ``backfilled-price-history`` evidence rung.
+DEMO_PACK_REAL_DIR = Path(__file__).parent / "fixtures" / "demo_pack_real"
+#: PINNED ``content_hash`` of the banked real demo pack — the tamper-evidence contract binding this
+#: script to exactly those banked bytes. Regenerate via ``scripts/fixtures/build_demo_pack_real.py``
+#: (deterministic); a mismatch means the pack was tampered OR the pin was edited without rebuilding.
+DEMO_PACK_REAL_CONTENT_HASH = "f16c3853a80fc6f0b4e5fe21d8f1c0dcfd4c66d732e5a915193988604f9ddb0b"
+#: The Sharp-Momentum harness (II-10) needs >=2 distinct fixtures; a single-fixture pack would
+#: silently disable its gate, so the resolver/guard REFUSES anything with fewer.
+SHARP_MOMENTUM_MIN_FIXTURES = 2
 #: Where the manifest is written by default (repo root, next to the README).
 DEFAULT_MANIFEST_PATH = Path(__file__).parent.parent / "demo_manifest.json"
 #: Coverage-window id for the flagship backtest.
@@ -60,8 +74,8 @@ FLAGSHIP_STRATEGY_LABEL = SHARP_MOMENTUM_V2_LABEL
 _MARKET_ALLOWLIST = ("OU",)
 #: The truthful ``kind`` labels a manifest row may carry — a proof-only demo NEVER emits "live".
 HONEST_KINDS: frozenset[str] = frozenset({"backtest", "paper", "replay"})
-#: Data-provenance marker the shipped pack self-declares (its odds are illustrative, not captured).
-SYNTHETIC_PROVENANCE = "synthetic-illustrative"
+#: Data-provenance marker the shipped pack self-declares — the canonical constant is owned by
+#: :mod:`veridex.ingest.capture_chain` (single source of truth; re-exported here for local use).
 #: Fail-safe label for a pack that declares NEITHER synthetic NOR a positive real marker — we must
 #: never assert it was really captured, so it reads "unknown" and still carries a cautious caveat.
 UNKNOWN_PROVENANCE = "unknown-provenance"
@@ -114,11 +128,11 @@ def build_reference_pack(dst: Path) -> Path:
     transform live capture uses, so the shipped pack is a genuine, content-hashed ReplayPack (its
     ``run_backtest`` replay path verifies the hash and refuses a tampered pack).
 
-    The pack SELF-DECLARES its synthetic provenance in its ``capture`` block (``synthetic: true`` +
+    The pack SELF-DECLARES its synthetic authority in its ``capture`` block (``synthetic: true`` +
     ``provenance``) so a downstream reader can never separate the numbers from the fact that the odds
     are illustrative. ``endpoints`` is empty — a synthetic tape was never streamed from a real feed.
-    Both markers live in ``capture`` metadata, which ``content_hash`` does NOT cover (it hashes the
-    DATA files), so the pack's ``content_hash`` — and therefore the demo's run ids — are unchanged.
+    MAJOR-1: those authority markers are folded INTO the v2 ``content_hash``, so the pack can never be
+    relabeled genuine without breaking its own hash (and it can never read genuine).
 
     Args:
         dst: Destination pack directory (recreated from scratch if it already exists).
@@ -139,13 +153,11 @@ def build_reference_pack(dst: Path) -> Path:
         )
         if dst.exists():
             shutil.rmtree(dst)
-        pack_from_session(session_dir, dst)
-    # Stamp the synthetic-provenance markers INTO the pack's capture block (open dict; not hashed).
-    pack_path = dst / "pack.json"
-    pack_doc = json.loads(pack_path.read_text())
-    pack_doc["capture"]["provenance"] = SYNTHETIC_PROVENANCE
-    pack_doc["capture"]["synthetic"] = True
-    pack_path.write_text(json.dumps(pack_doc))
+        # MAJOR-1: the synthetic authority (provenance=synthetic-illustrative, synthetic=True) is
+        # folded INTO the v2 content_hash by pack_from_session, so the synthetic label is
+        # tamper-evident — a reader can never separate the numbers from the fact they're illustrative,
+        # and the pack can NEVER be relabeled genuine without breaking its own hash.
+        pack_from_session(session_dir, dst, authority=synthetic_authority())
     return dst
 
 
@@ -206,6 +218,68 @@ def _odds_desc(data_provenance: str, is_synthetic: bool) -> str:
 def _pack_content_hash(pack_dir: Path) -> str:
     """Read the pack's stored ``content_hash`` (bound into the demo's deterministic run ids)."""
     return str(json.loads((pack_dir / "pack.json").read_text())["content_hash"])
+
+
+def require_min_fixtures(pack_dir: Path, minimum: int = SHARP_MOMENTUM_MIN_FIXTURES) -> list[int]:
+    """Return the pack's distinct fixture ids, REFUSING a pack with fewer than ``minimum``.
+
+    The Sharp-Momentum harness (II-10) consumes >=2 distinct fixtures; a single-fixture pack would
+    silently disable its gate, so we fail loud here rather than let it through.
+
+    Args:
+        pack_dir: The ReplayPack directory (must contain ``pack.json``).
+        minimum: The minimum distinct-fixture count required (default :data:`SHARP_MOMENTUM_MIN_FIXTURES`).
+
+    Returns:
+        The sorted distinct fixture ids in the pack manifest.
+
+    Raises:
+        ValueError: If the pack exposes fewer than ``minimum`` distinct fixtures.
+    """
+    manifest = json.loads((pack_dir / "pack.json").read_text())
+    fixture_ids = sorted({int(f["fixture_id"]) for f in manifest["fixtures"]})
+    if len(fixture_ids) < minimum:
+        raise ValueError(
+            f"pack at {pack_dir} exposes {len(fixture_ids)} distinct fixture(s) "
+            f"({fixture_ids}); the Sharp-Momentum harness needs >= {minimum}"
+        )
+    return fixture_ids
+
+
+def resolve_real_demo_pack() -> Path:
+    """Return :data:`DEMO_PACK_REAL_DIR` only when it is verifiably the pinned GENUINE demo pack.
+
+    Fail-closed on EVERY guard, so the judge/harness never runs the real-odds surface over a
+    tampered, mislabeled, or under-sized pack:
+
+    * ``pack.json`` exists;
+    * ``content_hash`` recomputes (:func:`~veridex.ingest.replay_pack.verify_content_hash`);
+    * the stored hash equals the pinned :data:`DEMO_PACK_REAL_CONTENT_HASH` (tamper-evidence);
+    * the pack reads ``genuine-txline`` (:func:`~veridex.ingest.capture_chain.is_genuine_pack`);
+    * it exposes >= :data:`SHARP_MOMENTUM_MIN_FIXTURES` distinct fixtures.
+
+    Returns:
+        :data:`DEMO_PACK_REAL_DIR`.
+
+    Raises:
+        FileNotFoundError: If the banked pack is absent.
+        ValueError: If any hash/provenance/fixture-count guard fails.
+    """
+    pack_dir = DEMO_PACK_REAL_DIR
+    if not (pack_dir / "pack.json").exists():
+        raise FileNotFoundError(f"real demo pack not banked at {pack_dir}")
+    if not verify_content_hash(pack_dir):
+        raise ValueError(f"real demo pack at {pack_dir} failed content_hash verification (tampered or corrupt)")
+    stored = _pack_content_hash(pack_dir)
+    if stored != DEMO_PACK_REAL_CONTENT_HASH:
+        raise ValueError(
+            f"real demo pack content_hash {stored} != pinned {DEMO_PACK_REAL_CONTENT_HASH} "
+            f"(pack tampered, or the pin was edited without rebuilding)"
+        )
+    if not is_genuine_pack(pack_dir):
+        raise ValueError(f"real demo pack at {pack_dir} does not read as genuine TxLINE — refusing to label it real")
+    require_min_fixtures(pack_dir)
+    return pack_dir
 
 
 def verify_url(run_id: str, *, base_url: str = "") -> str:
@@ -393,6 +467,7 @@ def main() -> None:
 
     Flags:
         ``--pack DIR``     Point at a real captured ReplayPack (default: the shipped illustrative pack).
+        ``--real``         Use the banked GENUINE World Cup demo pack (fail-closed, pinned hash).
         ``--fixture-id N`` Fixture within the pack to replay.
         ``--out PATH``     Where to write ``demo_manifest.json``.
         ``--rebuild-pack`` Regenerate the shipped illustrative pack before running.
@@ -401,12 +476,25 @@ def main() -> None:
     """
     parser = argparse.ArgumentParser(description="Veridex Phase-2D judge demo runner (offline).")
     parser.add_argument("--pack", type=Path, default=DEFAULT_PACK_DIR, help="ReplayPack directory.")
-    parser.add_argument("--fixture-id", type=int, default=DEFAULT_FIXTURE_ID, help="Fixture to replay.")
+    parser.add_argument(
+        "--real",
+        action="store_true",
+        help="Replay the banked GENUINE World Cup demo pack (pinned + fail-closed verified).",
+    )
+    parser.add_argument("--fixture-id", type=int, default=None, help="Fixture to replay (default: pack-appropriate).")
     parser.add_argument("--out", type=Path, default=DEFAULT_MANIFEST_PATH, help="Manifest output path.")
     parser.add_argument("--rebuild-pack", action="store_true", help="Rebuild the shipped demo pack first.")
     parser.add_argument("--serve", action="store_true", help="Serve the read API so verify URLs resolve.")
     parser.add_argument("--port", type=int, default=8080, help="Port for --serve (default 8080).")
     args = parser.parse_args()
+
+    # --real replays the banked GENUINE WC pack, resolved fail-closed (verified hash == pin, genuine
+    # provenance, >= 2 fixtures). Its default fixture is the first genuine WC fixture, not the
+    # synthetic demo fixture. An explicit --pack still wins (operator override).
+    if args.real and args.pack == DEFAULT_PACK_DIR:
+        args.pack = resolve_real_demo_pack()
+    if args.fixture_id is None:
+        args.fixture_id = require_min_fixtures(args.pack)[0] if args.real else DEFAULT_FIXTURE_ID
 
     if args.rebuild_pack or (args.pack == DEFAULT_PACK_DIR and not (args.pack / "pack.json").exists()):
         build_reference_pack(DEFAULT_PACK_DIR)

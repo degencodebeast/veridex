@@ -1,0 +1,4 @@
+.gate { display: flex; flex-direction: column; align-items: flex-start; gap: 8px; padding: 12px; border: 1px solid var(--border); border-radius: var(--radius-control); background: var(--panel); }
+.copy { margin: 0; color: var(--text-2); font-size: 12px; }
+.login { padding: 6px 12px; border: 1px solid var(--border); border-radius: var(--radius-control); background: var(--accent); color: var(--text-1); font-size: 12px; cursor: pointer; }
+.login:hover, .login:focus-visible { background: var(--accent-hi); outline: none; }

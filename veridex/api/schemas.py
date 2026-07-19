@@ -14,7 +14,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict, StrictInt
 
 
 class ExplainRequest(BaseModel):
@@ -147,6 +147,9 @@ class CompetitionStartResponse(BaseModel):
     competition_id: str
     status: str
     run_id: str | None
+    replay_binding: dict[str, Any] | None = None
+    """The FROZEN production-replay identity the run replayed (R-4): ``{pack_id, fixture_id,
+    content_hash}`` — so an auto-resolved (unnamed) run still names WHICH verified pack it ran."""
 
 
 class CompetitionLeaderboardRow(BaseModel):
@@ -197,6 +200,9 @@ class CompetitionStateResponse(BaseModel):
     run_id: str | None
     proof_card: dict[str, Any] | None = None
     execution: dict[str, Any] | None = None
+    replay_binding: dict[str, Any] | None = None
+    """The FROZEN production-replay identity (R-4): ``{pack_id, fixture_id, content_hash}`` — server-
+    derived, so an "unnamed" competition still surfaces WHICH verified pack it ran. ``None`` until bound."""
 
 
 class KillSwitchResponse(BaseModel):
@@ -312,6 +318,10 @@ class FeedHealthResponse(BaseModel):
         fixture_id: The fixture being followed, or ``None``.
         staleness_s: Seconds since the last tick, or ``None`` when none seen.
         stale: Whether the feed has exceeded its staleness budget.
+        feed_state: III-3 honest connection-derived state (the ACTIVE stream's real last-seen, not
+            credential presence): one of ``"live"`` / ``"heartbeat_only"`` / ``"stale"`` /
+            ``"disconnected"`` / ``"recorded_replay"`` (also ``"connecting"`` transiently). Optional
+            + defaulted so the pinned contract fixture stays valid; the live endpoint always sets it.
     """
 
     source_mode: str
@@ -325,6 +335,7 @@ class FeedHealthResponse(BaseModel):
     fixture_id: int | None
     staleness_s: int | None
     stale: bool
+    feed_state: str | None = None
 
 
 class RuntimeEventsResponse(BaseModel):
@@ -343,13 +354,23 @@ class RuntimeEventsResponse(BaseModel):
 class BacktestRunRequest(BaseModel):
     """Request body for ``POST /backtests`` — triggers a replay-sourced backtest run.
 
-    The run is driven over a deterministic, offline agent (no LLM, no network). ``pack_dir`` points
-    at a self-describing ReplayPack directory (containing ``pack.json``); the pack is verified
-    (content-hash) before replay.
+    The run is driven over a deterministic, offline agent (no LLM, no network). R-3: the browser
+    addresses a pack by its ``pack_id`` (the R-2 verified catalog key) — NEVER by a filesystem path.
+    The server resolves ``pack_id`` against the authoritative, hash-verified ReplayPack catalog
+    (``app.state.replay_catalog``) and binds the catalog-derived ``content_hash`` into the sealed
+    report; a client can never point the replay loader at an arbitrary filesystem directory.
+
+    ``extra="forbid"``: a legacy body carrying the removed ``pack_dir`` (or any unknown field) is
+    a hard 422 — the client-provided filesystem-path surface is GONE, not merely ignored.
 
     Attributes:
-        pack_dir: Filesystem path to the ReplayPack directory.
-        fixture_id: The fixture within the pack to replay.
+        pack_id: The R-2 catalog key of the ReplayPack to replay (resolved SERVER-side; unknown -> 404).
+        fixture_id: The fixture within the pack to replay (must be catalogued for the pack; else 422).
+            STRICT (``StrictInt``): a JSON bool is REJECTED (422), never coerced. A coercive ``int`` would
+            normalize ``true``/``false`` to ``1``/``0``, and since ``True == 1`` / ``False == 0`` the
+            catalog-membership guard would then admit the bool as the requested fixture identity — the
+            exact bool-as-fixture-id alias R-2 excludes from the catalog, reintroduced at the browser
+            boundary. Strictness rejects it BEFORE the identity is claimed to be catalog-validated.
         window_id: Stable id for the coverage window (echoed onto the report).
         market_allowlist: Market-key prefixes the window scores (the report's ``market_universe``).
         end_rule: Window close rule — ``"pre_match"`` (default), ``"fixed_duration"``, or ``"manual_stop"``.
@@ -357,13 +378,46 @@ class BacktestRunRequest(BaseModel):
         min_clv_horizon_s: DEC-2D-2 pending-horizon guard (seconds); defaults to 60.
     """
 
-    pack_dir: str
-    fixture_id: int
+    model_config = ConfigDict(extra="forbid")
+
+    pack_id: str
+    # StrictInt so a JSON bool (``true``/``false``) is a hard 422 at the request boundary — never coerced
+    # to 1/0 and aliased into a catalogued fixture id (identity-admission defect; Codex R-3 gate).
+    fixture_id: StrictInt
     window_id: str
     market_allowlist: list[str]
     end_rule: str = "pre_match"
     duration_s: int | None = None
     min_clv_horizon_s: int = 60
+
+
+class ReplayPackInfo(BaseModel):
+    """One hash-verified pack of the R-2 catalog, projected for the read-only ``/replay-packs`` API.
+
+    A pure projection of a :class:`~veridex.ingest.replay_catalog.CatalogEntry` — the verified
+    ``content_hash``, HONEST ``provenance`` (``is_genuine`` only for a coherent genuine pack), and the
+    catalogued ``fixtures``. The internal ``pack_dir`` filesystem path is DELIBERATELY not surfaced:
+    the browser addresses packs by ``pack_id`` only, so the server-side path never leaks to a client.
+
+    Attributes:
+        pack_id: The stable catalog key the browser addresses (never a filesystem path).
+        content_hash: The pack's verified (recompute-matched) ``content_hash``.
+        provenance: HONEST provenance label (``genuine-txline`` only for a coherent genuine pack).
+        is_genuine: ``True`` only for a hash-verified, coherent genuine TxLINE capture.
+        fixtures: The fixture ids the pack manifest declares (the replayable fixtures).
+    """
+
+    pack_id: str
+    content_hash: str
+    provenance: str
+    is_genuine: bool
+    fixtures: list[int]
+
+
+class ReplayPackListResponse(BaseModel):
+    """Envelope for ``GET /replay-packs`` — the verified R-2 catalog listing (single-field wrapper)."""
+
+    packs: list[ReplayPackInfo]
 
 
 class BacktestRunResponse(BaseModel):

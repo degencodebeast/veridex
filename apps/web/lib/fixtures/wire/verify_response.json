@@ -1,0 +1,330 @@
+{
+  "run_id": "86d77f79939c4a2ab8f5050b3ea293c5",
+  "verified": true,
+  "evidence_hash": "3f082b3504e0e5164c692ffd2e12265dabe3e1ce5b103a26499e371939c7d8d6",
+  "recomputed_evidence_hash": "3f082b3504e0e5164c692ffd2e12265dabe3e1ce5b103a26499e371939c7d8d6",
+  "manifest_hash": "d91397b9eea2a0ab85941e58987d3c85609275de2a0cd9cb3348928766b520a9",
+  "checks": {
+    "evidence_integrity": {
+      "id": "evidence_integrity",
+      "label": "Evidence Integrity",
+      "result": "pass",
+      "severity": "blocking",
+      "method": "sha256_evidence_hash",
+      "scope": "run_events",
+      "evidence_refs": [
+        "evidence_hash"
+      ],
+      "rules": [],
+      "details": {
+        "recomputed_match": true
+      },
+      "error": null
+    },
+    "llm_boundary": {
+      "id": "llm_boundary",
+      "label": "LLM Boundary",
+      "result": "pass",
+      "severity": "blocking",
+      "method": "static_import_audit",
+      "scope": "law/, scoring.py, leaderboard.py, verifier/, checks/, ingest/, policy/",
+      "evidence_refs": [],
+      "rules": [],
+      "details": {},
+      "error": null
+    },
+    "metrics_recomputed": {
+      "id": "metrics_recomputed",
+      "label": "Score Recomputed",
+      "result": "pass",
+      "severity": "blocking",
+      "method": "recompute_from_sealed_evidence",
+      "scope": "score_rows",
+      "evidence_refs": [
+        "evidence_hash",
+        "score_rows"
+      ],
+      "rules": [
+        {
+          "all_metrics_match": true
+        }
+      ],
+      "details": {
+        "recomputed_match": true,
+        "row_count": 4
+      },
+      "error": null
+    },
+    "manifest_bound": {
+      "id": "manifest_bound",
+      "label": "Manifest Bound",
+      "result": "pass",
+      "severity": "blocking",
+      "method": "manifest_field_binding",
+      "scope": "run_manifest",
+      "evidence_refs": [
+        "evidence_hash",
+        "score_root"
+      ],
+      "rules": [
+        {
+          "all_bound": true
+        }
+      ],
+      "details": {
+        "bound_fields": [
+          "action_evidence_root",
+          "code_prompt_schema_versions",
+          "manifest_hash",
+          "proof_mode_map",
+          "run_id",
+          "score_root"
+        ]
+      },
+      "error": null
+    },
+    "policy_obeyed": {
+      "id": "policy_obeyed",
+      "label": "Policy Obeyed",
+      "result": "not_applicable",
+      "severity": "blocking",
+      "method": "policy_event_audit",
+      "scope": "competition_events",
+      "evidence_refs": [],
+      "rules": [],
+      "details": {},
+      "error": null
+    },
+    "receipt_separation": {
+      "id": "receipt_separation",
+      "label": "Receipt Separation",
+      "result": "not_applicable",
+      "severity": "blocking",
+      "method": "evidence_flag_audit",
+      "scope": "competition_events",
+      "evidence_refs": [],
+      "rules": [],
+      "details": {},
+      "error": null
+    },
+    "anchor": {
+      "id": "anchor",
+      "label": "On-Chain Anchor",
+      "result": "not_applicable",
+      "severity": "info",
+      "method": "memo_anchor",
+      "scope": "solana_memo",
+      "evidence_refs": [],
+      "rules": [],
+      "details": {},
+      "error": null
+    }
+  },
+  "metrics": {
+    "clv": 92.0,
+    "sim_pnl": 184,
+    "brier": null,
+    "max_drawdown": 0.0,
+    "hit_rate": 0.5,
+    "scored_actions": 4,
+    "per_agent": [
+      {
+        "agent_id": "agent-alpha",
+        "rank": 1,
+        "avg_clv_bps": 92.0,
+        "total_clv_bps": 184,
+        "sim_pnl": 184,
+        "brier": null,
+        "max_drawdown": 0.0,
+        "action_count": 2
+      },
+      {
+        "agent_id": "agent-beta",
+        "rank": 2,
+        "avg_clv_bps": -92.0,
+        "total_clv_bps": -184,
+        "sim_pnl": -184,
+        "brier": null,
+        "max_drawdown": -184.0,
+        "action_count": 2
+      }
+    ]
+  },
+  "anchor": {
+    "status": "not_anchored",
+    "signature": null,
+    "cluster": "devnet"
+  },
+  "proof_card": {
+    "verifier_version": "v0",
+    "run": {
+      "run_id": "86d77f79939c4a2ab8f5050b3ea293c5",
+      "source_mode": "replay"
+    },
+    "lineage": {
+      "proof_mode_map": {
+        "agent-alpha": "reproducible",
+        "agent-beta": "reproducible"
+      },
+      "schema_versions": {
+        "action_schema": "sports_v0",
+        "verifier": "v0"
+      }
+    },
+    "evidence": {
+      "evidence_hash": "3f082b3504e0e5164c692ffd2e12265dabe3e1ce5b103a26499e371939c7d8d6",
+      "run_event_count": 6
+    },
+    "checks": {
+      "evidence_integrity": {
+        "id": "evidence_integrity",
+        "label": "Evidence Integrity",
+        "result": "pass",
+        "severity": "blocking",
+        "method": "sha256_evidence_hash",
+        "scope": "run_events",
+        "evidence_refs": [
+          "evidence_hash"
+        ],
+        "rules": [],
+        "details": {
+          "recomputed_match": true
+        },
+        "error": null
+      },
+      "llm_boundary": {
+        "id": "llm_boundary",
+        "label": "LLM Boundary",
+        "result": "pass",
+        "severity": "blocking",
+        "method": "static_import_audit",
+        "scope": "law/, scoring.py, leaderboard.py, verifier/, checks/, ingest/, policy/",
+        "evidence_refs": [],
+        "rules": [],
+        "details": {},
+        "error": null
+      },
+      "metrics_recomputed": {
+        "id": "metrics_recomputed",
+        "label": "Score Recomputed",
+        "result": "pass",
+        "severity": "blocking",
+        "method": "recompute_from_sealed_evidence",
+        "scope": "score_rows",
+        "evidence_refs": [
+          "evidence_hash",
+          "score_rows"
+        ],
+        "rules": [
+          {
+            "all_metrics_match": true
+          }
+        ],
+        "details": {
+          "recomputed_match": true,
+          "row_count": 4
+        },
+        "error": null
+      },
+      "manifest_bound": {
+        "id": "manifest_bound",
+        "label": "Manifest Bound",
+        "result": "pass",
+        "severity": "blocking",
+        "method": "manifest_field_binding",
+        "scope": "run_manifest",
+        "evidence_refs": [
+          "evidence_hash",
+          "score_root"
+        ],
+        "rules": [
+          {
+            "all_bound": true
+          }
+        ],
+        "details": {
+          "bound_fields": [
+            "action_evidence_root",
+            "code_prompt_schema_versions",
+            "manifest_hash",
+            "proof_mode_map",
+            "run_id",
+            "score_root"
+          ]
+        },
+        "error": null
+      },
+      "policy_obeyed": {
+        "id": "policy_obeyed",
+        "label": "Policy Obeyed",
+        "result": "not_applicable",
+        "severity": "blocking",
+        "method": "policy_event_audit",
+        "scope": "competition_events",
+        "evidence_refs": [],
+        "rules": [],
+        "details": {},
+        "error": null
+      },
+      "receipt_separation": {
+        "id": "receipt_separation",
+        "label": "Receipt Separation",
+        "result": "not_applicable",
+        "severity": "blocking",
+        "method": "evidence_flag_audit",
+        "scope": "competition_events",
+        "evidence_refs": [],
+        "rules": [],
+        "details": {},
+        "error": null
+      },
+      "anchor": {
+        "id": "anchor",
+        "label": "On-Chain Anchor",
+        "result": "not_applicable",
+        "severity": "info",
+        "method": "memo_anchor",
+        "scope": "solana_memo",
+        "evidence_refs": [],
+        "rules": [],
+        "details": {},
+        "error": null
+      }
+    },
+    "anchor": {
+      "status": "not_anchored",
+      "signature": null,
+      "cluster": "devnet"
+    },
+    "metrics": {
+      "clv": 92.0,
+      "sim_pnl": 184,
+      "brier": null,
+      "max_drawdown": 0.0,
+      "hit_rate": 0.5,
+      "scored_actions": 4,
+      "per_agent": [
+        {
+          "agent_id": "agent-alpha",
+          "rank": 1,
+          "avg_clv_bps": 92.0,
+          "total_clv_bps": 184,
+          "sim_pnl": 184,
+          "brier": null,
+          "max_drawdown": 0.0,
+          "action_count": 2
+        },
+        {
+          "agent_id": "agent-beta",
+          "rank": 2,
+          "avg_clv_bps": -92.0,
+          "total_clv_bps": -184,
+          "sim_pnl": -184,
+          "brier": null,
+          "max_drawdown": -184.0,
+          "action_count": 2
+        }
+      ]
+    }
+  }
+}

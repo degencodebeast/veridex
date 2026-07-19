@@ -74,6 +74,25 @@ def test_lookback_below_min_movements_raises_cross_field() -> None:
         AgentRunConfig(agent_id="v2", strategy="momentum-sharp", lookback=4, min_movements=8)
 
 
+def test_build_agent_cumulative_drift() -> None:
+    # I-6: cumulative-drift dispatch repair. The strategy already exists (veridex.strategies.drift)
+    # but strategy="cumulative-drift" was rejected by the config Literal and had no build branch.
+    config = AgentRunConfig(agent_id="d", strategy="cumulative-drift")
+    agent = build_agent(config)
+    assert agent.agent_id == "d"
+    assert agent.proof_mode == "reproducible"
+
+
+@pytest.mark.parametrize("strategy", ["baseline", "momentum", "momentum-sharp", "cumulative-drift", "llm"])
+def test_build_agent_covers_every_strategy(strategy: str) -> None:
+    # No-regression guard: every declared strategy value still builds (the fix adds a branch,
+    # breaks none). momentum-sharp's cross-field validator is satisfied by the field defaults
+    # (lookback=8 >= min_movements=8).
+    config = AgentRunConfig(agent_id="s", strategy=strategy)
+    agent = build_agent(config)
+    assert agent.agent_id == "s"
+
+
 def test_build_policy_envelope_from_config() -> None:
     config = AgentRunConfig(
         agent_id="m",

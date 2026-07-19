@@ -1,0 +1,42 @@
+{
+  "rows": [
+    {
+      "rank": 1,
+      "agent_id": "agent-alpha",
+      "runs": 1,
+      "avg_clv_bps": 92.0,
+      "total_clv_bps": 184,
+      "sim_pnl": 184,
+      "brier": null,
+      "max_drawdown": 0.0,
+      "action_count": 2,
+      "valid_pct": 100.0,
+      "proof_mode": "reproducible",
+      "eligibility_badge": "unproven",
+      "anchor_status": "none-anchored",
+      "source_mode": "all-replay",
+      "valid_count": 2,
+      "clv_confidence": "low",
+      "low_sample": true
+    },
+    {
+      "rank": 2,
+      "agent_id": "agent-beta",
+      "runs": 1,
+      "avg_clv_bps": -92.0,
+      "total_clv_bps": -184,
+      "sim_pnl": -184,
+      "brier": null,
+      "max_drawdown": -184.0,
+      "action_count": 2,
+      "valid_pct": 100.0,
+      "proof_mode": "reproducible",
+      "eligibility_badge": "unproven",
+      "anchor_status": "none-anchored",
+      "source_mode": "all-replay",
+      "valid_count": 2,
+      "clv_confidence": "low",
+      "low_sample": true
+    }
+  ]
+}

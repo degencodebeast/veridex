@@ -356,9 +356,19 @@ async def test_deploy_response_is_narrow() -> None:
         async with _transport(app) as client:
             resp = await client.post("/agents/deploy", json=_VALID)
         body = resp.json()
-        assert set(body.keys()) == {"instance_id", "config_hash", "policy_hash", "run_id"}
-        # Every exposed value is a plain string identity/hash — never a nested handle/task/trace.
-        assert all(isinstance(v, str) for v in body.values())
+        assert set(body.keys()) == {
+            "instance_id",
+            "config_hash",
+            "policy_hash",
+            "run_id",
+            "owner",
+            "replay_binding",
+        }
+        # Every exposed value is a plain string identity/hash, except ``replay_binding`` — the R-4
+        # frozen tape identity ({pack_id, fixture_id, content_hash}, or None for this live deploy),
+        # which is itself a small identity dict, never a secret/handle/task/trace.
+        assert body["replay_binding"] is None  # live deploy: no replay tape identity
+        assert all(isinstance(v, str) for k, v in body.items() if k != "replay_binding")
         forbidden = ("task", "trace", "secret", "keypair", "adapter", "envelope", "stream", "anchor_fn")
         blob = resp.text.lower()
         assert not any(word in blob for word in forbidden)

@@ -1,0 +1,50 @@
+# I-5 — production API container for the Veridex demo surface (veridex.api.server).
+# Serves on 0.0.0.0 with CORS for the web origin, a generic /healthz, and a DURABLE, fail-closed
+# Postgres backend (init_db invoked once + pooled connections). Secrets are NEVER baked in — pass
+# DATABASE_URL / CORS_ORIGINS / PRIVY_* / OPERATOR_TOKEN as env at run time (COM-001).
+# D-1 owns the full Coolify compose stack; this image is the container/CORS/healthz scaffold only.
+FROM python:3.11-slim AS base
+
+WORKDIR /app
+
+# Install the package with the extras the serving import path needs:
+#   api      — FastAPI + uvicorn + PyJWT[crypto] (the Privy ES256 auth boundary the app imports)
+#   postgres — psycopg[binary] + psycopg-pool (the durable pooled PostgresStore)
+#   live     — httpx (the live TxLINE/venue async HTTP the router imports)
+COPY pyproject.toml ./
+COPY veridex ./veridex
+COPY veridex_agent ./veridex_agent
+RUN pip install --no-cache-dir ".[api,postgres,live,agent]"
+
+# R-2 — bake the pinned, GENUINE curated seed pack (demo_pack_real: the verified WC /odds/updates
+# backfill) into the image so the ReplayPack catalog is SELF-CONTAINED: a bare `docker run` (no compose
+# bind-mount) still builds a hash-verified catalog and /readyz passes. COPY was chosen over relying on
+# the compose read-only mount alone: the image is then trustworthy on its own (no missing-mount failure
+# mode), and the packs are ~600KB — negligible bloat. NOTE: this COPYed layer is NOT a runtime read-only
+# boundary for the bare image — the container runs as root, so the overlay is writable at this path. The
+# ENFORCED read-only boundary is (a) the compose `:ro` curated bind mount below and (b) the catalog
+# module itself, which only READS the curated root and never writes it (`register_pack` publishes to the
+# SEPARATE writable capture volume, never here). In compose, REPLAY_PACK_ROOT is overridden to the
+# operator's provisioned :ro curated mount.
+# NOTE: the catalog derives pack_id from the leaf dir name, so this seed catalogs as pack_id="curated".
+# That id is STABLE across both the image-bake path and the compose :ro mount (both leaf-named "curated"),
+# so R-3's pack-bound competition identity references the same id in either deployment.
+COPY scripts/fixtures/demo_pack_real /opt/veridex/replay-packs/curated
+ENV REPLAY_PACK_ROOT=/opt/veridex/replay-packs/curated
+
+# Network binding (overridable). The process is the isolation boundary, so bind all interfaces.
+ENV HOST=0.0.0.0 \
+    PORT=8000
+EXPOSE 8000
+
+# WAL_DIR: the persistent, mounted spool directory the I-4 WAL writes to. It MUST be backed by a
+# durable mounted volume (NOT the ephemeral container layer, which is lost on restart — AC-13). The
+# WAL itself is I-4; this image only makes the path/volume ready. D-1's compose mounts a real volume
+# here; the VOLUME declaration documents the contract and prevents accidental writes to the image layer.
+ENV WAL_DIR=/data/wal
+VOLUME ["/data/wal"]
+
+# ASGI-factory form: the app is built from the environment INSIDE the process, so a misconfiguration
+# (e.g. missing CORS_ORIGINS, or an unreachable DATABASE_URL) fails startup loudly (fail-closed) —
+# never a silent InMemory fallback that would lose state on restart.
+CMD ["python", "-m", "veridex.api.server"]

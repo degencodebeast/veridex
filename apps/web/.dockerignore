@@ -1,0 +1,42 @@
+# apps/web/.dockerignore — D-0. This app dir is its own build context
+# (compose.coolify.yml `web.build.context: ./apps/web`), so the root
+# .dockerignore does NOT apply here — the secret exclusions must be repeated.
+
+# Secrets — must never enter an image layer (before any broad COPY).
+**/.env
+**/.env.*
+*.env
+**/*.pem
+**/*.key
+**/*.p12
+**/*.pfx
+**/id_rsa*
+**/id_ed25519*
+# Wallet material = keypair JSON — NOT source (WalletChip.tsx must build).
+**/*wallet*.json
+**/*keypair*.json
+**/id.json
+**/*.keystore
+
+# Dependencies + build output (rebuilt inside the image).
+node_modules/
+.next/
+out/
+
+# Tests + tooling — not needed in the production image.
+__tests__/
+e2e/
+# Colocated unit tests (e.g. lib/**/*.test.ts) — keep them out of the build context.
+# next build never bundles them, but excluding keeps the image lean and honest.
+**/*.test.ts
+**/*.test.tsx
+playwright.config.ts
+vitest.config.mts
+vitest.setup.ts
+eslint.config.mjs
+
+# VCS + local cruft.
+.git
+.gitignore
+Dockerfile
+.dockerignore

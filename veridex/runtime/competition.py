@@ -22,7 +22,7 @@ a live-mode state owned by B9).
 from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 from veridex.chain.anchor import anchor_memo, run_manifest_hash
@@ -32,6 +32,7 @@ from veridex.checks.build import (
     check_results_to_proof_block,
 )
 from veridex.leaderboard import leaderboard
+from veridex.runtime.arena_comparison import run_arena_comparison
 from veridex.runtime.orchestrator import RunResult, run_competition
 from veridex.scoring import score_run
 from veridex.verifier.proof_card import DEFAULT_SCHEMA_VERSIONS, proof_card_from_run_result
@@ -39,7 +40,9 @@ from veridex.verifier.recompute import manifest_from_run, recompute_score_root, 
 
 if TYPE_CHECKING:
     from veridex.ingest.marketstate import MarketState
+    from veridex.runtime.llm_checkpoint import CheckpointPolicy
     from veridex.store import Store
+    from veridex.strategies.llm_drift import ModelLauncher
 
 #: Solana cluster recorded in the proof-card anchor block (devnet for Phase 1).
 DEFAULT_CLUSTER: str = "devnet"
@@ -69,6 +72,11 @@ class CompetitionResult:
         signature: The Solana tx signature when anchored, else ``None``.
         proof_card: The judge-visible proof-card JSON (lineage + checks + anchor).
         leaderboard: The ranked cross-run leaderboard rows for this single run.
+        arena_comparison: The OPTIONAL II-9 checkpointed arena-comparison payload (eligible
+            checkpoints, per-contestant actions-vs-WAITs, scoreable decisions, fixture count,
+            clustered uncertainty, and the identical-opportunity flag). ADDITIVE: defaults to
+            ``None`` for every existing (non-arena) run, so current callers are unaffected. It is
+            NEVER a bare average CLV (addendum §3) — attach it via :func:`attach_arena_comparison`.
     """
 
     run: RunResult
@@ -79,6 +87,32 @@ class CompetitionResult:
     signature: str | None
     proof_card: dict[str, Any]
     leaderboard: list[dict[str, Any]]
+    arena_comparison: dict[str, Any] | None = None
+
+
+@dataclass(frozen=True)
+class ArenaSpec:
+    """Opt-in II-9 arena-comparison config, driven over the SAME tape as the scored competition.
+
+    When passed to :func:`run_demo_competition`, the checkpointed det-Drift vs LLM-Drift comparison is
+    driven over the run's ``marketstates`` and its HONEST report (eligible checkpoints, per-contestant
+    actions-vs-WAITs, AUTHORITATIVE scoreable decisions, fixture count, clustered uncertainty, and the
+    identical-opportunity flag) is attached to the returned :class:`CompetitionResult` via
+    :func:`attach_arena_comparison` — so a real det-Drift + LLM-Drift competition ACTUALLY produces and
+    exposes the fairness/accounting payload reaching the API/UI (NEVER a bare average CLV, addendum §3).
+
+    Attributes:
+        model: The injectable LLM launcher seam for LLM-Drift (production Agno launcher; a fake offline).
+        det_policy: The pinned checkpoint policy for det-Drift.
+        llm_policy: The pinned checkpoint policy for LLM-Drift; defaults to ``det_policy`` (the fair,
+            identical-grid case).
+        det_kwargs: det-Drift gate thresholds (mirrors ``CumulativeDriftStrategy`` kwargs).
+    """
+
+    model: ModelLauncher
+    det_policy: CheckpointPolicy
+    llm_policy: CheckpointPolicy | None = None
+    det_kwargs: dict[str, Any] = field(default_factory=dict)
 
 
 def _fixture_or_window_id(marketstates: list[MarketState]) -> str:
@@ -151,6 +185,7 @@ async def run_demo_competition(
     anchor_fn: AnchorFn | None = anchor_memo,
     checks_fn: ChecksFn | None = None,
     run_id: str | None = None,
+    arena: ArenaSpec | None = None,
 ) -> CompetitionResult:
     """Run one full demo competition: score → manifest → anchor → proof card → leaderboard.
 
@@ -228,7 +263,7 @@ async def run_demo_competition(
         [{**row, "anchor_status": anchor_status, "source_mode": source_mode} for row in scores]
     )
 
-    return CompetitionResult(
+    result = CompetitionResult(
         run=run,
         scores=scores,
         manifest=manifest,
@@ -238,3 +273,48 @@ async def run_demo_competition(
         proof_card=proof_card,
         leaderboard=leaderboard_rows,
     )
+
+    # II-9 — when this is an arena competition, ACTUALLY run the checkpointed det-Drift vs LLM-Drift
+    # comparison over the SAME tape and attach its honest report so the fairness/accounting payload
+    # (and the leaderboard's identical-opportunity context) reaches the API/UI — never a harness leaf.
+    if arena is not None:
+        arena_run = await run_arena_comparison(
+            marketstates,
+            model=arena.model,
+            det_policy=arena.det_policy,
+            llm_policy=arena.llm_policy,
+            **dict(arena.det_kwargs),
+        )
+        result = attach_arena_comparison(result, arena_run.report().to_payload())
+
+    return result
+
+
+def attach_arena_comparison(
+    result: CompetitionResult, comparison: dict[str, Any]
+) -> CompetitionResult:
+    """Return a COPY of ``result`` carrying the II-9 arena-comparison payload (additive, non-mutating).
+
+    The payload is the honest :meth:`~veridex.runtime.arena_comparison.ArenaComparisonReport.to_payload`
+    dict — eligible checkpoints, per-contestant actions-vs-WAITs, scoreable decisions, fixture count,
+    clustered uncertainty, and the identical-opportunity flag; NEVER a bare average CLV (addendum §3).
+    Each leaderboard row is additively tagged with the run-level ``identical_opportunities`` flag and
+    ``arena_scoreable_decisions`` so the ranked view carries the honest context without dropping or
+    reshaping any existing field. The input ``result`` is left untouched (``CompetitionResult`` is frozen).
+
+    Args:
+        result: The completed competition result to enrich.
+        comparison: The arena-comparison payload to attach (from ``ArenaComparisonReport.to_payload``).
+
+    Returns:
+        A new :class:`CompetitionResult` with ``arena_comparison`` set and the tagged leaderboard rows.
+    """
+    from dataclasses import replace
+
+    identical = comparison.get("identical_opportunities")
+    scoreable = comparison.get("scoreable_decisions")
+    tagged_rows = [
+        {**row, "identical_opportunities": identical, "arena_scoreable_decisions": scoreable}
+        for row in result.leaderboard
+    ]
+    return replace(result, arena_comparison=dict(comparison), leaderboard=tagged_rows)

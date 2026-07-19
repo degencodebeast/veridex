@@ -1,0 +1,122 @@
+# compose.coolify.yml — D-1 RUNNABLE Coolify/VPS stack (wires I-5's Dockerfile.api).
+#
+# Evolves the D-0 static skeleton into a bootable stack: real env injection with fail-closed
+# required-var guards, Docker healthchecks, db-init at startup, and durable named volumes.
+#
+# FAIL-CLOSED env: every required secret uses `${VAR:?message}` — a MISSING value aborts
+# `docker compose config`/`up` with that message (never a silent localhost fallback). The operator
+# sets these in Coolify; they are NEVER committed. `${VAR:-default}` is used ONLY for non-secret
+# knobs (ports, WAL path, pack root) that have a safe default.
+#
+# LOCAL vs PRODUCTION: this file boots as-is locally (bind-mounts the pinned demo pack as the curated
+# seed catalog, publishes api/web on the host). In production the operator supplies the secret env in
+# Coolify and points the curated seed mount at the provisioned pack directory (see
+# deploy/coolify/backup-restore.md + runbook.md). NO real DNS/VPS/credential is embedded here.
+
+services:
+  # ── api-runtime ──────────────────────────────────────────────────────
+  # AgentOS is mounted IN this service per II-4 — NOT a separate container. ONE process tree, ONE
+  # replica, serves the API + the agent runtime. `python -m veridex.api.server` runs init_db once at
+  # startup (fail-closed: an unreachable DATABASE_URL refuses to start — see veridex/api/server.py).
+  api-runtime:
+    build:
+      context: .
+      # I-5-owned Dockerfile.api — CONSUMED UNCHANGED by D-1 (production hardening stays in I-5).
+      dockerfile: Dockerfile.api
+    # Exactly ONE replica: the durable WAL spool + runtime-event/OPS spool live in this single process.
+    # (The served AgentOS surface is surface-only; its in-memory session store is non-authoritative.)
+    deploy:
+      replicas: 1
+    environment:
+      # --- required secrets (fail-closed `:?` guards) ---
+      DATABASE_URL: ${DATABASE_URL:?DATABASE_URL is required (durable Postgres DSN; no silent InMemory fallback)}
+      CORS_ORIGINS: ${CORS_ORIGINS:?CORS_ORIGINS is required (comma-separated exact web origins)}
+      OPERATOR_TOKEN: ${OPERATOR_TOKEN:?OPERATOR_TOKEN is required (control-plane write bearer)}
+      PRIVY_APP_ID: ${PRIVY_APP_ID:?PRIVY_APP_ID is required (Privy access-token aud)}
+      PRIVY_VERIFICATION_KEY: ${PRIVY_VERIFICATION_KEY:?PRIVY_VERIFICATION_KEY is required (Privy ES256 SPKI/PEM)}
+      # --- non-secret config (safe defaults) ---
+      OPERATOR_ID: ${OPERATOR_ID:-}
+      APP_ENV: ${APP_ENV:-production}
+      AUTH_MODE: ${AUTH_MODE:-privy}
+      HOST: 0.0.0.0
+      PORT: "8000"
+      # WAL_DIR reconciles with the wal-spool mount below AND Dockerfile.api's ENV default (/data/wal)
+      # so the I-4 WAL writes to a DURABLE volume, never the ephemeral container layer (AC-13).
+      WAL_DIR: ${WAL_DIR:-/data/wal}
+      # Curated seed-pack catalog the /readyz ReplayPack check + demo/backtest surfaces resolve.
+      REPLAY_PACK_ROOT: ${REPLAY_PACK_ROOT:-/var/lib/veridex/replay-packs/curated}
+      # Writable capture root the process rescans at startup (R-0b/R-2) — MUST equal the `replay-capture`
+      # mount below so a live-promoted pack SURVIVES a container restart (the new process folds it back
+      # into the catalog). Without this the mounted volume is never handed to the process (R-E durability).
+      REPLAY_CAPTURE_ROOT: ${REPLAY_CAPTURE_ROOT:-/var/lib/veridex/replay-packs/capture}
+    volumes:
+      # WAL_DIR — durable I-4 event spool (AC-13). Named volume survives container replacement.
+      - wal-spool:/data/wal
+      # Writable ReplayPack capture root (R-0b/R-2) — live captures must survive redeploys.
+      - replay-capture:/var/lib/veridex/replay-packs/capture
+      # Curated seed packs — READ-ONLY. Bind-mounts the I-10 pinned demo pack locally; the operator
+      # repoints this source at the provisioned curated directory in production.
+      - ./scripts/fixtures/demo_pack_real:/var/lib/veridex/replay-packs/curated:ro
+    depends_on:
+      postgres:
+        # init_db needs Postgres up first; wait for the pg_isready healthcheck to pass.
+        condition: service_healthy
+    healthcheck:
+      # Deployment READINESS (deeper than /healthz liveness): the durable Veridex deps — Postgres +
+      # runtime-event/OPS spool + ReplayPack catalog. Fail-closed — a 503 raises (non-zero) and marks
+      # the container unhealthy. (The surface-only AgentOS in-memory store is disclosed but NON-gating.)
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/readyz',timeout=5).status==200 else 1)",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 40s
+    ports:
+      # Coolify fronts public exposure via Traefik; publishing here makes the stack usable locally.
+      - "${API_HOST_PORT:-8000}:8000"
+
+  # ── web ──────────────────────────────────────────────────────────────
+  # Next.js frontend (apps/web). Build context is the app dir; apps/web/.dockerignore governs it.
+  web:
+    build:
+      context: ./apps/web
+      dockerfile: Dockerfile
+      args:
+        # Absolute API origin the browser + SSR fetch (fail-closed: a missing value aborts the build).
+        NEXT_PUBLIC_API_BASE: ${NEXT_PUBLIC_API_BASE:?NEXT_PUBLIC_API_BASE is required (absolute API origin)}
+    depends_on:
+      api-runtime:
+        condition: service_healthy
+    ports:
+      - "${WEB_HOST_PORT:-3000}:3000"
+
+  # ── postgres ─────────────────────────────────────────────────────────
+  # Pinned official image — never a floating tag in a trust-path deployment.
+  postgres:
+    image: postgres:16.6-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:?POSTGRES_USER is required}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
+      POSTGRES_DB: ${POSTGRES_DB:?POSTGRES_DB is required}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      # `$$` escapes compose interpolation so the container shell expands its own POSTGRES_* env.
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+volumes:
+  # Postgres data directory.
+  postgres-data:
+  # WAL_DIR spool (I-4/AC-13).
+  wal-spool:
+  # Writable ReplayPack capture root (R-0b/R-2).
+  replay-capture:

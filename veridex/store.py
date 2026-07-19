@@ -27,13 +27,22 @@ from __future__ import annotations
 
 import copy
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from enum import Enum
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 from veridex.competition.events import CompetitionEvent
-from veridex.competition.models import AgentEntry, Competition, CompetitionConfig, CompetitionStatus
+from veridex.competition.models import (
+    AgentEntry,
+    Competition,
+    CompetitionConfig,
+    CompetitionStatus,
+    ReplayBinding,
+)
 from veridex.config import get_settings, require_database_url
+from veridex.deploy.attempt import AttemptStatus, DeploymentAttempt, DuplicateAttemptError
 from veridex.deploy.instance import AgentInstance, DeployFailureReason, DeployStatus
+from veridex.dust_execution.provisioning_record import ExecutionWalletProvisioningRecord
 from veridex.execution.models import ExecutionRecord
 from veridex.runtime.evidence import serialize_payload
 
@@ -88,6 +97,126 @@ _EXECUTION_STATUS_VALUES: tuple[str, ...] = (
 # Values MUST stay in DeployStatus enum-definition order; the drift-guard test asserts exact
 # equality with veridex.deploy.instance.deploy_status_values().
 _INSTANCE_STATUS_VALUES: tuple[str, ...] = ("pending", "running", "sealed", "failed")
+
+
+# ---------------------------------------------------------------------------
+# Runtime instance-lease (II-4 / AC-25 — crash-safe single-active-run exclusivity)
+# ---------------------------------------------------------------------------
+
+
+class DuplicateLeaseError(Exception):
+    """Raised when acquiring a lease whose ``instance_id`` is already claimed (the exclusivity signal).
+
+    The single, store-agnostic "one run per instance" signal: :class:`PostgresStore` maps the Postgres
+    ``UniqueViolation`` on ``UNIQUE(instance_id)`` to this, and :class:`InMemoryStore` raises it in code
+    from the same collision — so the AgentOS wrapper route reconciles on ONE contract regardless of
+    backend and NEVER launches a second run (mirrors :class:`~veridex.deploy.attempt.DuplicateAttemptError`).
+    """
+
+
+class DeploymentAttemptTransitionError(Exception):
+    """Raised when an atomic deployment-attempt CAS forward-transition cannot be applied safely (II-5b).
+
+    The single, store-agnostic signal for a REFUSED provisioning-saga transition — a compare-and-set
+    whose observed status did not equal the caller's ``expected`` (a concurrent worker already
+    advanced it), or a write-once ``external_id`` collision (a different external id than the one
+    already pinned). Both :class:`InMemoryStore` and :class:`PostgresStore` raise it from the same
+    conditions so the saga reconciles on ONE contract and NEVER advances two workers inconsistently.
+    A backwards/rewind target is a :class:`ValueError` from
+    :meth:`~veridex.deploy.attempt.DeploymentAttempt.transition` (forward-only), surfaced unchanged.
+    """
+
+
+class CompetitionStatusClaimError(Exception):
+    """Raised when an atomic competition status compare-and-set (claim) cannot be applied.
+
+    The single, store-agnostic signal for a REFUSED competition-status claim — a compare-and-set whose
+    observed status did not equal the caller's ``expected`` (a concurrent request already claimed the
+    competition). Both :class:`InMemoryStore` and :class:`PostgresStore` raise it from the same
+    condition so the arena-start endpoint reconciles on ONE contract and NEVER launches two physical
+    comparisons for the same competition (mirrors :class:`DeploymentAttemptTransitionError`).
+    """
+
+
+class RosterAdmissionError(Exception):
+    """Raised when an atomic status-guarded roster admission (``add_agent_entry_guarded``) is refused.
+
+    The single, store-agnostic signal for a REFUSED roster append — the append is admitted ONLY inside
+    the same atomic write that verifies (a) the competition is still in a roster-mutable status, (b) the
+    agent-id is not already registered, and (c) the roster is under ``config.roster_size``. A registration
+    racing an arena start therefore cannot append after the arena has claimed the competition out of the
+    mutable window. The human-readable message distinguishes the three refusal causes (frozen / duplicate
+    / capacity). Both :class:`InMemoryStore` and :class:`PostgresStore` raise it from the same conditions
+    so the register endpoint reconciles on ONE contract (mirrors :class:`CompetitionStatusClaimError`).
+    """
+
+
+class LeaseStatus(str, Enum):
+    """Forward-only lifecycle of an :class:`InstanceLease` (crash-safe single-active-run exclusivity).
+
+    ``STARTING`` is claimed (unique-insert) BEFORE the AgentOS run is attached; ``ACTIVE`` marks the
+    run attached and the instance ``runtime_handle`` persisted; ``RELEASED`` / ``FAILED`` are the two
+    terminal outcomes. The state machine only ever advances (STARTING -> ACTIVE -> RELEASED|FAILED):
+    a crash that leaves the lease in ``STARTING`` is recoverable/boundedly-conflicting under the SAME
+    pre-allocated ids, never a second run.
+    """
+
+    STARTING = "starting"
+    ACTIVE = "active"
+    RELEASED = "released"
+    FAILED = "failed"
+
+
+# CHECK-constraint literal tuple for instance_leases.status. Values MUST stay in LeaseStatus
+# enum-definition order; the drift-guard test asserts exact equality with lease_status_values().
+_LEASE_STATUS_VALUES: tuple[str, ...] = tuple(m.value for m in LeaseStatus)
+
+# Forward-only rank: a lease may only advance to a STRICTLY-later rank (or stay idempotently on the
+# SAME terminal). Both terminals share rank 2, so a RELEASED lease can never flip to FAILED (or vice
+# versa) and nothing rewinds out of a terminal — the crash-safety invariant.
+_LEASE_STATUS_RANK: dict[LeaseStatus, int] = {
+    LeaseStatus.STARTING: 0,
+    LeaseStatus.ACTIVE: 1,
+    LeaseStatus.RELEASED: 2,
+    LeaseStatus.FAILED: 2,
+}
+
+
+def lease_status_values() -> tuple[str, ...]:
+    """Return the full set of valid ``instance_leases.status`` strings (enum-definition order)."""
+    return tuple(member.value for member in LeaseStatus)
+
+
+@dataclass
+class InstanceLease:
+    """The DURABLE single-active-run exclusivity claim for one deployed ``AgentInstance`` (II-4 / AC-25).
+
+    Inserted (once) under ``UNIQUE(instance_id)`` BEFORE an AgentOS run is attached; the unique
+    violation IS the "already running" signal (:class:`DuplicateLeaseError`). The SERVER pre-allocates
+    ``runtime_agent_id`` / ``session_id`` / ``run_id`` and pins them here, so a duplicate/recovery
+    starter reconciles under the SAME ids and never mints a second run.
+
+    Attributes:
+        instance_id: The owning :class:`~veridex.deploy.instance.AgentInstance` (the UNIQUE key —
+            one live run per instance for the scalar-run hackathon model; P-8 relaxes this).
+        runtime_agent_id: SERVER-pre-allocated AgentOS agent id the run is attached under.
+        session_id: SERVER-pre-allocated AgentOS session id.
+        run_id: SERVER-pre-allocated Veridex run id (the authoritative result/evidence identity).
+        status: Forward-only :class:`LeaseStatus`.
+        operator_id: The owning instance's ``operator_id`` — DUPLICATED here for AUDIT only; it is
+            NEVER the ownership authority (authority stays ``AgentInstance.operator_id``).
+        created_at: ISO-8601 UTC timestamp the lease was claimed.
+        updated_at: ISO-8601 UTC timestamp of the last status transition.
+    """
+
+    instance_id: str
+    runtime_agent_id: str
+    session_id: str
+    run_id: str
+    status: LeaseStatus
+    operator_id: str
+    created_at: str
+    updated_at: str
 
 
 # ---------------------------------------------------------------------------
@@ -163,6 +292,48 @@ class PreSubmitLedgerRow:
 
 
 # ---------------------------------------------------------------------------
+# Runtime-event row (I-4 / AC-13/14/15 — durable OPS-channel telemetry, INSERT-only + dedup)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class RuntimeEventRow:
+    """One durable OPS-channel :class:`~veridex.runtime.runtime_events.RuntimeEvent` (I-4).
+
+    The persistent backing for the Agent-Ops drawer feed. INSERT-only and de-duplicated at the DB
+    by the client-generated ``event_uuid`` (``UNIQUE(event_uuid)`` + ``ON CONFLICT DO NOTHING``), so
+    the durable spool's at-least-once replay lands each event exactly once. The read cursor clients
+    page on is the DB-assigned ``BIGSERIAL`` ``id`` — a monotonic commit-order sequence, NOT any
+    evidence ``sequence_no``.
+
+    SEC-003 by construction: the row carries NO ``sequence_no`` / ``payload_hash`` / ``evidence``
+    column, so an OPS event can never masquerade as a sealed RunEvent / CompetitionEvent — exactly
+    the three fields the evidence path requires are structurally absent.
+
+    Attributes:
+        id: DB-assigned monotonic commit-order cursor (``BIGSERIAL``); ``0`` before persistence.
+        event_uuid: Client-generated idempotency key (the dedup identity; never a venue/evidence key).
+        agent_id: The agent this telemetry is about (the owner-scoped read filters on it).
+        run_id: Correlation id for the run, when known.
+        session_id: Runtime session id, when known.
+        event_type: The :class:`~veridex.runtime.runtime_events.RuntimeEventType` value.
+        ts: Wall-clock emit time (ms) — NON-deterministic, precisely why it is never sealed.
+        channel: Always ``"OPS"``.
+        payload: Free-form, secret-free telemetry detail.
+    """
+
+    id: int
+    event_uuid: str
+    agent_id: str
+    run_id: str | None
+    session_id: str | None
+    event_type: str
+    ts: int
+    channel: str
+    payload: dict[str, Any]
+
+
+# ---------------------------------------------------------------------------
 # Protocol
 # ---------------------------------------------------------------------------
 
@@ -204,15 +375,27 @@ class Store(Protocol):
         """
         ...
 
-    async def add_agent_entry(self, competition_id: str, entry: AgentEntry) -> None:
-        """Append an agent entry to a competition's roster.
+    async def add_agent_entry_guarded(
+        self, competition_id: str, entry: AgentEntry, *, mutable_statuses: tuple[CompetitionStatus, ...]
+    ) -> None:
+        """Append ``entry`` ONLY IF the competition is still roster-mutable, atomically (roster freeze).
+
+        The atomic admission write the register path uses so a registration racing an arena start can
+        NEVER append after the arena claimed the competition out of the roster-mutable window. In ONE
+        atomic write it verifies, then appends: (a) ``status in mutable_statuses``, (b) no duplicate
+        ``agent_id``, and (c) the roster is under ``config.roster_size``. InMemory does the whole
+        check+append with no ``await`` gap; Postgres locks the row ``SELECT ... FOR UPDATE`` so a
+        concurrent claim blocks until this write commits.
 
         Args:
             competition_id: The owning competition.
-            entry: The agent entry to append.
+            entry: The finalized agent entry to append.
+            mutable_statuses: The statuses in which the roster may still be mutated (DRAFT/OPEN).
 
         Raises:
             KeyError: If no competition with ``competition_id`` exists.
+            RosterAdmissionError: If the status left the mutable window (``frozen``), the id is already
+                registered (``duplicate``), or the roster is full (``capacity``).
         """
         ...
 
@@ -225,6 +408,50 @@ class Store(Protocol):
 
         Raises:
             KeyError: If no competition with ``competition_id`` exists.
+        """
+        ...
+
+    async def claim_competition_run(
+        self, competition_id: str, *, expected: CompetitionStatus, new: CompetitionStatus, run_id: str
+    ) -> None:
+        """Atomically CAS status ``expected`` -> ``new`` AND set ``run_id`` in ONE write (arena claim).
+
+        The single guarded write the arena start uses to CLAIM a competition: it advances ``status`` and
+        reserves ``run_id`` together, only when the observed status equals ``expected``. Binding both in
+        one write closes the crash window the old two-write sequence left (status claimed, run_id not yet
+        written). Two concurrent claims can never both pass (InMemory: no ``await`` between check and
+        write; Postgres: ``... WHERE status = expected``); the loser is refused.
+
+        Args:
+            competition_id: The competition to claim.
+            expected: The status the caller believes is current (the compare half of the CAS).
+            new: The status to set (the swap half).
+            run_id: The reserved run identifier to persist atomically with the status swap.
+
+        Raises:
+            KeyError: If no competition with ``competition_id`` exists.
+            CompetitionStatusClaimError: On a CAS conflict (a concurrent request already claimed it).
+        """
+        ...
+
+    async def release_competition_run(
+        self, competition_id: str, *, expected: CompetitionStatus, new: CompetitionStatus
+    ) -> None:
+        """Atomically CAS status ``expected`` -> ``new`` AND clear ``run_id`` (post-failure rollback).
+
+        The fail-closed rollback the arena uses when a post-claim run fails before any canonical event
+        was committed: it returns the competition to a retryable status and clears the reserved run_id,
+        so a stalled/failed run never permanently strands the competition in RUNNING with a dead run_id.
+        CAS-guarded on ``expected`` so it never clobbers a competition that moved on.
+
+        Args:
+            competition_id: The competition to roll back.
+            expected: The status the caller believes is current (the compare half of the CAS).
+            new: The status to set (the swap half; DRAFT to make the run retryable).
+
+        Raises:
+            KeyError: If no competition with ``competition_id`` exists.
+            CompetitionStatusClaimError: On a CAS conflict.
         """
         ...
 
@@ -249,6 +476,26 @@ class Store(Protocol):
         Args:
             competition_id: The competition to update.
             config: The new :class:`~veridex.competition.models.CompetitionConfig` snapshot.
+
+        Raises:
+            KeyError: If no competition with ``competition_id`` exists.
+        """
+        ...
+
+    async def update_competition_replay_binding(
+        self, competition_id: str, binding: ReplayBinding
+    ) -> None:
+        """CAS-freeze the FROZEN, server-derived production-replay identity onto a competition (R-4).
+
+        Used at competition start to durably freeze the auto-resolved single-pack binding BEFORE the
+        run claim, so a legacy unbound DRAFT commits to exactly the pack it will replay. ONLY-IF-UNBOUND
+        compare-and-set: if the competition is ALREADY bound (a concurrent start that won the run claim
+        froze it first), this is a no-op — a losing start can never clobber the identity the winning run
+        actually replayed (which would make ``GET`` report a hash the run never replayed).
+
+        Args:
+            competition_id: The competition to bind.
+            binding: The resolved :class:`~veridex.competition.models.ReplayBinding` to persist.
 
         Raises:
             KeyError: If no competition with ``competition_id`` exists.
@@ -410,6 +657,39 @@ class Store(Protocol):
         """
         ...
 
+    async def append_runtime_events(self, rows: list[RuntimeEventRow]) -> int:
+        """INSERT durable OPS-channel runtime events, de-duplicated by ``event_uuid`` (I-4).
+
+        The durable spool delivers at-least-once and relies on the STORE to dedup: each row is
+        inserted ``ON CONFLICT (event_uuid) DO NOTHING`` (never client-side alone), so a WAL replay
+        of an already-committed batch is a no-op. INSERT-only — rows are never updated or deleted.
+
+        Args:
+            rows: The events to append. Their ``id`` is ignored (DB-assigned ``BIGSERIAL``).
+
+        Returns:
+            The number of rows NEWLY inserted (duplicates skipped).
+        """
+        ...
+
+    async def list_runtime_events(
+        self, agent_id: str, *, since: int = 0, limit: int | None = None
+    ) -> list[RuntimeEventRow]:
+        """Return one agent's durable OPS events with ``id > since``, ascending commit order (I-4).
+
+        Cursor paging: ``since`` is the last ``id`` the client consumed (``0`` returns everything);
+        the durable ``BIGSERIAL`` ``id`` guarantees no loss / no duplication across a reconnect.
+
+        Args:
+            agent_id: The agent whose OPS telemetry to read.
+            since: The last consumed ``id`` (exclusive lower bound); ``0`` returns from the start.
+            limit: When set, cap to the FIRST ``limit`` rows after ``since`` (forward paging).
+
+        Returns:
+            Matching :class:`RuntimeEventRow` objects, sorted by ``id`` ascending.
+        """
+        ...
+
     async def persist_agent_instance(self, instance: AgentInstance) -> None:
         """Persist a deployed :class:`~veridex.deploy.instance.AgentInstance` (source of truth).
 
@@ -463,6 +743,169 @@ class Store(Protocol):
         """
         ...
 
+    async def list_agent_instances(self) -> list[AgentInstance]:
+        """Return every persisted deployed instance (a dumb enumerator — no owner filtering here).
+
+        Owner-scoping is deliberately NOT applied at this layer: the owner-scoped route
+        (:mod:`veridex.api.deploy`) applies the fail-closed owner filter so the trust boundary lives
+        in one reviewable place. An UNOWNED / legacy row (``operator_id is None``) is therefore
+        returned here but excluded by the route from every caller's listing.
+
+        Returns:
+            All :class:`~veridex.deploy.instance.AgentInstance` records (any order).
+        """
+        ...
+
+    async def persist_deployment_attempt(self, attempt: DeploymentAttempt) -> None:
+        """INSERT a durable deployment-attempt claim (the deploy-saga idempotency backbone).
+
+        The attempt is persisted BEFORE any deploy side effect, into an append-only ledger table with
+        ``UNIQUE(operator_id, idempotency_key)``: a second INSERT for an already-claimed pair is the
+        idempotency signal, surfaced as :class:`~veridex.deploy.attempt.DuplicateAttemptError`.
+
+        Args:
+            attempt: The write-once claim to persist (keyed by ``(operator_id, idempotency_key)``).
+
+        Raises:
+            DuplicateAttemptError: If ``(operator_id, idempotency_key)`` is already claimed.
+        """
+        ...
+
+    async def get_deployment_attempt_by_key(
+        self, operator_id: str, idempotency_key: str
+    ) -> DeploymentAttempt | None:
+        """Load the deployment-attempt claim for ``(operator_id, idempotency_key)``, if any.
+
+        Args:
+            operator_id: The SERVER-DERIVED owner the claim is scoped to.
+            idempotency_key: The caller-scoped idempotency key.
+
+        Returns:
+            The recorded :class:`~veridex.deploy.attempt.DeploymentAttempt`, or ``None`` if unclaimed.
+        """
+        ...
+
+    # --- II-5b execution-wallet provisioning saga (atomic CAS forward-transition + record) ---
+
+    async def get_deployment_attempt(self, attempt_id: str) -> DeploymentAttempt | None:
+        """Load a deployment-attempt claim by its primary ``attempt_id`` (the provisioning-saga key).
+
+        The provisioning saga (:mod:`veridex.dust_execution.privy_provisioning`) addresses the attempt
+        by ``attempt_id`` (derived from ``instance_id``), independent of the ``(operator, key)`` pair.
+
+        Args:
+            attempt_id: The durable attempt identifier.
+
+        Returns:
+            The recorded :class:`~veridex.deploy.attempt.DeploymentAttempt`, or ``None`` if absent.
+        """
+        ...
+
+    async def advance_deployment_attempt(
+        self,
+        attempt_id: str,
+        *,
+        expected: AttemptStatus,
+        new: AttemptStatus,
+        external_id: str | None = None,
+    ) -> DeploymentAttempt:
+        """Atomically advance an attempt's status ONLY if it currently equals ``expected`` (CAS; II-5b).
+
+        The crash-safe forward-transition the provisioning saga drives: it advances ``status`` only
+        when the observed status equals ``expected`` (else refuses), preserves the WRITE-ONCE
+        ``external_id`` (a different value is refused; the same value is idempotent), rejects rewinds
+        (forward-only), and prevents two workers from advancing the same attempt inconsistently
+        (InMemory: no ``await`` between check and write; Postgres: ``... WHERE status = expected``).
+
+        Args:
+            attempt_id: The attempt to advance.
+            expected: The status the caller believes is current (the compare half of the CAS).
+            new: The strictly-forward status to set (the swap half).
+            external_id: The deterministic recovery id to pin write-once (``None`` leaves it unchanged).
+
+        Returns:
+            The updated :class:`~veridex.deploy.attempt.DeploymentAttempt`.
+
+        Raises:
+            KeyError: If no attempt with ``attempt_id`` exists.
+            DeploymentAttemptTransitionError: On a CAS conflict (``current != expected``) or a
+                write-once ``external_id`` collision.
+            ValueError: If ``new`` is not strictly forward of the current status (a rewind).
+        """
+        ...
+
+    async def persist_provisioning_record(self, record: ExecutionWalletProvisioningRecord) -> None:
+        """Persist the immutable execution-wallet provisioning record (idempotent; write-once by hash).
+
+        Keyed by ``record.instance_id``. Re-persisting an IDENTICAL record (same
+        ``provisioning_record_hash``) is a no-op; a DIFFERENT record for the same instance is refused
+        (the record is immutable — a substituted policy/quorum/wallet must never overwrite it).
+
+        Args:
+            record: The immutable provisioning record to persist.
+
+        Raises:
+            ValueError: If a DIFFERENT record already exists for ``record.instance_id``.
+        """
+        ...
+
+    async def get_provisioning_record(self, instance_id: str) -> ExecutionWalletProvisioningRecord | None:
+        """Load the execution-wallet provisioning record for ``instance_id`` (or ``None`` if absent)."""
+        ...
+
+    # --- runtime instance-lease methods (II-4 — crash-safe single-active-run exclusivity) ---
+
+    async def acquire_instance_lease(self, lease: InstanceLease) -> None:
+        """Atomically claim the single-active-run lease for ``lease.instance_id`` (INSERT-only).
+
+        The lease is inserted in ``STARTING`` under ``UNIQUE(instance_id)`` BEFORE an AgentOS run is
+        attached: a second acquire for an already-claimed instance is the "already running" signal,
+        surfaced as :class:`DuplicateLeaseError` — the caller must NEVER launch a second run.
+
+        Args:
+            lease: The pre-allocated claim to persist (keyed by ``instance_id``).
+
+        Raises:
+            DuplicateLeaseError: If ``instance_id`` already holds a lease.
+        """
+        ...
+
+    async def get_instance_lease(self, instance_id: str) -> InstanceLease | None:
+        """Load the current lease for ``instance_id``, if any.
+
+        Args:
+            instance_id: The instance whose lease to load.
+
+        Returns:
+            The recorded :class:`InstanceLease`, or ``None`` if the instance holds no lease.
+        """
+        ...
+
+    async def release_instance_lease(
+        self, instance_id: str, status: LeaseStatus, *, updated_at: str
+    ) -> InstanceLease:
+        """Advance the lease forward-only to ``status`` (idempotent compare-and-set).
+
+        The single transition primitive: ``STARTING -> ACTIVE`` (run attached + ``runtime_handle``
+        persisted) and ``ACTIVE|STARTING -> RELEASED|FAILED`` (terminal) both route here. The move is
+        forward-only and idempotent — re-releasing an already-terminal lease is a no-op (so a
+        cancellation-safe ``finally`` is safe), and a terminal lease NEVER flips to the other terminal
+        or rewinds.
+
+        Args:
+            instance_id: The instance whose lease to transition.
+            status: The target :class:`LeaseStatus` (must not rank earlier than the current status).
+            updated_at: ISO-8601 UTC timestamp of this transition.
+
+        Returns:
+            The transitioned (or unchanged, if idempotent) :class:`InstanceLease`.
+
+        Raises:
+            KeyError: If no lease exists for ``instance_id``.
+            ValueError: If ``status`` would rewind, or flip one terminal to the other.
+        """
+        ...
+
 
 # ---------------------------------------------------------------------------
 # Private reconstruction helpers
@@ -504,7 +947,8 @@ def _build_competition(
 
     Args:
         competition_id: Primary key value.
-        config_json: JSON-serialized :class:`~veridex.competition.models.CompetitionConfig`.
+        config_json: JSON-serialized :class:`~veridex.competition.models.CompetitionConfig`, which
+            ALSO carries the server-derived ``owner_id`` rider (I-7b; zero DDL — no owner column).
         status: Raw status string (one of ``_COMPETITION_STATUS_VALUES``).
         run_id: Optional run correlation id (may be ``None``).
         entries_json: JSON-serialized list of :class:`~veridex.competition.models.AgentEntry` dicts.
@@ -512,13 +956,48 @@ def _build_competition(
     Returns:
         The reconstructed :class:`~veridex.competition.models.Competition`.
     """
+    config_data = json.loads(config_json)
+    # ``owner_id`` (I-7b) and ``replay_binding`` (R-4) ride in the config_json blob to avoid a schema
+    # change. A legacy row written before either feature has no such key → ``None`` → the competition
+    # loads UNOWNED / UNBOUND (fail-closed, never silently inherited). Pop them before validating so
+    # they never leak into CompetitionConfig.
+    owner_id = config_data.pop("owner_id", None)
+    replay_binding_data = config_data.pop("replay_binding", None)
     return Competition(
         competition_id=competition_id,
-        config=CompetitionConfig.model_validate(json.loads(config_json)),
+        config=CompetitionConfig.model_validate(config_data),
         status=CompetitionStatus(status),
         entries=[AgentEntry.model_validate(e) for e in json.loads(entries_json)],
         run_id=run_id,
+        replay_binding=ReplayBinding.model_validate(replay_binding_data) if replay_binding_data else None,
+        owner_id=owner_id,
     )
+
+
+def _serialize_competition_config(
+    config: CompetitionConfig,
+    owner_id: str | None,
+    replay_binding: ReplayBinding | None = None,
+) -> str:
+    """Canonically serialize a config with the server-derived riders folded in (zero DDL).
+
+    The competition's server-derived ``owner_id`` (I-7b) and frozen ``replay_binding`` (R-4) are stored
+    inside the ``config_json`` blob (there are no dedicated columns) so :func:`_build_competition` can
+    read them back. Kept as the single write counterpart to that read so the rider convention lives in
+    one reviewable place.
+
+    Args:
+        config: The competition's immutable config snapshot.
+        owner_id: The server-derived owner DID (or ``None`` for an unowned/legacy competition).
+        replay_binding: The frozen R-4 production-replay identity (or ``None`` for an unbound competition).
+
+    Returns:
+        The canonical JSON string for the ``config_json`` column.
+    """
+    payload = config.model_dump(mode="json")
+    payload["owner_id"] = owner_id
+    payload["replay_binding"] = replay_binding.model_dump(mode="json") if replay_binding is not None else None
+    return serialize_payload(payload)
 
 
 # ---------------------------------------------------------------------------
@@ -536,12 +1015,26 @@ class InMemoryStore:
         self._competition_events: dict[str, list[CompetitionEvent]] = {}
         self._execution_records: dict[str, ExecutionRecord] = {}
         self._agent_instances: dict[str, AgentInstance] = {}
+        # Append-only deployment-attempt ledger, keyed by (operator_id, idempotency_key) — the
+        # in-code mirror of the Postgres UNIQUE(operator_id, idempotency_key) claim (I-3).
+        self._deployment_attempts: dict[tuple[str, str], DeploymentAttempt] = {}
+        # II-5b immutable execution-wallet provisioning records, keyed by instance_id (write-once).
+        self._provisioning_records: dict[str, ExecutionWalletProvisioningRecord] = {}
+        # Runtime single-active-run leases, keyed by instance_id — the in-code mirror of the Postgres
+        # UNIQUE(instance_id) claim (II-4). Atomic check/insert (no await between) makes acquire
+        # race-free under the single-threaded asyncio loop.
+        self._instance_leases: dict[str, InstanceLease] = {}
         # Append-only realized-fill ledger + its monotonic unique-seq counter (SAF-002b/c).
         self._realized_fills: list[RealizedFillLedgerRow] = []
         self._realized_fill_seq: int = 0
         # Append-only pre-submit ledger + its monotonic unique-seq counter (IDM-005).
         self._presubmit_rows: list[PreSubmitLedgerRow] = []
         self._presubmit_seq: int = 0
+        # Durable OPS-channel runtime events (I-4) + monotonic id + the event_uuid dedup set that
+        # mirrors the Postgres UNIQUE(event_uuid) + ON CONFLICT DO NOTHING at-least-once contract.
+        self._runtime_events: list[RuntimeEventRow] = []
+        self._runtime_event_id: int = 0
+        self._runtime_event_uuids: set[str] = set()
 
     # --- run methods (Phase-1, unchanged) ---
 
@@ -617,19 +1110,25 @@ class InMemoryStore:
             raise KeyError(f"no competition with competition_id={competition_id!r}")
         return self._competitions[competition_id].model_copy(deep=True)
 
-    async def add_agent_entry(self, competition_id: str, entry: AgentEntry) -> None:
-        """Append a deep copy of ``entry`` to the stored competition's roster.
+    async def add_agent_entry_guarded(
+        self, competition_id: str, entry: AgentEntry, *, mutable_statuses: tuple[CompetitionStatus, ...]
+    ) -> None:
+        """Append IFF roster-mutable + no-dup + under-capacity, atomically (no ``await`` gap).
 
-        Args:
-            competition_id: The owning competition.
-            entry: The agent entry to append.
-
-        Raises:
-            KeyError: If no competition with ``competition_id`` exists.
+        The whole check+append runs under a single asyncio step (no ``await``), so a registration
+        racing an arena claim can never observe a stale DRAFT and append after the claim advanced the
+        status — the check is re-evaluated at write time against the live status.
         """
         if competition_id not in self._competitions:
             raise KeyError(f"no competition with competition_id={competition_id!r}")
-        self._competitions[competition_id].entries.append(entry.model_copy(deep=True))
+        competition = self._competitions[competition_id]
+        if competition.status not in mutable_statuses:
+            raise RosterAdmissionError("roster is frozen: competition has already started")
+        if any(existing.agent_id == entry.agent_id for existing in competition.entries):
+            raise RosterAdmissionError(f"agent {entry.agent_id!r} is already registered")
+        if len(competition.entries) >= competition.config.roster_size:
+            raise RosterAdmissionError(f"roster is full (cap {competition.config.roster_size})")
+        competition.entries.append(entry.model_copy(deep=True))
 
     async def update_competition_status(self, competition_id: str, status: CompetitionStatus) -> None:
         """Overwrite the stored competition's status.
@@ -644,6 +1143,36 @@ class InMemoryStore:
         if competition_id not in self._competitions:
             raise KeyError(f"no competition with competition_id={competition_id!r}")
         self._competitions[competition_id].status = status
+
+    async def claim_competition_run(
+        self, competition_id: str, *, expected: CompetitionStatus, new: CompetitionStatus, run_id: str
+    ) -> None:
+        """Atomically CAS status + set run_id in one step (no ``await`` gap — see protocol)."""
+        if competition_id not in self._competitions:
+            raise KeyError(f"no competition with competition_id={competition_id!r}")
+        competition = self._competitions[competition_id]
+        if competition.status != expected:
+            raise CompetitionStatusClaimError(
+                f"CAS conflict for competition {competition_id!r}: expected {expected.value!r}, "
+                f"found {competition.status.value!r}"
+            )
+        competition.status = new
+        competition.run_id = run_id
+
+    async def release_competition_run(
+        self, competition_id: str, *, expected: CompetitionStatus, new: CompetitionStatus
+    ) -> None:
+        """Atomically CAS status + clear run_id (post-failure rollback — see protocol)."""
+        if competition_id not in self._competitions:
+            raise KeyError(f"no competition with competition_id={competition_id!r}")
+        competition = self._competitions[competition_id]
+        if competition.status != expected:
+            raise CompetitionStatusClaimError(
+                f"CAS conflict for competition {competition_id!r}: expected {expected.value!r}, "
+                f"found {competition.status.value!r}"
+            )
+        competition.status = new
+        competition.run_id = None
 
     async def update_competition_run_id(self, competition_id: str, run_id: str) -> None:
         """Store the run_id on the competition (deep-copy semantics preserved via direct field set).
@@ -672,6 +1201,21 @@ class InMemoryStore:
         if competition_id not in self._competitions:
             raise KeyError(f"no competition with competition_id={competition_id!r}")
         self._competitions[competition_id].config = config.model_copy(deep=True)
+
+    async def update_competition_replay_binding(
+        self, competition_id: str, binding: ReplayBinding
+    ) -> None:
+        """CAS-freeze the R-4 replay identity — persist ONLY IF the competition is still unbound.
+
+        Only-if-unbound compare-and-set: once a binding is frozen (by the concurrent start that won the
+        run claim), a later persist is a no-op, so a losing start can never clobber the identity the
+        winning run actually replayed. The check-then-set has no ``await`` gap (atomic under asyncio's
+        single-threaded scheduler), mirroring the InMemory claim CAS.
+        """
+        if competition_id not in self._competitions:
+            raise KeyError(f"no competition with competition_id={competition_id!r}")
+        if self._competitions[competition_id].replay_binding is None:
+            self._competitions[competition_id].replay_binding = binding.model_copy(deep=True)
 
     async def append_competition_events(self, competition_id: str, events: list[CompetitionEvent]) -> None:
         """Append deep copies of ``events`` to the competition's event list.
@@ -875,6 +1419,61 @@ class InMemoryStore:
         """
         return [row for row in sorted(self._presubmit_rows, key=lambda r: r.seq) if row.session_id == session_id]
 
+    # --- runtime-event methods (I-4 — durable OPS channel, INSERT-only + event_uuid dedup) ---
+
+    async def append_runtime_events(self, rows: list[RuntimeEventRow]) -> int:
+        """Append durable OPS events, skipping any whose ``event_uuid`` was already stored.
+
+        Mirrors the Postgres ``ON CONFLICT (event_uuid) DO NOTHING`` dedup: a WAL replay of an
+        already-committed batch inserts nothing. A monotonic ``id`` is assigned to each NEW row.
+
+        Args:
+            rows: The events to append (their input ``id`` is ignored; a fresh one is assigned).
+
+        Returns:
+            The number of rows newly inserted.
+        """
+        inserted = 0
+        for row in rows:
+            if row.event_uuid in self._runtime_event_uuids:
+                continue  # ON CONFLICT DO NOTHING — at-least-once replay is idempotent
+            self._runtime_event_uuids.add(row.event_uuid)
+            self._runtime_event_id += 1
+            self._runtime_events.append(
+                RuntimeEventRow(
+                    id=self._runtime_event_id,
+                    event_uuid=row.event_uuid,
+                    agent_id=row.agent_id,
+                    run_id=row.run_id,
+                    session_id=row.session_id,
+                    event_type=row.event_type,
+                    ts=row.ts,
+                    channel=row.channel,
+                    payload=copy.deepcopy(row.payload),
+                )
+            )
+            inserted += 1
+        return inserted
+
+    async def list_runtime_events(
+        self, agent_id: str, *, since: int = 0, limit: int | None = None
+    ) -> list[RuntimeEventRow]:
+        """Return this agent's durable OPS events with ``id > since``, ascending, capped at ``limit``.
+
+        Args:
+            agent_id: The agent whose OPS telemetry to read.
+            since: The last consumed ``id`` (exclusive); ``0`` returns from the start.
+            limit: When set, the FIRST ``limit`` rows after ``since`` (forward cursor paging).
+
+        Returns:
+            Matching :class:`RuntimeEventRow` objects, sorted by ``id`` ascending.
+        """
+        rows = [row for row in self._runtime_events if row.agent_id == agent_id and row.id > since]
+        rows.sort(key=lambda r: r.id)
+        if limit is not None:
+            rows = rows[:limit]
+        return rows
+
     # --- agent-instance methods (Phase-2D deploy — REQ-2D-701A) ---
 
     async def persist_agent_instance(self, instance: AgentInstance) -> None:
@@ -928,6 +1527,184 @@ class InMemoryStore:
             stored.last_failure_reason = last_failure_reason
         stored.updated_at = updated_at
 
+    async def list_agent_instances(self) -> list[AgentInstance]:
+        """Return deep copies of every stored deployed instance (owner filtering is the route's job).
+
+        Returns:
+            Deep copies of all :class:`~veridex.deploy.instance.AgentInstance` records (any order).
+        """
+        return [inst.model_copy(deep=True) for inst in self._agent_instances.values()]
+
+    # --- deployment-attempt ledger methods (I-3 — write-once idempotency claim) ---
+
+    async def persist_deployment_attempt(self, attempt: DeploymentAttempt) -> None:
+        """Store a deep copy of the attempt, enforcing the ``(operator_id, idempotency_key)`` claim.
+
+        Mirrors the Postgres ``UNIQUE(operator_id, idempotency_key)`` in code: a second persist for an
+        already-claimed pair raises :class:`~veridex.deploy.attempt.DuplicateAttemptError`.
+
+        Args:
+            attempt: The write-once claim to persist.
+
+        Raises:
+            DuplicateAttemptError: If ``(operator_id, idempotency_key)`` is already claimed.
+        """
+        key = (attempt.operator_id, attempt.idempotency_key)
+        if key in self._deployment_attempts:
+            raise DuplicateAttemptError(f"deployment attempt already claimed: {key!r}")
+        self._deployment_attempts[key] = attempt.model_copy(deep=True)
+
+    async def get_deployment_attempt_by_key(
+        self, operator_id: str, idempotency_key: str
+    ) -> DeploymentAttempt | None:
+        """Return a deep copy of the recorded attempt for ``(operator_id, idempotency_key)``, or None.
+
+        Args:
+            operator_id: The owner the claim is scoped to.
+            idempotency_key: The caller-scoped idempotency key.
+
+        Returns:
+            A fresh deep copy of the recorded :class:`~veridex.deploy.attempt.DeploymentAttempt`, or
+            ``None`` if the pair is unclaimed.
+        """
+        recorded = self._deployment_attempts.get((operator_id, idempotency_key))
+        return recorded.model_copy(deep=True) if recorded is not None else None
+
+    # --- II-5b execution-wallet provisioning saga (atomic CAS forward-transition + record) ---
+
+    def _find_attempt_key(self, attempt_id: str) -> tuple[str, str] | None:
+        """Return the ``(operator_id, idempotency_key)`` map key of the attempt with ``attempt_id``."""
+        for key, attempt in self._deployment_attempts.items():
+            if attempt.attempt_id == attempt_id:
+                return key
+        return None
+
+    async def get_deployment_attempt(self, attempt_id: str) -> DeploymentAttempt | None:
+        """Return a deep copy of the attempt with ``attempt_id`` (primary key), or ``None``."""
+        key = self._find_attempt_key(attempt_id)
+        if key is None:
+            return None
+        return self._deployment_attempts[key].model_copy(deep=True)
+
+    async def advance_deployment_attempt(
+        self,
+        attempt_id: str,
+        *,
+        expected: AttemptStatus,
+        new: AttemptStatus,
+        external_id: str | None = None,
+    ) -> DeploymentAttempt:
+        """Atomic CAS forward-transition (check + write with NO ``await`` between, so it is race-free).
+
+        Under the single-threaded asyncio loop, doing the compare and the swap without an intervening
+        ``await`` makes two concurrent advances impossible to interleave — exactly one observes
+        ``expected`` and wins; a later caller sees the advanced status and raises.
+        """
+        key = self._find_attempt_key(attempt_id)
+        if key is None:
+            raise KeyError(f"no deployment attempt with attempt_id={attempt_id!r}")
+        current = self._deployment_attempts[key]
+        if current.status != expected:
+            raise DeploymentAttemptTransitionError(
+                f"CAS conflict for attempt {attempt_id!r}: expected {expected.value!r}, "
+                f"found {current.status.value!r}"
+            )
+        # Forward-only: transition() raises ValueError on a rewind / same-state target.
+        advanced = current.transition(new)
+        # Write-once external_id: a different value is refused; the same value is idempotent.
+        if external_id is not None and current.external_id is not None and current.external_id != external_id:
+            raise DeploymentAttemptTransitionError(
+                f"external_id is write-once for attempt {attempt_id!r} "
+                f"({current.external_id!r} -> {external_id!r})"
+            )
+        pinned_external = current.external_id if current.external_id is not None else external_id
+        advanced = advanced.model_copy(update={"external_id": pinned_external})
+        self._deployment_attempts[key] = advanced.model_copy(deep=True)
+        return advanced.model_copy(deep=True)
+
+    async def persist_provisioning_record(self, record: ExecutionWalletProvisioningRecord) -> None:
+        """Persist the immutable record (idempotent by hash; a different record is refused)."""
+        existing = self._provisioning_records.get(record.instance_id)
+        if existing is not None:
+            if existing.provisioning_record_hash() != record.provisioning_record_hash():
+                raise ValueError(
+                    f"provisioning record for instance {record.instance_id!r} is immutable; "
+                    "a different record may not overwrite it"
+                )
+            return
+        self._provisioning_records[record.instance_id] = record.copy()
+
+    async def get_provisioning_record(self, instance_id: str) -> ExecutionWalletProvisioningRecord | None:
+        """Return a deep copy of the provisioning record for ``instance_id`` (or ``None``)."""
+        record = self._provisioning_records.get(instance_id)
+        return record.copy() if record is not None else None
+
+    # --- runtime instance-lease methods (II-4 — crash-safe single-active-run exclusivity) ---
+
+    async def acquire_instance_lease(self, lease: InstanceLease) -> None:
+        """Atomically claim the lease for ``lease.instance_id`` (mirrors the Postgres UNIQUE claim).
+
+        The check + insert run with NO ``await`` between them, so under the single-threaded asyncio
+        loop two concurrent acquires cannot both succeed — exactly one wins, the other raises.
+
+        Args:
+            lease: The pre-allocated claim to persist.
+
+        Raises:
+            DuplicateLeaseError: If ``instance_id`` already holds a lease.
+        """
+        if lease.instance_id in self._instance_leases:
+            raise DuplicateLeaseError(f"instance already holds a run lease: {lease.instance_id!r}")
+        self._instance_leases[lease.instance_id] = copy.deepcopy(lease)
+
+    async def get_instance_lease(self, instance_id: str) -> InstanceLease | None:
+        """Return a deep copy of the current lease for ``instance_id``, or ``None`` if unclaimed."""
+        recorded = self._instance_leases.get(instance_id)
+        return copy.deepcopy(recorded) if recorded is not None else None
+
+    async def release_instance_lease(
+        self, instance_id: str, status: LeaseStatus, *, updated_at: str
+    ) -> InstanceLease:
+        """Advance the in-memory lease forward-only to ``status`` (idempotent compare-and-set).
+
+        Args:
+            instance_id: The instance whose lease to transition.
+            status: The target :class:`LeaseStatus`.
+            updated_at: ISO-8601 UTC timestamp of this transition.
+
+        Returns:
+            A deep copy of the transitioned (or unchanged) lease.
+
+        Raises:
+            KeyError: If no lease exists for ``instance_id``.
+            ValueError: If ``status`` would rewind, or flip one terminal to the other.
+        """
+        current = self._instance_leases.get(instance_id)
+        if current is None:
+            raise KeyError(f"no run lease for instance_id={instance_id!r}")
+        updated = _lease_transition(current, status, updated_at)
+        self._instance_leases[instance_id] = updated
+        return copy.deepcopy(updated)
+
+
+def _lease_transition(current: InstanceLease, status: LeaseStatus, updated_at: str) -> InstanceLease:
+    """Return ``current`` advanced forward-only to ``status`` (idempotent; raises on rewind/terminal-flip).
+
+    Shared by both stores so the forward-only CAS rule lives in ONE place. Idempotent re-release of an
+    already-terminal lease returns it unchanged; a backward move or a terminal->other-terminal flip is
+    a :class:`ValueError` (the crash-safety invariant — a lease never un-terminates or launches twice).
+    """
+    cur_rank = _LEASE_STATUS_RANK[current.status]
+    new_rank = _LEASE_STATUS_RANK[status]
+    if status == current.status:
+        return replace(current)  # idempotent no-op (re-release in a finally is safe)
+    if new_rank <= cur_rank:
+        raise ValueError(
+            f"illegal lease transition {current.status.value!r} -> {status.value!r} for instance "
+            f"{current.instance_id!r} (leases are forward-only and never flip a terminal)"
+        )
+    return replace(current, status=status, updated_at=updated_at)
+
 
 # ---------------------------------------------------------------------------
 # PostgresStore column helpers
@@ -963,22 +1740,30 @@ class PostgresStore:
 
     DSN resolution: the explicit ``dsn`` argument, else ``require_database_url(get_settings())``.
 
-    Connection lifecycle: each method opens a FRESH ``AsyncConnection`` and closes it before
-    returning — there is NO connection pooling. This is an INTENTIONAL Phase-1 simplicity
-    choice (low write volume, no long-lived service), not an oversight.
+    Connection lifecycle: when a ``pool`` (``psycopg_pool.AsyncConnectionPool``) is supplied the
+    store ACQUIRES a connection from it per method and RETURNS it to the pool afterwards (the
+    long-lived-service path wired by ``veridex.api.server``). Without a pool it falls back to the
+    Phase-1 behaviour: open a FRESH ``AsyncConnection`` per method and close it (used by the gated
+    Postgres tests, which pass a bare ``dsn``). ``psycopg``/``psycopg_pool`` are never imported at
+    module level — the pool is created by the caller and passed in.
 
     Setup asymmetry: ``init_db(conn)`` is a one-time DDL step that takes a CALLER-supplied
     connection, whereas the DML methods self-connect; ``persist_run`` assumes ``init_db`` has
     already created the schema.
     """
 
-    def __init__(self, *, dsn: str | None = None) -> None:
+    def __init__(self, *, dsn: str | None = None, pool: Any = None) -> None:
         """Configure the store.
 
         Args:
             dsn: Optional Postgres DSN; resolved from config at use-time when omitted.
+            pool: Optional ``psycopg_pool.AsyncConnectionPool`` (duck-typed: ``getconn`` /
+                ``putconn``). When present, every method acquires from / returns to it instead of
+                opening a fresh connection per call. Its lifecycle (open / init_db / close) is
+                owned by the caller (``veridex.api.server``), not this store.
         """
         self._dsn = dsn
+        self._pool = pool
 
     def _resolve_dsn(self) -> str:
         """Return the configured DSN or fall back to the config-derived ``DATABASE_URL``."""
@@ -987,10 +1772,19 @@ class PostgresStore:
         return require_database_url(get_settings())
 
     async def _connect(self) -> Any:
-        """Open a fresh async connection (imports ``psycopg`` lazily)."""
+        """Acquire a connection: from the pool when configured, else open a fresh one (lazy psycopg)."""
+        if self._pool is not None:
+            return await self._pool.getconn()
         import psycopg
 
         return await psycopg.AsyncConnection.connect(self._resolve_dsn())
+
+    async def _release(self, conn: Any) -> None:
+        """Release a connection back to the pool when pooled, else close it (mirror of ``_connect``)."""
+        if self._pool is not None:
+            await self._pool.putconn(conn)
+        else:
+            await conn.close()
 
     async def init_db(self, conn: Any) -> None:
         """Create all five tables + indices + unique constraints (idempotent).
@@ -1145,6 +1939,88 @@ class PostgresStore:
             await cur.execute(
                 "CREATE INDEX IF NOT EXISTS idx_presubmit_ledger_session ON presubmit_ledger(session_id)"
             )
+
+            # --- durable runtime-event spool (I-4 / AC-13/14/15 — OPS channel, INSERT-only + dedup) ---
+            # BIGSERIAL id is the client-facing read cursor (monotonic commit order); the durable WAL
+            # spool delivers at-least-once and dedups HERE via UNIQUE(event_uuid) + ON CONFLICT DO
+            # NOTHING (never client-side alone). SEC-003 by construction: NO sequence_no / payload_hash
+            # column, so an OPS event can never masquerade as a sealed RunEvent / CompetitionEvent.
+            await cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS runtime_events (
+                    id BIGSERIAL PRIMARY KEY,
+                    event_uuid TEXT NOT NULL,
+                    agent_id TEXT NOT NULL,
+                    run_id TEXT,
+                    session_id TEXT,
+                    event_type TEXT NOT NULL,
+                    ts BIGINT NOT NULL,
+                    channel TEXT NOT NULL DEFAULT 'OPS',
+                    payload_json TEXT NOT NULL,
+                    CONSTRAINT uq_runtime_events_uuid UNIQUE (event_uuid)
+                )
+                """
+            )
+            await cur.execute(
+                "CREATE INDEX IF NOT EXISTS idx_runtime_events_agent_id ON runtime_events(agent_id, id)"
+            )
+
+            # --- deployment-attempt ledger (I-3 — durable idempotency claim, INSERT-only) ---
+            # One row per (operator_id, idempotency_key) claim, written ONCE before any deploy side
+            # effect; the UNIQUE constraint is the idempotency guarantee (a duplicate INSERT is the
+            # signal a retry / concurrent duplicate must reconcile on, NOT mint a second instance).
+            # Business columns (NOT a record_json blob): the recovery state is these explicit fields.
+            await cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS deployment_attempts (
+                    attempt_id TEXT PRIMARY KEY,
+                    operator_id TEXT NOT NULL,
+                    idempotency_key TEXT NOT NULL,
+                    config_fingerprint TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    instance_id TEXT,
+                    external_id TEXT,
+                    CONSTRAINT uq_deployment_attempts_operator_key UNIQUE (operator_id, idempotency_key)
+                )
+                """
+            )
+
+            # --- execution-wallet provisioning records (II-5b — immutable, one row per instance) ---
+            # One additive, immutable record per deployed instance: the exact pinned policy/quorum ids
+            # + the reviewed binding + hashes. ``record_hash`` is the immutability guard — a re-persist
+            # with a DIFFERENT hash is refused in code (the record may never be silently substituted).
+            # Holds ONLY non-secret ids/addresses/hashes (never a bearer token / signature / key).
+            await cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS provisioning_records (
+                    instance_id TEXT PRIMARY KEY,
+                    record_hash TEXT NOT NULL,
+                    record_json TEXT NOT NULL
+                )
+                """
+            )
+
+            # --- runtime instance-lease (II-4 — crash-safe single-active-run exclusivity, INSERT-only) ---
+            # One row per instance_id, written ONCE in STARTING before an AgentOS run is attached; the
+            # UNIQUE(instance_id) constraint is the "one run per instance" guarantee (a duplicate INSERT
+            # is the DuplicateLeaseError signal a concurrent/duplicate starter reconciles on, NEVER a
+            # second run). Business columns hold the SERVER-pre-allocated ids the run is pinned to.
+            lease_status_in = ", ".join(f"'{v}'" for v in _LEASE_STATUS_VALUES)
+            await cur.execute(
+                f"""
+                CREATE TABLE IF NOT EXISTS instance_leases (
+                    instance_id TEXT PRIMARY KEY,
+                    runtime_agent_id TEXT NOT NULL,
+                    session_id TEXT NOT NULL,
+                    run_id TEXT NOT NULL,
+                    status TEXT NOT NULL CHECK (status IN ({lease_status_in})),
+                    operator_id TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                )
+                """
+            )
         await conn.commit()
 
     # --- run methods (Phase-1, unchanged) ---
@@ -1187,7 +2063,7 @@ class PostgresStore:
                     ],
                 )
         finally:
-            await conn.close()
+            await self._release(conn)
 
     async def load_run(self, run_id: str) -> RunResult:
         """Reconstruct a run from the three Phase-1 tables.
@@ -1227,7 +2103,7 @@ class PostgresStore:
                 )
                 score_rows_raw = await cur.fetchall()
         finally:
-            await conn.close()
+            await self._release(conn)
 
         run_events = [dict(zip(_RUN_EVENT_COLUMNS, row, strict=True)) for row in event_rows]
         score_rows = [json.loads(row[0]) for row in score_rows_raw]
@@ -1263,7 +2139,9 @@ class PostgresStore:
                         "VALUES (%s, %s, %s, %s, %s)",
                         (
                             competition.competition_id,
-                            serialize_payload(competition.config.model_dump(mode="json")),
+                            _serialize_competition_config(
+                                competition.config, competition.owner_id, competition.replay_binding
+                            ),
                             competition.status.value,
                             competition.run_id,
                             serialize_payload([e.model_dump(mode="json") for e in competition.entries]),
@@ -1277,7 +2155,7 @@ class PostgresStore:
                         raise ValueError(f"competition already exists: {competition.competition_id!r}") from exc
                     raise
         finally:
-            await conn.close()
+            await self._release(conn)
 
     async def get_competition(self, competition_id: str) -> Competition:
         """Fetch and reconstruct a competition by id.
@@ -1301,40 +2179,50 @@ class PostgresStore:
                 )
                 row = await cur.fetchone()
         finally:
-            await conn.close()
+            await self._release(conn)
 
         if row is None:
             raise KeyError(f"no competition with competition_id={competition_id!r}")
         return _build_competition(*row)
 
-    async def add_agent_entry(self, competition_id: str, entry: AgentEntry) -> None:
-        """Read-modify-write the roster column, appending ``entry`` in one transaction.
+    async def add_agent_entry_guarded(
+        self, competition_id: str, entry: AgentEntry, *, mutable_statuses: tuple[CompetitionStatus, ...]
+    ) -> None:
+        """Read-verify-append under one ``SELECT ... FOR UPDATE`` transaction (status/dup/capacity).
 
-        Args:
-            competition_id: The owning competition.
-            entry: The agent entry to append.
-
-        Raises:
-            KeyError: If no competition with ``competition_id`` exists.
+        The competition row is locked ``FOR UPDATE`` so a concurrent claim (which also locks the row)
+        blocks until this admission commits; the status/duplicate/capacity checks and the roster append
+        are therefore atomic against a racing arena start. Raising inside the transaction rolls it back,
+        so a refused admission never partially writes.
         """
         conn = await self._connect()
         try:
             async with conn.transaction(), conn.cursor() as cur:
                 await cur.execute(
-                    "SELECT entries_json FROM competitions WHERE competition_id = %s FOR UPDATE",
+                    "SELECT status, config_json, entries_json FROM competitions WHERE competition_id = %s FOR UPDATE",
                     (competition_id,),
                 )
                 row = await cur.fetchone()
                 if row is None:
-                    raise KeyError(f"no competition with competition_id={competition_id!r}")
-                entries: list[dict[str, Any]] = json.loads(row[0])
+                    raise KeyError(f"no competition persisted with competition_id={competition_id!r}")
+                status = CompetitionStatus(row[0])
+                if status not in mutable_statuses:
+                    raise RosterAdmissionError("roster is frozen: competition has already started")
+                config_data = json.loads(row[1])
+                config_data.pop("owner_id", None)  # I-7b rider is not a CompetitionConfig field
+                roster_size = CompetitionConfig.model_validate(config_data).roster_size
+                entries: list[dict[str, Any]] = json.loads(row[2])
+                if any(e.get("agent_id") == entry.agent_id for e in entries):
+                    raise RosterAdmissionError(f"agent {entry.agent_id!r} is already registered")
+                if len(entries) >= roster_size:
+                    raise RosterAdmissionError(f"roster is full (cap {roster_size})")
                 entries.append(entry.model_dump(mode="json"))
                 await cur.execute(
                     "UPDATE competitions SET entries_json = %s WHERE competition_id = %s",
                     (serialize_payload(entries), competition_id),
                 )
         finally:
-            await conn.close()
+            await self._release(conn)
 
     async def update_competition_status(self, competition_id: str, status: CompetitionStatus) -> None:
         """Update the status column for a competition.
@@ -1356,7 +2244,69 @@ class PostgresStore:
                 if cur.rowcount == 0:
                     raise KeyError(f"no competition persisted with competition_id={competition_id!r}")
         finally:
-            await conn.close()
+            await self._release(conn)
+
+    async def claim_competition_run(
+        self, competition_id: str, *, expected: CompetitionStatus, new: CompetitionStatus, run_id: str
+    ) -> None:
+        """Atomic CAS status + run_id claim via ``SELECT ... FOR UPDATE`` + a guarded ``UPDATE`` (one txn)."""
+        conn = await self._connect()
+        try:
+            async with conn.transaction(), conn.cursor() as cur:
+                await cur.execute(
+                    "SELECT status FROM competitions WHERE competition_id = %s FOR UPDATE",
+                    (competition_id,),
+                )
+                row = await cur.fetchone()
+                if row is None:
+                    raise KeyError(f"no competition persisted with competition_id={competition_id!r}")
+                current = CompetitionStatus(row[0])
+                if current != expected:
+                    raise CompetitionStatusClaimError(
+                        f"CAS conflict for competition {competition_id!r}: expected {expected.value!r}, "
+                        f"found {current.value!r}"
+                    )
+                await cur.execute(
+                    "UPDATE competitions SET status = %s, run_id = %s WHERE competition_id = %s AND status = %s",
+                    (new.value, run_id, competition_id, expected.value),
+                )
+                if cur.rowcount != 1:
+                    raise CompetitionStatusClaimError(
+                        f"CAS conflict for competition {competition_id!r}: status changed under the claim"
+                    )
+        finally:
+            await self._release(conn)
+
+    async def release_competition_run(
+        self, competition_id: str, *, expected: CompetitionStatus, new: CompetitionStatus
+    ) -> None:
+        """Atomic CAS status + clear run_id (post-failure rollback) — guarded ``UPDATE`` in one txn."""
+        conn = await self._connect()
+        try:
+            async with conn.transaction(), conn.cursor() as cur:
+                await cur.execute(
+                    "SELECT status FROM competitions WHERE competition_id = %s FOR UPDATE",
+                    (competition_id,),
+                )
+                row = await cur.fetchone()
+                if row is None:
+                    raise KeyError(f"no competition persisted with competition_id={competition_id!r}")
+                current = CompetitionStatus(row[0])
+                if current != expected:
+                    raise CompetitionStatusClaimError(
+                        f"CAS conflict for competition {competition_id!r}: expected {expected.value!r}, "
+                        f"found {current.value!r}"
+                    )
+                await cur.execute(
+                    "UPDATE competitions SET status = %s, run_id = NULL WHERE competition_id = %s AND status = %s",
+                    (new.value, competition_id, expected.value),
+                )
+                if cur.rowcount != 1:
+                    raise CompetitionStatusClaimError(
+                        f"CAS conflict for competition {competition_id!r}: status changed under the rollback"
+                    )
+        finally:
+            await self._release(conn)
 
     async def update_competition_run_id(self, competition_id: str, run_id: str) -> None:
         """Set the run_id column for a competition.
@@ -1378,7 +2328,7 @@ class PostgresStore:
                 if cur.rowcount == 0:
                     raise KeyError(f"no competition persisted with competition_id={competition_id!r}")
         finally:
-            await conn.close()
+            await self._release(conn)
 
     async def update_competition_config(self, competition_id: str, config: CompetitionConfig) -> None:
         """Overwrite the config_json column for a competition.
@@ -1388,19 +2338,68 @@ class PostgresStore:
             config: The new config snapshot (canonically serialized).
 
         Raises:
-            KeyError: If no competition with ``competition_id`` exists (detected via ``rowcount``).
+            KeyError: If no competition with ``competition_id`` exists.
+        """
+        conn = await self._connect()
+        try:
+            async with conn.transaction(), conn.cursor() as cur:
+                # The server-derived ``owner_id`` (I-7b) and ``replay_binding`` (R-4) ride in
+                # config_json; a naive rewrite would strip them and silently un-own / un-bind the
+                # competition. Read both current riders and fold them back in so a config mutation
+                # (e.g. the kill-switch) can never drop ownership OR the frozen replay identity.
+                await cur.execute(
+                    "SELECT config_json FROM competitions WHERE competition_id = %s",
+                    (competition_id,),
+                )
+                existing = await cur.fetchone()
+                if existing is None:
+                    raise KeyError(f"no competition persisted with competition_id={competition_id!r}")
+                existing_blob = json.loads(existing[0])
+                owner_id = existing_blob.get("owner_id")
+                existing_binding_data = existing_blob.get("replay_binding")
+                existing_binding = (
+                    ReplayBinding.model_validate(existing_binding_data) if existing_binding_data else None
+                )
+                await cur.execute(
+                    "UPDATE competitions SET config_json = %s WHERE competition_id = %s",
+                    (_serialize_competition_config(config, owner_id, existing_binding), competition_id),
+                )
+        finally:
+            await self._release(conn)
+
+    async def update_competition_replay_binding(
+        self, competition_id: str, binding: ReplayBinding
+    ) -> None:
+        """CAS-fold the frozen R-4 replay identity into ``config_json`` — ONLY IF still unbound (zero DDL).
+
+        Only-if-unbound compare-and-set: the competition row is locked ``SELECT ... FOR UPDATE`` (mirroring
+        the claim CAS), the current ``replay_binding`` rider is read, and the ``UPDATE`` is SKIPPED if a
+        binding is already present — so a losing concurrent start can never clobber the identity the winning
+        run replayed. On an actual write it preserves the ``owner_id`` rider + the immutable
+        ``CompetitionConfig`` and rewrites ONLY the ``replay_binding`` rider.
         """
         conn = await self._connect()
         try:
             async with conn.transaction(), conn.cursor() as cur:
                 await cur.execute(
-                    "UPDATE competitions SET config_json = %s WHERE competition_id = %s",
-                    (serialize_payload(config.model_dump(mode="json")), competition_id),
+                    "SELECT config_json FROM competitions WHERE competition_id = %s FOR UPDATE",
+                    (competition_id,),
                 )
-                if cur.rowcount == 0:
+                existing = await cur.fetchone()
+                if existing is None:
                     raise KeyError(f"no competition persisted with competition_id={competition_id!r}")
+                existing_blob = json.loads(existing[0])
+                if existing_blob.get("replay_binding") is not None:
+                    return  # already frozen by the winning start — never clobber it (only-if-unbound CAS)
+                owner_id = existing_blob.pop("owner_id", None)
+                existing_blob.pop("replay_binding", None)
+                config = CompetitionConfig.model_validate(existing_blob)
+                await cur.execute(
+                    "UPDATE competitions SET config_json = %s WHERE competition_id = %s",
+                    (_serialize_competition_config(config, owner_id, binding), competition_id),
+                )
         finally:
-            await conn.close()
+            await self._release(conn)
 
     async def append_competition_events(self, competition_id: str, events: list[CompetitionEvent]) -> None:
         """Batch-insert competition events in one transaction (append-only).
@@ -1429,7 +2428,7 @@ class PostgresStore:
                     ],
                 )
         finally:
-            await conn.close()
+            await self._release(conn)
 
     async def list_competition_events(self, competition_id: str, since_seq: int = 0) -> list[CompetitionEvent]:
         """Return events with ``seq > since_seq``, ordered by ``seq`` ascending.
@@ -1453,7 +2452,7 @@ class PostgresStore:
                 )
                 rows = await cur.fetchall()
         finally:
-            await conn.close()
+            await self._release(conn)
 
         return [CompetitionEvent.model_validate(json.loads(row[0])) for row in rows]
 
@@ -1479,7 +2478,7 @@ class PostgresStore:
                     )
                 rows = await cur.fetchall()
         finally:
-            await conn.close()
+            await self._release(conn)
 
         return [_build_competition(*row) for row in rows]
 
@@ -1520,7 +2519,7 @@ class PostgresStore:
                     ),
                 )
         finally:
-            await conn.close()
+            await self._release(conn)
 
     async def get_execution_record(self, execution_id: str) -> ExecutionRecord:
         """Fetch and reconstruct an execution record by id.
@@ -1543,7 +2542,7 @@ class PostgresStore:
                 )
                 row = await cur.fetchone()
         finally:
-            await conn.close()
+            await self._release(conn)
 
         if row is None:
             raise KeyError(f"no execution record with execution_id={execution_id!r}")
@@ -1568,7 +2567,7 @@ class PostgresStore:
                 )
                 rows = await cur.fetchall()
         finally:
-            await conn.close()
+            await self._release(conn)
 
         return [ExecutionRecord.model_validate(json.loads(row[0])) for row in rows]
 
@@ -1609,7 +2608,7 @@ class PostgresStore:
                 )
                 row = await cur.fetchone()
         finally:
-            await conn.close()
+            await self._release(conn)
         return int(row[0])
 
     async def list_realized_fills(self, session_id: str) -> list[RealizedFillLedgerRow]:
@@ -1631,7 +2630,7 @@ class PostgresStore:
                 )
                 rows = await cur.fetchall()
         finally:
-            await conn.close()
+            await self._release(conn)
         return [
             RealizedFillLedgerRow(
                 seq=int(r[0]),
@@ -1680,7 +2679,7 @@ class PostgresStore:
                 )
                 row = await cur.fetchone()
         finally:
-            await conn.close()
+            await self._release(conn)
         return int(row[0])
 
     async def list_presubmit(self, session_id: str) -> list[PreSubmitLedgerRow]:
@@ -1702,7 +2701,7 @@ class PostgresStore:
                 )
                 rows = await cur.fetchall()
         finally:
-            await conn.close()
+            await self._release(conn)
         return [
             PreSubmitLedgerRow(
                 seq=int(r[0]),
@@ -1710,6 +2709,92 @@ class PostgresStore:
                 integrity_commitment_hash=r[2],
                 venue_order_key=r[3],
                 captured_id=r[4],
+            )
+            for r in rows
+        ]
+
+    # --- runtime-event methods (I-4 — durable OPS channel, INSERT-only + event_uuid dedup) ---
+
+    async def append_runtime_events(self, rows: list[RuntimeEventRow]) -> int:
+        """INSERT durable OPS events in ONE transaction, de-duplicated by ``event_uuid``.
+
+        ``INSERT … ON CONFLICT (event_uuid) DO NOTHING`` makes the durable spool's at-least-once
+        replay idempotent at the DB — re-flushing an already-committed batch inserts nothing. The
+        DB assigns the ``BIGSERIAL`` id (the read cursor). All SQL is parameterized; psycopg stays
+        lazy.
+
+        Args:
+            rows: The events to append (their input ``id`` is ignored).
+
+        Returns:
+            The number of rows newly inserted (conflicts skipped).
+        """
+        if not rows:
+            return 0
+        conn = await self._connect()
+        try:
+            inserted = 0
+            async with conn.transaction(), conn.cursor() as cur:
+                for row in rows:
+                    await cur.execute(
+                        "INSERT INTO runtime_events "
+                        "(event_uuid, agent_id, run_id, session_id, event_type, ts, channel, payload_json) "
+                        "VALUES (%s, %s, %s, %s, %s, %s, %s, %s) ON CONFLICT (event_uuid) DO NOTHING",
+                        (
+                            row.event_uuid,
+                            row.agent_id,
+                            row.run_id,
+                            row.session_id,
+                            row.event_type,
+                            row.ts,
+                            row.channel,
+                            json.dumps(row.payload, default=str),
+                        ),
+                    )
+                    inserted += cur.rowcount
+        finally:
+            await self._release(conn)
+        return inserted
+
+    async def list_runtime_events(
+        self, agent_id: str, *, since: int = 0, limit: int | None = None
+    ) -> list[RuntimeEventRow]:
+        """Return this agent's durable OPS events with ``id > since``, ascending, capped at ``limit``.
+
+        Args:
+            agent_id: The agent whose OPS telemetry to read.
+            since: The last consumed ``id`` (exclusive); ``0`` returns from the start.
+            limit: When set, the FIRST ``limit`` rows after ``since`` (forward cursor paging).
+
+        Returns:
+            Reconstructed :class:`RuntimeEventRow` objects, sorted by ``id`` ascending.
+        """
+        sql = (
+            "SELECT id, event_uuid, agent_id, run_id, session_id, event_type, ts, channel, payload_json "
+            "FROM runtime_events WHERE agent_id = %s AND id > %s ORDER BY id"
+        )
+        params: tuple[Any, ...] = (agent_id, since)
+        if limit is not None:
+            sql += " LIMIT %s"
+            params = (agent_id, since, limit)
+        conn = await self._connect()
+        try:
+            async with conn.cursor() as cur:
+                await cur.execute(sql, params)
+                rows = await cur.fetchall()
+        finally:
+            await self._release(conn)
+        return [
+            RuntimeEventRow(
+                id=int(r[0]),
+                event_uuid=r[1],
+                agent_id=r[2],
+                run_id=r[3],
+                session_id=r[4],
+                event_type=r[5],
+                ts=int(r[6]),
+                channel=r[7],
+                payload=json.loads(r[8]),
             )
             for r in rows
         ]
@@ -1751,7 +2836,7 @@ class PostgresStore:
                     ),
                 )
         finally:
-            await conn.close()
+            await self._release(conn)
 
     async def get_agent_instance(self, instance_id: str) -> AgentInstance:
         """Fetch and reconstruct a deployed instance by id.
@@ -1774,7 +2859,7 @@ class PostgresStore:
                 )
                 row = await cur.fetchone()
         finally:
-            await conn.close()
+            await self._release(conn)
 
         if row is None:
             raise KeyError(f"no agent instance with instance_id={instance_id!r}")
@@ -1823,4 +2908,376 @@ class PostgresStore:
                     (status.value, serialize_payload(record.model_dump(mode="json")), instance_id),
                 )
         finally:
-            await conn.close()
+            await self._release(conn)
+
+    async def list_agent_instances(self) -> list[AgentInstance]:
+        """Reconstruct every deployed instance from its ``record_json`` blob (no owner filter here).
+
+        A plain ``SELECT record_json`` over the existing table — ``operator_id`` / ``runtime_handle``
+        ride inside the blob (ZERO DDL, no dedicated column). The owner-scoped route applies the
+        fail-closed owner filter, so an UNOWNED / legacy row is returned here but never listed.
+
+        Returns:
+            All :class:`~veridex.deploy.instance.AgentInstance` records (any order).
+        """
+        conn = await self._connect()
+        try:
+            async with conn.cursor() as cur:
+                await cur.execute("SELECT record_json FROM agent_instances")
+                rows = await cur.fetchall()
+        finally:
+            await self._release(conn)
+        return [AgentInstance.model_validate(json.loads(row[0])) for row in rows]
+
+    # --- deployment-attempt ledger methods (I-3 — write-once idempotency claim) ---
+
+    async def persist_deployment_attempt(self, attempt: DeploymentAttempt) -> None:
+        """INSERT one deployment-attempt row (append-only); the UNIQUE claim signals a duplicate.
+
+        Maps the Postgres ``UniqueViolation`` on ``UNIQUE(operator_id, idempotency_key)`` to
+        :class:`~veridex.deploy.attempt.DuplicateAttemptError` — the same contract as
+        :class:`InMemoryStore` — so the deploy route reconciles on ONE backend-agnostic signal. All
+        SQL is parameterized; psycopg stays lazy.
+
+        Args:
+            attempt: The write-once claim to persist.
+
+        Raises:
+            DuplicateAttemptError: If ``(operator_id, idempotency_key)`` is already claimed.
+        """
+        conn = await self._connect()
+        try:
+            async with conn.transaction(), conn.cursor() as cur:
+                try:
+                    await cur.execute(
+                        "INSERT INTO deployment_attempts "
+                        "(attempt_id, operator_id, idempotency_key, config_fingerprint, status, "
+                        "created_at, instance_id, external_id) "
+                        "VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
+                        (
+                            attempt.attempt_id,
+                            attempt.operator_id,
+                            attempt.idempotency_key,
+                            attempt.config_fingerprint,
+                            attempt.status.value,
+                            attempt.created_at,
+                            attempt.instance_id,
+                            attempt.external_id,
+                        ),
+                    )
+                except Exception as exc:
+                    # psycopg is already in sys.modules (imported inside _connect).
+                    import psycopg.errors  # noqa: PLC0415 (lazy, not at module level)
+
+                    if isinstance(exc, psycopg.errors.UniqueViolation):
+                        raise DuplicateAttemptError(
+                            f"deployment attempt already claimed: "
+                            f"({attempt.operator_id!r}, {attempt.idempotency_key!r})"
+                        ) from exc
+                    raise
+        finally:
+            await self._release(conn)
+
+    async def get_deployment_attempt_by_key(
+        self, operator_id: str, idempotency_key: str
+    ) -> DeploymentAttempt | None:
+        """Fetch and reconstruct the deployment-attempt claim for the ``(operator_id, key)`` pair.
+
+        Args:
+            operator_id: The owner the claim is scoped to.
+            idempotency_key: The caller-scoped idempotency key.
+
+        Returns:
+            The reconstructed :class:`~veridex.deploy.attempt.DeploymentAttempt`, or ``None`` if the
+            pair is unclaimed.
+        """
+        conn = await self._connect()
+        try:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "SELECT attempt_id, operator_id, idempotency_key, config_fingerprint, status, "
+                    "created_at, instance_id, external_id "
+                    "FROM deployment_attempts WHERE operator_id = %s AND idempotency_key = %s",
+                    (operator_id, idempotency_key),
+                )
+                row = await cur.fetchone()
+        finally:
+            await self._release(conn)
+
+        if row is None:
+            return None
+        return DeploymentAttempt(
+            attempt_id=row[0],
+            operator_id=row[1],
+            idempotency_key=row[2],
+            config_fingerprint=row[3],
+            status=row[4],
+            created_at=row[5],
+            instance_id=row[6],
+            external_id=row[7],
+        )
+
+    # --- II-5b execution-wallet provisioning saga (atomic CAS forward-transition + record) ---
+
+    async def get_deployment_attempt(self, attempt_id: str) -> DeploymentAttempt | None:
+        """Fetch and reconstruct a deployment-attempt claim by its primary ``attempt_id``."""
+        conn = await self._connect()
+        try:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "SELECT attempt_id, operator_id, idempotency_key, config_fingerprint, status, "
+                    "created_at, instance_id, external_id "
+                    "FROM deployment_attempts WHERE attempt_id = %s",
+                    (attempt_id,),
+                )
+                row = await cur.fetchone()
+        finally:
+            await self._release(conn)
+        if row is None:
+            return None
+        return DeploymentAttempt(
+            attempt_id=row[0],
+            operator_id=row[1],
+            idempotency_key=row[2],
+            config_fingerprint=row[3],
+            status=row[4],
+            created_at=row[5],
+            instance_id=row[6],
+            external_id=row[7],
+        )
+
+    async def advance_deployment_attempt(
+        self,
+        attempt_id: str,
+        *,
+        expected: AttemptStatus,
+        new: AttemptStatus,
+        external_id: str | None = None,
+    ) -> DeploymentAttempt:
+        """Atomic CAS forward-transition via ``SELECT ... FOR UPDATE`` + a guarded ``UPDATE`` in one txn.
+
+        The row is locked ``FOR UPDATE`` so a concurrent worker blocks until this transition commits;
+        the ``UPDATE`` additionally carries ``WHERE status = expected`` so the compare is enforced at
+        the database even under the lock. Forward-only + write-once ``external_id`` mirror
+        :class:`InMemoryStore`.
+        """
+        conn = await self._connect()
+        try:
+            async with conn.transaction(), conn.cursor() as cur:
+                await cur.execute(
+                    "SELECT attempt_id, operator_id, idempotency_key, config_fingerprint, status, "
+                    "created_at, instance_id, external_id "
+                    "FROM deployment_attempts WHERE attempt_id = %s FOR UPDATE",
+                    (attempt_id,),
+                )
+                row = await cur.fetchone()
+                if row is None:
+                    raise KeyError(f"no deployment attempt with attempt_id={attempt_id!r}")
+                current = DeploymentAttempt(
+                    attempt_id=row[0],
+                    operator_id=row[1],
+                    idempotency_key=row[2],
+                    config_fingerprint=row[3],
+                    status=row[4],
+                    created_at=row[5],
+                    instance_id=row[6],
+                    external_id=row[7],
+                )
+                if current.status != expected:
+                    raise DeploymentAttemptTransitionError(
+                        f"CAS conflict for attempt {attempt_id!r}: expected {expected.value!r}, "
+                        f"found {current.status.value!r}"
+                    )
+                # Forward-only: transition() raises ValueError on a rewind / same-state target.
+                advanced = current.transition(new)
+                if (
+                    external_id is not None
+                    and current.external_id is not None
+                    and current.external_id != external_id
+                ):
+                    raise DeploymentAttemptTransitionError(
+                        f"external_id is write-once for attempt {attempt_id!r} "
+                        f"({current.external_id!r} -> {external_id!r})"
+                    )
+                pinned_external = current.external_id if current.external_id is not None else external_id
+                advanced = advanced.model_copy(update={"external_id": pinned_external})
+                await cur.execute(
+                    "UPDATE deployment_attempts SET status = %s, external_id = %s "
+                    "WHERE attempt_id = %s AND status = %s",
+                    (advanced.status.value, advanced.external_id, attempt_id, expected.value),
+                )
+                if cur.rowcount != 1:
+                    # The guarded UPDATE matched no row → a racing worker advanced past ``expected``.
+                    raise DeploymentAttemptTransitionError(
+                        f"CAS conflict for attempt {attempt_id!r}: status changed under the transition"
+                    )
+        finally:
+            await self._release(conn)
+        return advanced
+
+    async def persist_provisioning_record(self, record: ExecutionWalletProvisioningRecord) -> None:
+        """INSERT the immutable record; a DIFFERENT record for the same instance is refused."""
+        record_hash = record.provisioning_record_hash()
+        conn = await self._connect()
+        try:
+            async with conn.transaction(), conn.cursor() as cur:
+                await cur.execute(
+                    "SELECT record_hash FROM provisioning_records WHERE instance_id = %s FOR UPDATE",
+                    (record.instance_id,),
+                )
+                row = await cur.fetchone()
+                if row is not None:
+                    if row[0] != record_hash:
+                        raise ValueError(
+                            f"provisioning record for instance {record.instance_id!r} is immutable; "
+                            "a different record may not overwrite it"
+                        )
+                    return
+                await cur.execute(
+                    "INSERT INTO provisioning_records (instance_id, record_hash, record_json) "
+                    "VALUES (%s, %s, %s)",
+                    (record.instance_id, record_hash, serialize_payload(record.to_json_dict())),
+                )
+        finally:
+            await self._release(conn)
+
+    async def get_provisioning_record(self, instance_id: str) -> ExecutionWalletProvisioningRecord | None:
+        """Fetch and reconstruct the immutable provisioning record for ``instance_id`` (or ``None``)."""
+        conn = await self._connect()
+        try:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "SELECT record_json FROM provisioning_records WHERE instance_id = %s",
+                    (instance_id,),
+                )
+                row = await cur.fetchone()
+        finally:
+            await self._release(conn)
+        if row is None:
+            return None
+        return ExecutionWalletProvisioningRecord.from_json_dict(json.loads(row[0]))
+
+    # --- runtime instance-lease methods (II-4 — crash-safe single-active-run exclusivity) ---
+
+    async def acquire_instance_lease(self, lease: InstanceLease) -> None:
+        """INSERT one instance-lease row (INSERT-only); the UNIQUE(instance_id) claim signals a duplicate.
+
+        Maps the Postgres ``UniqueViolation`` on the ``instance_leases`` primary key to
+        :class:`DuplicateLeaseError` — the same contract as :class:`InMemoryStore` — so the wrapper
+        route reconciles on ONE backend-agnostic "already running" signal. All SQL is parameterized;
+        psycopg stays lazy.
+
+        Args:
+            lease: The pre-allocated claim to persist.
+
+        Raises:
+            DuplicateLeaseError: If ``instance_id`` already holds a lease.
+        """
+        conn = await self._connect()
+        try:
+            async with conn.transaction(), conn.cursor() as cur:
+                try:
+                    await cur.execute(
+                        "INSERT INTO instance_leases "
+                        "(instance_id, runtime_agent_id, session_id, run_id, status, operator_id, "
+                        "created_at, updated_at) "
+                        "VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
+                        (
+                            lease.instance_id,
+                            lease.runtime_agent_id,
+                            lease.session_id,
+                            lease.run_id,
+                            lease.status.value,
+                            lease.operator_id,
+                            lease.created_at,
+                            lease.updated_at,
+                        ),
+                    )
+                except Exception as exc:
+                    # psycopg is already in sys.modules (imported inside _connect).
+                    import psycopg.errors  # noqa: PLC0415 (lazy, not at module level)
+
+                    if isinstance(exc, psycopg.errors.UniqueViolation):
+                        raise DuplicateLeaseError(
+                            f"instance already holds a run lease: {lease.instance_id!r}"
+                        ) from exc
+                    raise
+        finally:
+            await self._release(conn)
+
+    async def get_instance_lease(self, instance_id: str) -> InstanceLease | None:
+        """Fetch and reconstruct the current lease for ``instance_id``, or ``None`` if unclaimed."""
+        conn = await self._connect()
+        try:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "SELECT instance_id, runtime_agent_id, session_id, run_id, status, operator_id, "
+                    "created_at, updated_at FROM instance_leases WHERE instance_id = %s",
+                    (instance_id,),
+                )
+                row = await cur.fetchone()
+        finally:
+            await self._release(conn)
+
+        if row is None:
+            return None
+        return InstanceLease(
+            instance_id=row[0],
+            runtime_agent_id=row[1],
+            session_id=row[2],
+            run_id=row[3],
+            status=LeaseStatus(row[4]),
+            operator_id=row[5],
+            created_at=row[6],
+            updated_at=row[7],
+        )
+
+    async def release_instance_lease(
+        self, instance_id: str, status: LeaseStatus, *, updated_at: str
+    ) -> InstanceLease:
+        """Read-modify-write the lease forward-only to ``status`` in one ``FOR UPDATE`` transaction.
+
+        Loads the row ``FOR UPDATE`` (serializing concurrent transitions), applies the shared
+        forward-only CAS rule (:func:`_lease_transition`), and writes the new status + timestamp.
+
+        Args:
+            instance_id: The instance whose lease to transition.
+            status: The target :class:`LeaseStatus`.
+            updated_at: ISO-8601 UTC timestamp of this transition.
+
+        Returns:
+            The transitioned (or unchanged, if idempotent) :class:`InstanceLease`.
+
+        Raises:
+            KeyError: If no lease exists for ``instance_id``.
+            ValueError: If ``status`` would rewind, or flip one terminal to the other.
+        """
+        conn = await self._connect()
+        try:
+            async with conn.transaction(), conn.cursor() as cur:
+                await cur.execute(
+                    "SELECT instance_id, runtime_agent_id, session_id, run_id, status, operator_id, "
+                    "created_at, updated_at FROM instance_leases WHERE instance_id = %s FOR UPDATE",
+                    (instance_id,),
+                )
+                row = await cur.fetchone()
+                if row is None:
+                    raise KeyError(f"no run lease for instance_id={instance_id!r}")
+                current = InstanceLease(
+                    instance_id=row[0],
+                    runtime_agent_id=row[1],
+                    session_id=row[2],
+                    run_id=row[3],
+                    status=LeaseStatus(row[4]),
+                    operator_id=row[5],
+                    created_at=row[6],
+                    updated_at=row[7],
+                )
+                updated = _lease_transition(current, status, updated_at)
+                await cur.execute(
+                    "UPDATE instance_leases SET status = %s, updated_at = %s WHERE instance_id = %s",
+                    (updated.status.value, updated.updated_at, instance_id),
+                )
+        finally:
+            await self._release(conn)
+        return updated

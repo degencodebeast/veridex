@@ -18,14 +18,30 @@ include = ["veridex*", "veridex_agent*"]
 
 [project.optional-dependencies]
 # Postgres persistence (PostgresStore) — lazy-imported; not needed for the offline suite.
-postgres = ["psycopg[binary]>=3"]
+# psycopg-pool: the AsyncConnectionPool the public entrypoint (veridex.api.server) wires into the
+# store for durable pooled connections (I-5). Also lazily imported (inside the server's pool factory).
+postgres = ["psycopg[binary]>=3", "psycopg-pool>=3"]
 # LLM agent layer (Agno via OpenRouter, OpenAI-compatible) — lazy-imported behind a seam;
 # not needed for the offline suite. openai is the client Agno's OpenRouter model uses.
-agent = ["agno", "openai"]
+# PINNED to the I-9-validated version (fu-i9-pin-agno): II-4 hosts run_market_maker inside AgentOS and
+# the AC-29 deployed-surface contract is calibrated against agno==2.7.3's exact native route table, so a
+# future `uv lock` must never silently drift off the reviewed surface.
+# python-multipart: agno's AgentOS routes (agno/remote, agno/client) declare Form/File params, so
+# FastAPI requires python-multipart at route-registration time whenever the served app composes AgentOS
+# (II-5f). Undeclared by agno itself; pin a floor here so the served image can boot.
+agent = ["agno==2.7.3", "openai", "python-multipart>=0.0.9"]
 # Live TxLINE SSE client (B2) — async HTTP.
 live = ["httpx>=0.27"]
 # FastAPI serving layer (B11 demo surface) — async read + trigger endpoints over the Store.
-api = ["fastapi>=0.115", "uvicorn>=0.30"]
+# websockets is Uvicorn's server-side RFC 6455 protocol implementation; plain uvicorn installs no
+# WebSocket backend and treats Upgrade requests as ordinary HTTP.
+# Includes the Privy ES256 access-token auth boundary (POST /agents/deploy; I-1, auth-contract@1):
+# `veridex.api.deploy` unconditionally imports `veridex.api.auth_privy`, which does a top-level
+# `import jwt`, so PyJWT is on the API import path and MUST ship with the api extra (dec-crit-i1-003,
+# amends dec-crit-i1-002). PyJWT with the crypto extra installs `cryptography` for the ECDSA/ES256
+# verify path. No network/JWKS: the static SPKI/PEM public key is passed straight to
+# `jwt.decode(..., algorithms=["ES256"])`.
+api = ["fastapi>=0.115", "uvicorn>=0.30", "websockets>=15,<16", "pyjwt[crypto]>=2,<3"]
 # Vendored Polymarket CLOB client (veridex/venues/_vendor/polymarket_clob/) — signing, HTTP,
 # and orderbook deps the vendored code imports (T12/REQ-2D-201).
 polymarket = [
@@ -44,7 +60,8 @@ polymarket = [
 chain = ["solana", "solders"]
 
 [dependency-groups]
-dev = ["pytest>=8,<9", "pytest-asyncio>=0.24", "ruff>=0.6", "mypy>=1.11"]
+# pyyaml: tests/test_deploy_scaffold.py parses compose.coolify.yml (D-0, dec-d0-dep-001).
+dev = ["pytest>=8,<9", "pytest-asyncio>=0.24", "ruff>=0.6", "mypy>=1.11", "pyyaml>=6"]
 
 [tool.pytest.ini_options]
 pythonpath = ["."]

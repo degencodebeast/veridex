@@ -18,6 +18,7 @@ from veridex.policy.envelope import PolicyEnvelope
 from veridex.runtime.evidence import serialize_payload
 from veridex.runtime.orchestrator import Agent, deterministic_agent, llm_agent
 from veridex.runtime.window import RunWindow
+from veridex.strategies.drift import cumulative_drift_agent
 from veridex.strategies.momentum import momentum_agent, sharp_momentum_agent
 
 
@@ -26,7 +27,8 @@ class AgentRunConfig(BaseModel):
 
     Attributes:
         agent_id: Stable agent identifier.
-        strategy: ``"baseline"`` | ``"momentum"`` | ``"momentum-sharp"`` (flagship v2) | ``"llm"``.
+        strategy: ``"baseline"`` | ``"momentum"`` | ``"momentum-sharp"`` (flagship v2) |
+            ``"cumulative-drift"`` | ``"llm"``.
         model_id: OpenRouter ``provider/model`` slug (LLM strategy only); ``None`` → config default.
         source_mode: ``"replay"`` or ``"live"``.
         fixture_path: Replay fixture path (required when ``source_mode == "replay"``).
@@ -48,6 +50,17 @@ class AgentRunConfig(BaseModel):
         min_movements: v2 minimum per-side movement samples before robust-z can fire (``>= 2``).
         scale_floor: v2 minimum robust-z denominator scale (``>= 0``).
         persistence_logit: v2 minimum cumulative logit move over the persistence window (``>= 0``).
+        cum_drift_logit_min: Cumulative-drift minimum RISING logit drift required to flag a side
+            (``>= 0``).
+        ewma_slope_alpha: Cumulative-drift EWMA smoothing factor for trend strength in ``(0, 1]``.
+        trend_strength_min: Cumulative-drift minimum EWMA-slope trend strength in ``[-1, 1]``.
+        min_tick_count: Cumulative-drift minimum observed ticks before a side can fire (``>= 1``).
+        min_horizon_s: Cumulative-drift minimum observation horizon in seconds (``>= 0``).
+        close_quality_required: Cumulative-drift — when ``True``, suspended/low-quality markets
+            are skipped.
+        drift_cooldown_ticks: Cumulative-drift ticks a market is suppressed after it fires
+            (``>= 0``). A distinct field from ``cooldown_ticks`` (momentum-sharp's own cooldown
+            knob) since the two strategies tune this independently with different defaults.
         market_allowlist: Allowed market keys (policy envelope + live window market prefixes).
         venue_allowlist: Allowed venues (policy envelope).
         max_stake: Max stake per order (policy envelope).
@@ -57,7 +70,7 @@ class AgentRunConfig(BaseModel):
     """
 
     agent_id: str
-    strategy: Literal["baseline", "momentum", "momentum-sharp", "llm"]
+    strategy: Literal["baseline", "momentum", "momentum-sharp", "cumulative-drift", "llm"]
     model_id: str | None = None
     source_mode: Literal["replay", "live"] = "replay"
     fixture_path: str | None = None
@@ -79,6 +92,14 @@ class AgentRunConfig(BaseModel):
     min_movements: int = Field(default=8, ge=2)
     scale_floor: float = Field(default=0.02, ge=0.0)
     persistence_logit: float = Field(default=0.06, ge=0.0)
+    # Cumulative-drift detector knobs (defaults mirror veridex.strategies.drift.cumulative_drift_agent).
+    cum_drift_logit_min: float = Field(default=0.15, ge=0.0)
+    ewma_slope_alpha: float = Field(default=0.2, gt=0.0, le=1.0)
+    trend_strength_min: float = Field(default=0.5, ge=-1.0, le=1.0)
+    min_tick_count: int = Field(default=20, ge=1)
+    min_horizon_s: int = Field(default=600, ge=0)
+    close_quality_required: bool = True
+    drift_cooldown_ticks: int = Field(default=5, ge=0)
     market_allowlist: list[str] = Field(default_factory=list)
     venue_allowlist: list[str] = Field(default_factory=list)
     max_stake: float = 0.0
@@ -158,6 +179,17 @@ def build_agent(config: AgentRunConfig) -> Agent:
             lookback=config.lookback,
             scale_floor=config.scale_floor,
             persistence_logit=config.persistence_logit,
+        )
+    if config.strategy == "cumulative-drift":
+        return cumulative_drift_agent(
+            cum_drift_logit_min=config.cum_drift_logit_min,
+            ewma_slope_alpha=config.ewma_slope_alpha,
+            trend_strength_min=config.trend_strength_min,
+            min_tick_count=config.min_tick_count,
+            min_horizon_s=config.min_horizon_s,
+            close_quality_required=config.close_quality_required,
+            cooldown_ticks=config.drift_cooldown_ticks,
+            agent_id=config.agent_id,
         )
     if config.strategy == "llm":
         return llm_agent(config.agent_id, model_id=config.model_id)

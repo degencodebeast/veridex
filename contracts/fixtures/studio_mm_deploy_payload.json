@@ -1,0 +1,24 @@
+{
+  "template_id": "quoteguard_mm",
+  "agent_id": "studio-quoteguard_mm",
+  "strategy": "quoteguard-mm",
+  "source_mode": "replay",
+  "execution_mode": "dry_run",
+  "market_allowlist": ["pmxt:18209181:home_win"],
+  "venue_allowlist": ["poly"],
+  "min_edge_bps": 10,
+  "max_stake": 5,
+  "window_id": "studio-quoteguard_mm",
+  "fixture_id": 18209181,
+  "end_rule": "pre_match",
+  "mm": {
+    "tape_ref": "pmxt-txline-mm-18209181-v1",
+    "guard_enabled": true,
+    "tif": "GTC",
+    "max_orders_per_run": 3,
+    "max_orders_per_session": 10,
+    "max_orders_per_day": 20,
+    "max_session_loss": 0,
+    "max_daily_loss": 0
+  }
+}

@@ -30,7 +30,9 @@ from veridex.store import (
     _COMPETITION_STATUS_VALUES,
     _EVENT_TYPE_VALUES,
     _EXECUTION_STATUS_VALUES,
+    CompetitionStatusClaimError,
     InMemoryStore,
+    RosterAdmissionError,
 )
 
 # ---------------------------------------------------------------------------
@@ -130,7 +132,7 @@ async def test_competition_round_trip() -> None:
     s = InMemoryStore()
     comp = _make_competition("c1")
     await s.create_competition(comp)
-    await s.add_agent_entry("c1", _make_entry())
+    await s.add_agent_entry_guarded("c1", _make_entry(), mutable_statuses=_MUTABLE)
     await s.update_competition_status("c1", CompetitionStatus.OPEN)
     got = await s.get_competition("c1")
     assert got.status is CompetitionStatus.OPEN
@@ -288,6 +290,101 @@ async def test_event_list_seq0_excluded_by_default() -> None:
 
 
 # ---------------------------------------------------------------------------
+# ROUND 5 M1 — atomic status-guarded roster admission: a registration cannot
+# append once the competition has left the roster-mutable window (arena claim).
+# ---------------------------------------------------------------------------
+
+_MUTABLE = (CompetitionStatus.DRAFT, CompetitionStatus.OPEN)
+
+
+async def test_add_agent_entry_guarded_appends_while_mutable() -> None:
+    """The guarded write appends normally while the competition is still roster-mutable (DRAFT/OPEN)."""
+    s = InMemoryStore()
+    await s.create_competition(_make_competition("c1"))  # DRAFT
+    await s.add_agent_entry_guarded("c1", _make_entry("a"), mutable_statuses=_MUTABLE)
+    assert [e.agent_id for e in (await s.get_competition("c1")).entries] == ["a"]
+
+
+async def test_add_agent_entry_guarded_rejects_once_status_left_mutable() -> None:
+    """M1 RED — the Codex interleave: the arena atomically claims the competition out of DRAFT, then a
+    delayed registration attempts its append. The atomic status guard must REJECT it, so the canonical
+    roster never gains an entry the finalized report did not run."""
+    s = InMemoryStore()
+    await s.create_competition(_make_competition("c1"))  # DRAFT, roster_size 2
+    await s.add_agent_entry_guarded("c1", _make_entry("det-drift"), mutable_statuses=_MUTABLE)
+    # The arena atomically claims the competition (DRAFT -> RUNNING) mid-registration.
+    await s.claim_competition_run("c1", expected=CompetitionStatus.DRAFT, new=CompetitionStatus.RUNNING, run_id="r1")
+    # The racing registration's append must now be refused (status left the mutable window).
+    with pytest.raises(RosterAdmissionError):
+        await s.add_agent_entry_guarded("c1", _make_entry("extra-x"), mutable_statuses=_MUTABLE)
+    assert [e.agent_id for e in (await s.get_competition("c1")).entries] == ["det-drift"]
+
+
+async def test_add_agent_entry_guarded_rejects_duplicate_id() -> None:
+    """Duplicate agent-id is refused inside the same atomic admission write."""
+    s = InMemoryStore()
+    await s.create_competition(_make_competition("c1"))
+    await s.add_agent_entry_guarded("c1", _make_entry("a"), mutable_statuses=_MUTABLE)
+    with pytest.raises(RosterAdmissionError):
+        await s.add_agent_entry_guarded("c1", _make_entry("a"), mutable_statuses=_MUTABLE)
+
+
+async def test_add_agent_entry_guarded_rejects_over_capacity() -> None:
+    """Capacity (config.roster_size) is enforced inside the same atomic admission write."""
+    s = InMemoryStore()
+    await s.create_competition(_make_competition("c1"))  # roster_size 2
+    await s.add_agent_entry_guarded("c1", _make_entry("a"), mutable_statuses=_MUTABLE)
+    await s.add_agent_entry_guarded("c1", _make_entry("b"), mutable_statuses=_MUTABLE)
+    with pytest.raises(RosterAdmissionError):
+        await s.add_agent_entry_guarded("c1", _make_entry("c"), mutable_statuses=_MUTABLE)
+
+
+async def test_add_agent_entry_guarded_unknown_competition_raises_key_error() -> None:
+    s = InMemoryStore()
+    with pytest.raises(KeyError):
+        await s.add_agent_entry_guarded("missing", _make_entry("a"), mutable_statuses=_MUTABLE)
+
+
+# ---------------------------------------------------------------------------
+# ROUND 5 M3 — atomic status+run_id claim, and CAS rollback (release) so a
+# post-claim failure never permanently strands the competition in RUNNING.
+# ---------------------------------------------------------------------------
+
+
+async def test_claim_competition_run_sets_status_and_run_id_atomically() -> None:
+    """M3 — status AND the reserved run_id are set in ONE write (no crash window between them)."""
+    s = InMemoryStore()
+    await s.create_competition(_make_competition("c1"))
+    await s.claim_competition_run("c1", expected=CompetitionStatus.DRAFT, new=CompetitionStatus.RUNNING, run_id="r1")
+    got = await s.get_competition("c1")
+    assert got.status is CompetitionStatus.RUNNING
+    assert got.run_id == "r1"
+
+
+async def test_claim_competition_run_conflict_refused() -> None:
+    """M3 — a second claim on an already-claimed competition is refused and does not overwrite run_id."""
+    s = InMemoryStore()
+    await s.create_competition(_make_competition("c1"))
+    await s.claim_competition_run("c1", expected=CompetitionStatus.DRAFT, new=CompetitionStatus.RUNNING, run_id="r1")
+    with pytest.raises(CompetitionStatusClaimError):
+        await s.claim_competition_run(
+            "c1", expected=CompetitionStatus.DRAFT, new=CompetitionStatus.RUNNING, run_id="r2"
+        )
+    assert (await s.get_competition("c1")).run_id == "r1"
+
+
+async def test_release_competition_run_rolls_back_and_clears_run_id() -> None:
+    """M3 — the CAS rollback returns the competition to DRAFT and clears run_id so a failed run retries."""
+    s = InMemoryStore()
+    await s.create_competition(_make_competition("c1"))
+    await s.claim_competition_run("c1", expected=CompetitionStatus.DRAFT, new=CompetitionStatus.RUNNING, run_id="r1")
+    await s.release_competition_run("c1", expected=CompetitionStatus.RUNNING, new=CompetitionStatus.DRAFT)
+    got = await s.get_competition("c1")
+    assert got.status is CompetitionStatus.DRAFT
+    assert got.run_id is None
+
+
+# ---------------------------------------------------------------------------
 # Postgres gated round-trip (skipped unless DATABASE_URL + psycopg present)
 # ---------------------------------------------------------------------------
 
@@ -318,7 +415,7 @@ async def test_postgres_competition_store_round_trip() -> None:
     # Competition CRUD
     comp = _make_competition("pg_c1_task4")
     await store.create_competition(comp)
-    await store.add_agent_entry("pg_c1_task4", _make_entry("pg_agent"))
+    await store.add_agent_entry_guarded("pg_c1_task4", _make_entry("pg_agent"), mutable_statuses=_MUTABLE)
     await store.update_competition_status("pg_c1_task4", CompetitionStatus.OPEN)
 
     got = await store.get_competition("pg_c1_task4")
@@ -338,6 +435,34 @@ async def test_postgres_competition_store_round_trip() -> None:
     assert any(c.competition_id == "pg_c1_task4" for c in comps)
     draft_comps = await store.list_competitions(status=CompetitionStatus.DRAFT)
     assert not any(c.competition_id == "pg_c1_task4" for c in draft_comps)
+
+
+@pytest.mark.skipif(
+    not (os.getenv("DATABASE_URL") and _psycopg_available()),
+    reason="Postgres guarded admission: set DATABASE_URL and install psycopg",
+)
+async def test_postgres_add_agent_entry_guarded_is_status_frozen() -> None:
+    """M1 RED (Postgres semantics) — the SELECT..FOR UPDATE guarded append refuses a registration once
+    the competition has been atomically claimed out of the roster-mutable window."""
+    import psycopg
+
+    from veridex.store import PostgresStore
+
+    dsn = os.environ["DATABASE_URL"]
+    store = PostgresStore(dsn=dsn)
+    async with await psycopg.AsyncConnection.connect(dsn) as conn:
+        await store.init_db(conn)
+
+    await store.create_competition(_make_competition("pg_guard_1"))
+    await store.add_agent_entry_guarded("pg_guard_1", _make_entry("det-drift"), mutable_statuses=_MUTABLE)
+    await store.claim_competition_run(
+        "pg_guard_1", expected=CompetitionStatus.DRAFT, new=CompetitionStatus.RUNNING, run_id="r1"
+    )
+    with pytest.raises(RosterAdmissionError):
+        await store.add_agent_entry_guarded("pg_guard_1", _make_entry("extra-x"), mutable_statuses=_MUTABLE)
+    got = await store.get_competition("pg_guard_1")
+    assert [e.agent_id for e in got.entries] == ["det-drift"]
+    assert got.status is CompetitionStatus.RUNNING and got.run_id == "r1"
 
 
 # ---------------------------------------------------------------------------

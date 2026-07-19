@@ -21,10 +21,10 @@ if (!window.matchMedia) {
   });
 }
 
-// next/font/google is a build-time transform that throws under Vitest — stub it.
-vi.mock('next/font/google', () => ({
-  IBM_Plex_Sans: () => ({ variable: '--font-sans', className: 'font-sans' }),
-  IBM_Plex_Mono: () => ({ variable: '--font-mono', className: 'font-mono' }),
+// next/font/local (used by app/layout.tsx for hermetic self-hosted fonts) is a build-time
+// transform that throws under Vitest — stub the default export.
+vi.mock('next/font/local', () => ({
+  default: () => ({ variable: '--font-local', className: 'font-local' }),
 }));
 
 // next/navigation: default usePathname; individual tests can re-mock.

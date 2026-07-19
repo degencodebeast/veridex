@@ -50,10 +50,13 @@ describe('catalog contracts (C2 §4 bind shapes; reuse C1, add C2-specific)', ()
     expect(p.min_edge_bps).toBe(8);
   });
 
-  it('extends C1 PATHS with the runtime-events route (no parallel ENDPOINTS map)', () => {
+  it('extends C1 PATHS with the OWNER-SCOPED runtime-events route (F-6: the public path is retired)', () => {
     expect(PATHS.leaderboard()).toBe('/leaderboard');
     expect(PATHS.competitionState('wc-fra-bra')).toBe('/competitions/wc-fra-bra');
-    expect(PATHS.runtimeEvents('momentum_fr')).toBe('/agents/momentum_fr/runtime-events');
+    // F-6 retired the orphaned PUBLIC /agents/{id}/runtime-events; the live path is owner-scoped by
+    // instance with an exclusive `since` cursor (veridex/api/router.py get_instance_runtime_events).
+    expect((PATHS as Record<string, unknown>).runtimeEvents).toBeUndefined();
+    expect(PATHS.instanceRuntimeEvents('inst_abc', 0)).toBe('/agents/instances/inst_abc/runtime-events?since=0');
   });
 
   it('maps a wire OPS RuntimeEvent → view RuntimeEvent, and OPS is NOT a canonical channel (SEC-003 seam)', () => {

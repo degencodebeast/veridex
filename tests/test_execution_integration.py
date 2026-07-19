@@ -71,7 +71,7 @@ def _config(
 _AGENT_A = {
     "agent_id": "agent-alpha",
     "owner": "team-a",
-    "strategy": "value_clv",
+    "strategy": "baseline",
     "model": None,
     "proof_mode": "reproducible",
     "execution_eligibility": True,
@@ -79,7 +79,7 @@ _AGENT_A = {
 _AGENT_B = {
     "agent_id": "agent-beta",
     "owner": "team-b",
-    "strategy": "contrarian_clv",
+    "strategy": "contrarian",
     "model": None,
     "proof_mode": "reproducible",
     "execution_eligibility": True,

@@ -70,6 +70,42 @@ export const GLOSSARY = {
     label: 'pending',
     definition: 'too little runway remains before the window closes to score CLV; excluded from CLV means, never shown as a fabricated number.',
   },
+  toxicity_loss: {
+    label: 'Toxicity Loss',
+    definition: 'mean of per-quote adverse-selection loss; the Maker lane rank axis, lower is better — never CLV.',
+  },
+  mean_markout_diagnostic: {
+    label: 'Mean Markout',
+    definition: 'raw two-sided mean ≈ half_spread/ref — geometry, not quality; a diagnostic only, never the rank axis.',
+  },
+  falsification: {
+    label: 'Falsification',
+    definition: 'pairwise bootstrap test of the Δ between two agents; SEPARATED = whole 95% CI above zero, INCONCLUSIVE = CI spans zero, INVERTED = whole CI below zero (the candidate is reliably worse).',
+  },
+  maker_small_n: {
+    label: 'Maker small-n',
+    definition: 'the Maker Arena result is scored on a small fixture universe (n=18); always shown as a caveat, never hidden or rounded away.',
+  },
+  maker_config_hash: {
+    label: 'Config Hash',
+    definition: 'hash of the exact sealed maker-arena configuration that produced this result — identifies which configuration was scored, never a performance claim.',
+  },
+  quoteguard_ablation: {
+    label: 'QuoteGuard ablation',
+    definition: 'same strategy on the same recorded tape with QuoteGuard OFF then ON; shows whether the guard changes behavior — never a rank, toxicity ordering, PnL, edge, or winner.',
+  },
+  divergent_frame: {
+    label: 'Divergent frame',
+    definition: 'a frame index where the guard OFF and guard ON arms took a different decision on the same observation; empty when the guard never changed a decision on this tape.',
+  },
+  terminal_reason: {
+    label: 'Terminal reason',
+    definition: 'why an arm stopped consuming the tape (e.g. tape_exhausted, guard_halt); descriptive of the run\'s end, never a score or verdict.',
+  },
+  post_only_leg: {
+    label: 'post_only leg',
+    definition: 'a quote leg posted as maker-only (never crosses the spread); a behavior attribute of the decision, not a fill or an edge claim.',
+  },
 } as const satisfies Record<string, GlossaryEntry>;
 
 export type GlossaryTerm = keyof typeof GLOSSARY;

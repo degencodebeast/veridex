@@ -55,6 +55,7 @@ from veridex.runtime.orchestrator import run_competition
 from veridex.venues.sx_bet import FakeVenueAdapter
 
 if TYPE_CHECKING:  # the heavy/offline-safe types are only needed for annotations
+    from veridex.deploy.instance import AgentInstance
     from veridex.ingest.marketstate import MarketState
     from veridex.runtime.orchestrator import Agent, RunResult
     from veridex.store import Store
@@ -243,6 +244,23 @@ class CompetitionIntegrityError(ValueError):
     """
 
 
+class RosterInstanceNotFoundError(ValueError):
+    """Raised when a roster entry references a deployed instance the caller may not bind, in a way that
+    must NOT leak the instance's existence: it is absent, OR unowned-legacy (``operator_id is None``).
+
+    Mirrors I-2's instance owner-scoping (``deploy.py`` ``GET /agents/instances/{id}``): both cases are
+    INDISTINGUISHABLE to a non-owner and map to HTTP 404 with no ``config_hash`` disclosure.
+    """
+
+
+class RosterInstanceNotOwnedError(ValueError):
+    """Raised when a roster entry references a deployed instance owned by a DIFFERENT principal.
+
+    Mirrors I-2's instance owner-scoping: maps to HTTP 403 (owned-by-another) — the check runs BEFORE
+    any ``config_hash`` is read, so a non-owner never learns the deployed identity fingerprint.
+    """
+
+
 async def create_competition(store: Store, config: CompetitionConfig) -> Competition:
     """Create and persist a new ``DRAFT`` competition with an empty roster.
 
@@ -265,35 +283,149 @@ async def create_competition(store: Store, config: CompetitionConfig) -> Competi
     return competition
 
 
-async def register_agent(store: Store, competition_id: str, entry: AgentEntry) -> AgentEntry:
+async def _resolve_owned_instance(
+    store: Store, instance_id: str, principal_did: str | None
+) -> AgentInstance:
+    """Resolve a deployed instance the caller OWNS, mirroring I-2's owner-scoping (fail-closed, no leak).
+
+    Mirrors :func:`veridex.api.deploy.get_agent_instance` (``GET /agents/instances/{id}``): absent OR
+    unowned-legacy (``operator_id is None``) → :class:`RosterInstanceNotFoundError` (404, no existence
+    leak); owned-by-another → :class:`RosterInstanceNotOwnedError` (403). The ownership decision is made
+    BEFORE the caller reads the instance's ``config_hash``, so a non-owner never learns the deployed
+    identity fingerprint.
+
+    Args:
+        store: The async repository.
+        instance_id: The deployed instance the roster entry references.
+        principal_did: The authenticated caller's DID; ``None`` (unauthenticated) is refused as
+            not-found (fail-closed — never resolve without a caller).
+
+    Returns:
+        The caller's own :class:`~veridex.deploy.instance.AgentInstance`.
+
+    Raises:
+        RosterInstanceNotFoundError: Absent, unowned-legacy, or unauthenticated (404, no leak).
+        RosterInstanceNotOwnedError: Owned by a different principal (403).
+    """
+    if principal_did is None:
+        raise RosterInstanceNotFoundError("agent instance not found")
+    try:
+        instance = await store.get_agent_instance(instance_id)
+    except KeyError as exc:
+        raise RosterInstanceNotFoundError("agent instance not found") from exc
+    # An unowned / legacy row is never inherited — hidden as if it does not exist (mirror I-2).
+    if instance.operator_id is None:
+        raise RosterInstanceNotFoundError("agent instance not found")
+    if instance.operator_id != principal_did:
+        raise RosterInstanceNotOwnedError("principal does not own this agent instance")
+    return instance
+
+
+#: The lifecycle statuses in which a competition's roster may still be mutated (I-7b). Once the arena
+#: (or start) claims the competition out of this window, ``add_agent_entry_guarded`` refuses any append,
+#: so a registration racing a start can never mutate a roster the run has already frozen (Codex M1).
+_ROSTER_MUTABLE_STATUSES: tuple[CompetitionStatus, ...] = (CompetitionStatus.DRAFT, CompetitionStatus.OPEN)
+
+
+def declared_config_hash(*, agent_id: str, strategy: str, model: str | None, proof_mode: str) -> str:
+    """Content hash of a DECLARED entry's identity (CON-207): ``{agent_id, strategy, model, proof_mode}``.
+
+    The single canonical serializer for a declared roster entry's identity commitment. ``proof_mode`` MUST
+    already be the normalized canonical value (``"reproducible"`` / ``"verified"``). The intrinsic arena's
+    strict config contract (Codex M2) recomputes an EXPECTED hash with this same helper and compares it to
+    each registered entry's pinned ``config_hash`` — so equal ids/strategy labels alone can never admit a
+    roster whose pinned model/proof identity differs from the contestant the arena actually runs.
+
+    Args:
+        agent_id: The declared agent identifier.
+        strategy: The declared strategy label.
+        model: The declared model slug (or ``None``).
+        proof_mode: The already-normalized proof mode.
+
+    Returns:
+        The hex SHA-256 identity hash.
+    """
+    return hashlib.sha256(
+        serialize_payload(
+            {
+                "agent_id": agent_id,
+                "strategy": strategy,
+                "model": model,
+                "proof_mode": proof_mode,
+            }
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+async def register_agent(
+    store: Store,
+    competition_id: str,
+    entry: AgentEntry,
+    *,
+    principal_did: str | None = None,
+) -> AgentEntry:
     """Pin ``config_hash`` + normalize ``proof_mode``, then persist the finalized entry.
 
-    The ``config_hash`` is computed over the canonical serialization of exactly
-    ``{agent_id, strategy, model, proof_mode}`` (the normalized proof mode), EXCLUDING the
-    incoming ``config_hash`` and ``execution_eligibility`` fields (CON-207).
+    Two roster kinds (I-7):
+
+    - **Instance-bound** (``entry.instance_id`` set): the entry references a Studio-deployed
+      :class:`~veridex.deploy.instance.AgentInstance`. The referenced instance is OWNER-SCOPED exactly
+      as I-2 scopes it (``deploy.py`` ``GET /agents/instances/{id}``): the resolve + ownership check runs
+      BEFORE any ``config_hash`` is read, and only the caller's OWN instance binds. A non-owned / legacy
+      unowned / absent instance is refused with NO ``config_hash`` disclosure (a non-owner may not even
+      learn the deployed identity fingerprint). On success we PIN that instance's identity — its
+      ``instance_id`` + its **deployment** ``config_hash`` — onto the entry, so the arena runs the ACTUAL
+      deployed contestant at start (:func:`~veridex.api.demo_fixtures.bind_roster_instance`). The label
+      hash is deliberately NOT recomputed here: the deployment ``config_hash`` (a ``DeployConfig``
+      serialization) and the label hash below are DIFFERENT serializers, so recomputing would clobber the
+      pinned deployment hash and make the start-time binding FALSE-drift (HTTP 400) for every bound entry.
+    - **Declared** (no ``instance_id``): unchanged legacy behavior — the ``config_hash`` is computed
+      over the canonical serialization of exactly ``{agent_id, strategy, model, proof_mode}`` (the
+      normalized proof mode), EXCLUDING the incoming ``config_hash`` and ``execution_eligibility``
+      fields (CON-207). ``principal_did`` is unused for a declared entry.
 
     Args:
         store: The async repository.
         competition_id: The owning competition.
         entry: The raw agent entry from the API/wire boundary.
+        principal_did: The authenticated caller's Privy DID (threaded from the register endpoint's
+            ``require_principal``). REQUIRED to bind an instance-bound entry — the ownership check is
+            fail-closed, so a missing principal on a bound entry is refused as not-found (no leak).
 
     Returns:
         The finalized :class:`~veridex.competition.models.AgentEntry` (with ``config_hash``
         pinned and ``proof_mode`` normalized) that was persisted.
+
+    Raises:
+        RosterInstanceNotFoundError: If a bound entry's instance is absent or unowned-legacy, or the
+            caller is unauthenticated (mirrors I-2 → HTTP 404, no existence leak).
+        RosterInstanceNotOwnedError: If a bound entry's instance is owned by another principal
+            (mirrors I-2 → HTTP 403).
     """
     normalized_proof_mode = normalize_proof_mode(entry.proof_mode)
-    config_hash = hashlib.sha256(
-        serialize_payload(
-            {
-                "agent_id": entry.agent_id,
-                "strategy": entry.strategy,
-                "model": entry.model,
+    if entry.instance_id is not None:
+        instance = await _resolve_owned_instance(store, entry.instance_id, principal_did)
+        finalized = entry.model_copy(
+            update={
                 "proof_mode": normalized_proof_mode,
+                "config_hash": instance.config_hash,
+                "instance_id": instance.instance_id,
             }
-        ).encode("utf-8")
-    ).hexdigest()
-    finalized = entry.model_copy(update={"proof_mode": normalized_proof_mode, "config_hash": config_hash})
-    await store.add_agent_entry(competition_id, finalized)
+        )
+    else:
+        config_hash = declared_config_hash(
+            agent_id=entry.agent_id,
+            strategy=entry.strategy,
+            model=entry.model,
+            proof_mode=normalized_proof_mode,
+        )
+        finalized = entry.model_copy(update={"proof_mode": normalized_proof_mode, "config_hash": config_hash})
+    # Atomic status-guarded admission (Codex M1): append ONLY IF the roster is still mutable, with the
+    # duplicate-id + capacity checks in the SAME write, so a registration racing an arena/start claim can
+    # never append after the run has frozen the roster. Raises RosterAdmissionError on any guard failure.
+    await store.add_agent_entry_guarded(
+        competition_id, finalized, mutable_statuses=_ROSTER_MUTABLE_STATUSES
+    )
     return finalized
 
 

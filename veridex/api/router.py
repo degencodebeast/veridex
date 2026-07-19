@@ -36,13 +36,17 @@ from __future__ import annotations
 
 import contextlib
 import json
+import os
 import time
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query
+from fastapi.middleware.cors import CORSMiddleware
 
+from veridex.api.auth_privy import PrivyPrincipal, make_require_principal
 from veridex.api.demo_fixtures import (
     build_agents_from_roster,
     build_demo_ticks,
@@ -67,6 +71,8 @@ from veridex.api.schemas import (
     KillSwitchResponse,
     LeaderboardResponse,
     LeaderboardRow,
+    ReplayPackInfo,
+    ReplayPackListResponse,
     RuntimeEventsResponse,
     VerifyResponse,
 )
@@ -79,20 +85,28 @@ from veridex.checks.build import (
     build_performance_metrics,
     check_results_to_proof_block,
 )
-from veridex.competition.events import CompetitionEvent, EventType
+from veridex.competition.events import (
+    CompetitionEvent,
+    EventType,
+    build_competition_started_event,
+    event_payload_hash,
+)
 from veridex.competition.models import (
     AgentEntry,
     Competition,
     CompetitionConfig,
     CompetitionStatus,
     ExecutionMode,
+    ReplayBinding,
 )
 from veridex.competition.service import (
     CompetitionConflictError,
     CompetitionIntegrityError,
     CompetitionStateError,
+    RosterInstanceNotFoundError,
+    RosterInstanceNotOwnedError,
     _default_policy_envelope,
-    create_competition,
+    declared_config_hash,
     register_agent,
     start_competition,
 )
@@ -100,19 +114,36 @@ from veridex.config import Settings, get_settings
 from veridex.execution.models import ExecutionRecord, ExecutionStatus
 from veridex.execution.runner import resolve_approval
 from veridex.explainer import GLOSSARY_DEFINITIONS, explain_proof
-from veridex.ingest.feed_health import feed_health
+from veridex.ingest.feed_health import LiveFeedStatus
+from veridex.ingest.replay_catalog import (
+    CatalogEntry,
+    ReplayCatalog,
+    ReplayResolutionError,
+    ResolvedReplaySource,
+    build_catalog,
+    load_resolved_marketstates,
+    resolve_replay_source,
+)
 from veridex.leaderboard import leaderboard as _build_leaderboard
+from veridex.runtime.arena_comparison import (
+    DET_DRIFT_CONTESTANT,
+    LLM_DRIFT_CONTESTANT,
+    run_arena_comparison,
+)
 from veridex.runtime.competition import (
     DEFAULT_CLUSTER,
     SCHEMA_VERSIONS,
     read_path_check_block,
     run_demo_competition,
 )
+from veridex.runtime.llm_checkpoint import CheckpointPolicy
 from veridex.runtime.orchestrator import deterministic_agent
-from veridex.runtime.runtime_store import RuntimeEventStore
+from veridex.runtime.runtime_events import RuntimeEvent, RuntimeEventType
+from veridex.runtime.runtime_store import DurableRuntimeEventStore
 from veridex.runtime.window import RunWindow
 from veridex.scoring import score_run
-from veridex.store import InMemoryStore, Store
+from veridex.store import CompetitionStatusClaimError, InMemoryStore, RosterAdmissionError, Store
+from veridex.strategies.llm_drift import default_model_launcher
 from veridex.venues.sx_bet import FakeVenueAdapter, SXBetAdapter
 from veridex.verifier.proof_card import proof_card_from_run_result
 from veridex.verifier.recompute import verify_run as _verify_run_core
@@ -129,6 +160,140 @@ def get_store() -> Store:
         The module-level :class:`~veridex.store.InMemoryStore` instance.
     """
     return _default_store
+
+
+def _cors_origins_from_env() -> list[str]:
+    """Parse the ``CORS_ORIGINS`` env (comma-separated exact origins) into an allow-list.
+
+    Fail-closed default: an unset/blank value yields an EMPTY allow-list, so no cross-origin request
+    is granted ``access-control-allow-origin`` (same-origin still works). The public entrypoint
+    (``veridex.api.server``) additionally REQUIRES this env before it will serve.
+    """
+    raw = os.environ.get("CORS_ORIGINS", "")
+    return [origin.strip() for origin in raw.split(",") if origin.strip()]
+
+
+#: The STRICT intrinsic-arena roster contract: the FROZEN roster must declare EXACTLY these two
+#: contestants — the intrinsic det-Drift (id ``det-drift`` / strategy ``cumulative-drift``) and
+#: LLM-Drift (id ``llm-drift`` / strategy ``llm``), no more, no less, no id/strategy substitution.
+#: The intrinsic arena runs these exact contestants; requiring the roster to declare EXACTLY them makes
+#: the started event's ``agent_ids`` BY CONSTRUCTION the report's contestant ids — never a run that
+#: reports one identity while the event claims another (Codex M2 identity substitution). The
+#: owner-scoped ``POST /competitions/{id}/arena`` FAILS CLOSED on any mismatch, extra, or missing entry.
+_ARENA_CONTESTANT_CONTRACT: dict[str, str] = {
+    DET_DRIFT_CONTESTANT: "cumulative-drift",
+    LLM_DRIFT_CONTESTANT: "llm",
+}
+
+#: The intrinsic arena's canonical proof mode. The checkpointed det-Drift vs LLM-Drift comparison is a
+#: reproducible snapshot replay (no per-contestant proof anchoring), so both intrinsic contestants pin
+#: ``"reproducible"``. Folded into each contestant's EXPECTED ``config_hash`` so the strict contract binds
+#: proof_mode as well as model + id/strategy (Codex M2).
+_ARENA_PROOF_MODE = "reproducible"
+
+
+class _ArenaRosterContractError(Exception):
+    """A strict intrinsic-arena roster contract violation, carrying the HTTP status + detail to surface.
+
+    Raised by :func:`_verify_intrinsic_arena_roster` so the SAME strict contract can run BOTH pre-claim
+    (translated to an ``HTTPException`` before any claim) AND post-claim (caught so the claim is recovered
+    and the run fails closed) — never a run over a roster different from the one frozen at RUNNING.
+    """
+
+    def __init__(self, status_code: int, detail: str) -> None:
+        super().__init__(detail)
+        self.status_code = status_code
+        self.detail = detail
+
+
+def _verify_intrinsic_arena_roster(
+    entries: list[AgentEntry], *, expected_models: dict[str, str | None]
+) -> dict[str, dict[str, Any]]:
+    """FAIL CLOSED unless ``entries`` declares EXACTLY the intrinsic arena contestants at the pinned
+    model/config identity; return the per-contestant config on success (Codex M1/M2).
+
+    The strict contract binds THREE things so the roster the report attests is provably the roster that
+    ran: (1) EXACTLY the two intrinsic ids -> strategies (cardinality 2, no extras, no substitution),
+    (2) each entry's pinned ``config_hash`` equals the EXPECTED hash for that intrinsic identity (folding
+    ``expected_models`` + ``_ARENA_PROOF_MODE``), and (3) no entry carries a deployed-instance binding the
+    intrinsic arena does not run. Any mismatch raises :class:`_ArenaRosterContractError` (409).
+
+    Args:
+        entries: The roster snapshot to validate (pre-claim, or the post-claim frozen roster).
+        expected_models: The pinned intrinsic model identity per contestant id (det-Drift -> ``None``,
+            LLM-Drift -> the arena launcher's real ``model_id``).
+
+    Returns:
+        ``{agent_id: {"strategy", "model", "proof_mode", "config_hash"}}`` for the two contestants.
+
+    Raises:
+        _ArenaRosterContractError: 409 on any cardinality / id / config / instance-binding mismatch.
+    """
+    declared = {entry.agent_id: entry.strategy for entry in entries}
+    if len(entries) != len(_ARENA_CONTESTANT_CONTRACT) or declared != _ARENA_CONTESTANT_CONTRACT:
+        raise _ArenaRosterContractError(
+            409,
+            "competition roster must declare EXACTLY the intrinsic arena contestants "
+            f"(required {sorted(_ARENA_CONTESTANT_CONTRACT.items())}; got {sorted(declared.items())})",
+        )
+    contestant_config: dict[str, dict[str, Any]] = {}
+    for entry in entries:
+        strategy = _ARENA_CONTESTANT_CONTRACT[entry.agent_id]  # safe: declared == contract above
+        model = expected_models[entry.agent_id]
+        expected_hash = declared_config_hash(
+            agent_id=entry.agent_id, strategy=strategy, model=model, proof_mode=_ARENA_PROOF_MODE
+        )
+        if entry.instance_id is not None:
+            raise _ArenaRosterContractError(
+                409,
+                f"roster entry {entry.agent_id!r} carries an incompatible instance binding; the "
+                "intrinsic arena runs no deployed instance",
+            )
+        if entry.config_hash != expected_hash:
+            raise _ArenaRosterContractError(
+                409,
+                f"roster entry {entry.agent_id!r} pins a model/config identity the intrinsic arena "
+                f"does not run (expected config_hash {expected_hash}, got {entry.config_hash})",
+            )
+        contestant_config[entry.agent_id] = {
+            "strategy": strategy,
+            "model": model,
+            "proof_mode": _ARENA_PROOF_MODE,
+            "config_hash": expected_hash,
+        }
+    return contestant_config
+
+
+async def _recover_arena_claim(store: Store, competition_id: str) -> None:
+    """Fail-closed recovery after a post-claim arena failure (Codex M3).
+
+    A model/drain/persistence failure AFTER the atomic claim must never strand the competition in
+    ``RUNNING`` with a reserved run_id, zero events, and a permanent 409. This best-effort reconciliation:
+
+    - If NO canonical events were committed for the claimed run (the reproduced ``ArenaDrainError`` case,
+      where the failure precedes any append), CAS-roll the competition back ``RUNNING -> DRAFT`` and clear
+      the reserved run_id, so the run is RETRYABLE rather than a permanently dead competition.
+    - If events WERE committed (the append landed but a later step failed), finalize the competition as
+      terminal so it is completed-as-failed, never stranded mid-``RUNNING``.
+
+    All store calls are best-effort — recovery must never raise over the original failure being surfaced.
+
+    Args:
+        store: The async repository.
+        competition_id: The competition to reconcile.
+    """
+    try:
+        events = await store.list_competition_events(competition_id, since_seq=-1)
+    except Exception:
+        events = []
+    if events:
+        with contextlib.suppress(Exception):
+            await store.update_competition_status(competition_id, CompetitionStatus.FINALIZED)
+    else:
+        with contextlib.suppress(CompetitionStatusClaimError, KeyError):
+            await store.release_competition_run(
+                competition_id, expected=CompetitionStatus.RUNNING, new=CompetitionStatus.DRAFT
+            )
 
 
 def _derive_leaderboard(events: list[CompetitionEvent]) -> list[CompetitionLeaderboardRow]:
@@ -198,11 +363,28 @@ def _build_execution_attachment(records: list[ExecutionRecord]) -> dict[str, Any
     }
 
 
+def _replay_pack_info(entry: CatalogEntry) -> ReplayPackInfo:
+    """Project a verified :class:`CatalogEntry` into the read-only ``/replay-packs`` view.
+
+    Surfaces the verified ``content_hash``, HONEST provenance, and catalogued fixtures — but NEVER the
+    internal ``pack_dir`` filesystem path (the browser addresses packs by ``pack_id`` only).
+    """
+    return ReplayPackInfo(
+        pack_id=entry.pack_id,
+        content_hash=entry.content_hash,
+        provenance=entry.provenance,
+        is_genuine=entry.is_genuine,
+        fixtures=list(entry.fixtures),
+    )
+
+
 def create_app(
     store: Store | None = None,
     settings: Settings | None = None,
-    runtime_event_store: RuntimeEventStore | None = None,
+    runtime_events: DurableRuntimeEventStore | None = None,
     deploy_deps: DeployDeps | None = None,
+    arena_model_launcher: Any | None = None,
+    replay_catalog: ReplayCatalog | None = None,
 ) -> FastAPI:
     """Create the Veridex demo FastAPI application.
 
@@ -214,9 +396,10 @@ def create_app(
             module-level ``_default_store`` (an :class:`~veridex.store.InMemoryStore`).
         settings: Optional :class:`~veridex.config.Settings` override carrying the operator
             control-plane credentials.  Defaults to :func:`~veridex.config.get_settings`.
-        runtime_event_store: Optional :class:`~veridex.runtime.runtime_store.RuntimeEventStore`
-            override — the OPS-channel buffer the Agent Ops drawer reads (SEC-003). Defaults to a
-            fresh per-app store. Distinct from the evidence/competition log.
+        runtime_events: Optional :class:`~veridex.runtime.runtime_store.DurableRuntimeEventStore`
+            override — the crash-safe OPS-channel spool (I-4) whose sink the deploy/runtime path emits
+            through and whose durable rows the owner-scoped drawer route reads (SEC-003). Defaults to a
+            fresh per-app store over ``resolved_store`` + ``WAL_DIR``. Distinct from the evidence log.
 
     Returns:
         A configured :class:`fastapi.FastAPI` application: the Phase-1 demo trio, the six
@@ -226,14 +409,27 @@ def create_app(
     """
     resolved_store: Store = store if store is not None else _default_store
     resolved_settings: Settings = settings if settings is not None else get_settings()
-    resolved_runtime_store: RuntimeEventStore = (
-        runtime_event_store if runtime_event_store is not None else RuntimeEventStore()
+    # ONE durable OPS spool shared across the app: its sink is threaded into the deploy/runtime path
+    # (below) so events are actually PRODUCED, and its durable rows back the owner-scoped read route —
+    # NEVER a fresh per-app store that nothing writes (the "empty drawer" bug this task prevents).
+    resolved_runtime_events: DurableRuntimeEventStore = (
+        runtime_events if runtime_events is not None else DurableRuntimeEventStore(store=resolved_store)
+    )
+    # I-1 Privy auth boundary reused for the owner-scoped drawer route (instance owner == principal.did).
+    require_principal = make_require_principal(resolved_settings)
+    # II-9 arena model seam: the owner-scoped arena endpoint drives det-Drift vs LLM-Drift over this
+    # launcher. Defaults to the lazy production Agno launcher (agno-free at import; a network call
+    # happens only on ``launch``); tests inject a hand-controlled offline fake so no LLM/network runs.
+    resolved_arena_model_launcher: Any = (
+        arena_model_launcher if arena_model_launcher is not None else default_model_launcher()
     )
 
     @contextlib.asynccontextmanager
     async def _lifespan(app_: FastAPI) -> AsyncIterator[None]:
-        """App lifespan — on shutdown, cancel any tracked background deploy-run tasks (T21)."""
+        """App lifespan — start the durable OPS flusher; on shutdown drain it + cancel deploy tasks."""
+        await resolved_runtime_events.start()
         yield
+        await resolved_runtime_events.aclose()
         await cancel_deploy_tasks(app_)
 
     app = FastAPI(
@@ -242,6 +438,47 @@ def create_app(
         version="0.1.0",
         lifespan=_lifespan,
     )
+
+    # I-5: browser reach from the web origin. Exact-origin allow-list from ``CORS_ORIGINS`` (never a
+    # wildcard with credentials — Starlette would silently disable ``*`` under allow_credentials).
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=_cors_origins_from_env(),
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+
+    # III-3: the observable last-seen of the ACTIVE live stream. Default is honestly DISCONNECTED
+    # (no stream running); a live launcher passes THIS object as ``run_live_window(feed_status=...)``
+    # so /feed/health derives its state from real ingestion, never from credential presence. Read-only
+    # OPERATIONAL TELEMETRY — never scored, never in evidence. Exposed on app.state for the launcher.
+    live_feed_status = LiveFeedStatus()
+    app.state.live_feed_status = live_feed_status
+
+    # R-3: the AUTHORITATIVE, hash-verified R-2 ReplayPack catalog this app serves replay identity from.
+    # PROVIDED path (the served composition + tests): ``build_agentos_app`` threads the ALREADY-BUILT
+    # catalog through, so it is USED as-is and NO env catalog is built — the served path hash-verifies /
+    # copies packs exactly ONCE (in ``create_server_app``), never a second env-built throwaway. FALLBACK
+    # path (a standalone ``create_app`` caller with no catalog): build one from the read-only
+    # ``REPLAY_PACK_ROOT`` (+ optional writable ``REPLAY_CAPTURE_ROOT``). Either way ``/replay-packs`` and
+    # the ``pack_id``-bound ``POST /backtests`` resolve packs SERVER-side against the verified catalog —
+    # never a client filesystem path. A blank/unset root yields an empty catalog (fail-closed: every
+    # pack_id is an unknown 404).
+    resolved_replay_catalog = (
+        replay_catalog
+        if replay_catalog is not None
+        else build_catalog(
+            os.environ.get("REPLAY_PACK_ROOT", ""),
+            capture_root=os.environ.get("REPLAY_CAPTURE_ROOT", "") or None,
+        )
+    )
+    app.state.replay_catalog = resolved_replay_catalog
+
+    @app.get("/healthz")
+    async def healthz() -> dict[str, str]:
+        """Generic liveness probe (I-5): always 200, never gated on auth or the DB."""
+        return {"status": "ok"}
 
     # Per-app registry: run_id → {anchor_status, source_mode}.
     # Populated by POST /demo/run; consumed by GET /leaderboard.
@@ -312,6 +549,25 @@ def create_app(
         owner = competition.config.operator_id
         if owner is not None and owner != principal_operator_id:
             raise HTTPException(status_code=403, detail="operator does not own this competition")
+
+    def _require_competition_owner(competition: Competition, principal_did: str) -> None:
+        """Enforce Privy owner-scoping on a competition write (I-7b; fail-closed).
+
+        The competition's ``owner_id`` is SERVER-DERIVED (set to the creator's principal DID at
+        create time). A competition whose ``owner_id`` is ``None`` is legacy/UNOWNED: it is refused
+        to EVERY caller (403) — an unowned competition is never silently inherited (mirror I-2's
+        fail-closed None handling). This is distinct from :func:`_check_owner`, which gates the
+        Phase-2B control-plane on the operator-token ``config.operator_id``.
+
+        Args:
+            competition: The loaded competition.
+            principal_did: The authenticated Privy principal's DID.
+
+        Raises:
+            HTTPException: 403 if the competition is unowned or owned by a different principal.
+        """
+        if competition.owner_id is None or competition.owner_id != principal_did:
+            raise HTTPException(status_code=403, detail="principal does not own this competition")
 
     # --- POST /demo/run ---------------------------------------------------
 
@@ -391,25 +647,69 @@ def create_app(
         rows_data = _build_leaderboard(all_score_rows) if all_score_rows else []
         return LeaderboardResponse(rows=[LeaderboardRow(**r) for r in rows_data])
 
+    # --- GET /replay-packs (R-3 — the verified R-2 catalog, read-only) ----------
+
+    @app.get("/replay-packs", response_model=ReplayPackListResponse)
+    async def list_replay_packs() -> ReplayPackListResponse:
+        """List the AUTHORITATIVE, hash-verified R-2 ReplayPack catalog (read-only, deterministic).
+
+        A pure projection of ``app.state.replay_catalog`` — every entry's verified ``content_hash``,
+        HONEST ``provenance``, ``is_genuine`` marker, and catalogued ``fixtures``, sorted by ``pack_id``.
+        NOT a filesystem scan: it surfaces ONLY the packs the R-2 catalog already hash-verified and
+        allowlisted (a tampered/unverified pack was fail-closed excluded and is never listed). The
+        internal ``pack_dir`` filesystem path is DELIBERATELY not exposed — the browser addresses packs
+        by ``pack_id`` only.
+        """
+        catalog: ReplayCatalog = app.state.replay_catalog
+        snapshot = catalog.snapshot()
+        packs = [_replay_pack_info(snapshot[pack_id]) for pack_id in sorted(snapshot)]
+        return ReplayPackListResponse(packs=packs)
+
+    @app.get("/replay-packs/{pack_id}", response_model=ReplayPackInfo)
+    async def get_replay_pack(pack_id: str) -> ReplayPackInfo:
+        """Return one verified R-2 pack's hash + provenance + fixtures by ``pack_id`` (unknown -> 404)."""
+        entry = app.state.replay_catalog.get(pack_id)
+        if entry is None:
+            raise HTTPException(status_code=404, detail=f"unknown pack_id: {pack_id}")
+        return _replay_pack_info(entry)
+
     # --- POST /backtests (T15 — replay a ReplayPack → honest BacktestReport) ----
 
     @app.post("/backtests", response_model=BacktestRunResponse)
     async def create_backtest(body: BacktestRunRequest) -> BacktestRunResponse:
-        """Replay a ReplayPack fixture through the live core and store its BacktestReport.
+        """Replay a catalogued ReplayPack fixture through the live core and store its BacktestReport.
 
         Deterministic + offline: the run is driven over a single reproducible baseline agent (no
         LLM, no network). The report is a pure projection of the sealed run (SEC-003) and its mode
         label is always ``"Backtest"`` (REQ-2D-304 — a replay is never dressed up as live).
 
+        R-3 — pack-bound competition identity (trust boundary): the browser sends a ``pack_id`` (a
+        catalog KEY), never a filesystem path. The pack is resolved SERVER-side against the verified
+        R-2 catalog (``app.state.replay_catalog``); an unknown ``pack_id`` is a 404 and a ``fixture_id``
+        not catalogued for the pack is a 422 — a client can NEVER point the replay loader at an arbitrary
+        directory (the former ``pack_dir`` path-traversal surface is gone). The report's replay identity
+        is pinned to the catalog: the bound ``content_hash`` is SERVER-derived from the verified entry.
+
         Args:
-            body: The backtest request (pack path, fixture, window spec).
+            body: The backtest request (``pack_id``, ``fixture_id``, window spec).
 
         Returns:
             A :class:`~veridex.api.schemas.BacktestRunResponse` with the ``backtest_id`` to fetch.
 
         Raises:
-            HTTPException: 400 if the window spec is invalid or the pack cannot be loaded/verified.
+            HTTPException: 404 if ``pack_id`` is not in the verified catalog; 422 if the fixture is not
+                catalogued for the pack; 400 if the window spec is invalid or the pack fails to replay.
         """
+        catalog: ReplayCatalog = app.state.replay_catalog
+        entry = catalog.get(body.pack_id)
+        if entry is None:
+            # Unknown/unverified pack_id — never a filesystem read. Fail-closed 404.
+            raise HTTPException(status_code=404, detail=f"unknown pack_id: {body.pack_id}")
+        if body.fixture_id not in entry.fixtures:
+            raise HTTPException(
+                status_code=422,
+                detail=f"fixture_id {body.fixture_id} is not catalogued for pack {body.pack_id!r}",
+            )
         try:
             window = RunWindow(
                 window_id=body.window_id,
@@ -419,14 +719,24 @@ def create_app(
                 duration_s=body.duration_s,
                 min_clv_horizon_s=body.min_clv_horizon_s,
             )
+            # Resolve the pack SERVER-side from the verified catalog entry (its OWNED, immutable path) —
+            # never a client-provided directory. The report's bound content_hash is therefore derived
+            # from the R-2-verified bytes, pinning the run's replay identity to the catalogued pack.
             _, report = await run_backtest(
-                Path(body.pack_dir),
+                Path(entry.pack_dir),
                 body.fixture_id,
                 [deterministic_agent("baseline")],
                 window=window,
             )
         except (ValueError, FileNotFoundError) as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+        # Binding invariant (defense-in-depth): the sealed report's identity MUST be the catalog's
+        # verified identity, not anything client-influenced. This can only trip on a server-side
+        # catalog/pack inconsistency (the catalog admits only recompute-verified packs), so a mismatch
+        # is a 500 — never silently served.
+        if report.pack_id != body.pack_id or report.content_hash != entry.content_hash:
+            raise HTTPException(status_code=500, detail="replay identity did not match the verified catalog entry")
 
         _backtest_reports[report.run_id] = report
         return BacktestRunResponse(backtest_id=report.run_id, mode_label=report.mode_label, run_id=report.run_id)
@@ -445,17 +755,26 @@ def create_app(
 
     @app.get("/feed/health", response_model=FeedHealthResponse)
     async def feed_health_endpoint(source_mode: str = Query(default="replay")) -> FeedHealthResponse:  # noqa: B008
-        """Report live/replay TxLINE feed health (WD-4 / REQ-053; offline-honest).
+        """Report live/replay TxLINE feed health from the ACTIVE stream's last-seen (III-3 / REQ-053).
 
         Read-only OPERATIONAL TELEMETRY: nothing here enters ``evidence_hash``, the proof checks,
         scoring, or the leaderboard. Surfaces ``txline_configured`` from credential PRESENCE only
-        (never the secret values — COM-001). Offline (no creds) the report is honest:
-        ``txline_configured=False``, ``connected=False``, no ticks, ``stale=False``. A judge can
-        curl this against the deployed devnet API to confirm the live path is wired.
+        (never the secret values — COM-001).
 
-        The :func:`~veridex.ingest.feed_health.feed_health` core drives the WD-4 staleness view;
-        A's throughput view rides alongside (``ws_live`` mirrors ``connected``; ``events_per_min``
-        is ``None`` until a live counter is wired; ``anchor_status`` is the honest default).
+        III-3 HONESTY: ``connected`` / ``last_tick_ts`` / ``feed_state`` are derived from the
+        observable :class:`~veridex.ingest.feed_health.LiveFeedStatus` that the live runner records
+        into — NOT from credential presence. Credentials being configured does NOT make the feed
+        live; only an ACTIVE stream does. The honest FIVE-STATE ``feed_state``:
+
+        * ``live`` — a recent odds RECORD was received;
+        * ``heartbeat_only`` — a recent HEARTBEAT, no recent odds (liveness, no market data);
+        * ``stale`` — the last-seen frame is beyond the staleness budget;
+        * ``disconnected`` — no active connection (the offline/no-stream default);
+        * ``recorded_replay`` — replay mode; NEVER labelled live.
+
+        A judge can curl this against the deployed devnet API: with no active live run it honestly
+        reads ``disconnected`` (live) / ``recorded_replay`` (replay), and it flips to ``live`` while
+        a windowed live run is streaming records.
 
         Args:
             source_mode: ``"replay"`` (default) or ``"live"``.
@@ -464,15 +783,11 @@ def create_app(
             A :class:`~veridex.api.schemas.FeedHealthResponse`.
         """
         configured = resolved_settings.txline_jwt is not None and resolved_settings.txline_api_token is not None
-        report = feed_health(
-            source_mode=source_mode,
-            txline_configured=configured,
-            connected=configured and source_mode == "live",
-            last_tick_ts=None,
-            now_ts=int(time.time()),
-            ticks_seen=0,
-            fixture_id=None,
+        now_ts = int(time.time())
+        report = live_feed_status.report(
+            source_mode=source_mode, txline_configured=configured, now_ts=now_ts
         )
+        state = live_feed_status.feed_state(source_mode=source_mode, now_ts=now_ts)
         return FeedHealthResponse(
             source_mode=report.source_mode,
             events_per_min=None,  # A's throughput view — no live counter wired yet (honest None)
@@ -485,6 +800,7 @@ def create_app(
             fixture_id=report.fixture_id,
             staleness_s=report.staleness_s,
             stale=report.stale,
+            feed_state=state.value,
         )
 
     # --- GET /runs/{run_id} -----------------------------------------------
@@ -779,19 +1095,58 @@ def create_app(
     @app.post("/competitions", response_model=CompetitionCreateResponse)
     async def create_competition_endpoint(
         config: CompetitionConfig,
+        principal: PrivyPrincipal = Depends(require_principal),  # noqa: B008
         dep_store: Store = Depends(_get_store),  # noqa: B008
     ) -> CompetitionCreateResponse:
-        """Create a new DRAFT competition from the supplied configuration.
+        """Create a new DRAFT competition owned by the authenticated principal (I-7b).
+
+        The ``owner_id`` is SERVER-DERIVED from the verified Privy principal (``principal.did``); a
+        client-supplied owner is structurally unable to reach it (the request body is a
+        :class:`~veridex.competition.models.CompetitionConfig`, which has no ``owner_id`` field, so
+        any forged key is dropped by the model). Constructed inline (rather than via
+        ``service.create_competition``) so the owner is set at construction — the service signature
+        is frozen and out of scope for I-7b.
 
         Args:
             config: Immutable :class:`~veridex.competition.models.CompetitionConfig`.
+            principal: The authenticated Privy principal (injected by ``require_principal``).
             dep_store: Injected store dependency.
 
         Returns:
             A :class:`~veridex.api.schemas.CompetitionCreateResponse` with ``competition_id``
             and ``status="draft"``.
         """
-        comp = await create_competition(dep_store, config)
+        # R-4: FREEZE the production-replay identity at the admission boundary when the client NAMES a
+        # pack. Resolved SERVER-side from the verified R-2 catalog (fail-closed on unknown/unverified),
+        # the frozen ReplayBinding (pack_id + resolved fixture_id + SERVER-derived content_hash) is
+        # persisted with the competition and REUSED verbatim at start — never re-selected, so an R-0b
+        # promotion between create and start can never change the tape. An UNBOUND competition (no pack
+        # named) stays unbound here and resolves ONCE at start (single-pack only). content_hash is
+        # server-owned: the client sends only pack_id + fixture_id (CompetitionConfig has no hash field).
+        replay_binding: ReplayBinding | None = None
+        if config.pack_id is not None:
+            try:
+                resolved = resolve_replay_source(
+                    app.state.replay_catalog, pack_id=config.pack_id, fixture_id=config.fixture_id
+                )
+            except ReplayResolutionError as exc:
+                raise HTTPException(
+                    status_code=400,
+                    detail={"error": "replay_unresolved", "reason": exc.reason, "message": str(exc)},
+                ) from None
+            replay_binding = ReplayBinding(
+                pack_id=resolved.pack_id, fixture_id=resolved.fixture_id, content_hash=resolved.content_hash
+            )
+        comp = Competition(
+            competition_id=f"c_{uuid4().hex}",
+            config=config,
+            status=CompetitionStatus.DRAFT,
+            entries=[],
+            run_id=None,
+            owner_id=principal.did,
+            replay_binding=replay_binding,
+        )
+        await dep_store.create_competition(comp)
         return CompetitionCreateResponse(
             competition_id=comp.competition_id,
             status=comp.status.value,
@@ -803,16 +1158,22 @@ def create_app(
     async def register_agent_endpoint(
         competition_id: str,
         entry: AgentEntry,
+        principal: PrivyPrincipal = Depends(require_principal),  # noqa: B008
         dep_store: Store = Depends(_get_store),  # noqa: B008
     ) -> AgentRegisterResponse:
-        """Register an agent on a competition's roster.
+        """Register an agent on a competition's roster (owner-scoped + lifecycle-enforced; I-7b).
 
-        Pins ``config_hash`` (CON-207) and normalises ``proof_mode`` to the two canonical
-        Phase-2A values via :func:`~veridex.competition.service.register_agent`.
+        Only the competition's owner may mutate its roster, and only while it is still forming.
+        Enforced in order (authorization before state): owner-gate (403), then the lifecycle gates
+        (409) — the roster is frozen once the competition has started/finalized, an agent cannot be
+        registered twice, and the roster cannot exceed ``config.roster_size``. On success delegates
+        to :func:`~veridex.competition.service.register_agent`, which pins ``config_hash`` (CON-207)
+        and normalises ``proof_mode`` to the two canonical Phase-2A values.
 
         Args:
             competition_id: The owning competition.
             entry: Raw agent entry from the wire boundary.
+            principal: The authenticated Privy principal (injected by ``require_principal``).
             dep_store: Injected store dependency.
 
         Returns:
@@ -820,12 +1181,53 @@ def create_app(
             ``config_hash``, and the normalised ``proof_mode``.
 
         Raises:
-            HTTPException: 404 when ``competition_id`` is not found.
+            HTTPException: 404 (unknown competition; OR an instance-bound entry whose referenced
+                deployed instance is absent/unowned-legacy — mirror I-2, no existence leak), 403
+                (caller is not the competition owner; OR the referenced deployed instance is owned by
+                another principal — mirror I-2), 409 (roster frozen post-start, duplicate agent, or
+                roster cap exceeded), 400 (other domain rejection, e.g. an unrecognised proof_mode).
         """
         try:
-            finalized = await register_agent(dep_store, competition_id, entry)
+            competition = await dep_store.get_competition(competition_id)
         except KeyError:
             raise HTTPException(status_code=404, detail=f"competition {competition_id!r} not found") from None
+
+        _require_competition_owner(competition, principal.did)
+
+        # Lifecycle gates (409): the roster is only mutable while the competition is still forming.
+        if competition.status not in (CompetitionStatus.DRAFT, CompetitionStatus.OPEN):
+            raise HTTPException(
+                status_code=409, detail="roster is frozen: competition has already started"
+            )
+        if any(existing.agent_id == entry.agent_id for existing in competition.entries):
+            raise HTTPException(status_code=409, detail=f"agent {entry.agent_id!r} is already registered")
+        if len(competition.entries) >= competition.config.roster_size:
+            raise HTTPException(
+                status_code=409, detail=f"roster is full (cap {competition.config.roster_size})"
+            )
+
+        try:
+            finalized = await register_agent(dep_store, competition_id, entry, principal_did=principal.did)
+        except RosterAdmissionError as exc:
+            # Atomic status-guarded admission refused the append (Codex M1): the roster left the mutable
+            # window (a racing arena/start claim froze it), a duplicate id, or the roster is full. The
+            # pre-checks above catch the common non-racing case; this catches the RACE (status changed
+            # between the pre-check read and the guarded write) — fail closed with 409, never a silent
+            # post-freeze mutation.
+            raise HTTPException(status_code=409, detail=str(exc)) from None
+        except RosterInstanceNotOwnedError:
+            # Instance-bound entry references a deployed instance owned by another principal — mirror I-2
+            # (deploy.py GET /agents/instances/{id}): 403, and no config_hash was read/returned.
+            raise HTTPException(status_code=403, detail="principal does not own this agent instance") from None
+        except RosterInstanceNotFoundError:
+            # Absent OR unowned-legacy(None) instance — mirror I-2: 404, INDISTINGUISHABLE, no existence
+            # leak and no config_hash disclosure to a non-owner.
+            raise HTTPException(status_code=404, detail="agent instance not found") from None
+        except KeyError:
+            raise HTTPException(status_code=404, detail=f"competition {competition_id!r} not found") from None
+        except ValueError as exc:
+            # Any other domain rejection (e.g. an unrecognised proof_mode) — fail closed with 400.
+            raise HTTPException(status_code=400, detail=str(exc)) from None
         return AgentRegisterResponse(
             agent_id=finalized.agent_id,
             config_hash=finalized.config_hash,
@@ -837,23 +1239,28 @@ def create_app(
     @app.post("/competitions/{competition_id}/start", response_model=CompetitionStartResponse)
     async def start_competition_endpoint(
         competition_id: str,
+        principal: PrivyPrincipal = Depends(require_principal),  # noqa: B008
         authorization: str | None = Header(default=None),  # noqa: B008
         dep_store: Store = Depends(_get_store),  # noqa: B008
     ) -> CompetitionStartResponse:
         """Run a competition offline/deterministically and return the finalized state.
 
-        Offline simplification: market data is sourced from the demo ticks
-        (:func:`~veridex.api.demo_fixtures.build_demo_ticks`), and roster entries are mapped to
-        deterministic Agent objects (alternating deterministic/contrarian).  This produces a real
-        ≥2-row leaderboard with distinct CLV without any LLM or network calls.
+        Offline replay: market data is the SELECTED verified ReplayPack tape (R-4), resolved
+        SERVER-side from the R-2 catalog via the FROZEN :class:`~veridex.competition.models.ReplayBinding`
+        (reused if bound at create, else resolved ONCE here for a single-pack catalog and persisted).
+        Roster entries are built by their DECLARED strategy. This produces a real ≥2-row leaderboard
+        without any LLM or network calls, over the SAME ``load_pack_marketstates`` normalizer +
+        downstream pipeline (``build_demo_ticks`` stays a CI/test fixture, no longer the production source).
 
-        Control-plane auth (fail-closed): a ``paper`` start is OPEN/public; a ``dry_run`` /
-        ``live_guarded`` start REQUIRES a valid operator bearer token (401) AND competition
-        ownership (403).  The live executor lane runs DOWNSTREAM of the seal as a separate derived
-        block and is broadcast live (persist-before-broadcast).
+        Auth (fail-closed): EVERY start requires the authenticated Privy owner (I-7b — a non-owner
+        is refused 403, regardless of execution mode). ADDITIONALLY, a ``dry_run`` / ``live_guarded``
+        start requires a valid operator bearer token (401) AND control-plane ownership (403). The
+        live executor lane runs DOWNSTREAM of the seal as a separate derived block and is broadcast
+        live (persist-before-broadcast).
 
         Args:
             competition_id: The competition to start.
+            principal: The authenticated Privy principal (injected by ``require_principal``).
             authorization: Operator bearer header (required only for non-paper modes).
             dep_store: Injected store dependency.
 
@@ -871,13 +1278,81 @@ def create_app(
         except KeyError:
             raise HTTPException(status_code=404, detail=f"competition {competition_id!r} not found") from None
 
-        # Fail-closed auth gate for non-paper modes (paper stays public).
-        if competition.config.execution_mode != ExecutionMode.PAPER:
-            principal = _authenticate(authorization)
-            _check_owner(competition, principal)
+        # I-7b: only the Privy owner may start their competition (fail-closed; applies to every
+        # execution mode, including paper). The operator-token gate below is an ADDITIONAL,
+        # orthogonal control-plane check that stays scoped to non-paper modes.
+        _require_competition_owner(competition, principal.did)
 
-        ticks = build_demo_ticks()
-        agents = build_agents_from_roster(competition.entries)
+        # Fail-closed auth gate for non-paper modes (paper stays public at the operator layer).
+        if competition.config.execution_mode != ExecutionMode.PAPER:
+            operator_principal = _authenticate(authorization)
+            _check_owner(competition, operator_principal)
+
+        # R-4: PRODUCTION replay serves the SELECTED verified pack, not the synthetic demo tape.
+        # REUSE the frozen ReplayBinding if present (bound at create, or by a prior start); otherwise
+        # this is a legacy/unbound DRAFT — resolve ONCE from the catalog (single-pack only; multiple
+        # packs fail closed "pack_id required") and PERSIST that binding BEFORE the claim so the run
+        # commits to exactly the tape it replays. The tape is then LOADED from the FROZEN identity
+        # (content_hash re-checked against the live catalog) — never re-selected, so an R-0b promotion
+        # can neither change the tape nor let the sealed identity diverge from the replayed bytes.
+        try:
+            if competition.replay_binding is not None:
+                resolved = ResolvedReplaySource(
+                    pack_id=competition.replay_binding.pack_id,
+                    fixture_id=competition.replay_binding.fixture_id,
+                    content_hash=competition.replay_binding.content_hash,
+                    provenance="",  # observability-only; not part of the frozen identity triple
+                    is_genuine=False,
+                )
+            else:
+                resolved = resolve_replay_source(
+                    app.state.replay_catalog,
+                    pack_id=competition.config.pack_id,
+                    fixture_id=competition.config.fixture_id,
+                )
+                await dep_store.update_competition_replay_binding(
+                    competition_id, ReplayBinding(
+                pack_id=resolved.pack_id, fixture_id=resolved.fixture_id, content_hash=resolved.content_hash
+            )
+                )
+                # The persist is an only-if-unbound CAS: it is a NO-OP if a CONCURRENT unbound start froze
+                # the binding first. That concurrent winner — not necessarily this start — owns the
+                # AUTHORITATIVE identity and may WIN the run claim below. Re-read the persisted binding and
+                # replay/report THAT, never this start's local resolution, so the tape LOADED and the
+                # identity SURFACED both match the single persisted authority (the mirror of the clobber the
+                # CAS closed: the honesty invariant that GET never reports an identity the run did not replay).
+                authoritative = await dep_store.get_competition(competition_id)
+                if authoritative.replay_binding is not None:
+                    resolved = ResolvedReplaySource(
+                        pack_id=authoritative.replay_binding.pack_id,
+                        fixture_id=authoritative.replay_binding.fixture_id,
+                        content_hash=authoritative.replay_binding.content_hash,
+                        provenance="",  # observability-only; not part of the frozen identity triple
+                        is_genuine=False,
+                    )
+            ticks = load_resolved_marketstates(app.state.replay_catalog, resolved)
+        except ReplayResolutionError as exc:
+            raise HTTPException(
+                status_code=400,
+                detail={"error": "replay_unresolved", "reason": exc.reason, "message": str(exc)},
+            ) from None
+        # Build the DECLARED roster (by strategy, position-independent). An entry referencing a
+        # Studio-deployed instance runs the ACTUAL deployed contestant (pinned config_hash +
+        # effective_config), never a same-named reconstruction — fail-closed on an unknown strategy
+        # or a config drift (never a silent substitution). This runs AFTER the I-7b owner-gate above.
+        try:
+            agents = await build_agents_from_roster(
+                competition.entries, get_instance=dep_store.get_agent_instance
+            )
+        except KeyError as exc:
+            # A roster entry references a deployed instance that no longer exists — fail closed.
+            raise HTTPException(
+                status_code=409, detail=f"rostered deployed instance not found: {exc}"
+            ) from None
+        except ValueError as exc:
+            # Unknown declared strategy or a config drift from the pinned deployed identity — refuse
+            # rather than silently substitute or run a drifted contestant.
+            raise HTTPException(status_code=400, detail=str(exc)) from None
 
         async def _broadcast(event: CompetitionEvent) -> None:
             await arena_manager.broadcast(competition_id, event)
@@ -901,7 +1376,220 @@ def create_app(
             competition_id=finalized.competition_id,
             status=finalized.status.value,
             run_id=finalized.run_id,
+            replay_binding=ReplayBinding(
+                pack_id=resolved.pack_id, fixture_id=resolved.fixture_id, content_hash=resolved.content_hash
+            ).model_dump(mode="json"),
         )
+
+    # --- POST /competitions/{competition_id}/arena ------------------------
+
+    @app.post("/competitions/{competition_id}/arena")
+    async def run_competition_arena_endpoint(
+        competition_id: str,
+        principal: PrivyPrincipal = Depends(require_principal),  # noqa: B008
+        dep_store: Store = Depends(_get_store),  # noqa: B008
+    ) -> dict[str, Any]:
+        """Run the II-9 checkpointed det-Drift vs LLM-Drift arena comparison for an OWNED competition.
+
+        This is the AUTHENTICATED, owner-scoped surface that makes the II-9 fairness/accounting payload
+        REACHABLE and OBSERVABLE over HTTP (Codex M1). It is deliberately SEPARATE from the legacy
+        unauthenticated ``POST /demo/run`` (an offline deterministic/contrarian demo — the wrong roster
+        and authority surface) and does not perturb the golden ``POST /start`` scored lifecycle.
+
+        The endpoint genuinely OPERATES ON the owned competition — it is NOT authenticated label
+        substitution. It FAILS CLOSED unless the competition's FROZEN roster declares EXACTLY the
+        intrinsic arena contestants — the STRICT intrinsic-arena contract (Codex M2): the exact ids
+        ``det-drift`` (``cumulative-drift``) + ``llm-drift`` (``llm``), cardinality 2, no extras, no
+        id/strategy substitution. An empty, unrelated, mismatched-id, or extra-entry roster is refused
+        409, so the started event's ``agent_ids`` are BY CONSTRUCTION the report's contestant ids — never
+        a run that reports one identity while the event claims another. The roster is validated through
+        the SAME machinery ``POST /competitions/{id}/start`` uses (:func:`build_agents_from_roster` —
+        fail-closed on an unknown strategy / a missing-or-drifted deployed instance). Concurrent starts
+        are claimed ATOMICALLY (Codex M1): the competition is compare-and-set DRAFT -> RUNNING and the
+        run identity reserved BEFORE the model runs, so two simultaneous owner POSTs never both drive the
+        comparison — exactly one runs and the loser returns 409 WITHOUT launching (no duplicate provider
+        work, no unhandled duplicate-seq 500). The honest report is PERSISTED as a canonical
+        :class:`~veridex.competition.events.CompetitionEvent` under a real ``run_id`` so it is OBSERVABLE
+        from ``GET /competitions/{id}`` (state + event stream), not only this POST body.
+
+        Auth (fail-closed, AC-27/AC-29 preserved): an anonymous caller is refused 401 (``require_principal``
+        rejects a missing/invalid Privy bearer BEFORE any work), and only the Privy competition OWNER may
+        run it (``_require_competition_owner`` → 403 for a non-owner or an unowned/legacy competition). An
+        unknown competition is 404. A competition that has already run (RUNNING/FINALIZED) is 409 (the
+        arena run seals canonical events + a run_id exactly once — mirror ``start_competition``).
+
+        The comparison drives det-Drift AND LLM-Drift at the SAME pinned checkpoints from the SAME shared
+        snapshot over the competition's configured (offline demo) tape, using the injected model launcher
+        (``arena_model_launcher``; the lazy production Agno launcher by default). The payload is the HONEST
+        :class:`~veridex.runtime.arena_comparison.ArenaComparisonReport` — eligible checkpoints,
+        per-contestant actions-vs-WAITs, AUTHORITATIVE scoreable decisions, fixture count, clustered
+        uncertainty, and the identical-opportunity flag — NEVER a bare average CLV (addendum §3).
+
+        Args:
+            competition_id: The owned competition to run the arena comparison for.
+            principal: The authenticated Privy principal (injected by ``require_principal``; 401 if absent).
+            dep_store: Injected store dependency.
+
+        Returns:
+            A JSON object ``{"competition_id", "run_id", "arena_comparison"}`` where ``arena_comparison``
+            is the honest report payload (never ``None``) and ``run_id`` is the persisted run identifier.
+
+        Raises:
+            HTTPException: 404 (unknown competition), 401 (anonymous), 403 (non-owner / unowned),
+                409 (already run / concurrent-start loser / roster does not declare EXACTLY the intrinsic
+                arena contestants / rostered deployed instance missing), 400 (unknown strategy / drift).
+        """
+        try:
+            competition = await dep_store.get_competition(competition_id)
+        except KeyError:
+            raise HTTPException(status_code=404, detail=f"competition {competition_id!r} not found") from None
+
+        # Owner-scoping (fail-closed): only the Privy owner may run their competition's arena comparison
+        # (a non-owner or an unowned/legacy competition is refused 403 — mirror the start/kill lifecycle).
+        _require_competition_owner(competition, principal.did)
+
+        # Idempotency (mirror start_competition): the arena comparison seals canonical events + a run_id
+        # exactly ONCE. A competition that has already run is refused rather than double-appending seqs.
+        if competition.status in (CompetitionStatus.RUNNING, CompetitionStatus.FINALIZED):
+            raise HTTPException(status_code=409, detail="competition already run")
+
+        # BIND the pinned MODEL/CONFIG identity, not just id -> strategy (Codex M2). id/strategy labels
+        # ALONE are insufficient: the declared-entry ``config_hash`` folds ``model`` + ``proof_mode``, and
+        # an instance-bound entry pins an entire deployed ``effective_config`` the intrinsic arena does not
+        # run. The intrinsic arena runs det-Drift (no model) + LLM-Drift over the injected launcher whose
+        # model identity is ``arena_model_id`` (its HONEST ``model_id``, ``None`` only for a launcher that
+        # exposes none). ``expected_models`` pins each contestant's intrinsic model identity.
+        arena_model_id = getattr(resolved_arena_model_launcher, "model_id", None)
+        expected_models: dict[str, str | None] = {DET_DRIFT_CONTESTANT: None, LLM_DRIFT_CONTESTANT: arena_model_id}
+
+        # FAIL CLOSED (pre-claim) unless the FROZEN roster snapshot declares EXACTLY the intrinsic arena
+        # contestants at the pinned model/config identity — the STRICT intrinsic-arena contract (Codex M2).
+        # Requiring EXACTLY them (exact ids -> strategies, cardinality 2, no extras, config_hash bound, no
+        # instance binding) makes the started event's agent_ids BY CONSTRUCTION the report's contestant ids.
+        # An empty, unrelated, mismatched-id (e.g. desk-rules-v7), extra-entry, wrong-model, or
+        # instance-bound roster is refused 409, never a substitution. RE-RUN post-claim (below) closes the
+        # pre-claim TOCTOU window — this snapshot may be stale by the time the claim freezes the roster.
+        try:
+            _verify_intrinsic_arena_roster(competition.entries, expected_models=expected_models)
+        except _ArenaRosterContractError as exc:
+            raise HTTPException(status_code=exc.status_code, detail=exc.detail) from None
+
+        # VALIDATE the declared roster through the SAME machinery start_competition uses — fail-closed on
+        # an unknown strategy / a missing-or-drifted deployed instance (never a same-named reconstruction,
+        # never a silent substitution). The strict contract above already pinned the ids + strategies.
+        try:
+            await build_agents_from_roster(
+                competition.entries, get_instance=dep_store.get_agent_instance
+            )
+        except KeyError as exc:
+            raise HTTPException(status_code=409, detail=f"rostered deployed instance not found: {exc}") from None
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from None
+
+        # ATOMICALLY CLAIM the competition BEFORE the model runs (Codex M1 + M3). ONE guarded write sets
+        # status DRAFT -> RUNNING AND reserves the run_id together (no crash window between the two writes,
+        # Codex M3). Two concurrent owner POSTs can never both pass the claim, so exactly ONE drives the
+        # physical comparison and the LOSER returns a controlled 409 WITHOUT launching. The claim also
+        # freezes the roster against concurrent mutation for the duration of the run (the register path's
+        # atomic status-guarded admission refuses any append once status left the mutable window).
+        run_id = uuid4().hex
+        try:
+            await dep_store.claim_competition_run(
+                competition_id, expected=CompetitionStatus.DRAFT, new=CompetitionStatus.RUNNING, run_id=run_id
+            )
+        except CompetitionStatusClaimError:
+            raise HTTPException(status_code=409, detail="competition already run") from None
+
+        # POST-CLAIM ROSTER RE-VERIFY (Codex M1 pre-claim TOCTOU). The strict contract above ran against
+        # the roster snapshot fetched BEFORE the claim; between that check and the claim a concurrent
+        # ``register_agent`` can LEGALLY commit an extra entry (status still DRAFT) — so the claim could
+        # freeze a roster (e.g. ``[det, llm, extra-x]``) DIFFERENT from the one the report attests
+        # (``[det, llm]``). RE-FETCH the now-frozen roster and RE-RUN the SAME strict contract against it;
+        # on ANY mismatch FAIL CLOSED — recover the claim (``_recover_arena_claim`` CAS-rolls RUNNING ->
+        # DRAFT and clears the run_id since no events landed yet) and refuse 409, never a run over a mutated
+        # roster. The post-claim result is the AUTHORITATIVE ``contestant_config``: it attests EXACTLY the
+        # roster frozen at RUNNING. (The claim freezes the roster, so this is the last possible mutation.)
+        try:
+            claimed = await dep_store.get_competition(competition_id)
+            contestant_config = _verify_intrinsic_arena_roster(
+                claimed.entries, expected_models=expected_models
+            )
+        except _ArenaRosterContractError as exc:
+            await _recover_arena_claim(dep_store, competition_id)
+            raise HTTPException(status_code=exc.status_code, detail=exc.detail) from None
+        except KeyError:
+            await _recover_arena_claim(dep_store, competition_id)
+            raise HTTPException(status_code=404, detail=f"competition {competition_id!r} not found") from None
+
+        # FAIL-CLOSED post-claim recovery (Codex M3): wrap model execution + report construction + event
+        # persistence so ANY failure (run_arena_comparison, ArenaDrainError, report/append error) RECOVERS
+        # instead of stranding the competition in RUNNING with a dead run_id, zero events, and a permanent
+        # 409. On failure ``_recover_arena_claim`` CAS-rolls RUNNING -> DRAFT and clears the run_id (when no
+        # events were committed) so the run is retryable, or finalizes as terminal (when events landed).
+        try:
+            # Derive the tape from the competition's configured (offline) source — the SAME source
+            # start_competition drives the scored lifecycle over. Drive the checkpointed comparison HERE.
+            ticks = build_demo_ticks()
+            det_policy = CheckpointPolicy(cadence_s=1.0, evidence_age_limit_s=100_000.0)
+            arena = await run_arena_comparison(
+                ticks, model=resolved_arena_model_launcher, det_policy=det_policy
+            )
+            report = arena.report().to_payload()
+            # REFLECT the ACTUAL verified model/config identity that ran (Codex M2) in the report payload.
+            report["contestant_config"] = contestant_config
+
+            # PERSIST the comparison through canonical competition state so it is OBSERVABLE from
+            # GET /competitions/{id} (a real run_id) and the canonical event stream — not ONLY this POST
+            # body. Mirror start_competition's finalize: emit the seq=0 COMPETITION_STARTED, append a
+            # derived event carrying the honest report, then FINALIZE. The arena comparison is checkpoint-
+            # based (not the scored orchestrator), so it produces no SCORE_UPDATE rows — the leaderboard
+            # stays empty, never a fabricated ranking. The started event's agent_ids ARE the run's ACTUAL
+            # contestant ids (the report's contestant identities) — BYTE-EQUAL, and (by the strict
+            # contract) exactly the declared roster ids: no identity substitution (Codex M2).
+            base_ts = int(ticks[0].ts) if ticks else 0
+            agent_ids = list(report["contestants"].keys())
+            started = build_competition_started_event(
+                competition_id=competition_id,
+                run_id=run_id,
+                source_mode=competition.config.source_mode,
+                agent_ids=agent_ids,
+                base_ts=base_ts,
+            )
+            # Reflect the verified model/config identity in the started event too (Codex M2) — the started
+            # event now declares WHICH model/config each contestant ran, not just the ids.
+            started_payload = dict(started.payload)
+            started_payload["contestant_config"] = contestant_config
+            started = started.model_copy(
+                update={"payload": started_payload, "payload_hash": event_payload_hash(started_payload)}
+            )
+            arena_payload: dict[str, Any] = {
+                "competition_id": competition_id,
+                "run_id": run_id,
+                "agent_ids": agent_ids,
+                "arena_comparison": report,
+            }
+            arena_event = CompetitionEvent(
+                competition_id=competition_id,
+                run_id=run_id,
+                seq=1,
+                event_type=EventType.COMPETITION_FINALIZED,
+                event_ts=base_ts,
+                evidence=False,
+                source_sequence_no=None,
+                derived_from=[f"arena_comparison:{run_id}"],
+                payload=arena_payload,
+                payload_hash=event_payload_hash(arena_payload),
+            )
+            await dep_store.append_competition_events(competition_id, [started, arena_event])
+            # run_id was reserved+persisted at the atomic claim above; RUNNING -> FINALIZED seals the run.
+            await dep_store.update_competition_status(competition_id, CompetitionStatus.FINALIZED)
+        except Exception as exc:
+            await _recover_arena_claim(dep_store, competition_id)
+            raise HTTPException(
+                status_code=503, detail="arena run failed; competition rolled back and retryable"
+            ) from exc
+
+        return {"competition_id": competition_id, "run_id": run_id, "arena_comparison": report}
 
     # --- GET /competitions/{competition_id} -------------------------------
 
@@ -983,6 +1671,11 @@ def create_app(
             run_id=competition.run_id,
             proof_card=proof_card,
             execution=execution,
+            replay_binding=(
+                competition.replay_binding.model_dump(mode="json")
+                if competition.replay_binding is not None
+                else None
+            ),
         )
 
     # --- GET /competitions ------------------------------------------------
@@ -1091,29 +1784,63 @@ def create_app(
         except KeyError:
             raise HTTPException(status_code=404, detail=f"execution {execution_id!r} not found") from None
 
-    # --- GET /agents/{agent_id}/runtime-events (OPS channel; read-only) ----
+    # --- GET /agents/instances/{instance_id}/runtime-events (OPS channel; OWNER-SCOPED) ----
 
-    @app.get("/agents/{agent_id}/runtime-events", response_model=RuntimeEventsResponse)
-    async def get_runtime_events(  # noqa: B008
-        agent_id: str,
+    @app.get("/agents/instances/{instance_id}/runtime-events", response_model=RuntimeEventsResponse)
+    async def get_instance_runtime_events(  # noqa: B008
+        instance_id: str,
         since: int = Query(default=0),  # noqa: B008
         limit: int | None = Query(default=None),  # noqa: B008
+        principal: PrivyPrincipal = Depends(require_principal),  # noqa: B008
+        dep_store: Store = Depends(_get_store),  # noqa: B008
     ) -> RuntimeEventsResponse:
-        """Serve an agent's OPS-channel RuntimeEvents (Agent Ops drawer feed — SEC-003 / REQ-030).
+        """Serve the caller's OWN durable OPS-channel RuntimeEvents for a deployed instance (I-4).
 
-        Read-only, runtime-neutral (SEC-010). Unknown agents return an empty list, never 404, so a
-        minimal/just-started runtime renders a clean empty drawer (REQ-031).
+        REPLACES the former PUBLIC ``/agents/{id}/runtime-events`` — a trust boundary: ownership is
+        resolved SERVER-SIDE from the persisted instance (never the request), and the durable feed is
+        read through the store's ``BIGSERIAL`` cursor. Fail-closed exactly like the sibling
+        ``GET /agents/instances/{id}`` (I-2): 404 for absent OR unowned/legacy (no existence leak),
+        403 for owned-by-another. Channel-pure (SEC-003): the rows carry no evidence fields.
 
         Args:
-            agent_id: The agent whose OPS-channel telemetry to read.
-            since: ``ts`` lower bound (ms); ``0`` returns everything retained.
-            limit: When set, return only the most-recent ``limit`` matching events.
+            instance_id: The deployed instance whose OPS telemetry to read.
+            since: The last consumed durable ``id`` (exclusive cursor); ``0`` returns from the start.
+            limit: When set, the FIRST ``limit`` events after ``since`` (forward paging).
+            principal: The authenticated Privy principal (injected by ``require_principal``).
+            dep_store: Injected store dependency.
 
         Returns:
-            A :class:`~veridex.api.schemas.RuntimeEventsResponse` wrapping the ``events`` list.
+            A :class:`~veridex.api.schemas.RuntimeEventsResponse` wrapping the ``events`` list (each a
+            RuntimeEvent dict plus its durable ``id`` cursor).
+
+        Raises:
+            HTTPException: 401 (unauthenticated), 404 (absent or unowned — no leak), 403 (wrong owner).
         """
-        events = resolved_runtime_store.list_for_agent(agent_id, since=since, limit=limit)
-        return RuntimeEventsResponse(events=[e.model_dump(mode="json") for e in events])
+        try:
+            instance = await dep_store.get_agent_instance(instance_id)
+        except KeyError:
+            raise HTTPException(status_code=404, detail="agent instance not found") from None
+        # Fail-closed: an unowned / legacy row is never inherited — hide it as if it does not exist.
+        if instance.operator_id is None:
+            raise HTTPException(status_code=404, detail="agent instance not found")
+        if instance.operator_id != principal.did:
+            raise HTTPException(status_code=403, detail="principal does not own this agent instance")
+        rows = await dep_store.list_runtime_events(instance.agent_id, since=since, limit=limit)
+        events: list[dict[str, Any]] = []
+        for row in rows:
+            # Reconstruct through RuntimeEvent so the served shape is channel-pure by construction
+            # (RuntimeEvent has NO sequence_no / payload_hash), then attach the durable read cursor.
+            payload = RuntimeEvent(
+                type=RuntimeEventType(row.event_type),
+                agent_id=row.agent_id,
+                run_id=row.run_id,
+                session_id=row.session_id,
+                ts=row.ts,
+                payload=row.payload,
+            ).model_dump(mode="json")
+            payload["id"] = row.id
+            events.append(payload)
+        return RuntimeEventsResponse(events=events)
 
     # --- POST /competitions/{competition_id}/kill-switch (auth) -----------
 
@@ -1323,12 +2050,19 @@ def create_app(
     # (no injected deps), the default route degrades anchoring HONESTLY — it anchors on-chain only
     # when a Solana keypair is configured, else the run is legitimately ``not_anchored`` (offline
     # replay), NEVER a fabricated anchor and NEVER a crash on a missing keypair. The replay SOURCE
-    # is the in-code demo fixture (``build_demo_ticks``), wired inside ``register_deploy_routes``.
+    # is the SELECTED verified ReplayPack (R-4), resolved from the R-2 catalog and frozen onto the
+    # deployed instance, loaded through ``load_pack_marketstates``, wired inside ``register_deploy_routes``.
     resolved_deploy_deps = deploy_deps
     if resolved_deploy_deps is None:
         anchor_fn = anchor_memo if resolved_settings.solana_keypair_path is not None else None
         resolved_deploy_deps = DeployDeps(anchor_fn=anchor_fn)
-    register_deploy_routes(app, store=resolved_store, deploy_deps=resolved_deploy_deps)
+    register_deploy_routes(
+        app,
+        store=resolved_store,
+        settings=resolved_settings,
+        deploy_deps=resolved_deploy_deps,
+        runtime_event_sink=resolved_runtime_events.sink(),
+    )
 
     # --- GET /maker/arena-result (read-only maker-UI bridge; SEC-005 isolated lane) ----
     # Separate namespace over the SEALED maker arena artifact — never re-runs the arena, never

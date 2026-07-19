@@ -15,6 +15,7 @@
 //     not in wire CompetitionStateResponse; they come from the WS stream + /leaderboard.
 //   - InspectorRecord: proof_mode/is_live/clv_explanation are not in wire InspectorRecord.
 import { CHECK_ORDER } from '@/lib/checks';
+import { getAuthToken } from '@/lib/auth';
 import { isMockEnabled, MOCK_FIXTURES } from '@/lib/mock';
 import { COCKPIT_DEMO } from '@/lib/fixtures/cockpit';
 import { INSPECTOR_DEMO_QUANTITIES } from '@/lib/fixtures/inspector';
@@ -24,11 +25,29 @@ import { VERIFIER_VERSION, type StatusBarState } from '@/lib/status';
 import type * as W from '@/lib/wire';
 import type {
   AnchorInfo, AnchorStatus, CheckResult, CockpitState, ExecutionMode, FeedHealthState,
+  GuardAblationArm, GuardAblationDecision, GuardAblationLeg, GuardAblationView,
   InspectorRecord, LeaderboardRow, MakerArenaResultView, MakerLeaderboardRow, MatchState,
   PerformanceMetrics, ProofArtifact, ProofMode, SourceMode, VerifyResult,
 } from '@/lib/contracts';
 
 export const API_BASE = process.env.NEXT_PUBLIC_API_BASE ?? '';
+
+// Resolve a request URL against the configured API base. The base is read at CALL TIME (Next inlines
+// NEXT_PUBLIC_* into the client bundle, and it is a live env read on the server), so SSR fetches
+// resolve to an ABSOLUTE URL. Fail-closed on the server: a missing base is a boot error because a
+// relative URL cannot be fetched in Node — never silently hit the wrong origin. In the browser a
+// same-origin relative path is correct, so an unset base falls through to the bare path.
+function resolveApiUrl(path: string): string {
+  const base = process.env.NEXT_PUBLIC_API_BASE ?? '';
+  if (base) return `${base}${path}`;
+  if (typeof window === 'undefined') {
+    throw new Error(
+      'NEXT_PUBLIC_API_BASE is required for server-side rendering: set it to the absolute API origin ' +
+        '(e.g. https://api.example.com). A relative URL cannot be fetched during SSR.',
+    );
+  }
+  return path;
+}
 
 // Centralized path map — the C1 binding points. A route change is a one-line edit.
 export const PATHS = {
@@ -43,10 +62,33 @@ export const PATHS = {
     competitionId ? `/leaderboard?competition_id=${competitionId}` : `/leaderboard`,
   inspector: (runId: string, seq: number | string) => `/runs/${runId}/actions/${seq}`,
   feedHealth: () => `/feed/health`,
-  // C2 catalog: agent runtime-events (OPS telemetry; ImplD-served orphaned route).
-  runtimeEvents: (agentId: string) => `/agents/${agentId}/runtime-events`,
+  // I-4 OWNER-SCOPED runtime-events (OPS telemetry). REPLACES the retired PUBLIC
+  // `/agents/{id}/runtime-events`: ownership is resolved server-side from the persisted instance
+  // (router.py get_instance_runtime_events). Cursor-polling: `since` is an EXCLUSIVE durable `id`
+  // cursor (0 ⇒ from the start); `limit` forward-pages the first N events after `since`.
+  instanceRuntimeEvents: (instanceId: string, since = 0, limit?: number) =>
+    `/agents/instances/${instanceId}/runtime-events?since=${since}` + (limit != null ? `&limit=${limit}` : ''),
   // MAKER lane: the sealed maker_arena_result.v1 envelope (quote-quality, toxicity-ranked).
   makerArenaResult: () => `/maker/arena-result`,
+  // F-8 QuoteGuard behavior ablation (maker_live_ab.v1). Read-only, public, per-instance. 404s
+  // (honest "no ablation for this instance") until an ablation provider is wired for the instance.
+  makerLiveAb: (instanceId: string) => `/maker/live-ab/${encodeURIComponent(instanceId)}`,
+  // F-4 competition lifecycle (owner-scoped POSTs): create → register roster entry → start.
+  competitions: () => `/competitions`,
+  competitionAgents: (id: string) => `/competitions/${id}/agents`,
+  competitionStart: (id: string) => `/competitions/${id}/start`,
+  // I-2 owner-scoped deployed instances. Bearer-authed GETs; the backend 401s anon
+  // (require_principal), returns ONLY the caller's own rows, and 403/404s a non-owner.
+  agentInstances: () => `/agents/instances`,
+  agentInstance: (instanceId: string) => `/agents/instances/${instanceId}`,
+  // F-7 owner-scoped instance LIFECYCLE. Status is a read-only run/lease view (deploy.py:985); kill
+  // is the owner-gated exactly-once shutdown-cancel (deploy.py:1008). Both 401 anon / 403 non-owner /
+  // 404 absent before any effect. Kill additionally 409s a run that was never minted / is not live.
+  instanceStatus: (instanceId: string) => `/agents/instances/${instanceId}/status`,
+  instanceKill: (instanceId: string) => `/agents/instances/${instanceId}/kill`,
+  // F-7 "Disable execution" maps to the competition policy-envelope kill-switch (router.py:1654):
+  // ENGAGE-ONLY + idempotent (SAF-004) — it SETS the stop True and can never re-open trading.
+  competitionKillSwitch: (competitionId: string) => `/competitions/${competitionId}/kill-switch`,
 } as const;
 
 export class ApiError extends Error {
@@ -56,14 +98,69 @@ export class ApiError extends Error {
   }
 }
 
+// POST an owner-scoped route with the auth-contract@1 bearer. Attaches Authorization when the
+// seam (lib/auth.ts) has a token; omits it otherwise — the fail-closed "no token ⇒ never fires"
+// guarantee lives at the UI layer (components/auth/AuthGate keeps the gated affordance out of the
+// DOM entirely) plus the backend, which 401s any request missing a valid bearer before any side
+// effect (auth-contract@1). This client stays a dumb, honest transport: it never fabricates a
+// bearer and never silently eats a 401. On a 401 it re-acquires the token (re-auth) and retries
+// EXACTLY ONCE — never an infinite loop; the final response is returned as-is for the caller to
+// inspect, so a persistent 401 always surfaces (via the existing !res.ok → ApiError check).
+// Shared owner-scoped transport core: acquire the seam's bearer, fire the request, and on a 401
+// re-acquire the token (re-auth) and retry EXACTLY ONCE. Both the POST (deploy) and the GET
+// (owner-scoped reads) helpers below share this identical bearer + 401-retry contract, so the
+// honesty posture (never fabricate a bearer; never silently eat a 401) lives in one place.
+async function authedRequest(path: string, buildInit: (bearer: string | null) => RequestInit): Promise<Response> {
+  const token = await getAuthToken();
+  const doFetch = (bearer: string | null) => fetch(resolveApiUrl(path), buildInit(bearer));
+  let res = await doFetch(token);
+  if (res.status === 401) {
+    const retryToken = await getAuthToken(); // re-auth: re-acquire token / re-login
+    if (retryToken) res = await doFetch(retryToken);
+  }
+  return res;
+}
+
+async function authedFetch(
+  path: string,
+  body: unknown,
+  extraHeaders?: Record<string, string>,
+): Promise<Response> {
+  return authedRequest(path, (bearer) => ({
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      accept: 'application/json',
+      ...(bearer ? { authorization: `Bearer ${bearer}` } : {}),
+      // Caller-supplied request headers (e.g. the deploy Idempotency-Key). Spread LAST so an
+      // explicit caller header is honest and visible — the transport never fabricates one.
+      ...(extraHeaders ?? {}),
+    },
+    body: JSON.stringify(body),
+  }));
+}
+
+// Owner-scoped authed GET (auth-contract@1): same bearer + 401-retry as authedFetch, no body.
+// A no-token call fires WITHOUT an Authorization header — it never fabricates a bearer; the
+// backend then 401s (require_principal) before returning any owner-private data (fail-closed).
+async function authedGet(path: string): Promise<Response> {
+  return authedRequest(path, (bearer) => ({
+    method: 'GET',
+    headers: {
+      accept: 'application/json',
+      ...(bearer ? { authorization: `Bearer ${bearer}` } : {}),
+    },
+  }));
+}
+
 async function getJson<T>(path: string): Promise<T> {
-  const res = await fetch(`${API_BASE}${path}`, { headers: { accept: 'application/json' } });
+  const res = await fetch(resolveApiUrl(path), { headers: { accept: 'application/json' } });
   if (!res.ok) throw new ApiError(res.status, `GET ${path} failed: ${res.status}`);
   return (await res.json()) as T;
 }
 
 async function postJson<T>(path: string, body?: unknown): Promise<T> {
-  const res = await fetch(`${API_BASE}${path}`, {
+  const res = await fetch(resolveApiUrl(path), {
     method: 'POST',
     headers: { 'content-type': 'application/json', accept: 'application/json' },
     body: body === undefined ? undefined : JSON.stringify(body),
@@ -232,6 +329,7 @@ export function adaptMakerArenaResult(w: W.MakerArenaResultResponseWire): MakerA
     rank_axis: w.rank_axis,
     rank_axis_direction: w.rank_axis_direction,
     rung: w.result.rung,
+    config_hash: w.result.config_hash, // sealed configuration identity, verbatim (I-R M3)
     fixture_universe_n: w.result.fixture_universe_n,
     small_n_flag: w.result.small_n_flag,
     real_executable_edge_bps: null,
@@ -402,6 +500,139 @@ export async function getLeaderboard(competitionId?: string): Promise<Leaderboar
   return adaptLeaderboard(await getJson<W.LeaderboardResponse>(PATHS.leaderboard(competitionId)));
 }
 
+// ---- QuoteGuard behavior ablation (F-8 · maker_live_ab.v1) ----
+//
+// The guard OFF vs ON behavior ablation for a maker instance. It is a BEHAVIOR comparison (does the
+// guard change the decision on the same recorded tape?), NEVER a rank / toxicity / edge / winner —
+// the wire envelope carries no such field and this adapter never synthesizes one. 404 is a REAL,
+// honest state ("no recorded ablation for this instance"), distinct from a transport error: the
+// reader returns `null` on 404 and THROWS on any other non-ok so the screen renders the two states
+// differently (unavailable vs error+retry), never a fabricated ablation (T-2 fixture prohibition).
+
+/** Wire shape of one ablation arm (guard_off / guard_on) — the backend `_project_arm` dict. */
+interface GuardAblationArmWire {
+  guard_enabled?: boolean;
+  terminal_reason?: string | null;
+  observations_consumed?: number;
+  decisions?: {
+    index?: number;
+    kind?: string;
+    reason_codes?: string[];
+    legs?: { kind?: string; role?: string; price?: number | null; post_only?: boolean }[];
+  }[];
+}
+
+/** Wire shape of the `GET /maker/live-ab/{instance_id}` envelope (LiveGuardAblationResponse). */
+interface GuardAblationResponseWire {
+  schema_version?: string;
+  lane?: string;
+  panel?: string;
+  is_ablation?: boolean;
+  instance_id: string;
+  mode: string;
+  guard_off: GuardAblationArmWire;
+  guard_on: GuardAblationArmWire;
+  divergent_frame_indices?: number[];
+  diverges?: boolean;
+  labels?: Record<string, string>;
+}
+
+function adaptGuardAblationLeg(l: NonNullable<NonNullable<GuardAblationArmWire['decisions']>[number]['legs']>[number]): GuardAblationLeg {
+  return {
+    kind: String(l.kind ?? ''),
+    role: String(l.role ?? ''),
+    // price is honest: a real number when priced, null otherwise — NEVER coerced to 0 (a 0 odds
+    // would be a fabricated quote). typeof-guard so a wire null/undefined stays null.
+    price: typeof l.price === 'number' ? l.price : null,
+    post_only: l.post_only === true,
+  };
+}
+
+function adaptGuardAblationArm(a: GuardAblationArmWire): GuardAblationArm {
+  return {
+    guard_enabled: a.guard_enabled === true,
+    terminal_reason: a.terminal_reason ?? null, // null = honest "no terminal reason", never invented
+    observations_consumed: a.observations_consumed ?? 0,
+    decisions: (a.decisions ?? []).map((d): GuardAblationDecision => ({
+      index: d.index ?? 0,
+      kind: String(d.kind ?? ''),
+      reason_codes: d.reason_codes ?? [],
+      legs: (d.legs ?? []).map(adaptGuardAblationLeg),
+    })),
+  };
+}
+
+export function adaptGuardAblation(w: GuardAblationResponseWire): GuardAblationView {
+  return {
+    schema_version: w.schema_version ?? 'maker_live_ab.v1',
+    lane: w.lane ?? 'maker',
+    panel: w.panel ?? 'guard_on_off_ablation',
+    is_ablation: w.is_ablation !== false,
+    instance_id: w.instance_id,
+    mode: w.mode,
+    guard_off: adaptGuardAblationArm(w.guard_off),
+    guard_on: adaptGuardAblationArm(w.guard_on),
+    divergent_frame_indices: w.divergent_frame_indices ?? [],
+    diverges: w.diverges === true,
+    labels: w.labels ?? {},
+  };
+}
+
+// DEMO ablation for MOCK MODE only (recorded replay — never a live claim; the app-wide "DEMO DATA ·
+// MOCK MODE" indicator makes this honest). Divergent example: the guard suppresses a toxic quote on
+// three frames. Live (mock off) NEVER falls back to this — it 404s → null (unavailable) honestly.
+const MOCK_GUARD_ABLATION: GuardAblationView = {
+  schema_version: 'maker_live_ab.v1', lane: 'maker', panel: 'guard_on_off_ablation', is_ablation: true,
+  instance_id: 'mm-inst-0f74a4', mode: 'replay',
+  guard_off: {
+    guard_enabled: false, terminal_reason: 'tape_exhausted', observations_consumed: 1024,
+    decisions: [
+      { index: 211, kind: 'QUOTE', reason_codes: ['spread_ok'], legs: [
+        { kind: 'BID', role: 'maker', price: 2.34, post_only: true },
+        { kind: 'ASK', role: 'maker', price: 2.51, post_only: true }] },
+      { index: 212, kind: 'QUOTE', reason_codes: ['wide_ok', 'inv_room'], legs: [
+        { kind: 'BID', role: 'maker', price: 2.34, post_only: true },
+        { kind: 'ASK', role: 'maker', price: 2.51, post_only: true }] },
+      { index: 213, kind: 'QUOTE', reason_codes: ['wide_ok'], legs: [
+        { kind: 'BID', role: 'maker', price: 2.30, post_only: true }] },
+      { index: 214, kind: 'QUOTE', reason_codes: ['spread_ok'], legs: [] },
+      { index: 640, kind: 'QUOTE', reason_codes: ['wide_ok'], legs: [
+        { kind: 'BID', role: 'maker', price: 1.98, post_only: true }] },
+    ],
+  },
+  guard_on: {
+    guard_enabled: true, terminal_reason: 'guard_halt', observations_consumed: 1024,
+    decisions: [
+      { index: 211, kind: 'QUOTE', reason_codes: ['spread_ok'], legs: [
+        { kind: 'BID', role: 'maker', price: 2.34, post_only: true },
+        { kind: 'ASK', role: 'maker', price: 2.51, post_only: true }] },
+      { index: 212, kind: 'SUPPRESS', reason_codes: ['guard_toxicity_block'], legs: [] },
+      { index: 213, kind: 'SUPPRESS', reason_codes: ['guard_cooldown'], legs: [] },
+      { index: 214, kind: 'QUOTE', reason_codes: ['spread_ok'], legs: [] },
+      { index: 640, kind: 'SUPPRESS', reason_codes: ['guard_toxicity_block'], legs: [] },
+    ],
+  },
+  divergent_frame_indices: [212, 213, 640], diverges: true,
+  labels: {
+    panel_kind: 'behavior_ablation_guard_off_vs_on',
+    comparison_basis: 'same strategy, same pinned tape — only the QuoteGuard arm differs',
+    panel_disclaimer: 'this demonstrates the guard CHANGES behavior; it is NOT a rank / toxicity / performance ordering / winner and is never conflated with the sealed historical maker leaderboard',
+    divergence_scope: 'divergence is what the two arms actually did on this tape — expected on the pinned adversarial trigger frame, may be empty on a quiescent stretch; never a promise the guard always diverges',
+  },
+};
+
+// GET /maker/live-ab/{instanceId} → the guard behavior ablation, or `null` when the backend has no
+// recorded ablation for the instance (404 — an honest "unavailable" state, NOT an error). Any other
+// non-ok THROWS ApiError so the screen shows its error/retry state with no fabricated values. Mock ⇒
+// the DEMO ablation (recorded replay). The route is public (read-only), so a plain accept-JSON GET.
+export async function getMakerLiveAb(instanceId: string): Promise<GuardAblationView | null> {
+  if (isMockEnabled()) return MOCK_GUARD_ABLATION;
+  const res = await fetch(resolveApiUrl(PATHS.makerLiveAb(instanceId)), { headers: { accept: 'application/json' } });
+  if (res.status === 404) return null; // honest "no recorded ablation for this instance"
+  if (!res.ok) throw new ApiError(res.status, `GET ${PATHS.makerLiveAb(instanceId)} failed: ${res.status}`);
+  return adaptGuardAblation((await res.json()) as GuardAblationResponseWire);
+}
+
 // GET /maker/arena-result → maker view-model (SEC-005: never routed through the CLV leaderboard).
 // Mock ⇒ the canonical maker fixture (REPLAY, never LIVE), through the SAME adapter.
 export async function getMakerArenaResult(): Promise<MakerArenaResultView> {
@@ -456,6 +687,19 @@ export interface DeployAgentPayload {
   window_id: string;
   fixture_id: number;
   end_rule: 'pre_match' | 'fixed_duration' | 'manual_stop';
+  // fu-ii5: the maker/quote-guard subset, present ONLY for the `quoteguard-mm` MM family (the
+  // backend dispatches on `strategy == "quoteguard-mm"`). Mirrors MakerDeployConfig (extra="forbid"),
+  // so no unknown fields. `tape_ref` is a bounded catalog KEY (never a path/fixture).
+  mm?: {
+    tape_ref: string;
+    guard_enabled?: boolean;
+    tif?: 'GTC' | 'GTD';
+    max_orders_per_run?: number;
+    max_orders_per_session?: number;
+    max_orders_per_day?: number;
+    max_session_loss?: number;
+    max_daily_loss?: number;
+  };
 }
 
 /** The pinned-instance handle the deploy endpoint returns (run_id known BEFORE the seal). */
@@ -491,20 +735,340 @@ export class DeployPreflightError extends Error {
  * surfaces it as a {@link DeployPreflightError} so the UI can name the failing check instead of a
  * bare status. The 200 body is the pinned instance + the launched ``run_id`` (returned WITHOUT
  * awaiting the seal).
+ *
+ * auth-contract@1: owner-scoped — carries the bearer from lib/auth.ts when the seam has a token
+ * (never fabricates one when it doesn't), and retries once on a 401 (see authedFetch). The
+ * fail-closed "no token → never fires" guarantee is enforced at the UI layer by wrapping the
+ * calling affordance in {@link AuthGate}, not by this function refusing to fetch.
  */
-export async function deployAgent(payload: DeployAgentPayload): Promise<DeployAgentResult> {
-  const res = await fetch(`${API_BASE}/agents/deploy`, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json', accept: 'application/json' },
-    body: JSON.stringify(payload),
-  });
+export async function deployAgent(
+  payload: DeployAgentPayload,
+  idempotencyKey?: string,
+): Promise<DeployAgentResult> {
+  // The Idempotency-Key HTTP header (I-3, deploy.py) makes the deploy idempotent: same
+  // (operator_id, key) ⇒ the SAME instance. A client that reuses ONE stable key across a
+  // retry/timeout reconciles to a single instance instead of minting duplicates. Absent ⇒ the
+  // backend mints a fresh per-request key (client idempotency lost), so the caller owns the key.
+  const res = await authedFetch(
+    '/agents/deploy',
+    payload,
+    idempotencyKey ? { 'Idempotency-Key': idempotencyKey } : undefined,
+  );
   if (res.status === 422) {
-    const body = (await res.json().catch(() => ({}))) as { detail?: { failed_checks?: string[]; checks?: DeployPreflightVerdict[] } };
-    const detail = body.detail ?? {};
-    throw new DeployPreflightError(detail.failed_checks ?? [], detail.checks ?? []);
+    const body = (await res.json().catch(() => ({}))) as { detail?: unknown };
+    // The preflight 422 detail is a {failed_checks, checks} OBJECT. But a bare FastAPI request-
+    // validation 422 returns `detail` as an ARRAY, and a malformed body may omit it — in those cases
+    // there are no named checks. Never surface an EMPTY failed-checks list: the UI suppresses both the
+    // success badge (gated `!preflightFailure`) AND the alert (gated `.length > 0`), so an empty list
+    // renders NOTHING (silence). Fall back to a named `preflight_failed` so a 422 is always visible.
+    const detail = (body.detail && typeof body.detail === 'object' && !Array.isArray(body.detail))
+      ? (body.detail as { failed_checks?: string[]; checks?: DeployPreflightVerdict[] })
+      : {};
+    const failed = detail.failed_checks && detail.failed_checks.length > 0
+      ? detail.failed_checks
+      : ['preflight_failed'];
+    throw new DeployPreflightError(failed, detail.checks ?? []);
   }
   if (!res.ok) throw new ApiError(res.status, `POST /agents/deploy failed: ${res.status}`);
   return (await res.json()) as DeployAgentResult;
+}
+
+// ---- Owner-scoped deployed instances (I-2 · F-3) ----
+//
+// The DURABLE deployed-instance record — the OWNER-scoped deployment identity, distinct from the
+// PUBLIC /agents strategy profile. Mirrors the frozen backend `AgentInstance`
+// (veridex/deploy/instance.py): `run_id` is the AUTHORITATIVE Veridex evidence identity;
+// `runtime_handle.session_id` is a REPLACEABLE AgentOS handle (re-minted on restart under the same
+// run_id) — never the result/ownership authority. `operator_id` is the SERVER-DERIVED owner.
+
+/** The runtime infra pointer — replaceable; NEVER the ownership/result authority (run_id is). */
+export interface InstanceRuntimeHandle {
+  runtime_kind: string;
+  runtime_agent_id: string;
+  session_id: string | null;
+  run_id: string;
+}
+
+/** Wire shape of a deployed instance as served by GET /agents/instances[/{id}] (frozen contract). */
+export interface AgentInstanceWire {
+  instance_id: string;
+  template_id: string;
+  agent_id: string;
+  config_hash: string;
+  policy_hash: string;
+  source_mode: string;
+  execution_mode: string;
+  market_allowlist: string[];
+  venue_allowlist: string[];
+  run_id: string;
+  status: string; // DeployStatus value: pending | running | sealed | failed
+  last_failure_reason: string | null;
+  operator_id: string | null;
+  runtime_handle: InstanceRuntimeHandle | null;
+  created_at: string;
+  updated_at: string; // durable last-write timestamp (present on the contract; not surfaced today)
+}
+
+/** View-model of a deployed instance (owner-scoped identity the instance page + dashboard render). */
+export interface DeployedInstance {
+  instance_id: string;
+  template_id: string;
+  agent_id: string;
+  run_id: string;
+  status: string; // preserved VERBATIM — never coerced to a rosier lifecycle state (honesty)
+  source_mode: SourceMode;
+  execution_mode: string;
+  config_hash: string;
+  policy_hash: string;
+  operator_id: string | null;
+  runtime_handle: InstanceRuntimeHandle | null;
+  last_failure_reason: string | null;
+  market_allowlist: string[];
+  venue_allowlist: string[];
+  created_at: string;
+}
+
+export function adaptAgentInstance(w: AgentInstanceWire): DeployedInstance {
+  const rh = w.runtime_handle;
+  return {
+    instance_id: w.instance_id,
+    template_id: w.template_id,
+    agent_id: w.agent_id,
+    run_id: w.run_id, // authoritative evidence identity — carried through 1:1
+    status: w.status, // verbatim (SEC honesty: a failed/pending instance never reads as sealed)
+    source_mode: toSourceMode(w.source_mode),
+    execution_mode: w.execution_mode,
+    config_hash: w.config_hash,
+    policy_hash: w.policy_hash,
+    operator_id: w.operator_id ?? null,
+    runtime_handle: rh
+      ? {
+          runtime_kind: String(rh.runtime_kind ?? ''),
+          runtime_agent_id: String(rh.runtime_agent_id ?? ''),
+          session_id: rh.session_id ?? null, // replaceable handle, null-honest
+          run_id: String(rh.run_id ?? ''),
+        }
+      : null,
+    last_failure_reason: w.last_failure_reason ?? null,
+    market_allowlist: w.market_allowlist ?? [],
+    venue_allowlist: w.venue_allowlist ?? [],
+    created_at: w.created_at,
+  };
+}
+
+// DEMO instances for MOCK MODE only (source REPLAY — never rendered under a LIVE badge; the app-wide
+// "DEMO DATA · MOCK MODE" indicator makes this honest). Live (mock off) NEVER falls back to these.
+const MOCK_INSTANCES: DeployedInstance[] = [
+  {
+    instance_id: 'inst_demo_value_clv', template_id: 'value_clv', agent_id: 'studio-value_clv',
+    run_id: 'run_demo_esp_ned', status: 'sealed', source_mode: 'replay', execution_mode: 'paper',
+    config_hash: 'c'.repeat(64), policy_hash: 'p'.repeat(64), operator_id: 'did:privy:demo-operator',
+    runtime_handle: { runtime_kind: 'agentos', runtime_agent_id: 'aos_demo_1', session_id: 'sess_demo_1', run_id: 'run_demo_esp_ned' },
+    last_failure_reason: null, market_allowlist: ['moneyline'], venue_allowlist: ['polymarket'],
+    created_at: '2026-07-15T12:00:00Z',
+  },
+  {
+    instance_id: 'inst_demo_momentum', template_id: 'momentum', agent_id: 'studio-momentum',
+    run_id: 'run_demo_fra_bra', status: 'running', source_mode: 'replay', execution_mode: 'paper',
+    config_hash: 'd'.repeat(64), policy_hash: 'q'.repeat(64), operator_id: 'did:privy:demo-operator',
+    runtime_handle: { runtime_kind: 'agentos', runtime_agent_id: 'aos_demo_2', session_id: 'sess_demo_2', run_id: 'run_demo_fra_bra' },
+    last_failure_reason: null, market_allowlist: ['moneyline'], venue_allowlist: ['polymarket'],
+    created_at: '2026-07-16T09:30:00Z',
+  },
+];
+
+// GET /agents/instances — the caller's OWN deployed instances (owner-scoped, bearer-authed). Mock
+// ⇒ the DEMO set (replay). Live ⇒ authedGet; a non-ok (401/403/5xx) throws so the caller can render
+// an honest empty/error state — it NEVER silently falls back to a fixture (T-2 fixture prohibition).
+export async function getInstances(): Promise<DeployedInstance[]> {
+  if (isMockEnabled()) return MOCK_INSTANCES.map((i) => ({ ...i, source_mode: demote(i.source_mode) }));
+  const res = await authedGet(PATHS.agentInstances());
+  if (!res.ok) throw new ApiError(res.status, `GET ${PATHS.agentInstances()} failed: ${res.status}`);
+  return ((await res.json()) as AgentInstanceWire[]).map(adaptAgentInstance);
+}
+
+// ---- Owner-scoped runtime-events (I-4 · F-6) ----
+//
+// One SERVED runtime event: the frozen wire RuntimeEvent (OPS-channel telemetry, SEC-003 — never
+// sealed/scored) PLUS its durable BIGSERIAL `id`, the exclusive read-cursor the poller advances.
+// The `agent_id` is already in the response body (wire RuntimeEvent), never re-derived here.
+export interface RuntimeEventRecord extends W.RuntimeEvent {
+  id: number;
+}
+
+// GET /agents/instances/{id}/runtime-events — the caller's OWN durable OPS telemetry for a deployed
+// instance (owner-scoped, bearer-authed; same seam as getInstances). `since` is the EXCLUSIVE durable
+// cursor (advance to max(id) across polls ⇒ no duplicates). A non-ok (401/403/404/5xx) THROWS so the
+// drawer can render an honest empty/error state — it NEVER silently falls back to a fixture (T-2).
+// No mock branch: runtime events have no frozen wire fixture; the drawer's demo path is gated at the
+// hook (isMockEnabled) so the LIVE reader stays a dumb, honest transport that only ever hits the API.
+export async function getRuntimeEvents(
+  instanceId: string,
+  since = 0,
+  limit?: number,
+): Promise<RuntimeEventRecord[]> {
+  const path = PATHS.instanceRuntimeEvents(instanceId, since, limit);
+  const res = await authedGet(path);
+  if (!res.ok) throw new ApiError(res.status, `GET ${path} failed: ${res.status}`);
+  const body = (await res.json()) as { events: RuntimeEventRecord[] };
+  return body.events;
+}
+
+// GET /agents/instances/{id} — ONE instance the caller owns. A 403 (owned by another) / 404 (absent
+// or unowned legacy row) throws ApiError so the page renders an honest unauthorized/not-found state,
+// never a fabricated instance.
+export async function getInstance(instanceId: string): Promise<DeployedInstance> {
+  if (isMockEnabled()) {
+    const found = MOCK_INSTANCES.find((i) => i.instance_id === instanceId);
+    // Honest 404 for an unknown id even in mock — never fabricate a first-demo success on the
+    // not-found surface (InstanceScreen renders the honest not-found state).
+    if (!found) throw new ApiError(404, `GET ${PATHS.agentInstance(instanceId)} failed: 404 (mock: unknown instance)`);
+    return { ...found, source_mode: demote(found.source_mode) };
+  }
+  const res = await authedGet(PATHS.agentInstance(instanceId));
+  if (!res.ok) throw new ApiError(res.status, `GET ${PATHS.agentInstance(instanceId)} failed: ${res.status}`);
+  return adaptAgentInstance((await res.json()) as AgentInstanceWire);
+}
+
+// ---- Owner-scoped instance lifecycle (II-6 · F-7) ----
+//
+// The control-plane WRITE surface for the Agent Ops drawer: read a deployed instance's authoritative
+// run/lease status, engage the owner-gated exactly-once kill, and (for "Disable execution") engage a
+// competition's kill-switch. All owner-scoped through the SAME bearer + 401-retry seam as deployAgent
+// / getInstances (never fabricates a bearer; never silently eats a 401). No mock branch: these are
+// real control-plane mutations — the drawer's demo path is gated at the hook (isMockEnabled) so a
+// kill is NEVER faked, and these readers stay dumb, honest transports that only ever hit the API.
+// There is deliberately NO pauseInstance: the runtime has no pause/resume endpoint (shutdown-cancel
+// only — deploy.py CON-2D-701), so the drawer keeps Pause/Resume honestly disabled instead of faking.
+
+/** Owner-scoped run/lease status for a deployed instance (mirrors backend InstanceStatusResponse). */
+export interface InstanceStatus {
+  instance_id: string;
+  run_id: string;
+  // HEADLINE run/lease state: running | cancelled | sealed | failed | pending. Reflects an engaged
+  // owner kill as `cancelled` (durable across the run settling) — carried through VERBATIM.
+  run_state: string;
+  killed: boolean; // whether an owner kill engaged the exactly-once cancel for this run
+  status: string; // the DURABLE DeployStatus record value (pending | running | sealed | failed)
+  lease_status: string | null;
+}
+
+/** Result of an owner kill (mirrors backend KillResponse). */
+export interface KillResult {
+  instance_id: string;
+  run_id: string;
+  phase: string; // RunPhase after this call: active | cancelling | completed | failed | cancelled
+  engaged: boolean; // true ONLY for the single caller that engaged the exactly-once cancel
+}
+
+/** Result of a competition kill-switch engage (mirrors backend KillSwitchResponse). */
+export interface KillSwitchResult {
+  competition_id: string;
+  kill_switch: boolean; // always true post-engage (engage-only, SAF-004)
+  status: string; // "kill_switch_on" | "kill_switch_off"
+}
+
+// GET /agents/instances/{id}/status — the caller's OWN run/lease status. A non-ok (401/403/404/5xx)
+// THROWS ApiError so the drawer renders an honest unauthorized/not-found/error state, never a
+// fabricated status. The drawer refetches this after a kill to reflect the resulting terminal state.
+export async function getInstanceStatus(instanceId: string): Promise<InstanceStatus> {
+  const path = PATHS.instanceStatus(instanceId);
+  const res = await authedGet(path);
+  if (!res.ok) throw new ApiError(res.status, `GET ${path} failed: ${res.status}`);
+  return (await res.json()) as InstanceStatus;
+}
+
+// POST /agents/instances/{id}/kill — engage the owner-gated exactly-once shutdown-cancel (no body).
+// A non-ok THROWS: 403 owned-by-another, 404 absent/unowned, 409 no active run / not live — so a
+// failed kill surfaces VISIBLY and is NEVER shown as a success. The 200 body names the resulting
+// RunPhase + whether THIS caller engaged the cancel (a repeat kill returns engaged=false).
+export async function killInstance(instanceId: string): Promise<KillResult> {
+  const path = PATHS.instanceKill(instanceId);
+  const res = await authedFetch(path, undefined); // POST, no body (kill takes no request payload)
+  if (!res.ok) throw new ApiError(res.status, `POST ${path} failed: ${res.status}`);
+  return (await res.json()) as KillResult;
+}
+
+// POST /competitions/{id}/kill-switch — ENGAGE (never toggle) the competition's kill-switch (no
+// body). Engage-only + idempotent (SAF-004): the first engage stops trading; a retry keeps it
+// engaged and re-opens nothing. A non-ok THROWS (401/403/404) so a failed engage surfaces visibly.
+export async function armCompetitionKillSwitch(competitionId: string): Promise<KillSwitchResult> {
+  const path = PATHS.competitionKillSwitch(competitionId);
+  const res = await authedFetch(path, undefined); // POST, no body
+  if (!res.ok) throw new ApiError(res.status, `POST ${path} failed: ${res.status}`);
+  return (await res.json()) as KillSwitchResult;
+}
+
+// ---- Competition lifecycle (F-4 · create → register roster → start) ----
+//
+// The Create-Competition wizard's launch flow. All three are OWNER-scoped POSTs (auth-contract@1):
+// the bearer is attached when the seam has a token (never fabricated) and the request retries once
+// on a 401 (authedFetch). The backend derives the owner from the verified Privy principal — a
+// client-supplied owner cannot reach it. Roster entries are INSTANCE-BOUND: each entry references a
+// Studio-deployed instance via `instance_id`, and the arena runs the ACTUAL deployed contestant
+// (pinned config_hash), never a same-named reconstruction. These bind `POST /competitions` →
+// `POST /competitions/{id}/agents` (one entry per instance) → `POST /competitions/{id}/start`, NOT
+// the separate strict intrinsic-arena endpoint (which rejects instance-bound entries).
+
+/** The CompetitionConfig POST /competitions freezes (mirrors veridex CompetitionConfig, create subset). */
+export interface CompetitionConfigPayload {
+  competition_type: string;
+  source_mode: 'replay' | 'live';
+  execution_mode: ExecutionMode;
+  market_scope: string;
+  scoring_window: string | null;
+  roster_size: number; // ge=2 (backend Field constraint) — the wizard guards this before firing
+}
+
+/** One instance-bound roster entry POST /competitions/{id}/agents registers (mirrors AgentEntry). */
+export interface RosterEntryPayload {
+  agent_id: string;
+  owner: string;
+  strategy: string;
+  model: string | null;
+  proof_mode: string; // backend re-normalises to the two canonical values; sent advisory
+  config_hash: string | null; // pins the referenced instance's config identity (I-7)
+  execution_eligibility: boolean;
+  instance_id: string | null; // the deployed-instance binding — the roster trust core
+}
+
+/** POST /competitions response (CompetitionCreateResponse). */
+export interface CompetitionCreateResult { competition_id: string; status: string }
+/** POST /competitions/{id}/agents response (AgentRegisterResponse). */
+export interface AgentRegisterResult { agent_id: string; config_hash: string | null; proof_mode: string }
+/** POST /competitions/{id}/start response (CompetitionStartResponse). */
+export interface CompetitionStartResult { competition_id: string; status: string; run_id: string | null }
+
+/** Create a DRAFT competition owned by the authenticated principal. Throws ApiError on non-ok. */
+export async function createCompetition(config: CompetitionConfigPayload): Promise<CompetitionCreateResult> {
+  const res = await authedFetch(PATHS.competitions(), config);
+  if (!res.ok) throw new ApiError(res.status, `POST ${PATHS.competitions()} failed: ${res.status}`);
+  return (await res.json()) as CompetitionCreateResult;
+}
+
+/**
+ * Register ONE instance-bound roster entry. Throws ApiError carrying the real status so the launch
+ * progression can distinguish a per-instance failure (403 not-owner / 404 absent / 409 roster
+ * frozen-or-full / 400 domain) and offer retry-that-one or start-with-the-rest — never a fabricated
+ * success. The backend fail-closes each of those before any roster mutation.
+ */
+export async function registerRosterAgent(
+  competitionId: string, entry: RosterEntryPayload,
+): Promise<AgentRegisterResult> {
+  const res = await authedFetch(PATHS.competitionAgents(competitionId), entry);
+  if (!res.ok) throw new ApiError(res.status, `POST ${PATHS.competitionAgents(competitionId)} failed: ${res.status}`);
+  return (await res.json()) as AgentRegisterResult;
+}
+
+/**
+ * Start the competition (freezes scoring law, source mode, roster, execution mode for the run) and
+ * return the finalized handle. Throws ApiError on non-ok (404 unknown / 409 already started / 401/403
+ * control-plane for non-paper / 501 live venue disabled) — the caller surfaces it, never fakes a run.
+ */
+export async function startCompetition(competitionId: string): Promise<CompetitionStartResult> {
+  const res = await authedFetch(PATHS.competitionStart(competitionId), undefined);
+  if (!res.ok) throw new ApiError(res.status, `POST ${PATHS.competitionStart(competitionId)} failed: ${res.status}`);
+  return (await res.json()) as CompetitionStartResult;
 }
 
 // MOCK status-bar seed (sync): when mock is on, the status bar populates app-wide from the mock

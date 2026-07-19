@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import time
 from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
@@ -39,6 +40,7 @@ from veridex.checks.build import (
     build_performance_metrics,
     check_results_to_proof_block,
 )
+from veridex.ingest.feed_health import LiveFeedStatus
 from veridex.ingest.marketstate import MarketState
 from veridex.ingest.txline_client import reconstruct_closing
 from veridex.ingest.txline_normalize import market_key, marketstate_from_txline_odds
@@ -233,6 +235,8 @@ async def run_live_window(
     anchor_fn: Callable[[str], Awaitable[str]] | None = None,
     stop_event: asyncio.Event | None = None,
     run_id: str | None = None,
+    feed_status: LiveFeedStatus | None = None,
+    clock: Callable[[], int] | None = None,
 ) -> LiveRunResult:
     """Drive one windowed LIVE run: stream → feed (real time) → seal close → finalize → proof.
 
@@ -255,6 +259,13 @@ async def run_live_window(
             IDLE stream (no line moves) rather than blocking until the next tick.
         run_id: Optional pre-known run id (T21 deploy) so a launcher can return the run id BEFORE the
             window seals; ``None`` → a fresh id is minted at construction (the arena default).
+        feed_status: Optional observable :class:`~veridex.ingest.feed_health.LiveFeedStatus` (III-3).
+            When given, the runner records the last-seen wall time of each fed odds RECORD into it and
+            marks connect/disconnect around the stream, so ``/feed/health`` derives its honest feed
+            state from THIS active stream (not credential presence). Read-only telemetry — it is
+            never scored, never in the sealed evidence.
+        clock: Injectable ``() -> int`` wall-seconds source for the ``feed_status`` last-seen stamps
+            (test seam); ``None`` → ``int(time.time())``. Only consulted when ``feed_status`` is set.
 
     Returns:
         A :class:`LiveRunResult` bundle (the sealed run + the after-seal proof composition + ops).
@@ -285,64 +296,90 @@ async def run_live_window(
     stream_interrupted: BaseException | None = None
     # A stop_event only governs the manual_stop end rule; ``None`` elsewhere disables the race path.
     stop = stop_event if window.end_rule == "manual_stop" else None
+    # III-3 last-seen hook: stamp fed odds records into the observable feed status (wall time), so
+    # /feed/health derives its honest state from THIS active stream. No-op when feed_status is None.
+    # We start CONNECTING (dialing / awaiting the first frame — the socket is not confirmed open yet),
+    # flip to connected on the first received frame, and mark disconnected in the finally below.
+    _now: Callable[[], int] = clock if clock is not None else (lambda: int(time.time()))
+    if feed_status is not None:
+        feed_status.mark_connecting()
 
-    async with _aclosing_if_possible(stream) as guarded_stream:
-        try:
-            while True:
-                # (a) Obtain the next tick. For manual_stop, RACE the next-tick against stop_event so
-                # an IDLE stream (no line moves) still honors a SET stop promptly instead of hanging.
-                if stop is not None:
-                    outcome = await _race_next_tick(guarded_stream, stop)
-                    if outcome is _STOPPED:
+    try:
+        async with _aclosing_if_possible(stream) as guarded_stream:
+            try:
+                while True:
+                    # (a) Obtain the next tick. For manual_stop, RACE the next-tick against stop_event
+                    # so an IDLE stream (no line moves) still honors a SET stop promptly, not hanging.
+                    if stop is not None:
+                        outcome = await _race_next_tick(guarded_stream, stop)
+                        if outcome is _STOPPED:
+                            break
+                        tick = outcome
+                    else:
+                        tick = await _next_or_done(guarded_stream)
+                    if tick is _STREAM_DONE:
+                        break  # a finite stream reached its end — a normal window close.
+
+                    # A real frame arrived from the socket -> honestly connected (idempotent). Even a
+                    # foreign-fixture frame proves the socket is live; with no fed odds/heartbeat yet
+                    # the derive still reads CONNECTING (connected, no frames) until real data lands.
+                    if feed_status is not None:
+                        feed_status.mark_connected()
+
+                    # (b) Between-ticks stop check: a stop set by the time this tick arrived means the
+                    # tick is post-stop and must NOT be fed. This keeps the "ends between ticks" rule
+                    # deterministic even when a tick and the stop become ready in the same loop turn.
+                    if stop is not None and stop.is_set():
                         break
-                    tick = outcome
-                else:
-                    tick = await _next_or_done(guarded_stream)
-                if tick is _STREAM_DONE:
-                    break  # a finite stream reached its end — a normal window close.
 
-                # (b) Between-ticks stop check: a stop set by the time this tick arrived means the
-                # tick is post-stop and must NOT be fed. This keeps the "ends between ticks" rule
-                # deterministic even when a tick and the stop become ready in the same loop turn.
-                if stop is not None and stop.is_set():
-                    break
+                    # Fixture filter: a tick for another fixture is dropped whole (never fed).
+                    if tick.fixture_id != window.fixture_id:
+                        continue
 
-                # Fixture filter: a tick for another fixture is dropped whole (never fed).
-                if tick.fixture_id != window.fixture_id:
-                    continue
+                    # pre_match end: the first IN-RUNNING (kickoff) tick TERMINATES the window and is
+                    # NOT fed — it is post-kickoff; the line agents are scored against comes from the
+                    # reconstructed close, not this tick. All prior pre-kickoff ticks were already fed.
+                    if window.end_rule == "pre_match" and _is_in_running(tick):
+                        break
 
-                # pre_match end: the first IN-RUNNING (kickoff) tick TERMINATES the window and is NOT
-                # fed — it is post-kickoff; the line agents are scored against comes from the
-                # reconstructed close, not this tick. All prior pre-kickoff ticks were already fed.
-                if window.end_rule == "pre_match" and _is_in_running(tick):
-                    break
+                    # fixed_duration end: a tick past started_ts + duration_s terminates and is NOT
+                    # fed. We track started_ts from the first FED tick ourselves (finalize stamps
+                    # window.started_ts, but that is not visible during the loop).
+                    if (
+                        window.end_rule == "fixed_duration"
+                        and started_ts is not None
+                        and window.duration_s is not None
+                        and tick.ts > started_ts + window.duration_s
+                    ):
+                        break
 
-                # fixed_duration end: a tick past started_ts + duration_s terminates and is NOT fed. We
-                # track started_ts from the first FED tick ourselves (finalize stamps window.started_ts,
-                # but that is not visible during the loop).
-                if (
-                    window.end_rule == "fixed_duration"
-                    and started_ts is not None
-                    and window.duration_s is not None
-                    and tick.ts > started_ts + window.duration_s
-                ):
-                    break
-
-                # Restrict to allowlisted markets, then feed in REAL TIME (concurrency lives in feed()).
-                filtered = _filter_markets(tick, window.market_allowlist)
-                await run.feed(filtered)
-                fed_any = True
-                if started_ts is None:
-                    started_ts = filtered.ts
-                last_tick_seq = filtered.tick_seq
-                seen_markets.update(filtered.markets)
-        except Exception as exc:  # noqa: BLE001 — a mid-stream error (e.g. an httpx blip over hours).
-            # Honesty over data-loss: if ANY ticks were fed, finalize the PARTIAL run as a DEGRADE
-            # below (window_clv, NEVER true CLV — the window was cut short) so hours of sealed work
-            # are not vaporized and the interruption is EXPLICIT. ZERO ticks -> nothing to seal.
-            if not fed_any:
-                raise
-            stream_interrupted = exc
+                    # Restrict to allowlisted markets, then feed in REAL TIME (concurrency in feed()).
+                    filtered = _filter_markets(tick, window.market_allowlist)
+                    await run.feed(filtered)
+                    fed_any = True
+                    if feed_status is not None:
+                        feed_status.record_odds_record(_now(), fixture_id=filtered.fixture_id)
+                    if started_ts is None:
+                        started_ts = filtered.ts
+                    last_tick_seq = filtered.tick_seq
+                    seen_markets.update(filtered.markets)
+            except Exception as exc:  # noqa: BLE001 — a mid-stream error (e.g. an httpx blip / hours).
+                # Honesty over data-loss: if ANY ticks were fed, finalize the PARTIAL run as a DEGRADE
+                # below (window_clv, NEVER true CLV — the window was cut short) so hours of sealed work
+                # are not vaporized and the interruption is EXPLICIT. ZERO ticks -> nothing to seal.
+                if not fed_any:
+                    raise
+                stream_interrupted = exc
+    finally:
+        # The stream context has exited by ANY path — normal exhaustion, a manual/idle stop, a mid-
+        # stream Exception, OR a BaseException (asyncio.CancelledError from a cancelled live task, a
+        # KeyboardInterrupt). The live socket is no longer open, so honestly mark the feed
+        # disconnected for /feed/health. A finally (not a post-``async with`` statement) is REQUIRED:
+        # a pre-first-tick crash re-raises out of the loop, and CancelledError is a BaseException the
+        # ``except Exception`` never catches — either would otherwise skip the mark and leave the feed
+        # stuck CONNECTING (pre-tick) or FALSELY-FRESH LIVE (post-tick) until staleness.
+        if feed_status is not None:
+            feed_status.mark_disconnected()
 
     ops: dict[str, Any] = {}
     effective_window = window
