@@ -239,7 +239,12 @@ export interface ExecutionReceipt {
 
 // One row of the cockpit's canonical event stream (seq · type · payload_hash · evidence?).
 export interface CanonicalEvent {
-  seq: number;
+  seq: number; // transport competition-stream sequence (0-based, contiguous) — the LOG position, NOT the record key
+  // II-W defect 1: the sealed RunEvent.sequence_no for an evidence event (null for derived events) —
+  // veridex/competition/events.py:118. This, NOT the transport `seq`, is the key the Inspector
+  // endpoint GET /runs/{id}/actions/{seq} looks up (veridex/api/router.py:747,778), so the Inspector
+  // deep-link MUST open off `source_sequence_no` when present (fall back to `seq` only when absent).
+  source_sequence_no?: number | null;
   type: string; // AGENT_ACTION | law_recomputed | score_update | policy_result | execution_receipt | proof_anchor | ...
   payload_hash: string;
   evidence: boolean; // true = sealed evidence prefix; false = derived non-scoring tail
@@ -450,6 +455,10 @@ export interface ClvExplanation {
   // executable_edge render ONLY when this is true — fail-closed. Live wire carries no quote → false.
   real_venue_quote: boolean;
   clv_bps: number;                         // the proven skill metric (the real scored value)
+  // PENDING state (II-W defect 2): the backend emits the "pending" sentinel (clv_bps: int|str) for a
+  // valid WAIT/abstention with too little runway to score — DISTINCT from a null/unscored value ("—").
+  // When true, the screen shows an honest PENDING affordance and NEVER the (fabricated) numeric score.
+  clv_pending?: boolean;
   clv_low_sample?: boolean;                // WD-7 sample-size flag — shown (never hidden), never a score
   stake_fraction: number | null;          // Kelly/policy sizing
   plain: string;

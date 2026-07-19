@@ -170,9 +170,17 @@ async function postJson<T>(path: string, body?: unknown): Promise<T> {
 }
 
 // ---- pure coercion helpers ----
+// Anchor status is BACKEND-AUTHORITATIVE (v2.10.10 §A6): render the backend's word verbatim, never
+// a fabricated anchor. Two backend vocabularies feed this one coercion: the canonical per-surface
+// vocabulary ("anchored" / "not_anchored" / "pending" / "not_applicable" — proof/feed/competition,
+// veridex/api/schemas.py:96,308) AND the cross-run leaderboard AGGREGATE vocabulary ("all-anchored" /
+// "some-pending" / "none-anchored" — schemas.py:53, veridex/leaderboard.py:66-82). Every "not / absent
+// / unverified / unknown" word FAILS CLOSED to `not-anchored` — an absent anchor is NEVER a green one.
 function toAnchorStatus(s: string): AnchorStatus {
-  if (s === 'anchored' || s === 'pending' || s === 'not_applicable') return s;
-  return 'not-anchored';
+  if (s === 'anchored' || s === 'all-anchored') return 'anchored';
+  if (s === 'pending' || s === 'some-pending') return 'pending';
+  if (s === 'not_applicable') return 'not_applicable';
+  return 'not-anchored'; // not_anchored | none-anchored | absent | unknown ⇒ never a fabricated anchor
 }
 function toProofMode(s: string): ProofMode {
   return s === 'verified' || s === 'partial' ? s : 'reproducible';
@@ -332,9 +340,20 @@ export function adaptLeaderboard(w: W.LeaderboardResponse): LeaderboardRow[] {
     action_count: r.action_count,
     valid_pct: r.valid_pct, // PERCENT 0-100, passed through 1:1 from the wire
     proof_mode: toProofMode(r.proof_mode),
-    eligibility_badge: r.eligibility_badge === 'eligible' ? 'eligible' : 'not-eligible',
+    // eligibility is BACKEND-AUTHORITATIVE (anchor-derived server-side: fully-proven iff every run is
+    // anchored — veridex/leaderboard.py:_eligibility_badge). Read the backend `eligibility_badge`
+    // ("fully-proven" | "partially-proven" | "unproven", schemas.py:52) — NEVER re-derive from
+    // proof_mode. Only a fully-proven agent is eligible; partial/unproven fail closed to not-eligible.
+    eligibility_badge: r.eligibility_badge === 'eligible' || r.eligibility_badge === 'fully-proven' ? 'eligible' : 'not-eligible',
     anchor_status: toAnchorStatus(r.anchor_status),
-    source_mode: r.source_mode === 'live' ? 'live' : r.source_mode === 'replay' ? 'replay' : 'mixed',
+    // source_mode is the backend cross-run AGGREGATE ("all-replay" | "all-live" | "mixed" | "unknown"
+    // — schemas.py:54, veridex/leaderboard.py:_summarize_source_mode). An all-replay board renders
+    // `replay` (never a spurious `mixed`); all-live renders `live`; anything else is honestly `mixed`.
+    // Plain "replay"/"live" are also accepted so single-run/fixture rows keep mapping 1:1.
+    source_mode:
+      r.source_mode === 'live' || r.source_mode === 'all-live' ? 'live'
+      : r.source_mode === 'replay' || r.source_mode === 'all-replay' ? 'replay'
+      : 'mixed',
     // WD-7 confidence preserved faithfully (display-only, never reorders — SEC-005).
     valid_count: r.valid_count,
     clv_confidence: r.clv_confidence,
@@ -513,9 +532,21 @@ export function adaptCompetitionState(w: W.CompetitionStateResponse): CockpitSta
 }
 
 export function adaptInspector(w: W.InspectorRecord): InspectorRecord {
-  const rec = w.recompute as { recomputed_edge_bps?: number; clv_bps?: number; valid?: boolean; real_venue_quote?: boolean };
+  const rec = w.recompute as { recomputed_edge_bps?: number; clv_bps?: number | string; valid?: boolean; real_venue_quote?: boolean };
   const llm = w.untrusted_llm_metadata as { reason?: string; confidence?: number; claimed_edge_bps?: number; model?: string };
+  // PENDING CLV (defect 2): the backend emits the non-numeric "pending" sentinel for a valid
+  // WAIT/abstention — clv_bps is typed `int | str` (veridex/api/schemas.py:290; router.py:796). This
+  // is DISTINCT from the F-5/R-globalclv null/unscored path (that renders "—"): pending is "too little
+  // runway to score yet". Flag it so the screen shows an honest PENDING affordance and NEVER a
+  // fabricated 0 — the pre-fix `Number('pending') || 0` silently coerced it to a scored-looking 0 bps.
+  const clvPending = w.clv_bps === 'pending' || rec.clv_bps === 'pending';
   const clv = typeof w.clv_bps === 'number' ? w.clv_bps : Number(w.clv_bps) || 0;
+  // DETERMINISTIC vs LLM (defect 6): the backend populates untrusted_llm_metadata ONLY from an LLM
+  // action's {reason, confidence, claimed_edge_bps} params — it is the EMPTY dict {} for a
+  // deterministic agent that emits none (router.py:803-805). An empty {} is truthy in JS, so key off
+  // its CONTENTS: no keys ⇒ null (deterministic — no LLM in the provenance story), never a fabricated
+  // zero-valued LLM record.
+  const hasLlm = llm != null && Object.keys(llm).length > 0;
   return {
     run_id: w.run_id,
     agent_id: w.agent_id,
@@ -524,7 +555,10 @@ export function adaptInspector(w: W.InspectorRecord): InspectorRecord {
     is_live: false, // GAP
     market_state: w.market_state as unknown as InspectorRecord['market_state'],
     agent_action: w.agent_action as unknown as InspectorRecord['agent_action'],
-    recompute: { recomputed_edge_bps: rec.recomputed_edge_bps ?? 0, clv_bps: rec.clv_bps ?? 0, valid: rec.valid ?? false },
+    // The recompute echo is a numeric view-model field; a "pending" sentinel folds to the same coerced
+    // `clv` (0) that the pending flag above gates — the CLV explanation is the trust surface that shows
+    // PENDING, this secondary deterministic echo never presents the sentinel string as a number.
+    recompute: { recomputed_edge_bps: rec.recomputed_edge_bps ?? 0, clv_bps: typeof rec.clv_bps === 'number' ? rec.clv_bps : clv, valid: rec.valid ?? false },
     // GAP: the wire InspectorRecord carries no doctrine quantities (fair value,
     // executable edge, venue price, mispricing gap, stake) → null = honest "not in proof
     // artifact" (rendered as "—"), NOT a plausible 0. CLV (the real score) is carried through.
@@ -535,10 +569,10 @@ export function adaptInspector(w: W.InspectorRecord): InspectorRecord {
     clv_explanation: {
       fair_value_pct: null, closing_fair_value_pct: null, venue_decimal_price: null,
       mispricing_gap_bps: null, executable_edge_bps: null, real_venue_quote: rec.real_venue_quote === true,
-      clv_bps: clv, stake_fraction: null,
+      clv_bps: clv, clv_pending: clvPending, stake_fraction: null,
       plain: '',
     },
-    untrusted_llm: llm
+    untrusted_llm: hasLlm
       ? { model: llm.model ?? '', confidence: llm.confidence ?? 0, claimed_edge_bps: llm.claimed_edge_bps ?? 0, rationale: llm.reason ?? '' }
       : null,
   };

@@ -41,10 +41,14 @@ export function CanonicalEventStream({ runId, events }: { runId: string; events:
       <ul className={styles.list}>
         {events.map((event) => {
           const clickable = event.type === 'AGENT_ACTION';
+          // II-W defect 1: open the Inspector off the sealed record key (source_sequence_no), which is
+          // what GET /runs/{id}/actions/{seq} looks up — NOT the transport stream `seq`. Fall back to
+          // `seq` only for legacy/derived frames that carry no source_sequence_no.
+          const inspectorSeq = event.source_sequence_no ?? event.seq;
           return (
             <li key={event.seq} className={styles.row}>
               {clickable ? (
-                <Link href={inspectorHref(runId, event.seq)} className={`${styles.line} ${styles.clickable}`}>
+                <Link href={inspectorHref(runId, inspectorSeq)} className={`${styles.line} ${styles.clickable}`}>
                   <Cells event={event} />
                   <span className={styles.chevron} aria-hidden>›</span>
                 </Link>

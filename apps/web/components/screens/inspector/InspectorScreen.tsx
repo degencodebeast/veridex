@@ -15,6 +15,12 @@ const QLABEL = Object.fromEntries(QUANTITIES.map((q) => [q.id, q.label])) as Rec
 
 export function InspectorScreen({ record }: { record: InspectorRecord }) {
   const { clv_explanation: clv } = record;
+  // PENDING CLV (II-W defect 2): a valid WAIT/abstention with too little runway shows the honest
+  // glossary affordance, NEVER a fabricated numeric score (fmtBps(0) would read "+0.0 bps").
+  const clvText = clv.clv_pending ? GLOSSARY.clv_pending.label : fmtBps(clv.clv_bps);
+  // DETERMINISTIC vs LLM (II-W defect 6): the proposer step reflects the real provenance — a
+  // deterministic agent (no untrusted LLM metadata) is NEVER labeled "LLM proposed".
+  const proposerLabel = record.untrusted_llm ? 'LLM proposed' : 'Deterministic proposal';
   // Honest-absence: the doctrine quantities are null when not in the proof artifact —
   // render "—", never a plausible 0.0%/0.000 (no-overclaim). CLV is the real score.
   const fairValueText = clv.fair_value_pct == null || clv.closing_fair_value_pct == null
@@ -45,7 +51,7 @@ export function InspectorScreen({ record }: { record: InspectorRecord }) {
 
       <ol className={styles.story}>
         <li className={`${styles.step} ${styles.proposed}`}>
-          <span className={styles.stepNo}>1</span><span className={styles.stepLabel}>LLM proposed</span>
+          <span className={styles.stepNo}>1</span><span className={styles.stepLabel}>{proposerLabel}</span>
         </li>
         <li className={`${styles.step} ${styles.recomputed}`}>
           <span className={styles.stepNo}>2</span><span className={styles.stepLabel}>Law recomputed</span>
@@ -74,11 +80,11 @@ export function InspectorScreen({ record }: { record: InspectorRecord }) {
             {/* Mispricing Gap — prob-space dislocation; glossary-sourced label, DISTINCT from Executable Edge (never labeled "edge"). */}
             <div className={styles.qrow}><dt className={styles.qlabel}>{GLOSSARY.mispricing_gap.label} <InfoTip label={GLOSSARY.mispricing_gap.label}>{GLOSSARY.mispricing_gap.definition}</InfoTip></dt><dd className={`${styles.qval} mono`}>{mispricingGapText}</dd></div>
             <div className={styles.qrow}><dt className={styles.qlabel}>{QLABEL.executable_edge} <InfoTip label={GLOSSARY.executable_edge.label}>{GLOSSARY.executable_edge.definition}</InfoTip></dt><dd className={`${styles.qval} mono`}>{execEdgeText}</dd></div>
-            <div className={styles.qrow}><dt className={styles.qlabel}>{QLABEL.clv} <InfoTip label={GLOSSARY.clv.label}>{GLOSSARY.clv.definition}</InfoTip></dt><dd className={`${styles.qval} mono`}>{fmtBps(clv.clv_bps)}{clv.clv_low_sample ? <span className={`${styles.lowSample} mono`}> · low sample</span> : null}</dd></div>
+            <div className={styles.qrow}><dt className={styles.qlabel}>{QLABEL.clv} <InfoTip label={GLOSSARY.clv.label}>{GLOSSARY.clv.definition}</InfoTip></dt><dd className={`${styles.qval} mono`}>{clvText}{clv.clv_low_sample && !clv.clv_pending ? <span className={`${styles.lowSample} mono`}> · low sample</span> : null}</dd></div>
             <div className={styles.qrow}><dt className={styles.qlabel}>{QLABEL.stake} <InfoTip label={GLOSSARY.kelly.label}>{GLOSSARY.kelly.definition}</InfoTip></dt><dd className={`${styles.qval} mono`}>{stakeText}</dd></div>
           </dl>
           <p className={styles.clvPlain}>{clv.plain}</p>
-          <span className={`${styles.scoreChip} mono`}>SCORE = {fmtBps(clv.clv_bps)}</span>
+          <span className={`${styles.scoreChip} mono`}>SCORE = {clvText}</span>
           <p className={styles.stableNote}>{STABLE_PRICE_CAPTION}</p>
         </section>
       </div>
