@@ -60,8 +60,10 @@ export function LandingScreen() {
         <Link href="/" className={styles.navBrand}><Wordmark tag /></Link>
         <span className={styles.navSpacer} />
         <div className={styles.navLinks}>
-          <a href="#how" className={styles.navLink}>How it works</a>
-          <a href="#why" className={styles.navLink}>Why Veridex</a>
+          {/* Long-form explainer pages (the homepage keeps its short #how/#why previews below;
+              these nav links point at the dedicated public routes). */}
+          <Link href="/how-it-works" className={styles.navLink}>How it works</Link>
+          <Link href="/why-veridex" className={styles.navLink}>Why Veridex</Link>
           <a href="#prizes" className={styles.navLink}>Prizes</a>
         </div>
         <button type="button" className={styles.navWallet}>Connect Wallet</button>
