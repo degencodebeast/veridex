@@ -95,14 +95,31 @@ def _compute_content_hash(
     identity. A legacy ``pack_version == 1`` hash covers DATA FILES ONLY (unchanged semantics) — such
     packs keep loading, but their authority is not hash-bound and can never read genuine.
     """
+    file_bytes = {name: (pack_dir / name).read_bytes() for name in _manifest_filenames(fixtures)}
+    return _content_hash_from_file_bytes(file_bytes, fixtures, pack_version=pack_version, capture=capture)
+
+
+def _content_hash_from_file_bytes(
+    file_bytes: dict[str, bytes],
+    fixtures: list[dict[str, Any]],
+    *,
+    pack_version: int = 1,
+    capture: dict[str, Any] | None = None,
+) -> str:
+    """The content-hash CORE over an IN-MEMORY ``{filename: bytes}`` snapshot (see :func:`_compute_content_hash`).
+
+    Iterates the SAME canonical, duplicate-preserving filename sequence (:func:`_manifest_filenames`) as
+    the on-disk path and mixes bytes identically, so the digest is byte-for-byte equal — only the byte
+    SOURCE differs (memory vs disk). Exposed so a load can hash the EXACT bytes it parses/replays from one
+    snapshot, closing the load-vs-hash TOCTOU (a second disk read can be swapped between the two)."""
     digest = hashlib.sha256()
     for name in _manifest_filenames(fixtures):
         name_bytes = name.encode("utf-8")
-        file_bytes = (pack_dir / name).read_bytes()
+        data = file_bytes[name]
         digest.update(len(name_bytes).to_bytes(4, "big"))
         digest.update(name_bytes)
-        digest.update(len(file_bytes).to_bytes(8, "big"))
-        digest.update(file_bytes)
+        digest.update(len(data).to_bytes(8, "big"))
+        digest.update(data)
     if pack_version >= 2:
         authority_bytes = _canonical_authority_bytes(capture or {})
         digest.update(_AUTHORITY_DOMAIN_SEP)
@@ -270,6 +287,124 @@ def load_pack_venue_quotes(
         # NON-EVIDENCE marker: a recorded venue quote is never a sealed tick event.
         row["evidence"] = False
     return rows
+
+
+class PackIntegrityError(ValueError):
+    """A pack failed a LOAD-TIME integrity gate — content-hash binding or fixture->file mapping.
+
+    Carries a machine-usable ``reason`` so a caller can surface a stable code (e.g. over HTTP) without
+    string-matching the message. Subclasses :class:`ValueError` so existing ``except ValueError`` load
+    guards still fail closed.
+    """
+
+    def __init__(self, message: str, *, reason: str) -> None:
+        super().__init__(message)
+        self.reason = reason
+
+
+def load_pack_fixture_states_bound(
+    pack_dir: Path,
+    fixture_id: int,
+    *,
+    expected_content_hash: str,
+    batch_size: int = 1,
+) -> list[MarketState]:
+    """Load a fixture's ``MarketState`` tape under ONE immutable in-memory snapshot, binding the replayed
+    bytes to ``expected_content_hash`` AND the fixture->file mapping to ``fixture_id`` (fail-closed).
+
+    Closes two load-side gaps left by :func:`verify_content_hash` + :func:`load_pack_marketstates`:
+
+    * **TOCTOU** — the manifest and every referenced data file are read into memory EXACTLY ONCE; the
+      content_hash is recomputed from those in-memory bytes and the records are parsed from the SAME
+      bytes, so the bytes hashed are provably the bytes replayed (no second, swappable disk snapshot).
+    * **fixture<->file mapping** — the ``fixture_id -> records file`` mapping is NOT covered by
+      ``content_hash`` (which hashes only sorted ``(name, bytes)`` + the authority block). A hash-valid
+      ``pack.json`` that swaps two fixtures' ids would point the frozen fixture at ANOTHER fixture's
+      bytes. Every RAW record (across all referenced legs) and every NORMALIZED ``MarketState`` must
+      carry ``fixture_id``.
+
+    Args:
+        pack_dir: Directory of the self-describing ReplayPack (must contain ``pack.json``).
+        fixture_id: The FROZEN fixture the run is bound to replay.
+        expected_content_hash: The FROZEN ``content_hash`` the replayed bytes must recompute to.
+        batch_size: Records buffered per fixture before emitting a snapshot (default ``1`` — the runtime
+            default; matches :func:`load_pack_marketstates`).
+
+    Returns:
+        The frozen fixture's non-empty ``MarketState`` tape.
+
+    Raises:
+        PackIntegrityError: ``reason='content_hash_drift'`` (unreadable/malformed pack, or the recomputed
+            in-memory bytes != ``expected_content_hash``), ``reason='fixture_gone'`` (fixture absent from
+            the manifest), ``reason='fixture_mapping_mismatch'`` (a raw or normalized record belongs to a
+            different fixture — a hash-valid fixture<->file swap), or ``reason='empty_fixture'`` (the
+            frozen fixture yields no snapshots).
+    """
+    # ONE immutable in-memory snapshot: read the manifest + every hash-referenced file EXACTLY once.
+    try:
+        manifest = json.loads((pack_dir / "pack.json").read_text())
+        fixtures = manifest["fixtures"]
+        file_bytes = {name: (pack_dir / name).read_bytes() for name in _manifest_filenames(fixtures)}
+    except (OSError, json.JSONDecodeError, KeyError, TypeError) as exc:
+        raise PackIntegrityError(
+            f"unreadable or malformed pack at {pack_dir}: {exc}", reason="content_hash_drift"
+        ) from exc
+
+    # TOCTOU close: hash the EXACT in-memory bytes (not a second disk read) and bind to the frozen hash.
+    recomputed = _content_hash_from_file_bytes(
+        file_bytes,
+        fixtures,
+        pack_version=int(manifest.get("pack_version", 1)),
+        capture=manifest.get("capture", {}),
+    )
+    if recomputed != expected_content_hash:
+        raise PackIntegrityError(
+            f"recomputed content_hash for pack at {pack_dir} does not match the frozen binding — "
+            f"refusing to replay bytes that differ from the sealed identity",
+            reason="content_hash_drift",
+        )
+
+    entry = next((f for f in fixtures if int(f["fixture_id"]) == fixture_id), None)
+    if entry is None:
+        raise PackIntegrityError(
+            f"fixture_id {fixture_id} not present in pack manifest at {pack_dir}", reason="fixture_gone"
+        )
+
+    # RAW mapping guard across ALL referenced legs: the fixture->file mapping is unhashed, so a hash-valid
+    # id/file swap points the frozen fixture at another fixture's file. Every raw record that carries a
+    # ``FixtureId`` must be the frozen fixture's — fail closed on the first foreign record (parsed from the
+    # SAME in-memory snapshot that was hashed).
+    for leg in ("records", "odds_updates", "venue_quotes"):
+        name = entry.get(leg)
+        if name is None:
+            continue
+        for line in file_bytes[name].decode("utf-8").splitlines():
+            if not line:
+                continue
+            raw_fid = json.loads(line).get("FixtureId")
+            if raw_fid is not None and int(raw_fid) != fixture_id:
+                raise PackIntegrityError(
+                    f"pack at {pack_dir} maps fixture_id {fixture_id} onto a file whose records carry "
+                    f"FixtureId {int(raw_fid)} — a hash-valid fixture<->file swap",
+                    reason="fixture_mapping_mismatch",
+                )
+
+    records = [json.loads(line) for line in file_bytes[entry["records"]].decode("utf-8").splitlines() if line]
+    states = list(marketstates_from_record_stream(records, batch_size=batch_size))
+
+    # NORMALIZED mapping guard: every emitted snapshot is exactly what the run replays and seals, so each
+    # MUST belong to the frozen fixture (defence in depth over the raw guard).
+    if any(ms.fixture_id != fixture_id for ms in states):
+        raise PackIntegrityError(
+            f"pack at {pack_dir} produced normalized snapshots for a fixture other than {fixture_id}",
+            reason="fixture_mapping_mismatch",
+        )
+    if not states:
+        raise PackIntegrityError(
+            f"frozen fixture {fixture_id} in pack at {pack_dir} yields no market snapshots",
+            reason="empty_fixture",
+        )
+    return states
 
 
 def verify_content_hash(pack_dir: Path) -> bool:

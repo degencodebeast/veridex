@@ -46,8 +46,8 @@ from veridex.ingest.capture_chain import (
     read_pack_provenance,
 )
 from veridex.ingest.replay_pack import (
-    _compute_content_hash,
-    load_pack_marketstates,
+    PackIntegrityError,
+    load_pack_fixture_states_bound,
     verify_content_hash,
 )
 
@@ -650,38 +650,14 @@ def load_resolved_marketstates(
             f"frozen fixture_id {resolved.fixture_id} no longer catalogued for pack {resolved.pack_id!r}",
             reason="fixture_gone",
         )
-    pack_dir = Path(entry.pack_dir)
-    states = load_pack_marketstates(pack_dir, resolved.fixture_id, verify=True)
-    # DIRECT byte guarantee (drops the pack_dir-immutability assumption): recompute the on-disk content
-    # hash and compare it to the FROZEN ``resolved.content_hash``. The entry check above only compares
-    # CATALOG METADATA to the frozen hash, and ``verify=True`` above only proves disk SELF-consistency
-    # (recomputed == the pack's OWN manifest) — neither directly ties the REPLAYED BYTES to the frozen
-    # identity. A consistent on-disk tamper (data + manifest both rewritten) under a stale catalog entry
-    # would pass both, so assert the recomputed disk hash equals the frozen one; fail closed otherwise.
-    if _recompute_disk_content_hash(pack_dir) != resolved.content_hash:
-        raise ReplayResolutionError(
-            f"recomputed on-disk content_hash for pack {resolved.pack_id!r} does not match the frozen "
-            f"binding — refusing to replay bytes that differ from the sealed identity",
-            reason="content_hash_drift",
-        )
-    return states
-
-
-def _recompute_disk_content_hash(pack_dir: Path) -> str | None:
-    """Recompute the pack's ``content_hash`` DIRECTLY from its on-disk manifest + data files.
-
-    Mirrors :func:`~veridex.ingest.replay_pack.verify_content_hash`'s recomputation but RETURNS the
-    recomputed digest (not a self-consistency bool), so a caller can compare the ACTUAL replayed bytes
-    to a FROZEN identity rather than to the pack's own (possibly co-tampered) manifest. Returns ``None``
-    on any read/parse failure — fail-closed: an unreadable pack can never satisfy an equality check.
-    """
+    # AUTHORITATIVE byte-level load under ONE in-memory snapshot: recompute content_hash from the EXACT
+    # bytes parsed/replayed (closes the load-vs-hash TOCTOU that a second disk read leaves open) AND bind
+    # the fixture->file mapping — unhashed by content_hash — so a hash-valid pack.json fixture<->file swap
+    # can never replay a different fixture than the frozen identity. The catalog-metadata checks above are
+    # cheap first gates; this is the load-time trust boundary. Any breach maps to a fail-closed 400.
     try:
-        manifest = json.loads((pack_dir / "pack.json").read_text())
-        return _compute_content_hash(
-            pack_dir,
-            manifest["fixtures"],
-            pack_version=int(manifest.get("pack_version", 1)),
-            capture=manifest.get("capture", {}),
+        return load_pack_fixture_states_bound(
+            Path(entry.pack_dir), resolved.fixture_id, expected_content_hash=resolved.content_hash
         )
-    except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError):
-        return None
+    except PackIntegrityError as exc:
+        raise ReplayResolutionError(str(exc), reason=exc.reason) from exc

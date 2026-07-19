@@ -487,3 +487,98 @@ def test_fold_start_binding_aligns_to_persisted_authority_under_freeze_race(
     # Honesty invariant: GET never reports an identity the run did not replay. The response identity (what
     # the run replayed) MUST equal the persisted authority — not this start's local (min) resolution.
     assert start.json()["replay_binding"] == persisted
+
+
+def test_fold_m2_hash_valid_fixture_file_swap_fails_closed(tmp_path: Path) -> None:
+    # MAJOR 2: content_hash covers sorted (filename, bytes) + the authority block, but NOT the
+    # fixture->file mapping. Swapping two fixtures' ``fixture_id`` values in pack.json (records files
+    # unchanged) keeps ``verify_content_hash`` True while pointing the frozen fixture at ANOTHER
+    # fixture's records. The load must FAIL CLOSED (fixture_mapping_mismatch) rather than replay a
+    # different fixture than the sealed identity.
+    packroot = tmp_path / "packs"
+    packroot.mkdir()
+    packx = packroot / "packx"
+    shutil.copytree(SEED, packx)
+    catalog = build_catalog(str(packroot))
+    entry = catalog.snapshot()["packx"]
+    pack_dir = Path(entry.pack_dir)
+
+    fixtures = sorted(int(f["fixture_id"]) for f in _MANIFEST["fixtures"])
+    frozen, other = fixtures[0], fixtures[1]
+    resolved = ResolvedReplaySource(
+        pack_id="packx", fixture_id=frozen, content_hash=entry.content_hash, provenance="", is_genuine=False
+    )
+
+    # Swap the two entries' fixture_id VALUES (records files untouched). pack.json is not part of the
+    # content hash, so the swap is hash-valid but re-points frozen `frozen` at `other`'s records file.
+    manifest = json.loads((pack_dir / "pack.json").read_text())
+    by_fid = {int(f["fixture_id"]): f for f in manifest["fixtures"]}
+    by_fid[frozen]["fixture_id"], by_fid[other]["fixture_id"] = other, frozen
+    (pack_dir / "pack.json").write_text(json.dumps(manifest))
+    assert verify_content_hash(pack_dir)  # the swap leaves content_hash valid (mapping is unhashed)
+
+    with pytest.raises(ReplayResolutionError) as exc:
+        load_resolved_marketstates(catalog, resolved)
+    assert exc.value.reason == "fixture_mapping_mismatch"
+
+
+def test_fold_m3_toctou_swap_between_parse_and_hash_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # MAJOR 3: the post-load hash check must not hash a SECOND, independent disk snapshot. Model the
+    # TOCTOU: the admitted pack on disk is a self-consistent tampered variant (a record relabelled to
+    # fixture 999999, manifest re-hashed) while the loader PARSES it, then it is restored to the ORIGINAL
+    # bytes before any separate hash read — so a load that hashes a second read would accept the frozen
+    # hash while returning the tampered tape. A single in-memory snapshot (hash == parsed bytes) rejects it.
+    packroot = tmp_path / "packs"
+    packroot.mkdir()
+    packx = packroot / "packx"
+    shutil.copytree(SEED, packx)
+    catalog = build_catalog(str(packroot))  # entry.content_hash captured over the ORIGINAL bytes
+    entry = catalog.snapshot()["packx"]
+    pack_dir = Path(entry.pack_dir)
+    h_orig = entry.content_hash
+    resolved = ResolvedReplaySource(
+        pack_id="packx", fixture_id=SEED_MIN_FIXTURE, content_hash=h_orig, provenance="", is_genuine=False
+    )
+
+    manifest = json.loads((pack_dir / "pack.json").read_text())
+    min_entry = next(f for f in manifest["fixtures"] if int(f["fixture_id"]) == SEED_MIN_FIXTURE)
+    records_path = pack_dir / min_entry["records"]
+    pack_json_path = pack_dir / "pack.json"
+    orig_records = records_path.read_bytes()
+    orig_pack_json = pack_json_path.read_bytes()
+
+    # Write a SELF-CONSISTENT tampered variant to disk (first record -> FixtureId 999999, manifest rehashed).
+    lines = orig_records.decode("utf-8").splitlines()
+    first = json.loads(lines[0])
+    first["FixtureId"] = 999999
+    lines[0] = json.dumps(first)
+    records_path.write_text("\n".join(lines) + "\n")
+    h_tampered = _compute_content_hash(
+        pack_dir,
+        manifest["fixtures"],
+        pack_version=int(manifest.get("pack_version", 1)),
+        capture=manifest.get("capture", {}),
+    )
+    assert h_tampered != h_orig
+    manifest["content_hash"] = h_tampered
+    pack_json_path.write_text(json.dumps(manifest))
+    assert verify_content_hash(pack_dir)  # the on-disk tampered variant is self-consistent at h_tampered
+
+    import veridex.ingest.replay_pack as replay_pack_mod
+
+    real_stream = replay_pack_mod.marketstates_from_record_stream
+
+    def _restore_original_then_stream(records: Any, **kwargs: Any) -> Any:
+        # Simulate the pack being restored to its ORIGINAL bytes mid-load — after the parse read, before a
+        # separate hash read. A loader that hashes a second disk snapshot would now read the frozen hash.
+        records_path.write_bytes(orig_records)
+        pack_json_path.write_bytes(orig_pack_json)
+        return real_stream(records, **kwargs)
+
+    monkeypatch.setattr(replay_pack_mod, "marketstates_from_record_stream", _restore_original_then_stream)
+
+    with pytest.raises(ReplayResolutionError) as exc:
+        load_resolved_marketstates(catalog, resolved)
+    assert exc.value.reason == "content_hash_drift"
