@@ -101,13 +101,20 @@ async function authedRequest(path: string, buildInit: (bearer: string | null) =>
   return res;
 }
 
-async function authedFetch(path: string, body: unknown): Promise<Response> {
+async function authedFetch(
+  path: string,
+  body: unknown,
+  extraHeaders?: Record<string, string>,
+): Promise<Response> {
   return authedRequest(path, (bearer) => ({
     method: 'POST',
     headers: {
       'content-type': 'application/json',
       accept: 'application/json',
       ...(bearer ? { authorization: `Bearer ${bearer}` } : {}),
+      // Caller-supplied request headers (e.g. the deploy Idempotency-Key). Spread LAST so an
+      // explicit caller header is honest and visible — the transport never fabricates one.
+      ...(extraHeaders ?? {}),
     },
     body: JSON.stringify(body),
   }));
@@ -581,8 +588,19 @@ export class DeployPreflightError extends Error {
  * fail-closed "no token → never fires" guarantee is enforced at the UI layer by wrapping the
  * calling affordance in {@link AuthGate}, not by this function refusing to fetch.
  */
-export async function deployAgent(payload: DeployAgentPayload): Promise<DeployAgentResult> {
-  const res = await authedFetch('/agents/deploy', payload);
+export async function deployAgent(
+  payload: DeployAgentPayload,
+  idempotencyKey?: string,
+): Promise<DeployAgentResult> {
+  // The Idempotency-Key HTTP header (I-3, deploy.py) makes the deploy idempotent: same
+  // (operator_id, key) ⇒ the SAME instance. A client that reuses ONE stable key across a
+  // retry/timeout reconciles to a single instance instead of minting duplicates. Absent ⇒ the
+  // backend mints a fresh per-request key (client idempotency lost), so the caller owns the key.
+  const res = await authedFetch(
+    '/agents/deploy',
+    payload,
+    idempotencyKey ? { 'Idempotency-Key': idempotencyKey } : undefined,
+  );
   if (res.status === 422) {
     const body = (await res.json().catch(() => ({}))) as { detail?: { failed_checks?: string[]; checks?: DeployPreflightVerdict[] } };
     const detail = body.detail ?? {};

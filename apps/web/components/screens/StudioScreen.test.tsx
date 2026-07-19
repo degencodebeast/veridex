@@ -312,12 +312,14 @@ describe('StudioScreen (REQ-018 / AC-007 / SEC-006/007/009)', () => {
     const onPin = vi.fn();
     render(<StudioScreen onPin={onPin} />);
     await user.click(screen.getByRole('button', { name: /pin config & queue run/i }));
-    expect(onPin).toHaveBeenCalledTimes(1);
-    // The pin is represented as an honest affordance ("Config pinned ✓"), NOT a fabricated hash.
+    // The local pin affordance is synchronous: config is frozen ("Config pinned ✓", NOT a fabricated
+    // hash) and the baseline advances → no pending changes — independent of the async deploy outcome.
     expect(screen.getByTestId('config-pinned')).toHaveTextContent(/config pinned ✓/i);
-    // After pin, baseline advances → no pending changes
     expect(within(screen.getByTestId('config-diff')).getByText(/no pending changes/i)).toBeInTheDocument();
-    await screen.findByTestId('deploy-run-id'); // flush the async deploy state update
+    // F-2: navigation (onPin) is AWAIT-BEFORE-NAVIGATE — it fires only AFTER the deploy resolves,
+    // with the real result. So flush the deploy first, THEN assert onPin was called (exactly once).
+    await screen.findByTestId('deploy-run-id');
+    expect(onPin).toHaveBeenCalledTimes(1);
   });
 
   it('DOCTRINE: renders NO fabricated proof-flavored hash (no 0x… / config_hash / fiction hex) anywhere on Studio', async () => {

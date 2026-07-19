@@ -1,5 +1,5 @@
 'use client';
-import { useMemo, useState, type ReactNode } from 'react';
+import { useMemo, useRef, useState, type ReactNode } from 'react';
 import { SegmentedControl } from '@/components/ui/SegmentedControl';
 import { InfoTip } from '@/components/ui/InfoTip';
 import { availableModes, resolveMode, type StudioMode } from '@/lib/studio/coupling';
@@ -8,8 +8,19 @@ import { STRATEGY_TEMPLATES, COMPLEXITY_LABEL, type StrategyTemplate } from '@/l
 import { buildPreflightPreview, PREFLIGHT_DISCLAIMER } from '@/lib/studio/preflight';
 import { DEFAULT_POLICY_ENVELOPE, MM_POLICY_ENVELOPE } from '@/lib/fixtures/catalog';
 import { GLOSSARY } from '@/lib/glossary';
-import { deployAgent, DeployPreflightError, type DeployAgentPayload } from '@/lib/api';
+import { deployAgent, DeployPreflightError, type DeployAgentPayload, type DeployAgentResult } from '@/lib/api';
 import styles from './StudioScreen.module.css';
+
+// ONE stable Idempotency-Key per submit (I-3 header contract). Reused verbatim across a
+// retry/timeout so a retried deploy reconciles to the SAME instance (never a fresh key, which the
+// backend would treat as a second logical deploy). `crypto.randomUUID` is present in the browser and
+// the jsdom/Node test env; the fallback keeps this pure/total in any exotic runtime.
+function newIdempotencyKey(): string {
+  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+    return crypto.randomUUID();
+  }
+  return `idem_${Date.now().toString(36)}_${Math.random().toString(36).slice(2)}`;
+}
 
 // The QuoteGuard/MM template id — the deploy discriminator for the MM family (decision 2). Driving
 // the MM payload off the SELECTED TEMPLATE (not the archetype) is deliberate: quoteguard_mm reuses
@@ -130,7 +141,7 @@ function Section({ n, title, inactive, children }: { n: string; title: string; i
 export function StudioScreen({
   onPin = () => {},
   running = false,
-}: { onPin?: () => void; running?: boolean }) {
+}: { onPin?: (result: DeployAgentResult) => void; running?: boolean }) {
   const [archetype, setArchetype] = useState<Archetype>('value_clv');
   const [mode, setMode] = useState<StudioMode>('numeric');
   const [exec, setExec] = useState<ExecutionMode>('paper');
@@ -152,6 +163,14 @@ export function StudioScreen({
   const [runId, setRunId] = useState<string | null>(null);
   const [preflightFailure, setPreflightFailure] = useState<string[] | null>(null);
   const [deploying, setDeploying] = useState(false);
+  // The current submit's stable Idempotency-Key (I-3). Held OUTSIDE render state because it must be
+  // read/written synchronously within one submit and survive a retry without re-rendering. Cleared on
+  // any config edit (a genuinely NEW submit — reusing a key with a different config would 409) and on
+  // a successful deploy (the next submit is a new logical deploy); KEPT on failure so a retry reuses it.
+  const idempotencyKeyRef = useRef<string | null>(null);
+  function resetIdempotencyKey() {
+    idempotencyKeyRef.current = null;
+  }
 
   const modes = availableModes(archetype);
   // fu-ii5: the MM template is restricted to the fail-closed-safe modes — the source/exec selectors
@@ -164,10 +183,22 @@ export function StudioScreen({
     setArchetype(next);
     setMode((m) => resolveMode(next, m));
     setTemplateId(null);
+    resetIdempotencyKey(); // config edit ⇒ a NEW submit gets a fresh key (never reuse across configs)
   }
   function onMode(next: StudioMode) {
     setMode(resolveMode(archetype, next));
     setTemplateId(null);
+    resetIdempotencyKey();
+  }
+  // Source/exec edits are also config changes — a retry must not reuse a key minted for a different
+  // config (the backend 409s a reused key with a different fingerprint), so each edit resets it.
+  function onSource(next: SourceMode) {
+    setSource(next);
+    resetIdempotencyKey();
+  }
+  function onExec(next: ExecutionMode) {
+    setExec(next);
+    resetIdempotencyKey();
   }
   // Selecting a BUILT template applies its archetype + default mode through the existing coupling
   // (snap-back preserved) and tracks the template id as the deploy discriminator. Locked heavy
@@ -177,6 +208,7 @@ export function StudioScreen({
     setArchetype(t.archetype);
     setMode(resolveMode(t.archetype, t.defaultMode));
     setTemplateId(t.id);
+    resetIdempotencyKey(); // selecting a template rewrites the config ⇒ a new submit / fresh key
     if (t.id === MM_TEMPLATE_ID) {
       setSource('replay');
       // Default the MM card to Dry Run: replay+paper mints OPS telemetry ONLY, while replay+dry_run
@@ -194,7 +226,9 @@ export function StudioScreen({
   ].filter((e) => e.before !== e.after);
 
   async function pin() {
-    onPin();
+    // Pin the config locally (freeze the draft as the new version) — this is the local affordance,
+    // DISTINCT from the deploy outcome below. Navigation is NOT triggered here: an HONEST deploy must
+    // AWAIT the real result and navigate ONLY on success (never fire-and-forget past a failure).
     setBaseline({ archetype, mode, exec }); // applied as the new pinned version
     setPinned(true);
     // DEPLOY for real: POST the config → fail-closed preflight → pinned instance + async run_id.
@@ -202,10 +236,25 @@ export function StudioScreen({
     setDeploying(true);
     setPreflightFailure(null);
     setRunId(null);
+    // ONE stable Idempotency-Key for this submit — minted once, then reused verbatim if the submit is
+    // retried after a timeout/error (kept in the ref on failure below). A config edit or a success
+    // clears it, so a retry of the SAME config reconciles to a single instance (I-3), never a duplicate.
+    if (!idempotencyKeyRef.current) idempotencyKeyRef.current = newIdempotencyKey();
+    const idempotencyKey = idempotencyKeyRef.current;
     try {
-      const result = await deployAgent(buildDeployPayload(archetype, mode, exec, source, templateId));
+      const result = await deployAgent(
+        buildDeployPayload(archetype, mode, exec, source, templateId),
+        idempotencyKey,
+      );
+      // SUCCESS: use the REAL result — surface the run_id AND hand the resolved instance to the
+      // navigation callback so the page routes to /instances/{instance_id}. Clear the key: the next
+      // submit is a new logical deploy.
       setRunId(result.run_id);
+      resetIdempotencyKey();
+      onPin(result); // navigate ON SUCCESS ONLY, with the awaited result — never before it exists.
     } catch (err) {
+      // FAILURE: STAY on Studio and surface the named fail-closed check in place (no navigation).
+      // KEEP the Idempotency-Key so a retry of this same submit reuses it (idempotent reconcile).
       if (err instanceof DeployPreflightError) setPreflightFailure(err.failedChecks);
       else setPreflightFailure(['deploy_unavailable']);
     } finally {
@@ -319,7 +368,7 @@ export function StudioScreen({
                 <span className="mono" data-testid="source-mode-ro">{source}</span>
               ) : (
                 <SegmentedControl<SourceMode>
-                  ariaLabel="Source mode" value={source} onChange={setSource}
+                  ariaLabel="Source mode" value={source} onChange={onSource}
                   options={isMM
                     ? [{ value: 'replay', label: 'Replay' }] // MM: replay only (backend rejects live)
                     : [{ value: 'replay', label: 'Replay' }, { value: 'live', label: 'Live' }]}
@@ -341,7 +390,7 @@ export function StudioScreen({
                 <span className="mono">{exec}</span>
               ) : (
                 <SegmentedControl<ExecutionMode>
-                  ariaLabel="Execution mode" value={exec} onChange={setExec}
+                  ariaLabel="Execution mode" value={exec} onChange={onExec}
                   options={isMM
                     ? [{ value: 'paper', label: 'Paper' }, { value: 'dry_run', label: 'Dry Run' }] // MM: no live_guarded
                     : [{ value: 'paper', label: 'Paper' }, { value: 'dry_run', label: 'Dry Run' }, { value: 'live_guarded', label: 'Live Guarded' }]}
