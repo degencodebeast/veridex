@@ -587,10 +587,17 @@ def build_agentos_app(
             ``{agent_id}``, so extra agents add NO new route templates — the AC-29 native surface is
             unchanged. Each is contract-checked. Defaults to ``None`` (byte-identical to before).
         base_routers: ADDITIVE — extra ``APIRouter``s (e.g. the deploy ``/readyz`` readiness probe)
-            registered on the base app BEFORE the veridex matcher snapshot, so they are veridex-owned
-            and self-gated (they PASS the guard) rather than being treated as agno-native and DENIED.
-            They are subtracted as veridex-owned by the AC-29 contract, so they add NO agno-native
-            surface. Defaults to ``None`` (byte-identical to before).
+            registered on the base app BEFORE the veridex matcher snapshot, so they are subtracted as
+            veridex-owned by the AC-29 contract (they add NO agno-native surface). Defaults to ``None``
+            (byte-identical to before).
+
+            **SECURITY — a base router BYPASSES deny-by-default.** Because it is captured in the
+            veridex matcher snapshot, every route it declares PASSES the guard unauthenticated (the
+            guard treats veridex-owned routes as self-gated). A router passed here therefore MUST
+            either self-enforce auth via its own FastAPI ``Depends`` (like the owner-scoped wrapper
+            routes) OR be intentionally PUBLIC (like ``/readyz`` — a no-auth readiness probe exposing
+            no owner/instance/competition data). Do NOT pass a router carrying sensitive or
+            owner-scoped data without its own auth dependency — it would open an un-gated hole.
 
     Returns:
         The OUTERMOST :class:`DenyByDefaultGuard` ASGI app wrapping the composed FastAPI app.

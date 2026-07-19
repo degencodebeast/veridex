@@ -58,7 +58,7 @@ def _settings() -> Settings:
     return Settings(AUTH_MODE="privy", PRIVY_APP_ID="app", PRIVY_VERIFICATION_KEY="key")
 
 
-def _served() -> tuple[object, TestClient]:
+def _served() -> tuple[svc.DenyByDefaultGuard, TestClient]:
     """Build the SERVED app (the guard) + a TestClient, on the offline InMemory path."""
     guard = server.create_server_app(env=_ENV, settings=_settings(), verifier=_fake_verifier)
     return guard, TestClient(guard)
@@ -107,8 +107,8 @@ def test_red2_served_readyz_never_denied() -> None:
     """
     _guard, client = _served()
     status = client.get("/readyz").status_code
+    # 200/503 is the whole allowed set — it already excludes the guard's 401/403 denials.
     assert status in (200, 503), status
-    assert status not in (401, 403), status
 
 
 # --- RED#3: native surface byte-identical + no template leakage --------------
@@ -164,12 +164,17 @@ def test_red4_served_hosts_the_registered_agents() -> None:
     assert ids >= _HOSTED_IDS, ids
 
 
-def test_red4_served_native_run_route_reachable_but_gated() -> None:
-    """RED#4: the agno-native agent-run route EXISTS + an authenticated request REACHES it (403, not 404).
+def test_red4_served_native_run_route_hosted_and_gated() -> None:
+    """RED#4: the agno-native agent-run route is genuinely HOSTED on the composed app, and gated.
 
-    Reachable-but-gated (403) — NOT absent (404) — proves the run surface is genuinely hosted behind
-    the boundary, without driving a run. (Authority-bound execution stays in the deploy path.)
+    Route existence is proven DIRECTLY against the composed inner app's route table — the guard's 403
+    alone does NOT prove existence (it denies ANY authenticated non-veridex path before dispatch, so a
+    nonexistent id would 403 too). The through-guard 403 then shows the hosted run surface is auth-gated
+    (deny-by-default), never public. No run is driven.
     """
-    _guard, client = _served()
+    guard, client = _served()
+    # (a) the agno-native run route is genuinely hosted on the composed app (not an empty surface).
+    assert ("POST", "/agents/{agent_id}/runs") in set(svc._route_table(guard.app))
+    # (b) reaching it THROUGH the guard is auth-gated (deny-by-default), never public.
     resp = client.post("/agents/veridex-market-maker/runs", headers=_auth("tokenA"))
-    assert resp.status_code == 403, resp.status_code  # exists + gated (hosted), not 404 (absent)
+    assert resp.status_code == 403, resp.status_code

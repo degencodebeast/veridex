@@ -37,6 +37,7 @@ from veridex.store import InMemoryStore, PostgresStore, Store
 if TYPE_CHECKING:
     from veridex.api.auth_privy import _Verifier
     from veridex.config import Settings
+    from veridex.runtime.agentos_service import DenyByDefaultGuard
     from veridex.runtime.mm_agent_adapter import RunContext
 
 # Container binds all interfaces by default (the process is the isolation boundary).
@@ -187,7 +188,7 @@ def create_server_app(
     pool_factory: PoolFactory | None = None,
     settings: Settings | None = None,
     verifier: _Verifier | None = None,
-) -> Any:
+) -> DenyByDefaultGuard:
     """Build the public-deploy app: the deny-by-default GUARD hosting the AgentOS surface.
 
     Composes :func:`~veridex.runtime.agentos_service.build_agentos_app` INTO the served app so the
