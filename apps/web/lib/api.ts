@@ -73,6 +73,14 @@ export const PATHS = {
   // (require_principal), returns ONLY the caller's own rows, and 403/404s a non-owner.
   agentInstances: () => `/agents/instances`,
   agentInstance: (instanceId: string) => `/agents/instances/${instanceId}`,
+  // F-7 owner-scoped instance LIFECYCLE. Status is a read-only run/lease view (deploy.py:985); kill
+  // is the owner-gated exactly-once shutdown-cancel (deploy.py:1008). Both 401 anon / 403 non-owner /
+  // 404 absent before any effect. Kill additionally 409s a run that was never minted / is not live.
+  instanceStatus: (instanceId: string) => `/agents/instances/${instanceId}/status`,
+  instanceKill: (instanceId: string) => `/agents/instances/${instanceId}/kill`,
+  // F-7 "Disable execution" maps to the competition policy-envelope kill-switch (router.py:1654):
+  // ENGAGE-ONLY + idempotent (SAF-004) — it SETS the stop True and can never re-open trading.
+  competitionKillSwitch: (competitionId: string) => `/competitions/${competitionId}/kill-switch`,
 } as const;
 
 export class ApiError extends Error {
@@ -779,6 +787,75 @@ export async function getInstance(instanceId: string): Promise<DeployedInstance>
   const res = await authedGet(PATHS.agentInstance(instanceId));
   if (!res.ok) throw new ApiError(res.status, `GET ${PATHS.agentInstance(instanceId)} failed: ${res.status}`);
   return adaptAgentInstance((await res.json()) as AgentInstanceWire);
+}
+
+// ---- Owner-scoped instance lifecycle (II-6 · F-7) ----
+//
+// The control-plane WRITE surface for the Agent Ops drawer: read a deployed instance's authoritative
+// run/lease status, engage the owner-gated exactly-once kill, and (for "Disable execution") engage a
+// competition's kill-switch. All owner-scoped through the SAME bearer + 401-retry seam as deployAgent
+// / getInstances (never fabricates a bearer; never silently eats a 401). No mock branch: these are
+// real control-plane mutations — the drawer's demo path is gated at the hook (isMockEnabled) so a
+// kill is NEVER faked, and these readers stay dumb, honest transports that only ever hit the API.
+// There is deliberately NO pauseInstance: the runtime has no pause/resume endpoint (shutdown-cancel
+// only — deploy.py CON-2D-701), so the drawer keeps Pause/Resume honestly disabled instead of faking.
+
+/** Owner-scoped run/lease status for a deployed instance (mirrors backend InstanceStatusResponse). */
+export interface InstanceStatus {
+  instance_id: string;
+  run_id: string;
+  // HEADLINE run/lease state: running | cancelled | sealed | failed | pending. Reflects an engaged
+  // owner kill as `cancelled` (durable across the run settling) — carried through VERBATIM.
+  run_state: string;
+  killed: boolean; // whether an owner kill engaged the exactly-once cancel for this run
+  status: string; // the DURABLE DeployStatus record value (pending | running | sealed | failed)
+  lease_status: string | null;
+}
+
+/** Result of an owner kill (mirrors backend KillResponse). */
+export interface KillResult {
+  instance_id: string;
+  run_id: string;
+  phase: string; // RunPhase after this call: active | cancelling | completed | failed | cancelled
+  engaged: boolean; // true ONLY for the single caller that engaged the exactly-once cancel
+}
+
+/** Result of a competition kill-switch engage (mirrors backend KillSwitchResponse). */
+export interface KillSwitchResult {
+  competition_id: string;
+  kill_switch: boolean; // always true post-engage (engage-only, SAF-004)
+  status: string; // "kill_switch_on" | "kill_switch_off"
+}
+
+// GET /agents/instances/{id}/status — the caller's OWN run/lease status. A non-ok (401/403/404/5xx)
+// THROWS ApiError so the drawer renders an honest unauthorized/not-found/error state, never a
+// fabricated status. The drawer refetches this after a kill to reflect the resulting terminal state.
+export async function getInstanceStatus(instanceId: string): Promise<InstanceStatus> {
+  const path = PATHS.instanceStatus(instanceId);
+  const res = await authedGet(path);
+  if (!res.ok) throw new ApiError(res.status, `GET ${path} failed: ${res.status}`);
+  return (await res.json()) as InstanceStatus;
+}
+
+// POST /agents/instances/{id}/kill — engage the owner-gated exactly-once shutdown-cancel (no body).
+// A non-ok THROWS: 403 owned-by-another, 404 absent/unowned, 409 no active run / not live — so a
+// failed kill surfaces VISIBLY and is NEVER shown as a success. The 200 body names the resulting
+// RunPhase + whether THIS caller engaged the cancel (a repeat kill returns engaged=false).
+export async function killInstance(instanceId: string): Promise<KillResult> {
+  const path = PATHS.instanceKill(instanceId);
+  const res = await authedFetch(path, undefined); // POST, no body (kill takes no request payload)
+  if (!res.ok) throw new ApiError(res.status, `POST ${path} failed: ${res.status}`);
+  return (await res.json()) as KillResult;
+}
+
+// POST /competitions/{id}/kill-switch — ENGAGE (never toggle) the competition's kill-switch (no
+// body). Engage-only + idempotent (SAF-004): the first engage stops trading; a retry keeps it
+// engaged and re-opens nothing. A non-ok THROWS (401/403/404) so a failed engage surfaces visibly.
+export async function armCompetitionKillSwitch(competitionId: string): Promise<KillSwitchResult> {
+  const path = PATHS.competitionKillSwitch(competitionId);
+  const res = await authedFetch(path, undefined); // POST, no body
+  if (!res.ok) throw new ApiError(res.status, `POST ${path} failed: ${res.status}`);
+  return (await res.json()) as KillSwitchResult;
 }
 
 // MOCK status-bar seed (sync): when mock is on, the status bar populates app-wide from the mock

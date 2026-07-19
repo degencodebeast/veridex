@@ -4,6 +4,7 @@ import { Badge } from '@/components/ui/Badge';
 import { SegmentedControl } from '@/components/ui/SegmentedControl';
 import { isCanonicalChannel } from '@/lib/catalog';
 import { useRuntimeEvents, type AgentOpsState } from './useAgentOps';
+import { useLifecycle, type LifecycleState } from './useLifecycle';
 import type { CanonicalLogLine, LogChannel, RuntimeOverview, RuntimeStatus } from '@/lib/catalog';
 import styles from './AgentOpsDrawer.module.css';
 
@@ -15,8 +16,6 @@ const STATUS_BADGE: Record<RuntimeStatus, 'live' | 'pending' | 'invalid' | 'vali
 };
 const dash = (v: number | null) => (v == null ? '—' : String(v));
 
-const LIFECYCLE = ['Pause', 'Resume', 'Kill', 'Rotate creds', 'Disable execution'];
-
 function OverviewTab({ o }: { o: RuntimeOverview }) {
   return (
     <div className={styles.overview} data-testid="ops-overview">
@@ -27,10 +26,86 @@ function OverviewTab({ o }: { o: RuntimeOverview }) {
       <div className={styles.kv}><span>Last action</span><span className="mono">{o.last_action ?? '—'}</span></div>
       <div className={styles.kv}><span>Schema valid</span><span className="mono">{o.schema_valid == null ? '—' : String(o.schema_valid)}</span></div>
       <div className={styles.kv}><span>Errors / retries / tools</span><span className="mono">{o.errors} / {o.retries} / {o.tool_calls}</span></div>
-      <div className={styles.controls} aria-disabled="true">
-        {LIFECYCLE.map((c) => <button key={c} type="button" className={styles.ctl} disabled>{c}</button>)}
+    </div>
+  );
+}
+
+// F-7: the OWNER-SCOPED lifecycle control-plane region. A confirm dialog gates the destructive
+// action; the POST only fires on confirm and the drawer then reflects the AUTHORITATIVE resulting
+// run state (never a locally-assumed terminal). Kill / Disable-execution are enabled ONLY for an
+// owned, RUNNING instance — a non-owner / non-running / demo state leaves them disabled (no POST
+// possible). Pause/Resume/Rotate-creds have NO backend endpoint (the runtime is shutdown-cancel
+// only), so they stay honestly disabled rather than fake an action.
+type PendingAction = 'kill' | 'disable-execution' | null;
+
+const CONFIRM_COPY: Record<'kill' | 'disable-execution', { title: string; body: string; cta: string }> = {
+  kill: {
+    title: 'Kill this run?',
+    body: 'This terminates the live run through the owner-gated shutdown-cancel. It is audited and never edits scored evidence. This cannot be undone here.',
+    cta: 'Kill run',
+  },
+  'disable-execution': {
+    title: 'Disable execution?',
+    body: 'This engages the competition kill-switch and stops all trading. It is engage-only — re-arming is a separate, reconciled operation.',
+    cta: 'Disable execution',
+  },
+};
+
+function ConfirmDialog({
+  action, busy, onConfirm, onCancel,
+}: { action: 'kill' | 'disable-execution'; busy: boolean; onConfirm: () => void; onCancel: () => void }) {
+  const copy = CONFIRM_COPY[action];
+  return (
+    <div className={styles.confirmScrim} onClick={onCancel}>
+      <div
+        className={styles.confirmBox}
+        role="alertdialog"
+        aria-modal="true"
+        aria-labelledby="lifecycle-confirm-title"
+        aria-describedby="lifecycle-confirm-body"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <p id="lifecycle-confirm-title" className={styles.confirmTitle}>{copy.title}</p>
+        <p id="lifecycle-confirm-body" className={styles.confirmBody}>{copy.body}</p>
+        <div className={styles.confirmActions}>
+          <button type="button" className={styles.confirmCancel} onClick={onCancel} disabled={busy}>Cancel</button>
+          <button type="button" className={styles.confirmDanger} onClick={onConfirm} disabled={busy}>{copy.cta}</button>
+        </div>
       </div>
-      <p className={styles.audit}>Control-plane wiring lands in a later phase. When wired, lifecycle actions will be audited and will never edit scored evidence.</p>
+    </div>
+  );
+}
+
+function LifecycleControls({ lifecycle }: { lifecycle: LifecycleState }) {
+  const [pending, setPending] = useState<PendingAction>(null);
+  const { killable, canDisableExecution, busy, error, status, executionDisabled } = lifecycle;
+
+  const confirm = async () => {
+    const action = pending;
+    setPending(null);
+    if (action === 'kill') await lifecycle.kill();
+    else if (action === 'disable-execution') await lifecycle.disableExecution();
+  };
+
+  return (
+    <div className={styles.lifecycle}>
+      <div className={styles.controls}>
+        <button type="button" className={styles.ctl} disabled={!killable} onClick={() => setPending('kill')}>Kill</button>
+        <button type="button" className={styles.ctl} disabled={!canDisableExecution} onClick={() => setPending('disable-execution')}>Disable execution</button>
+        <button type="button" className={styles.ctl} disabled title="No pause endpoint — the runtime supports shutdown-cancel only.">Pause</button>
+        <button type="button" className={styles.ctl} disabled title="No resume endpoint — the runtime supports shutdown-cancel only.">Resume</button>
+        <button type="button" className={styles.ctl} disabled title="Credential rotation is not available from this drawer.">Rotate creds</button>
+      </div>
+      {status && (
+        <p className={styles.runState}>
+          Run state <span className="mono" data-testid="lifecycle-run-state">{status.run_state}</span>
+        </p>
+      )}
+      {executionDisabled && <p className={styles.runState}>Execution kill-switch <span className="mono">engaged</span></p>}
+      {error && <p role="alert" className={styles.ctlError}>Lifecycle action failed: {error}</p>}
+      <p className={styles.audit}>Lifecycle actions are audited and never edit scored evidence.</p>
+      <p className={styles.note}>Pause/Resume and credential rotation are not available in this runtime — shutdown-cancel only.</p>
+      {pending && <ConfirmDialog action={pending} busy={busy} onConfirm={confirm} onCancel={() => setPending(null)} />}
     </div>
   );
 }
@@ -70,8 +145,16 @@ function LogsTab({ log, error }: { log: CanonicalLogLine[]; error: string | null
 }
 
 export function AgentOpsDrawer({
-  state, overviewByAgent, log: logProp,
-}: { state: AgentOpsState; overviewByAgent?: Record<string, RuntimeOverview>; log?: CanonicalLogLine[] }) {
+  state, overviewByAgent, log: logProp, competitionId,
+}: {
+  state: AgentOpsState;
+  overviewByAgent?: Record<string, RuntimeOverview>;
+  log?: CanonicalLogLine[];
+  // F-7: the competition this runtime belongs to, if the caller knows it. Present ⇒ "Disable
+  // execution" wires to that competition's kill-switch; absent ⇒ the button stays honestly disabled
+  // (the drawer never fabricates a competition id). Existing call sites don't pass it yet.
+  competitionId?: string;
+}) {
   const [tab, setTab] = useState<Tab>('overview');
   const panelRef = useRef<HTMLElement>(null);
   const { isOpen, close } = state;
@@ -80,6 +163,9 @@ export function AgentOpsDrawer({
   // `log` to render controlled data (tests, or a future merged competition-event feed); those
   // OVERRIDE the live hook. Fixtures are gone from the default path (T-2).
   const live = useRuntimeEvents(state.agentId);
+  // F-7: the SEPARATE lifecycle control-plane concern (owner-scoped kill/status + disable-execution).
+  // Distinct from F-6's poll loop — it resolves the owned instance once and acts on demand.
+  const lifecycle = useLifecycle(state.agentId, competitionId);
 
   // Modal semantics (WalletChip keydown pattern): focus into the dialog on open, Escape closes,
   // and focus is restored to the trigger on close. Listener is cleaned up to avoid leaks.
@@ -123,9 +209,16 @@ export function AgentOpsDrawer({
         </div>
         <div className={styles.body} id={panelId} role="tabpanel" aria-labelledby={activeTabId}>
           {tab === 'overview'
-            ? (overview
-                ? <OverviewTab o={overview} />
-                : <p className={styles.empty}>{live.error ? 'Runtime telemetry unavailable.' : 'No runtime data for this agent.'}</p>)
+            ? (
+              <>
+                {overview
+                  ? <OverviewTab o={overview} />
+                  : <p className={styles.empty}>{live.error ? 'Runtime telemetry unavailable.' : 'No runtime data for this agent.'}</p>}
+                {/* F-7: lifecycle controls render independent of the telemetry-derived overview —
+                    they are gated by the authoritative instance status, not by whether events exist. */}
+                <LifecycleControls lifecycle={lifecycle} />
+              </>
+            )
             : <LogsTab log={log} error={live.error} />}
         </div>
       </aside>
