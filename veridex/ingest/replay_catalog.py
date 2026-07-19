@@ -270,14 +270,13 @@ class ReplayCatalog:
 
         # Immutable publication: take ownership of the bytes, then verify the OWNED copy (stage → verify →
         # admit), so the admitted entry's bytes are byte-independent of the mutable source (MAJOR-2).
-        owned_dir = self._take_ownership(pack_dir)
-        entry = _build_verified_entry(owned_dir)
+        entry = self._own_and_verify(pack_dir)
         if entry is None:
-            self._discard_owned(owned_dir)
             raise CatalogVerificationError(
                 f"refusing to register pack at {pack_dir}: content_hash verification failed "
                 "(tampered, corrupt, or malformed) — unverified packs are never promoted"
             )
+        owned_dir = entry.pack_dir
 
         with self._lock:
             # Boundary guard (under the lock so the decision reflects the live catalog): a runtime
@@ -293,6 +292,11 @@ class ReplayCatalog:
                 )
             # Copy-on-write: build a fresh mapping and swap the reference atomically. Never mutate the
             # existing dict in place, so lock-free readers never observe a half-updated catalog.
+            # TODO(bounded-growth): on a REFRESH (re-registered pack_id) the SUPERSEDED owned copy is
+            # intentionally NOT deleted here — a lock-free reader may still hold the old entry and be
+            # reading its bytes. Superseded copies are reclaimed when the catalog is garbage-collected
+            # (the weakref.finalize on _published_root). This trades bounded in-process disk growth for
+            # in-flight-reader safety; a generational sweep could reclaim sooner if it ever matters.
             updated = dict(self._entries)
             updated[entry.pack_id] = entry
             self._entries = updated
@@ -333,29 +337,78 @@ class ReplayCatalog:
                 f"{self._capture_root} (a sibling path or symlink-escape is refused, fail-closed)"
             )
 
+    def _own_and_verify(self, source_dir: Path) -> CatalogEntry | None:
+        """Take ownership of ``source_dir`` and verify the OWNED copy; return its entry, else ``None``.
+
+        The shared immutable-publication core of both the runtime promote path (:meth:`register_pack`)
+        and the startup capture-root fold (:meth:`_fold_capture_root_at_startup`): stage an owned copy,
+        verify THAT copy, and return an entry pointing at it. Any verification miss (``None``) OR a raise
+        while verifying discards the staged copy, so a rejected/erroring admission never leaks a temp dir.
+        """
+        owned_dir = self._take_ownership(source_dir)
+        try:
+            entry = _build_verified_entry(owned_dir)
+        except BaseException:
+            self._discard_owned(owned_dir)
+            raise
+        if entry is None:
+            self._discard_owned(owned_dir)
+            return None
+        return entry
+
     def _take_ownership(self, source_dir: Path) -> Path:
         """Copy ``source_dir`` into a catalog-OWNED directory and return the owned copy (MAJOR-2).
 
-        Each registration lands in a fresh unique version directory under the catalog's publication
-        root, so a re-registration never overwrites (or deletes) the bytes an in-flight reader may still
-        hold. The publication root is created lazily under the system temp dir and rmtree'd when this
-        catalog is garbage-collected. The owned copy keeps the source leaf name so ``pack_id`` is stable.
+        Each admission lands in a fresh unique version directory under the catalog's publication root, so
+        a re-registration never overwrites (or deletes) the bytes an in-flight reader may still hold. The
+        publication root is created lazily under the system temp dir and rmtree'd when this catalog is
+        garbage-collected. The owned copy keeps the source leaf name so ``pack_id`` is stable.
         """
+        # Double-checked lazy init under the lock: two concurrent first admissions must not each mkdtemp
+        # (which would orphan one publication root and leak it past GC of the losing reference).
         if self._published_root is None:
-            root = Path(tempfile.mkdtemp(prefix="veridex-replay-published-"))
-            self._published_root = root
-            # Best-effort cleanup of the owned copies when the catalog is collected (never at import).
-            weakref.finalize(self, shutil.rmtree, str(root), ignore_errors=True)
+            with self._lock:
+                if self._published_root is None:
+                    root = Path(tempfile.mkdtemp(prefix="veridex-replay-published-"))
+                    # Best-effort cleanup of the owned copies when the catalog is collected (never at import).
+                    weakref.finalize(self, shutil.rmtree, str(root), ignore_errors=True)
+                    self._published_root = root
         version_dir = self._published_root / uuid.uuid4().hex
         version_dir.mkdir()
-        owned = version_dir / source_dir.name
-        shutil.copytree(source_dir, owned)
+        try:
+            owned = version_dir / source_dir.name
+            shutil.copytree(source_dir, owned)
+        except BaseException:
+            # A partial/failed copytree must not leave an orphaned version dir behind (temp-dir hygiene).
+            shutil.rmtree(version_dir, ignore_errors=True)
+            raise
         return owned
 
     @staticmethod
     def _discard_owned(owned_dir: Path) -> None:
         """Remove an owned copy (and its unique version dir) that was staged but never admitted."""
         shutil.rmtree(owned_dir.parent, ignore_errors=True)
+
+    def _fold_capture_root_at_startup(self, capture_root: Path) -> None:
+        """Fold previously-captured packs under the WRITABLE capture root into the catalog at STARTUP.
+
+        Symmetric with :meth:`register_pack`'s immutable publication (MAJOR-2): each capture-root pack is
+        served from a catalog-OWNED copy, so a later mutation of the writable capture volume cannot affect
+        the served pack (a promoted pack rediscovered after a restart must not revert to a mutable-source
+        reference). CURATED seeds already loaded WIN on a ``pack_id`` collision and are NEVER copied — the
+        curated seed is the trusted, canonically-:ro-mounted seed and keeps pointing at the curated dir.
+
+        Runs during construction (single-threaded, before the catalog is published to any reader), so it
+        mutates ``self._entries`` in place rather than via copy-on-write.
+        """
+        for source_dir in _iter_pack_dirs(capture_root):
+            # Curated (or an earlier capture) seed wins the pack_id — skip BEFORE copying so a colliding
+            # capture pack never costs an owned-copy write.
+            if source_dir.name in self._entries:
+                continue
+            entry = self._own_and_verify(source_dir)
+            if entry is not None:
+                self._entries[entry.pack_id] = entry
 
     def _resolves_under_curated(self, path: Path) -> bool:
         """Return ``True`` iff ``path`` is the curated root itself or lives beneath it (boundary test)."""
@@ -398,17 +451,19 @@ def build_catalog(
     curated = Path(curated_root) if curated_root else None
     capture = Path(capture_root) if capture_root else None
 
+    # Curated seeds are catalogued in place — they stay pointing at the READ-ONLY curated root (the
+    # canonically-:ro-mounted trusted seed) and are NEVER copied (no per-startup ~600KB duplication).
     entries: dict[str, CatalogEntry] = {}
     if curated is not None:
         for pack_dir in _iter_pack_dirs(curated):
             entry = _build_verified_entry(pack_dir)
             if entry is not None:
                 entries[entry.pack_id] = entry
-    if capture is not None:
-        for pack_dir in _iter_pack_dirs(capture):
-            entry = _build_verified_entry(pack_dir)
-            if entry is not None:
-                # Curated seed wins on collision — a writable-root pack never shadows a trusted seed.
-                entries.setdefault(entry.pack_id, entry)
 
-    return ReplayCatalog(entries, curated_root=curated, capture_root=capture)
+    catalog = ReplayCatalog(entries, curated_root=curated, capture_root=capture)
+    # WRITABLE capture-root packs are folded in through the OWNING path (immutable publication, MAJOR-2),
+    # symmetric with register_pack — a captured pack rediscovered after a restart is served from a
+    # catalog-owned copy, never a mutable capture-volume reference. Curated seeds win on collision.
+    if capture is not None:
+        catalog._fold_capture_root_at_startup(capture)
+    return catalog

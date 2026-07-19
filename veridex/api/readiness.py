@@ -41,12 +41,17 @@ import json
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from fastapi import APIRouter
 from fastapi.responses import JSONResponse
 
 from veridex.ingest.replay_pack import load_pack_marketstates
+
+if TYPE_CHECKING:
+    # Type-only (no runtime import cycle: replay_catalog never imports readiness). ``from __future__
+    # import annotations`` keeps the annotation a string, so this costs nothing at runtime.
+    from veridex.ingest.replay_catalog import CatalogEntry
 
 #: A single readiness check: an async, argument-free callable returning ``True`` when its subsystem
 #: is ready. Raising is permitted and is treated as not-ready (fail-closed) by :func:`check_readiness`.
@@ -293,7 +298,7 @@ def make_replay_pack_probe(pack_root: str | Path) -> ReadinessProbe:
     return probe
 
 
-def _entry_loadable_with_admitted_hash(entry: Any) -> bool:
+def _entry_loadable_with_admitted_hash(entry: CatalogEntry) -> bool:
     """Return ``True`` iff a catalogued entry is still loadable AT ITS EXACT ADMITTED HASH (fail-closed).
 
     Two gates, both fail-closed: (1) the pack's CURRENT stored ``content_hash`` must equal the hash the

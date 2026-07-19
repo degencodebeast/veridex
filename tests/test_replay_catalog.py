@@ -457,3 +457,38 @@ def test_m2_registered_pack_is_immutable_to_source_mutation(tmp_path: Path) -> N
     assert verify_content_hash(served.pack_dir) is True  # immune to the source mutation
     assert is_genuine_pack(served.pack_dir) is True
     assert served.is_genuine is True
+
+
+def test_m2_startup_folded_capture_pack_is_immutable_but_curated_is_not_copied(tmp_path: Path) -> None:
+    """Symmetry residual: a CAPTURE-root pack folded at STARTUP (build_catalog) must be served from a
+    catalog-OWNED immutable copy too — NOT a mutable capture-volume reference (else a promoted pack
+    reverts to the M2-vulnerable class after a restart). The CURATED seed must NOT be copied (it stays
+    pointing under its canonically-:ro curated root — no per-startup ~600KB copy)."""
+    curated = tmp_path / "curated"
+    curated.mkdir()
+    seed_src = _copy_real_pack(curated / "seed_real")  # a genuine CURATED seed
+    capture = tmp_path / "capture"
+    capture.mkdir()
+    cap_source = _copy_real_pack(capture / "promoted")  # a genuine pack persisted on the capture volume
+
+    catalog = build_catalog(curated, capture_root=capture)
+
+    # The CAPTURE-root pack is served from an OWNED copy (not the mutable capture source).
+    promoted = catalog.get("promoted")
+    assert promoted is not None and promoted.is_genuine is True
+    assert promoted.pack_dir.resolve() != cap_source.resolve()
+    assert capture.resolve() not in promoted.pack_dir.resolve().parents
+
+    # The CURATED seed is NOT copied — its entry still resolves under the curated root.
+    seed = catalog.get("seed_real")
+    assert seed is not None
+    assert seed.pack_dir.resolve() == seed_src.resolve()
+    assert curated.resolve() in seed.pack_dir.resolve().parents
+
+    # Mutate the capture-volume SOURCE after startup -> the served pack is immune (owned copy).
+    _tamper_data_file(cap_source)
+    assert verify_content_hash(cap_source) is False
+    served = catalog.get("promoted")
+    assert verify_content_hash(served.pack_dir) is True
+    assert is_genuine_pack(served.pack_dir) is True
+    assert served.is_genuine is True
