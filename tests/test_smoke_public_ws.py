@@ -7,13 +7,18 @@ import importlib.util
 import json
 import subprocess
 import sys
+import time
 from pathlib import Path
 from types import ModuleType
 from typing import Any
 
+import pytest
+
 ROOT = Path(__file__).resolve().parents[1]
 CLIENT = ROOT / "scripts" / "smoke_public_ws.py"
 SMOKE = ROOT / "scripts" / "smoke_public.sh"
+MAX_HTTP_RESPONSE_BYTES = 1024 * 1024
+MAX_CANONICAL_EVENTS = 10_000
 
 
 def _load_client() -> ModuleType:
@@ -55,13 +60,13 @@ async def test_public_ws_smoke_reconnects_with_exact_exclusive_tail() -> None:
     sockets = [_FakeSocket(canonical[:1]), _FakeSocket(canonical[1:])]
 
     async def fetch_events(url: str, timeout: float) -> list[dict[str, Any]]:
-        assert timeout == 2
+        assert 0 < timeout <= 2
         requested_rest_urls.append(url)
         return canonical
 
     def connect_factory(url: str, **options: object) -> _FakeConnection:
-        assert options["open_timeout"] == 2
-        assert options["close_timeout"] == 2
+        assert 0 < options["open_timeout"] <= 2
+        assert 0 < options["close_timeout"] <= 2
         connected_ws_urls.append(url)
         return _FakeConnection(sockets.pop(0))
 
@@ -81,6 +86,85 @@ async def test_public_ws_smoke_reconnects_with_exact_exclusive_tail() -> None:
     ]
     assert result.first_seq == 1
     assert result.replayed_seqs == (2, 3)
+
+
+async def test_public_ws_smoke_uses_one_global_deadline() -> None:
+    module = _load_client()
+    canonical = [{"seq": seq} for seq in (1, 2, 3)]
+
+    async def fetch_events(_url: str, _timeout: float) -> list[dict[str, Any]]:
+        await asyncio.sleep(0.02)
+        return canonical
+
+    class _DelayedSocket(_FakeSocket):
+        async def recv(self) -> str:
+            await asyncio.sleep(0.02)
+            return await super().recv()
+
+    sockets = [_DelayedSocket(canonical[:1]), _DelayedSocket(canonical[1:])]
+
+    def connect_factory(_url: str, **_options: object) -> _FakeConnection:
+        return _FakeConnection(sockets.pop(0))
+
+    with pytest.raises(TimeoutError):
+        await module.run_public_ws_smoke(
+            "https://arena.example.test",
+            "c_deadline",
+            timeout=0.05,
+            quiet_timeout=0.001,
+            fetch_events=fetch_events,
+            connect_factory=connect_factory,
+        )
+
+
+class _FakeHttpResponse:
+    status = 200
+
+    def __init__(self, read) -> None:
+        self.read = read
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        return None
+
+
+async def test_http_body_read_obeys_timeout(monkeypatch) -> None:
+    module = _load_client()
+
+    def slow_read(_size: int = -1) -> bytes:
+        time.sleep(0.1)
+        return b"[]"
+
+    monkeypatch.setattr(module, "urlopen", lambda *_args, **_kwargs: _FakeHttpResponse(slow_read))
+    started = asyncio.get_running_loop().time()
+    with pytest.raises(TimeoutError):
+        await module._fetch_events("https://arena.example.test/events", timeout=0.02)
+    assert asyncio.get_running_loop().time() - started < 0.08
+
+
+async def test_http_body_read_rejects_oversize_response(monkeypatch) -> None:
+    module = _load_client()
+
+    def oversize_when_bounded(size: int = -1) -> bytes:
+        if size < 0:
+            return b"[]"
+        return b" " * size
+
+    response = _FakeHttpResponse(oversize_when_bounded)
+    monkeypatch.setattr(module, "urlopen", lambda *_args, **_kwargs: response)
+
+    with pytest.raises(module.SmokeError, match="response-size bound"):
+        await module._fetch_events("https://arena.example.test/events", timeout=1)
+
+
+def test_canonical_event_count_is_bounded() -> None:
+    module = _load_client()
+    events = [{"seq": seq} for seq in range(1, MAX_CANONICAL_EVENTS + 2)]
+
+    with pytest.raises(module.SmokeError, match="event-count bound"):
+        module._validate_canonical(events)
 
 
 def test_default_transport_needs_no_undeclared_websocket_package(monkeypatch) -> None:

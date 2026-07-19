@@ -19,6 +19,7 @@ import asyncio
 import contextlib
 
 import pytest
+from fastapi import WebSocketDisconnect
 from fastapi.testclient import TestClient
 
 from veridex.api.router import create_app
@@ -118,6 +119,31 @@ class _RaisingArenaWebSocket:
         await self._send_attempted.wait()
         await asyncio.sleep(0)  # let the forwarder finish failing before teardown
         return {"type": "websocket.disconnect"}
+
+
+class _BlockedReceiveRaisingWebSocket:
+    """Fake whose receive never finishes while its first live send terminates."""
+
+    def __init__(self, exc: Exception) -> None:
+        self._exc = exc
+        self.accepted = False
+        self.send_attempted = asyncio.Event()
+        self.receive_cancelled = asyncio.Event()
+
+    async def accept(self) -> None:
+        self.accepted = True
+
+    async def send_json(self, data: dict) -> None:
+        del data
+        self.send_attempted.set()
+        raise self._exc
+
+    async def receive(self) -> dict:
+        try:
+            await asyncio.Event().wait()
+        finally:
+            self.receive_cancelled.set()
+        raise AssertionError("unreachable")
 
 
 class _ControlledArenaWebSocket:
@@ -418,3 +444,31 @@ async def test_route_cleanup_runs_even_if_forwarder_raises() -> None:
 
     assert cid not in manager._clients  # queue removed despite the raise — no leak
     assert ws.accepted is True
+
+
+@pytest.mark.parametrize(
+    "send_error",
+    [RuntimeError("socket closed"), WebSocketDisconnect(code=1006)],
+    ids=["runtime-error", "websocket-disconnect"],
+)
+async def test_route_finishes_when_live_send_terminates_with_receive_blocked(send_error: Exception) -> None:
+    """A terminal live sender wakes the blocked receive path and unregisters its queue."""
+    store = InMemoryStore()
+    manager = ArenaConnectionManager()
+    cid = "c_send_terminal"
+    ws = _BlockedReceiveRaisingWebSocket(send_error)
+    task = asyncio.create_task(_run_arena(ws, store=store, manager=manager, competition_id=cid, since_seq=0))
+
+    try:
+        await _wait_until(lambda: cid in manager._clients)
+        await manager.broadcast(cid, _make_event(cid, seq=1))
+        await asyncio.wait_for(ws.send_attempted.wait(), timeout=1)
+        await asyncio.wait_for(task, timeout=0.1)
+    finally:
+        if not task.done():
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+
+    assert ws.receive_cancelled.is_set()
+    assert cid not in manager._clients
