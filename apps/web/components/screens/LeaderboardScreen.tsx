@@ -93,7 +93,7 @@ export function LeaderboardScreen({
                       </Link>
                     </td>
                     <td className={styles.num}>{r.runs}</td>
-                    <td className={styles.num} data-testid="lb-clv"><Num value={r.avg_clv_bps} kind="bps" /></td>
+                    <td className={styles.num} data-testid="lb-clv">{r.avg_clv_bps === null ? '—' : <Num value={r.avg_clv_bps} kind="bps" />}</td>
                     <td className={styles.num}><Num value={r.total_clv_bps} kind="bps" /></td>
                     {/* The cross-run board always carries these proxy metrics; the `— ` guards are
                         defensive for the shared LeaderboardRow whose competition variant omits them. */}

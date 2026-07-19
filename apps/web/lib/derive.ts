@@ -4,7 +4,9 @@ import type { LeaderboardRow, ProofMode } from '@/lib/contracts';
 // NEVER consulted here — they are display-derived and must not reorder the board.
 export function rankByAvgClv(rows: LeaderboardRow[]): LeaderboardRow[] {
   return [...rows]
-    .sort((a, b) => b.avg_clv_bps - a.avg_clv_bps)
+    // null (unscored) sorts last — mirrors the backend's None → -inf ranking; identical order for
+    // the always-numeric rows this helper actually receives (type-totality guard, not a logic change).
+    .sort((a, b) => (b.avg_clv_bps ?? -Infinity) - (a.avg_clv_bps ?? -Infinity))
     .map((r, i) => ({ ...r, rank: i + 1 }));
 }
 

@@ -77,7 +77,10 @@ export interface LeaderboardRow {
   agent_name: string;
   agent_kind: string;
   runs: number;
-  avg_clv_bps: number;
+  // The rank axis. null = UNSCORED (backend mean_clv_bps=None: no true-CLV scored actions) — render
+  // "—" ("unavailable"), never a fabricated 0 bps (F-5). The backend still supplies the authoritative
+  // rank, so a null-CLV agent keeps its server-assigned position without a fake number.
+  avg_clv_bps: number | null;
   total_clv_bps: number;
   // These proxy metrics are carried by the CROSS-RUN wire LeaderboardRow but are ABSENT from the
   // competition-scoped CompetitionLeaderboardRow (F-5). null = honestly absent ("—"), never a fake 0.

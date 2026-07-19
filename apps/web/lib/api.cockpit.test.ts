@@ -78,6 +78,16 @@ describe('F-5 · adaptCompetitionState binds the competition-scoped leaderboard 
     expect(s.leaderboard.map((r) => r.rank)).toEqual([1, 2]);              // backend rank
   });
 
+  it('preserves a null mean_clv_bps as null avg_clv_bps — an UNSCORED agent is never shown as 0 bps', () => {
+    // Backend emits mean_clv_bps=None for an agent with NO true-CLV scored actions (WAIT / pending-
+    // horizon / window-only) — veridex/competition/events.py:~663 emits None, schemas.py preserves the
+    // null. Coercing it to 0 would tell the judge an unscored agent earned 0 bps instead of "unavailable".
+    const s = adaptCompetitionState(wireWith({
+      leaderboard: [{ rank: 1, agent_id: 'unscored', total_clv_bps: 0, mean_clv_bps: null, valid_count: 0, proof_mode: 'reproducible' }] as unknown as Record<string, unknown>[],
+    }));
+    expect(s.leaderboard[0].avg_clv_bps).toBeNull(); // honest "unavailable", NOT 0
+  });
+
   it('marks competition-absent proxy metrics null (honest "—"), never a fabricated 0', () => {
     const s = adaptCompetitionState(wireWith({
       leaderboard: [{ rank: 1, agent_id: 'a', total_clv_bps: 1, mean_clv_bps: 1, valid_count: 1, proof_mode: 'verified' }] as unknown as Record<string, unknown>[],

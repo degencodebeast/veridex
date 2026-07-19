@@ -49,7 +49,8 @@ export function ClvLeaderboard({ rows }: { rows: LeaderboardRow[] }) {
                   </span>
                 ) : null}
               </td>
-              <td className={`${styles.num} mono ${NUM[signClass(r.avg_clv_bps)]}`}>{fmtBps(r.avg_clv_bps)}</td>
+              {/* Avg CLV is the rank axis; a null mean (UNSCORED agent) renders "—", never a fake 0 bps. */}
+              <td className={`${styles.num} mono ${numClass(r.avg_clv_bps)}`}>{r.avg_clv_bps === null ? DASH : fmtBps(r.avg_clv_bps)}</td>
               <td className={`${styles.num} mono ${NUM[signClass(r.total_clv_bps)]}`}>{fmtBps(r.total_clv_bps)}</td>
               {/* sim_pnl / brier / max_drawdown / action_count / valid_pct are NOT in the
                   competition-scoped wire row — a null renders an honest em-dash, never a fake 0. */}

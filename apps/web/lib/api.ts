@@ -366,7 +366,7 @@ export function adaptCompetitionLeaderboard(
       agent_name: r.agent_id,               // GAP: competition row has no display name — fall back to id
       agent_kind: '',                       // GAP: not in the competition contract
       runs: 0,                              // GAP: single sealed run, not a cross-run count
-      avg_clv_bps: r.mean_clv_bps ?? 0,     // mean_clv_bps → avg_clv_bps (null mean ⇒ ranked last by server)
+      avg_clv_bps: r.mean_clv_bps,          // mean_clv_bps → avg_clv_bps; null (UNSCORED) preserved ⇒ "—", never a fake 0
       total_clv_bps: r.total_clv_bps,
       sim_pnl: null, brier: null, max_drawdown: null, action_count: null, valid_pct: null, // ABSENT ⇒ "—"
       proof_mode,

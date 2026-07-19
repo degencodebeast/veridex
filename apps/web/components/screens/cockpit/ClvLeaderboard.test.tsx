@@ -74,6 +74,19 @@ describe('ClvLeaderboard (REQ-011 / SEC-005)', () => {
     expect(within(bodyRow).getByText('7')).toBeInTheDocument();
   });
 
+  it('renders a null Avg CLV (unscored agent) as an em-dash, never a fabricated 0 bps', () => {
+    // mean_clv_bps=None → avg_clv_bps=null: the primary rank column must read "—" ("unavailable"),
+    // NEVER "0.0 bps"/"+0.0 bps" (which would claim the unscored agent earned zero closing-line value).
+    const row: LeaderboardRow = {
+      ...base, rank: 1, agent_id: 'u', agent_name: 'Unscored', avg_clv_bps: null, eligibility_badge: 'eligible',
+    };
+    render(<ClvLeaderboard rows={[row]} />);
+    const bodyRow = screen.getAllByRole('row').slice(1)[0];
+    // fmtBps(0) → exactly "0.0 bps" — the fabricated value the old `?? 0` produced in the avg cell.
+    expect(within(bodyRow).queryByText('0.0 bps')).not.toBeInTheDocument();
+    expect(within(bodyRow).getAllByText('—').length).toBeGreaterThanOrEqual(1);
+  });
+
   it('renders competition-absent metrics as an em-dash, never a fabricated 0 (honest gap)', () => {
     // The competition-scoped wire row carries NO sim_pnl/brier/max_drawdown/action_count/valid_pct;
     // the adapter maps them to null and the cell must render "—", never "0.0"/"0.000"/"0%".
