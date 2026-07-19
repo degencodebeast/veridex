@@ -7,14 +7,21 @@
 // "DEMO DATA · MOCK MODE" indicator; the api.ts mock branch demotes any `live` source_mode to
 // `replay` so no screen renders a LIVE badge over fixtures. The fixtures' anchor is honestly
 // `not_anchored`, so a mock Proof/Verify shows a demo recompute — never a real anchored claim.
+//
+// SOURCE OF TRUTH: the canonical wire fixtures live at repo-root contracts/fixtures/*.json (the
+// frozen contract the parse tests validate against). This app's Docker image builds with
+// build.context=./apps/web (see compose.coolify.yml) — a self-sufficient context that cannot reach
+// repo-root files — so the fixtures consumed at BUILD time are vendored copies under
+// lib/fixtures/wire/. They are NOT re-authored: fixtures/wire/sync.test.ts asserts every copy is
+// byte-identical to its repo-root canonical, so the copies fail CI the moment they drift.
 import type * as W from '@/lib/wire';
-import proofArtifact from '../../../contracts/fixtures/proof_artifact.json';
-import verifyResponse from '../../../contracts/fixtures/verify_response.json';
-import leaderboard from '../../../contracts/fixtures/leaderboard.json';
-import competitionState from '../../../contracts/fixtures/competition_state.json';
-import inspectorRecord from '../../../contracts/fixtures/inspector_record.json';
-import feedHealth from '../../../contracts/fixtures/feed_health.json';
-import makerArenaResult from '../../../contracts/fixtures/maker_arena_result.json';
+import proofArtifact from './fixtures/wire/proof_artifact.json';
+import verifyResponse from './fixtures/wire/verify_response.json';
+import leaderboard from './fixtures/wire/leaderboard.json';
+import competitionState from './fixtures/wire/competition_state.json';
+import inspectorRecord from './fixtures/wire/inspector_record.json';
+import feedHealth from './fixtures/wire/feed_health.json';
+import makerArenaResult from './fixtures/wire/maker_arena_result.json';
 
 /** True when the frontend mock flag is set: env (build/runtime) or the `?mock=1` per-tab dev param. */
 export function isMockEnabled(): boolean {
