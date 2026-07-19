@@ -9,32 +9,27 @@ export type MakerArenaResultState =
   | { status: 'unavailable'; result: null }
   | { status: 'ready'; result: MakerArenaResultView };
 
+const IDLE_STATE: MakerArenaResultState = { status: 'idle', result: null };
+const LOADING_STATE: MakerArenaResultState = { status: 'loading', result: null };
+
 export function useMakerArenaResult(
   enabled: boolean,
   injectedResult?: MakerArenaResultView,
 ): MakerArenaResultState {
-  const [state, setState] = useState<MakerArenaResultState>(
-    injectedResult
-      ? { status: 'ready', result: injectedResult }
-      : { status: 'idle', result: null },
-  );
+  const [state, setState] = useState<MakerArenaResultState>(IDLE_STATE);
 
   useEffect(() => {
     if (injectedResult) {
-      setState((current) => current.status === 'ready' && current.result === injectedResult
-        ? current
-        : { status: 'ready', result: injectedResult });
+      setState((current) => current.status === 'idle' ? current : IDLE_STATE);
       return;
     }
     if (!enabled) {
-      setState((current) => current.status === 'idle'
-        ? current
-        : { status: 'idle', result: null });
+      setState((current) => current.status === 'idle' ? current : IDLE_STATE);
       return;
     }
 
     let ignore = false;
-    setState({ status: 'loading', result: null });
+    setState(LOADING_STATE);
     getMakerArenaResult().then(
       (result) => {
         if (!ignore) setState({ status: 'ready', result });
@@ -49,5 +44,8 @@ export function useMakerArenaResult(
     };
   }, [enabled, injectedResult]);
 
+  if (injectedResult) return { status: 'ready', result: injectedResult };
+  if (!enabled) return IDLE_STATE;
+  if (state.status === 'idle') return LOADING_STATE;
   return state;
 }

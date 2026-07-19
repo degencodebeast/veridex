@@ -165,12 +165,13 @@ describe('AgentsScreen — live maker result loading (F-9)', () => {
     expect(getMakerArenaResultMock).not.toHaveBeenCalled();
   });
 
-  it('prohibits direct sealed-fixture imports and defaults in all three production screens', () => {
+  it('prohibits direct sealed-fixture imports and defaults across production maker readers', () => {
     const sources = [
-      'AgentsScreen.tsx',
-      'DuelScreen.tsx',
-      'LeaderboardScreen.tsx',
-    ].map((file) => readFileSync(resolve(process.cwd(), 'components/screens', file), 'utf8'));
+      resolve(process.cwd(), 'components/screens/AgentsScreen.tsx'),
+      resolve(process.cwd(), 'components/screens/DuelScreen.tsx'),
+      resolve(process.cwd(), 'components/screens/LeaderboardScreen.tsx'),
+      resolve(process.cwd(), 'hooks/useMakerArenaResult.ts'),
+    ].map((file) => readFileSync(file, 'utf8'));
 
     for (const source of sources) {
       expect(source).not.toContain('MAKER_ARENA_RESULT');
