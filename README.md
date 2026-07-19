@@ -105,6 +105,11 @@ A run's manifest hash is written to one devnet Memo transaction (confirms in ~1.
 
 Full check semantics → [`docs/technical-deep-dive.md`](docs/technical-deep-dive.md).
 
+**Verify a run yourself** — you need nothing from us. Run the offline demo above, then re-check any sealed run; tamper one byte and `evidence_integrity` flips to `fail`:
+```bash
+curl -s localhost:8000/runs/<id>/verify | jq '.checks'   # the law re-runs from the sealed bytes
+```
+
 ## Results, honestly
 
 We pulled real TxLINE history for **18 finished World Cup fixtures**, sealed each into a content-hashed ReplayPack, and ran two experiments end-to-end.
@@ -117,7 +122,16 @@ We pulled real TxLINE history for **18 finished World Cup fixtures**, sealed eac
 
 The firmer number is CLV (recomputed, outcome-independent); the softer one is estimated venue mids (not fills), and we say so. Veridex refused to headline "+607 bps" — a trustworthy *"no edge yet, stated with evidence"* is part of what it ships. The leaderboard shows which agents performed best under controlled conditions; the verification record shows whether those results deserve to be trusted.
 
-## How TxLINE powers Veridex
+## How Veridex uses TxLINE
+
+TxLINE **StablePrice** is de-margined consensus — the bookmaker margin is already stripped, so outcome probabilities sum to ~100%. That vig-free fair value is the *truth* Veridex scores against, and it moves the instant news lands. We ingest it **live over SSE** and seal it into content-hashed ReplayPacks for deterministic replay.
+
+**It powers all three of the track's starter ideas:**
+- **Sharp-movement detector** — the Sharp Momentum + Cumulative Drift agents read the de-margined StablePrice probability and act on how it moves.
+- **Agent-vs-agent arena** — every contestant is scored on **closing-line value against the sharp TxLINE close**, the fair vig-free benchmark.
+- **In-play market maker** — **QuoteGuard anchors its two-sided quotes on TxLINE's fair value (not the venue mid), and pulls its quotes the instant the TxLINE feed goes stale, missing, or suspended** — it never rests a quote into a market TxLINE can't currently price.
+
+**Endpoints used** (auth: guest JWT + an on-chain Solana `subscribe` → API token):
 
 | Endpoint | How Veridex uses it |
 |----------|---------------------|
@@ -128,7 +142,7 @@ The firmer number is CLV (recomputed, outcome-independent); the softer one is es
 | `GET /api/scores/stream` · `/api/scores/updates/{id}` | live / updated scores — match phase for honest closing-line semantics |
 | `POST /auth/guest/start` · `POST /api/token/activate` | guest JWT + API token (after the on-chain devnet subscription) |
 
-TxLINE **StablePrice** is de-margined consensus (outcome probabilities sum to ~100%) — the clean fair-value input CLV needs. The bounded curated genuine ReplayPack (a 400-record prefix per fixture) ships with TxODDS's confirmation; the full multi-GB raw capture stays local.
+The bounded curated genuine ReplayPack (a 400-record prefix per fixture) ships with TxODDS's confirmation; the full multi-GB raw capture stays local.
 
 ## Architecture
 
@@ -181,6 +195,16 @@ Depth-on-demand — the root README is the tour; the docs are the proof.
 | **[FAQ](docs/faq.md)** · **[Full submission writeup](docs/submission.md)** | Common questions · the complete submission narrative |
 
 Hosted docs: `[Documentation]` (Mintlify).
+
+---
+
+## What Veridex never does
+
+- **Never lets an agent grade itself** — every score is recomputed by an independent law from sealed evidence.
+- **Never scores a claimed edge** — the agent's own number is metadata, never an input to the leaderboard.
+- **Never moves real money on its own** — the venue path is fail-closed; only a human operator can arm it.
+- **Never passes synthetic data off as genuine** — packs are labeled `genuine-txline` vs `synthetic`, and a run replays the selected verified bytes or fails closed.
+- **Never asks to be believed** — you can re-run every proof yourself.
 
 ---
 
