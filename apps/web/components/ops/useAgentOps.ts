@@ -1,5 +1,5 @@
 'use client';
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useState } from 'react';
 import { getInstances, getRuntimeEvents, type RuntimeEventRecord } from '@/lib/api';
 import { isMockEnabled } from '@/lib/mock';
 import { RUNTIME_OVERVIEW, RUNTIME_LOG } from '@/lib/fixtures/catalog';
@@ -151,7 +151,16 @@ export function useRuntimeEvents(agentId: string | null): RuntimeOpsData {
   const [events, setEvents] = useState<RuntimeEventRecord[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const eventsRef = useRef<RuntimeEventRecord[]>([]);
+
+  // Render-phase reset (React's "adjust state on prop change" pattern): when the open agent switches,
+  // clear the prior agent's events/error IN THE SAME render — so no stale carry-over frame is ever
+  // committed before the effect below re-runs. Guarded by a tracked value so it fires once per switch.
+  const [trackedAgent, setTrackedAgent] = useState(agentId);
+  if (agentId !== trackedAgent) {
+    setTrackedAgent(agentId);
+    setEvents([]);
+    setError(null);
+  }
 
   useEffect(() => {
     if (agentId == null || demo) return undefined;
@@ -159,12 +168,13 @@ export function useRuntimeEvents(agentId: string | null): RuntimeOpsData {
     let cancelled = false;
     const cursors = new Map<string, number>();
     let instanceIds: string[] | null = null;
-    let acc: RuntimeEventRecord[] = [];
+    // Accumulate by durable `id` (BIGSERIAL, globally unique). A single agent can have ≥2 deployed
+    // instances that share ONE agent_id (Studio deploys with a template-constant `studio-${archetype}`
+    // id), and the backend serves runtime-events keyed by agent_id — so both instances return the
+    // IDENTICAL list. Keying by id dedupes those, so multi-instance agents never double events (nor
+    // the Overview counters derived from them). "Dedup by construction" holds ACROSS instances here.
+    const byId = new Map<number, RuntimeEventRecord>();
 
-    // Reset on (re)mount / instance switch — no stale carry-over from a prior agent.
-    eventsRef.current = [];
-    setEvents([]);
-    setError(null);
     setLoading(true);
 
     const poll = async () => {
@@ -175,16 +185,19 @@ export function useRuntimeEvents(agentId: string | null): RuntimeOpsData {
           instanceIds = instances.filter((i) => i.agent_id === agentId).map((i) => i.instance_id);
           for (const id of instanceIds) cursors.set(id, 0);
         }
+        let changed = false;
         for (const id of instanceIds) {
           const since = cursors.get(id) ?? 0;
           const batch = await getRuntimeEvents(id, since);
           if (cancelled) return;
           if (batch.length > 0) {
             cursors.set(id, batch.reduce((m, e) => (e.id > m ? e.id : m), since));
-            acc = acc.concat(batch).sort((a, b) => (a.ts - b.ts) || (a.id - b.id));
-            eventsRef.current = acc;
-            setEvents(acc);
+            for (const e of batch) byId.set(e.id, e);
+            changed = true;
           }
+        }
+        if (changed) {
+          setEvents([...byId.values()].sort((a, b) => (a.ts - b.ts) || (a.id - b.id)));
         }
         if (!cancelled) { setLoading(false); setError(null); }
       } catch (e) {

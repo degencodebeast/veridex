@@ -165,6 +165,45 @@ describe('useRuntimeEvents — live cursor-polling (RED controls #2–#5)', () =
     expect(result.current.log.some((l) => l.detail.includes('FADE'))).toBe(true);
   });
 
+  it('MAJOR-1: two instances sharing one agent_id do NOT double events or Overview counters (dedup by durable id)', async () => {
+    vi.useFakeTimers();
+    // Studio deploys the same archetype with a template-constant agent_id → 2 instances, one agent_id.
+    getInstances.mockResolvedValue([instance('inst_1', 'a'), instance('inst_2', 'a')]);
+    // The backend keys runtime-events by agent_id (store filters WHERE agent_id=%s), so BOTH
+    // instances return the IDENTICAL durable-id list — the events must be counted exactly once.
+    const shared = [
+      ev({ id: 1, type: 'error', payload: { error: 'boom' } }),
+      ev({ id: 2, type: 'action_emitted', payload: { action: 'WAIT' } }),
+    ];
+    getRuntimeEvents.mockImplementation(async (_id: string, since: number) => (since === 0 ? shared : []));
+
+    const { result } = renderHook(() => useRuntimeEvents('a'));
+    await act(async () => { await vi.advanceTimersByTimeAsync(1); });
+
+    expect(result.current.log).toHaveLength(2); // NOT 4 — no duplicate of ids 1/2 across instances
+    expect(result.current.overview?.errors).toBe(1); // NOT 2 — counters not doubled
+  });
+
+  it('MINOR-1: an instance switch clears the prior agent events with no stale carry-over frame', async () => {
+    vi.useFakeTimers();
+    getInstances.mockResolvedValue([instance('inst_1', 'a'), instance('inst_2', 'b')]);
+    getRuntimeEvents.mockImplementation(async (id: string, since: number) => {
+      if (id === 'inst_1' && since === 0) return [ev({ id: 5, agent_id: 'a', payload: { action: 'WAIT' } })];
+      if (id === 'inst_2' && since === 0) return [ev({ id: 9, agent_id: 'b', payload: { action: 'FADE' } })];
+      return [];
+    });
+
+    const { result, rerender } = renderHook(({ a }) => useRuntimeEvents(a), { initialProps: { a: 'a' } });
+    await act(async () => { await vi.advanceTimersByTimeAsync(1); });
+    expect(result.current.log.some((l) => l.detail.includes('WAIT'))).toBe(true);
+
+    // On switch, the prior agent's events are cleared synchronously (render-phase reset) — the very
+    // next observed state must NOT still be showing agent a's events under agent b.
+    rerender({ a: 'b' });
+    expect(result.current.log.some((l) => l.detail.includes('WAIT'))).toBe(false);
+    expect(result.current.overview).toBeNull(); // no derived overview from stale carry-over
+  });
+
   it('#5 mock OFF + no owned events → honest-empty (overview null, empty log), NEVER a fixture', async () => {
     getInstances.mockResolvedValue([]); // caller owns no instance for this agent
     const { result } = renderHook(() => useRuntimeEvents('a'));
