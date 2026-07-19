@@ -29,6 +29,12 @@ from httpx import ASGITransport
 
 from veridex.api.demo_fixtures import DEMO_MARKET_KEY, build_demo_ticks
 from veridex.api.router import create_app
+from veridex.competition.models import (
+    Competition,
+    CompetitionConfig,
+    CompetitionStatus,
+    ReplayBinding,
+)
 from veridex.deploy.preflight import DeployConfig
 from veridex.ingest.replay_catalog import (
     ReplayResolutionError,
@@ -37,7 +43,11 @@ from veridex.ingest.replay_catalog import (
     load_resolved_marketstates,
     resolve_replay_source,
 )
-from veridex.ingest.replay_pack import load_pack_marketstates
+from veridex.ingest.replay_pack import (
+    _compute_content_hash,
+    load_pack_marketstates,
+    verify_content_hash,
+)
 from veridex.store import InMemoryStore
 
 # --- the R-1 banked curated seed pack (the single production pack; catalogs as one entry) --------
@@ -320,3 +330,116 @@ def test_h_content_hash_drift_is_fail_closed_at_load() -> None:
     # the correct frozen hash still loads (control): drift-detection is not over-broad.
     good = resolve_replay_source(catalog, pack_id=SEED_PACK_ID, fixture_id=None)
     assert load_resolved_marketstates(catalog, good)
+
+
+# ---------------------------------------------------------------------------
+# R-4 spec-fold residuals (MINOR 1/2/3)
+# ---------------------------------------------------------------------------
+
+
+async def test_fold1_unbound_binding_persist_is_cas_only_if_unbound() -> None:
+    # MINOR 1 (honesty): the unbound-start persist must be an ONLY-IF-UNBOUND compare-and-set.
+    # Two concurrent starts of an unbound DRAFT can race an R-0b re-register: the WINNER (claims the
+    # run, replays its tape) freezes its binding first; the LOSER (409 at the claim) resolves a
+    # DIFFERENT hash and, with the OLD unconditional overwrite, clobbers the winner's binding AFTER
+    # the winning run already replayed — so GET reports a hash the run never replayed. CAS fixes it:
+    # once bound, a later persist is a no-op and the winner's binding stands.
+    store = InMemoryStore()
+    comp = Competition(
+        competition_id="comp-fold1",
+        config=CompetitionConfig.model_validate(_CONFIG),
+        status=CompetitionStatus.DRAFT,
+        entries=[],
+        run_id=None,
+    )
+    await store.create_competition(comp)
+    winner = ReplayBinding(pack_id=SEED_PACK_ID, fixture_id=SEED_MIN_FIXTURE, content_hash="hash-winner")
+    loser = ReplayBinding(pack_id=SEED_PACK_ID, fixture_id=SEED_MIN_FIXTURE, content_hash="hash-loser")
+
+    await store.update_competition_replay_binding("comp-fold1", winner)  # the winning run freezes first
+    await store.update_competition_replay_binding("comp-fold1", loser)  # the loser must NOT clobber it
+
+    persisted = await store.get_competition("comp-fold1")
+    assert persisted.replay_binding is not None
+    # GET reports exactly the binding the winning run replayed — never the loser's late overwrite.
+    assert persisted.replay_binding.content_hash == "hash-winner"
+
+
+async def test_fold2_unnamed_replay_retry_reconciles_before_reresolve(tmp_path: Path) -> None:
+    # MINOR 2 (availability): the idempotent-existing instance must be reconciled BEFORE the replay
+    # source is re-resolved. A successful UNNAMED single-pack replay deploy freezes its tape identity;
+    # if an R-0b promotion later makes the catalog multi-pack, a retry that re-resolves FIRST would
+    # 400 ``pack_id_required`` instead of returning the existing instance. The frozen binding is
+    # authoritative and reused verbatim — the retry stays available and the tape never changes.
+    capture = tmp_path / "cap"
+    capture.mkdir()
+    catalog = build_catalog(str(SEED), capture_root=str(capture))
+    app = create_app(store=InMemoryStore(), replay_catalog=catalog)
+    cfg = {**_REPLAY_STUDIO}  # UNNAMED: no replay_pack_id -> single-pack auto-resolution
+    cfg.pop("replay_pack_id", None)
+    async with _async_client(app) as client:
+        first = await client.post("/agents/deploy", json=cfg, headers={"Idempotency-Key": "k-fold2"})
+        assert first.status_code == 200, first.text
+        b1 = first.json()["replay_binding"]
+        assert b1 == {"pack_id": SEED_PACK_ID, "fixture_id": SEED_MIN_FIXTURE, "content_hash": SEED_HASH}
+
+        # R-0b promotes a SECOND verified pack -> an UNNAMED re-resolve is now ambiguous.
+        packB = capture / "packB"
+        shutil.copytree(SEED, packB)
+        catalog.register_pack(packB)
+        assert len(catalog) == 2
+
+        # Retry with the SAME key: reconcile the existing instance BEFORE re-resolving -> 200, not 400.
+        retry = await client.post("/agents/deploy", json=cfg, headers={"Idempotency-Key": "k-fold2"})
+        assert retry.status_code == 200, retry.text
+        assert retry.json()["instance_id"] == first.json()["instance_id"]
+        assert retry.json()["replay_binding"] == b1  # frozen tape identity unchanged
+
+        for task in list(getattr(app.state, "deploy_background_tasks", set())):
+            task.cancel()
+
+
+def test_fold3_recomputed_disk_hash_must_match_frozen_binding(tmp_path: Path) -> None:
+    # MINOR 3 (direct byte guarantee): the load must DIRECTLY compare the RECOMPUTED on-disk content
+    # hash to the frozen ``resolved.content_hash`` — dropping the pack_dir-immutability assumption.
+    # Construct a CONSISTENT on-disk tamper (data + manifest both rewritten so the pack is self-
+    # consistent at a NEW hash) while the in-memory catalog entry still carries the ORIGINAL hash.
+    # Today: the entry-vs-frozen check matches (metadata) and verify=True passes (disk self-consistent),
+    # so the load would serve bytes whose recomputed hash differs from the frozen identity. Fail-closed.
+    packroot = tmp_path / "packs"
+    packroot.mkdir()
+    packx = packroot / "packx"
+    shutil.copytree(SEED, packx)
+    catalog = build_catalog(str(packroot))  # curated seeds are catalogued IN PLACE (no owned copy)
+    entry = catalog.snapshot()["packx"]
+    assert entry.content_hash == SEED_HASH  # same bytes as the seed at admission
+    pack_dir = Path(entry.pack_dir)
+
+    manifest = json.loads((pack_dir / "pack.json").read_text())
+    fixtures = manifest["fixtures"]
+    # Tamper a fixture the loader will NOT read (keeps the loaded fixture parseable), then rewrite the
+    # manifest hash so the pack stays self-consistent (verify=True passes) at a NEW recomputed hash.
+    victim = pack_dir / fixtures[-1]["records"]
+    victim.write_bytes(victim.read_bytes() + b'{"tampered": true}\n')
+    new_hash = _compute_content_hash(
+        pack_dir,
+        fixtures,
+        pack_version=int(manifest.get("pack_version", 1)),
+        capture=manifest.get("capture", {}),
+    )
+    assert new_hash != SEED_HASH
+    manifest["content_hash"] = new_hash
+    (pack_dir / "pack.json").write_text(json.dumps(manifest))
+    assert verify_content_hash(pack_dir)  # disk is self-consistent at the NEW hash
+
+    # The frozen identity (and the still-cached catalog entry) carry the ORIGINAL hash.
+    stale = ResolvedReplaySource(
+        pack_id="packx",
+        fixture_id=SEED_MIN_FIXTURE,
+        content_hash=SEED_HASH,
+        provenance="",
+        is_genuine=False,
+    )
+    with pytest.raises(ReplayResolutionError) as exc:
+        load_resolved_marketstates(catalog, stale)
+    assert exc.value.reason == "content_hash_drift"

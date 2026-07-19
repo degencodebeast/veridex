@@ -702,6 +702,56 @@ def register_deploy_routes(
             envelope = build_maker_policy_envelope(config, config.mm)
         else:
             envelope = config.to_policy_envelope()
+
+        operator_id = principal.did
+        config_fingerprint = config.config_hash()
+
+        def _reconcile_existing_deploy(
+            existing: AgentInstance, recorded_status: AttemptStatus
+        ) -> DeployResponse:
+            """Return an already-materialized idempotent instance, re-driving MM provisioning recovery
+            if the original saga is still incomplete. The FROZEN ``replay_binding`` is reused verbatim —
+            the tape identity is NEVER re-selected on retry (R-4), so an R-0b promotion between the
+            original deploy and this retry can never change the run's tape."""
+            if (
+                config.strategy == MM_STRATEGY_FAMILY
+                and recorded_status in _INCOMPLETE_PROVISIONING_STATES
+                and require_privy_provisioning(settings) is not None
+                and deps.provisioning_provider is not None
+            ):
+                recovery_task = asyncio.create_task(_recover_mm_provisioning(existing))
+                background_tasks.add(recovery_task)
+                recovery_task.add_done_callback(_discard_recovery_task)
+            return DeployResponse(
+                instance_id=existing.instance_id,
+                config_hash=existing.config_hash,
+                policy_hash=existing.policy_hash,
+                run_id=existing.run_id,
+                owner=operator_id,
+                replay_binding=existing.replay_binding,
+            )
+
+        # R-4 (retry availability): reconcile an ALREADY-materialized idempotent instance BEFORE resolving
+        # the replay source. A prior successful UNNAMED single-pack replay deploy froze its tape identity
+        # onto the instance; if an R-0b promotion later made the catalog multi-pack, a blind re-resolve
+        # here would 400 ``pack_id_required`` and break the idempotent retry. The frozen binding is
+        # authoritative and reused verbatim. Only the clean already-materialized case short-circuits; a
+        # config-fingerprint mismatch or a not-yet-materialized claim falls through to the authoritative
+        # attempt claim below (which owns the 409s and the fresh-deploy saga).
+        if idempotency_key is not None:
+            prior = await store.get_deployment_attempt_by_key(operator_id, idempotency_key)
+            if (
+                prior is not None
+                and prior.instance_id is not None
+                and prior.config_fingerprint == config_fingerprint
+            ):
+                try:
+                    existing_instance = await store.get_agent_instance(prior.instance_id)
+                except KeyError:
+                    existing_instance = None
+                if existing_instance is not None:
+                    return _reconcile_existing_deploy(existing_instance, prior.status)
+
         # MODE-AWARE source resolution: a replay deploy resolves its SOURCE (bundled/injected pack)
         # BEFORE preflight, so the named feed_health check verifies the replay source resolves
         # (non-empty) rather than a live feed. Live resolves nothing here — it is gated fail-closed
@@ -743,9 +793,7 @@ def register_deploy_routes(
         # side effect. The attempt CLAIMS (operator_id, idempotency_key) under a UNIQUE constraint and
         # pre-allocates the deterministic instance_id it targets — so a retry (or a concurrent
         # duplicate) reconciles to the SAME instance via the recorded state, never a blind re-execute.
-        operator_id = principal.did
         idem_key = idempotency_key if idempotency_key is not None else uuid.uuid4().hex
-        config_fingerprint = config.config_hash()
         now = _now_iso()
         attempt_id = uuid.uuid4().hex
         instance_id = f"inst_{attempt_id}"
@@ -786,34 +834,12 @@ def register_deploy_routes(
             except KeyError:
                 existing = None
             if existing is not None:
-                # An MM deploy whose provisioning saga is INCOMPLETE (PENDING or any nonterminal wallet
-                # state) must RE-DRIVE the owned provisioning recovery in the background — reconciling by
-                # the recorded external_id — rather than returning as if complete. It starts NO second run
-                # (the II-4 lease governs that); the store CAS guards against inconsistent concurrent
-                # advance if the original _launch_mm is still mid-flight. A COMPLETE instance (provisioning
-                # done/terminal, or provisioning not applicable) returns unchanged, and directional
-                # (non-MM) idempotent replay is untouched.
-                if (
-                    config.strategy == MM_STRATEGY_FAMILY
-                    and recorded.status in _INCOMPLETE_PROVISIONING_STATES
-                    and require_privy_provisioning(settings) is not None
-                    and deps.provisioning_provider is not None
-                ):
-                    recovery_task = asyncio.create_task(_recover_mm_provisioning(existing))
-                    background_tasks.add(recovery_task)
-                    recovery_task.add_done_callback(_discard_recovery_task)
                 # The side effect already completed — return the SAME instance (idempotent replay /
-                # crash-recovered), launching NO second run. R-4: REUSE the instance's FROZEN
-                # replay_binding verbatim — the tape identity is never re-selected on retry, so an R-0b
-                # promotion between the original deploy and this retry can never change the run's tape.
-                return DeployResponse(
-                    instance_id=existing.instance_id,
-                    config_hash=existing.config_hash,
-                    policy_hash=existing.policy_hash,
-                    run_id=existing.run_id,
-                    owner=operator_id,
-                    replay_binding=existing.replay_binding,
-                )
+                # crash-recovered), launching NO second run. An MM deploy whose provisioning saga is
+                # INCOMPLETE re-drives the owned provisioning recovery in the background; a COMPLETE (or
+                # directional non-MM) instance returns unchanged. R-4: the instance's FROZEN
+                # replay_binding is reused verbatim — the tape identity is never re-selected on retry.
+                return _reconcile_existing_deploy(existing, recorded.status)
             # No instance yet. Fail-closed: only re-drive from the known-safe PENDING claim; any other
             # recorded state is treated as unrecoverable and NEVER auto-retries a side effect.
             if recorded.status is not AttemptStatus.PENDING:

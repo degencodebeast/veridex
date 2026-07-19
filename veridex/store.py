@@ -485,11 +485,13 @@ class Store(Protocol):
     async def update_competition_replay_binding(
         self, competition_id: str, binding: ReplayBinding
     ) -> None:
-        """Persist the FROZEN, server-derived production-replay identity onto a competition (R-4).
+        """CAS-freeze the FROZEN, server-derived production-replay identity onto a competition (R-4).
 
         Used at competition start to durably freeze the auto-resolved single-pack binding BEFORE the
-        run claim, so a legacy unbound DRAFT commits to exactly the pack it will replay. Idempotent
-        (re-writing the same binding is a no-op semantically).
+        run claim, so a legacy unbound DRAFT commits to exactly the pack it will replay. ONLY-IF-UNBOUND
+        compare-and-set: if the competition is ALREADY bound (a concurrent start that won the run claim
+        froze it first), this is a no-op — a losing start can never clobber the identity the winning run
+        actually replayed (which would make ``GET`` report a hash the run never replayed).
 
         Args:
             competition_id: The competition to bind.
@@ -1203,10 +1205,17 @@ class InMemoryStore:
     async def update_competition_replay_binding(
         self, competition_id: str, binding: ReplayBinding
     ) -> None:
-        """Persist the frozen R-4 production-replay identity onto the stored competition (deep-copied)."""
+        """CAS-freeze the R-4 replay identity — persist ONLY IF the competition is still unbound.
+
+        Only-if-unbound compare-and-set: once a binding is frozen (by the concurrent start that won the
+        run claim), a later persist is a no-op, so a losing start can never clobber the identity the
+        winning run actually replayed. The check-then-set has no ``await`` gap (atomic under asyncio's
+        single-threaded scheduler), mirroring the InMemory claim CAS.
+        """
         if competition_id not in self._competitions:
             raise KeyError(f"no competition with competition_id={competition_id!r}")
-        self._competitions[competition_id].replay_binding = binding.model_copy(deep=True)
+        if self._competitions[competition_id].replay_binding is None:
+            self._competitions[competition_id].replay_binding = binding.model_copy(deep=True)
 
     async def append_competition_events(self, competition_id: str, events: list[CompetitionEvent]) -> None:
         """Append deep copies of ``events`` to the competition's event list.
@@ -2361,23 +2370,27 @@ class PostgresStore:
     async def update_competition_replay_binding(
         self, competition_id: str, binding: ReplayBinding
     ) -> None:
-        """Fold the frozen R-4 replay identity into the competition's ``config_json`` rider (zero DDL).
+        """CAS-fold the frozen R-4 replay identity into ``config_json`` — ONLY IF still unbound (zero DDL).
 
-        Reads the current blob, preserves the ``owner_id`` rider + the existing ``CompetitionConfig``,
-        and rewrites ONLY the ``replay_binding`` rider — so freezing the tape identity can never drop
-        ownership or mutate the immutable config.
+        Only-if-unbound compare-and-set: the competition row is locked ``SELECT ... FOR UPDATE`` (mirroring
+        the claim CAS), the current ``replay_binding`` rider is read, and the ``UPDATE`` is SKIPPED if a
+        binding is already present — so a losing concurrent start can never clobber the identity the winning
+        run replayed. On an actual write it preserves the ``owner_id`` rider + the immutable
+        ``CompetitionConfig`` and rewrites ONLY the ``replay_binding`` rider.
         """
         conn = await self._connect()
         try:
             async with conn.transaction(), conn.cursor() as cur:
                 await cur.execute(
-                    "SELECT config_json FROM competitions WHERE competition_id = %s",
+                    "SELECT config_json FROM competitions WHERE competition_id = %s FOR UPDATE",
                     (competition_id,),
                 )
                 existing = await cur.fetchone()
                 if existing is None:
                     raise KeyError(f"no competition persisted with competition_id={competition_id!r}")
                 existing_blob = json.loads(existing[0])
+                if existing_blob.get("replay_binding") is not None:
+                    return  # already frozen by the winning start — never clobber it (only-if-unbound CAS)
                 owner_id = existing_blob.pop("owner_id", None)
                 existing_blob.pop("replay_binding", None)
                 config = CompetitionConfig.model_validate(existing_blob)

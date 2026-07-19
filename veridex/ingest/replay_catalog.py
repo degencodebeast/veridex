@@ -45,7 +45,11 @@ from veridex.ingest.capture_chain import (
     is_genuine_pack,
     read_pack_provenance,
 )
-from veridex.ingest.replay_pack import load_pack_marketstates, verify_content_hash
+from veridex.ingest.replay_pack import (
+    _compute_content_hash,
+    load_pack_marketstates,
+    verify_content_hash,
+)
 
 if TYPE_CHECKING:
     from veridex.ingest.marketstate import MarketState
@@ -646,4 +650,38 @@ def load_resolved_marketstates(
             f"frozen fixture_id {resolved.fixture_id} no longer catalogued for pack {resolved.pack_id!r}",
             reason="fixture_gone",
         )
-    return load_pack_marketstates(Path(entry.pack_dir), resolved.fixture_id, verify=True)
+    pack_dir = Path(entry.pack_dir)
+    states = load_pack_marketstates(pack_dir, resolved.fixture_id, verify=True)
+    # DIRECT byte guarantee (drops the pack_dir-immutability assumption): recompute the on-disk content
+    # hash and compare it to the FROZEN ``resolved.content_hash``. The entry check above only compares
+    # CATALOG METADATA to the frozen hash, and ``verify=True`` above only proves disk SELF-consistency
+    # (recomputed == the pack's OWN manifest) — neither directly ties the REPLAYED BYTES to the frozen
+    # identity. A consistent on-disk tamper (data + manifest both rewritten) under a stale catalog entry
+    # would pass both, so assert the recomputed disk hash equals the frozen one; fail closed otherwise.
+    if _recompute_disk_content_hash(pack_dir) != resolved.content_hash:
+        raise ReplayResolutionError(
+            f"recomputed on-disk content_hash for pack {resolved.pack_id!r} does not match the frozen "
+            f"binding — refusing to replay bytes that differ from the sealed identity",
+            reason="content_hash_drift",
+        )
+    return states
+
+
+def _recompute_disk_content_hash(pack_dir: Path) -> str | None:
+    """Recompute the pack's ``content_hash`` DIRECTLY from its on-disk manifest + data files.
+
+    Mirrors :func:`~veridex.ingest.replay_pack.verify_content_hash`'s recomputation but RETURNS the
+    recomputed digest (not a self-consistency bool), so a caller can compare the ACTUAL replayed bytes
+    to a FROZEN identity rather than to the pack's own (possibly co-tampered) manifest. Returns ``None``
+    on any read/parse failure — fail-closed: an unreadable pack can never satisfy an equality check.
+    """
+    try:
+        manifest = json.loads((pack_dir / "pack.json").read_text())
+        return _compute_content_hash(
+            pack_dir,
+            manifest["fixtures"],
+            pack_version=int(manifest.get("pack_version", 1)),
+            capture=manifest.get("capture", {}),
+        )
+    except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError):
+        return None
