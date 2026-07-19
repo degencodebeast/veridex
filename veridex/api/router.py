@@ -448,10 +448,14 @@ def create_app(
     app.state.live_feed_status = live_feed_status
 
     # R-3: the AUTHORITATIVE, hash-verified R-2 ReplayPack catalog this app serves replay identity from.
-    # Injected in tests; otherwise built from the SAME read-only ``REPLAY_PACK_ROOT`` (+ optional writable
-    # ``REPLAY_CAPTURE_ROOT``) the server composition uses, so ``/replay-packs`` and the ``pack_id``-bound
-    # ``POST /backtests`` resolve packs SERVER-side against the verified catalog — never a client filesystem
-    # path. A blank/unset root yields an empty catalog (fail-closed: every pack_id is an unknown 404).
+    # PROVIDED path (the served composition + tests): ``build_agentos_app`` threads the ALREADY-BUILT
+    # catalog through, so it is USED as-is and NO env catalog is built — the served path hash-verifies /
+    # copies packs exactly ONCE (in ``create_server_app``), never a second env-built throwaway. FALLBACK
+    # path (a standalone ``create_app`` caller with no catalog): build one from the read-only
+    # ``REPLAY_PACK_ROOT`` (+ optional writable ``REPLAY_CAPTURE_ROOT``). Either way ``/replay-packs`` and
+    # the ``pack_id``-bound ``POST /backtests`` resolve packs SERVER-side against the verified catalog —
+    # never a client filesystem path. A blank/unset root yields an empty catalog (fail-closed: every
+    # pack_id is an unknown 404).
     resolved_replay_catalog = (
         replay_catalog
         if replay_catalog is not None

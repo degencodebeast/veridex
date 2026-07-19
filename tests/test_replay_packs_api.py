@@ -1,6 +1,6 @@
 """R-3 — the Replay catalog API + pack-bound competition identity (trust-relevant).
 
-These RED tests pin the R-3 contract:
+These tests pin the R-3 contract:
 
 * ``GET /replay-packs`` lists the AUTHORITATIVE R-2 catalog (verified ``content_hash`` +
   honest ``provenance`` + ``fixtures``) and NEVER leaks the internal ``pack_dir`` filesystem path;

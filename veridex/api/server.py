@@ -337,6 +337,7 @@ def create_server_app(
         enforce_contract=True,  # AC-29: fail-closed on any agno-native surface drift
         base_routers=[readiness_router],  # /readyz registered pre-snapshot -> veridex-owned, public
         surface_only=surface_only,  # SURFACE hosting: wrapper routes deny before mutation (not executor)
+        replay_catalog=replay_catalog,  # thread the ONCE-built R-2 catalog into create_app (no rebuild)
     )
     app = guard.app  # the composed FastAPI: durability lifecycle + state live HERE (not on the guard)
 
@@ -349,6 +350,9 @@ def create_server_app(
         app.state.db_pool = None
 
     app.state.store = store
+    # create_app already set app.state.replay_catalog to THIS same threaded catalog (build_agentos_app
+    # -> create_app(replay_catalog=...)); reaffirmed here for locality — the object is identical, so this
+    # no longer depends on statement ordering to overwrite a divergent env-built catalog.
     app.state.replay_catalog = replay_catalog  # R-2: trusted hash-verified catalog for /readyz + R-3
     return guard  # RETURN THE GUARD (the ASGI callable) — never the inner FastAPI
 

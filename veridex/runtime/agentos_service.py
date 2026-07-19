@@ -45,6 +45,7 @@ if TYPE_CHECKING:
 
     from veridex.api.auth_privy import _Verifier
     from veridex.config import Settings
+    from veridex.ingest.replay_catalog import ReplayCatalog
     from veridex.runtime.runtime_events import RuntimeEventSink
     from veridex.store import Store
 
@@ -623,6 +624,7 @@ def build_agentos_app(
     extra_agents: Sequence[VeridexAgentAdapter] | None = None,
     base_routers: Sequence[APIRouter] | None = None,
     surface_only: bool = False,
+    replay_catalog: ReplayCatalog | None = None,
 ) -> Any:
     """Compose the guarded AgentOS app: veridex routes + adapter(s) + deny-by-default boundary.
 
@@ -659,6 +661,13 @@ def build_agentos_app(
             lease / ``runtime_handle`` mutation — this composition hosts the AgentOS SURFACE only and
             is NOT the per-instance executor (that stays authority-bound in ``deploy.py``). Defaults to
             ``False`` (the wrapper genuinely drives the adapter — the test-harness / non-served path).
+        replay_catalog: ADDITIVE — the ALREADY-BUILT, authoritative R-2 :class:`ReplayCatalog` the served
+            composition built ONCE (in ``create_server_app``). Threaded straight into ``create_app`` so the
+            served path builds the hash-verified catalog exactly ONCE — NOT a second env-built throwaway.
+            Passing it also removes the latent trust hazard of the served ``app.state.replay_catalog``
+            depending on statement ordering + agno's in-place base-app mutation to overwrite a divergent,
+            ``os.environ``-built catalog. ``None`` (default) keeps the standalone behaviour: ``create_app``
+            env-builds its own catalog (backward-compatible for direct ``build_agentos_app`` callers/tests).
 
     Returns:
         The OUTERMOST :class:`DenyByDefaultGuard` ASGI app wrapping the composed FastAPI app.
@@ -671,8 +680,10 @@ def build_agentos_app(
 
     hosted_agents: list[VeridexAgentAdapter] = [adapter, *(extra_agents or [])]
 
-    # (1) veridex routes FIRST.
-    veridex_app = create_app(store=store, settings=settings)
+    # (1) veridex routes FIRST. Thread the SERVER's already-built catalog through so the served path
+    # builds the hash-verified R-2 catalog ONCE (no env-built throwaway, no double copytree, no reliance
+    # on statement-ordering to overwrite a divergent catalog). None -> create_app env-builds its own.
+    veridex_app = create_app(store=store, settings=settings, replay_catalog=replay_catalog)
     # (1a) additive base routers (currently only the /readyz probe) — on the base app BEFORE the
     # snapshot so they are veridex-owned/self-gated (they PASS the guard), never agno-native + denied.
     # SECURITY: because such a route bypasses the guard, each one MUST be in the hardcoded public

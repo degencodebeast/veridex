@@ -694,3 +694,46 @@ def test_m3_readyz_ready_when_catalog_has_a_loadable_admitted_pack(tmp_path) -> 
     resp = TestClient(app).get("/readyz")
     assert resp.status_code == 200, resp.status_code
     assert resp.json()["checks"]["replay_pack_catalog"] is True
+
+
+# --- R-3 fold: the ONCE-built catalog is threaded through (no env-built throwaway) ---
+
+
+def test_build_agentos_app_threads_provided_catalog(monkeypatch) -> None:
+    """The served composition builds the R-2 catalog ONCE and threads it through.
+
+    ``build_agentos_app(replay_catalog=X)`` must expose the SAME object on the composed
+    ``app.state.replay_catalog`` — NOT a second, env-built catalog. Identity (``is``) proves the
+    provided catalog was used verbatim and the ``os.environ`` build was skipped (even with a bogus
+    ``REPLAY_PACK_ROOT`` set, which an env-build would have scanned).
+    """
+    from agno.db.in_memory import InMemoryDb
+
+    from veridex.ingest.replay_catalog import build_catalog
+
+    # A bogus env root: were the served path to env-build, it would scan THIS (and get a different
+    # object). The provided catalog must win — env is never consulted.
+    monkeypatch.setenv("REPLAY_PACK_ROOT", "/nonexistent/should-never-be-scanned")
+    provided = build_catalog("")  # a distinct, empty ReplayCatalog instance (identity sentinel)
+
+    guard = svc.build_agentos_app(
+        store=InMemoryStore(),
+        settings=_settings(),
+        adapter=_mm_adapter(),
+        owner_db=InMemoryDb(),
+        verifier=_fake_verifier,
+        replay_catalog=provided,
+    )
+    assert guard.app.state.replay_catalog is provided
+
+
+def test_create_app_uses_provided_catalog_and_skips_env(monkeypatch) -> None:
+    """``create_app(replay_catalog=X)`` uses X verbatim and does NOT scan/build from the environment."""
+    from veridex.api.router import create_app
+    from veridex.ingest.replay_catalog import build_catalog
+
+    monkeypatch.setenv("REPLAY_PACK_ROOT", "/nonexistent/should-never-be-scanned")
+    provided = build_catalog("")
+
+    app = create_app(store=InMemoryStore(), replay_catalog=provided)
+    assert app.state.replay_catalog is provided
