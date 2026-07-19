@@ -85,8 +85,12 @@ export function CreateCompetitionScreen({
   launchApi?: LaunchApi;
   onLaunched?: (competitionId: string) => void;
 }) {
-  const [type, setType] = useState<CompetitionType>('live_arena');
-  const [source, setSource] = useState<SourceMode>('live');
+  // MAJOR-1 honesty: default to a REPLAY competition. The backend `start` runs a recorded tape
+  // (build_demo_ticks) unconditionally and only echoes source_mode, so a "live" default would ship a
+  // tape mislabeled live end-to-end. Default replay + gate the Live source option (below) until a real
+  // live feed is wired — a tape run must never be presented as live.
+  const [type, setType] = useState<CompetitionType>('replay_arena');
+  const [source, setSource] = useState<SourceMode>('replay');
   const [exec, setExec] = useState<ExecutionMode>('paper');
   const [fixtureId, setFixtureId] = useState<number>(
     FIXTURES.some((f) => f.fixture_id === initialFixtureId) ? (initialFixtureId as number) : (FIXTURES[0]?.fixture_id ?? 0),
@@ -174,13 +178,22 @@ export function CreateCompetitionScreen({
               ))}
             </div>
             <div className={styles.controls}>
-              <label className={styles.field}>
+              {/* A <div> (not <label>): a label must not wrap a radiogroup — the group carries its own
+                  aria-label, and wrapping would fold the label + note text into the first radio's
+                  accessible name. */}
+              <div className={styles.field}>
                 <span className={styles.label}>Source</span>
                 <SegmentedControl<SourceMode>
                   ariaLabel="Source mode" value={source} onChange={setSource}
-                  options={[{ value: 'live', label: 'Live' }, { value: 'replay', label: 'Replay' }]}
+                  options={[{ value: 'replay', label: 'Replay' }, { value: 'live', label: 'Live', locked: true }]}
                 />
-              </label>
+                {/* MAJOR-1: Live is gated closed (fail-closed, mirroring the deploy path) — there is no
+                    live TxLINE feed wired, so every run is a recorded replay. Never offer a selectable
+                    "live" source that silently runs the demo tape. */}
+                <span className={styles.sourceNote} data-testid="source-live-note">
+                  Live is unavailable — no live TxLINE feed is wired yet, so every run uses a recorded replay.
+                </span>
+              </div>
               <label className={styles.field}>
                 <span className={styles.label}>Execution</span>
                 <SegmentedControl<ExecutionMode>

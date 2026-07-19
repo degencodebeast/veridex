@@ -59,6 +59,42 @@ describe('CreateCompetitionScreen (REQ-015 / SEC-009)', () => {
   });
 });
 
+// ── F-4 MAJOR-1: live-source honesty ─────────────────────────────────────────────────────────────
+// The backend `start` runs a recorded tape (build_demo_ticks) unconditionally and only echoes
+// source_mode, so a "live" wizard run would ship a tape dishonestly labeled live. Plan F-4 forbids
+// offering a "live" source that silently runs the demo tape: default to replay, and gate "live"
+// behind a real feed. These assertions FAIL on the pre-fix default (source='live', Live ungated).
+describe('CreateCompetitionScreen — F-4 MAJOR-1: live-source honesty (no live feed wired)', () => {
+  it('defaults to REPLAY source — never live — because a run is a recorded tape, not a live feed', () => {
+    render(<CreateCompetitionScreen />);
+    const summarySource = within(screen.getByTestId('pinned-config')).getByTestId('summary-source');
+    expect(summarySource).toHaveTextContent(/replay/i);
+    expect(summarySource).not.toHaveTextContent(/\blive\b/i);
+  });
+
+  it('gates the "Live" source option (disabled) with an honest no-feed note — never a selectable live claim', () => {
+    render(<CreateCompetitionScreen />);
+    const sourceGroup = screen.getByRole('radiogroup', { name: /source mode/i });
+    // Select the Live radio by its text (the wizard's <label> mis-attributes an accessible name to the
+    // first radio, so query by content, not name) and assert it is genuinely disabled + honestly noted.
+    const live = within(sourceGroup).getAllByRole('radio').find((r) => /live/i.test(r.textContent ?? ''));
+    expect(live).toBeDefined();
+    expect(live).toHaveAttribute('aria-disabled', 'true');
+    expect(live).toHaveAttribute('aria-checked', 'false');
+    expect(screen.getByTestId('source-live-note')).toHaveTextContent(/no live .*feed .*wired|recorded replay/i);
+  });
+
+  it('a default tape run is sent to the backend as replay, never live (untouched source axis)', async () => {
+    const user = userEvent.setup();
+    const api = okApi();
+    render(<CreateCompetitionScreen connected loadInstances={vi.fn().mockResolvedValue(TWO_INSTANCES)} launchApi={api} />);
+    await selectBothInstances(user); // deliberately do NOT touch the source control — exercise the default
+    await user.click(screen.getByTestId('launch-button'));
+    await waitFor(() => expect(api.create).toHaveBeenCalled());
+    expect((api.create as ReturnType<typeof vi.fn>).mock.calls[0][0]).toMatchObject({ source_mode: 'replay' });
+  });
+});
+
 // ── F-4: roster + launch progression ─────────────────────────────────────────────────────────────
 describe('CreateCompetitionScreen — roster (F-4 · owner-scoped, honest states)', () => {
   it('not signed in → prompts to connect wallet, never lists instances', () => {

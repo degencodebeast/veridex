@@ -21,6 +21,8 @@
 .label { font-family: var(--font-mono), monospace; font-size: 9px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--text-3); }
 .select, .input { padding: 7px 9px; border: 1px solid var(--border-soft); border-radius: var(--radius-control); background: var(--panel-2); color: var(--text-1); font-size: 12px; }
 .input::placeholder { color: var(--text-3); }
+/* MAJOR-1: honest note under the gated Live source option (no live feed wired). */
+.sourceNote { font-family: var(--font-mono), monospace; font-size: 9px; line-height: 1.4; color: var(--warning-hi); }
 
 .checks { display: flex; flex-wrap: wrap; gap: var(--space-2); }
 .check { display: inline-flex; align-items: center; gap: 6px; padding: 6px 10px; border: 1px solid var(--border-soft); border-radius: var(--radius-control); background: var(--panel-2); font-size: 11px; color: var(--text-1); cursor: pointer; }
