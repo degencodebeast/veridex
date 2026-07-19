@@ -234,6 +234,14 @@ async def _run_arena(
     overflow_signal = manager._overflow_signal(queue)
     forwarder: asyncio.Task[None] | None = None
     overflow_closer = asyncio.create_task(_close_on_overflow(websocket, overflow_signal))
+    owner = asyncio.current_task()
+    assert owner is not None
+
+    def wake_owner(_completed: asyncio.Future[None]) -> None:
+        if not owner.done():
+            owner.cancel()
+
+    overflow_closer.add_done_callback(wake_owner)
     try:
         # 1. Replay the persisted tail (strict seq > since_seq), tracking the boundary.
         replayed = await store.list_competition_events(competition_id, since_seq=since_seq)
@@ -244,6 +252,7 @@ async def _run_arena(
 
         # 2. Hand off to the live drain (queue → socket, seq-deduped against replay).
         forwarder = asyncio.create_task(_forward_live(websocket, queue, last_sent_seq))
+        forwarder.add_done_callback(wake_owner)
 
         # 3. Read-only liveness loop: consume inbound frames purely to detect disconnect.
         #    Inbound client data is intentionally ignored — it can never mutate state (REQ-213).
@@ -253,12 +262,22 @@ async def _run_arena(
             message = await websocket.receive()
             if message["type"] == "websocket.disconnect":
                 break
+    except asyncio.CancelledError:
+        # A terminal child wakes the receive supervisor by cancellation. Preserve true external
+        # cancellation when neither child completed, and surface unexpected child exceptions.
+        completed = [task for task in (forwarder, overflow_closer) if task is not None and task.done()]
+        if not completed:
+            raise
+        for task in completed:
+            await task
     except (WebSocketDisconnect, RuntimeError):
         pass  # client vanished mid-send — fall through to cleanup
     finally:
         # Cancel and join every child task so blocked send/receive operations cannot leak.
         try:
             tasks = [task for task in (forwarder, overflow_closer) if task is not None]
+            for task in tasks:
+                task.remove_done_callback(wake_owner)
             for task in tasks:
                 if not task.done():
                     task.cancel()

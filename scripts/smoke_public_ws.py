@@ -13,7 +13,9 @@ import os
 import ssl
 import struct
 import sys
+import threading
 from collections.abc import Awaitable, Callable
+from functools import partial
 from typing import Any, NamedTuple
 from urllib.parse import quote, urlencode, urlsplit, urlunsplit
 from urllib.request import Request, urlopen
@@ -34,6 +36,8 @@ FetchEvents = Callable[[str, float], Awaitable[list[dict[str, Any]]]]
 ConnectFactory = Callable[..., Any]
 
 _WEBSOCKET_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+_MAX_HTTP_RESPONSE_BYTES = 1024 * 1024
+_MAX_CANONICAL_EVENTS = 10_000
 
 
 def _urls(base_url: str, competition_id: str, since_seq: int) -> tuple[str, str]:
@@ -62,15 +66,46 @@ async def _fetch_events(url: str, timeout: float) -> list[dict[str, Any]]:
         with urlopen(request, timeout=timeout) as response:  # noqa: S310 - validated http(s) URL
             if response.status != 200:
                 raise SmokeError(f"canonical event tail returned HTTP {response.status}")
-            payload = json.load(response)
+            body = response.read(_MAX_HTTP_RESPONSE_BYTES + 1)
+        if len(body) > _MAX_HTTP_RESPONSE_BYTES:
+            raise SmokeError("canonical event response exceeded the response-size bound")
+        try:
+            payload = json.loads(body)
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise SmokeError("canonical event tail returned invalid JSON") from exc
         if not isinstance(payload, list):
             raise SmokeError("canonical event tail must be a JSON array")
         return payload
 
-    return await asyncio.to_thread(fetch)
+    loop = asyncio.get_running_loop()
+    result: asyncio.Future[list[dict[str, Any]]] = loop.create_future()
+
+    def publish(*, value: list[dict[str, Any]] | None = None, error: BaseException | None = None) -> None:
+        if result.done():
+            return
+        if error is not None:
+            result.set_exception(error)
+        else:
+            assert value is not None
+            result.set_result(value)
+
+    def run_fetch() -> None:
+        try:
+            value = fetch()
+        except BaseException as exc:
+            callback = partial(publish, error=exc)
+        else:
+            callback = partial(publish, value=value)
+        with contextlib.suppress(RuntimeError):
+            loop.call_soon_threadsafe(callback)
+
+    threading.Thread(target=run_fetch, name="public-smoke-http", daemon=True).start()
+    return await asyncio.wait_for(result, timeout=timeout)
 
 
 def _validate_canonical(events: list[dict[str, Any]]) -> None:
+    if len(events) > _MAX_CANONICAL_EVENTS:
+        raise SmokeError("canonical event tail exceeded the event-count bound")
     if len(events) < 2:
         raise SmokeError("canonical event tail needs at least two events to prove reconnect replay")
     seqs: list[int] = []
@@ -266,6 +301,13 @@ def _default_connect(url: str, **options: object) -> Any:
     )
 
 
+def _remaining(deadline: float) -> float:
+    remaining = deadline - asyncio.get_running_loop().time()
+    if remaining <= 0:
+        raise TimeoutError("public WebSocket acceptance deadline exceeded")
+    return remaining
+
+
 async def run_public_ws_smoke(
     base_url: str,
     competition_id: str,
@@ -279,43 +321,51 @@ async def run_public_ws_smoke(
     if timeout <= 0 or quiet_timeout <= 0:
         raise SmokeError("timeouts must be positive")
 
-    rest_url, initial_ws_url = _urls(base_url, competition_id, since_seq=0)
-    canonical = await fetch_events(rest_url, timeout)
-    _validate_canonical(canonical)
-    options = {
-        "open_timeout": timeout,
-        "close_timeout": min(timeout, 5),
-        "ping_timeout": timeout,
-        "max_size": 1024 * 1024,
-        "max_queue": 16,
-    }
+    deadline = asyncio.get_running_loop().time() + timeout
+    async with asyncio.timeout_at(deadline):
+        rest_url, initial_ws_url = _urls(base_url, competition_id, since_seq=0)
+        canonical = await fetch_events(rest_url, _remaining(deadline))
+        _validate_canonical(canonical)
 
-    async with connect_factory(initial_ws_url, **options) as socket:
-        first = await _recv_json(socket, timeout)
-    if first != canonical[0]:
-        raise SmokeError("first WebSocket event does not match the canonical REST event")
+        def connection_options() -> dict[str, float | int]:
+            remaining = _remaining(deadline)
+            return {
+                "open_timeout": remaining,
+                "close_timeout": min(remaining, 5),
+                "ping_timeout": remaining,
+                "max_size": 1024 * 1024,
+                "max_queue": 16,
+            }
 
-    first_seq = first["seq"]
-    expected_tail = [event for event in canonical if event["seq"] > first_seq]
-    _, reconnect_ws_url = _urls(base_url, competition_id, since_seq=first_seq)
-    replayed: list[dict[str, Any]] = []
-    async with connect_factory(reconnect_ws_url, **options) as socket:
-        for _ in expected_tail:
-            replayed.append(await _recv_json(socket, timeout))
-        try:
-            extra = await _recv_json(socket, quiet_timeout)
-        except TimeoutError:
-            pass
-        else:
-            raise SmokeError(f"reconnect returned an unexpected extra event with seq={extra.get('seq')!r}")
+        async with connect_factory(initial_ws_url, **connection_options()) as socket:
+            first = await _recv_json(socket, _remaining(deadline))
+        if first != canonical[0]:
+            raise SmokeError("first WebSocket event does not match the canonical REST event")
 
-    if replayed != expected_tail:
-        raise SmokeError("reconnect did not return the exact canonical missing tail")
-    replayed_seqs = tuple(event["seq"] for event in replayed)
-    combined = (first_seq, *replayed_seqs)
-    if len(combined) != len(set(combined)):
-        raise SmokeError("duplicate sequence observed across disconnect and reconnect")
-    return SmokeResult(first_seq=first_seq, replayed_seqs=replayed_seqs)
+        first_seq = first["seq"]
+        expected_tail = [event for event in canonical if event["seq"] > first_seq]
+        _, reconnect_ws_url = _urls(base_url, competition_id, since_seq=first_seq)
+        replayed: list[dict[str, Any]] = []
+        async with connect_factory(reconnect_ws_url, **connection_options()) as socket:
+            for _ in expected_tail:
+                replayed.append(await _recv_json(socket, _remaining(deadline)))
+            remaining = _remaining(deadline)
+            deadline_limited = remaining <= quiet_timeout
+            try:
+                extra = await _recv_json(socket, min(quiet_timeout, remaining))
+            except TimeoutError:
+                if deadline_limited:
+                    raise
+            else:
+                raise SmokeError(f"reconnect returned an unexpected extra event with seq={extra.get('seq')!r}")
+
+        if replayed != expected_tail:
+            raise SmokeError("reconnect did not return the exact canonical missing tail")
+        replayed_seqs = tuple(event["seq"] for event in replayed)
+        combined = (first_seq, *replayed_seqs)
+        if len(combined) != len(set(combined)):
+            raise SmokeError("duplicate sequence observed across disconnect and reconnect")
+        return SmokeResult(first_seq=first_seq, replayed_seqs=replayed_seqs)
 
 
 def _parse_args() -> argparse.Namespace:
