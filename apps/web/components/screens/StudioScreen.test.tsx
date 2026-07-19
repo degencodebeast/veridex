@@ -1,9 +1,10 @@
+import { cloneElement, type ReactElement } from 'react';
 import { readFileSync, existsSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { render, screen, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
-import { StudioScreen, buildDeployPayload } from '@/components/screens/StudioScreen';
+import { StudioScreen, buildDeployPayload, UnsupportedStrategyError } from '@/components/screens/StudioScreen';
 import { PREFLIGHT_DISCLAIMER } from '@/lib/studio/preflight';
 import { DEFAULT_POLICY_ENVELOPE, MM_POLICY_ENVELOPE } from '@/lib/fixtures/catalog';
 import { GLOSSARY } from '@/lib/glossary';
@@ -746,12 +747,46 @@ describe('StudioScreen (REQ-018 / AC-007 / SEC-006/007/009)', () => {
     // RED-3b (unit): buildDeployPayload THROWS rather than silently substitute for an unsupported combo.
     it('buildDeployPayload THROWS for value_clv/contrarian/stale_line deterministic — never returns momentum-sharp', () => {
       for (const arche of ['value_clv', 'contrarian', 'stale_line'] as const) {
-        expect(() => buildDeployPayload(arche, 'numeric', 'paper', 'replay', null)).toThrow();
+        // Assert the SPECIFIC exported error type (not a bare throw): a strategy the card does not
+        // name must fail as an UnsupportedStrategyError — the typed net pin() relies on to fail closed.
+        expect(() => buildDeployPayload(arche, 'numeric', 'paper', 'replay', null)).toThrow(UnsupportedStrategyError);
         // Guard the exact dishonesty: it must NOT return a momentum-sharp payload for these.
         let emitted: unknown = null;
         try { emitted = buildDeployPayload(arche, 'numeric', 'paper', 'replay', null); } catch { /* expected */ }
         expect(emitted).toBeNull();
       }
+    });
+
+    // RED-3c (component, F-1 fold): if a caller BYPASSES the disabled deploy affordance and drives
+    // pin() for an unsupported combo, buildDeployPayload's UnsupportedStrategyError must be CAUGHT —
+    // surfacing a VISIBLE deploy failure and RESETTING the deploying state — never a stuck
+    // "DEPLOYING…" spinner, and never a navigation. (Pre-fix: the payload build ran outside the try,
+    // so the throw was an unhandled rejection that left the UI stuck deploying.)
+    it('pin() with a bypassed unsupported-strategy affordance surfaces a visible failure, resets the deploying state, and never navigates', async () => {
+      const user = userEvent.setup();
+      const onPin = vi.fn();
+      const fetchMock = vi.fn(async () => okDeploy());
+      vi.stubGlobal('fetch', fetchMock);
+      // Simulate the bypassed affordance: the deploy gate force-enables the button (strips `disabled`)
+      // while preserving its real onClick=pin — the exact defense-in-depth case the throw exists for.
+      render(
+        <StudioScreen
+          onPin={onPin}
+          deployGate={(btn) => cloneElement(btn as ReactElement<{ disabled?: boolean }>, { disabled: false })}
+        />,
+      );
+
+      // value_clv (deterministic) is LLM-locked AND has no distinct backend strategy → pin() throws.
+      await user.selectOptions(screen.getByLabelText(/archetype/i), 'value_clv');
+      await user.click(screen.getByRole('button', { name: /pin config & queue run/i }));
+
+      // The throw surfaces a VISIBLE deploy failure (same channel as every other deploy error)…
+      expect(await screen.findByTestId('deploy-preflight-error')).toBeInTheDocument();
+      // …the deploying state RESETS — never a stuck "DEPLOYING…" spinner…
+      expect(screen.queryByText(/DEPLOYING/i)).toBeNull();
+      // …no deploy is POSTed and navigation NEVER fires.
+      expect(fetchMock).not.toHaveBeenCalled();
+      expect(onPin).not.toHaveBeenCalled();
     });
 
     // RED-4: LLM-Drift is ARENA-ONLY — a "Use in Arena" affordance and NO standalone deploy button.

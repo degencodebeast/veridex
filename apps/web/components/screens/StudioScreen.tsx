@@ -315,17 +315,22 @@ export function StudioScreen({
     setDeploying(true);
     setPreflightFailure(null);
     setRunId(null);
-    const payload = buildDeployPayload(archetype, mode, exec, source, templateId);
-    // ONE stable Idempotency-Key per logical submit (I-3). Reuse the held key IFF this payload is
-    // byte-identical to the one it was minted for — so a retry after a timeout reconciles to the SAME
-    // instance, while a genuine config change mints a fresh key (the backend 409s a reused key with a
-    // different config). Fingerprinting the payload (not click events) makes a no-op interaction inert.
-    const fingerprint = JSON.stringify(payload);
-    if (!idempotencyKeyRef.current || idempotencyKeyRef.current.fingerprint !== fingerprint) {
-      idempotencyKeyRef.current = { key: newIdempotencyKey(), fingerprint };
-    }
-    const idempotencyKey = idempotencyKeyRef.current.key;
     try {
+      // Build the payload INSIDE the try: buildDeployPayload throws UnsupportedStrategyError for a
+      // bypassed-affordance deploy (a strategy the card does not name). Keeping the build outside the
+      // try left that throw as an UNHANDLED rejection AFTER setDeploying(true) — the UI stuck on
+      // "DEPLOYING…" forever with no surfaced failure. Inside the try, the throw routes to the same
+      // visible fail-closed channel below and `finally` resets the deploying state (F-1 fold).
+      const payload = buildDeployPayload(archetype, mode, exec, source, templateId);
+      // ONE stable Idempotency-Key per logical submit (I-3). Reuse the held key IFF this payload is
+      // byte-identical to the one it was minted for — so a retry after a timeout reconciles to the SAME
+      // instance, while a genuine config change mints a fresh key (the backend 409s a reused key with a
+      // different config). Fingerprinting the payload (not click events) makes a no-op interaction inert.
+      const fingerprint = JSON.stringify(payload);
+      if (!idempotencyKeyRef.current || idempotencyKeyRef.current.fingerprint !== fingerprint) {
+        idempotencyKeyRef.current = { key: newIdempotencyKey(), fingerprint };
+      }
+      const idempotencyKey = idempotencyKeyRef.current.key;
       const result = await deployAgent(payload, idempotencyKey);
       // SUCCESS: use the REAL result — surface the run_id AND hand the resolved instance to the
       // navigation callback so the page routes to /instances/{instance_id}. Clear the key: the next
@@ -337,6 +342,9 @@ export function StudioScreen({
       // FAILURE: STAY on Studio and surface the named fail-closed check in place (no navigation).
       // KEEP the Idempotency-Key so a retry of this same submit reuses it (idempotent reconcile).
       if (err instanceof DeployPreflightError) setPreflightFailure(err.failedChecks);
+      // A bypassed-affordance unsupported combo surfaces as a NAMED fail-closed check — never a
+      // silent stuck spinner (the deploy affordance is disabled first; this is defense-in-depth).
+      else if (err instanceof UnsupportedStrategyError) setPreflightFailure(['unsupported_strategy']);
       else setPreflightFailure(['deploy_unavailable']);
     } finally {
       setDeploying(false);
