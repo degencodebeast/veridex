@@ -246,6 +246,8 @@ fi
 echo "---"
 if [ "$FAILURES" -eq 0 ]; then
   echo "ALL CHECKS PASSED"
+  # Stable machine sentinel for programmatic checks (e.g. the D-1 compose-deploy test greps this).
+  echo "SMOKE_OK"
   exit 0
 else
   echo "SMOKE FAILED (${FAILURES} checks)"
