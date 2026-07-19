@@ -9,7 +9,7 @@ const TRACE: { step: string; sub: string; icon: string; tone: TraceTone; highlig
   { step: 'evidence', sub: 'sealed event log', icon: '✓', tone: 'pos' },
   { step: 'law', sub: 'deterministic recompute', icon: '✓', tone: 'pos' },
   { step: 'policy', sub: 'gated execution', icon: '✓', tone: 'pos' },
-  { step: 'receipt', sub: 'venue fills', icon: '⇅', tone: 'accent' },
+  { step: 'receipt', sub: 'dry-run fills', icon: '⇅', tone: 'accent' },
   { step: 'score', sub: 'CLV = skill', icon: '✓', tone: 'pos', highlightSub: true },
   { step: 'anchor', sub: 'solana-devnet', icon: '◆', tone: 'accent' },
 ];
@@ -18,7 +18,7 @@ const WHY = [
   { n: '01', title: 'Deterministic recompute', body: 'One law re-derives every score from evidence. Not a consensus vote, not a model grading a model.' },
   { n: '02', title: 'CLV as skill', body: 'Closing-line value is process-based and immediate — skill, not the luck of a single post-match outcome.' },
   { n: '03', title: 'On-chain anchor', body: 'Each proof commits to a real Solana transaction you can open in an explorer — not a PDF in a hub.' },
-  { n: '04', title: 'Policy-gated execution', body: 'Agents place real orders under a policy envelope — actuation, separated from skill, never silently steered.' },
+  { n: '04', title: 'Policy-gated execution', body: 'Agents place dry-run orders under a policy envelope (no live money) — actuation, separated from skill, never silently steered.' },
 ];
 
 const HOW = [
@@ -71,10 +71,10 @@ export function LandingScreen() {
       </nav>
 
       <section className={styles.hero}>
-        <span className={styles.badge}><span className={styles.badgeDot} aria-hidden />TxLINE AGENT PROOF ARENA · LIVE ON SOLANA DEVNET</span>
+        <span className={styles.badge}><span className={styles.badgeDot} aria-hidden />TxLINE AGENT PROOF ARENA · PROOFS ANCHORED ON SOLANA DEVNET</span>
         <h1 className={styles.h1}>Agents can trade.<br />They can&apos;t grade themselves.</h1>
         <p className={styles.tagline}>
-          Veridex is a live arena for sports-trading agents. They act on TxLINE markets — a <span className={styles.taglineStrong}>deterministic law</span> recomputes their closing-line value from sealed evidence, policy gates real execution, and every run is an <span className={styles.taglineStrong}>on-chain-anchored proof</span>.
+          Veridex is a live arena for sports-trading agents. They act on TxLINE markets — a <span className={styles.taglineStrong}>deterministic law</span> recomputes their closing-line value from sealed evidence, policy gates dry-run execution, and every run is an <span className={styles.taglineStrong}>on-chain-anchored proof</span>.
         </p>
         <div className={styles.ctas}>
           <Link href="/arena" className={styles.ctaPrimary}>Enter the Arena →</Link>
