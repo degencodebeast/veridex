@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { readFileSync } from 'node:fs';
+import { readFileSync, readdirSync } from 'node:fs';
 import { resolve } from 'node:path';
 
 // DRIFT GUARD. lib/mock.ts imports these wire fixtures at BUILD time, but the app's Docker image
@@ -11,15 +11,10 @@ import { resolve } from 'node:path';
 // excluded from the Docker image, which only needs the vendored copies.
 const CANONICAL = resolve(__dirname, '../../../../../contracts/fixtures');
 
-const VENDORED = [
-  'proof_artifact.json',
-  'verify_response.json',
-  'leaderboard.json',
-  'competition_state.json',
-  'inspector_record.json',
-  'feed_health.json',
-  'maker_arena_result.json',
-] as const;
+// Derived, not hardcoded: every *.json vendored next to mock.ts is guarded automatically, so a
+// future 8th vendored fixture can never slip in unguarded. A vendored file with no repo-root
+// counterpart fails correctly on the canonical readFileSync below.
+const VENDORED = readdirSync(__dirname).filter((f) => f.endsWith('.json')).sort();
 
 describe('wire fixture vendoring — apps/web copies stay byte-identical to the frozen contract', () => {
   for (const name of VENDORED) {
