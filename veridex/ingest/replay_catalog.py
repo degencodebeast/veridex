@@ -53,6 +53,17 @@ class CatalogVerificationError(Exception):
     """
 
 
+class CatalogAdmissionError(ValueError):
+    """Raised when :meth:`ReplayCatalog.register_pack` refuses a pack on an ADMISSION-POLICY boundary.
+
+    Distinct from :class:`CatalogVerificationError` (the pack failed hash-verification): here the pack
+    verifies fine but violates the read-only-curated boundary — it either resolves UNDER the curated
+    root, or its ``pack_id`` COLLIDES with an existing CURATED-SEED entry (a runtime-registered capture
+    pack may never REPLACE a curated seed). Subclasses :class:`ValueError` so the boundary refusal reads
+    as a caller/argument error to existing handlers.
+    """
+
+
 @dataclass(frozen=True)
 class CatalogEntry:
     """One allowlisted, hash-verified pack in the catalog.
@@ -202,8 +213,12 @@ class ReplayCatalog:
         re-registered ``pack_id`` REFRESHES its entry.
 
         The curated root is READ-ONLY: registering a pack that resolves under the curated root is
-        REFUSED (deployed capture must publish to the writable capture root). This method never WRITES
-        any file — it only reads and hash-verifies ``pack_dir``.
+        REFUSED, and a capture pack whose ``pack_id`` COLLIDES with an existing CURATED-SEED entry is
+        REFUSED too — a runtime-registered writable-root pack may never REPLACE a curated seed's catalog
+        entry (deployed capture must publish to the writable capture root, and startup already gives
+        curated seeds precedence on collision). A genuinely NEW ``pack_id`` still registers, and
+        re-registering a non-curated ``pack_id`` REFRESHES it. This method never WRITES any file — it
+        only reads and hash-verifies ``pack_dir``.
 
         Args:
             pack_dir: Directory of the freshly-captured pack under the writable capture root.
@@ -212,7 +227,8 @@ class ReplayCatalog:
             The promoted :class:`CatalogEntry`.
 
         Raises:
-            ValueError: If ``pack_dir`` resolves under the read-only curated root.
+            CatalogAdmissionError: If ``pack_dir`` resolves under the read-only curated root, or its
+                ``pack_id`` collides with an existing curated-seed entry (both ``ValueError`` subtypes).
             CatalogVerificationError: If the pack fails hash-verification (not promoted).
         """
         pack_dir = Path(pack_dir)
@@ -226,6 +242,16 @@ class ReplayCatalog:
             )
 
         with self._lock:
+            # Boundary guard (under the lock so the decision reflects the live catalog): a runtime
+            # capture-root registration may NEVER replace a curated-seed entry. Startup gives curated
+            # seeds precedence via setdefault; this closes the same hole on the runtime promote path.
+            existing = self._entries.get(entry.pack_id)
+            if existing is not None and self._resolves_under_curated(existing.pack_dir):
+                raise CatalogAdmissionError(
+                    f"refusing to register {pack_dir}: pack_id {entry.pack_id!r} collides with a "
+                    f"READ-ONLY curated-seed entry at {existing.pack_dir}; a runtime-registered capture "
+                    "pack may never replace a curated seed"
+                )
             # Copy-on-write: build a fresh mapping and swap the reference atomically. Never mutate the
             # existing dict in place, so lock-free readers never observe a half-updated catalog.
             updated = dict(self._entries)
@@ -235,18 +261,22 @@ class ReplayCatalog:
 
     def _reject_curated_root_writes(self, pack_dir: Path) -> None:
         """Refuse to register a pack that resolves under the READ-ONLY curated root (boundary guard)."""
-        if self._curated_root is None:
-            return
-        try:
-            resolved = pack_dir.resolve()
-            curated = self._curated_root.resolve()
-        except OSError:
-            return
-        if resolved == curated or curated in resolved.parents:
-            raise ValueError(
+        if self._resolves_under_curated(pack_dir):
+            raise CatalogAdmissionError(
                 f"refusing to register {pack_dir} under the READ-ONLY curated root {self._curated_root}; "
                 "deployed capture must publish to the separate writable capture root"
             )
+
+    def _resolves_under_curated(self, path: Path) -> bool:
+        """Return ``True`` iff ``path`` is the curated root itself or lives beneath it (boundary test)."""
+        if self._curated_root is None:
+            return False
+        try:
+            resolved = path.resolve()
+            curated = self._curated_root.resolve()
+        except OSError:
+            return False
+        return resolved == curated or curated in resolved.parents
 
 
 def build_catalog(

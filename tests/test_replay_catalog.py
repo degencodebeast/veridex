@@ -26,6 +26,7 @@ from veridex.ingest.capture_chain import (
 )
 from veridex.ingest.recorder import SessionMeta, envelope_line
 from veridex.ingest.replay_catalog import (
+    CatalogAdmissionError,
     CatalogVerificationError,
     ReplayCatalog,
     build_catalog,
@@ -247,6 +248,39 @@ def test_red_d_curated_root_never_written(tmp_path: Path) -> None:
 
     after = _dir_fingerprint(curated)
     assert before == after  # curated tree byte-and-mtime identical — the scan/register never wrote it
+
+
+def test_red_d_register_refuses_curated_seed_pack_id_collision(tmp_path: Path) -> None:
+    """A capture-root pack whose pack_id COLLIDES with a curated seed must NOT replace the genuine
+    seed's catalog entry — the runtime writable-root promotion path can never overwrite a curated
+    seed (load-bearing once R-3 exposes registration). A genuinely NEW pack_id still registers."""
+    curated = tmp_path / "curated"
+    curated.mkdir()
+    # A GENUINE curated seed named "shared".
+    _copy_real_pack(curated / "shared")
+    capture = tmp_path / "capture"
+    capture.mkdir()
+    catalog = build_catalog(curated, capture_root=capture)
+    seed_entry = catalog.get("shared")
+    assert seed_entry is not None and seed_entry.is_genuine is True
+
+    # A DIFFERENT (synthetic) pack under the writable capture root, colliding on pack_id "shared".
+    collider = _make_synthetic_pack(tmp_path, "capture/shared", fixture_id=5)
+    assert collider.name == "shared"
+
+    with pytest.raises(CatalogAdmissionError):
+        catalog.register_pack(collider)
+
+    # The curated seed's entry is UNCHANGED — still the genuine one, never replaced.
+    after = catalog.get("shared")
+    assert after is seed_entry
+    assert after.is_genuine is True
+    assert after.provenance == GENUINE_TXLINE_PROVENANCE
+
+    # A genuinely NEW pack_id still registers fine (the refusal is collision-specific, not blanket).
+    fresh = _make_synthetic_pack(tmp_path, "capture/fresh", fixture_id=9)
+    entry = catalog.register_pack(fresh)
+    assert entry.pack_id == "fresh" and "fresh" in catalog
 
 
 def test_red_d_register_refuses_curated_root_pack(tmp_path: Path) -> None:
