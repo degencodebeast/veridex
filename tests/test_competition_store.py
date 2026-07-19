@@ -132,7 +132,7 @@ async def test_competition_round_trip() -> None:
     s = InMemoryStore()
     comp = _make_competition("c1")
     await s.create_competition(comp)
-    await s.add_agent_entry("c1", _make_entry())
+    await s.add_agent_entry_guarded("c1", _make_entry(), mutable_statuses=_MUTABLE)
     await s.update_competition_status("c1", CompetitionStatus.OPEN)
     got = await s.get_competition("c1")
     assert got.status is CompetitionStatus.OPEN
@@ -415,7 +415,7 @@ async def test_postgres_competition_store_round_trip() -> None:
     # Competition CRUD
     comp = _make_competition("pg_c1_task4")
     await store.create_competition(comp)
-    await store.add_agent_entry("pg_c1_task4", _make_entry("pg_agent"))
+    await store.add_agent_entry_guarded("pg_c1_task4", _make_entry("pg_agent"), mutable_statuses=_MUTABLE)
     await store.update_competition_status("pg_c1_task4", CompetitionStatus.OPEN)
 
     got = await store.get_competition("pg_c1_task4")
