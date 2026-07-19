@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass, field
@@ -28,7 +29,6 @@ from fastapi import Depends, FastAPI, Header, HTTPException
 from pydantic import BaseModel
 
 from veridex.api.auth_privy import PrivyPrincipal, make_require_principal
-from veridex.api.demo_fixtures import build_demo_ticks
 from veridex.chain.anchor import anchor_memo
 from veridex.config import require_privy_provisioning
 from veridex.deploy.attempt import AttemptStatus, DeploymentAttempt, DuplicateAttemptError
@@ -36,6 +36,13 @@ from veridex.deploy.instance import AgentInstance, DeployFailureReason, DeploySt
 from veridex.deploy.preflight import MM_STRATEGY_FAMILY, DeployConfig, PreflightCheck, run_deploy_preflight
 from veridex.ingest.feed_health import FeedHealthReport
 from veridex.ingest.marketstate import MarketState
+from veridex.ingest.replay_catalog import (
+    ReplayResolutionError,
+    ResolvedReplaySource,
+    build_catalog,
+    load_resolved_marketstates,
+    resolve_replay_source,
+)
 from veridex.mm_strategy.session_factory import build_maker_policy_envelope, reconstruct_mm_session
 from veridex.runtime.mm_agent_adapter import (
     OwnerMismatchError,
@@ -107,6 +114,10 @@ class DeployResponse(BaseModel):
         run_id: The launched run id (returned WITHOUT awaiting the seal).
         owner: The SERVER-DERIVED owner identity — the authenticated Privy principal's DID
             (``did:privy:...``). Derived from the verified access token, NEVER the request body.
+        replay_binding: The FROZEN production-replay identity (R-4) a ``replay`` deploy committed to —
+            ``{pack_id, fixture_id, content_hash}``, server-derived from the verified catalog. ``None``
+            for a live deploy or an injected-tape test. Surfaces WHICH verified pack an auto-resolved
+            (unnamed) deploy replays, so an unnamed request never becomes an unidentified run.
     """
 
     instance_id: str
@@ -114,6 +125,7 @@ class DeployResponse(BaseModel):
     policy_hash: str
     run_id: str
     owner: str
+    replay_binding: dict[str, Any] | None = None
 
 
 class InstanceStatusResponse(BaseModel):
@@ -350,6 +362,16 @@ def register_deploy_routes(
     background_tasks: set[asyncio.Task[None]] = set()
     app.state.deploy_background_tasks = background_tasks
 
+    # R-4: ensure a verified ReplayPack catalog backs the deploy replay path. ``create_app`` sets
+    # ``app.state.replay_catalog`` BEFORE mounting these routes; a standalone host (or a test mounting
+    # deploy routes on a bare app) may not — so build one from the SAME env-driven curated root
+    # ``create_app`` uses, exactly once at registration. A host-provided catalog is NEVER overwritten.
+    if getattr(app.state, "replay_catalog", None) is None:
+        app.state.replay_catalog = build_catalog(
+            os.environ.get("REPLAY_PACK_ROOT", "") or None,
+            capture_root=os.environ.get("REPLAY_CAPTURE_ROOT", "") or None,
+        )
+
     # II-6 owner-kill wiring (in-process, like ``background_tasks`` — the durable record stays the
     # store's job). ``mm_run_adapters`` maps a live instance to the hosted ``VeridexAgentAdapter`` so an
     # owner kill can reach the SAME exactly-once ``acancel_run`` (AC-16) the II-4 wrapper uses — there
@@ -391,18 +413,29 @@ def register_deploy_routes(
             ) from exc
         return {"status": "ok", "provisioning_enabled": enabled}
 
-    def _resolve_replay_marketstates() -> list[MarketState]:
-        """Resolve the REPLAY source ticks: injected fakes (tests) or the in-code demo fixture.
+    def _resolve_replay_source(config: DeployConfig) -> tuple[ResolvedReplaySource | None, list[MarketState]]:
+        """Resolve the REPLAY tape + its FROZEN identity: injected fakes (tests) or the verified pack (R-4).
 
-        The default mounted route has no injected ``deps.marketstates``, so a ``replay`` deploy
-        sources the SAME deterministic, zero-I/O demo fixture the ``/demo/run`` route uses
-        (:func:`~veridex.api.demo_fixtures.build_demo_ticks`). This is a REAL replay over recorded
-        demo ticks (honestly labeled REPLAY, NEVER live) — it makes the headline flow demonstrable
-        from the real app with no injected deps and no bundled-pack file on disk (REQ-2D-703).
+        The injected ``deps.marketstates`` test seam is unchanged (returns ``(None, injected)`` — an
+        injected tape has no catalog identity). The DEFAULT mounted route (no injected deps) selects a
+        REAL, hash-verified ReplayPack from the R-2 catalog via :func:`resolve_replay_source` (Option B
+        atomic snapshot: a bound ``replay_pack_id`` is looked up exactly; unbound auto-selects the single
+        catalogued pack; multiple packs unbound -> fail closed ``pack_id_required``) and loads it through
+        the SAME ``load_pack_marketstates`` normalizer live replay uses — NEVER ``build_demo_ticks``.
+        ``config.replay_fixture_id`` is presence-aware (``0`` is a valid fixture, never "omitted"). The
+        returned :class:`ResolvedReplaySource` is FROZEN onto the instance before launch.
+
+        Raises:
+            ReplayResolutionError: Fail-closed selection (empty catalog, pack_id required, unknown
+                pack/fixture) — surfaced as a 400 at the deploy boundary, never a silent demo fallback.
         """
         if deps.marketstates is not None:
-            return list(deps.marketstates)
-        return build_demo_ticks()
+            return None, list(deps.marketstates)
+        catalog = getattr(app.state, "replay_catalog", None)
+        resolved = resolve_replay_source(
+            catalog, pack_id=config.replay_pack_id, fixture_id=config.replay_fixture_id
+        )
+        return resolved, load_resolved_marketstates(catalog, resolved)
 
     async def _launch(config: DeployConfig, run_id: str, instance_id: str, marketstates: list[MarketState]) -> None:
         """Run the deployed agent through the SINGLE seam, durably tracking the instance status.
@@ -674,9 +707,18 @@ def register_deploy_routes(
         # (non-empty) rather than a live feed. Live resolves nothing here — it is gated fail-closed
         # by the feed report (the correct 422 until a live feed is wired).
         replay_marketstates: list[MarketState] = []
+        resolved_replay: ResolvedReplaySource | None = None
         source_resolved: bool | None = None
         if config.source_mode == "replay":
-            replay_marketstates = _resolve_replay_marketstates()
+            try:
+                resolved_replay, replay_marketstates = _resolve_replay_source(config)
+            except ReplayResolutionError as exc:
+                # Fail-closed: an unresolvable/ambiguous/unverified replay source is a 400 — never a
+                # silent fallback to a synthetic tape. No instance is pinned and no run is launched.
+                raise HTTPException(
+                    status_code=400,
+                    detail={"error": "replay_source_unresolved", "reason": exc.reason, "message": str(exc)},
+                ) from None
             source_resolved = len(replay_marketstates) > 0
         checks: list[PreflightCheck] = run_deploy_preflight(
             config,
@@ -761,13 +803,16 @@ def register_deploy_routes(
                     background_tasks.add(recovery_task)
                     recovery_task.add_done_callback(_discard_recovery_task)
                 # The side effect already completed — return the SAME instance (idempotent replay /
-                # crash-recovered), launching NO second run.
+                # crash-recovered), launching NO second run. R-4: REUSE the instance's FROZEN
+                # replay_binding verbatim — the tape identity is never re-selected on retry, so an R-0b
+                # promotion between the original deploy and this retry can never change the run's tape.
                 return DeployResponse(
                     instance_id=existing.instance_id,
                     config_hash=existing.config_hash,
                     policy_hash=existing.policy_hash,
                     run_id=existing.run_id,
                     owner=operator_id,
+                    replay_binding=existing.replay_binding,
                 )
             # No instance yet. Fail-closed: only re-drive from the known-safe PENDING claim; any other
             # recorded state is treated as unrecoverable and NEVER auto-retries a side effect.
@@ -790,6 +835,13 @@ def register_deploy_routes(
             effective_config = config.mm.model_dump(mode="json")
         else:
             effective_config = _build_run_config(config).model_dump(mode="json")
+        # R-4: FREEZE the resolved production-replay identity (pack_id + fixture_id + SERVER-derived
+        # content_hash) onto the durable instance BEFORE launch, so the sealed run's tape identity is
+        # observable and an idempotent retry that reconciles to this instance REUSES it verbatim (never
+        # re-selects). It is carried in a DEDICATED ``AgentInstance.replay_binding`` field — NEVER folded
+        # into ``effective_config`` (the MM session factory re-parses that with ``extra="forbid"``, so a
+        # rider there would break ``reconstruct_mm_session``). ``None`` for a live/injected-tape deploy.
+        replay_binding = resolved_replay.as_binding() if resolved_replay is not None else None
         instance = AgentInstance(
             instance_id=instance_id,
             template_id=config.template_id,
@@ -803,6 +855,7 @@ def register_deploy_routes(
             market_allowlist=list(config.market_allowlist),
             venue_allowlist=list(config.venue_allowlist),
             run_id=run_id,
+            replay_binding=replay_binding,
             # Durable "why did this launch?" audit: the named preflight verdicts that GATED it
             # (all passing/not-applicable — a failing preflight never reaches here).
             preflight_checks=list(checks),
@@ -859,6 +912,7 @@ def register_deploy_routes(
             policy_hash=instance.policy_hash,
             run_id=run_id,
             owner=principal.did,
+            replay_binding=instance.replay_binding,
         )
 
     @app.get("/agents/instances", response_model=list[AgentInstance])

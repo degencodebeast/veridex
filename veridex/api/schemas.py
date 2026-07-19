@@ -147,6 +147,9 @@ class CompetitionStartResponse(BaseModel):
     competition_id: str
     status: str
     run_id: str | None
+    replay_binding: dict[str, Any] | None = None
+    """The FROZEN production-replay identity the run replayed (R-4): ``{pack_id, fixture_id,
+    content_hash}`` — so an auto-resolved (unnamed) run still names WHICH verified pack it ran."""
 
 
 class CompetitionLeaderboardRow(BaseModel):
@@ -197,6 +200,9 @@ class CompetitionStateResponse(BaseModel):
     run_id: str | None
     proof_card: dict[str, Any] | None = None
     execution: dict[str, Any] | None = None
+    replay_binding: dict[str, Any] | None = None
+    """The FROZEN production-replay identity (R-4): ``{pack_id, fixture_id, content_hash}`` — server-
+    derived, so an "unnamed" competition still surfaces WHICH verified pack it ran. ``None`` until bound."""
 
 
 class KillSwitchResponse(BaseModel):

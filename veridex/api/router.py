@@ -97,6 +97,7 @@ from veridex.competition.models import (
     CompetitionConfig,
     CompetitionStatus,
     ExecutionMode,
+    ReplayBinding,
 )
 from veridex.competition.service import (
     CompetitionConflictError,
@@ -114,7 +115,15 @@ from veridex.execution.models import ExecutionRecord, ExecutionStatus
 from veridex.execution.runner import resolve_approval
 from veridex.explainer import GLOSSARY_DEFINITIONS, explain_proof
 from veridex.ingest.feed_health import LiveFeedStatus
-from veridex.ingest.replay_catalog import CatalogEntry, ReplayCatalog, build_catalog
+from veridex.ingest.replay_catalog import (
+    CatalogEntry,
+    ReplayCatalog,
+    ReplayResolutionError,
+    ResolvedReplaySource,
+    build_catalog,
+    load_resolved_marketstates,
+    resolve_replay_source,
+)
 from veridex.leaderboard import leaderboard as _build_leaderboard
 from veridex.runtime.arena_comparison import (
     DET_DRIFT_CONTESTANT,
@@ -1107,6 +1116,27 @@ def create_app(
             A :class:`~veridex.api.schemas.CompetitionCreateResponse` with ``competition_id``
             and ``status="draft"``.
         """
+        # R-4: FREEZE the production-replay identity at the admission boundary when the client NAMES a
+        # pack. Resolved SERVER-side from the verified R-2 catalog (fail-closed on unknown/unverified),
+        # the frozen ReplayBinding (pack_id + resolved fixture_id + SERVER-derived content_hash) is
+        # persisted with the competition and REUSED verbatim at start — never re-selected, so an R-0b
+        # promotion between create and start can never change the tape. An UNBOUND competition (no pack
+        # named) stays unbound here and resolves ONCE at start (single-pack only). content_hash is
+        # server-owned: the client sends only pack_id + fixture_id (CompetitionConfig has no hash field).
+        replay_binding: ReplayBinding | None = None
+        if config.pack_id is not None:
+            try:
+                resolved = resolve_replay_source(
+                    app.state.replay_catalog, pack_id=config.pack_id, fixture_id=config.fixture_id
+                )
+            except ReplayResolutionError as exc:
+                raise HTTPException(
+                    status_code=400,
+                    detail={"error": "replay_unresolved", "reason": exc.reason, "message": str(exc)},
+                ) from None
+            replay_binding = ReplayBinding(
+                pack_id=resolved.pack_id, fixture_id=resolved.fixture_id, content_hash=resolved.content_hash
+            )
         comp = Competition(
             competition_id=f"c_{uuid4().hex}",
             config=config,
@@ -1114,6 +1144,7 @@ def create_app(
             entries=[],
             run_id=None,
             owner_id=principal.did,
+            replay_binding=replay_binding,
         )
         await dep_store.create_competition(comp)
         return CompetitionCreateResponse(
@@ -1214,10 +1245,12 @@ def create_app(
     ) -> CompetitionStartResponse:
         """Run a competition offline/deterministically and return the finalized state.
 
-        Offline simplification: market data is sourced from the demo ticks
-        (:func:`~veridex.api.demo_fixtures.build_demo_ticks`), and roster entries are mapped to
-        deterministic Agent objects (alternating deterministic/contrarian).  This produces a real
-        ≥2-row leaderboard with distinct CLV without any LLM or network calls.
+        Offline replay: market data is the SELECTED verified ReplayPack tape (R-4), resolved
+        SERVER-side from the R-2 catalog via the FROZEN :class:`~veridex.competition.models.ReplayBinding`
+        (reused if bound at create, else resolved ONCE here for a single-pack catalog and persisted).
+        Roster entries are built by their DECLARED strategy. This produces a real ≥2-row leaderboard
+        without any LLM or network calls, over the SAME ``load_pack_marketstates`` normalizer +
+        downstream pipeline (``build_demo_ticks`` stays a CI/test fixture, no longer the production source).
 
         Auth (fail-closed): EVERY start requires the authenticated Privy owner (I-7b — a non-owner
         is refused 403, regardless of execution mode). ADDITIONALLY, a ``dry_run`` / ``live_guarded``
@@ -1255,7 +1288,39 @@ def create_app(
             operator_principal = _authenticate(authorization)
             _check_owner(competition, operator_principal)
 
-        ticks = build_demo_ticks()
+        # R-4: PRODUCTION replay serves the SELECTED verified pack, not the synthetic demo tape.
+        # REUSE the frozen ReplayBinding if present (bound at create, or by a prior start); otherwise
+        # this is a legacy/unbound DRAFT — resolve ONCE from the catalog (single-pack only; multiple
+        # packs fail closed "pack_id required") and PERSIST that binding BEFORE the claim so the run
+        # commits to exactly the tape it replays. The tape is then LOADED from the FROZEN identity
+        # (content_hash re-checked against the live catalog) — never re-selected, so an R-0b promotion
+        # can neither change the tape nor let the sealed identity diverge from the replayed bytes.
+        try:
+            if competition.replay_binding is not None:
+                resolved = ResolvedReplaySource(
+                    pack_id=competition.replay_binding.pack_id,
+                    fixture_id=competition.replay_binding.fixture_id,
+                    content_hash=competition.replay_binding.content_hash,
+                    provenance="",  # observability-only; not part of the frozen identity triple
+                    is_genuine=False,
+                )
+            else:
+                resolved = resolve_replay_source(
+                    app.state.replay_catalog,
+                    pack_id=competition.config.pack_id,
+                    fixture_id=competition.config.fixture_id,
+                )
+                await dep_store.update_competition_replay_binding(
+                    competition_id, ReplayBinding(
+                pack_id=resolved.pack_id, fixture_id=resolved.fixture_id, content_hash=resolved.content_hash
+            )
+                )
+            ticks = load_resolved_marketstates(app.state.replay_catalog, resolved)
+        except ReplayResolutionError as exc:
+            raise HTTPException(
+                status_code=400,
+                detail={"error": "replay_unresolved", "reason": exc.reason, "message": str(exc)},
+            ) from None
         # Build the DECLARED roster (by strategy, position-independent). An entry referencing a
         # Studio-deployed instance runs the ACTUAL deployed contestant (pinned config_hash +
         # effective_config), never a same-named reconstruction — fail-closed on an unknown strategy
@@ -1296,6 +1361,9 @@ def create_app(
             competition_id=finalized.competition_id,
             status=finalized.status.value,
             run_id=finalized.run_id,
+            replay_binding=ReplayBinding(
+                pack_id=resolved.pack_id, fixture_id=resolved.fixture_id, content_hash=resolved.content_hash
+            ).model_dump(mode="json"),
         )
 
     # --- POST /competitions/{competition_id}/arena ------------------------
@@ -1588,6 +1656,11 @@ def create_app(
             run_id=competition.run_id,
             proof_card=proof_card,
             execution=execution,
+            replay_binding=(
+                competition.replay_binding.model_dump(mode="json")
+                if competition.replay_binding is not None
+                else None
+            ),
         )
 
     # --- GET /competitions ------------------------------------------------
@@ -1962,7 +2035,8 @@ def create_app(
     # (no injected deps), the default route degrades anchoring HONESTLY — it anchors on-chain only
     # when a Solana keypair is configured, else the run is legitimately ``not_anchored`` (offline
     # replay), NEVER a fabricated anchor and NEVER a crash on a missing keypair. The replay SOURCE
-    # is the in-code demo fixture (``build_demo_ticks``), wired inside ``register_deploy_routes``.
+    # is the SELECTED verified ReplayPack (R-4), resolved from the R-2 catalog and frozen onto the
+    # deployed instance, loaded through ``load_pack_marketstates``, wired inside ``register_deploy_routes``.
     resolved_deploy_deps = deploy_deps
     if resolved_deploy_deps is None:
         anchor_fn = anchor_memo if resolved_settings.solana_keypair_path is not None else None

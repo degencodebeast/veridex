@@ -1,0 +1,322 @@
+"""R-4 (Option B) — PRODUCTION replay loads the SELECTED verified pack via an atomic-snapshot resolver.
+
+Competition-start and deploy replay source their tape from a REAL, hash-verified ReplayPack through the
+SAME ``load_pack_marketstates`` normalizer live replay uses — resolved SERVER-side from the R-2 catalog
+under ONE atomic snapshot. The synthetic ``build_demo_ticks`` fixture stays a CI/test artifact and is
+NO LONGER a production source (there is no silent fallback to it). These tests pin the Option B contract:
+
+* (a) one catalogued pack + UNNAMED request -> resolves that pack, FREEZES + persists the identity,
+      surfaces it, and ``build_demo_ticks`` is never called;
+* (b) MULTIPLE packs + UNNAMED -> fail closed ``pack_id_required`` (never guess);
+* (c) NAMED unknown/unverified pack -> fail closed ``unknown_pack`` (competition + deploy), no demo tape;
+* (d) resolve -> R-0b promotes a 2nd pack -> retry REUSES the frozen binding (not re-selected);
+* (e) explicit ``fixture_id=0`` is PRESENCE-AWARE (validated, not aliased to "omitted");
+* (f) ``build_demo_ticks`` is unchanged for CI/test callers (and ``/demo/run``);
+* (g) ``content_hash`` is SERVER-derived — a client can never supply the tape identity hash.
+"""
+
+from __future__ import annotations
+
+import json
+import shutil
+from pathlib import Path
+from typing import Any
+
+import httpx
+import pytest
+from fastapi.testclient import TestClient
+from httpx import ASGITransport
+
+from veridex.api.demo_fixtures import DEMO_MARKET_KEY, build_demo_ticks
+from veridex.api.router import create_app
+from veridex.deploy.preflight import DeployConfig
+from veridex.ingest.replay_catalog import (
+    ReplayResolutionError,
+    ResolvedReplaySource,
+    build_catalog,
+    load_resolved_marketstates,
+    resolve_replay_source,
+)
+from veridex.ingest.replay_pack import load_pack_marketstates
+from veridex.store import InMemoryStore
+
+# --- the R-1 banked curated seed pack (the single production pack; catalogs as one entry) --------
+SEED = Path(__file__).resolve().parents[1] / "scripts" / "fixtures" / "demo_pack_real"
+SEED_PACK_ID = SEED.name  # the catalog derives pack_id from the leaf dir name
+_MANIFEST = json.loads((SEED / "pack.json").read_text())
+SEED_HASH = _MANIFEST["content_hash"]
+SEED_MIN_FIXTURE = min(int(f["fixture_id"]) for f in _MANIFEST["fixtures"])
+SEED_COUNT = len(load_pack_marketstates(SEED, SEED_MIN_FIXTURE, verify=True))
+
+_CONFIG: dict[str, Any] = {
+    "competition_type": "replay_arena",
+    "source_mode": "replay",
+    "execution_mode": "paper",
+    "market_scope": "WC:TEST",
+    "roster_size": 2,
+}
+_A = {"agent_id": "agent-alpha", "owner": "team-a", "strategy": "baseline", "model": None, "proof_mode": "reproducible"}
+_B = {"agent_id": "agent-beta", "owner": "team-b", "strategy": "baseline", "model": None, "proof_mode": "reproducible"}
+
+_REPLAY_STUDIO: dict[str, Any] = {
+    "template_id": "sharp-momentum-v2",
+    "agent_id": "studio-agent",
+    "strategy": "momentum-sharp",
+    "source_mode": "replay",
+    "execution_mode": "paper",
+    "market_allowlist": [],
+    "venue_allowlist": ["fake"],
+    "window_id": "w1",
+    "fixture_id": 1,
+    "end_rule": "pre_match",
+}
+
+
+def _boom() -> Any:
+    raise AssertionError("build_demo_ticks must not be called on the production replay path (R-4)")
+
+
+def _seed_catalog() -> Any:
+    """A 1-entry R-2 catalog over the curated seed pack (pack_id == 'demo_pack_real')."""
+    return build_catalog(str(SEED))
+
+
+def _multi_catalog(tmp: Path) -> Any:
+    """A 2-entry R-2 catalog (two verified packs) — so an UNNAMED request is ambiguous."""
+    root = tmp / "packs"
+    root.mkdir()
+    shutil.copytree(SEED, root / "packA")
+    shutil.copytree(SEED, root / "packB")
+    return build_catalog(str(root))
+
+
+def _client(catalog: Any, store: InMemoryStore | None = None) -> TestClient:
+    return TestClient(create_app(store=store or InMemoryStore(), replay_catalog=catalog))
+
+
+def _async_client(app: Any) -> httpx.AsyncClient:
+    return httpx.AsyncClient(transport=ASGITransport(app=app), base_url="http://test")
+
+
+def _register_roster(client: TestClient, comp_id: str) -> None:
+    client.post(f"/competitions/{comp_id}/agents", json=_A)
+    client.post(f"/competitions/{comp_id}/agents", json=_B)
+
+
+def _market_ticks(client: TestClient, comp_id: str) -> list[dict[str, Any]]:
+    events = client.get(f"/competitions/{comp_id}/events?since_seq=0").json()
+    return [e for e in events if e["event_type"] == "market_tick"]
+
+
+# ---------------------------------------------------------------------------
+# (a) one catalogued pack + UNNAMED -> resolves + freezes + persists + not build_demo_ticks
+# ---------------------------------------------------------------------------
+
+
+def test_a_one_pack_unnamed_resolves_and_persists(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("veridex.api.router.build_demo_ticks", _boom)  # any call would 500 the start
+    client = _client(_seed_catalog())
+    comp_id = client.post("/competitions", json=_CONFIG).json()["competition_id"]  # UNNAMED
+    _register_roster(client, comp_id)
+
+    start = client.post(f"/competitions/{comp_id}/start")
+    assert start.status_code == 200, start.text
+    binding = start.json()["replay_binding"]
+    # the auto-resolved identity is surfaced on the response (an unnamed request is NOT unidentified).
+    assert binding == {"pack_id": SEED_PACK_ID, "fixture_id": SEED_MIN_FIXTURE, "content_hash": SEED_HASH}
+
+    # persisted + observable via GET /competitions/{id}.
+    state = client.get(f"/competitions/{comp_id}").json()
+    assert state["replay_binding"] == binding
+
+    # the served tape IS the seed fixture (one MARKET_TICK per seed MarketState — never the 2-tick demo).
+    ticks = _market_ticks(client, comp_id)
+    assert len(ticks) == SEED_COUNT
+    assert SEED_COUNT > 2
+
+
+# ---------------------------------------------------------------------------
+# (b) MULTIPLE packs + UNNAMED -> fail closed pack_id_required
+# ---------------------------------------------------------------------------
+
+
+def test_b_multiple_packs_unnamed_requires_pack_id(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("veridex.api.router.build_demo_ticks", _boom)  # no silent demo fallback
+    client = _client(_multi_catalog(tmp_path))
+    comp_id = client.post("/competitions", json=_CONFIG).json()["competition_id"]  # UNNAMED, 2 packs
+    _register_roster(client, comp_id)
+
+    start = client.post(f"/competitions/{comp_id}/start")
+    assert start.status_code == 400, start.text
+    assert start.json()["detail"]["reason"] == "pack_id_required"
+
+
+# ---------------------------------------------------------------------------
+# (c) NAMED unknown pack -> fail closed unknown_pack, no build_demo_ticks (competition + deploy)
+# ---------------------------------------------------------------------------
+
+
+def test_c_named_unknown_pack_fails_closed_competition(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("veridex.api.router.build_demo_ticks", _boom)
+    client = _client(_seed_catalog())
+    # NAMED at create -> freeze-at-admission resolves it -> unknown -> 400 (no competition is created).
+    resp = client.post("/competitions", json={**_CONFIG, "pack_id": "does-not-exist"})
+    assert resp.status_code == 400, resp.text
+    assert resp.json()["detail"]["reason"] == "unknown_pack"
+
+
+async def test_c_named_unknown_pack_fails_closed_deploy() -> None:
+    app = create_app(store=InMemoryStore(), replay_catalog=_seed_catalog())
+    async with _async_client(app) as client:
+        resp = await client.post("/agents/deploy", json={**_REPLAY_STUDIO, "replay_pack_id": "does-not-exist"})
+    assert resp.status_code == 400, resp.text
+    assert resp.json()["detail"]["reason"] == "unknown_pack"
+    assert not getattr(app.state, "deploy_background_tasks", set())  # fail closed: no run launched
+
+
+# ---------------------------------------------------------------------------
+# (d) resolve -> R-0b promotes a 2nd pack -> retry REUSES the frozen binding (not re-selected)
+# ---------------------------------------------------------------------------
+
+
+async def test_d_retry_reuses_frozen_binding_across_r0b_promotion(tmp_path: Path) -> None:
+    capture = tmp_path / "cap"
+    capture.mkdir()
+    catalog = build_catalog(str(SEED), capture_root=str(capture))
+    app = create_app(store=InMemoryStore(), replay_catalog=catalog)
+    cfg = {**_REPLAY_STUDIO, "replay_pack_id": SEED_PACK_ID}  # bound to the seed pack
+    async with _async_client(app) as client:
+        first = await client.post("/agents/deploy", json=cfg, headers={"Idempotency-Key": "k-r4d"})
+        assert first.status_code == 200, first.text
+        b1 = first.json()["replay_binding"]
+        assert b1 == {"pack_id": SEED_PACK_ID, "fixture_id": SEED_MIN_FIXTURE, "content_hash": SEED_HASH}
+
+        # R-0b promotes a SECOND verified pack into the live catalog AFTER the deploy froze its identity.
+        packB = capture / "packB"
+        shutil.copytree(SEED, packB)
+        catalog.register_pack(packB)
+        assert len(catalog) == 2  # the promotion is live
+
+        # Retry with the SAME idempotency key reconciles to the SAME instance and REUSES the frozen
+        # binding verbatim — the tape identity is NOT re-selected against the now-2-pack catalog.
+        retry = await client.post("/agents/deploy", json=cfg, headers={"Idempotency-Key": "k-r4d"})
+        assert retry.status_code == 200, retry.text
+        assert retry.json()["instance_id"] == first.json()["instance_id"]
+        assert retry.json()["replay_binding"] == b1
+
+        for task in list(getattr(app.state, "deploy_background_tasks", set())):
+            task.cancel()
+
+
+# ---------------------------------------------------------------------------
+# (e) explicit fixture_id=0 is presence-aware — validated, NOT aliased to "omitted"
+# ---------------------------------------------------------------------------
+
+
+async def test_e_explicit_fixture_zero_is_presence_aware() -> None:
+    # The seed has NO fixture 0. An explicit ``replay_fixture_id=0`` must fail closed ``unknown_fixture``
+    # — a ``0 or None`` alias would treat it as omitted and SILENTLY pick the pack's min fixture instead.
+    app = create_app(store=InMemoryStore(), replay_catalog=_seed_catalog())
+    async with _async_client(app) as client:
+        resp = await client.post(
+            "/agents/deploy",
+            json={**_REPLAY_STUDIO, "replay_pack_id": SEED_PACK_ID, "replay_fixture_id": 0},
+        )
+    assert resp.status_code == 400, resp.text
+    assert resp.json()["detail"]["reason"] == "unknown_fixture"
+
+
+def test_e_resolver_honors_fixture_zero_when_catalogued() -> None:
+    # Unit-level: fixture 0 is a VALID id. Presence-aware selection rejects an explicit 0 (unknown_fixture)
+    # rather than silently substituting the pack's min — and ``None`` selects the deterministic lowest id.
+    with pytest.raises(ReplayResolutionError) as exc:
+        resolve_replay_source(_seed_catalog(), pack_id=SEED_PACK_ID, fixture_id=0)
+    assert exc.value.reason == "unknown_fixture"
+    resolved = resolve_replay_source(_seed_catalog(), pack_id=SEED_PACK_ID, fixture_id=None)
+    assert resolved.fixture_id == SEED_MIN_FIXTURE
+
+
+# ---------------------------------------------------------------------------
+# (f) build_demo_ticks is unchanged for CI/test callers (and /demo/run)
+# ---------------------------------------------------------------------------
+
+
+def test_f_build_demo_ticks_still_available_for_ci() -> None:
+    ticks = build_demo_ticks()
+    assert len(ticks) == 2
+    assert ticks[0].fixture_id == 17588404
+    assert DEMO_MARKET_KEY in ticks[0].markets
+
+
+def test_f_demo_run_endpoint_still_uses_demo_fixture() -> None:
+    client = _client(_seed_catalog())
+    resp = client.post("/demo/run")
+    assert resp.status_code == 200, resp.text
+    assert len(resp.json()["leaderboard"]) >= 2
+
+
+# ---------------------------------------------------------------------------
+# (g) content_hash is SERVER-derived — a client can never supply the tape identity hash
+# ---------------------------------------------------------------------------
+
+
+def test_g_content_hash_is_server_derived_competition() -> None:
+    client = _client(_seed_catalog())
+    # A client tries to smuggle a bogus content_hash into the create body. CompetitionConfig has NO
+    # content_hash field, so it is dropped; the frozen binding's hash is the CATALOG's verified hash.
+    resp = client.post("/competitions", json={**_CONFIG, "pack_id": SEED_PACK_ID, "content_hash": "deadbeef"})
+    assert resp.status_code == 200, resp.text
+    comp_id = resp.json()["competition_id"]
+    binding = client.get(f"/competitions/{comp_id}").json()["replay_binding"]
+    assert binding["content_hash"] == SEED_HASH
+    assert binding["content_hash"] != "deadbeef"
+
+
+async def test_g_content_hash_is_server_derived_deploy() -> None:
+    app = create_app(store=InMemoryStore(), replay_catalog=_seed_catalog())
+    async with _async_client(app) as client:
+        resp = await client.post("/agents/deploy", json={**_REPLAY_STUDIO, "replay_pack_id": SEED_PACK_ID})
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["replay_binding"]["content_hash"] == SEED_HASH
+        for task in list(getattr(app.state, "deploy_background_tasks", set())):
+            task.cancel()
+
+
+# ---------------------------------------------------------------------------
+# (h) the tape identity is bound to the SEALED run: pack SELECTION ∈ config_hash, and content_hash
+#     drift is FAIL-CLOSED at load (a run can NEVER seal over bytes different from the frozen hash).
+# ---------------------------------------------------------------------------
+
+
+def test_h_pack_selection_is_bound_into_deploy_config_hash() -> None:
+    # The resolved pack SELECTION (replay_pack_id + replay_fixture_id) rides in DeployConfig.config_hash()
+    # — reconstruct_mm_session recomputes this from submitted_config and re-verifies it (fail-closed). So
+    # the sealed run identity commits to WHICH pack/fixture was chosen: you cannot swap the selected pack
+    # without changing the pinned config_hash (and thus the run's identity).
+    base = {**_REPLAY_STUDIO, "strategy": "momentum-sharp"}
+    h_none = DeployConfig(**base).config_hash()
+    h_pack_a = DeployConfig(**{**base, "replay_pack_id": "pack-a"}).config_hash()
+    h_pack_b = DeployConfig(**{**base, "replay_pack_id": "pack-b"}).config_hash()
+    h_fix = DeployConfig(**{**base, "replay_pack_id": "pack-a", "replay_fixture_id": 7}).config_hash()
+    assert len({h_none, h_pack_a, h_pack_b, h_fix}) == 4  # every selection change changes config_hash
+
+
+def test_h_content_hash_drift_is_fail_closed_at_load() -> None:
+    # The FROZEN content_hash is re-checked against the live catalog at LOAD. If an R-0b re-publish drifts
+    # the pack's bytes (same pack_id, new content_hash), the frozen identity NO LONGER matches and the
+    # load is REFUSED — so a run can never seal over bytes whose content_hash differs from the frozen one
+    # (this is what makes the durable binding transitively bind the replayed bytes to the sealed run).
+    catalog = _seed_catalog()
+    stale = ResolvedReplaySource(
+        pack_id=SEED_PACK_ID,
+        fixture_id=SEED_MIN_FIXTURE,
+        content_hash="stale-drifted-hash",  # a hash that no longer matches the catalogued bytes
+        provenance="",
+        is_genuine=False,
+    )
+    with pytest.raises(ReplayResolutionError) as exc:
+        load_resolved_marketstates(catalog, stale)
+    assert exc.value.reason == "content_hash_drift"
+    # the correct frozen hash still loads (control): drift-detection is not over-broad.
+    good = resolve_replay_source(catalog, pack_id=SEED_PACK_ID, fixture_id=None)
+    assert load_resolved_marketstates(catalog, good)

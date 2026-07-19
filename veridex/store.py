@@ -32,7 +32,13 @@ from enum import Enum
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 from veridex.competition.events import CompetitionEvent
-from veridex.competition.models import AgentEntry, Competition, CompetitionConfig, CompetitionStatus
+from veridex.competition.models import (
+    AgentEntry,
+    Competition,
+    CompetitionConfig,
+    CompetitionStatus,
+    ReplayBinding,
+)
 from veridex.config import get_settings, require_database_url
 from veridex.deploy.attempt import AttemptStatus, DeploymentAttempt, DuplicateAttemptError
 from veridex.deploy.instance import AgentInstance, DeployFailureReason, DeployStatus
@@ -470,6 +476,24 @@ class Store(Protocol):
         Args:
             competition_id: The competition to update.
             config: The new :class:`~veridex.competition.models.CompetitionConfig` snapshot.
+
+        Raises:
+            KeyError: If no competition with ``competition_id`` exists.
+        """
+        ...
+
+    async def update_competition_replay_binding(
+        self, competition_id: str, binding: ReplayBinding
+    ) -> None:
+        """Persist the FROZEN, server-derived production-replay identity onto a competition (R-4).
+
+        Used at competition start to durably freeze the auto-resolved single-pack binding BEFORE the
+        run claim, so a legacy unbound DRAFT commits to exactly the pack it will replay. Idempotent
+        (re-writing the same binding is a no-op semantically).
+
+        Args:
+            competition_id: The competition to bind.
+            binding: The resolved :class:`~veridex.competition.models.ReplayBinding` to persist.
 
         Raises:
             KeyError: If no competition with ``competition_id`` exists.
@@ -931,36 +955,46 @@ def _build_competition(
         The reconstructed :class:`~veridex.competition.models.Competition`.
     """
     config_data = json.loads(config_json)
-    # ``owner_id`` (I-7b) rides in the config_json blob to avoid a schema change. A legacy row
-    # written before I-7b has no such key → ``None`` → the competition loads as UNOWNED (fail-closed,
-    # never silently inherited). Pop it before validating so it never leaks into CompetitionConfig.
+    # ``owner_id`` (I-7b) and ``replay_binding`` (R-4) ride in the config_json blob to avoid a schema
+    # change. A legacy row written before either feature has no such key → ``None`` → the competition
+    # loads UNOWNED / UNBOUND (fail-closed, never silently inherited). Pop them before validating so
+    # they never leak into CompetitionConfig.
     owner_id = config_data.pop("owner_id", None)
+    replay_binding_data = config_data.pop("replay_binding", None)
     return Competition(
         competition_id=competition_id,
         config=CompetitionConfig.model_validate(config_data),
         status=CompetitionStatus(status),
         entries=[AgentEntry.model_validate(e) for e in json.loads(entries_json)],
         run_id=run_id,
+        replay_binding=ReplayBinding.model_validate(replay_binding_data) if replay_binding_data else None,
         owner_id=owner_id,
     )
 
 
-def _serialize_competition_config(config: CompetitionConfig, owner_id: str | None) -> str:
-    """Canonically serialize a config with the I-7b ``owner_id`` rider folded in (zero DDL).
+def _serialize_competition_config(
+    config: CompetitionConfig,
+    owner_id: str | None,
+    replay_binding: ReplayBinding | None = None,
+) -> str:
+    """Canonically serialize a config with the server-derived riders folded in (zero DDL).
 
-    The competition's server-derived ``owner_id`` is stored inside the ``config_json`` blob (there is
-    no ``owner_id`` column) so :func:`_build_competition` can read it back. Kept as the single write
-    counterpart to that read so the rider convention lives in one reviewable place.
+    The competition's server-derived ``owner_id`` (I-7b) and frozen ``replay_binding`` (R-4) are stored
+    inside the ``config_json`` blob (there are no dedicated columns) so :func:`_build_competition` can
+    read them back. Kept as the single write counterpart to that read so the rider convention lives in
+    one reviewable place.
 
     Args:
         config: The competition's immutable config snapshot.
         owner_id: The server-derived owner DID (or ``None`` for an unowned/legacy competition).
+        replay_binding: The frozen R-4 production-replay identity (or ``None`` for an unbound competition).
 
     Returns:
         The canonical JSON string for the ``config_json`` column.
     """
     payload = config.model_dump(mode="json")
     payload["owner_id"] = owner_id
+    payload["replay_binding"] = replay_binding.model_dump(mode="json") if replay_binding is not None else None
     return serialize_payload(payload)
 
 
@@ -1165,6 +1199,14 @@ class InMemoryStore:
         if competition_id not in self._competitions:
             raise KeyError(f"no competition with competition_id={competition_id!r}")
         self._competitions[competition_id].config = config.model_copy(deep=True)
+
+    async def update_competition_replay_binding(
+        self, competition_id: str, binding: ReplayBinding
+    ) -> None:
+        """Persist the frozen R-4 production-replay identity onto the stored competition (deep-copied)."""
+        if competition_id not in self._competitions:
+            raise KeyError(f"no competition with competition_id={competition_id!r}")
+        self._competitions[competition_id].replay_binding = binding.model_copy(deep=True)
 
     async def append_competition_events(self, competition_id: str, events: list[CompetitionEvent]) -> None:
         """Append deep copies of ``events`` to the competition's event list.
@@ -2088,7 +2130,9 @@ class PostgresStore:
                         "VALUES (%s, %s, %s, %s, %s)",
                         (
                             competition.competition_id,
-                            _serialize_competition_config(competition.config, competition.owner_id),
+                            _serialize_competition_config(
+                                competition.config, competition.owner_id, competition.replay_binding
+                            ),
                             competition.status.value,
                             competition.run_id,
                             serialize_payload([e.model_dump(mode="json") for e in competition.entries]),
@@ -2290,9 +2334,10 @@ class PostgresStore:
         conn = await self._connect()
         try:
             async with conn.transaction(), conn.cursor() as cur:
-                # The server-derived ``owner_id`` (I-7b) rides in config_json; a naive rewrite would
-                # strip it and silently un-own the competition. Read the current owner and fold it
-                # back in so a config mutation (e.g. the kill-switch) can never drop ownership.
+                # The server-derived ``owner_id`` (I-7b) and ``replay_binding`` (R-4) ride in
+                # config_json; a naive rewrite would strip them and silently un-own / un-bind the
+                # competition. Read both current riders and fold them back in so a config mutation
+                # (e.g. the kill-switch) can never drop ownership OR the frozen replay identity.
                 await cur.execute(
                     "SELECT config_json FROM competitions WHERE competition_id = %s",
                     (competition_id,),
@@ -2300,10 +2345,45 @@ class PostgresStore:
                 existing = await cur.fetchone()
                 if existing is None:
                     raise KeyError(f"no competition persisted with competition_id={competition_id!r}")
-                owner_id = json.loads(existing[0]).get("owner_id")
+                existing_blob = json.loads(existing[0])
+                owner_id = existing_blob.get("owner_id")
+                existing_binding_data = existing_blob.get("replay_binding")
+                existing_binding = (
+                    ReplayBinding.model_validate(existing_binding_data) if existing_binding_data else None
+                )
                 await cur.execute(
                     "UPDATE competitions SET config_json = %s WHERE competition_id = %s",
-                    (_serialize_competition_config(config, owner_id), competition_id),
+                    (_serialize_competition_config(config, owner_id, existing_binding), competition_id),
+                )
+        finally:
+            await self._release(conn)
+
+    async def update_competition_replay_binding(
+        self, competition_id: str, binding: ReplayBinding
+    ) -> None:
+        """Fold the frozen R-4 replay identity into the competition's ``config_json`` rider (zero DDL).
+
+        Reads the current blob, preserves the ``owner_id`` rider + the existing ``CompetitionConfig``,
+        and rewrites ONLY the ``replay_binding`` rider — so freezing the tape identity can never drop
+        ownership or mutate the immutable config.
+        """
+        conn = await self._connect()
+        try:
+            async with conn.transaction(), conn.cursor() as cur:
+                await cur.execute(
+                    "SELECT config_json FROM competitions WHERE competition_id = %s",
+                    (competition_id,),
+                )
+                existing = await cur.fetchone()
+                if existing is None:
+                    raise KeyError(f"no competition persisted with competition_id={competition_id!r}")
+                existing_blob = json.loads(existing[0])
+                owner_id = existing_blob.pop("owner_id", None)
+                existing_blob.pop("replay_binding", None)
+                config = CompetitionConfig.model_validate(existing_blob)
+                await cur.execute(
+                    "UPDATE competitions SET config_json = %s WHERE competition_id = %s",
+                    (_serialize_competition_config(config, owner_id, binding), competition_id),
                 )
         finally:
             await self._release(conn)

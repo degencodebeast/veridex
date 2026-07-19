@@ -65,6 +65,26 @@ class PrizeVaultRef(BaseModel):
     vault_id: str | None = None
 
 
+class ReplayBinding(BaseModel):
+    """The FROZEN, server-derived production-replay identity of a competition (R-4, Option B).
+
+    Set once at the admission boundary (create when a pack is named, else start when the catalog holds
+    exactly one pack) from the verified R-2 catalog, then REUSED at execution — never re-selected. The
+    ``content_hash`` is copied from the verified catalog entry; a client can NEVER supply it (this model
+    is server-constructed and is not a request-body field), so a run's tape identity is always
+    catalog-derived. ``fixture_id`` is a real int (``0`` is valid).
+
+    Attributes:
+        pack_id: The verified catalog key the competition replays.
+        fixture_id: The selected fixture within the pack.
+        content_hash: The pack's verified ``content_hash`` at selection time (tamper-evidence anchor).
+    """
+
+    pack_id: str
+    fixture_id: int
+    content_hash: str
+
+
 class CompetitionConfig(BaseModel):
     """Immutable configuration snapshot for a competition.
 
@@ -83,6 +103,13 @@ class CompetitionConfig(BaseModel):
         policy_envelope: Optional operator-set execution guardrail envelope (Phase-2B). When
             ``None``, the service builds a conservative deny-by-default envelope for non-paper
             runs. The control-plane kill-switch endpoint mutates ``kill_switch`` here.
+        pack_id: Optional CLIENT selection of which verified R-2 ReplayPack to replay (R-4). The
+            server resolves it against ``app.state.replay_catalog`` and FREEZES the result into the
+            competition's server-derived :class:`ReplayBinding`; an unknown/unverified id fails closed.
+            ``None`` requests auto-selection (permitted only when the catalog holds exactly one pack).
+        fixture_id: Optional CLIENT selection of the fixture within ``pack_id``. Presence-aware —
+            ``None`` means "omitted" (server picks the pack's lowest fixture); ``0`` is a VALID fixture
+            id and is never treated as omitted. A client NEVER supplies ``content_hash`` (server-owned).
     """
 
     competition_type: CompetitionType
@@ -96,6 +123,8 @@ class CompetitionConfig(BaseModel):
     prize_vault_ref: PrizeVaultRef | None = None
     operator_id: str | None = None
     policy_envelope: PolicyEnvelope | None = None
+    pack_id: str | None = None
+    fixture_id: int | None = None
 
 
 class AgentEntry(BaseModel):
@@ -152,6 +181,11 @@ class Competition(BaseModel):
             competition persisted without an ``owner_id`` still loads with ``None`` and is treated
             as UNOWNED (never silently granted to any caller — fail-closed, mirrors I-2's
             ``AgentInstance.operator_id``).
+        replay_binding: The FROZEN, server-derived production-replay identity (R-4). Set once at the
+            admission boundary (create when a pack is named, else start when the catalog holds exactly
+            one pack) and REUSED at execution — never re-selected, so an R-0b promotion between
+            admission and run can never change the tape. Optional + legacy-compatible: a competition
+            persisted before R-4 loads with ``None`` (an unbound DRAFT) and is resolved once at start.
     """
 
     competition_id: str
@@ -160,6 +194,7 @@ class Competition(BaseModel):
     entries: list[AgentEntry]
     run_id: str | None
     owner_id: str | None = None
+    replay_binding: ReplayBinding | None = None
 
     def advance_status(self, new: CompetitionStatus) -> None:
         """Mutate status to `new`, enforcing monotonic forward-only transitions.

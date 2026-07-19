@@ -37,6 +37,7 @@ import weakref
 from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from veridex.ingest.capture_chain import (
     GENUINE_TXLINE_PROVENANCE,
@@ -44,7 +45,10 @@ from veridex.ingest.capture_chain import (
     is_genuine_pack,
     read_pack_provenance,
 )
-from veridex.ingest.replay_pack import verify_content_hash
+from veridex.ingest.replay_pack import load_pack_marketstates, verify_content_hash
+
+if TYPE_CHECKING:
+    from veridex.ingest.marketstate import MarketState
 
 
 class CatalogVerificationError(Exception):
@@ -490,3 +494,156 @@ def build_catalog(
     if capture is not None:
         catalog._fold_capture_root_at_startup(capture)
     return catalog
+
+
+@dataclass(frozen=True)
+class ResolvedReplaySource:
+    """The FROZEN identity of a production-replay tape (R-4, Option B): server-derived + catalog-verified.
+
+    Produced by :func:`resolve_replay_source` at the ADMISSION boundary and PERSISTED, then REUSED
+    (never re-selected) at execution/retry via :func:`load_resolved_marketstates`. Because the identity
+    is frozen once, an R-0b promotion between admission and load can never silently change the tape or
+    make a sealed run's identity diverge from the bytes it replayed.
+
+    Attributes:
+        pack_id: The verified catalog key that was selected.
+        fixture_id: The selected fixture within the pack (a VALID int, incl. ``0``).
+        content_hash: The pack's verified ``content_hash`` at selection time (the tamper-evidence anchor).
+        provenance: HONEST provenance label of the selected pack (observability).
+        is_genuine: Whether the selected pack proved a coherent genuine state (observability).
+    """
+
+    pack_id: str
+    fixture_id: int
+    content_hash: str
+    provenance: str
+    is_genuine: bool
+
+    def as_binding(self) -> dict[str, str | int]:
+        """The minimal, durable identity triple to persist (pack_id + fixture_id + content_hash)."""
+        return {"pack_id": self.pack_id, "fixture_id": self.fixture_id, "content_hash": self.content_hash}
+
+
+class ReplayResolutionError(ValueError):
+    """Fail-closed production-replay selection/resolution (Option B).
+
+    Raised INSTEAD of any silent fallback (``build_demo_ticks`` / a filesystem path / another catalog
+    entry). ``reason`` is a stable machine label the API boundary maps to a 4xx error body.
+    """
+
+    def __init__(self, message: str, *, reason: str) -> None:
+        super().__init__(message)
+        self.reason = reason
+
+
+def resolve_replay_source(
+    catalog: ReplayCatalog | None,
+    *,
+    pack_id: str | None,
+    fixture_id: int | None,
+) -> ResolvedReplaySource:
+    """Select the production-replay pack from the verified catalog under a SINGLE atomic snapshot (Option B).
+
+    ONE :meth:`ReplayCatalog.snapshot` drives BOTH the cardinality decision AND the selected entry, so a
+    concurrent R-0b :meth:`ReplayCatalog.register_pack` can never make cardinality and selection disagree
+    (never ``len()`` then a separate live ``get()``). Selection is fail-closed at every gate — there is no
+    fallback to ``build_demo_ticks``, a filesystem path, or another entry after ANY failure.
+
+    Selection rules:
+
+    * ``pack_id`` given -> exact lookup IN THAT SNAPSHOT; unknown/unverified -> :class:`ReplayResolutionError`.
+    * ``pack_id`` omitted + ZERO entries -> fail closed (``empty_catalog``).
+    * ``pack_id`` omitted + exactly ONE entry -> select it.
+    * ``pack_id`` omitted + MULTIPLE entries -> fail closed (``pack_id_required``) — never guess.
+    * ``fixture_id`` given -> must belong to the selected entry; else fail closed (``unknown_fixture``).
+      ``fixture_id`` is presence-aware: ``0`` is a VALID identity and is NEVER treated as "omitted".
+    * ``fixture_id`` omitted -> the DETERMINISTIC, documented choice: the entry's LOWEST fixture id.
+
+    Args:
+        catalog: The live R-2 catalog (``None`` is treated as an empty catalog -> fail closed when unnamed).
+        pack_id: The requested catalog key, or ``None`` to auto-select the single catalogued pack.
+        fixture_id: The requested fixture (``None`` -> the entry's lowest fixture id; ``0`` is valid).
+
+    Returns:
+        The :class:`ResolvedReplaySource` frozen identity (pack_id + fixture_id + content_hash + provenance).
+
+    Raises:
+        ReplayResolutionError: Any fail-closed gate (empty catalog, pack_id required, unknown pack/fixture).
+    """
+    snapshot = catalog.snapshot() if catalog is not None else {}
+
+    if pack_id is not None:
+        entry = snapshot.get(pack_id)
+        if entry is None:
+            raise ReplayResolutionError(
+                f"unknown or unverified replay pack_id: {pack_id!r}", reason="unknown_pack"
+            )
+    elif not snapshot:
+        raise ReplayResolutionError(
+            "no verified replay pack is catalogued (empty catalog)", reason="empty_catalog"
+        )
+    elif len(snapshot) > 1:
+        raise ReplayResolutionError(
+            f"pack_id required: {len(snapshot)} verified packs catalogued ({sorted(snapshot)})",
+            reason="pack_id_required",
+        )
+    else:
+        entry = next(iter(snapshot.values()))
+
+    if fixture_id is not None:
+        if fixture_id not in entry.fixtures:
+            raise ReplayResolutionError(
+                f"fixture_id {fixture_id} is not catalogued for pack {entry.pack_id!r}",
+                reason="unknown_fixture",
+            )
+        chosen_fixture = fixture_id
+    else:
+        chosen_fixture = min(entry.fixtures)
+
+    return ResolvedReplaySource(
+        pack_id=entry.pack_id,
+        fixture_id=chosen_fixture,
+        content_hash=entry.content_hash,
+        provenance=entry.provenance,
+        is_genuine=entry.is_genuine,
+    )
+
+
+def load_resolved_marketstates(
+    catalog: ReplayCatalog | None,
+    resolved: ResolvedReplaySource,
+) -> list[MarketState]:
+    """Load the FROZEN identity's tape, re-checking the bound ``content_hash`` against the live catalog.
+
+    The frozen identity is NEVER re-selected here — it is looked up by its exact ``pack_id`` and the load
+    is refused (fail closed) if the pack has left the catalog OR its current ``content_hash`` drifted from
+    the frozen one (an R-0b re-publish of different bytes under the same id). This guarantees the replayed
+    bytes always match the sealed identity: a bound run can never quietly serve a different tape.
+
+    Args:
+        catalog: The live R-2 catalog.
+        resolved: The frozen :class:`ResolvedReplaySource` (from :func:`resolve_replay_source`, persisted).
+
+    Returns:
+        The pack fixture's ``MarketState`` tape (``verify=True`` — the runtime default), non-empty.
+
+    Raises:
+        ReplayResolutionError: The frozen pack/fixture is gone, or its bytes drifted from ``content_hash``.
+    """
+    snapshot = catalog.snapshot() if catalog is not None else {}
+    entry = snapshot.get(resolved.pack_id)
+    if entry is None:
+        raise ReplayResolutionError(
+            f"frozen replay pack_id no longer catalogued: {resolved.pack_id!r}", reason="pack_gone"
+        )
+    if entry.content_hash != resolved.content_hash:
+        raise ReplayResolutionError(
+            f"frozen content_hash for pack {resolved.pack_id!r} drifted from the catalogued bytes",
+            reason="content_hash_drift",
+        )
+    if resolved.fixture_id not in entry.fixtures:
+        raise ReplayResolutionError(
+            f"frozen fixture_id {resolved.fixture_id} no longer catalogued for pack {resolved.pack_id!r}",
+            reason="fixture_gone",
+        )
+    return load_pack_marketstates(Path(entry.pack_dir), resolved.fixture_id, verify=True)

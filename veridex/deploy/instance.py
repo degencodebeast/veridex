@@ -135,5 +135,10 @@ class AgentInstance(BaseModel):
     # Optional so legacy record_json (pre-field) still validates on read; None == UNOWNED (fail-closed).
     operator_id: str | None = None
     runtime_handle: dict[str, Any] | None = None
+    # R-4: the FROZEN production-replay identity a ``replay`` deploy committed to BEFORE launch —
+    # ``{pack_id, fixture_id, content_hash}``, server-derived from the verified R-2 catalog. Persisted
+    # durably so an idempotent retry REUSES it (never re-selects) and the sealed run's tape identity is
+    # observable. ``None`` for a live deploy or a legacy record written before R-4.
+    replay_binding: dict[str, Any] | None = None
     created_at: str
     updated_at: str

@@ -159,6 +159,14 @@ class DeployConfig(BaseModel):
     # preflight check, never by a pydantic requiredness flip, so a missing/invalid mm block gets a
     # NAMED, legible preflight reason rather than a raw 422).
     mm: MakerDeployConfig | None = None
+    # R-4 production-replay SELECTION (distinct from ``fixture_id``, which scopes the LIVE window).
+    # ``replay_pack_id``: which verified R-2 pack a ``replay`` deploy replays (``None`` -> auto-select
+    # the single catalogued pack; multiple -> fail closed "pack_id required"). ``replay_fixture_id`` is
+    # PRESENCE-AWARE: ``None`` = omitted (server picks the pack's lowest fixture); ``0`` is a VALID
+    # fixture id and is NEVER aliased to omitted. content_hash is SERVER-owned (no field here) — a
+    # client can never supply the tape's identity hash.
+    replay_pack_id: str | None = None
+    replay_fixture_id: int | None = None
 
     def config_hash(self) -> str:
         """SHA-256 over the canonical serialization of this (non-secret) config.
