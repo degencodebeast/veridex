@@ -32,6 +32,7 @@ from fastapi import FastAPI
 
 from veridex.api.readiness import build_readiness_router
 from veridex.config import get_settings
+from veridex.ingest.replay_catalog import build_catalog
 from veridex.store import InMemoryStore, PostgresStore, Store
 
 if TYPE_CHECKING:
@@ -230,7 +231,9 @@ def create_server_app(
 
     Args:
         env: Environment mapping (defaults to ``os.environ``). Read for ``DATABASE_URL``,
-            ``CORS_ORIGINS`` (required), ``REPLAY_PACK_ROOT``, and optional pool / connect-timeout keys.
+            ``CORS_ORIGINS`` (required), ``REPLAY_PACK_ROOT`` (the read-only curated catalog root), the
+            optional ``REPLAY_CAPTURE_ROOT`` (the separate writable capture root folded in at startup),
+            and optional pool / connect-timeout keys.
         pool_factory: Injection seam for tests — builds the pool from ``(dsn, env)``. Defaults to a
             real ``psycopg_pool.AsyncConnectionPool``.
         settings: Injection seam for tests — resolved :class:`~veridex.config.Settings` (auth mode +
@@ -300,12 +303,23 @@ def create_server_app(
     # (it PASSES the guard, returning 200/503) rather than treated as agno-native and denied. The gate is
     # ONLY the durable Veridex deps; the AgentOS store is disclosed as non-gating info (surface_only).
     pool_holder: dict[str, Any] = {"pool": None}
+    pack_root = resolved_env.get("REPLAY_PACK_ROOT", "")
     readiness_router = build_readiness_router(
         get_pool=lambda: pool_holder["pool"],
-        pack_root=resolved_env.get("REPLAY_PACK_ROOT", ""),
+        pack_root=pack_root,
         get_agentos_db=lambda: owner_db,  # /readyz DISCLOSES the ACTUAL (ephemeral) AgentOS DB, honestly
         surface_only=surface_only,
     )
+
+    # R-2 — build the TRUSTED, hash-verified ReplayPack CATALOG at startup (root of replay trust).
+    # Scans the READ-ONLY curated REPLAY_PACK_ROOT (and, when configured, the SEPARATE writable capture
+    # root so redeploy-surviving captures are folded in), hash-verifies every pack, and allowlists only
+    # the verified ones with HONEST provenance — a tampered/unverified pack is fail-closed EXCLUDED. It
+    # is exposed on ``app.state`` for the /readyz probe + R-3's serving API; the writable-root register
+    # path (``catalog.register_pack``) atomically promotes freshly-captured deployed packs at runtime
+    # (no restart), and NEVER writes the read-only curated root. This is additive: it does NOT alter the
+    # II-5f served composition (the guard return / deny-by-default / /readyz gate set are unchanged).
+    replay_catalog = build_catalog(pack_root, capture_root=resolved_env.get("REPLAY_CAPTURE_ROOT", "") or None)
 
     primary, extra_agents = _build_served_hosting_adapters()
     guard = build_agentos_app(
@@ -330,6 +344,7 @@ def create_server_app(
         app.state.db_pool = None
 
     app.state.store = store
+    app.state.replay_catalog = replay_catalog  # R-2: trusted hash-verified catalog for /readyz + R-3
     return guard  # RETURN THE GUARD (the ASGI callable) — never the inner FastAPI
 
 

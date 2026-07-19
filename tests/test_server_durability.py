@@ -145,3 +145,38 @@ def test_no_database_url_uses_inmemory() -> None:
     """With no DATABASE_URL the entrypoint uses InMemoryStore (local-dev), still CORS-validated."""
     app = server.create_server_app(env={"CORS_ORIGINS": "https://app.example.test"}).app
     assert isinstance(app.state.store, InMemoryStore)
+
+
+# ---------------------------------------------------------------------------
+# R-2 — the trusted, hash-verified ReplayPack catalog is built at startup + exposed on app.state
+# ---------------------------------------------------------------------------
+
+
+def test_replay_catalog_built_from_pack_root_and_exposed(tmp_path: Any) -> None:
+    """create_server_app builds the hash-verified catalog from REPLAY_PACK_ROOT onto app.state (R-3 seam)."""
+    import shutil
+    from pathlib import Path
+
+    from veridex.ingest.replay_catalog import ReplayCatalog
+
+    real_src = Path(__file__).resolve().parents[1] / "scripts" / "fixtures" / "demo_pack_real"
+    curated = tmp_path / "curated"
+    shutil.copytree(real_src, curated / "real")
+
+    app = server.create_server_app(
+        env={"CORS_ORIGINS": "https://app.example.test", "REPLAY_PACK_ROOT": str(curated)}
+    ).app
+
+    catalog = app.state.replay_catalog
+    assert isinstance(catalog, ReplayCatalog)
+    entry = catalog.get("real")
+    assert entry is not None and entry.is_genuine is True  # the genuine curated pack is allowlisted
+
+
+def test_replay_catalog_empty_when_pack_root_unset() -> None:
+    """No REPLAY_PACK_ROOT -> an empty (but present) catalog; the app still builds (fail-closed, no crash)."""
+    from veridex.ingest.replay_catalog import ReplayCatalog
+
+    app = server.create_server_app(env={"CORS_ORIGINS": "https://app.example.test"}).app
+    assert isinstance(app.state.replay_catalog, ReplayCatalog)
+    assert len(app.state.replay_catalog) == 0

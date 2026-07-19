@@ -16,6 +16,16 @@ COPY veridex ./veridex
 COPY veridex_agent ./veridex_agent
 RUN pip install --no-cache-dir ".[api,postgres,live,agent]"
 
+# R-2 — bake the pinned, GENUINE curated seed pack (demo_pack_real: the verified WC /odds/updates
+# backfill) into the image so the ReplayPack catalog is SELF-CONTAINED: a bare `docker run` (no compose
+# bind-mount) still builds a hash-verified catalog and /readyz passes. COPY was chosen over relying on
+# the compose read-only mount alone: the image is then trustworthy on its own (no missing-mount failure
+# mode), and the packs are ~600KB — negligible bloat. This layer is READ-ONLY at runtime (curated =
+# read-only); R-0b's freshly-captured packs go to the SEPARATE writable capture volume, never here. In
+# compose, REPLAY_PACK_ROOT is overridden to the operator's provisioned :ro curated mount.
+COPY scripts/fixtures/demo_pack_real /opt/veridex/replay-packs/curated
+ENV REPLAY_PACK_ROOT=/opt/veridex/replay-packs/curated
+
 # Network binding (overridable). The process is the isolation boundary, so bind all interfaces.
 ENV HOST=0.0.0.0 \
     PORT=8000
