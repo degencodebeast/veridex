@@ -1,7 +1,7 @@
 # Operator Runbook — real-money live_guarded + deploy rehearsal
 
 *Draft. These are the steps that only a human operator can perform — they involve real funds and
-on-chain approvals. No agent, subagent, or automated test in this repo runs a real order; the code is
+on-chain approvals. No agent, automated agent, or automated test in this repo runs a real order; the code is
 DRY_RUN by default and every real-money path is gated behind the explicit, operator-only steps below.*
 
 ## Safety model (read first)
@@ -99,7 +99,7 @@ On the `PolicyEnvelope` (`veridex/policy/envelope.py`):
 - Note: the HTTP `POST /competitions/{id}/start` endpoint passes **no** `live_deps` by design, so a
   real order **cannot** be armed over the API. Real money is reachable **only** by an operator directly
   supplying the armed `LiveExecutionDeps` — this is intentional (real money is operator-direct-only,
-  never over HTTP or by a subagent).
+  never over HTTP or by an automated agent).
 
 ---
 

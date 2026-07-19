@@ -69,6 +69,20 @@ clv_bps = closing.stable_prob_bps[side] − entry.stable_prob_bps[side]
 
 The de-margined (vig-free) probability of the chosen side at the market's **close** minus at **entry**, in basis points. Plain-English: *did the agent get a better price than where the sharp market closed?* — measured from the sealed tape, never self-reported. An action with no close yet is `pending`, never scored as 0.
 
+## The strategy roster
+
+Veridex isn't one bot — it runs a **roster of strategies through the same sealed pipeline**, so you can compare them on identical data. Each only *proposes*; the law scores them all on recomputed CLV.
+
+| Strategy | Type | How it works |
+|----------|------|-------------|
+| **Cumulative Drift** | rule-based | Catches slow, sustained repricing — takes the side whose de-margined probability is grinding monotonically in one direction (logit-space cumulative drift + EWMA-slope gates). *The featured 18-fixture candidate signal.* |
+| **Sharp Momentum** | rule-based | Trend-continuation — takes the side whose de-margined probability is *rising*, betting the sharp close confirms the move. |
+| **Value vs. Venue** | rule-based | Compares TxLINE's de-margined fair probability against a real venue quote to surface an *estimated* executable edge (estimated mids, **not** fills). |
+| **LLM-Drift** | language-model | An LLM contestant that decides from the **same** drift features as the deterministic drift agent — identical inputs, so the contest is fair and the model's *claimed* edge is fenced out of scoring. |
+| **QuoteGuard Maker** | market-making | Quotes a two-sided spread anchored on TxLINE fair value, with a guard that pulls quotes when the fair-value feed is stale, missing, or suspended. |
+
+Every strategy is scored the same way (CLV, recomputed by the law). **We tested most of them and found no tradeable edge** — reported in full, including the nulls, in [Research findings](docs/mm-research-findings.md). The platform's value is the *fair comparison and honest scoring*, not a claim that any one strategy prints money.
+
 ## Why the leaderboard is trustworthy
 
 - **Same inputs for everyone** — a competition replays identical sealed ticks to every agent.
@@ -161,6 +175,7 @@ Depth-on-demand — the root README is the tour; the docs are the proof.
 | **[TxLINE integration feedback](docs/txline-feedback.md)** | Our real experience with the TxLINE API — what worked, and every point of friction we hit and reported back |
 | **[Judge walkthrough](docs/deploy-judges.md)** | Step-by-step: run the sealed demo, open a Proof Card, verify it yourself |
 | **[Deploy your own agent](docs/deploy-your-own-agent.md)** | Run *your* strategy through the same sealed pipeline and compete on the same leaderboard |
+| **[Research findings](docs/mm-research-findings.md)** | The honest edge investigation — every strategy we tested and *killed*, and the one candidate signal, honestly labeled |
 | **[Research journey](docs/research-journey.md)** | How the 18-fixture Run-001 / Run-002 experiments were run — including what didn't survive |
 | **[Operator runbook](docs/operator-runbook.md)** | The guarded, operator-only real-money path (fail-closed by construction) |
 | **[FAQ](docs/faq.md)** · **[Full submission writeup](docs/submission.md)** | Common questions · the complete submission narrative |

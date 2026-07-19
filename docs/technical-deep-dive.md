@@ -1375,9 +1375,8 @@ are what happens.
 
 ### 12.6 Run-001 & Run-002 — the roadmap executed (18-fixture strategy results)
 
-The §12.5 roadmap was then run. Both results are recorded cold in the research record
-(`.omc/research/run-001-run-note.md`, `run-002-run-note.md`); the honest framing below is the same
-one the docs and UI carry.
+The §12.5 roadmap was then run. Both results are recorded cold in the research record;
+the honest framing below is the same one the docs and UI carry.
 
 **Run-001 — candidate rung-1 CLV signal.** Across **18 finished World Cup fixtures** (market-quality-filtered
 eligible universe, pre-kickoff decisions, CLV vs the CON-040 kickoff close), the `CumulativeDriftAgent`
@@ -1390,7 +1389,7 @@ effective *n* ≈ 18 fixtures (the ~19.7k drift picks are autocorrelated intra-m
 taken **out-of-sample (OOS)** — did **not** reproduce it: on the circular TxLINE-close metric the sign flipped
 hard negative (in-sample +162 → OOS −254 bps, fixture-clustered) and on **independent settled outcomes**
 it was **NULL** (≈0), at only **N=2 effective fixtures** (the ~800 OU picks collapse to two match totals),
-so it is kept as a benchmark, not a promoted edge (`.omc/research/drift-oos-test.md`). The runner
+so it is kept as a benchmark, not a promoted edge. The runner
 self-verifies against a pre-run stamp and
 reproduced the committed eligible-universe hash exactly (`universe_verified: True`).
 

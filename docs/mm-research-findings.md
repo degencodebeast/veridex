@@ -13,8 +13,7 @@
 > here is `EVIDENCE_GATED` or `PROMOTED`**, none is claimed as independently verified research, and no
 > profitability/alpha claim is made. Read every result below as *reviewed / scoped / pending independent
 > re-backtest*, not as certified truth. The authoritative gate definition and the certification standard
-> live in **`spec/spec-architecture-post2d-research-verification-gate-b.md`** (plan-level view:
-> `.omc/plans/r4a-entry-gate.md`). This banner is on-thesis: Veridex's own principle is "recompute from
+> are tracked in the internal research-verification-gate spec. This banner is on-thesis: Veridex's own principle is "recompute from
 > evidence; don't trust the agent that grades itself" — applied here to our own research.
 
 ---
@@ -79,7 +78,7 @@ capture survive *measured* adverse selection and fees? A bounded counterfactual-
 France–Morocco tested it. Setup: quote symmetric around the venue mid (the *optimistic* reference — an
 FV-centered quote would be staler and worse), continuously re-centered; credit a fill only when a real
 trade prints against the quote; markout the venue mid over δ∈{1..30}s; net = half-spread − adverse
-selection. **Triple-reviewed by Codex, Fable, and an independent Claude critic** — the conclusion was
+selection. **Triple-reviewed via independent cross-model adversarial review** — the conclusion was
 **reviewed and reproduced in-session (NOT yet independently Gate-B-verified — Gate B is OPEN)**, and the two
 implementation defects found in review were checked to *strengthen*, not flip, it.
 
@@ -123,7 +122,7 @@ overclaimed as dead. A preregistered ≥6-match extension (clustered by match) i
 
 Beyond make/take, the roster carries FV-only directional strategies (`CumulativeDriftStrategy`,
 `MomentumStrategy`, `SharpMomentumStrategy`) and a `value_vs_venue` strategy. Three-family review
-(Codex + Fable + an independent Claude critic) mapped and adjudicated them:
+(independent cross-model adversarial review) mapped and adjudicated them:
 
 - **`value_vs_venue` — FALSIFIED.** It compares TxLINE fair value against the venue price — i.e. it
   *is* the venue-timing bet. Our finding that the venue leads TxLINE makes its mids-dislocation stale
@@ -141,8 +140,7 @@ Beyond make/take, the roster carries FV-only directional strategies (`Cumulative
     the shape of a post-selection artifact, indistinguishable from a real trend-catcher without
     out-of-sample data — and the first genuinely out-of-sample (OOS) test (frozen OU-only, N≈4 predeclared →
     **N=2 finished**) did **not** reproduce it: *falsifying* on the circular metric (+162 → −254 bps
-    clustered), **NULL on independent settled outcomes** (≈0), confirming nothing either way at N=2
-    (`.omc/research/drift-autocorrelation-closer.md`, `drift-oos-test.md`).
+    clustered), **NULL on independent settled outcomes** (≈0), confirming nothing either way at N=2.
   - **And not monetizable even if real:** drift is a pre-match/minutes signal, and the pre-match venue
     is *frozen* (§7) → no execution surface.
 
@@ -187,7 +185,7 @@ which, unverified, would have shipped a subtly-wrong result.
   are convergent and decisive for the tested family, not a claim about all markets or all strategies.
 - Maker fills are counterfactual executability, not proof of queue priority or real fills.
 - Goal-derived results beyond France–Morocco are **exploratory/unvalidated** pending the pipeline
-  hardening tracked in `.omc/plans/backtest-carry-forwards.md`.
+  hardening tracked in the internal research backlog.
 - **The "venue leads TxLINE ~6.5s" finding is IN-PLAY-ONLY** — measured at in-play goal events in
   liquid WC-soccer matches. It is *not* a universal claim. The mechanism (Polymarket's fast informed
   in-play sweeper flow front-runs TxLINE's confirmation pipeline) is specific to live, liquid,
@@ -206,7 +204,7 @@ which, unverified, would have shipped a subtly-wrong result.
   So the venue is either **FAST** (in-play) or **FROZEN** (pre-match); **TxLINE does not demonstrably
   lead a *moving* venue anywhere tested.** Honest scope (both families): this **closes the angle for the
   submission — it is NOT a universal statistical rejection** (the corpus is underpowered, ≤4 testable
-  matches). (`.omc/research/prematch-lead-test.md`.) The *stale-level catch-up* variant is also dead on
+  matches). The *stale-level catch-up* variant is also dead on
   data: at KO−2m the frozen mid already sits within 3–67 bps of FV (no stale level to catch up from).
 - **TxLINE's structural value is NOT speed** — it is the *sharp de-margined fair-value anchor* (breadth)
   + *cryptographic provenance* (provable "when you knew it"), which is the right primitive for honest
@@ -248,7 +246,7 @@ print-through, mid-anchored + zero-fee = generous to the maker):
 **Verdict:** no implementable smarter-maker variant turns positive; the best they do is claw back toward
 breakeven by NOT trading around goals — damage avoidance, not edge. Notably, the marquee "pull quotes
 around goals" mechanism **backfires once its ~6.5s signal latency is honestly modeled** — the toxic fills
-have already happened before the goal signal exists. (`.omc/research/smarter-maker-probe.md`.)
+have already happened before the goal signal exists.
 
 ## 4.7 Cross-market consistency (Dixon-Coles / cross-market relative value) — NULL
 Test: are TxLINE's 1X2 / OU / AH families (all StablePrice) internally inconsistent with one coherent
@@ -261,12 +259,12 @@ FT snapshots, de-margined probs verified summing to 1.0 (0/292 violations).
   marginal AH −0.5 fails Bonferroni). ~80% of the apparent inconsistency dissolves once the total floats.
 - **Verdict: no SYSTEMATIC cross-market inconsistency detected** under the tested Dixon-Coles model + corpus; the residual is
   within plain-model misspecification. And **no execution surface** (WC Polymarket lists only 1X2, no
-  OU/AH) → signal-only even if a residual existed. (`.omc/research/cross-market-consistency-probe.md`.)
+  OU/AH) → signal-only even if a residual existed.
 
 ## 4.8 Cross-venue convergence (does the venue move toward the TxLINE fair?) — SUGGESTIVE-POSITIVE, not tradeable
 > **(2026-07-11) Contamination fix + independent verification.** This probe's original NULL used a hand-rolled
 > goal detector blind to lifecycle retractions (the phantom-goal bug). Re-running through the fixed extractor
-> **flipped the sign**, and an independent Fable adversarial self-check **reproduced** it: corrected goals
+> **flipped the sign**, and an independent adversarial self-check **reproduced** it: corrected goals
 > (FRA-MAR 2-0), the goal-excluded 5-min net edge is **+1.86pp [+0.70,+3.10]** (grid-robust: 32/36 cells net>0,
 > 25/36 CI>0; seed- and leave-one-out-stable), and Findings 2 & 4 below (the "FV rides own reversion" and "the
 > edge is goal-capture" attributions) were phantom-goal artifacts — **retracted**. **BUT the honest label is
@@ -274,7 +272,7 @@ FT snapshots, de-margined probs verified summing to 1.0 (0/292 violations).
 > still **spans 0** (+1.35 [−1.56,+3.63]), on N=19 single-tournament clusters, counterfactual fills, a swept
 > grid with ~10× overlapping entries, and no OOS. It is a **candidate for R4-B**, not a proven edge, and the
 > full methodology re-backtest (Gate B) remains open, so it is NOT promoted. (Distinguish the FM ~6.5s pilot
-> from the scaled −5.18s median.) Full detail: `.omc/research/cross-venue-convergence-probe.md`.
+> from the scaled −5.18s median.)
 > **⟨SUPERSEDED ORIGINAL RESULT — pre-fix, retained for provenance. The banner ABOVE is the authoritative
 > corrected verdict. The numbers in the four bullets below (sign-match 0.704, FV-specific t=1.17,
 > "mostly GOAL-capture", the INCONCLUSIVE/NEGATIVE verdict, "no tradeable path") were computed on the
@@ -296,7 +294,6 @@ divergence)? In-play non-goal regime, 19 fixtures, fixture-clustered, cross-reco
   FV-specific effect is statistically indistinguishable from zero at N=fixtures, and net of spread it is
   NOT an edge. → **No tradeable venue-executability path for TxLINE-FV directional signals** (drift /
   momentum / sharp): the venue doesn't reliably converge to the TxLINE fair beyond its own noise.
-  (`.omc/research/cross-venue-convergence-probe.md`.)
 
 ---
 ## Research status: COMPLETE for the frozen Polymarket / WC hypothesis set. Every make/take/directional
@@ -315,7 +312,7 @@ The one roster strategy never characterized (robust-z + Page-Hinkley + persisten
   TxLINE has no timing edge — the same structural fact as every other null, via a different strategy.
 - **Circular CLV of its 15 scoreable fires:** fixture-clustered −87 bps, CI [−282,+108] (straddles 0);
   pooled↔clustered sign-flip = pseudo-replication. NULL / uninterpretable; circular + not venue-tradeable
-  regardless. (`.omc/research/sharpmomentum-characterization.md`.) The probe refused to p-hack (did NOT
+  regardless. The probe refused to p-hack (did NOT
   loosen thresholds to force fires).
 
 **The pre-declared roster is now fully characterized for the frozen Polymarket / WC hypothesis set.** Every
@@ -340,7 +337,7 @@ FROZEN, pre-declared 6-match set (FM, ESP-BEL, + 4 more; goal counts matched the
 - Every (h × δ) cell is 6/6 negative; wider spread = worse; breakeven fee is negative (no fee ≥0 works).
 - **Limitation:** N=6, same-venue/same-competition (cross-MATCH, not cross-regime); counterfactual fills;
   5/6 goal-sets manifest-unvalidated (counts match pre-declaration, only FM settlement-verified).
-**Verdict: the maker null HOLDS and STRENGTHENS at N=6.** (`.omc/research/maker-scaled-6match.md`.)
+**Verdict: the maker null HOLDS and STRENGTHENS at N=6.**
 
 ## 4.11 Taker null SCALED — N=2 goals → 48 extracted goals, 35 clean / 16 fixtures analyzed (robust, with one honest exception)
 Scales §3's FM taker null across the played slate (updates §3's "convergent negative" to a
@@ -355,4 +352,4 @@ slate-wide; goalless controls → 0 (placebo passes).
 - **The correct honest claim:** the venue leads on the vast majority of goals and 15/16 fixtures; a
   durable stale-quote taker window is the RARE EXCEPTION seen once — consistent with a *candidate* thin/late
   low-liquidity regime (one counterexample suggests the hypothesis; it does not prove the regime), not a
-  repeatable edge. (`.omc/research/taker-goalshock-scaled.md`.)
+  repeatable edge.
