@@ -83,7 +83,9 @@ def test_missing_cors_origins_fails_closed() -> None:
 async def test_init_db_invoked_once_at_startup() -> None:
     """Entering the app lifespan invokes PostgresStore.init_db exactly once (tables get created)."""
     pool = _FakePool()
-    app = server.create_server_app(env=_ENV, pool_factory=lambda dsn, env: pool)
+    # II-5f: create_server_app returns the deny-by-default GUARD; the durable Postgres wiring
+    # (store + lifecycle + pool) lives on the composed inner FastAPI at ``guard.app``.
+    app = server.create_server_app(env=_ENV, pool_factory=lambda dsn, env: pool).app
     assert isinstance(app.state.store, PostgresStore)
 
     spy = AsyncMock()
@@ -128,7 +130,7 @@ async def test_postgres_store_acquires_from_pool(monkeypatch: pytest.MonkeyPatch
 async def test_unreachable_db_fails_closed_no_inmemory_fallback() -> None:
     """A pool that can't reach the DB raises at startup; the store is Postgres, never InMemory."""
     pool = _FakePool(wait_error=RuntimeError("pool initialization incomplete"))
-    app = server.create_server_app(env=_ENV, pool_factory=lambda dsn, env: pool)
+    app = server.create_server_app(env=_ENV, pool_factory=lambda dsn, env: pool).app
 
     # The Postgres path was chosen — NOT silently downgraded to InMemory.
     assert isinstance(app.state.store, PostgresStore)
@@ -141,5 +143,5 @@ async def test_unreachable_db_fails_closed_no_inmemory_fallback() -> None:
 
 def test_no_database_url_uses_inmemory() -> None:
     """With no DATABASE_URL the entrypoint uses InMemoryStore (local-dev), still CORS-validated."""
-    app = server.create_server_app(env={"CORS_ORIGINS": "https://app.example.test"})
+    app = server.create_server_app(env={"CORS_ORIGINS": "https://app.example.test"}).app
     assert isinstance(app.state.store, InMemoryStore)

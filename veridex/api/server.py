@@ -12,6 +12,10 @@ What this module guarantees over the bare ``create_app`` factory:
     ``pool.wait``); it NEVER silently downgrades to an ``InMemoryStore`` that would lose state on
     restart. Only an ABSENT ``DATABASE_URL`` selects InMemory (explicit local-dev, not a fallback).
   * **required env** — ``CORS_ORIGINS`` must be set or the app refuses to build (no localhost default).
+  * **AgentOS surface hosted (II-5f)** — the served app is the deny-by-default GUARD hosting the
+    AgentOS surface (AC-27/AC-29 enforced on the SERVED app, not just the test harness). Functional
+    agent EXECUTION stays authority-bound via the per-instance deploy path (``deploy.py``), NOT the
+    hosted wrapper route. The factory RETURNS THE GUARD (the ASGI callable), never the inner FastAPI.
 
 ``psycopg_pool`` is imported lazily inside the default pool factory so importing this module (and the
 offline suite) stays free of the optional ``postgres`` extra.
@@ -22,14 +26,18 @@ from __future__ import annotations
 import contextlib
 import os
 from collections.abc import AsyncIterator, Callable, Mapping
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from fastapi import FastAPI
 
 from veridex.api.readiness import build_readiness_router
-from veridex.api.router import create_app
 from veridex.config import get_settings
 from veridex.store import InMemoryStore, PostgresStore, Store
+
+if TYPE_CHECKING:
+    from veridex.api.auth_privy import _Verifier
+    from veridex.config import Settings
+    from veridex.runtime.mm_agent_adapter import RunContext
 
 # Container binds all interfaces by default (the process is the isolation boundary).
 DEFAULT_HOST = "0.0.0.0"
@@ -89,56 +97,181 @@ def _install_pg_lifecycle(app: FastAPI, *, pool: Any, store: PostgresStore, time
     app.router.lifespan_context = _combined
 
 
+async def _served_mm_not_executor(_ctx: RunContext) -> Any:
+    """Fail-closed MM session factory for the served host adapter (SURFACE hosting; not the executor).
+
+    The served AgentOS wrapper route is a HOSTED SURFACE, not the per-instance MM executor: a single
+    build-time adapter cannot reconstruct an arbitrary instance from a ``RunContext`` (it carries no
+    ``instance_id``, and the wrapper mints a FRESH ``run_id`` that ``reconstruct_mm_session`` rejects,
+    since it requires ``ctx.run_id == instance.run_id``). Functional per-instance runs are
+    authority-bound via the deploy path (``deploy.py``), which builds a fresh per-instance adapter and
+    drives ``start_owned_instance_run`` with ``run_id == instance.run_id``. This fails CLOSED rather
+    than fabricating a run — and it is never reached by any public path (every agno-native route is
+    denied by the guard; the wrapper route is owner-gated and unused by the deploy executor).
+    """
+    raise RuntimeError(
+        "served AgentOS hosted wrapper route is not the per-instance MM executor; per-instance runs "
+        "are authority-bound via the deploy path (deploy.py)"
+    )
+
+
+def _served_no_tape(_ctx: RunContext) -> Any:
+    """Fail-closed tape resolver for the served directional host adapters (surface-only; not driven).
+
+    No server-owned tape is wired for hosted directional runs on the served app — directional
+    execution is authority-bound via the deploy path. The directional agno-native routes are all
+    denied by the guard, so this is never reached publicly; it fails CLOSED if ever invoked.
+    """
+    raise RuntimeError(
+        "no server-owned tape is wired for hosted directional runs on the served app; directional "
+        "execution is authority-bound via the deploy path (deploy.py)"
+    )
+
+
+def _build_served_hosting_adapters() -> tuple[Any, list[Any]]:
+    """Construct the SURFACE-HOSTING adapters the served app composes into AgentOS (Approach A).
+
+    Faithful to II-8b's composed set: the primary MM adapter (``veridex-market-maker``) plus the two
+    directional contestants (``veridex-cumulative-drift``, ``veridex-llm-drift``). These make the
+    agno-native surface REAL behind the deny-by-default guard; their run drivers are NEVER exercised by
+    any public path (every agno-native route is denied, and functional per-instance execution stays in
+    the deploy path), so they fail CLOSED if ever driven rather than fabricating a run.
+
+    agno-touching imports are LOCAL so this construction only pulls the runtime adapters on the real
+    serving path (importing this module adds no NEW agno import beyond the existing router chain).
+    """
+    from veridex.runtime.directional_agent_adapters import (
+        VeridexDeterministicAgentAdapter,
+        VeridexLLMAgentAdapter,
+    )
+    from veridex.runtime.mm_agent_adapter import VeridexAgentAdapter, build_market_maker_driver
+    from veridex.strategies.drift import cumulative_drift_agent
+    from veridex.strategies.llm_drift import default_model_launcher, llm_drift_agent
+
+    primary = VeridexAgentAdapter(
+        run_driver=build_market_maker_driver(_served_mm_not_executor),
+        id="veridex-market-maker",
+    )
+    det = VeridexDeterministicAgentAdapter(
+        agent_factory=cumulative_drift_agent,
+        tape_resolver=_served_no_tape,
+        name="veridex-cumulative-drift",
+        id="veridex-cumulative-drift",
+    )
+
+    def _served_llm_builder(model: Any, clock: Callable[[], float]) -> Any:
+        return llm_drift_agent("veridex-llm-drift", model=model, clock=clock)
+
+    llm = VeridexLLMAgentAdapter(
+        agent_builder=_served_llm_builder,
+        base_launcher=default_model_launcher(),  # the lazy Agno production launcher (never launched here)
+        tape_resolver=_served_no_tape,
+        name="veridex-llm-drift",
+        id="veridex-llm-drift",
+    )
+    return primary, [det, llm]
+
+
+def _resolve_verifier(verifier: _Verifier | None) -> _Verifier:
+    """Resolve the Privy token verifier, defaulting to the real ``verify_privy_token`` (injectable)."""
+    if verifier is not None:
+        return verifier
+    from veridex.api.auth_privy import verify_privy_token
+
+    return verify_privy_token
+
+
 def create_server_app(
     env: Mapping[str, str] | None = None,
     *,
     pool_factory: PoolFactory | None = None,
-) -> FastAPI:
-    """Build the public-deploy FastAPI app: durable Postgres when configured, else InMemory.
+    settings: Settings | None = None,
+    verifier: _Verifier | None = None,
+) -> Any:
+    """Build the public-deploy app: the deny-by-default GUARD hosting the AgentOS surface.
+
+    Composes :func:`~veridex.runtime.agentos_service.build_agentos_app` INTO the served app so the
+    AgentOS surface is hosted behind the deny-by-default boundary (AC-27/AC-29 enforced on the SERVED
+    app, not just the test harness). The durable Postgres wiring is unchanged (durable when configured,
+    else InMemory local-dev); it now operates on ``guard.app`` (the composed FastAPI), and the function
+    RETURNS THE GUARD (the ASGI callable) — never the inner FastAPI.
+
+    SURFACE HOSTING (Approach A): the served composition hosts the AgentOS surface; functional agent
+    EXECUTION remains authority-bound via the per-instance deploy path (``deploy.py``), NOT the hosted
+    wrapper route (the hosted adapters' run drivers fail closed if ever driven — never a fabricated run).
 
     Args:
         env: Environment mapping (defaults to ``os.environ``). Read for ``DATABASE_URL``,
-            ``CORS_ORIGINS`` (required), and optional pool-sizing / connect-timeout keys.
+            ``CORS_ORIGINS`` (required), ``REPLAY_PACK_ROOT``, and optional pool / connect-timeout keys.
         pool_factory: Injection seam for tests — builds the pool from ``(dsn, env)``. Defaults to a
             real ``psycopg_pool.AsyncConnectionPool``.
+        settings: Injection seam for tests — resolved :class:`~veridex.config.Settings` (auth mode +
+            Privy material). Defaults to :func:`~veridex.config.get_settings`.
+        verifier: Injection seam for tests — the Privy token verifier. Defaults to the real
+            ``verify_privy_token``.
 
     Returns:
-        A configured app. ``app.state.store`` exposes the resolved store (for durability assertions);
-        ``app.state.db_pool`` is the pool on the Postgres path, else ``None``.
+        The :class:`~veridex.runtime.agentos_service.DenyByDefaultGuard` ASGI app. Its ``.app`` is the
+        composed FastAPI: ``guard.app.state.store`` exposes the resolved store (durability assertions);
+        ``guard.app.state.db_pool`` is the pool on the Postgres path, else ``None``.
 
     Raises:
         ValueError: If ``CORS_ORIGINS`` is not configured (fail-closed).
     """
     resolved_env: Mapping[str, str] = os.environ if env is None else env
-    _require_cors_origins(resolved_env)  # fail closed BEFORE any store/pool is built
-    settings = get_settings()
+    _require_cors_origins(resolved_env)  # fail closed BEFORE any store/pool/composition is built
+    resolved_settings = get_settings() if settings is None else settings
 
+    # Resolve the store/pool (durable Postgres when configured, else explicit InMemory local-dev).
     database_url = resolved_env.get("DATABASE_URL")
     if database_url:
         pool = (pool_factory or _default_pool_factory)(database_url, resolved_env)
         pg_store = PostgresStore(pool=pool)
-        app = create_app(store=pg_store, settings=settings)
-        timeout = float(resolved_env.get("DB_CONNECT_TIMEOUT_S", _DEFAULT_CONNECT_TIMEOUT_S))
-        _install_pg_lifecycle(app, pool=pool, store=pg_store, timeout=timeout)
         store: Store = pg_store
-        app.state.db_pool = pool
     else:
         # Explicit local-dev choice — NOT a fallback for an unreachable Postgres.
         store = InMemoryStore()
-        app = create_app(store=store, settings=settings)
+        pool = None
+
+    # D-1 deployment READINESS probe (additive; distinct from I-5's /healthz liveness). Reads the live
+    # pool LAZILY at request time via a holder (the pool is attached to guard.app.state AFTER
+    # composition). Registered pre-snapshot as a base router so /readyz is veridex-owned/self-gated
+    # (it PASSES the guard, returning 200/503) rather than treated as agno-native and denied.
+    pool_holder: dict[str, Any] = {"pool": None}
+    readiness_router = build_readiness_router(
+        get_pool=lambda: pool_holder["pool"],
+        pack_root=resolved_env.get("REPLAY_PACK_ROOT", ""),
+    )
+
+    # Compose AgentOS behind the deny-by-default guard. agno-touching imports are LOCAL (build_agentos_app
+    # keeps the agno import lazy internally; the adapters are built via the local helper).
+    from agno.db.in_memory import InMemoryDb  # noqa: PLC0415 (lazy: only on the real serving path)
+
+    from veridex.runtime.agentos_service import build_agentos_app  # noqa: PLC0415
+
+    primary, extra_agents = _build_served_hosting_adapters()
+    guard = build_agentos_app(
+        store=store,
+        settings=resolved_settings,
+        adapter=primary,
+        extra_agents=extra_agents,
+        owner_db=InMemoryDb(),
+        verifier=_resolve_verifier(verifier),
+        enforce_contract=True,  # AC-29: fail-closed on any agno-native surface drift
+        base_routers=[readiness_router],  # /readyz registered pre-snapshot -> veridex-owned, public
+    )
+    app = guard.app  # the composed FastAPI: durability lifecycle + state live HERE (not on the guard)
+
+    if database_url:
+        timeout = float(resolved_env.get("DB_CONNECT_TIMEOUT_S", _DEFAULT_CONNECT_TIMEOUT_S))
+        _install_pg_lifecycle(app, pool=pool, store=pg_store, timeout=timeout)
+        app.state.db_pool = pool
+        pool_holder["pool"] = pool  # readiness now sees the live pool (opened in the lifespan)
+    else:
         app.state.db_pool = None
 
     app.state.store = store
-
-    # D-1 deployment READINESS probe (additive; distinct from I-5's /healthz liveness). Reads the
-    # live pool lazily (opened in the lifespan) + REPLAY_PACK_ROOT; the compose healthcheck curls it.
-    app.include_router(
-        build_readiness_router(
-            get_pool=lambda: getattr(app.state, "db_pool", None),
-            pack_root=resolved_env.get("REPLAY_PACK_ROOT", ""),
-        )
-    )
-    return app
+    return guard  # RETURN THE GUARD (the ASGI callable) — never the inner FastAPI
 
 
 def main() -> None:

@@ -41,6 +41,8 @@ from veridex.store import DuplicateLeaseError, InstanceLease, LeaseStatus
 if TYPE_CHECKING:
     from collections.abc import Callable, Sequence
 
+    from fastapi import APIRouter
+
     from veridex.api.auth_privy import _Verifier
     from veridex.config import Settings
     from veridex.runtime.runtime_events import RuntimeEventSink
@@ -565,6 +567,7 @@ def build_agentos_app(
     event_sink: RuntimeEventSink | None = None,
     enforce_contract: bool = True,
     extra_agents: Sequence[VeridexAgentAdapter] | None = None,
+    base_routers: Sequence[APIRouter] | None = None,
 ) -> Any:
     """Compose the guarded AgentOS app: veridex routes + adapter(s) + deny-by-default boundary.
 
@@ -583,6 +586,11 @@ def build_agentos_app(
             behind the SAME deny-by-default boundary. Agno's agent routes are templated by
             ``{agent_id}``, so extra agents add NO new route templates — the AC-29 native surface is
             unchanged. Each is contract-checked. Defaults to ``None`` (byte-identical to before).
+        base_routers: ADDITIVE — extra ``APIRouter``s (e.g. the deploy ``/readyz`` readiness probe)
+            registered on the base app BEFORE the veridex matcher snapshot, so they are veridex-owned
+            and self-gated (they PASS the guard) rather than being treated as agno-native and DENIED.
+            They are subtracted as veridex-owned by the AC-29 contract, so they add NO agno-native
+            surface. Defaults to ``None`` (byte-identical to before).
 
     Returns:
         The OUTERMOST :class:`DenyByDefaultGuard` ASGI app wrapping the composed FastAPI app.
@@ -596,6 +604,10 @@ def build_agentos_app(
 
     # (1) veridex routes FIRST.
     veridex_app = create_app(store=store, settings=settings)
+    # (1a) additive base routers (e.g. the deploy /readyz probe) — on the base app BEFORE the snapshot
+    # so they are veridex-owned/self-gated (they PASS the guard), never treated as agno-native + denied.
+    for router in base_routers or ():
+        veridex_app.include_router(router)
     require_principal = make_require_principal(settings, verifier)
 
     # (2) owner-scoped wrapper routes on the base app (BEFORE composition). The wrapper drives the
