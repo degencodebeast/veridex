@@ -1,4 +1,5 @@
 'use client';
+import Link from 'next/link';
 import { useMemo, useRef, useState, type ReactNode } from 'react';
 import { SegmentedControl } from '@/components/ui/SegmentedControl';
 import { InfoTip } from '@/components/ui/InfoTip';
@@ -26,6 +27,12 @@ function newIdempotencyKey(): string {
 // the MM payload off the SELECTED TEMPLATE (not the archetype) is deliberate: quoteguard_mm reuses
 // the `baseline` archetype, so mapping by archetype alone would hijack every manual baseline pick.
 const MM_TEMPLATE_ID = 'quoteguard_mm';
+
+// F-1: the det-Drift template id — the deploy discriminator for the real `cumulative-drift` detector.
+// Like MM, the STRATEGY is driven off the selected TEMPLATE (not the archetype): det-Drift reuses the
+// `momentum` archetype for mode coupling, so a manual momentum pick still deploys momentum-sharp while
+// THIS template deploys cumulative-drift. (build_agent accepts `cumulative-drift`; config.py:183.)
+const DET_DRIFT_TEMPLATE_ID = 'det_drift';
 
 // The MM tape catalog KEY (NOT a path/fixture) resolved server-side via the mm_tape_resolver seam.
 // This is the REAL-DATA maker replay tape registered in the production catalog
@@ -55,12 +62,47 @@ function mmExecutionMode(exec: ExecutionMode): 'paper' | 'dry_run' {
   return exec === 'dry_run' ? 'dry_run' : 'paper';
 }
 
-// Map the Studio archetype + mode onto a backend strategy family (deploy launches this agent).
-function toStrategy(archetype: Archetype, mode: StudioMode): string {
-  if (mode === 'llm') return 'llm';
-  if (archetype === 'momentum') return 'momentum-sharp';
-  if (archetype === 'baseline') return 'baseline';
-  return 'momentum-sharp';
+// F-1: the honest, EXHAUSTIVE strategy resolution. The old `toStrategy` ended in a silent
+// `return 'momentum-sharp'`, so value_clv / contrarian / stale_line in a deterministic mode all deployed
+// an IDENTICAL momentum-sharp agent under three different card names — that is the dishonesty F-1 removes.
+// This resolver is bounded by what the deploy path actually supports (build_agent's Literal
+// baseline|momentum|momentum-sharp|cumulative-drift|llm, plus the separate quoteguard-mm MM seam) and has
+// NO default fallthrough: an unmapped combo returns a typed `unsupported` verdict so the UI can disable
+// deploy — a strategy the card does not name is NEVER emitted.
+export type StrategyResolution =
+  | { supported: true; strategy: string }
+  | { supported: false; reason: string };
+
+export function resolveStrategy(
+  templateId: string | null, archetype: Archetype, mode: StudioMode,
+): StrategyResolution {
+  // Template-driven overrides — the deploy discriminator is the SELECTED template, not the archetype
+  // (so a manual archetype pick never hijacks a template family; mirrors the MM carve-out).
+  if (templateId === MM_TEMPLATE_ID) return { supported: true, strategy: 'quoteguard-mm' };
+  if (templateId === DET_DRIFT_TEMPLATE_ID) return { supported: true, strategy: 'cumulative-drift' };
+  // Directional path — an honest map onto the build_agent Literal:
+  //   • any llm-capable archetype in LLM mode → the generic `llm` agent (value_clv/baseline are
+  //     LLM-locked in coupling.ts, so this branch only ever sees momentum/contrarian/stale_line).
+  //   • momentum (deterministic) → momentum-sharp; baseline (deterministic) → baseline.
+  if (mode === 'llm') return { supported: true, strategy: 'llm' };
+  if (archetype === 'momentum') return { supported: true, strategy: 'momentum-sharp' };
+  if (archetype === 'baseline') return { supported: true, strategy: 'baseline' };
+  // value_clv / contrarian / stale_line in a deterministic mode: NO distinct backend strategy exists.
+  // Return unsupported (never a silent momentum-sharp) — the deploy affordance is disabled for these.
+  return {
+    supported: false,
+    reason: `${archetype} has no deterministic backend strategy — switch to LLM mode (if available), or pick a supported template (Momentum, det-Drift, or QuoteGuard/MM)`,
+  };
+}
+
+// Thrown if a deploy payload is somehow built for an unsupported combo (defense-in-depth: the UI
+// disables the button first). Making this a hard throw means a strategy the card does not name can
+// never be silently substituted, even if a caller bypasses the disabled affordance.
+export class UnsupportedStrategyError extends Error {
+  constructor(public readonly archetype: Archetype, public readonly mode: StudioMode, reason: string) {
+    super(`unsupported strategy for archetype=${archetype} mode=${mode}: ${reason}`);
+    this.name = 'UnsupportedStrategyError';
+  }
 }
 
 // Build the non-secret deploy payload from the pinned Studio config + policy envelope.
@@ -105,10 +147,36 @@ export function buildDeployPayload(
       },
     };
   }
+  // F-1: det-Drift — the real `cumulative-drift` detector as a standalone Studio deploy. Same directional
+  // payload/envelope as the archetype path (the backend applies its own cum_drift_* knob defaults —
+  // config.py:183), with the strategy fixed by the template id. NO invented drift params on the wire.
+  if (templateId === DET_DRIFT_TEMPLATE_ID) {
+    return {
+      template_id: DET_DRIFT_TEMPLATE_ID,
+      agent_id: `studio-${DET_DRIFT_TEMPLATE_ID}`,
+      strategy: 'cumulative-drift',
+      source_mode: source,
+      execution_mode: exec,
+      market_allowlist: DEFAULT_POLICY_ENVELOPE.market_allowlist,
+      venue_allowlist: DEFAULT_POLICY_ENVELOPE.venue_allowlist,
+      min_edge_bps: DEFAULT_POLICY_ENVELOPE.min_edge_bps,
+      max_stake: DEFAULT_POLICY_ENVELOPE.max_stake,
+      window_id: `studio-${DET_DRIFT_TEMPLATE_ID}`,
+      fixture_id: 1,
+      end_rule: 'pre_match',
+    };
+  }
+  // Directional path — resolve the strategy EXHAUSTIVELY (no silent momentum-sharp fallthrough). An
+  // unsupported combo throws rather than emit a strategy the card does not name; the UI disables the
+  // deploy button for these, so this throw is defense-in-depth against a bypassed affordance.
+  const resolution = resolveStrategy(templateId, archetype, mode);
+  if (!resolution.supported) {
+    throw new UnsupportedStrategyError(archetype, mode, resolution.reason);
+  }
   return {
     template_id: archetype,
     agent_id: `studio-${archetype}`,
-    strategy: toStrategy(archetype, mode),
+    strategy: resolution.strategy,
     source_mode: source,
     execution_mode: exec,
     market_allowlist: DEFAULT_POLICY_ENVELOPE.market_allowlist,
@@ -151,7 +219,12 @@ export function StudioScreen({
   // is identity — the authenticated path — so component tests exercise the deploy button directly.
   deployGate?: (deployButton: ReactNode) => ReactNode;
 }) {
-  const [archetype, setArchetype] = useState<Archetype>('value_clv');
+  // F-1: default to `baseline` — a genuinely deployable strategy. value_clv (the prior default) is
+  // LLM-locked AND has no distinct deterministic backend strategy, so under the honest exhaustive
+  // mapping it is never deployable; defaulting the primary CTA to a non-deployable archetype would be a
+  // broken-looking (and dishonest-feeling) first-run. baseline is also LLM-locked, so the AC-007
+  // LLM-lock behavior is preserved. value_clv remains selectable (its deploy is honestly disabled).
+  const [archetype, setArchetype] = useState<Archetype>('baseline');
   const [mode, setMode] = useState<StudioMode>('numeric');
   const [exec, setExec] = useState<ExecutionMode>('paper');
   // fu-ii5: the SELECTED template id — the deploy discriminator for the MM family. null once the
@@ -163,7 +236,7 @@ export function StudioScreen({
   const [source, setSource] = useState<SourceMode>('replay');
   // The last-pinned snapshot — edits are diffed against it and applied as a NEW version on pin.
   const [baseline, setBaseline] = useState<{ archetype: Archetype; mode: StudioMode; exec: ExecutionMode }>(
-    { archetype: 'value_clv', mode: 'numeric', exec: 'paper' },
+    { archetype: 'baseline', mode: 'numeric', exec: 'paper' },
   );
   // Whether the current draft has been pinned (drives the honest "Config pinned ✓" affordance).
   const [pinned, setPinned] = useState(false);
@@ -186,6 +259,12 @@ export function StudioScreen({
   // fu-ii5: the MM template is restricted to the fail-closed-safe modes — the source/exec selectors
   // must not offer live / live_guarded for it (an operator cannot pick a mode the backend rejects).
   const isMM = templateId === MM_TEMPLATE_ID;
+  // F-1: resolve the honest strategy for the CURRENT selection. When the combo has no distinct backend
+  // strategy (value_clv / contrarian / stale_line in a deterministic mode), deploy is disabled and the
+  // reason is surfaced — never a silent momentum-sharp substitution.
+  const strategyResolution = resolveStrategy(templateId, archetype, mode);
+  const deployUnsupported = !strategyResolution.supported;
+  const unsupportedReason = strategyResolution.supported ? null : strategyResolution.reason;
 
   // AC-007 snap-back: whenever archetype changes, re-resolve the current mode. A manual archetype/
   // mode edit clears the selected template — the deploy reverts to the directional path (fu-ii5).
@@ -288,17 +367,29 @@ export function StudioScreen({
           <Section n="01" title="Identity & archetype">
             <div className={styles.cards} data-testid="strategy-cards">
               {STRATEGY_TEMPLATES.map((t) => {
+                // F-1: LLM-Drift is an ARENA-ONLY contestant — `strategy:"llm-drift"` does NOT exist in
+                // the deploy path (it lives ONLY in veridex/runtime/arena_comparison.py). So it is NOT a
+                // selectable deploy card: it renders a "Use in Arena" affordance and NO deploy button,
+                // and it never sets a deploy template. (Operator reconciliation 2026-07-19.)
+                if (t.arenaOnly) {
+                  return (
+                    <div key={t.id} className={`${styles.card} ${styles.cardArena}`} data-testid="arena-only-card">
+                      <span className={styles.cardLabel}>{t.label}</span>
+                      <span className={styles.cardComplexity}>arena contestant · no Studio deploy</span>
+                      <span className={styles.cardBlurb}>{t.blurb}</span>
+                      <Link className={styles.arenaLink} href="/arena" data-testid="use-in-arena">Use in Arena →</Link>
+                    </div>
+                  );
+                }
                 // fu-ii5: a heavy extension is LOCKED unless it is per-template `deployable`. Only
-                // quoteguard_mm is deployable, so Arb/Spread stays Phase-3-locked and the MM card
-                // becomes selectable with an HONEST label (no "Phase-3", no implied live trading).
+                // Arb/Spread stays Phase-3-locked; quoteguard_mm + det-Drift are deployable.
                 const locked = t.complexity === 'heavy-extension' && !t.deployable;
-                // HONEST source label: the deployable MM card is a SIMULATED REPLAY (dry-run, no live
-                // money) of REAL recorded in-play data — Polymarket depth + TxLINE fair value, France v
-                // Morocco — research-grade (NOT R3-sealed / genuine). No "live", no "genuine".
-                const complexityLabel = t.deployable ? MM_CARD_PROVENANCE : COMPLEXITY_LABEL[t.complexity];
-                // Override the template's stale "synthetic canned fixture" blurb with the honest
-                // real-recorded-data provenance for the now-wired deployable MM card.
-                const cardBlurb = t.deployable ? MM_CARD_BLURB : t.blurb;
+                // The MM card carries a SIMULATED-REPLAY provenance label + blurb (real recorded
+                // Polymarket/TxLINE data, dry-run, live-money disabled). Keyed off the MM id specifically
+                // (NOT `deployable`, which now also covers det-Drift) so det-Drift keeps its own copy.
+                const isMMCard = t.id === MM_TEMPLATE_ID;
+                const complexityLabel = isMMCard ? MM_CARD_PROVENANCE : COMPLEXITY_LABEL[t.complexity];
+                const cardBlurb = isMMCard ? MM_CARD_BLURB : t.blurb;
                 return (
                   <button
                     key={t.id}
@@ -483,11 +574,19 @@ export function StudioScreen({
               // bearer-less owner-scoped POST is structurally impossible (the button is absent, not
               // merely disabled). Default deployGate is identity (authenticated path).
               deployGate(
-                <button type="button" className={styles.pin} onClick={pin} disabled={deploying}>
+                <button type="button" className={styles.pin} onClick={pin} disabled={deploying || deployUnsupported}>
                   {deploying ? 'DEPLOYING…' : 'PIN CONFIG & QUEUE RUN →'}
                 </button>,
               )
             )}
+            {/* F-1: the unsupported combos (value_clv / contrarian / stale_line, deterministic) have NO
+                distinct backend strategy. Rather than silently deploy momentum-sharp under a mismatched
+                card name, deploy is DISABLED and the reason is shown — observable, never silent. */}
+            {!running && deployUnsupported ? (
+              <p className={styles.deployBlocked} data-testid="deploy-unsupported-note" role="note">
+                Deploy unavailable: {unsupportedReason}. No agent is queued.
+              </p>
+            ) : null}
             {/* Honest pin affordance — NOT a fabricated hash (law_hash / Create-wizard ruling).
                 Real evidence/score/manifest hashes appear on the Proof Card after the sealed run.
                 SUPPRESSED while a preflight failure is showing: a fail-closed 422 pins NO instance

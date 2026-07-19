@@ -74,7 +74,10 @@ describe('StudioScreen (REQ-018 / AC-007 / SEC-006/007/009)', () => {
   it('locks LLM mode for value_clv and prevents selecting it; momentum unlocks it (AC-007)', async () => {
     const user = userEvent.setup();
     render(<StudioScreen />);
-    // default archetype is value_clv → LLM locked
+    // F-1: the default archetype is now `baseline` (also LLM-locked), so select value_clv explicitly to
+    // test ITS lock. (baseline replaced value_clv as the default because value_clv has no deployable
+    // deterministic strategy; both are LLM-locked, so AC-007 lock behavior is unchanged.)
+    await user.selectOptions(screen.getByLabelText(/archetype/i), 'value_clv');
     const llm = screen.getByRole('radio', { name: /LLM/ });
     expect(llm).toHaveAttribute('aria-disabled', 'true');
     await user.click(llm);
@@ -97,7 +100,7 @@ describe('StudioScreen (REQ-018 / AC-007 / SEC-006/007/009)', () => {
   it('keeps sections 02 and 03 mutually exclusive with continuous 01-05 numbering (AC-007)', async () => {
     const user = userEvent.setup();
     render(<StudioScreen />);
-    // value_clv + numeric: section 03 active, 02 is "not applicable" stub
+    // baseline (default) + numeric: section 03 active, 02 is "not applicable" stub
     expect(screen.getByTestId('section-03')).not.toHaveAttribute('data-inactive', 'true');
     expect(screen.getByTestId('section-02')).toHaveAttribute('data-inactive', 'true');
     expect(within(screen.getByTestId('section-02')).getByText(/not applicable in this mode/i)).toBeInTheDocument();
@@ -256,7 +259,7 @@ describe('StudioScreen (REQ-018 / AC-007 / SEC-006/007/009)', () => {
 
   // ── fu-ii5: decision 2 must NOT hijack the directional deploy path ───────────
   describe('directional deploys stay directional (fu-ii5 regression guard)', () => {
-    it('the default (value_clv) deploy carries NO mm object and a non-MM strategy', async () => {
+    it('the default (baseline) deploy carries NO mm object and a non-MM strategy', async () => {
       const user = userEvent.setup();
       const fetchMock = vi.fn(async () => okDeploy());
       vi.stubGlobal('fetch', fetchMock);
@@ -294,7 +297,7 @@ describe('StudioScreen (REQ-018 / AC-007 / SEC-006/007/009)', () => {
     expect(within(diff).getByText(/no pending changes/i)).toBeInTheDocument();
     await user.selectOptions(screen.getByLabelText(/archetype/i), 'momentum');
     const row = within(diff).getByTestId('diff-archetype');
-    expect(row).toHaveTextContent(/value_clv/);
+    expect(row).toHaveTextContent(/baseline/); // F-1: default archetype is now baseline
     expect(row).toHaveTextContent(/momentum/);
     expect(within(diff).getByText(/new (pinned )?version/i)).toBeInTheDocument();
   });
@@ -660,6 +663,115 @@ describe('StudioScreen (REQ-018 / AC-007 / SEC-006/007/009)', () => {
     it('proof_mode InfoTip renders GLOSSARY.proof_mode.definition verbatim', () => {
       render(<StudioScreen />);
       expect(allTooltipTexts()).toContain(GLOSSARY.proof_mode.definition);
+    });
+  });
+
+  // ── F-1: det-Drift standalone deploy + honest exhaustive strategy mapping ─────
+  // OPERATOR RECONCILIATION (2026-07-19, operator-authorized deadline reconciliation): the deploy path
+  // (veridex_agent/config.py build_agent) accepts ONLY the strategy Literal
+  //   baseline | momentum | momentum-sharp | cumulative-drift | llm
+  // and raises `unknown strategy` on anything else. So:
+  //  • det-Drift is a REAL standalone Studio deploy → strategy 'cumulative-drift'.
+  //  • `llm-drift` does NOT exist in the deploy path (it lives ONLY in
+  //    veridex/runtime/arena_comparison.py), so LLM-Drift is a pinned fair-comparison ARENA contestant
+  //    with NO Studio deploy — and the generic `llm` agent is NEVER relabeled as LLM-Drift.
+  //  • value_clv / contrarian / stale_line in a deterministic mode have NO distinct backend strategy;
+  //    the old `toStrategy` silently funneled them to momentum-sharp. That silent substitution is the
+  //    dishonesty F-1 removes: these combos are DISABLED, never deployed under a mismatched strategy.
+  describe('F-1 · det-Drift standalone deploy + honest exhaustive strategy mapping', () => {
+    async function selectCard(user: ReturnType<typeof userEvent.setup>, name: RegExp) {
+      await user.click(within(screen.getByTestId('strategy-cards')).getByRole('button', { name }));
+    }
+
+    // RED-1: the det-Drift template deploy POSTs the REAL cumulative-drift strategy (build_agent-accepted).
+    it('det-Drift template deploy POSTs strategy:"cumulative-drift" (directional payload, no mm)', async () => {
+      const user = userEvent.setup();
+      const fetchMock = vi.fn(async () => okDeploy());
+      vi.stubGlobal('fetch', fetchMock);
+      render(<StudioScreen />);
+
+      await selectCard(user, /det-Drift/);
+      await user.click(screen.getByRole('button', { name: /pin config & queue run/i }));
+
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      const [, init] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
+      const body = JSON.parse(init.body as string);
+      expect(body.strategy).toBe('cumulative-drift'); // the real det-Drift detector, not momentum-sharp
+      expect(body.mm).toBeUndefined();                // directional payload, NOT the MM family
+      expect(body.source_mode).toBe('replay');
+      expect(await screen.findByTestId('deploy-run-id')).toHaveTextContent('run_deadbeefcafe');
+    });
+
+    // RED-1b (unit): buildDeployPayload maps the det-Drift template onto cumulative-drift + directional envelope.
+    it('buildDeployPayload(det_drift) emits strategy:"cumulative-drift" with the directional envelope', () => {
+      const payload = buildDeployPayload('momentum', 'numeric', 'paper', 'replay', 'det_drift');
+      expect(payload.strategy).toBe('cumulative-drift');
+      expect(payload.mm).toBeUndefined();
+      expect(payload.template_id).toBe('det_drift');
+      expect(payload.market_allowlist).toEqual(DEFAULT_POLICY_ENVELOPE.market_allowlist);
+    });
+
+    // RED-2: EVERY supported mapping posts EXACTLY the strategy its card names — never a substitution.
+    it('each supported mapping resolves to the strategy the card claims (baseline/momentum/llm/mm/drift)', () => {
+      // baseline archetype (deterministic) → baseline
+      expect(buildDeployPayload('baseline', 'numeric', 'paper', 'replay', null).strategy).toBe('baseline');
+      // momentum archetype (deterministic) → momentum-sharp
+      expect(buildDeployPayload('momentum', 'numeric', 'paper', 'replay', null).strategy).toBe('momentum-sharp');
+      // any llm-capable archetype in LLM mode → the generic llm agent
+      expect(buildDeployPayload('momentum', 'llm', 'paper', 'replay', null).strategy).toBe('llm');
+      expect(buildDeployPayload('contrarian', 'llm', 'paper', 'replay', null).strategy).toBe('llm');
+      // template families (deploy discriminator is the SELECTED template, not the archetype)
+      expect(buildDeployPayload('baseline', 'rule', 'dry_run', 'replay', 'quoteguard_mm').strategy).toBe('quoteguard-mm');
+      expect(buildDeployPayload('momentum', 'numeric', 'paper', 'replay', 'det_drift').strategy).toBe('cumulative-drift');
+    });
+
+    // RED-3 (component): the UNSUPPORTED deterministic combos DISABLE deploy — no silent momentum-sharp POST.
+    it('value_clv (deterministic) DISABLES deploy with an honest note — no deploy fires, no silent momentum-sharp', async () => {
+      const user = userEvent.setup();
+      const fetchMock = vi.fn(async () => okDeploy());
+      vi.stubGlobal('fetch', fetchMock);
+      render(<StudioScreen />);
+
+      // value_clv is LLM-locked AND has no distinct deterministic backend strategy → never deployable.
+      await user.selectOptions(screen.getByLabelText(/archetype/i), 'value_clv');
+      const deployBtn = screen.getByRole('button', { name: /pin config & queue run/i });
+      expect(deployBtn).toBeDisabled();
+      // The reason is OBSERVABLE (not a silent no-op) …
+      expect(screen.getByTestId('deploy-unsupported-note')).toBeInTheDocument();
+      // … and clicking the disabled button fires NO deploy (so it can never post momentum-sharp).
+      await user.click(deployBtn);
+      expect(fetchMock).not.toHaveBeenCalled();
+    });
+
+    // RED-3b (unit): buildDeployPayload THROWS rather than silently substitute for an unsupported combo.
+    it('buildDeployPayload THROWS for value_clv/contrarian/stale_line deterministic — never returns momentum-sharp', () => {
+      for (const arche of ['value_clv', 'contrarian', 'stale_line'] as const) {
+        expect(() => buildDeployPayload(arche, 'numeric', 'paper', 'replay', null)).toThrow();
+        // Guard the exact dishonesty: it must NOT return a momentum-sharp payload for these.
+        let emitted: unknown = null;
+        try { emitted = buildDeployPayload(arche, 'numeric', 'paper', 'replay', null); } catch { /* expected */ }
+        expect(emitted).toBeNull();
+      }
+    });
+
+    // RED-4: LLM-Drift is ARENA-ONLY — a "Use in Arena" affordance and NO standalone deploy button.
+    it('LLM-Drift renders a "Use in Arena" affordance and NO standalone deploy button (arena-only)', () => {
+      render(<StudioScreen />);
+      const cards = screen.getByTestId('strategy-cards');
+      // The arena-only card carries a Use-in-Arena affordance …
+      expect(within(cards).getByRole('link', { name: /use in arena/i })).toBeInTheDocument();
+      // … and there is NO selectable/deploy button that would queue an "llm-drift" Studio deploy.
+      expect(within(cards).queryByRole('button', { name: /LLM-Drift/i })).toBeNull();
+    });
+
+    // RED-5: honesty copy — det-Drift standalone-deployable; LLM-Drift arena contestant; no false claims.
+    it('renders the honest F-1 copy and never claims both were deployed from Studio', () => {
+      render(<StudioScreen />);
+      const cards = screen.getByTestId('strategy-cards');
+      expect(within(cards).getByText(/det-Drift: standalone Studio deployment available/i)).toBeInTheDocument();
+      expect(within(cards).getByText(/LLM-Drift: pinned fair-comparison arena contestant/i)).toBeInTheDocument();
+      // NEVER claim both were deployed from Studio.
+      expect(cards.textContent ?? '').not.toMatch(/both.*deployed from Studio/i);
     });
   });
 });
