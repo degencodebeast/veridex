@@ -180,3 +180,90 @@ def test_replay_catalog_empty_when_pack_root_unset() -> None:
     app = server.create_server_app(env={"CORS_ORIGINS": "https://app.example.test"}).app
     assert isinstance(app.state.replay_catalog, ReplayCatalog)
     assert len(app.state.replay_catalog) == 0
+
+
+# ---------------------------------------------------------------------------
+# MAJOR 4 (Codex R-2 gate) — the deployed writable capture volume is mounted but
+# was never handed to the process via REPLAY_CAPTURE_ROOT, so an in-memory
+# promoted R-0b pack vanished after a container restart (the new process never
+# rescanned the mounted capture volume). Wire REPLAY_CAPTURE_ROOT = the capture
+# mount; a captured pack must be REDISCOVERED by a fresh startup rescan.
+# ---------------------------------------------------------------------------
+
+_CAPTURE_MOUNT = "/var/lib/veridex/replay-packs/capture"
+
+
+def _make_synthetic_pack_at(out_dir: Any, *, fixture_id: int = 42) -> Any:
+    """Build a real, hash-valid SYNTHETIC ReplayPack directory at ``out_dir`` (returns the dir)."""
+    from pathlib import Path
+
+    from veridex.ingest.capture_chain import synthetic_authority
+    from veridex.ingest.recorder import SessionMeta, envelope_line
+    from veridex.ingest.replay_pack import pack_from_session
+
+    out_dir = Path(out_dir)
+    session = out_dir.parent / f"_session_{out_dir.name}"
+    session.mkdir(parents=True, exist_ok=True)
+    rec = {
+        "FixtureId": fixture_id,
+        "Ts": 100_000,
+        "InRunning": False,
+        "SuperOddsType": "1X2",
+        "MarketPeriod": None,
+        "MarketParameters": None,
+        "PriceNames": ["Home", "Draw", "Away"],
+        "Prices": [2500, 3200, 2800],
+        "Pct": [35.5, 28.0, 36.5],
+    }
+    (session / "records.jsonl").write_text(
+        envelope_line(rec, 100) + "\n" + envelope_line({**rec, "Ts": 131_000}, 131) + "\n"
+    )
+    (session / "meta.json").write_text(
+        SessionMeta(started_ts=99, endpoints=["/odds/stream"], tool_version="t").model_dump_json()
+    )
+    pack_from_session(session, out_dir, authority=synthetic_authority())
+    return out_dir
+
+
+def test_m4_captured_pack_rediscovered_at_startup_via_capture_root_env(tmp_path: Any) -> None:
+    """A pack persisted on the writable capture volume must be REDISCOVERED by a fresh startup rescan
+    when REPLAY_CAPTURE_ROOT points at that volume — restart-durability of promoted R-0b packs."""
+    curated = tmp_path / "curated"
+    curated.mkdir()
+    capture = tmp_path / "capture"
+    capture.mkdir()
+    # Simulate an R-0b pack that had been promoted and persisted on the writable capture volume.
+    _make_synthetic_pack_at(capture / "promoted", fixture_id=77)
+
+    # A FRESH process startup: create_server_app reads REPLAY_CAPTURE_ROOT and folds the capture volume in.
+    app = server.create_server_app(
+        env={
+            "CORS_ORIGINS": "https://app.example.test",
+            "REPLAY_PACK_ROOT": str(curated),
+            "REPLAY_CAPTURE_ROOT": str(capture),
+        }
+    ).app
+
+    entry = app.state.replay_catalog.get("promoted")
+    assert entry is not None  # survived the "restart" — rediscovered from the mounted capture volume
+    assert entry.fixtures == (77,)
+
+
+def test_m4_compose_and_env_example_wire_replay_capture_root() -> None:
+    """The deployed config must SET REPLAY_CAPTURE_ROOT to the writable capture mount (config-wiring RED).
+
+    Without this, the mounted ``replay-capture`` volume is never handed to the process, so a fresh
+    startup cannot rescan it and a promoted pack disappears on restart.
+    """
+    from pathlib import Path
+
+    repo = Path(__file__).resolve().parents[1]
+    compose = (repo / "compose.coolify.yml").read_text()
+    env_example = (repo / ".env.example").read_text()
+
+    # compose sets REPLAY_CAPTURE_ROOT AND still mounts the writable capture volume at the same path.
+    assert "REPLAY_CAPTURE_ROOT" in compose
+    assert _CAPTURE_MOUNT in compose
+    assert f"replay-capture:{_CAPTURE_MOUNT}" in compose  # the writable mount is unchanged
+    # .env.example documents the capture-root var so operators can override it.
+    assert "REPLAY_CAPTURE_ROOT" in env_example

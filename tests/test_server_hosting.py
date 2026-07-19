@@ -564,3 +564,133 @@ def test_red4_served_native_run_route_hosted_and_gated() -> None:
     # (b) reaching it THROUGH the guard is auth-gated (deny-by-default), never public.
     resp = client.post("/agents/veridex-market-maker/runs", headers=_auth("tokenA"))
     assert resp.status_code == 403, resp.status_code
+
+
+# ==============================================================================
+# Codex SECURITY gate (R-2) — MAJOR 3: /readyz must probe the AUTHORITATIVE R-2
+# catalog, not the weaker legacy scanner. Codex reproduced a hash-valid manifest
+# with ``fixture_id: true`` (bool): the R-2 catalog EXCLUDES it (``type(fid) is
+# int``) yet the legacy scanner's ``isinstance(fixture_id, int)`` ADMITS it
+# ({'catalog_ids': [], 'ready_probe': True}). Readiness must consult the catalog.
+# ==============================================================================
+
+
+def _bool_fixture_curated_root(tmp_path):
+    """Build a curated root holding one hash-VALID pack whose fixture_id is a JSON bool (``true``).
+
+    Re-seals ``content_hash`` after flipping the fixture id to a bool, so the pack VERIFIES — the only
+    reason to exclude it is the R-2 honesty gate (``bool`` is not a valid fixture id). This reproduces
+    Codex's exact PoC input.
+    """
+    import json
+    from pathlib import Path
+
+    from veridex.ingest.capture_chain import synthetic_authority
+    from veridex.ingest.recorder import SessionMeta, envelope_line
+    from veridex.ingest.replay_pack import _compute_content_hash, pack_from_session
+
+    curated = tmp_path / "curated"
+    curated.mkdir()
+    session = tmp_path / "_session_bool"
+    session.mkdir()
+    rec = {
+        "FixtureId": 7,
+        "Ts": 100_000,
+        "InRunning": False,
+        "SuperOddsType": "1X2",
+        "MarketPeriod": None,
+        "MarketParameters": None,
+        "PriceNames": ["Home", "Draw", "Away"],
+        "Prices": [2500, 3200, 2800],
+        "Pct": [35.5, 28.0, 36.5],
+    }
+    (session / "records.jsonl").write_text(
+        envelope_line(rec, 100) + "\n" + envelope_line({**rec, "Ts": 131_000}, 131) + "\n"
+    )
+    (session / "meta.json").write_text(
+        SessionMeta(started_ts=99, endpoints=["/odds/stream"], tool_version="t").model_dump_json()
+    )
+    pack_dir = curated / "boolpack"
+    pack_from_session(session, pack_dir, authority=synthetic_authority())
+
+    manifest = json.loads((pack_dir / "pack.json").read_text())
+    manifest["fixtures"][0]["fixture_id"] = True  # a JSON bool — bool subclasses int
+    manifest["content_hash"] = _compute_content_hash(
+        pack_dir,
+        manifest["fixtures"],
+        pack_version=int(manifest["pack_version"]),
+        capture=manifest["capture"],
+    )
+    (pack_dir / "pack.json").write_text(json.dumps(manifest))
+    return Path(curated)
+
+
+async def _true_probe() -> bool:
+    return True
+
+
+def test_m3_readyz_probes_authoritative_r2_catalog_not_legacy_scanner(tmp_path) -> None:
+    """MAJOR 3 RED: a bool-``fixture_id`` pack that the LEGACY scanner would admit but R-2 EXCLUDES must
+    make ``/readyz`` report NOT ready (503), because readiness now probes the authoritative R-2 catalog.
+
+    Other gates (postgres, spool) are forced ready so ONLY the catalog gate decides the outcome.
+    """
+    from fastapi import FastAPI
+
+    from veridex.api.readiness import make_replay_pack_probe
+    from veridex.ingest.replay_catalog import build_catalog
+
+    curated = _bool_fixture_curated_root(tmp_path)
+
+    # The authoritative R-2 catalog correctly EXCLUDES the bool-fixture pack -> it is empty.
+    catalog = build_catalog(str(curated))
+    assert len(catalog) == 0
+
+    # Contrast: the LEGACY filesystem scanner ADMITS it (isinstance(fixture_id, int) admits bool) —
+    # this is exactly the weaker validator Codex exploited to get ready_probe: True.
+    import asyncio
+
+    legacy_ready = asyncio.run(make_replay_pack_probe(str(curated))())
+    assert legacy_ready is True  # the weaker scanner would (wrongly) advertise ready
+
+    # The authoritative wiring: /readyz consults the catalog -> empty -> 503 (fail-closed).
+    router = build_readiness_router(
+        get_catalog=lambda: catalog,
+        postgres_probe=_true_probe,
+        runtime_event_spool_probe=_true_probe,
+    )
+    app = FastAPI()
+    app.include_router(router)
+    resp = TestClient(app).get("/readyz")
+    assert resp.status_code == 503, resp.status_code
+    body = resp.json()
+    assert body["ready"] is False
+    assert body["checks"]["replay_pack_catalog"] is False
+
+
+def test_m3_readyz_ready_when_catalog_has_a_loadable_admitted_pack(tmp_path) -> None:
+    """MAJOR 3 control: a catalog holding a genuinely loadable, admitted-hash pack passes the probe
+    (200) once the other gates pass — proving the authoritative probe is not vacuously always-false."""
+    import shutil
+    from pathlib import Path
+
+    from fastapi import FastAPI
+
+    from veridex.ingest.replay_catalog import build_catalog
+
+    real_src = Path(__file__).resolve().parents[1] / "scripts" / "fixtures" / "demo_pack_real"
+    curated = tmp_path / "curated"
+    shutil.copytree(real_src, curated / "real")
+    catalog = build_catalog(str(curated))
+    assert catalog.get("real") is not None
+
+    router = build_readiness_router(
+        get_catalog=lambda: catalog,
+        postgres_probe=_true_probe,
+        runtime_event_spool_probe=_true_probe,
+    )
+    app = FastAPI()
+    app.include_router(router)
+    resp = TestClient(app).get("/readyz")
+    assert resp.status_code == 200, resp.status_code
+    assert resp.json()["checks"]["replay_pack_catalog"] is True

@@ -61,6 +61,10 @@ PoolSupplier = Callable[[], Any]
 #: (process-local, empty after restart) and must NOT be advertised as a durable session DB.
 AgentOsDbSupplier = Callable[[], Any]
 
+#: A supplier of the (possibly ``None``) AUTHORITATIVE R-2 :class:`~veridex.ingest.replay_catalog.ReplayCatalog`.
+#: Read lazily so the probe reflects the LIVE catalog (it can gain runtime-promoted packs after startup).
+CatalogSupplier = Callable[[], Any]
+
 
 @dataclass(frozen=True)
 class ReadinessReport:
@@ -289,6 +293,58 @@ def make_replay_pack_probe(pack_root: str | Path) -> ReadinessProbe:
     return probe
 
 
+def _entry_loadable_with_admitted_hash(entry: Any) -> bool:
+    """Return ``True`` iff a catalogued entry is still loadable AT ITS EXACT ADMITTED HASH (fail-closed).
+
+    Two gates, both fail-closed: (1) the pack's CURRENT stored ``content_hash`` must equal the hash the
+    catalog ADMITTED (``entry.content_hash``) — a drift means the served bytes are no longer the admitted
+    ones; (2) at least one declared fixture must load through the SAME verified runtime loader live
+    replay uses (:func:`load_pack_marketstates`, ``verify=True``) to a NON-EMPTY result. Any error /
+    mismatch counts as not-loadable.
+    """
+    pack_dir = Path(entry.pack_dir)
+    try:
+        manifest = json.loads((pack_dir / "pack.json").read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    if not isinstance(manifest, dict) or manifest.get("content_hash") != entry.content_hash:
+        return False  # the served bytes drifted from the exact admitted hash
+    for fixture_id in entry.fixtures:
+        try:
+            marketstates = load_pack_marketstates(pack_dir, fixture_id, verify=True)
+        except Exception:  # noqa: BLE001 — any load failure == not-loadable (fail-closed).
+            continue
+        if marketstates:
+            return True
+    return False
+
+
+def make_replay_catalog_probe(get_catalog: CatalogSupplier) -> ReadinessProbe:
+    """Build the AUTHORITATIVE ReplayPack-catalog readiness probe (consults the R-2 catalog directly).
+
+    Distinct from :func:`make_replay_pack_probe` (a weaker, independent filesystem scanner that admits a
+    ``bool`` fixture id via ``isinstance(fixture_id, int)``): this probe consults the SAME allowlisted,
+    hash-verified R-2 :class:`~veridex.ingest.replay_catalog.ReplayCatalog` the serving path uses, and
+    proves at least ONE catalogued entry remains loadable at its EXACT admitted hash
+    (:func:`_entry_loadable_with_admitted_hash`). An empty catalog (or none loadable) is not-ready —
+    fail-closed, so a deploy whose authoritative catalog has nothing servable is never advertised ready.
+
+    Args:
+        get_catalog: Supplier of the live R-2 catalog (``None`` → not ready).
+
+    Returns:
+        An async probe returning ``True`` iff a catalogued entry is loadable at its admitted hash.
+    """
+
+    async def probe() -> bool:
+        catalog = get_catalog()
+        if catalog is None:
+            return False
+        return any(_entry_loadable_with_admitted_hash(e) for e in catalog.snapshot().values())
+
+    return probe
+
+
 # --------------------------------------------------------------------------------------------------
 # Router
 # --------------------------------------------------------------------------------------------------
@@ -298,6 +354,7 @@ def build_readiness_router(
     *,
     get_pool: PoolSupplier | None = None,
     pack_root: str | Path | None = None,
+    get_catalog: CatalogSupplier | None = None,
     get_agentos_db: AgentOsDbSupplier | None = None,
     surface_only: bool = True,
     postgres_probe: ReadinessProbe | None = None,
@@ -320,7 +377,11 @@ def build_readiness_router(
 
     Args:
         get_pool: Supplier of the psycopg pool for the real Postgres + runtime-event-spool probes.
-        pack_root: Directory (``REPLAY_PACK_ROOT``) for the real pack-catalog probe.
+        pack_root: Directory (``REPLAY_PACK_ROOT``) for the LEGACY filesystem pack scanner — used only as
+            a fallback when neither ``pack_probe`` nor ``get_catalog`` is supplied (never the deployed path).
+        get_catalog: Supplier of the AUTHORITATIVE R-2 ReplayPack catalog. When provided (the deployed
+            served path), the ``replay_pack_catalog`` gate consults the catalog directly and proves an
+            entry is loadable at its exact admitted hash — not the weaker filesystem scanner.
         get_agentos_db: Supplier of the composed AgentOS owner/session DB. When provided, ``/readyz``
             emits the non-gating ``agentos_session_store`` disclosure; in executor mode it also gates.
         surface_only: ``True`` (the deployed served mode) → the AgentOS store is non-gating info. ``False``
@@ -336,7 +397,16 @@ def build_readiness_router(
     supplier: PoolSupplier = get_pool if get_pool is not None else (lambda: None)
     postgres = postgres_probe or make_postgres_probe(supplier)
     runtime_event_spool = runtime_event_spool_probe or make_runtime_event_spool_probe(supplier)
-    packs = pack_probe or make_replay_pack_probe(pack_root or "")
+    # The replay_pack_catalog gate must be AUTHORITATIVE (MAJOR-3): when a catalog supplier is wired (the
+    # deployed served path) the probe consults the R-2 catalog directly. An explicit ``pack_probe`` still
+    # wins (test seam); ``make_replay_pack_probe`` (the weaker legacy filesystem scanner) is only the
+    # fallback for callers that supply neither — never the deployed path.
+    if pack_probe is not None:
+        packs = pack_probe
+    elif get_catalog is not None:
+        packs = make_replay_catalog_probe(get_catalog)
+    else:
+        packs = make_replay_pack_probe(pack_root or "")
 
     # Executor-mode ONLY (surface_only=False): the AgentOS store becomes authoritative, so it gates the
     # conjunction (fail-closed coupling). In surface-only mode it is disclosed but NEVER gates.

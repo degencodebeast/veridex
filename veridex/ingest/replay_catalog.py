@@ -29,7 +29,11 @@ re-deriving trust.
 from __future__ import annotations
 
 import json
+import shutil
+import tempfile
 import threading
+import uuid
+import weakref
 from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -185,9 +189,16 @@ class ReplayCatalog:
         self._entries: dict[str, CatalogEntry] = dict(entries)
         self._lock = threading.Lock()
         self._curated_root = curated_root
-        # reserved for R-3 must-be-under-capture-root enforcement (a registered pack must live under
-        # the writable capture root); today only _curated_root is read (the read-only boundary guard).
+        # The configured WRITABLE capture root. :meth:`register_pack` FAILS CLOSED unless a candidate
+        # pack resolves to this root or a descendant (MAJOR-1 confinement) — a sibling path or a symlink
+        # that escapes the capture root is refused. ``None`` means no writable root is configured, so
+        # nothing is promotable and every register call is refused.
         self._capture_root = capture_root
+        # Catalog-OWNED publication root (lazy): on admission :meth:`register_pack` copies the verified
+        # bytes here (immutable publication, MAJOR-2) so a later mutation of the writable SOURCE can never
+        # affect the catalogued/served pack. It is created under the system temp dir on first register and
+        # rmtree'd when this catalog is garbage-collected (see :meth:`_take_ownership`).
+        self._published_root: Path | None = None
 
     # -- lock-free reads (single atomic reference read of self._entries) --
 
@@ -221,30 +232,48 @@ class ReplayCatalog:
         reader sees the catalog either without or with the new pack whole — never a torn read. A
         re-registered ``pack_id`` REFRESHES its entry.
 
+        **Capture-root confinement (MAJOR-1).** A candidate must resolve to the configured WRITABLE
+        capture root or a descendant, else it is REFUSED (fail-closed). ``.resolve()`` is used, so a
+        SIBLING path AND a symlink that sits inside the capture root but points OUTSIDE it are both
+        caught. With no capture root configured, nothing is promotable and every call is refused.
+
+        **Immutable publication (MAJOR-2).** On admission the catalog TAKES OWNERSHIP of the verified
+        bytes: the pack is copied into a catalog-owned, non-source directory and re-verified THERE, and
+        the resulting entry points at the OWNED copy. A later mutation of the writable source therefore
+        cannot affect the catalogued/served pack. This method writes ONLY to the catalog-owned
+        publication root — it NEVER writes the curated root or the capture-root source.
+
         The curated root is READ-ONLY: registering a pack that resolves under the curated root is
         REFUSED, and a capture pack whose ``pack_id`` COLLIDES with an existing CURATED-SEED entry is
         REFUSED too — a runtime-registered writable-root pack may never REPLACE a curated seed's catalog
         entry (deployed capture must publish to the writable capture root, and startup already gives
         curated seeds precedence on collision). A genuinely NEW ``pack_id`` still registers, and
-        re-registering a non-curated ``pack_id`` REFRESHES it. This method never WRITES any file — it
-        only reads and hash-verifies ``pack_dir``.
+        re-registering a non-curated ``pack_id`` REFRESHES it.
 
         Args:
             pack_dir: Directory of the freshly-captured pack under the writable capture root.
 
         Returns:
-            The promoted :class:`CatalogEntry`.
+            The promoted :class:`CatalogEntry` (its ``pack_dir`` is the catalog-owned immutable copy).
 
         Raises:
-            CatalogAdmissionError: If ``pack_dir`` resolves under the read-only curated root, or its
-                ``pack_id`` collides with an existing curated-seed entry (both ``ValueError`` subtypes).
+            CatalogAdmissionError: If ``pack_dir`` resolves under the read-only curated root, does NOT
+                resolve under the configured writable capture root, or its ``pack_id`` collides with an
+                existing curated-seed entry (all ``ValueError`` subtypes).
             CatalogVerificationError: If the pack fails hash-verification (not promoted).
         """
         pack_dir = Path(pack_dir)
+        # Order matters: the curated-root guard runs FIRST so a curated-root candidate keeps its explicit
+        # "curated" refusal message before the capture-root confinement (which reports a different cause).
         self._reject_curated_root_writes(pack_dir)
+        self._require_within_capture_root(pack_dir)
 
-        entry = _build_verified_entry(pack_dir)
+        # Immutable publication: take ownership of the bytes, then verify the OWNED copy (stage → verify →
+        # admit), so the admitted entry's bytes are byte-independent of the mutable source (MAJOR-2).
+        owned_dir = self._take_ownership(pack_dir)
+        entry = _build_verified_entry(owned_dir)
         if entry is None:
+            self._discard_owned(owned_dir)
             raise CatalogVerificationError(
                 f"refusing to register pack at {pack_dir}: content_hash verification failed "
                 "(tampered, corrupt, or malformed) — unverified packs are never promoted"
@@ -256,6 +285,7 @@ class ReplayCatalog:
             # seeds precedence via setdefault; this closes the same hole on the runtime promote path.
             existing = self._entries.get(entry.pack_id)
             if existing is not None and self._resolves_under_curated(existing.pack_dir):
+                self._discard_owned(owned_dir)
                 raise CatalogAdmissionError(
                     f"refusing to register {pack_dir}: pack_id {entry.pack_id!r} collides with a "
                     f"READ-ONLY curated-seed entry at {existing.pack_dir}; a runtime-registered capture "
@@ -275,6 +305,57 @@ class ReplayCatalog:
                 f"refusing to register {pack_dir} under the READ-ONLY curated root {self._curated_root}; "
                 "deployed capture must publish to the separate writable capture root"
             )
+
+    def _require_within_capture_root(self, pack_dir: Path) -> None:
+        """FAIL CLOSED unless ``pack_dir`` resolves to the configured writable capture root or below it.
+
+        MAJOR-1 confinement: ``.resolve()`` follows symlinks, so a SIBLING path and a symlink inside the
+        capture root that points OUTSIDE it are both refused. With no capture root configured, nothing is
+        promotable — every registration is refused (there is no owned writable volume to promote from).
+        """
+        if self._capture_root is None:
+            raise CatalogAdmissionError(
+                f"refusing to register {pack_dir}: no writable capture root is configured, so no pack is "
+                "promotable — a runtime-registered pack must live under the writable capture root"
+            )
+        try:
+            resolved = pack_dir.resolve()
+            capture = self._capture_root.resolve()
+        except OSError:
+            # Fail CLOSED: an unresolvable candidate cannot be proven to live under the capture root.
+            raise CatalogAdmissionError(
+                f"refusing to register {pack_dir}: its path could not be resolved for capture-root "
+                "confinement"
+            ) from None
+        if not (resolved == capture or capture in resolved.parents):
+            raise CatalogAdmissionError(
+                f"refusing to register {pack_dir}: it does not resolve under the writable capture root "
+                f"{self._capture_root} (a sibling path or symlink-escape is refused, fail-closed)"
+            )
+
+    def _take_ownership(self, source_dir: Path) -> Path:
+        """Copy ``source_dir`` into a catalog-OWNED directory and return the owned copy (MAJOR-2).
+
+        Each registration lands in a fresh unique version directory under the catalog's publication
+        root, so a re-registration never overwrites (or deletes) the bytes an in-flight reader may still
+        hold. The publication root is created lazily under the system temp dir and rmtree'd when this
+        catalog is garbage-collected. The owned copy keeps the source leaf name so ``pack_id`` is stable.
+        """
+        if self._published_root is None:
+            root = Path(tempfile.mkdtemp(prefix="veridex-replay-published-"))
+            self._published_root = root
+            # Best-effort cleanup of the owned copies when the catalog is collected (never at import).
+            weakref.finalize(self, shutil.rmtree, str(root), ignore_errors=True)
+        version_dir = self._published_root / uuid.uuid4().hex
+        version_dir.mkdir()
+        owned = version_dir / source_dir.name
+        shutil.copytree(source_dir, owned)
+        return owned
+
+    @staticmethod
+    def _discard_owned(owned_dir: Path) -> None:
+        """Remove an owned copy (and its unique version dir) that was staged but never admitted."""
+        shutil.rmtree(owned_dir.parent, ignore_errors=True)
 
     def _resolves_under_curated(self, path: Path) -> bool:
         """Return ``True`` iff ``path`` is the curated root itself or lives beneath it (boundary test)."""
@@ -311,8 +392,8 @@ def build_catalog(
 
     Returns:
         A :class:`ReplayCatalog` carrying only hash-verified packs. It retains the curated root so
-        :meth:`ReplayCatalog.register_pack` can enforce the read-only-curated boundary; the capture root
-        is retained as a reserved seam for R-3's must-be-under-capture-root enforcement (not read today).
+        :meth:`ReplayCatalog.register_pack` can enforce the read-only-curated boundary, and the capture
+        root so registration can CONFINE promotions to the writable capture root (MAJOR-1, fail-closed).
     """
     curated = Path(curated_root) if curated_root else None
     capture = Path(capture_root) if capture_root else None

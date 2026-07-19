@@ -45,6 +45,10 @@ services:
       WAL_DIR: ${WAL_DIR:-/data/wal}
       # Curated seed-pack catalog the /readyz ReplayPack check + demo/backtest surfaces resolve.
       REPLAY_PACK_ROOT: ${REPLAY_PACK_ROOT:-/var/lib/veridex/replay-packs/curated}
+      # Writable capture root the process rescans at startup (R-0b/R-2) — MUST equal the `replay-capture`
+      # mount below so a live-promoted pack SURVIVES a container restart (the new process folds it back
+      # into the catalog). Without this the mounted volume is never handed to the process (R-E durability).
+      REPLAY_CAPTURE_ROOT: ${REPLAY_CAPTURE_ROOT:-/var/lib/veridex/replay-packs/capture}
     volumes:
       # WAL_DIR — durable I-4 event spool (AC-13). Named volume survives container replacement.
       - wal-spool:/data/wal

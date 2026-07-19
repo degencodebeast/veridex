@@ -20,9 +20,12 @@ RUN pip install --no-cache-dir ".[api,postgres,live,agent]"
 # backfill) into the image so the ReplayPack catalog is SELF-CONTAINED: a bare `docker run` (no compose
 # bind-mount) still builds a hash-verified catalog and /readyz passes. COPY was chosen over relying on
 # the compose read-only mount alone: the image is then trustworthy on its own (no missing-mount failure
-# mode), and the packs are ~600KB — negligible bloat. This layer is READ-ONLY at runtime (curated =
-# read-only); R-0b's freshly-captured packs go to the SEPARATE writable capture volume, never here. In
-# compose, REPLAY_PACK_ROOT is overridden to the operator's provisioned :ro curated mount.
+# mode), and the packs are ~600KB — negligible bloat. NOTE: this COPYed layer is NOT a runtime read-only
+# boundary for the bare image — the container runs as root, so the overlay is writable at this path. The
+# ENFORCED read-only boundary is (a) the compose `:ro` curated bind mount below and (b) the catalog
+# module itself, which only READS the curated root and never writes it (`register_pack` publishes to the
+# SEPARATE writable capture volume, never here). In compose, REPLAY_PACK_ROOT is overridden to the
+# operator's provisioned :ro curated mount.
 # NOTE: the catalog derives pack_id from the leaf dir name, so this seed catalogs as pack_id="curated".
 # That id is STABLE across both the image-bake path and the compose :ro mount (both leaf-named "curated"),
 # so R-3's pack-bound competition identity references the same id in either deployment.

@@ -13,6 +13,7 @@ The four load-bearing REDs (each fails before the R-2 catalog exists):
 from __future__ import annotations
 
 import json
+import os
 import shutil
 from pathlib import Path
 
@@ -343,3 +344,116 @@ def test_blank_root_yields_empty_catalog() -> None:
     assert isinstance(build_catalog(""), ReplayCatalog)
     assert len(build_catalog("")) == 0
     assert len(build_catalog(None)) == 0
+
+
+# ---------------------------------------------------------------------------
+# MAJOR 1 (Codex R-2 gate) — runtime registration is CONFINED to the configured
+# writable capture root. Codex reproduced acceptance of a pack in a SIBLING
+# ``outside/`` dir ({'accepted': 'offroot', 'under_capture': False}); the fix
+# fails closed unless ``pack_dir.resolve()`` is the capture root or a descendant,
+# catching sibling paths AND symlink escapes.
+# ---------------------------------------------------------------------------
+
+
+def test_m1_register_refuses_sibling_offroot_pack(tmp_path: Path) -> None:
+    """Codex PoC: a valid pack built in a SIBLING ``outside/`` dir was accepted. It must be REFUSED —
+    a runtime-registered pack must resolve UNDER the configured writable capture root."""
+    curated = tmp_path / "curated"
+    curated.mkdir()
+    capture = tmp_path / "capture"
+    capture.mkdir()
+    catalog = build_catalog(curated, capture_root=capture)
+
+    # A genuine, self-consistent pack that lives OUTSIDE the capture root (a sibling dir).
+    offroot = _make_synthetic_pack(tmp_path, "outside/offroot", fixture_id=8)
+    assert verify_content_hash(offroot) is True  # it verifies — the reject is the confinement boundary
+    assert capture not in offroot.resolve().parents  # and it is genuinely not under the capture root
+
+    with pytest.raises(CatalogAdmissionError):
+        catalog.register_pack(offroot)
+    assert "offroot" not in catalog  # never promoted
+
+
+def test_m1_register_refuses_symlink_escape_out_of_capture_root(tmp_path: Path) -> None:
+    """A symlink that SITS INSIDE the capture root but POINTS at an outside pack must be REFUSED —
+    ``.resolve()`` follows the link out of the capture root (a symlink-escape control)."""
+    curated = tmp_path / "curated"
+    curated.mkdir()
+    capture = tmp_path / "capture"
+    capture.mkdir()
+    catalog = build_catalog(curated, capture_root=capture)
+
+    real = _make_synthetic_pack(tmp_path, "outside/realpack", fixture_id=11)
+    link = capture / "sneaky"
+    os.symlink(real, link)  # link is under the capture root; its target is NOT
+    assert link.resolve() == real.resolve()
+
+    with pytest.raises(CatalogAdmissionError):
+        catalog.register_pack(link)
+    assert "sneaky" not in catalog
+
+
+def test_m1_register_accepts_pack_genuinely_under_capture_root(tmp_path: Path) -> None:
+    """The positive control: a genuine pack living UNDER the capture root still registers."""
+    curated = tmp_path / "curated"
+    curated.mkdir()
+    capture = tmp_path / "capture"
+    capture.mkdir()
+    catalog = build_catalog(curated, capture_root=capture)
+
+    fresh = _make_synthetic_pack(tmp_path, "capture/under", fixture_id=21)
+    entry = catalog.register_pack(fresh)
+    assert entry.pack_id == "under"
+    assert "under" in catalog
+
+
+def test_m1_register_refuses_when_no_capture_root_configured(tmp_path: Path) -> None:
+    """With NO writable capture root configured, nothing is promotable — register must fail closed."""
+    curated = tmp_path / "curated"
+    curated.mkdir()
+    catalog = build_catalog(curated)  # no capture_root
+    somewhere = _make_synthetic_pack(tmp_path, "somewhere/pack", fixture_id=3)
+
+    with pytest.raises(CatalogAdmissionError):
+        catalog.register_pack(somewhere)
+
+
+# ---------------------------------------------------------------------------
+# MAJOR 2 (Codex R-2 gate) — a promoted pack must be IMMUTABLE: post-admission
+# mutation of the writable SOURCE must not affect the catalogued/served pack.
+# Codex reproduced {'admitted_genuine': True, 'now_verifies': False,
+# 'still_reported_genuine': True} — the entry pointed at the mutable source.
+# Fix: on admission the catalog TAKES OWNERSHIP of the verified bytes (immutable
+# publication), so mutating the source has NO effect on the served pack.
+# ---------------------------------------------------------------------------
+
+
+def test_m2_registered_pack_is_immutable_to_source_mutation(tmp_path: Path) -> None:
+    """Register a genuine pack, then mutate a manifest-referenced data file in the SOURCE. The
+    catalogued entry must remain hash-verifying (owned copy is immune) — NOT ``still_reported_genuine``
+    while its own referenced dir fails to verify."""
+    curated = tmp_path / "curated"
+    curated.mkdir()
+    capture = tmp_path / "capture"
+    capture.mkdir()
+    catalog = build_catalog(curated, capture_root=capture)
+
+    source = _copy_real_pack(capture / "promoted")  # a GENUINE pack under the writable capture root
+    entry = catalog.register_pack(source)
+    assert entry.is_genuine is True
+    assert entry.provenance == GENUINE_TXLINE_PROVENANCE
+
+    # The catalog took OWNERSHIP — the served entry does NOT point at the mutable source dir.
+    assert entry.pack_dir.resolve() != source.resolve()
+    assert capture.resolve() not in entry.pack_dir.resolve().parents
+
+    # Now mutate the SOURCE so it no longer verifies (Codex's post-admission tamper).
+    _tamper_data_file(source)
+    assert verify_content_hash(source) is False  # the source is now demonstrably tampered
+
+    # The catalogued/served pack is UNAFFECTED: its owned bytes still verify and still read genuine.
+    served = catalog.get("promoted")
+    assert served is not None
+    assert verify_content_hash(served.pack_dir) is True  # immune to the source mutation
+    assert is_genuine_pack(served.pack_dir) is True
+    assert served.is_genuine is True

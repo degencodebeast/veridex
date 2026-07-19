@@ -304,12 +304,6 @@ def create_server_app(
     # ONLY the durable Veridex deps; the AgentOS store is disclosed as non-gating info (surface_only).
     pool_holder: dict[str, Any] = {"pool": None}
     pack_root = resolved_env.get("REPLAY_PACK_ROOT", "")
-    readiness_router = build_readiness_router(
-        get_pool=lambda: pool_holder["pool"],
-        pack_root=pack_root,
-        get_agentos_db=lambda: owner_db,  # /readyz DISCLOSES the ACTUAL (ephemeral) AgentOS DB, honestly
-        surface_only=surface_only,
-    )
 
     # R-2 — build the TRUSTED, hash-verified ReplayPack CATALOG at startup (root of replay trust).
     # Scans the READ-ONLY curated REPLAY_PACK_ROOT (and, when configured, the SEPARATE writable capture
@@ -319,8 +313,17 @@ def create_server_app(
     # path (``catalog.register_pack``) atomically promotes freshly-captured deployed packs at runtime
     # (no restart), and NEVER writes the read-only curated root. This is additive: it does NOT alter the
     # II-5f served composition (the guard return / deny-by-default / /readyz gate set are unchanged).
+    # Built BEFORE the readiness router so /readyz probes the AUTHORITATIVE R-2 catalog (Codex MAJOR-3),
+    # not a weaker second filesystem validator.
     replay_catalog = build_catalog(
         pack_root, capture_root=resolved_env.get("REPLAY_CAPTURE_ROOT", "") or None
+    )
+
+    readiness_router = build_readiness_router(
+        get_pool=lambda: pool_holder["pool"],
+        get_catalog=lambda: replay_catalog,  # /readyz gates on the AUTHORITATIVE R-2 catalog (MAJOR-3)
+        get_agentos_db=lambda: owner_db,  # /readyz DISCLOSES the ACTUAL (ephemeral) AgentOS DB, honestly
+        surface_only=surface_only,
     )
 
     primary, extra_agents = _build_served_hosting_adapters()
