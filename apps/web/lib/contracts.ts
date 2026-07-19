@@ -162,6 +162,43 @@ export interface MakerArenaResultView {
   };
 }
 
+// ── QuoteGuard Behavior Ablation (F-8 · maker_live_ab.v1) ───────────────────────────────────────
+// A read-only projection of the guard OFF vs ON behavior ablation: the SAME strategy on the SAME
+// pinned tape with only the QuoteGuard arm flipped. It is a BEHAVIOR comparison, NOT a rank — the
+// wire envelope deliberately carries NO rank / toxicity / CLV / PnL / edge / winner field, and this
+// view-model mirrors it field-for-field (nothing invented, nothing scored).
+export interface GuardAblationLeg {
+  kind: string;
+  role: string;
+  price: number | null; // decimal odds when priced; null = honest "no price" (never coerced to 0)
+  post_only: boolean;
+}
+export interface GuardAblationDecision {
+  index: number; // the frame index this decision was taken on (timeline key)
+  kind: string; // e.g. QUOTE | SUPPRESS — the decision the arm actually took
+  reason_codes: string[]; // closed reason-code set the arm emitted (verbatim)
+  legs: GuardAblationLeg[];
+}
+export interface GuardAblationArm {
+  guard_enabled: boolean;
+  terminal_reason: string | null; // why the arm stopped (e.g. tape_exhausted, guard_halt)
+  observations_consumed: number;
+  decisions: GuardAblationDecision[];
+}
+export interface GuardAblationView {
+  schema_version: string; // "maker_live_ab.v1"
+  lane: string; // "maker"
+  panel: string; // "guard_on_off_ablation"
+  is_ablation: boolean; // always true — a behavior ablation, never a ranking
+  instance_id: string; // the maker instance the ablation was run for (echoed from the request)
+  mode: string; // the replay/dry-run mode both arms ran under
+  guard_off: GuardAblationArm;
+  guard_on: GuardAblationArm;
+  divergent_frame_indices: number[]; // frames where the two arms' substantive decision diverged
+  diverges: boolean; // whether the guard flip changed the decision on at least one frame
+  labels: Record<string, string>; // backend-provided honesty labels (ablation-not-ranking)
+}
+
 // NON-SCORING off-chain venue artifact (SEC-004).
 export type ReceiptStatus =
   | 'proposed' | 'law_approved' | 'policy_approved' | 'submitted' | 'filled'

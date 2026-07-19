@@ -13,6 +13,9 @@
 .card { display: flex; flex-direction: column; gap: 4px; text-align: left; padding: var(--space-2); border: 1px solid var(--border-soft); border-radius: var(--radius-control); background: var(--panel-2); cursor: pointer; }
 .card:hover { border-color: var(--accent); }
 .cardActive { border-color: var(--accent); background: var(--panel); }
+/* MAJOR-1: gated live_arena type card — visibly locked, not selectable (no live feed wired). */
+.cardLocked { opacity: 0.5; cursor: not-allowed; }
+.cardLocked:hover { border-color: var(--border-soft); }
 .cardLabel { font-size: 12px; font-weight: 600; color: var(--text-1); }
 .cardBlurb { font-size: 10px; color: var(--text-3); line-height: 1.4; }
 
@@ -21,6 +24,8 @@
 .label { font-family: var(--font-mono), monospace; font-size: 9px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--text-3); }
 .select, .input { padding: 7px 9px; border: 1px solid var(--border-soft); border-radius: var(--radius-control); background: var(--panel-2); color: var(--text-1); font-size: 12px; }
 .input::placeholder { color: var(--text-3); }
+/* MAJOR-1: honest note under the gated Live source option (no live feed wired). */
+.sourceNote { font-family: var(--font-mono), monospace; font-size: 9px; line-height: 1.4; color: var(--warning-hi); }
 
 .checks { display: flex; flex-wrap: wrap; gap: var(--space-2); }
 .check { display: inline-flex; align-items: center; gap: 6px; padding: 6px 10px; border: 1px solid var(--border-soft); border-radius: var(--radius-control); background: var(--panel-2); font-size: 11px; color: var(--text-1); cursor: pointer; }
@@ -36,3 +41,68 @@
 .pinnedCaption { margin: 0; font-size: 9px; line-height: 1.5; color: var(--text-3); }
 .note { margin: 0; color: var(--warning-hi); font-size: 11px; }
 .commit { align-self: stretch; padding: 9px 14px; border-radius: var(--radius-control); background: var(--accent); border: none; color: var(--text-1); font-size: 12px; font-weight: 600; cursor: pointer; }
+
+/* ── Section 05 · ROSTER (F-4) ─────────────────────────────────────────────── */
+.rosterEmpty { margin: 0; font-family: var(--font-mono), monospace; font-size: 10px; line-height: 1.5; color: var(--text-3); }
+.rosterList { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: var(--space-2); }
+.rosterRow { display: flex; align-items: center; gap: 10px; width: 100%; text-align: left; padding: 10px 12px; border: 1px solid var(--border-soft); border-radius: var(--radius-control); background: var(--panel-2); cursor: pointer; transition: border-color 160ms ease, background 160ms ease; }
+.rosterRow:hover { border-color: var(--border-strong); }
+.rosterRowSel { border-color: rgba(59, 130, 246, 0.34); background: var(--panel); }
+.rosterCheck { width: 15px; height: 15px; flex: none; border-radius: var(--radius-badge); border: 1px solid var(--border-strong); background: var(--panel-2); display: flex; align-items: center; justify-content: center; font-family: var(--font-mono), monospace; font-size: 9px; font-weight: 700; color: var(--accent-hi); }
+.rosterCheckOn { border-color: rgba(59, 130, 246, 0.5); background: var(--accent-bg-soft); }
+.rosterMain { display: flex; flex-direction: column; gap: 4px; min-width: 0; flex: 1; }
+.rosterIdentity { display: flex; align-items: center; gap: 7px; flex-wrap: wrap; }
+.rosterName { font-size: 11.5px; font-weight: 600; color: var(--text-1); }
+.rosterStrategy { font-family: var(--font-mono), monospace; font-size: 7px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.04em; color: var(--text-2-alt); background: rgba(147, 158, 176, 0.1); padding: 2px 5px; border-radius: 3px; }
+.rosterMeta { font-size: 8.5px; color: var(--text-3); }
+.rosterHint { margin: 2px 0 0; font-family: var(--font-mono), monospace; font-size: 8.5px; line-height: 1.4; color: var(--text-3); }
+.rosterHint strong { color: var(--text-2-alt); font-weight: 600; }
+
+/* ── Launch progression (F-4) ─────────────────────────────────────────────── */
+.launch { display: flex; flex-direction: column; gap: var(--space-2); margin-top: var(--space-2); border-top: 1px solid var(--border-soft); padding-top: var(--space-3); }
+.launchBtn { align-self: stretch; padding: 11px; border-radius: var(--radius-control); background: var(--accent-bg); border: 1px solid rgba(59, 130, 246, 0.4); color: var(--accent-hi); font-family: var(--font-mono), monospace; font-size: 11px; font-weight: 600; letter-spacing: 0.04em; cursor: pointer; transition: transform 160ms cubic-bezier(0.23, 1, 0.32, 1), background 160ms ease; }
+.launchBtn:hover:not(:disabled) { background: rgba(59, 130, 246, 0.24); }
+.launchBtn:active:not(:disabled) { transform: scale(0.98); }
+.launchBtn:disabled { opacity: 0.5; cursor: not-allowed; }
+.launchChip { display: flex; align-items: center; gap: 8px; background: var(--bg-bar); border: 1px dashed var(--border-soft); border-radius: var(--radius-control); padding: 9px 11px; font-family: var(--font-mono), monospace; font-size: 9px; line-height: 1.4; color: var(--text-2); }
+.launchChipGlyph { color: var(--warning-hi); font-weight: 600; flex: none; }
+.launchConnect { margin-left: auto; font-family: var(--font-mono), monospace; font-size: 8px; font-weight: 600; color: var(--accent-hi); background: var(--accent-bg); border: 1px solid rgba(59, 130, 246, 0.34); padding: 4px 8px; border-radius: var(--radius-badge); cursor: pointer; transition: transform 140ms cubic-bezier(0.23, 1, 0.32, 1); }
+.launchConnect:active { transform: scale(0.96); }
+.launchHint { margin: 0; font-family: var(--font-mono), monospace; font-size: 9px; line-height: 1.4; color: var(--text-3); }
+
+.progress { background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius-panel); overflow: hidden; }
+.progressHead { padding: 10px 12px; border-bottom: 1px solid var(--border); font-size: 10px; font-weight: 600; letter-spacing: 0.04em; color: var(--text-2-alt); }
+.steps { list-style: none; margin: 0; padding: 12px; display: flex; flex-direction: column; gap: 9px; }
+.step { display: flex; align-items: center; gap: 9px; }
+.stepDot { width: 14px; height: 14px; flex: none; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-family: var(--font-mono), monospace; font-size: 8px; font-weight: 700; border: 1px solid var(--border-strong); background: var(--bg-bar); color: var(--text-3); }
+.step_queued { border-color: var(--border-strong); background: var(--bg-bar); color: var(--text-3); }
+/* Active step: a gentle opacity pulse signals the in-flight async register/start step (state
+   indication — a valid purpose, seen only during a launch). Movement-free, so it survives reduced
+   motion; the guard below still stills it for users who opt out of all non-essential motion. */
+.step_active { border-color: rgba(59, 130, 246, 0.4); background: var(--accent-bg-soft); color: var(--accent-2); animation: stepPulse 1.4s ease-in-out infinite; }
+@keyframes stepPulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.55; } }
+.step_done { border-color: rgba(63, 164, 107, 0.4); background: var(--positive-bg); color: var(--positive); }
+.step_failed { border-color: rgba(210, 96, 75, 0.4); background: var(--negative-bg); color: var(--negative); }
+.stepLabel { flex: 1; font-family: var(--font-mono), monospace; font-size: 10px; font-weight: 500; color: var(--text-1); }
+.stepState { font-family: var(--font-mono), monospace; font-size: 8px; font-weight: 600; color: var(--text-3); }
+.step[data-status='active'] .stepState { color: var(--accent-2); }
+.step[data-status='done'] .stepState { color: var(--positive); }
+.step[data-status='failed'] .stepState { color: var(--negative); }
+
+.partial { margin: 0 12px 12px; background: var(--warning-bg); border: 1px solid rgba(200, 154, 58, 0.22); border-radius: var(--radius-control); padding: 8px 10px; }
+.launchError { margin: 0 12px 12px; background: var(--negative-bg); border: 1px solid rgba(210, 96, 75, 0.28); border-radius: var(--radius-control); padding: 8px 10px; }
+.partialTitle { font-family: var(--font-mono), monospace; font-size: 9.5px; font-weight: 600; color: var(--warning-hi); line-height: 1.3; }
+.launchError .partialTitle { color: var(--negative); }
+.partialNote { margin: 3px 0 0; font-family: var(--font-mono), monospace; font-size: 8.5px; line-height: 1.4; color: var(--text-2); }
+.partialActions { display: flex; gap: 6px; margin-top: 7px; }
+.partialRetry { font-family: var(--font-mono), monospace; font-size: 8px; font-weight: 600; color: var(--accent-hi); background: var(--accent-bg); border: 1px solid rgba(59, 130, 246, 0.34); padding: 5px 8px; border-radius: var(--radius-badge); cursor: pointer; transition: transform 140ms cubic-bezier(0.23, 1, 0.32, 1); }
+.partialStart { font-family: var(--font-mono), monospace; font-size: 8px; font-weight: 600; color: var(--text-2-alt); background: var(--panel-2); border: 1px solid var(--border-soft); padding: 5px 8px; border-radius: var(--radius-badge); cursor: pointer; transition: transform 140ms cubic-bezier(0.23, 1, 0.32, 1); }
+.partialRetry:active, .partialStart:active { transform: scale(0.96); }
+.started { margin: 0 12px 12px; font-family: var(--font-mono), monospace; font-size: 9px; line-height: 1.4; color: var(--positive); }
+
+/* Reduced-motion: keep meaning (color/border feedback), drop movement (press scale + pulse). */
+@media (prefers-reduced-motion: reduce) {
+  .launchBtn, .launchConnect, .partialRetry, .partialStart { transition: background 160ms ease; }
+  .launchBtn:active:not(:disabled), .launchConnect:active, .partialRetry:active, .partialStart:active { transform: none; }
+  .step_active { animation: none; }
+}

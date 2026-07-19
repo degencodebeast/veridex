@@ -1,0 +1,50 @@
+.screen { display: flex; flex-direction: column; gap: var(--space-3); }
+
+/* Loading + error states — honest, direction-giving, never a fabricated instance. */
+.loading { padding: var(--pad-panel); border: 1px solid var(--border); border-radius: var(--radius-panel); background: var(--panel); color: var(--text-2); font-size: 12px; }
+.error { padding: var(--pad-panel); border: 1px solid var(--border-strong); border-radius: var(--radius-panel); background: var(--panel); display: flex; flex-direction: column; gap: var(--space-2); align-items: flex-start; }
+.errorTitle { margin: 0; font-size: 15px; font-weight: 600; color: var(--text-1); }
+.errorBody { margin: 0; font-size: 12px; color: var(--text-2); }
+.back { font-size: 12px; color: var(--accent-hi); text-decoration: none; }
+.back:hover { text-decoration: underline; }
+
+/* Header — the owner-scoped identity, led by the eyebrow so it never reads as the public profile. */
+.head { display: flex; align-items: flex-start; justify-content: space-between; gap: var(--space-3); flex-wrap: wrap; }
+.ident { display: flex; flex-direction: column; gap: 3px; min-width: 0; }
+.eyebrow { font-size: 10px; font-weight: 600; letter-spacing: 0.08em; text-transform: uppercase; color: var(--accent-hi); }
+.title { margin: 0; font-size: 19px; font-weight: 600; letter-spacing: -0.01em; word-break: break-all; }
+.sub { color: var(--text-3); font-size: 11px; font-family: var(--font-mono), monospace; }
+.headMeta { display: inline-flex; align-items: center; gap: var(--space-2); flex-shrink: 0; }
+
+/* Status pill — derived from the REAL lifecycle status, colored honestly (failed is never rosy). */
+.status { font-size: 10px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.04em; padding: 2px 8px; border-radius: var(--radius-badge); border: 1px solid var(--border-strong); color: var(--text-2); background: var(--panel-2); }
+.status[data-status='running'] { color: var(--accent-hi); border-color: var(--accent); background: var(--accent-bg-soft); }
+.status[data-status='sealed'] { color: var(--positive); border-color: var(--positive); background: var(--positive-bg); }
+.status[data-status='pending'] { color: var(--warning-hi); border-color: var(--warning); background: var(--warning-bg); }
+.status[data-status='failed'] { color: var(--negative); border-color: var(--negative); background: var(--negative-bg); }
+.source { font-size: 10px; text-transform: uppercase; letter-spacing: 0.04em; padding: 2px 8px; border-radius: var(--radius-badge); border: 1px solid var(--border); color: var(--text-3); }
+
+.panel { display: flex; flex-direction: column; gap: var(--space-2); padding: var(--pad-panel); border: 1px solid var(--border); border-radius: var(--radius-panel); background: var(--panel); }
+.h2 { margin: 0; font-size: 11px; font-weight: 600; letter-spacing: 0.06em; text-transform: uppercase; color: var(--text-2); }
+
+.kvRow { display: flex; align-items: baseline; justify-content: space-between; gap: var(--space-3); padding: 4px 0; border-bottom: 1px solid var(--border-soft); }
+.kvRow:last-child { border-bottom: none; }
+.kvLabel { color: var(--text-3); font-size: 11px; flex-shrink: 0; }
+.kvVal { color: var(--text-1); font-size: 12px; text-align: right; word-break: break-all; }
+.kvLink { color: var(--accent-hi); font-size: 12px; text-decoration: none; word-break: break-all; text-align: right; }
+.kvLink:hover { text-decoration: underline; }
+.note { margin: 0; color: var(--text-3); font-size: 10px; line-height: 1.5; }
+
+.tags { display: inline-flex; flex-wrap: wrap; gap: var(--space-1); justify-content: flex-end; }
+.tag { font-size: 10px; font-family: var(--font-mono), monospace; padding: 1px 6px; border-radius: var(--radius-badge); border: 1px solid var(--border); color: var(--text-2); }
+
+.failPanel { border-color: var(--negative); }
+.failReason { margin: 0; font-size: 12px; color: var(--negative); font-family: var(--font-mono), monospace; }
+
+@media (max-width: 640px) {
+  .head { flex-direction: column; align-items: stretch; }
+  .headMeta { justify-content: flex-start; }
+  .kvRow { flex-direction: column; align-items: flex-start; gap: 2px; }
+  .kvVal, .kvLink { text-align: left; }
+  .tags { justify-content: flex-start; }
+}

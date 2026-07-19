@@ -1,10 +1,69 @@
 'use client';
+import { useEffect, useState } from 'react';
 import Link from 'next/link';
 import { Badge } from '@/components/ui/Badge';
 import { Num } from '@/components/ui/Num';
-import { MY_AGENTS, MY_RUNS, MY_REWARDS, ALERTS, COMPETITIONS } from '@/lib/fixtures/catalog';
+import { MY_RUNS, MY_REWARDS, ALERTS, COMPETITIONS } from '@/lib/fixtures/catalog';
+import { getInstances, type DeployedInstance } from '@/lib/api';
 import type { PayoutState, RewardSummary } from '@/lib/catalog';
 import styles from './OperatorDashboardScreen.module.css';
+
+type AgentsState =
+  | { kind: 'loading' }
+  | { kind: 'ready'; instances: DeployedInstance[] }
+  | { kind: 'error' };
+
+// "Your Agents" is bound to the operator's REAL owned instances (getInstances → owner-scoped,
+// bearer-authed). It NEVER falls back to a fixture: an empty/unauthorized/failed load renders an
+// honest empty or error state (T-2 fixture prohibition), so a fixture agent can never masquerade
+// as a live deployment.
+function YourAgents({
+  loadInstances,
+  onOpenRuntime,
+}: {
+  loadInstances: () => Promise<DeployedInstance[]>;
+  onOpenRuntime: (agentId: string) => void;
+}) {
+  const [state, setState] = useState<AgentsState>({ kind: 'loading' });
+
+  useEffect(() => {
+    let active = true;
+    setState({ kind: 'loading' });
+    loadInstances()
+      .then((instances) => { if (active) setState({ kind: 'ready', instances }); })
+      .catch(() => { if (active) setState({ kind: 'error' }); });
+    return () => { active = false; };
+  }, [loadInstances]);
+
+  return (
+    <section className={styles.panel}>
+      <h2 className={styles.h2}>Your Agents</h2>
+      {state.kind === 'loading' && <p className={styles.hint} data-testid="agents-loading">Loading your agents…</p>}
+      {state.kind === 'error' && <p className={styles.hint} data-testid="agents-error">Couldn&apos;t load your agents. Check your session and try again.</p>}
+      {state.kind === 'ready' && state.instances.length === 0 && (
+        <p className={styles.hint} data-testid="agents-empty">No deployed agents yet. <Link href="/studio" className={styles.inlineLink}>Deploy one in Studio →</Link></p>
+      )}
+      {state.kind === 'ready' && state.instances.length > 0 && (
+        <ul className={styles.list}>
+          {state.instances.map((inst) => (
+            <li key={inst.instance_id} className={styles.agentRow}>
+              <Link href={`/instances/${inst.instance_id}`} className={styles.rowMain}>
+                <span className="mono">{inst.instance_id}</span>
+                <span className={styles.sub}>{inst.template_id} · {inst.status} · {inst.source_mode}</span>
+              </Link>
+              <span className={styles.rowMeta}>
+                <span className={styles.status} data-status={inst.status}>{inst.status}</span>
+                <button type="button" className={styles.runtimeBtn} onClick={() => onOpenRuntime(inst.agent_id)}>
+                  ⌬ Runtime
+                </button>
+              </span>
+            </li>
+          ))}
+        </ul>
+      )}
+    </section>
+  );
+}
 
 // `failed` is intentionally excluded: a failed payout is an off-nominal state and is
 // rendered as a distinct NEGATIVE span (below), never collapsed into a nominal badge.
@@ -17,7 +76,17 @@ export function OperatorDashboardScreen({
   connected = false,
   onOpenRuntime = () => {},
   rewards = MY_REWARDS,
-}: { connected?: boolean; onOpenRuntime?: (agentId: string) => void; rewards?: RewardSummary[] }) {
+  loadInstances = getInstances,
+  onConnect,
+}: {
+  connected?: boolean;
+  onOpenRuntime?: (agentId: string) => void;
+  rewards?: RewardSummary[];
+  loadInstances?: () => Promise<DeployedInstance[]>;
+  // Fires the real login flow (usePrivy().login), wired from the page. Absent in builds where login
+  // is impossible (Privy unconfigured) — then the gate stays informative text, never a dead button.
+  onConnect?: () => void;
+}) {
   // SEC-008 fail-closed gate: operator-private data (agents/runs/rewards/alerts) is only
   // ever rendered when the operator session is authorized. When disconnected we render an
   // honest prompt and NOTHING private — not hidden-but-present, genuinely absent from the DOM.
@@ -29,6 +98,9 @@ export function OperatorDashboardScreen({
         </header>
         <div className={styles.gate} data-testid="connect-gate">
           <p className={styles.gateMsg}>Connect your operator wallet to view your agents, runs, rewards, and alerts.</p>
+          {onConnect && (
+            <button type="button" className={styles.connectBtn} onClick={onConnect}>Connect wallet</button>
+          )}
         </div>
       </section>
     );
@@ -46,25 +118,7 @@ export function OperatorDashboardScreen({
 
       <div className={styles.grid}>
         <div className={styles.col}>
-          <section className={styles.panel}>
-            <h2 className={styles.h2}>Your Agents</h2>
-            <ul className={styles.list}>
-              {MY_AGENTS.map((a) => (
-                <li key={a.agent_id} className={styles.agentRow}>
-                  <Link href={`/agents/${a.agent_id}`} className={styles.rowMain}>
-                    <span>{a.agent_name}</span>
-                    <span className={styles.sub}>{a.archetype} · {a.mode} · {a.source}</span>
-                  </Link>
-                  <span className={styles.rowMeta}>
-                    <Badge variant={a.proof_mode} />
-                    <button type="button" className={styles.runtimeBtn} onClick={() => onOpenRuntime(a.agent_id)}>
-                      ⌬ Runtime
-                    </button>
-                  </span>
-                </li>
-              ))}
-            </ul>
-          </section>
+          <YourAgents loadInstances={loadInstances} onOpenRuntime={onOpenRuntime} />
 
           <section className={styles.panel}>
             <h2 className={styles.h2}>Your Runs</h2>
