@@ -9,7 +9,7 @@ production DNS/VPS/credential mutation.
 
 | Surface | What lives there | Volume | Loss = |
 |---|---|---|---|
-| Postgres | runs, competitions, event log, execution records, deployment attempts, **`runtime_events`** (AgentOS session/OPS spool) | `postgres-data` | the proof record + Agent-Ops history |
+| Postgres | runs, competitions, event log, execution records, deployment attempts, **`runtime_events`** (Veridex runtime-event/OPS spool) | `postgres-data` | the proof record + Agent-Ops history |
 | WAL spool | I-4 crash-safe Agent-Ops WAL (`WAL_DIR=/data/wal`) | `wal-spool` | in-flight ops events not yet committed (AC-13) |
 | ReplayPack capture | live-captured packs (R-0b/R-2) | `replay-capture` | captured replay artifacts |
 
