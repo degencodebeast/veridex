@@ -40,7 +40,7 @@ def _manifest_fixture_ids() -> list[int]:
 def test_seed_pack_content_hash_recomputes_to_stored():
     """The banked seed's stored ``content_hash`` recomputes from its data files + authority block."""
     assert verify_content_hash(DEMO_PACK_REAL_DIR) is True
-    # Explicit recompute == stored (the pinned identity binds the seed to these exact bytes).
+    # Stored hash == the demo-script pin (verify_content_hash above already proved recompute == stored).
     assert _pack_content_hash(DEMO_PACK_REAL_DIR) == DEMO_PACK_REAL_CONTENT_HASH
 
 
