@@ -93,8 +93,14 @@
 .stateGlyphError { background: var(--negative-bg); border: 1px solid rgba(210, 96, 75, 0.3); border-style: solid; color: var(--negative); }
 .stateTitle { font-size: 13px; font-weight: 600; color: var(--text-1); }
 .stateNote { margin: 0; font-family: var(--font-mono), monospace; font-size: 10.5px; line-height: 1.6; color: var(--text-3); max-width: 380px; }
-.retry { margin-top: 4px; font-family: var(--font-mono), monospace; font-size: 10px; font-weight: 600; color: var(--accent-hi); background: var(--accent-bg); border: 1px solid rgba(59, 130, 246, 0.34); padding: 8px 14px; border-radius: var(--radius-control); cursor: pointer; letter-spacing: 0.04em; }
+.retry { margin-top: 4px; font-family: var(--font-mono), monospace; font-size: 10px; font-weight: 600; color: var(--accent-hi); background: var(--accent-bg); border: 1px solid rgba(59, 130, 246, 0.34); padding: 8px 14px; border-radius: var(--radius-control); cursor: pointer; letter-spacing: 0.04em; transition: transform 160ms cubic-bezier(0.23, 1, 0.32, 1), background 160ms ease; }
+.retry:hover { background: rgba(59, 130, 246, 0.22); }
 .retry:active { transform: scale(0.97); }
+
+@media (prefers-reduced-motion: reduce) {
+  .retry { transition: background 160ms ease; }
+  .retry:active { transform: none; }
+}
 
 /* interpretation note (always present when populated) */
 .note { display: flex; align-items: flex-start; gap: var(--space-2); background: var(--bg-bar); border: 1px solid var(--border); border-radius: var(--radius-control); padding: 11px 14px; }
