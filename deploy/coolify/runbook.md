@@ -220,6 +220,12 @@ that `DATABASE_URL` (not an in-memory fallback) and the `wal-spool`
 volume (§2) are actually wired on the deployed service, not just present
 in this runbook. See the script header for the exact routes and rationale.
 
+Trust boundary: `AC13_MET` is only as strong as the restart it was run
+around — a no-op `RESTART_CMD` (or an operator restart that didn't
+actually happen) reports MET without proving anything, since the script
+has no process-uptime endpoint to verify the restart itself occurred.
+Prefer `--ac13-pre` / `--ac13-post` around a restart you have verified.
+
 ## 12. Negative scope (what D-0 does NOT do)
 
 - NO `Dockerfile.api` — I-5-owned; D-1 wires it (graph: D-0 + I-5 → D-1 → II-11).

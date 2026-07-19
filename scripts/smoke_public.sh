@@ -35,32 +35,21 @@
 #   Or, single-shot automated (when a restart command is available in-process):
 #     RESTART_CMD='docker compose restart api-runtime' ./scripts/smoke_public.sh --ac13
 #
+#   Trust boundary: AC13_MET is only as strong as RESTART_CMD (or the operator's manual step)
+#   actually restarting the service — a no-op RESTART_CMD reports MET without a real restart.
+#   This script cannot independently verify the restart happened (no process-uptime endpoint
+#   exists to probe); prefer --ac13-pre / --ac13-post around a restart you have verified yourself.
+#
 # Usage (default smoke):
 #   BASE_URL=https://api.example.com ./scripts/smoke_public.sh
 #   (defaults to http://localhost:8000 — the LOCAL compose stack's API_HOST_PORT; see
 #   compose.coolify.yml:77, .env.example:71, README.md:250-252)
 #
-# Fail-closed: an empty BASE_URL or an unreachable host aborts loudly (non-zero) before any
-# checks run. Never reads or prints a bearer token — every request here is deliberately
-# UNAUTHENTICATED (that is what checks 3 and AC-13 are proving).
+# Fail-closed: an unreachable host aborts loudly (non-zero) before any checks run. BASE_URL always
+# has a value — it defaults to http://localhost:8000 rather than requiring one. Never reads or
+# prints a bearer token — every request here is deliberately UNAUTHENTICATED (that is what checks
+# 3 and AC-13 are proving).
 set -uo pipefail
-
-BASE_URL="${BASE_URL:-}"
-MODE=""
-for arg in "$@"; do
-  case "$arg" in
-    --ac13|--ac13-pre|--ac13-post|-h|--help) MODE="$arg" ;;
-    *) BASE_URL="${BASE_URL:-$arg}" ;;
-  esac
-done
-BASE_URL="${BASE_URL:-http://localhost:8000}"
-
-CURL_TIMEOUT=15
-BODY_FILE="$(mktemp)"
-AC13_STATE_FILE="${AC13_STATE_FILE:-${TMPDIR:-/tmp}/veridex_smoke_ac13_state}"
-trap 'rm -f "$BODY_FILE"' EXIT
-
-FAILURES=0
 
 usage() {
   cat <<'EOF'
@@ -74,6 +63,28 @@ Env: BASE_URL (default http://localhost:8000), AC13_STATE_FILE, RESTART_CMD
 EOF
 }
 
+BASE_URL="${BASE_URL:-}"
+MODE=""
+for arg in "$@"; do
+  case "$arg" in
+    --ac13|--ac13-pre|--ac13-post|-h|--help) MODE="$arg" ;;
+    --*)
+      echo "unrecognized flag: $arg" >&2
+      usage >&2
+      exit 2
+      ;;
+    *) BASE_URL="${BASE_URL:-$arg}" ;;
+  esac
+done
+BASE_URL="${BASE_URL:-http://localhost:8000}"
+
+CURL_TIMEOUT=15
+BODY_FILE="$(mktemp)"
+AC13_STATE_FILE="${AC13_STATE_FILE:-${TMPDIR:-/tmp}/veridex_smoke_ac13_state}"
+trap 'rm -f "$BODY_FILE"' EXIT
+
+FAILURES=0
+
 abort() {
   echo "SMOKE ABORT: $1" >&2
   exit 2
@@ -86,9 +97,15 @@ require_jq() {
   command -v jq >/dev/null 2>&1 || abort "jq is required to parse JSON responses (install jq)"
 }
 
-# req METHOD PATH — sets HTTP_CODE, leaves the response body in $BODY_FILE. Returns non-zero (and
-# leaves HTTP_CODE unset) ONLY on a transport-level failure (unreachable host, DNS, timeout) — an
-# HTTP error status (4xx/5xx) is a normal, successful request and returns 0.
+require_curl() {
+  command -v curl >/dev/null 2>&1 || abort "curl is required to run this smoke script"
+}
+
+# req METHOD PATH — sets HTTP_CODE, leaves the response body in $BODY_FILE. Returns non-zero on a
+# transport-level failure (unreachable host, DNS, timeout) — in that case HTTP_CODE is NOT cleanly
+# unset, it holds curl's mixed stdout/stderr diagnostic text, so callers must branch on the return
+# code (`req ... || abort ...`), never on HTTP_CODE's contents after a failed call. An HTTP error
+# status (4xx/5xx) is a normal, successful request and returns 0.
 req() {
   local method="$1" path="$2"
   if ! HTTP_CODE="$(curl -sS --max-time "$CURL_TIMEOUT" -o "$BODY_FILE" -w '%{http_code}' -X "$method" "${BASE_URL}${path}" 2>&1)"; then
@@ -96,12 +113,12 @@ req() {
   fi
 }
 
-[ -n "$BASE_URL" ] || abort "BASE_URL is empty"
-
 if [ "$MODE" = "-h" ] || [ "$MODE" = "--help" ]; then
   usage
   exit 0
 fi
+
+require_curl
 
 echo "smoke: target ${BASE_URL}"
 
@@ -203,7 +220,7 @@ fi
 # 3) Deploy-auth fail-closed — unauthenticated control-plane write must be refused with 401
 #    (router.py:1654-1684: the operator-bearer-token dependency runs before any competition
 #    lookup, so this is 401 even though "smoke-probe" is not a real competition id).
-req POST /competitions/smoke-probe/kill-switch
+req POST /competitions/smoke-probe/kill-switch || abort "cannot reach ${BASE_URL} for deploy-auth check"
 if [ "$HTTP_CODE" = "401" ]; then
   pass deploy-auth "POST /competitions/{id}/kill-switch (no token) -> 401"
 else
@@ -212,10 +229,10 @@ fi
 
 # 4) Replay run reachable — the judge cold-hit path: an unauthenticated replay-mode run is
 #    creatable and visible on the leaderboard with no operator setup (router.py:520-594).
-req POST /demo/run
+req POST /demo/run || abort "cannot reach ${BASE_URL} for replay-run check"
 if [ "$HTTP_CODE" = "200" ]; then
   run_id="$(jq -r '.run_id' "$BODY_FILE" 2>/dev/null)"
-  req GET /leaderboard
+  req GET /leaderboard || abort "cannot reach ${BASE_URL} for replay-run check (leaderboard)"
   rows_len="$(jq -r '.rows | length' "$BODY_FILE" 2>/dev/null || echo 0)"
   if [ "$HTTP_CODE" = "200" ] && [ "${rows_len:-0}" -gt 0 ] 2>/dev/null; then
     pass replay-run "POST /demo/run -> 200 (run_id=${run_id}), GET /leaderboard -> 200 (${rows_len} row(s))"
