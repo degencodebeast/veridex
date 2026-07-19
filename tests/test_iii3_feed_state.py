@@ -16,8 +16,11 @@ last odds-record timestamp into an observable :class:`LiveFeedStatus` the endpoi
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncIterator
 from typing import Any
+
+import pytest
 
 from veridex.ingest.feed_health import (
     DEFAULT_STALE_AFTER_S,
@@ -157,3 +160,54 @@ async def test_run_live_window_without_feed_status_still_seals() -> None:
         _window("manual_stop"), [_flag_agent()], stream=_astream(ticks), anchor_fn=None
     )
     assert bundle.run.evidence_hash
+
+
+# =================================================================================================
+# LIFECYCLE honesty (finally): the feed is marked disconnected on EVERY exit path — including a
+# BaseException (asyncio.CancelledError) that ``except Exception`` never catches. Without the
+# finally, a cancelled live task after feeding ticks would leave a FALSELY-FRESH LIVE.
+# =================================================================================================
+async def _cancel_after_first(tick: MarketState) -> AsyncIterator[MarketState]:
+    yield tick
+    raise asyncio.CancelledError  # a cancelled live task — a BaseException, not an Exception
+
+
+async def test_cancelled_after_feeding_marks_disconnected_never_fresh_live() -> None:
+    status = LiveFeedStatus()
+    with pytest.raises(asyncio.CancelledError):
+        await run_live_window(
+            _window("pre_match"),
+            [_flag_agent()],
+            stream=_cancel_after_first(_ms(6000, tick_seq=0, ts=1000)),
+            anchor_fn=None,
+            feed_status=status,
+            clock=lambda: 5000,
+        )
+    # A tick WAS fed (last-seen is fresh at now=5000), yet the cancel must have disconnected the feed.
+    assert status.odds_records_seen == 1
+    assert status.last_odds_ts == 5000
+    assert status.connected is False
+    # The endpoint derives DISCONNECTED even though the odds last-seen is "fresh" — NEVER a stale LIVE.
+    assert status.feed_state(source_mode="live", now_ts=5000) is FeedState.DISCONNECTED
+
+
+async def _crash_before_first_tick() -> AsyncIterator[MarketState]:
+    raise RuntimeError("connect failed")
+    yield  # pragma: no cover — unreachable, only makes this an async generator
+
+
+async def test_crash_before_first_tick_is_disconnected_not_connecting_forever() -> None:
+    status = LiveFeedStatus()
+    with pytest.raises(RuntimeError, match="connect failed"):
+        await run_live_window(
+            _window("manual_stop"),
+            [_flag_agent()],
+            stream=_crash_before_first_tick(),
+            anchor_fn=None,
+            feed_status=status,
+        )
+    # No tick was fed and the connect crashed — the finally marks disconnected, so the feed is
+    # honestly DISCONNECTED, not stuck CONNECTING forever.
+    assert status.odds_records_seen == 0
+    assert status.connected is False
+    assert status.feed_state(source_mode="live", now_ts=1000) is FeedState.DISCONNECTED
