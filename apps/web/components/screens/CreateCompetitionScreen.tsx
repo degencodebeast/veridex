@@ -243,7 +243,8 @@ export function CreateCompetitionScreen({
             </div>
           </section>
 
-          {/* 05 — ROSTER (F-4): owner-scoped selector of eligible deployed instances */}
+          {/* 04 — ROSTER (F-4): owner-scoped selector of eligible deployed instances (the shipped
+              wizard has no separate proof/exec section, so ROSTER is section 04, not 05) */}
           <RosterSection
             connected={connected}
             state={instState}
@@ -294,7 +295,7 @@ export function CreateCompetitionScreen({
   );
 }
 
-// ── Section 05 · ROSTER ─────────────────────────────────────────────────────────────────────────
+// ── Section 04 · ROSTER ─────────────────────────────────────────────────────────────────────────
 function RosterSection({
   connected, state, eligible, selected, onToggle, proofFor: proofForInstance,
 }: {
@@ -307,7 +308,7 @@ function RosterSection({
 }) {
   return (
     <section className={styles.section} data-testid="roster-section">
-      <h2 className={styles.h2}><span className={styles.n}>05</span> Roster</h2>
+      <h2 className={styles.h2}><span className={styles.n}>04</span> Roster</h2>
       {!connected && (
         <p className={styles.rosterEmpty} data-testid="roster-auth">Connect wallet to list your instances.</p>
       )}
