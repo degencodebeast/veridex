@@ -3,7 +3,7 @@ import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import {
   getProofArtifact, getCockpitState, getInspectorRecord, getLeaderboard, verifyProof,
-  ApiError, adaptProofArtifact, adaptVerify,
+  ApiError, adaptProofArtifact, adaptVerify, adaptLeaderboard,
 } from '@/lib/api';
 import { CHECK_ORDER } from '@/lib/checks';
 import type * as W from '@/lib/wire';
@@ -70,6 +70,35 @@ describe('api client (CON-003: binds the frozen wire contract, maps to the view-
     expect(typeof r.low_sample).toBe('boolean');
     // WD-7 is display-only and never reorders (SEC-005): rank preserved as given.
     expect(r.rank).toBe(1);
+  });
+
+  it('preserves a null cross-run avg_clv_bps (UNSCORED, action_count==0) as null — never a fabricated 0 bps (R-globalclv)', () => {
+    // Backend contract: cross-run LeaderboardRow.avg_clv_bps is `float | None`, None when
+    // action_count == 0 (veridex/api/schemas.py:44,63). An UNSCORED agent must stay "unavailable"
+    // (rendered "—"), never read as an earned 0 bps. Mirrors the F-5 competition-board honesty fix.
+    const wire = {
+      rows: [
+        {
+          rank: 1, agent_id: 'scored', runs: 3, avg_clv_bps: 14.2, total_clv_bps: 42, sim_pnl: 42,
+          brier: null, max_drawdown: 0, action_count: 3, valid_pct: 100, proof_mode: 'reproducible',
+          eligibility_badge: 'unproven', anchor_status: 'none-anchored', source_mode: 'all-replay',
+          valid_count: 3, clv_confidence: 'low', low_sample: true,
+        },
+        {
+          rank: 2, agent_id: 'unscored', runs: 0, avg_clv_bps: null, total_clv_bps: 0, sim_pnl: 0,
+          brier: null, max_drawdown: 0, action_count: 0, valid_pct: 0, proof_mode: 'reproducible',
+          eligibility_badge: 'unproven', anchor_status: 'none-anchored', source_mode: 'all-replay',
+          valid_count: 0, clv_confidence: 'low', low_sample: true,
+        },
+      ],
+    } as unknown as W.LeaderboardResponse;
+    const rows = adaptLeaderboard(wire);
+    // UNSCORED row: null preserved (RED pre-fix: the `?? 0` coercion turned this into 0).
+    expect(rows[1].avg_clv_bps).toBeNull();
+    // SCORED row: real bps carried through unchanged (no regression on always-numeric rows).
+    expect(rows[0].avg_clv_bps).toBe(14.2);
+    // Backend rank + row order preserved verbatim — the adapter introduces no local re-sort.
+    expect(rows.map((r) => [r.agent_id, r.rank])).toEqual([['scored', 1], ['unscored', 2]]);
   });
 
   it('GETs competition state from /competitions/{id}', async () => {

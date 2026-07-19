@@ -321,7 +321,10 @@ export function adaptLeaderboard(w: W.LeaderboardResponse): LeaderboardRow[] {
     agent_name: r.agent_id, // GAP: wire has no agent_name — fall back to id
     agent_kind: '', // GAP: wire has no agent_kind
     runs: r.runs,
-    avg_clv_bps: r.avg_clv_bps ?? 0,
+    // avg_clv_bps is the rank axis; the wire carries `number | null` (backend `float | None`, None
+    // when action_count == 0 — an UNSCORED agent). Preserve null verbatim ⇒ "—", NEVER a fabricated
+    // 0 bps (R-globalclv — mirrors the F-5 competition-board fix on this cross-run/global surface).
+    avg_clv_bps: r.avg_clv_bps,
     total_clv_bps: r.total_clv_bps,
     sim_pnl: r.sim_pnl,
     brier: r.brier ?? 0,

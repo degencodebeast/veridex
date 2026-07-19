@@ -72,6 +72,32 @@ describe('LeaderboardScreen (REQ-013 / AC-005 / WD-7)', () => {
     expect(src).not.toHaveTextContent(/replay/i);
   });
 
+  it('renders an UNSCORED global row (avg_clv_bps=null) as "—", never a fabricated 0 bps (R-globalclv)', () => {
+    // The cross-run adapter now preserves the backend null (action_count==0). The board must show
+    // "—" (unavailable) for that agent's Avg CLV, never "0" — mirrors the F-5 competition-board fix.
+    render(<LeaderboardScreen rows={[mk({ agent_id: 'unscored', agent_name: 'Unscored Co', avg_clv_bps: null })]} />);
+    const clv = within(screen.getByTestId('lb-row')).getByTestId('lb-clv');
+    expect(clv).toHaveTextContent('—');
+    expect(clv).not.toHaveTextContent('0');
+  });
+
+  it('null-CLV (unscored) rows sort LAST and never crash the board — mirrors backend None → last (R-globalclv)', () => {
+    // A null-CLV agent keeps a real, rendered position at the bottom (None → -inf), and the scored
+    // rows keep their CLV-desc order — no fabricated 0 lets an unscored agent leapfrog a scored one.
+    const rows: LeaderboardRow[] = [
+      mk({ agent_id: 'mid', agent_name: 'Mid', avg_clv_bps: 5 }),
+      mk({ agent_id: 'unscored', agent_name: 'Unscored', avg_clv_bps: null }),
+      mk({ agent_id: 'top', agent_name: 'Top', avg_clv_bps: 20 }),
+    ];
+    render(<LeaderboardScreen rows={rows} />);
+    const order = screen.getAllByTestId('lb-row').map((r) => within(r).getByTestId('lb-agent').textContent);
+    expect(order[0]).toMatch(/Top/);
+    expect(order[1]).toMatch(/Mid/);
+    expect(order[2]).toMatch(/Unscored/);
+    // The unscored row is present with an em-dash CLV — a real position, not hidden, not a fake 0.
+    expect(within(screen.getAllByTestId('lb-row')[2]).getByTestId('lb-clv')).toHaveTextContent('—');
+  });
+
   it('filters by source without changing the CLV-only sort rule', async () => {
     const user = userEvent.setup();
     render(<LeaderboardScreen />);
