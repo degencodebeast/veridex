@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { buildPreflightPreview, PREFLIGHT_DISCLAIMER } from '@/lib/studio/preflight';
-import { DEFAULT_POLICY_ENVELOPE } from '@/lib/fixtures/catalog';
+import { DEFAULT_POLICY_ENVELOPE } from '@/lib/config/policy';
 
 // Studio preflight is FULLY (A) real config (codex option 3): it shows the real min_edge THRESHOLD
 // from the policy envelope + the rule-config table + a plain disclaimer. It NEVER shows a computed/

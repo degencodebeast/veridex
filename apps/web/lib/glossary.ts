@@ -106,6 +106,10 @@ export const GLOSSARY = {
     label: 'post_only leg',
     definition: 'a quote leg posted as maker-only (never crosses the spread); a behavior attribute of the decision, not a fill or an edge claim.',
   },
+  counterfactual_capacity: {
+    label: 'Counterfactual capacity',
+    definition: 'a recomputed ceiling of what the OBSERVED book would have cleared, or a third-party market print — bounded by matched observed liquidity, never our own fill, receipt, PnL, or the rank axis.',
+  },
 } as const satisfies Record<string, GlossaryEntry>;
 
 export type GlossaryTerm = keyof typeof GLOSSARY;

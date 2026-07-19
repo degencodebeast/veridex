@@ -5,7 +5,7 @@ import {
 
 describe('fixtures (typed realistic fiction)', () => {
   it('includes a not-eligible row with the highest avg_clv_bps (AC-005 coverage)', () => {
-    const top = [...LEADERBOARD_ROWS].sort((a, b) => b.avg_clv_bps - a.avg_clv_bps)[0];
+    const top = [...LEADERBOARD_ROWS].sort((a, b) => (b.avg_clv_bps ?? -Infinity) - (a.avg_clv_bps ?? -Infinity))[0];
     expect(top.eligibility_badge).toBe('not-eligible');
   });
 

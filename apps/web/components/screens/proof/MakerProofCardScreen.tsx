@@ -5,7 +5,7 @@ import { InfoTip } from '@/components/ui/InfoTip';
 import { GLOSSARY } from '@/lib/glossary';
 import { shortHash } from '@/lib/format';
 import { MAKER_AGENT_META } from '@/lib/fixtures/maker';
-import { deriveMakerVerdict } from '@/lib/makerVerdict';
+import { deriveMakerVerdict, deriveCounterfactualCapacity } from '@/lib/makerVerdict';
 import type { MakerArenaResultView } from '@/lib/contracts';
 import styles from './MakerProofCardScreen.module.css';
 
@@ -22,6 +22,11 @@ export function MakerProofCardScreen({ result, agentId }: { result: MakerArenaRe
   const verdict = deriveMakerVerdict(card.falsification, {
     candidate: candidate.agent_id, control: control.agent_id,
   });
+  // AC-30/AC-31: a historical entry/exit capacity claim (when present) is ALWAYS a bounded, LABELED
+  // counterfactual — a fourth evidence class, kept structurally distinct from the sealed arena score,
+  // the null exec-edge, and the falsification claim. Absent on the sealed MM-R1 fixture ⇒ null ⇒ the
+  // honest-empty future rungs render exactly as before.
+  const cf = result.historical_capacity ? deriveCounterfactualCapacity(result.historical_capacity) : null;
 
   return (
     <article className={styles.proof}>
@@ -111,6 +116,36 @@ export function MakerProofCardScreen({ result, agentId }: { result: MakerArenaRe
           </div>
         </div>
       </section>
+
+      {/* AC-30/AC-31 — the fourth evidence class. Rendered ONLY when a historical capacity claim is
+          carried; it is a bounded, labeled counterfactual, deliberately OUTSIDE the rank/edge/fill
+          surfaces above so no class is ever conflated. A third-party print or counterfactual ceiling
+          can never be presented as our own fill, PnL, receipt, or rank. */}
+      {cf && (
+        <section
+          className={styles.panel}
+          aria-label="Historical capacity — counterfactual"
+          data-testid="maker-proof-counterfactual"
+          data-evidence-class={cf.badge}
+        >
+          <div className={styles.panelHead}>
+            <span className={styles.sectionLabel}>HISTORICAL CAPACITY</span>
+            <Badge variant={cf.badge} />
+            <InfoTip label={GLOSSARY.counterfactual_capacity.label}>{GLOSSARY.counterfactual_capacity.definition}</InfoTip>
+          </div>
+          <div className={styles.panelBody}>
+            <div className={styles.statRow}>
+              <div className={styles.stat}>
+                <span className={styles.statLabel}>BOUNDED CEILING</span>
+                <span className="mono" data-testid="maker-proof-counterfactual-ceiling">
+                  ${cf.boundedCapacityUsd.toLocaleString()}{cf.isBounded ? ' · clamped to observed liquidity' : ''}
+                </span>
+              </div>
+            </div>
+            <p className={styles.note}>{cf.label} — bounded by matched observed liquidity, never routed to fill / PnL / rank / executable edge.</p>
+          </div>
+        </section>
+      )}
 
       {/* QuoteGuard behavior ablation entry (F-8) — a contextual deep-link to the guard OFF vs ON
           BEHAVIOR comparison. It is not a rank/profit surface; the link is keyed by the card's

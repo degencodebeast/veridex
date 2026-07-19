@@ -75,6 +75,12 @@ describe('LandingScreen (V4 fidelity)', () => {
     expect(within(screen.getByTestId('how-it-works')).getAllByRole('listitem')).toHaveLength(3);
   });
 
+  it('wires the nav "How it works" / "Why Veridex" links to the dedicated explainer routes', () => {
+    render(<LandingScreen />);
+    expect(screen.getByRole('link', { name: /how it works/i })).toHaveAttribute('href', '/how-it-works');
+    expect(screen.getByRole('link', { name: /why veridex/i })).toHaveAttribute('href', '/why-veridex');
+  });
+
   it('keeps the GENERIC comparison (self-reported bots) — no fabricated named competitors', () => {
     render(<LandingScreen />);
     expect(screen.getByText(/self-reported bots/i)).toBeInTheDocument();

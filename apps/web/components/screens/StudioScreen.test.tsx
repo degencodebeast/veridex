@@ -6,7 +6,7 @@ import { render, screen, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { StudioScreen, buildDeployPayload, UnsupportedStrategyError } from '@/components/screens/StudioScreen';
 import { PREFLIGHT_DISCLAIMER } from '@/lib/studio/preflight';
-import { DEFAULT_POLICY_ENVELOPE, MM_POLICY_ENVELOPE } from '@/lib/fixtures/catalog';
+import { DEFAULT_POLICY_ENVELOPE, MM_POLICY_ENVELOPE } from '@/lib/config/policy';
 import { GLOSSARY } from '@/lib/glossary';
 
 // THE canonical Studio MM deploy payload — the ONE shared, committed contract fixture BOTH this

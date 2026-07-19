@@ -12,6 +12,9 @@ export const OVERFLOW_BUFFER_MAX = 512;
 // ...}. `type`/`ts` are accepted too so existing simplified test fixtures keep working unchanged.
 interface WireEvent {
   seq: number;
+  // Sealed RunEvent.sequence_no for evidence events (null for derived) — the Inspector deep-link key
+  // (see CanonicalEvent.source_sequence_no). Preserved verbatim off the real backend frame.
+  source_sequence_no?: number | null;
   event_type?: string;
   type?: string;
   event_ts?: number;
@@ -81,6 +84,7 @@ export function normalizeWireEvent(raw: WireEvent): CanonicalEvent {
   const payload = raw.payload ?? {};
   const event: CanonicalEvent = {
     seq: raw.seq,
+    source_sequence_no: raw.source_sequence_no ?? null, // sealed record key for the Inspector deep-link (defect 1)
     type: TYPE_ALIASES[rawType] ?? rawType,
     payload_hash: raw.payload_hash,
     evidence: raw.evidence,

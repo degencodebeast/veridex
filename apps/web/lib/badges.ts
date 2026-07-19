@@ -9,6 +9,8 @@ export const BADGE_VARIANTS = [
   // never carry a rank / winner / edge meaning (guard-on/off name the ARM, not a better/worse verdict).
   'behavior-ablation', 'not-a-leaderboard', 'recorded-replay', 'same-strategy-tape',
   'diverges-true', 'diverges-false', 'guard-on', 'guard-off',
+  // AC-30/AC-31 — a third-party print / counterfactual capacity ceiling. NEVER a fill/PnL/rank badge.
+  'counterfactual',
 ] as const;
 
 export type BadgeVariant = (typeof BADGE_VARIANTS)[number];
@@ -43,4 +45,6 @@ export const BADGE_META: Record<BadgeVariant, { glyph: string; label: string }> 
   'diverges-false': { glyph: '=', label: 'Diverges: false' },
   'guard-on': { glyph: '', label: 'Guard On' },
   'guard-off': { glyph: '', label: 'Guard Off' },
+  // Third-party print / counterfactual capacity ceiling — labeled, bounded, never our fill/PnL/rank.
+  counterfactual: { glyph: '⋯', label: 'Counterfactual' },
 };

@@ -23,6 +23,8 @@ describe('Badge (PAT-002: one component, full vocabulary)', () => {
         // QuoteGuard behavior ablation (F-8) — behavior-comparison labels, never a rank/winner.
         'behavior-ablation', 'not-a-leaderboard', 'recorded-replay', 'same-strategy-tape',
         'diverges-true', 'diverges-false', 'guard-on', 'guard-off',
+        // AC-30/AC-31 — third-party print / counterfactual capacity ceiling, never a fill/PnL/rank.
+        'counterfactual',
       ].sort(),
     );
   });

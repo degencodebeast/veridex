@@ -51,17 +51,54 @@ describe('ClvLeaderboard (REQ-011 / SEC-005)', () => {
     expect(within(bodyRows[1]).getByText('LowCLV')).toBeInTheDocument();
   });
 
-  it('REORDERS ascending input into Avg-CLV-desc (rank IS Avg CLV — would fail a no-op comparator)', () => {
-    // Input is in ASCENDING avg_clv order; a no-op/identity sort would render
-    // [12, 25] and fail. The metric-sort must actively reorder to [25, 12].
+  // F-5 honesty: competition rank is BACKEND-AUTHORITATIVE (CON-203). The server ranks + orders the
+  // rows; ClvLeaderboard renders that order VERBATIM and must NEVER re-sort by a local CLV comparator
+  // (a client re-sort would silently disagree with the sealed leaderboard the demo is proving).
+  it('renders rows in backend order verbatim — does NOT re-sort by local Avg CLV', () => {
+    // Backend order deliberately DISAGREES with an Avg-CLV-desc sort: the rank-1 row has the LOWER
+    // avg. A local re-sort would flip these to [HighCLV, LowCLV] and fail; verbatim order must hold.
     const rows: LeaderboardRow[] = [
-      { ...base, rank: 99, agent_id: 'lo', agent_name: 'LowCLV', avg_clv_bps: 12, eligibility_badge: 'eligible' },
-      { ...base, rank: 1, agent_id: 'hi', agent_name: 'HighCLV', avg_clv_bps: 25, eligibility_badge: 'eligible' },
+      { ...base, rank: 1, agent_id: 'lo', agent_name: 'BackendFirst', avg_clv_bps: 12, eligibility_badge: 'eligible' },
+      { ...base, rank: 2, agent_id: 'hi', agent_name: 'BackendSecond', avg_clv_bps: 25, eligibility_badge: 'eligible' },
     ];
     render(<ClvLeaderboard rows={rows} />);
     const bodyRows = screen.getAllByRole('row').slice(1);
-    expect(within(bodyRows[0]).getByText('HighCLV')).toBeInTheDocument(); // avg 25 first
-    expect(within(bodyRows[1]).getByText('LowCLV')).toBeInTheDocument();  // avg 12 second
+    expect(within(bodyRows[0]).getByText('BackendFirst')).toBeInTheDocument();  // rank 1, avg 12 — verbatim
+    expect(within(bodyRows[1]).getByText('BackendSecond')).toBeInTheDocument(); // rank 2, avg 25 — verbatim
+  });
+
+  it('renders the backend rank in the # column (not a local 1-based position index)', () => {
+    // A single row carrying a non-1 backend rank: a local `i + 1` index would render "1" and fail.
+    render(<ClvLeaderboard rows={[{ ...base, rank: 7, agent_id: 'a', agent_name: 'A', avg_clv_bps: 20, eligibility_badge: 'eligible' }]} />);
+    const bodyRow = screen.getAllByRole('row').slice(1)[0];
+    expect(within(bodyRow).getByText('7')).toBeInTheDocument();
+  });
+
+  it('renders a null Avg CLV (unscored agent) as an em-dash, never a fabricated 0 bps', () => {
+    // mean_clv_bps=None → avg_clv_bps=null: the primary rank column must read "—" ("unavailable"),
+    // NEVER "0.0 bps"/"+0.0 bps" (which would claim the unscored agent earned zero closing-line value).
+    const row: LeaderboardRow = {
+      ...base, rank: 1, agent_id: 'u', agent_name: 'Unscored', avg_clv_bps: null, eligibility_badge: 'eligible',
+    };
+    render(<ClvLeaderboard rows={[row]} />);
+    const bodyRow = screen.getAllByRole('row').slice(1)[0];
+    // fmtBps(0) → exactly "0.0 bps" — the fabricated value the old `?? 0` produced in the avg cell.
+    expect(within(bodyRow).queryByText('0.0 bps')).not.toBeInTheDocument();
+    expect(within(bodyRow).getAllByText('—').length).toBeGreaterThanOrEqual(1);
+  });
+
+  it('renders competition-absent metrics as an em-dash, never a fabricated 0 (honest gap)', () => {
+    // The competition-scoped wire row carries NO sim_pnl/brier/max_drawdown/action_count/valid_pct;
+    // the adapter maps them to null and the cell must render "—", never "0.0"/"0.000"/"0%".
+    const row: LeaderboardRow = {
+      ...base, rank: 1, agent_id: 'a', agent_name: 'A', avg_clv_bps: 20, eligibility_badge: 'eligible',
+      sim_pnl: null, brier: null, max_drawdown: null, action_count: null, valid_pct: null,
+    };
+    render(<ClvLeaderboard rows={[row]} />);
+    const bodyRow = screen.getAllByRole('row').slice(1)[0];
+    expect(within(bodyRow).queryByText('0.0')).not.toBeInTheDocument();
+    expect(within(bodyRow).queryByText('0.000')).not.toBeInTheDocument();
+    expect(within(bodyRow).getAllByText('—').length).toBeGreaterThanOrEqual(5);
   });
 
   it('labels a not_applicable anchor as n/a, not "Not Anchored"', () => {

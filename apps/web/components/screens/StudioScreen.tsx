@@ -7,7 +7,7 @@ import { availableModes, resolveMode, type StudioMode } from '@/lib/studio/coupl
 import { ARCHETYPES, SPORTS_ACTION_TYPES, type Archetype, type ExecutionMode, type SourceMode } from '@/lib/catalog';
 import { STRATEGY_TEMPLATES, COMPLEXITY_LABEL, type StrategyTemplate } from '@/lib/studio/templates';
 import { buildPreflightPreview, PREFLIGHT_DISCLAIMER } from '@/lib/studio/preflight';
-import { DEFAULT_POLICY_ENVELOPE, MM_POLICY_ENVELOPE } from '@/lib/fixtures/catalog';
+import { DEFAULT_POLICY_ENVELOPE, MM_POLICY_ENVELOPE } from '@/lib/config/policy';
 import { GLOSSARY } from '@/lib/glossary';
 import { deployAgent, DeployPreflightError, type DeployAgentPayload, type DeployAgentResult } from '@/lib/api';
 import styles from './StudioScreen.module.css';

@@ -216,7 +216,7 @@ export function MarketsScreen({
                 {eligible.map((a) => (
                   <li key={a.agent_id} className={styles.eligibleRow}>
                     <span>{a.agent_name}</span>
-                    <span className={`${styles.num} mono`}>{a.avg_clv_bps >= 0 ? '+' : ''}{a.avg_clv_bps.toFixed(1)} bps</span>
+                    <span className={`${styles.num} mono`}>{a.avg_clv_bps === null ? '—' : `${a.avg_clv_bps >= 0 ? '+' : ''}${a.avg_clv_bps.toFixed(1)} bps`}</span>
                   </li>
                 ))}
               </ul>
