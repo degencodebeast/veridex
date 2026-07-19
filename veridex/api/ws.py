@@ -13,9 +13,10 @@ Decoupled fanout (REQ-214 / REQ-2B-30):
     enqueues with non-blocking ``put_nowait`` and is NEVER allowed to ``await`` and stall the
     producer or other clients. A slow client whose bounded queue is FULL is **disconnected**
     (dropped from the registry) rather than silently skipping one event — a silent skip would
-    leave a hidden mid-stream sequence gap, whereas dropping the client ends its live stream so the
-    gap is observable and it must reconnect. A client that raises on enqueue is likewise dropped
-    (error isolation), so a dead client can never abort the run loop or skip persistence.
+    leave a hidden mid-stream sequence gap. Overflow signals the owning route, which closes the
+    socket and cancels any blocked sender so the gap is observable and the client can reconnect. A
+    client that raises on enqueue is likewise dropped (error isolation), so a dead client can never
+    abort the run loop or skip persistence.
 
 Single-instance scope:
     This is the **in-memory, single-process** broadcaster for Phase 2A — NO Redis, NO sticky
@@ -89,6 +90,7 @@ class ArenaConnectionManager:
             max_queue_size: Bounded capacity for each per-client queue.
         """
         self._clients: dict[str, set[asyncio.Queue[CompetitionEvent]]] = {}
+        self._overflow_signals: dict[asyncio.Queue[CompetitionEvent], asyncio.Event] = {}
         self._max_queue_size = max_queue_size
 
     def connect(self, competition_id: str) -> asyncio.Queue[CompetitionEvent]:
@@ -102,7 +104,12 @@ class ArenaConnectionManager:
         """
         queue: asyncio.Queue[CompetitionEvent] = asyncio.Queue(maxsize=self._max_queue_size)
         self._clients.setdefault(competition_id, set()).add(queue)
+        self._overflow_signals[queue] = asyncio.Event()
         return queue
+
+    def _overflow_signal(self, queue: asyncio.Queue[CompetitionEvent]) -> asyncio.Event:
+        """Return the route-owned signal created alongside ``queue``."""
+        return self._overflow_signals[queue]
 
     def disconnect(self, competition_id: str, queue: asyncio.Queue[CompetitionEvent]) -> None:
         """Deregister a spectator's queue, dropping the competition key when it empties.
@@ -114,6 +121,7 @@ class ArenaConnectionManager:
             competition_id: The competition the spectator was subscribed to.
             queue: The queue returned by :meth:`connect`.
         """
+        self._overflow_signals.pop(queue, None)
         queues = self._clients.get(competition_id)
         if queues is None:
             return
@@ -147,7 +155,10 @@ class ArenaConnectionManager:
             try:
                 queue.put_nowait(event)
             except asyncio.QueueFull:
-                # Slow client: disconnect (gap-signal) instead of a silent single-event drop.
+                # Wake the owning route before deregistration so it can close the actual socket.
+                signal = self._overflow_signals.get(queue)
+                if signal is not None:
+                    signal.set()
                 self.disconnect(competition_id, queue)
             except Exception:
                 # Error isolation: a raising client must not abort the run/persistence — drop it.
@@ -185,6 +196,13 @@ async def _forward_live(
         last_sent_seq = event.seq
 
 
+async def _close_on_overflow(websocket: WebSocket, overflow_signal: asyncio.Event) -> None:
+    """Close ``websocket`` once its bounded fanout queue overflows."""
+    await overflow_signal.wait()
+    with contextlib.suppress(WebSocketDisconnect, RuntimeError):
+        await websocket.close(code=1013, reason="client too slow; reconnect with since_seq")
+
+
 async def _run_arena(
     websocket: WebSocket,
     *,
@@ -213,7 +231,9 @@ async def _run_arena(
     await websocket.accept()
     # Register FIRST so any event broadcast during replay lands in the queue (gapless seam).
     queue = manager.connect(competition_id)
+    overflow_signal = manager._overflow_signal(queue)
     forwarder: asyncio.Task[None] | None = None
+    overflow_closer = asyncio.create_task(_close_on_overflow(websocket, overflow_signal))
     try:
         # 1. Replay the persisted tail (strict seq > since_seq), tracking the boundary.
         replayed = await store.list_competition_events(competition_id, since_seq=since_seq)
@@ -227,19 +247,24 @@ async def _run_arena(
 
         # 3. Read-only liveness loop: consume inbound frames purely to detect disconnect.
         #    Inbound client data is intentionally ignored — it can never mutate state (REQ-213).
+        #    The overflow closer runs independently so it can close a socket even while its live
+        #    forwarder is blocked in send_json.
         while True:
             message = await websocket.receive()
             if message["type"] == "websocket.disconnect":
                 break
-    except WebSocketDisconnect:
+    except (WebSocketDisconnect, RuntimeError):
         pass  # client vanished mid-send — fall through to cleanup
     finally:
-        # Nested finally: disconnect MUST run even if awaiting the forwarder re-raises.
+        # Cancel and join every child task so blocked send/receive operations cannot leak.
         try:
-            if forwarder is not None:
-                forwarder.cancel()
+            tasks = [task for task in (forwarder, overflow_closer) if task is not None]
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            for task in tasks:
                 with contextlib.suppress(asyncio.CancelledError):
-                    await forwarder
+                    await task
         finally:
             manager.disconnect(competition_id, queue)
 
