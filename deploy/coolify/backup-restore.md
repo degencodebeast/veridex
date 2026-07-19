@@ -62,7 +62,8 @@ Success prints `RESTORE_DRILL_OK: sample row read back from fresh restore: <note
 ## Readiness after restore
 
 After a restore, confirm the stack is serving with the deployment readiness probe (deeper than
-`/healthz` liveness — it checks Postgres + the AgentOS session DB + the ReplayPack catalog):
+`/healthz` liveness — it checks the durable Veridex deps: Postgres + the runtime-event/OPS spool + the
+ReplayPack catalog; the surface-only AgentOS in-memory store is disclosed but non-gating):
 
 ```sh
 curl -fsS http://<host>:8000/readyz    # 200 {"ready": true, ...}; 503 fail-closed if any is down

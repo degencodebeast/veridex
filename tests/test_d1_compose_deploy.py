@@ -213,18 +213,18 @@ class TestReadinessFailClosed:
         from veridex.api.readiness import check_readiness
 
         report = await check_readiness(
-            postgres=_probe(True), session_db=_probe(True), replay_pack_catalog=_probe(True)
+            postgres=_probe(True), runtime_event_spool=_probe(True), replay_pack_catalog=_probe(True)
         )
         assert report.ready is True
-        assert report.checks == {"postgres": True, "session_db": True, "replay_pack_catalog": True}
+        assert report.checks == {"postgres": True, "runtime_event_spool": True, "replay_pack_catalog": True}
 
-    @pytest.mark.parametrize("down", ["postgres", "session_db", "replay_pack_catalog"])
+    @pytest.mark.parametrize("down", ["postgres", "runtime_event_spool", "replay_pack_catalog"])
     async def test_not_ready_when_any_subsystem_down(self, down: str) -> None:
         from veridex.api.readiness import check_readiness
 
         probes: dict[str, Callable[[], Awaitable[bool]]] = {
             "postgres": _probe(True),
-            "session_db": _probe(True),
+            "runtime_event_spool": _probe(True),
             "replay_pack_catalog": _probe(True),
         }
         probes[down] = _probe(False)
@@ -232,13 +232,13 @@ class TestReadinessFailClosed:
         assert report.ready is False, f"a down {down} must make the stack NOT ready (fail closed)"
         assert report.checks[down] is False
 
-    @pytest.mark.parametrize("down", ["postgres", "session_db", "replay_pack_catalog"])
+    @pytest.mark.parametrize("down", ["postgres", "runtime_event_spool", "replay_pack_catalog"])
     async def test_probe_that_raises_is_treated_as_down(self, down: str) -> None:
         from veridex.api.readiness import check_readiness
 
         probes: dict[str, Callable[[], Awaitable[bool]]] = {
             "postgres": _probe(True),
-            "session_db": _probe(True),
+            "runtime_event_spool": _probe(True),
             "replay_pack_catalog": _probe(True),
         }
         probes[down] = _raising_probe()
@@ -357,7 +357,7 @@ class TestReadyzRoute:
         app.include_router(
             build_readiness_router(
                 postgres_probe=_probe(ready),
-                session_probe=_probe(ready),
+                runtime_event_spool_probe=_probe(ready),
                 pack_probe=_probe(ready),
             )
         )
@@ -552,7 +552,7 @@ class TestLocalComposeBoot:
         assert proc.returncode == 0, f"/readyz must be 200 on the booted stack:\n{proc.stderr}"
         body = json.loads(proc.stdout.strip().splitlines()[-1])
         assert body["ready"] is True
-        assert body["checks"] == {"postgres": True, "session_db": True, "replay_pack_catalog": True}
+        assert body["checks"] == {"postgres": True, "runtime_event_spool": True, "replay_pack_catalog": True}
 
     @docker_required
     def test_smoke_public_passes_against_local_stack(self, compose_stack: Path) -> None:

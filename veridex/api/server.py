@@ -177,6 +177,28 @@ def _build_served_hosting_adapters() -> tuple[Any, list[Any]]:
     return primary, [det, llm]
 
 
+def _require_durable_agentos_db_when_executor(owner_db: Any, *, surface_only: bool) -> None:
+    """FAIL CLOSED when the served app would be an executor over an ephemeral AgentOS DB (Option-A coupling).
+
+    In surface-only mode the composed AgentOS store is intentionally non-authoritative, so an in-memory
+    agno DB is acceptable (readiness discloses it as non-gating). But if ``surface_only`` is disabled —
+    executor mode, or a permitted Agno-native run/session route, or the wrapper becoming an AgentOS
+    executor — the store becomes behaviorally/authoritatively relevant, and an in-memory agno DB (lost on
+    restart) is no longer acceptable. Reject at startup until a durable backend is configured, so the
+    temporary hackathon exception cannot silently survive a capability flip.
+    """
+    if surface_only:
+        return
+    from agno.db.in_memory import InMemoryDb  # lazy: only on the real serving path
+
+    if isinstance(owner_db, InMemoryDb):
+        raise RuntimeError(
+            "executor mode (surface_only=False) requires a DURABLE AgentOS owner/session DB; an in-memory "
+            "agno DB is process-local and lost on restart. Configure a durable backend before enabling "
+            "native run/session execution (fail-closed coupling)."
+        )
+
+
 def _resolve_verifier(verifier: _Verifier | None) -> _Verifier:
     """Resolve the Privy token verifier, defaulting to the real ``verify_privy_token`` (injectable)."""
     if verifier is not None:
@@ -192,6 +214,7 @@ def create_server_app(
     pool_factory: PoolFactory | None = None,
     settings: Settings | None = None,
     verifier: _Verifier | None = None,
+    surface_only: bool = True,
 ) -> DenyByDefaultGuard:
     """Build the public-deploy app: the deny-by-default GUARD hosting the AgentOS surface.
 
@@ -214,6 +237,12 @@ def create_server_app(
             Privy material). Defaults to :func:`~veridex.config.get_settings`.
         verifier: Injection seam for tests — the Privy token verifier. Defaults to the real
             ``verify_privy_token``.
+        surface_only: When ``True`` (the deployed default), the served composition mounts the AgentOS
+            surface behind deny-by-default and is NOT an executor — so an ephemeral in-memory AgentOS
+            owner/session DB is acceptable (non-authoritative; readiness discloses it as non-gating). When
+            ``False`` (executor mode / native run+session routes permitted), a DURABLE AgentOS backend is
+            REQUIRED and this factory FAILS CLOSED at startup on an in-memory agno DB (Codex Option-A
+            fail-closed coupling — the temporary exception cannot survive a capability flip).
 
     Returns:
         The :class:`~veridex.runtime.agentos_service.DenyByDefaultGuard` ASGI app. Its ``.app`` is the
@@ -222,6 +251,8 @@ def create_server_app(
 
     Raises:
         ValueError: If ``CORS_ORIGINS`` is not configured (fail-closed).
+        RuntimeError: If ``surface_only`` is ``False`` while the composed AgentOS owner/session DB is an
+            in-memory agno DB (fail-closed coupling — executor mode requires a durable backend).
     """
     resolved_env: Mapping[str, str] = os.environ if env is None else env
     _require_cors_origins(resolved_env)  # fail closed BEFORE any store/pool/composition is built
@@ -244,22 +275,36 @@ def create_server_app(
 
     from veridex.runtime.agentos_service import build_agentos_app  # noqa: PLC0415
 
-    # The AgentOS owner/session DB. RESIDUAL (tracked): a DURABLE agno DB (agno's ``PostgresDb``)
-    # requires SQLAlchemy, which is NOT a project dependency (only ``agno`` + psycopg are), so even on
-    # the Postgres path this stays an in-memory agno DB. Rather than LIE about it, /readyz reflects it
-    # HONESTLY below (its ``session_db`` check reports not-ready for an ephemeral AgentOS DB) — the
-    # durable authority/OPS state lives in the Veridex Postgres store, not this surface-only agno DB.
+    # The AgentOS owner/session DB. Surface-only served mode: the served app mounts the reviewed AgentOS
+    # adapter surface behind deny-by-default; execution and durable authority remain on the Veridex
+    # per-instance/Postgres path. The composed AgentOS store is therefore a non-authoritative, ephemeral
+    # in-memory agno DB (rebuilt at process start; losing it cannot change an authoritative result or
+    # permit an action). We do NOT claim durable AgentOS sessions: /readyz discloses this store as
+    # NON-GATING info (see build_readiness_router) instead of gating on it.
+    #
+    # RESIDUAL (tracked, post-hackathon): a DURABLE agno DB (agno's ``PostgresDb``) needs SQLAlchemy/
+    # greenlet, ``postgresql+psycopg://`` DSN handling, an independent pool + schema/migrations, a real
+    # DB readiness probe, and a restart-persistence test — none are project dependencies today.
     owner_db = InMemoryDb()
+
+    # FAIL-CLOSED COUPLING (Codex Option-A): the ephemeral-AgentOS-DB exception is valid ONLY while the
+    # served app is surface-only. If a future capability flip disables surface_only (executor mode /
+    # native run+session routes permitted, or the wrapper becomes an AgentOS executor), a durable AgentOS
+    # backend is REQUIRED — an in-memory agno DB is process-local and lost on restart. Reject at STARTUP
+    # so the temporary exception cannot silently survive the capability change.
+    _require_durable_agentos_db_when_executor(owner_db, surface_only=surface_only)
 
     # D-1 deployment READINESS probe (additive; distinct from I-5's /healthz liveness). Reads the live
     # pool + the composed AgentOS DB LAZILY at request time (the pool is attached to guard.app.state
     # AFTER composition). Registered pre-snapshot as a base router so /readyz is veridex-owned/self-gated
-    # (it PASSES the guard, returning 200/503) rather than treated as agno-native and denied.
+    # (it PASSES the guard, returning 200/503) rather than treated as agno-native and denied. The gate is
+    # ONLY the durable Veridex deps; the AgentOS store is disclosed as non-gating info (surface_only).
     pool_holder: dict[str, Any] = {"pool": None}
     readiness_router = build_readiness_router(
         get_pool=lambda: pool_holder["pool"],
         pack_root=resolved_env.get("REPLAY_PACK_ROOT", ""),
-        get_agentos_db=lambda: owner_db,  # /readyz reflects the ACTUAL (ephemeral) AgentOS DB, honestly
+        get_agentos_db=lambda: owner_db,  # /readyz DISCLOSES the ACTUAL (ephemeral) AgentOS DB, honestly
+        surface_only=surface_only,
     )
 
     primary, extra_agents = _build_served_hosting_adapters()
@@ -272,7 +317,7 @@ def create_server_app(
         verifier=_resolve_verifier(verifier),
         enforce_contract=True,  # AC-29: fail-closed on any agno-native surface drift
         base_routers=[readiness_router],  # /readyz registered pre-snapshot -> veridex-owned, public
-        surface_only=True,  # SURFACE hosting: the wrapper routes deny before any mutation (not executor)
+        surface_only=surface_only,  # SURFACE hosting: wrapper routes deny before mutation (not executor)
     )
     app = guard.app  # the composed FastAPI: durability lifecycle + state live HERE (not on the guard)
 

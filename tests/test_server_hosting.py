@@ -308,7 +308,11 @@ def test_m2_served_mm_session_factory_is_sync_fail_closed() -> None:
         server._served_mm_not_executor(object())
 
 
-# --- MAJOR 3: /readyz honestly reflects the AgentOS DB (no false session_db:true for ephemeral) ---
+# --- MAJOR 3 (Codex ADJUDICATED Option A): /readyz gates ONLY the durable Veridex dependencies of the
+#     surface-only served mode (Postgres + runtime-event/OPS spool + verified ReplayPack catalog). The
+#     ephemeral AgentOS in-memory store is DISCLOSED as NON-GATING information — never a false durability
+#     claim and never a 503 that would break the deploy healthcheck. This REVISES the honest-minimum M3
+#     approach (which made the AgentOS store gate readiness and 503 on Postgres). ---
 
 
 def _always(value: bool):
@@ -320,8 +324,24 @@ def _always(value: bool):
     return _probe
 
 
+#: The exact non-gating disclosure the served (surface-only, in-memory AgentOS) app must publish.
+_AGENTOS_INMEMORY_DISCLOSURE = {
+    "backend": "in_memory",
+    "durable": False,
+    "required_for_ready": False,
+    "mode": "surface_only",
+}
+
+#: The gating conjunction is EXACTLY the three durable Veridex deps — never the AgentOS store.
+_DURABLE_GATE_KEYS = {"postgres", "runtime_event_spool", "replay_pack_catalog"}
+
+
 async def test_m3_agentos_session_db_probe_reflects_true_durability() -> None:
-    """MAJOR 3 RED: the AgentOS session-DB probe is False for an ephemeral (in-memory) agno DB."""
+    """The AgentOS durability classifier is False for an ephemeral (in-memory) agno DB, True for durable.
+
+    Retained from the surface-only fix: this classifier feeds the non-gating disclosure AND the
+    fail-closed executor-mode gate (surface_only=False) — it is NOT part of the surface-only conjunction.
+    """
     from agno.db.in_memory import InMemoryDb
 
     from veridex.api.readiness import make_agentos_session_db_probe
@@ -335,34 +355,143 @@ async def test_m3_agentos_session_db_probe_reflects_true_durability() -> None:
     assert await make_agentos_session_db_probe(lambda: _DurableDb())() is True
 
 
-def test_m3_readyz_not_falsely_healthy_for_ephemeral_agentos_db() -> None:
-    """MAJOR 3 RED: with Postgres+packs up but an in-memory AgentOS DB, /readyz is NOT healthy.
-
-    Simulates a restart/empty-agno-DB: even when the other durable deps are up, an ephemeral AgentOS
-    session DB must make ``session_db`` False and ``/readyz`` 503 — never a false ``session_db: true``.
-    """
-    from agno.db.in_memory import InMemoryDb
+def _readyz(**kwargs):
+    """Build a standalone /readyz app from ``build_readiness_router(**kwargs)`` and GET it once."""
     from fastapi import FastAPI
 
-    router = build_readiness_router(
+    app = FastAPI()
+    app.include_router(build_readiness_router(**kwargs))
+    return TestClient(app).get("/readyz")
+
+
+def test_m3_red_a_readyz_ready_with_inmemory_agentos_when_durable_deps_up() -> None:
+    """RED (a): PG path + in-memory AgentOS (surface_only) + durable deps up -> /readyz 200 ready:true.
+
+    The ephemeral AgentOS store must NOT drag readiness to 503: the top-level conjunction is ONLY the
+    durable Veridex deps. This is the behavior the deploy healthcheck depends on (Postgres up == ready).
+    """
+    from agno.db.in_memory import InMemoryDb
+
+    resp = _readyz(
         postgres_probe=_always(True),
+        runtime_event_spool_probe=_always(True),
         pack_probe=_always(True),
         get_agentos_db=lambda: InMemoryDb(),
+        surface_only=True,
     )
-    app = FastAPI()
-    app.include_router(router)
-    resp = TestClient(app).get("/readyz")
-    assert resp.status_code == 503, resp.status_code
-    assert resp.json()["checks"]["session_db"] is False
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["ready"] is True
+    # gate is EXACTLY the three durable Veridex deps — the agentos store is not in the conjunction.
+    assert set(body["checks"]) == _DURABLE_GATE_KEYS
 
 
-def test_m3_served_app_wires_agentos_db_into_readiness() -> None:
-    """MAJOR 3 RED: the served app's /readyz reflects its (ephemeral) AgentOS DB, never falsely true."""
+def test_m3_red_b_agentos_session_store_is_nongating_disclosure() -> None:
+    """RED (b): /readyz carries the exact non-gating ``agentos_session_store`` disclosure block."""
+    from agno.db.in_memory import InMemoryDb
+
+    resp = _readyz(
+        postgres_probe=_always(True),
+        runtime_event_spool_probe=_always(True),
+        pack_probe=_always(True),
+        get_agentos_db=lambda: InMemoryDb(),
+        surface_only=True,
+    )
+    body = resp.json()
+    assert body["agentos_session_store"] == _AGENTOS_INMEMORY_DISCLOSURE
+    # It must NOT participate in the readiness conjunction (never a key in checks).
+    assert "agentos_session_store" not in body["checks"]
+    assert body["ready"] is True  # its in_memory status did not affect readiness
+
+
+def test_m3_red_c_durable_dep_down_still_503() -> None:
+    """RED (c): a durable Veridex dep DOWN still makes /readyz 503 (the gate still works for real deps)."""
+    from agno.db.in_memory import InMemoryDb
+
+    resp = _readyz(
+        postgres_probe=_always(False),  # a real durable dep is down
+        runtime_event_spool_probe=_always(True),
+        pack_probe=_always(True),
+        get_agentos_db=lambda: InMemoryDb(),
+        surface_only=True,
+    )
+    assert resp.status_code == 503, resp.text
+    body = resp.json()
+    assert body["ready"] is False
+    assert body["checks"]["postgres"] is False
+    # the disclosure is still present and honest even while not-ready for a real reason.
+    assert body["agentos_session_store"] == _AGENTOS_INMEMORY_DISCLOSURE
+
+
+def test_m3_red_d_startup_rejects_inmemory_agentos_when_not_surface_only() -> None:
+    """RED (d): surface_only=False + in-memory AgentOS DB -> the served STARTUP rejects (fail-closed).
+
+    The Option-A exception (ephemeral AgentOS store) may exist ONLY while the served app is surface-only.
+    If a future capability flip disables surface_only (executor mode / native run+session routes), startup
+    MUST reject an in-memory AgentOS DB until a durable backend is configured — proving the exception
+    cannot silently survive the capability change.
+    """
+    with pytest.raises(RuntimeError, match="durable"):
+        server.create_server_app(
+            env=_ENV, settings=_settings(), verifier=_fake_verifier, surface_only=False
+        )
+    # the deployed default (surface_only=True) still composes fine on the same in-memory path.
+    guard = server.create_server_app(env=_ENV, settings=_settings(), verifier=_fake_verifier)
+    assert isinstance(guard, svc.DenyByDefaultGuard)
+
+
+def test_m3_red_d_readiness_gates_agentos_when_not_surface_only() -> None:
+    """RED (d, readiness arm): with surface_only=False the AgentOS DB participates in the gate.
+
+    Belt-and-suspenders to the startup guard: a readiness router built in executor mode over an
+    ephemeral store drags /readyz to 503 (never a false ready:true), and the disclosure reports it as
+    required_for_ready in ``executor`` mode.
+    """
+    from agno.db.in_memory import InMemoryDb
+
+    resp = _readyz(
+        postgres_probe=_always(True),
+        runtime_event_spool_probe=_always(True),
+        pack_probe=_always(True),
+        get_agentos_db=lambda: InMemoryDb(),
+        surface_only=False,
+    )
+    assert resp.status_code == 503, resp.text
+    body = resp.json()
+    assert body["ready"] is False
+    assert body["checks"]["agentos_session_store"] is False  # now a GATING check
+    assert body["agentos_session_store"]["required_for_ready"] is True
+    assert body["agentos_session_store"]["mode"] == "executor"
+
+
+def test_m3_red_e_runtime_event_spool_gates_and_no_stale_session_db_key() -> None:
+    """RED (e): the renamed ``runtime_event_spool`` probe still gates; no consumer sees a stale key."""
+    from agno.db.in_memory import InMemoryDb
+
+    resp = _readyz(
+        postgres_probe=_always(True),
+        runtime_event_spool_probe=_always(False),  # the renamed durable spool probe is down
+        pack_probe=_always(True),
+        get_agentos_db=lambda: InMemoryDb(),
+        surface_only=True,
+    )
+    assert resp.status_code == 503, resp.text
+    body = resp.json()
+    assert body["checks"]["runtime_event_spool"] is False
+    assert "session_db" not in body["checks"]  # the misnomer is gone everywhere
+
+
+def test_m3_served_app_readyz_discloses_agentos_store() -> None:
+    """The served app's /readyz carries the non-gating ``agentos_session_store`` disclosure block.
+
+    The offline served path has no Postgres, so ready is False for the durable deps — but the agentos
+    store is disclosed honestly (in-memory, non-gating) rather than dragging the gate as a false claim.
+    """
     _guard, client = _served()
     body = client.get("/readyz").json()
-    # The served composition uses an in-memory AgentOS DB (durable agno DB is a tracked residual);
-    # /readyz must NOT advertise session_db durable for it.
-    assert body["checks"]["session_db"] is False
+    assert body["agentos_session_store"] == _AGENTOS_INMEMORY_DISCLOSURE
+    assert "agentos_session_store" not in body["checks"]
+    assert set(body["checks"]) == _DURABLE_GATE_KEYS
 
 
 # --- RED#4: AgentOS surface actually hosted (authenticated; NO fabricated run) ---
