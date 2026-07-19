@@ -61,8 +61,12 @@ export const PATHS = {
     competitionId ? `/leaderboard?competition_id=${competitionId}` : `/leaderboard`,
   inspector: (runId: string, seq: number | string) => `/runs/${runId}/actions/${seq}`,
   feedHealth: () => `/feed/health`,
-  // C2 catalog: agent runtime-events (OPS telemetry; ImplD-served orphaned route).
-  runtimeEvents: (agentId: string) => `/agents/${agentId}/runtime-events`,
+  // I-4 OWNER-SCOPED runtime-events (OPS telemetry). REPLACES the retired PUBLIC
+  // `/agents/{id}/runtime-events`: ownership is resolved server-side from the persisted instance
+  // (router.py get_instance_runtime_events). Cursor-polling: `since` is an EXCLUSIVE durable `id`
+  // cursor (0 ⇒ from the start); `limit` forward-pages the first N events after `since`.
+  instanceRuntimeEvents: (instanceId: string, since = 0, limit?: number) =>
+    `/agents/instances/${instanceId}/runtime-events?since=${since}` + (limit != null ? `&limit=${limit}` : ''),
   // MAKER lane: the sealed maker_arena_result.v1 envelope (quote-quality, toxicity-ranked).
   makerArenaResult: () => `/maker/arena-result`,
   // I-2 owner-scoped deployed instances. Bearer-authed GETs; the backend 401s anon
@@ -732,6 +736,33 @@ export async function getInstances(): Promise<DeployedInstance[]> {
   const res = await authedGet(PATHS.agentInstances());
   if (!res.ok) throw new ApiError(res.status, `GET ${PATHS.agentInstances()} failed: ${res.status}`);
   return ((await res.json()) as AgentInstanceWire[]).map(adaptAgentInstance);
+}
+
+// ---- Owner-scoped runtime-events (I-4 · F-6) ----
+//
+// One SERVED runtime event: the frozen wire RuntimeEvent (OPS-channel telemetry, SEC-003 — never
+// sealed/scored) PLUS its durable BIGSERIAL `id`, the exclusive read-cursor the poller advances.
+// The `agent_id` is already in the response body (wire RuntimeEvent), never re-derived here.
+export interface RuntimeEventRecord extends W.RuntimeEvent {
+  id: number;
+}
+
+// GET /agents/instances/{id}/runtime-events — the caller's OWN durable OPS telemetry for a deployed
+// instance (owner-scoped, bearer-authed; same seam as getInstances). `since` is the EXCLUSIVE durable
+// cursor (advance to max(id) across polls ⇒ no duplicates). A non-ok (401/403/404/5xx) THROWS so the
+// drawer can render an honest empty/error state — it NEVER silently falls back to a fixture (T-2).
+// No mock branch: runtime events have no frozen wire fixture; the drawer's demo path is gated at the
+// hook (isMockEnabled) so the LIVE reader stays a dumb, honest transport that only ever hits the API.
+export async function getRuntimeEvents(
+  instanceId: string,
+  since = 0,
+  limit?: number,
+): Promise<RuntimeEventRecord[]> {
+  const path = PATHS.instanceRuntimeEvents(instanceId, since, limit);
+  const res = await authedGet(path);
+  if (!res.ok) throw new ApiError(res.status, `GET ${path} failed: ${res.status}`);
+  const body = (await res.json()) as { events: RuntimeEventRecord[] };
+  return body.events;
 }
 
 // GET /agents/instances/{id} — ONE instance the caller owns. A 403 (owned by another) / 404 (absent

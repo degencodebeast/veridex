@@ -2,9 +2,8 @@
 import { useState, useEffect, useRef } from 'react';
 import { Badge } from '@/components/ui/Badge';
 import { SegmentedControl } from '@/components/ui/SegmentedControl';
-import { RUNTIME_OVERVIEW, RUNTIME_LOG } from '@/lib/fixtures/catalog';
 import { isCanonicalChannel } from '@/lib/catalog';
-import type { AgentOpsState } from './useAgentOps';
+import { useRuntimeEvents, type AgentOpsState } from './useAgentOps';
 import type { CanonicalLogLine, LogChannel, RuntimeOverview, RuntimeStatus } from '@/lib/catalog';
 import styles from './AgentOpsDrawer.module.css';
 
@@ -36,7 +35,7 @@ function OverviewTab({ o }: { o: RuntimeOverview }) {
   );
 }
 
-function LogsTab({ log }: { log: CanonicalLogLine[] }) {
+function LogsTab({ log, error }: { log: CanonicalLogLine[]; error: string | null }) {
   // SEC-003 / #1: default is CANONICAL — OPS runtime telemetry is hidden until the operator
   // explicitly opts into the All (telemetry) view. The filter reuses the b1 isCanonicalChannel seam.
   const [filter, setFilter] = useState<LogFilter>('canonical');
@@ -48,6 +47,11 @@ function LogsTab({ log }: { log: CanonicalLogLine[] }) {
         ariaLabel="Log filter" value={filter} onChange={setFilter}
         options={[{ value: 'canonical', label: 'Canonical only' }, { value: 'all', label: 'All' }]}
       />
+      {/* HONESTY (T-2): with no live events the drawer shows an honest empty/unavailable line —
+          NEVER a canned fixture. `error` distinguishes a failed owner-scoped read from "nothing yet". */}
+      {log.length === 0 && (
+        <p className={styles.empty}>{error ? 'Runtime telemetry unavailable.' : 'No runtime events yet.'}</p>
+      )}
       <div className={styles.log} data-testid="log">
         {visible.map((l, i) => (
           <div key={`${l.ts}-${l.channel}-${i}`} className={`${styles.line} ${l.channel === 'OPS' ? styles.ops : ''}`}>
@@ -66,11 +70,16 @@ function LogsTab({ log }: { log: CanonicalLogLine[] }) {
 }
 
 export function AgentOpsDrawer({
-  state, overviewByAgent = RUNTIME_OVERVIEW, log = RUNTIME_LOG,
+  state, overviewByAgent, log: logProp,
 }: { state: AgentOpsState; overviewByAgent?: Record<string, RuntimeOverview>; log?: CanonicalLogLine[] }) {
   const [tab, setTab] = useState<Tab>('overview');
   const panelRef = useRef<HTMLElement>(null);
   const { isOpen, close } = state;
+  // F-6: the LIVE data path. Resolves the owner's instances and cursor-polls durable runtime-events
+  // for the open agent (honest-empty/error, never a fixture). Callers MAY inject `overviewByAgent`/
+  // `log` to render controlled data (tests, or a future merged competition-event feed); those
+  // OVERRIDE the live hook. Fixtures are gone from the default path (T-2).
+  const live = useRuntimeEvents(state.agentId);
 
   // Modal semantics (WalletChip keydown pattern): focus into the dialog on open, Escape closes,
   // and focus is restored to the trigger on close. Listener is cleaned up to avoid leaks.
@@ -87,7 +96,8 @@ export function AgentOpsDrawer({
   }, [isOpen, close]);
 
   if (!state.isOpen || !state.agentId) return null;
-  const overview = overviewByAgent[state.agentId];
+  const overview = overviewByAgent ? overviewByAgent[state.agentId] : live.overview;
+  const log = logProp ?? live.log;
   const panelId = 'ops-panel';
   const activeTabId = tab === 'overview' ? 'ops-tab-overview' : 'ops-tab-logs';
 
@@ -113,8 +123,10 @@ export function AgentOpsDrawer({
         </div>
         <div className={styles.body} id={panelId} role="tabpanel" aria-labelledby={activeTabId}>
           {tab === 'overview'
-            ? (overview ? <OverviewTab o={overview} /> : <p className={styles.empty}>No runtime data for this agent.</p>)
-            : <LogsTab log={log} />}
+            ? (overview
+                ? <OverviewTab o={overview} />
+                : <p className={styles.empty}>{live.error ? 'Runtime telemetry unavailable.' : 'No runtime data for this agent.'}</p>)
+            : <LogsTab log={log} error={live.error} />}
         </div>
       </aside>
     </div>
