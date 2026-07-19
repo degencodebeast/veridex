@@ -98,8 +98,12 @@ def _install_pg_lifecycle(app: FastAPI, *, pool: Any, store: PostgresStore, time
     app.router.lifespan_context = _combined
 
 
-async def _served_mm_not_executor(_ctx: RunContext) -> Any:
+def _served_mm_not_executor(_ctx: RunContext) -> Any:
     """Fail-closed MM session factory for the served host adapter (SURFACE hosting; not the executor).
+
+    SYNC by contract: ``build_market_maker_driver`` calls the session factory synchronously
+    (``session_factory(ctx)``), so this MUST be a plain function — an ``async def`` would return an
+    un-awaited coroutine (a ``coroutine ... never awaited`` warning) instead of failing closed.
 
     The served AgentOS wrapper route is a HOSTED SURFACE, not the per-instance MM executor: a single
     build-time adapter cannot reconstruct an arbitrary instance from a ``RunContext`` (it carries no
@@ -108,7 +112,7 @@ async def _served_mm_not_executor(_ctx: RunContext) -> Any:
     authority-bound via the deploy path (``deploy.py``), which builds a fresh per-instance adapter and
     drives ``start_owned_instance_run`` with ``run_id == instance.run_id``. This fails CLOSED rather
     than fabricating a run — and it is never reached by any public path (every agno-native route is
-    denied by the guard; the wrapper route is owner-gated and unused by the deploy executor).
+    denied by the guard; the served wrapper route denies before driving via ``surface_only``).
     """
     raise RuntimeError(
         "served AgentOS hosted wrapper route is not the per-instance MM executor; per-instance runs "
@@ -234,21 +238,29 @@ def create_server_app(
         store = InMemoryStore()
         pool = None
 
-    # D-1 deployment READINESS probe (additive; distinct from I-5's /healthz liveness). Reads the live
-    # pool LAZILY at request time via a holder (the pool is attached to guard.app.state AFTER
-    # composition). Registered pre-snapshot as a base router so /readyz is veridex-owned/self-gated
-    # (it PASSES the guard, returning 200/503) rather than treated as agno-native and denied.
-    pool_holder: dict[str, Any] = {"pool": None}
-    readiness_router = build_readiness_router(
-        get_pool=lambda: pool_holder["pool"],
-        pack_root=resolved_env.get("REPLAY_PACK_ROOT", ""),
-    )
-
     # Compose AgentOS behind the deny-by-default guard. agno-touching imports are LOCAL (build_agentos_app
     # keeps the agno import lazy internally; the adapters are built via the local helper).
     from agno.db.in_memory import InMemoryDb  # noqa: PLC0415 (lazy: only on the real serving path)
 
     from veridex.runtime.agentos_service import build_agentos_app  # noqa: PLC0415
+
+    # The AgentOS owner/session DB. RESIDUAL (tracked): a DURABLE agno DB (agno's ``PostgresDb``)
+    # requires SQLAlchemy, which is NOT a project dependency (only ``agno`` + psycopg are), so even on
+    # the Postgres path this stays an in-memory agno DB. Rather than LIE about it, /readyz reflects it
+    # HONESTLY below (its ``session_db`` check reports not-ready for an ephemeral AgentOS DB) — the
+    # durable authority/OPS state lives in the Veridex Postgres store, not this surface-only agno DB.
+    owner_db = InMemoryDb()
+
+    # D-1 deployment READINESS probe (additive; distinct from I-5's /healthz liveness). Reads the live
+    # pool + the composed AgentOS DB LAZILY at request time (the pool is attached to guard.app.state
+    # AFTER composition). Registered pre-snapshot as a base router so /readyz is veridex-owned/self-gated
+    # (it PASSES the guard, returning 200/503) rather than treated as agno-native and denied.
+    pool_holder: dict[str, Any] = {"pool": None}
+    readiness_router = build_readiness_router(
+        get_pool=lambda: pool_holder["pool"],
+        pack_root=resolved_env.get("REPLAY_PACK_ROOT", ""),
+        get_agentos_db=lambda: owner_db,  # /readyz reflects the ACTUAL (ephemeral) AgentOS DB, honestly
+    )
 
     primary, extra_agents = _build_served_hosting_adapters()
     guard = build_agentos_app(
@@ -256,10 +268,11 @@ def create_server_app(
         settings=resolved_settings,
         adapter=primary,
         extra_agents=extra_agents,
-        owner_db=InMemoryDb(),
+        owner_db=owner_db,
         verifier=_resolve_verifier(verifier),
         enforce_contract=True,  # AC-29: fail-closed on any agno-native surface drift
         base_routers=[readiness_router],  # /readyz registered pre-snapshot -> veridex-owned, public
+        surface_only=True,  # SURFACE hosting: the wrapper routes deny before any mutation (not executor)
     )
     app = guard.app  # the composed FastAPI: durability lifecycle + state live HERE (not on the guard)
 

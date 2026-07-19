@@ -84,6 +84,15 @@ REQUIRED_AGNO_NATIVE_ROUTES: frozenset[tuple[str, str]] = frozenset(
 )
 
 
+#: The EXACT public routes a caller-supplied ``base_router`` is permitted to expose. A base router is
+#: captured in the veridex matcher snapshot and therefore BYPASSES the outer deny-by-default guard, so
+#: the composition constrains it to this HARDCODED allowlist (currently only the no-auth ``/readyz``
+#: readiness probe — it exposes no owner/instance/competition data) and FAILS STARTUP on any other
+#: method/path. Authority is established here in code, NEVER by a docstring warning or a caller-supplied
+#: allowlist / dependency introspection.
+_ALLOWED_PUBLIC_BASE_ROUTES: frozenset[tuple[str, str]] = frozenset({("GET", "/readyz")})
+
+
 class AgentOSCompositionError(RuntimeError):
     """Raised when the DEPLOYED AgentOS surface drifts from the reviewed policy (AC-29 — fail deploy).
 
@@ -157,6 +166,22 @@ def _route_table(app: FastAPI) -> list[tuple[str, str]]:
     """
     table: list[tuple[str, str]] = []
     for methods, path in _walk_routes(app.routes):
+        if methods is None:
+            table.append(("WEBSOCKET", path))
+        else:
+            for method in sorted(methods):
+                table.append((method, path))
+    return table
+
+
+def _router_route_table(router: APIRouter) -> list[tuple[str, str]]:
+    """Enumerate an ``APIRouter``'s contributed ``(METHOD, path_template)`` pairs (websocket => WEBSOCKET).
+
+    Used to validate a caller-supplied ``base_router`` against :data:`_ALLOWED_PUBLIC_BASE_ROUTES`
+    BEFORE it is included on the base app (so a non-allowlisted public route fails startup).
+    """
+    table: list[tuple[str, str]] = []
+    for methods, path in _walk_routes(router.routes):
         if methods is None:
             table.append(("WEBSOCKET", path))
         else:
@@ -411,8 +436,17 @@ def _register_wrapper_routes(
     adapter: VeridexAgentAdapter,
     require_principal: Callable[..., PrivyPrincipal],
     event_sink: RuntimeEventSink | None,
+    surface_only: bool = False,
 ) -> None:
-    """Register the owner-scoped run-start + cancel wrapper routes on ``app`` (BEFORE agno composition)."""
+    """Register the owner-scoped run-start + cancel wrapper routes on ``app`` (BEFORE agno composition).
+
+    When ``surface_only`` is ``True`` (the served host composition — see
+    :func:`~veridex.api.server.create_server_app`), the routes are still REGISTERED (so the AC-29
+    wrapper-route contract and native surface stay byte-identical) but they DENY the request BEFORE any
+    lease / ``runtime_handle`` mutation: this composition hosts the AgentOS SURFACE only and is NOT the
+    per-instance executor (the real per-instance run path stays authority-bound in ``deploy.py``). A
+    surface-only refusal therefore leaves ZERO durable footprint — never a partially-mutated instance.
+    """
 
     @app.post("/agents/instances/{instance_id}/runs", response_model=StartRunResponse)
     async def start_instance_run(
@@ -427,6 +461,17 @@ def _register_wrapper_routes(
         starter gets 409 and NEVER launches a second run. Delegates the lease/handle/adapter sequence
         to the SHARED :func:`start_owned_instance_run` service (II-5 req 1).
         """
+        if surface_only:
+            # SURFACE-ONLY served host: refuse BEFORE any store/lease/runtime_handle mutation. The
+            # served composition hosts the AgentOS surface but cannot execute a per-instance run
+            # (per-instance execution is authority-bound via deploy.py). Deny cleanly — no corruption.
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "served surface is not the per-instance executor; per-instance runs are "
+                    "authority-bound via the deploy path"
+                ),
+            )
         instance = await _load_owned_instance(store, instance_id, principal)
 
         # SERVER-pre-allocate the run identity — never caller-supplied.
@@ -463,6 +508,15 @@ def _register_wrapper_routes(
         Ownership resolves from server-owned state (the persisted instance + the lease's ``run_id``),
         never from caller-supplied identity. The adapter re-checks the owner before any kill effect.
         """
+        if surface_only:
+            # SURFACE-ONLY served host: refuse before any effect (see start_instance_run above).
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "served surface is not the per-instance executor; run cancellation is "
+                    "authority-bound via the deploy path"
+                ),
+            )
         instance = await _load_owned_instance(store, instance_id, principal)
         lease = await store.get_instance_lease(instance_id)
         if lease is None or lease.run_id != run_id:
@@ -568,6 +622,7 @@ def build_agentos_app(
     enforce_contract: bool = True,
     extra_agents: Sequence[VeridexAgentAdapter] | None = None,
     base_routers: Sequence[APIRouter] | None = None,
+    surface_only: bool = False,
 ) -> Any:
     """Compose the guarded AgentOS app: veridex routes + adapter(s) + deny-by-default boundary.
 
@@ -586,24 +641,31 @@ def build_agentos_app(
             behind the SAME deny-by-default boundary. Agno's agent routes are templated by
             ``{agent_id}``, so extra agents add NO new route templates — the AC-29 native surface is
             unchanged. Each is contract-checked. Defaults to ``None`` (byte-identical to before).
-        base_routers: ADDITIVE — extra ``APIRouter``s (e.g. the deploy ``/readyz`` readiness probe)
-            registered on the base app BEFORE the veridex matcher snapshot, so they are subtracted as
-            veridex-owned by the AC-29 contract (they add NO agno-native surface). Defaults to ``None``
-            (byte-identical to before).
+        base_routers: ADDITIVE — extra ``APIRouter``s (currently only the deploy ``/readyz`` readiness
+            probe) registered on the base app BEFORE the veridex matcher snapshot, so they are
+            subtracted as veridex-owned by the AC-29 contract (they add NO agno-native surface).
+            Defaults to ``None`` (byte-identical to before).
 
-            **SECURITY — a base router BYPASSES deny-by-default.** Because it is captured in the
-            veridex matcher snapshot, every route it declares PASSES the guard unauthenticated (the
-            guard treats veridex-owned routes as self-gated). A router passed here therefore MUST
-            either self-enforce auth via its own FastAPI ``Depends`` (like the owner-scoped wrapper
-            routes) OR be intentionally PUBLIC (like ``/readyz`` — a no-auth readiness probe exposing
-            no owner/instance/competition data). Do NOT pass a router carrying sensitive or
-            owner-scoped data without its own auth dependency — it would open an un-gated hole.
+            **SECURITY — a base router BYPASSES deny-by-default, so it is CONSTRAINED, not trusted.**
+            Because it is captured in the veridex matcher snapshot, every route it declares PASSES the
+            guard unauthenticated. This is therefore NOT a general extension hook: each route a base
+            router contributes MUST appear in the hardcoded :data:`_ALLOWED_PUBLIC_BASE_ROUTES`
+            allowlist (currently exactly the no-auth ``GET /readyz`` probe, which exposes no
+            owner/instance/competition data). A base router carrying ANY other method/path FAILS
+            STARTUP (raises :class:`AgentOSCompositionError`) — authority is enforced in code here, not
+            by dependency introspection or a caller-supplied allowlist.
+        surface_only: When ``True`` (the served host composition), the owner-scoped wrapper routes are
+            still registered (AC-29 wrapper contract + native surface unchanged) but DENY before any
+            lease / ``runtime_handle`` mutation — this composition hosts the AgentOS SURFACE only and
+            is NOT the per-instance executor (that stays authority-bound in ``deploy.py``). Defaults to
+            ``False`` (the wrapper genuinely drives the adapter — the test-harness / non-served path).
 
     Returns:
         The OUTERMOST :class:`DenyByDefaultGuard` ASGI app wrapping the composed FastAPI app.
 
     Raises:
-        AgentOSCompositionError: If the AC-29 contract fails (drifted agno surface).
+        AgentOSCompositionError: If a base router exposes a non-allowlisted route (fail-closed at
+            startup), or the AC-29 contract fails (drifted agno surface).
     """
     from agno.os import AgentOS
 
@@ -611,16 +673,33 @@ def build_agentos_app(
 
     # (1) veridex routes FIRST.
     veridex_app = create_app(store=store, settings=settings)
-    # (1a) additive base routers (e.g. the deploy /readyz probe) — on the base app BEFORE the snapshot
-    # so they are veridex-owned/self-gated (they PASS the guard), never treated as agno-native + denied.
+    # (1a) additive base routers (currently only the /readyz probe) — on the base app BEFORE the
+    # snapshot so they are veridex-owned/self-gated (they PASS the guard), never agno-native + denied.
+    # SECURITY: because such a route bypasses the guard, each one MUST be in the hardcoded public
+    # allowlist; anything else FAILS STARTUP (no unchecked auth bypass via a caller-supplied router).
     for router in base_routers or ():
+        for entry in _router_route_table(router):
+            if entry not in _ALLOWED_PUBLIC_BASE_ROUTES:
+                raise AgentOSCompositionError(
+                    "base_routers may expose ONLY the hardcoded public allowlist "
+                    f"{sorted(_ALLOWED_PUBLIC_BASE_ROUTES)}; got un-permitted route {entry}. A base "
+                    "router bypasses the deny-by-default guard, so the served surface is constrained "
+                    "to the allowlist (fail-closed at startup)."
+                )
         veridex_app.include_router(router)
     require_principal = make_require_principal(settings, verifier)
 
     # (2) owner-scoped wrapper routes on the base app (BEFORE composition). The wrapper drives the
-    # PRIMARY adapter only; directional contestants are hosted via agno-native routes + start_run.
+    # PRIMARY adapter only; directional contestants are hosted via agno-native routes + start_run. On
+    # the served surface-only host (surface_only=True) the routes are registered but deny before any
+    # mutation (the served composition is not the per-instance executor).
     _register_wrapper_routes(
-        veridex_app, store=store, adapter=adapter, require_principal=require_principal, event_sink=event_sink
+        veridex_app,
+        store=store,
+        adapter=adapter,
+        require_principal=require_principal,
+        event_sink=event_sink,
+        surface_only=surface_only,
     )
 
     # (3) snapshot the veridex surface (self-gated) BEFORE agno mutates the base app.

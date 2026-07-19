@@ -4,8 +4,11 @@
 deeper: the stack is only ready to serve real traffic once its three durable dependencies are up —
 
   * **Postgres** is reachable (``SELECT 1``),
-  * the **AgentOS session DB** is initialised — the durable OPS/runtime-events spool table exists
-    (i.e. ``init_db`` has run), so the Agent-Ops feed can persist,
+  * the **AgentOS session DB** is durable — the ``runtime_events`` OPS spool table exists
+    (i.e. ``init_db`` has run) so the Agent-Ops feed can persist, AND (when the served app wires it)
+    the composed AgentOS owner/session DB is itself durable (a non-in-memory agno DB). An ephemeral
+    (in-memory) AgentOS DB is process-local and empty after a restart, so ``session_db`` is reported
+    NOT-ready for it — ``/readyz`` never advertises a durable session DB it does not have,
   * the **ReplayPack catalog** is loaded — at least one well-formed pack is present under
     ``REPLAY_PACK_ROOT``, so the demo/backtest surfaces have data to replay.
 
@@ -38,6 +41,11 @@ ReadinessProbe = Callable[[], Awaitable[bool]]
 #: A supplier of the (possibly ``None``) psycopg connection pool — read lazily so the probe reflects
 #: the pool's live state at request time (it is opened in the app lifespan, after app construction).
 PoolSupplier = Callable[[], Any]
+
+#: A supplier of the (possibly ``None``) AgentOS owner/session DB object (an ``agno`` db). Read lazily
+#: so the probe reflects the DB actually composed into AgentOS — an in-memory agno DB is ephemeral
+#: (process-local, empty after restart) and must NOT be advertised as a durable session DB.
+AgentOsDbSupplier = Callable[[], Any]
 
 
 @dataclass(frozen=True)
@@ -147,6 +155,34 @@ def make_session_db_probe(get_pool: PoolSupplier) -> ReadinessProbe:
     return probe
 
 
+def make_agentos_session_db_probe(get_agentos_db: AgentOsDbSupplier) -> ReadinessProbe:
+    """Build a probe reflecting the ACTUAL AgentOS owner/session DB's durability (fail-closed honest).
+
+    Distinct from :func:`make_session_db_probe` (which checks the Veridex ``runtime_events`` OPS spool):
+    this inspects the ``agno`` DB actually composed into AgentOS. An in-memory AgentOS DB is
+    process-local and empty after a restart, so it is reported NOT-ready — ``/readyz`` must never
+    advertise ``session_db: true`` for an ephemeral AgentOS DB (the Major-3 honesty fix). A durable
+    (non-in-memory) agno DB is reported ready; ``None`` (unwired) is not-ready.
+
+    Args:
+        get_agentos_db: Supplier of the composed AgentOS db object (``None`` → not ready).
+
+    Returns:
+        An async probe returning ``True`` iff the AgentOS DB is a durable (non-in-memory) agno DB.
+    """
+
+    async def probe() -> bool:
+        db = get_agentos_db()
+        if db is None:
+            return False
+        from agno.db.in_memory import InMemoryDb  # lazy: only on the real serving path
+
+        # An in-memory AgentOS DB does not survive a restart -> NOT durably ready (fail-closed honest).
+        return not isinstance(db, InMemoryDb)
+
+    return probe
+
+
 def _catalog_has_loadable_pack(root: Path) -> bool:
     """Return ``True`` iff ``root`` holds at least one ReplayPack the replay RUNTIME can load.
 
@@ -221,6 +257,7 @@ def build_readiness_router(
     *,
     get_pool: PoolSupplier | None = None,
     pack_root: str | Path | None = None,
+    get_agentos_db: AgentOsDbSupplier | None = None,
     postgres_probe: ReadinessProbe | None = None,
     session_probe: ReadinessProbe | None = None,
     pack_probe: ReadinessProbe | None = None,
@@ -234,6 +271,10 @@ def build_readiness_router(
     Args:
         get_pool: Supplier of the psycopg pool for the real Postgres + session-DB probes.
         pack_root: Directory (``REPLAY_PACK_ROOT``) for the real pack-catalog probe.
+        get_agentos_db: Supplier of the composed AgentOS owner/session DB. When provided (the served
+            app), the ``session_db`` check requires BOTH the durable ``runtime_events`` OPS spool AND a
+            durable (non-in-memory) AgentOS DB — so ``/readyz`` never reports ``session_db: true`` for
+            an ephemeral AgentOS DB (Major-3 honesty). Ignored when ``session_probe`` is supplied.
         postgres_probe: Explicit Postgres probe override.
         session_probe: Explicit session-DB probe override.
         pack_probe: Explicit pack-catalog probe override.
@@ -243,7 +284,20 @@ def build_readiness_router(
     """
     supplier: PoolSupplier = get_pool if get_pool is not None else (lambda: None)
     postgres = postgres_probe or make_postgres_probe(supplier)
-    session_db = session_probe or make_session_db_probe(supplier)
+    if session_probe is not None:
+        session_db = session_probe
+    elif get_agentos_db is not None:
+        # Honest served-app check: durable ONLY if the runtime_events OPS spool is provisioned AND the
+        # composed AgentOS DB is durable (non-in-memory). An ephemeral agno DB -> session_db False.
+        spool_probe = make_session_db_probe(supplier)
+        agentos_probe = make_agentos_session_db_probe(get_agentos_db)
+
+        async def _combined_session_db() -> bool:
+            return await spool_probe() and await agentos_probe()
+
+        session_db = _combined_session_db
+    else:
+        session_db = make_session_db_probe(supplier)
     packs = pack_probe or make_replay_pack_probe(pack_root or "")
 
     router = APIRouter()
