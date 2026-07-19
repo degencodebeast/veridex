@@ -52,7 +52,8 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-from typing import TYPE_CHECKING, Any, Protocol
+from collections.abc import Awaitable, Callable
+from typing import TYPE_CHECKING, Any, NoReturn, Protocol
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 
@@ -64,6 +65,24 @@ if TYPE_CHECKING:  # keep the runtime import surface minimal (store reaches psyc
 # Per-client queue capacity. A client that fails to keep up fills this and then has further
 # events dropped — bounded memory per connection, never backpressure onto the producer.
 _CLIENT_QUEUE_MAXSIZE = 1000
+
+
+class _ArenaChildTerminated(Exception):
+    """Private TaskGroup signal that a terminal arena child finished."""
+
+
+async def _signal_child_termination(
+    child_factory: Callable[[], Awaitable[None]],
+    errors: list[Exception],
+) -> NoReturn:
+    """Run one arena child and convert its completion into a TaskGroup wake-up."""
+    try:
+        await child_factory()
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        errors.append(exc)
+    raise _ArenaChildTerminated
 
 
 class _SupportsSendJson(Protocol):
@@ -232,60 +251,57 @@ async def _run_arena(
     # Register FIRST so any event broadcast during replay lands in the queue (gapless seam).
     queue = manager.connect(competition_id)
     overflow_signal = manager._overflow_signal(queue)
-    forwarder: asyncio.Task[None] | None = None
-    overflow_closer = asyncio.create_task(_close_on_overflow(websocket, overflow_signal))
-    owner = asyncio.current_task()
-    assert owner is not None
-
-    def wake_owner(_completed: asyncio.Future[None]) -> None:
-        if not owner.done():
-            owner.cancel()
-
-    overflow_closer.add_done_callback(wake_owner)
+    child_errors: list[Exception] = []
+    body_errors: list[Exception] = []
     try:
-        # 1. Replay the persisted tail (strict seq > since_seq), tracking the boundary.
-        replayed = await store.list_competition_events(competition_id, since_seq=since_seq)
-        last_sent_seq = since_seq
-        for event in replayed:
-            await websocket.send_json(event.model_dump(mode="json"))
-            last_sent_seq = event.seq
-
-        # 2. Hand off to the live drain (queue → socket, seq-deduped against replay).
-        forwarder = asyncio.create_task(_forward_live(websocket, queue, last_sent_seq))
-        forwarder.add_done_callback(wake_owner)
-
-        # 3. Read-only liveness loop: consume inbound frames purely to detect disconnect.
-        #    Inbound client data is intentionally ignored — it can never mutate state (REQ-213).
-        #    The overflow closer runs independently so it can close a socket even while its live
-        #    forwarder is blocked in send_json.
-        while True:
-            message = await websocket.receive()
-            if message["type"] == "websocket.disconnect":
-                break
-    except asyncio.CancelledError:
-        # A terminal child wakes the receive supervisor by cancellation. Preserve true external
-        # cancellation when neither child completed, and surface unexpected child exceptions.
-        completed = [task for task in (forwarder, overflow_closer) if task is not None and task.done()]
-        if not completed:
-            raise
-        for task in completed:
-            await task
-    except (WebSocketDisconnect, RuntimeError):
-        pass  # client vanished mid-send — fall through to cleanup
-    finally:
-        # Cancel and join every child task so blocked send/receive operations cannot leak.
         try:
-            tasks = [task for task in (forwarder, overflow_closer) if task is not None]
-            for task in tasks:
-                task.remove_done_callback(wake_owner)
-            for task in tasks:
-                if not task.done():
-                    task.cancel()
-            for task in tasks:
-                with contextlib.suppress(asyncio.CancelledError):
-                    await task
-        finally:
-            manager.disconnect(competition_id, queue)
+            async with asyncio.TaskGroup() as group:
+                overflow_closer = group.create_task(
+                    _signal_child_termination(
+                        lambda: _close_on_overflow(websocket, overflow_signal),
+                        child_errors,
+                    )
+                )
+                forwarder: asyncio.Task[NoReturn] | None = None
+                try:
+                    # 1. Replay the persisted tail (strict seq > since_seq), tracking the boundary.
+                    replayed = await store.list_competition_events(competition_id, since_seq=since_seq)
+                    last_sent_seq = since_seq
+                    for event in replayed:
+                        await websocket.send_json(event.model_dump(mode="json"))
+                        last_sent_seq = event.seq
+
+                    # 2. Hand off to the live drain (queue → socket, seq-deduped against replay).
+                    forwarder = group.create_task(
+                        _signal_child_termination(
+                            lambda: _forward_live(websocket, queue, last_sent_seq),
+                            child_errors,
+                        )
+                    )
+
+                    # 3. Keep receive in the route task while TaskGroup supervises terminal peers.
+                    #    Inbound data is ignored — it can never mutate state (REQ-213).
+                    while True:
+                        message = await websocket.receive()
+                        if message["type"] == "websocket.disconnect":
+                            break
+                except (WebSocketDisconnect, RuntimeError):
+                    pass  # client vanished mid-send — fall through to cleanup
+                except Exception as exc:
+                    body_errors.append(exc)
+                finally:
+                    overflow_closer.cancel()
+                    if forwarder is not None:
+                        forwarder.cancel()
+        except* _ArenaChildTerminated:
+            pass
+
+        if body_errors:
+            raise body_errors[0]
+        if child_errors:
+            raise child_errors[0]
+    finally:
+        manager.disconnect(competition_id, queue)
 
 
 def register_arena_routes(app: FastAPI, *, store: Store, manager: ArenaConnectionManager) -> None:

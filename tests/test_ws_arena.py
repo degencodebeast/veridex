@@ -509,6 +509,7 @@ async def test_external_cancel_propagates_after_terminal_child_wakes_blocked_rec
     manager = ArenaConnectionManager()
     cid = "c_child_external_cancel_race"
     ws = _GatedReceiveRaisingWebSocket()
+    preexisting_tasks = asyncio.all_tasks()
     route = asyncio.create_task(_run_arena(ws, store=store, manager=manager, competition_id=cid, since_seq=0))
     children: set[asyncio.Task] = set()
     propagated_cancel = False
@@ -517,12 +518,7 @@ async def test_external_cancel_propagates_after_terminal_child_wakes_blocked_rec
         await _wait_until(lambda: cid in manager._clients)
 
         def arena_children() -> set[asyncio.Task]:
-            return {
-                task
-                for task in asyncio.all_tasks()
-                if task is not route
-                and getattr(task.get_coro(), "__name__", "") in {"_close_on_overflow", "_forward_live"}
-            }
+            return asyncio.all_tasks() - preexisting_tasks - {route}
 
         await _wait_until(lambda: len(arena_children()) == 2)
         children = arena_children()
