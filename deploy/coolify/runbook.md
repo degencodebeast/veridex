@@ -189,7 +189,38 @@ Rules:
 3. `wal-spool` and `replay-capture` are durability surfaces — never
    mount them `tmpfs`, never bind them to ephemeral paths.
 
-## 11. Negative scope (what D-0 does NOT do)
+## 11. Post-deploy smoke verification (III-1)
+
+`scripts/smoke_public.sh` is the operator-run acceptance instrument for a
+LIVE deploy (or a local boot). It is read-only except for one idempotent,
+unauthenticated write (`POST /demo/run`, an offline deterministic demo
+competition) and never reads or prints a bearer token.
+
+```bash
+BASE_URL=https://api.veridex.example ./scripts/smoke_public.sh
+```
+
+Checks liveness (`/healthz`), readiness (`/readyz`, durable Postgres + OPS
+spool + ReplayPack catalog), the deploy-auth fail-closed boundary (an
+unauthenticated control-plane write must be 401), and that a replay-mode
+run is reachable with no operator help (the judge cold-hit path).
+
+**AC-13 restart-durability** (I-4/AC-13 — the WAL-spool → Postgres path
+keeping the durable run store intact across a restart) is a separate
+BINARY GATE, run explicitly around a restart:
+
+```bash
+./scripts/smoke_public.sh --ac13-pre     # records a run_id
+# now restart the api-runtime service in Coolify (or `docker compose restart api-runtime`)
+./scripts/smoke_public.sh --ac13-post    # re-queries the SAME run_id; MET or UNMET
+```
+
+`AC13 UNMET` means the durable run was lost across the restart — check
+that `DATABASE_URL` (not an in-memory fallback) and the `wal-spool`
+volume (§2) are actually wired on the deployed service, not just present
+in this runbook. See the script header for the exact routes and rationale.
+
+## 12. Negative scope (what D-0 does NOT do)
 
 - NO `Dockerfile.api` — I-5-owned; D-1 wires it (graph: D-0 + I-5 → D-1 → II-11).
 - NO env values, no `:?` guards, no healthchecks, no db-init — D-1.
