@@ -36,6 +36,7 @@ from veridex.competition.models import (
     ReplayBinding,
 )
 from veridex.deploy.preflight import DeployConfig
+from veridex.ingest.backfill import build_pack_from_fixture
 from veridex.ingest.replay_catalog import (
     ReplayResolutionError,
     ResolvedReplaySource,
@@ -582,3 +583,67 @@ def test_fold_m3_toctou_swap_between_parse_and_hash_fails_closed(
     with pytest.raises(ReplayResolutionError) as exc:
         load_resolved_marketstates(catalog, resolved)
     assert exc.value.reason == "content_hash_drift"
+
+
+def _backfilled_pack(out_dir: Path, fixture_id: int, n: int = 5) -> None:
+    """Build a BACKFILLED/legged pack (records leg = JSONL, odds_updates leg = a single JSON ARRAY).
+
+    Uses the real backfill converter over ``n`` genuine seed records, so the pack carries the exact
+    ``updates_<fid>.json`` array shape that R-0b live-capture promotion produces.
+    """
+    seed = [json.loads(line) for line in (SEED / f"odds_{fixture_id}.jsonl").read_text().splitlines() if line]
+    build_pack_from_fixture(fixture_id, seed[:n], [], out_dir)
+
+
+def test_fold_backfilled_array_leg_pack_loads_bound(tmp_path: Path) -> None:
+    # REGRESSION (new Major from the M2/M3 fix): a backfilled pack's ``odds_updates`` leg is a SINGLE
+    # JSON array (json.dumps(list)), not JSONL-of-dicts. The M2 raw guard line-parsed every leg and hit
+    # ``AttributeError: 'list' object has no attribute 'get'`` — uncaught, escaping both excepts -> 500.
+    # A well-formed backfilled pack (the R-0b promotion target class) MUST load, not crash.
+    out_dir = tmp_path / "packs" / "bf"
+    _backfilled_pack(out_dir, SEED_MIN_FIXTURE)
+
+    # Sanity: the legacy loader already returns the states (this is what the bound loader must match).
+    assert len(load_pack_marketstates(out_dir, SEED_MIN_FIXTURE, verify=True)) == 5
+
+    catalog = build_catalog(str(out_dir.parent))
+    entry = catalog.snapshot()["bf"]
+    resolved = ResolvedReplaySource(
+        pack_id="bf", fixture_id=SEED_MIN_FIXTURE, content_hash=entry.content_hash, provenance="", is_genuine=False
+    )
+    states = load_resolved_marketstates(catalog, resolved)  # crashes AttributeError -> 500 on c879399
+    assert len(states) == 5
+    assert all(ms.fixture_id == SEED_MIN_FIXTURE for ms in states)
+
+
+def test_fold_backfilled_array_leg_fixture_swap_still_fails_closed(tmp_path: Path) -> None:
+    # M2 PRESERVED on the array path: relabel one element of the ``odds_updates`` ARRAY leg to a foreign
+    # fixture and re-hash the manifest (self-consistent). The bound load must still fail closed
+    # (fixture_mapping_mismatch) — the array shape must not become an M2 blind spot.
+    out_dir = tmp_path / "packs" / "bf"
+    _backfilled_pack(out_dir, SEED_MIN_FIXTURE)
+
+    manifest = json.loads((out_dir / "pack.json").read_text())
+    leg_entry = next(f for f in manifest["fixtures"] if int(f["fixture_id"]) == SEED_MIN_FIXTURE)
+    updates_path = out_dir / leg_entry["odds_updates"]
+    array_leg = json.loads(updates_path.read_text())
+    array_leg[0]["FixtureId"] = 999999  # a foreign element inside the ARRAY-shaped leg
+    updates_path.write_text(json.dumps(array_leg))
+    # Re-hash so the pack stays self-consistent (admission + the byte-level content_hash check pass).
+    manifest["content_hash"] = _compute_content_hash(
+        out_dir,
+        manifest["fixtures"],
+        pack_version=int(manifest.get("pack_version", 1)),
+        capture=manifest.get("capture", {}),
+    )
+    (out_dir / "pack.json").write_text(json.dumps(manifest))
+    assert verify_content_hash(out_dir)
+
+    catalog = build_catalog(str(out_dir.parent))
+    entry = catalog.snapshot()["bf"]
+    resolved = ResolvedReplaySource(
+        pack_id="bf", fixture_id=SEED_MIN_FIXTURE, content_hash=entry.content_hash, provenance="", is_genuine=False
+    )
+    with pytest.raises(ReplayResolutionError) as exc:
+        load_resolved_marketstates(catalog, resolved)
+    assert exc.value.reason == "fixture_mapping_mismatch"

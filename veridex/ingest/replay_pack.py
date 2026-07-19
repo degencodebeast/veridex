@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections.abc import Iterator
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -302,6 +303,34 @@ class PackIntegrityError(ValueError):
         self.reason = reason
 
 
+def _iter_leg_records(raw: bytes) -> Iterator[dict[str, Any]]:
+    """Yield the dict records of a pack leg, handling BOTH on-disk leg shapes.
+
+    A leg is written either as NEWLINE-DELIMITED dicts (the ``records`` leg — one JSON object per line,
+    :func:`pack_from_session`) or as a SINGLE JSON ARRAY of dicts (the backfill ``odds_updates`` leg —
+    ``updates_<fid>.json`` is ``json.dumps(list)``; see :func:`~veridex.ingest.backfill.build_pack_from_fixture`).
+    Whole-file parse first: a JSON array yields its dict elements, a lone JSON object yields itself;
+    anything else (multi-line JSONL, which is not a single JSON value) falls back to per-line parsing.
+    Non-dict elements/lines are skipped — they carry no ``FixtureId`` to bind against.
+    """
+    text = raw.decode("utf-8")
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        for line in text.splitlines():
+            if line.strip():
+                record = json.loads(line)
+                if isinstance(record, dict):
+                    yield record
+        return
+    if isinstance(parsed, list):
+        for element in parsed:
+            if isinstance(element, dict):
+                yield element
+    elif isinstance(parsed, dict):
+        yield parsed
+
+
 def load_pack_fixture_states_bound(
     pack_dir: Path,
     fixture_id: int,
@@ -373,23 +402,22 @@ def load_pack_fixture_states_bound(
     # RAW mapping guard across ALL referenced legs: the fixture->file mapping is unhashed, so a hash-valid
     # id/file swap points the frozen fixture at another fixture's file. Every raw record that carries a
     # ``FixtureId`` must be the frozen fixture's — fail closed on the first foreign record (parsed from the
-    # SAME in-memory snapshot that was hashed).
+    # SAME in-memory snapshot that was hashed). Legs are read shape-agnostically (:func:`_iter_leg_records`)
+    # so a JSON-ARRAY leg (backfill ``odds_updates``) is checked element-wise, never mis-parsed as JSONL.
     for leg in ("records", "odds_updates", "venue_quotes"):
         name = entry.get(leg)
         if name is None:
             continue
-        for line in file_bytes[name].decode("utf-8").splitlines():
-            if not line:
-                continue
-            raw_fid = json.loads(line).get("FixtureId")
+        for record in _iter_leg_records(file_bytes[name]):
+            raw_fid = record.get("FixtureId")
             if raw_fid is not None and int(raw_fid) != fixture_id:
                 raise PackIntegrityError(
-                    f"pack at {pack_dir} maps fixture_id {fixture_id} onto a file whose records carry "
+                    f"pack at {pack_dir} maps fixture_id {fixture_id} onto a leg whose records carry "
                     f"FixtureId {int(raw_fid)} — a hash-valid fixture<->file swap",
                     reason="fixture_mapping_mismatch",
                 )
 
-    records = [json.loads(line) for line in file_bytes[entry["records"]].decode("utf-8").splitlines() if line]
+    records = list(_iter_leg_records(file_bytes[entry["records"]]))
     states = list(marketstates_from_record_stream(records, batch_size=batch_size))
 
     # NORMALIZED mapping guard: every emitted snapshot is exactly what the run replays and seals, so each
