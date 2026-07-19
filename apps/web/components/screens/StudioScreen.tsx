@@ -141,7 +141,16 @@ function Section({ n, title, inactive, children }: { n: string; title: string; i
 export function StudioScreen({
   onPin = () => {},
   running = false,
-}: { onPin?: (result: DeployAgentResult) => void; running?: boolean }) {
+  deployGate = (deployButton) => deployButton,
+}: {
+  onPin?: (result: DeployAgentResult) => void;
+  running?: boolean;
+  // Render seam for the owner-scoped DEPLOY affordance (auth-contract@1). The page injects the auth
+  // gate here (wrap the button with <AuthGate>, or replace it with a fail-closed prompt when Privy is
+  // unconfigured) so an unauthenticated operator can still configure a draft but cannot deploy. Default
+  // is identity — the authenticated path — so component tests exercise the deploy button directly.
+  deployGate?: (deployButton: ReactNode) => ReactNode;
+}) {
   const [archetype, setArchetype] = useState<Archetype>('value_clv');
   const [mode, setMode] = useState<StudioMode>('numeric');
   const [exec, setExec] = useState<ExecutionMode>('paper');
@@ -469,9 +478,15 @@ export function StudioScreen({
             {running ? (
               <p className={styles.roBanner} data-testid="run-readonly">Config is read-only during a scored run (SEC-006). Edits create a new version, never a live mutation.</p>
             ) : (
-              <button type="button" className={styles.pin} onClick={pin} disabled={deploying}>
-                {deploying ? 'DEPLOYING…' : 'PIN CONFIG & QUEUE RUN →'}
-              </button>
+              // The deploy affordance is auth-gated by the page via deployGate: an unauthenticated
+              // operator sees the login gate (or a fail-closed prompt) in place of this button, so a
+              // bearer-less owner-scoped POST is structurally impossible (the button is absent, not
+              // merely disabled). Default deployGate is identity (authenticated path).
+              deployGate(
+                <button type="button" className={styles.pin} onClick={pin} disabled={deploying}>
+                  {deploying ? 'DEPLOYING…' : 'PIN CONFIG & QUEUE RUN →'}
+                </button>,
+              )
             )}
             {/* Honest pin affordance — NOT a fabricated hash (law_hash / Create-wizard ruling).
                 Real evidence/score/manifest hashes appear on the Proof Card after the sealed run.

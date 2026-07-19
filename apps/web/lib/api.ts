@@ -602,9 +602,19 @@ export async function deployAgent(
     idempotencyKey ? { 'Idempotency-Key': idempotencyKey } : undefined,
   );
   if (res.status === 422) {
-    const body = (await res.json().catch(() => ({}))) as { detail?: { failed_checks?: string[]; checks?: DeployPreflightVerdict[] } };
-    const detail = body.detail ?? {};
-    throw new DeployPreflightError(detail.failed_checks ?? [], detail.checks ?? []);
+    const body = (await res.json().catch(() => ({}))) as { detail?: unknown };
+    // The preflight 422 detail is a {failed_checks, checks} OBJECT. But a bare FastAPI request-
+    // validation 422 returns `detail` as an ARRAY, and a malformed body may omit it — in those cases
+    // there are no named checks. Never surface an EMPTY failed-checks list: the UI suppresses both the
+    // success badge (gated `!preflightFailure`) AND the alert (gated `.length > 0`), so an empty list
+    // renders NOTHING (silence). Fall back to a named `preflight_failed` so a 422 is always visible.
+    const detail = (body.detail && typeof body.detail === 'object' && !Array.isArray(body.detail))
+      ? (body.detail as { failed_checks?: string[]; checks?: DeployPreflightVerdict[] })
+      : {};
+    const failed = detail.failed_checks && detail.failed_checks.length > 0
+      ? detail.failed_checks
+      : ['preflight_failed'];
+    throw new DeployPreflightError(failed, detail.checks ?? []);
   }
   if (!res.ok) throw new ApiError(res.status, `POST /agents/deploy failed: ${res.status}`);
   return (await res.json()) as DeployAgentResult;

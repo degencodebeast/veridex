@@ -522,6 +522,31 @@ describe('StudioScreen (REQ-018 / AC-007 / SEC-006/007/009)', () => {
       // …and no "Config pinned ✓" success affordance is shown (nothing was created server-side).
       expect(screen.queryByTestId('config-pinned')).toBeNull();
     });
+
+    // ── Codex remediation · Item 2: a malformed/empty 422 must show an HONEST failure, not silence ──
+    // api.ts mapped a 422 lacking detail.failed_checks (incl. a FastAPI request-validation 422 whose
+    // `detail` is an ARRAY, not the preflight object) to an EMPTY failed-checks list. An empty list
+    // suppressed BOTH the success badge (gated `!preflightFailure`) AND the failure alert (gated
+    // `.length > 0`) → the operator saw NOTHING. A 422 must always render a visible, named failure.
+    it('renders a visible failure alert on a malformed/validation 422 (never silent)', async () => {
+      const user = userEvent.setup();
+      // A FastAPI request-validation 422: `detail` is an ARRAY, not the {failed_checks, checks} object.
+      vi.stubGlobal('fetch', vi.fn(async () => ({
+        ok: false,
+        status: 422,
+        json: async () => ({ detail: [{ loc: ['body', 'fixture_id'], msg: 'field required', type: 'value_error' }] }),
+      } as unknown as Response)));
+      render(<StudioScreen />);
+
+      await user.click(screen.getByRole('button', { name: /pin config & queue run/i }));
+
+      // A named fallback failure is surfaced (never silence)…
+      const err = await screen.findByTestId('deploy-preflight-error');
+      expect(err.textContent).toBeTruthy();
+      // …and no false success badge accompanies a failed deploy.
+      expect(screen.queryByTestId('config-pinned')).toBeNull();
+      expect(screen.queryByTestId('deploy-run-id')).toBeNull();
+    });
   });
 
   // ── PREFLIGHT PREVIEW — codex option 3 (TEETH) ─────────────────────────────
