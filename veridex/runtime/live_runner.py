@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import time
 from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
@@ -39,6 +40,7 @@ from veridex.checks.build import (
     build_performance_metrics,
     check_results_to_proof_block,
 )
+from veridex.ingest.feed_health import LiveFeedStatus
 from veridex.ingest.marketstate import MarketState
 from veridex.ingest.txline_client import reconstruct_closing
 from veridex.ingest.txline_normalize import market_key, marketstate_from_txline_odds
@@ -233,6 +235,8 @@ async def run_live_window(
     anchor_fn: Callable[[str], Awaitable[str]] | None = None,
     stop_event: asyncio.Event | None = None,
     run_id: str | None = None,
+    feed_status: LiveFeedStatus | None = None,
+    clock: Callable[[], int] | None = None,
 ) -> LiveRunResult:
     """Drive one windowed LIVE run: stream → feed (real time) → seal close → finalize → proof.
 
@@ -255,6 +259,13 @@ async def run_live_window(
             IDLE stream (no line moves) rather than blocking until the next tick.
         run_id: Optional pre-known run id (T21 deploy) so a launcher can return the run id BEFORE the
             window seals; ``None`` → a fresh id is minted at construction (the arena default).
+        feed_status: Optional observable :class:`~veridex.ingest.feed_health.LiveFeedStatus` (III-3).
+            When given, the runner records the last-seen wall time of each fed odds RECORD into it and
+            marks connect/disconnect around the stream, so ``/feed/health`` derives its honest feed
+            state from THIS active stream (not credential presence). Read-only telemetry — it is
+            never scored, never in the sealed evidence.
+        clock: Injectable ``() -> int`` wall-seconds source for the ``feed_status`` last-seen stamps
+            (test seam); ``None`` → ``int(time.time())``. Only consulted when ``feed_status`` is set.
 
     Returns:
         A :class:`LiveRunResult` bundle (the sealed run + the after-seal proof composition + ops).
@@ -285,6 +296,11 @@ async def run_live_window(
     stream_interrupted: BaseException | None = None
     # A stop_event only governs the manual_stop end rule; ``None`` elsewhere disables the race path.
     stop = stop_event if window.end_rule == "manual_stop" else None
+    # III-3 last-seen hook: stamp fed odds records into the observable feed status (wall time), so
+    # /feed/health derives its honest state from THIS active stream. No-op when feed_status is None.
+    _now: Callable[[], int] = clock if clock is not None else (lambda: int(time.time()))
+    if feed_status is not None:
+        feed_status.mark_connected()
 
     async with _aclosing_if_possible(stream) as guarded_stream:
         try:
@@ -332,6 +348,8 @@ async def run_live_window(
                 filtered = _filter_markets(tick, window.market_allowlist)
                 await run.feed(filtered)
                 fed_any = True
+                if feed_status is not None:
+                    feed_status.record_odds_record(_now(), fixture_id=filtered.fixture_id)
                 if started_ts is None:
                     started_ts = filtered.ts
                 last_tick_seq = filtered.tick_seq
@@ -343,6 +361,11 @@ async def run_live_window(
             if not fed_any:
                 raise
             stream_interrupted = exc
+
+    # The stream context has exited (exhausted, stopped, or interrupted-after-≥1-tick): the live
+    # socket is no longer open, so honestly mark the feed disconnected for /feed/health.
+    if feed_status is not None:
+        feed_status.mark_disconnected()
 
     ops: dict[str, Any] = {}
     effective_window = window

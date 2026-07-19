@@ -44,6 +44,10 @@ class FeedState(str, enum.Enum):
     LIVE = "live"
     HEARTBEAT_ONLY = "heartbeat_only"
     STALE = "stale"
+    #: The active ingestion is a RECORDED REPLAY, not a live connection (III-3 honesty surface).
+    #: A replay is NEVER labelled live/heartbeat/stale/disconnected — those describe a live socket;
+    #: a replay is its own state so the ``/feed/health`` panel can never dress a replay up as live.
+    RECORDED_REPLAY = "recorded_replay"
 
 
 def derive_feed_state(
@@ -84,6 +88,160 @@ def derive_feed_state(
     if heartbeats_seen > 0:
         return FeedState.HEARTBEAT_ONLY
     return FeedState.CONNECTING
+
+
+def derive_live_feed_state(
+    *,
+    source_mode: str,
+    connected: bool,
+    connecting: bool,
+    last_odds_ts: int | None,
+    last_heartbeat_ts: int | None,
+    now_ts: int,
+    stale_after_s: int = DEFAULT_STALE_AFTER_S,
+) -> FeedState:
+    """Derive the honest III-3 feed state from the ACTIVE stream's PER-CHANNEL last-seen (pure).
+
+    This is the endpoint's derivation (as opposed to :func:`derive_feed_state`, which the offline
+    capture chain uses with ``now_ts == last_frame_ts``). The difference that matters: here ``now``
+    advances INDEPENDENTLY of the frames, so LIVE-vs-HEARTBEAT_ONLY is decided by the RECENCY of
+    each channel — not by cumulative counts. A feed whose odds records went stale while its
+    heartbeat stays fresh is honestly ``HEARTBEAT_ONLY`` (liveness proven, no market data), never a
+    stale ``LIVE``.
+
+    Precedence:
+
+    * ``replay`` mode is ALWAYS :attr:`FeedState.RECORDED_REPLAY` — a recorded replay is never a
+      live connection, whatever the last-seen values are (the core honesty invariant).
+    * not connected → :attr:`FeedState.CONNECTING` if a connect is in flight, else
+      :attr:`FeedState.DISCONNECTED`.
+    * a FRESH odds record (within the budget) → :attr:`FeedState.LIVE`.
+    * else a FRESH heartbeat (within the budget) → :attr:`FeedState.HEARTBEAT_ONLY`.
+    * else, having seen a frame that is now beyond the budget → :attr:`FeedState.STALE`.
+    * else (connected, no frame yet) → :attr:`FeedState.CONNECTING`.
+
+    Args:
+        source_mode: ``"live"`` or ``"replay"``. ``"replay"`` short-circuits to RECORDED_REPLAY.
+        connected: Whether the live stream is currently connected.
+        connecting: Whether a connection is being established (only consulted when not connected).
+        last_odds_ts: Unix seconds of the last odds RECORD, or ``None``.
+        last_heartbeat_ts: Unix seconds of the last HEARTBEAT, or ``None``.
+        now_ts: Current Unix seconds (the recency reference).
+        stale_after_s: Freshness budget in seconds.
+
+    Returns:
+        The single honest :class:`FeedState` for this observation.
+    """
+    if source_mode == "replay":
+        return FeedState.RECORDED_REPLAY
+    if not connected:
+        return FeedState.CONNECTING if connecting else FeedState.DISCONNECTED
+
+    def _fresh(ts: int | None) -> bool:
+        return ts is not None and (now_ts - ts) <= stale_after_s
+
+    if _fresh(last_odds_ts):
+        return FeedState.LIVE
+    if _fresh(last_heartbeat_ts):
+        return FeedState.HEARTBEAT_ONLY
+    if last_odds_ts is not None or last_heartbeat_ts is not None:
+        return FeedState.STALE  # saw a frame, but it is now beyond the budget
+    return FeedState.CONNECTING  # connected, nothing received yet
+
+
+class LiveFeedStatus:
+    """Observable last-seen state of the ACTIVE stream — the place the live runner records into and
+    the ``/feed/health`` endpoint reads from (III-3).
+
+    Read-only OPERATIONAL TELEMETRY (same doctrine as :class:`FeedHealthReport`): never scored,
+    never in ``evidence_hash``, never a proof check or leaderboard input. It is a small MUTABLE
+    holder — the live runner is a single-event-loop async shell, so a plain object (no lock) is
+    sufficient; the endpoint reads a coherent-enough snapshot for a health panel.
+
+    Records BOTH channels independently: the last odds-RECORD wall time (``last_odds_ts``) and the
+    last HEARTBEAT wall time (``last_heartbeat_ts``), plus the connection lifecycle. The runner's
+    stream yields odds records, so it drives :meth:`record_odds_record`; the heartbeat channel is
+    exposed (:meth:`record_heartbeat`) for the SSE reader that observes raw heartbeat frames.
+    """
+
+    def __init__(self) -> None:
+        self.connecting: bool = False
+        self.connected: bool = False
+        self.last_odds_ts: int | None = None
+        self.last_heartbeat_ts: int | None = None
+        self.odds_records_seen: int = 0
+        self.heartbeats_seen: int = 0
+        self.fixture_id: int | None = None
+
+    def mark_connecting(self) -> None:
+        """A connection is being established (pre-first-frame)."""
+        self.connecting = True
+        self.connected = False
+
+    def mark_connected(self) -> None:
+        """The live stream is up."""
+        self.connected = True
+        self.connecting = False
+
+    def mark_disconnected(self) -> None:
+        """The live stream dropped / ended — honestly no longer live."""
+        self.connected = False
+        self.connecting = False
+
+    def record_odds_record(self, ts: int, fixture_id: int | None = None) -> None:
+        """Record the receipt (wall) time of one odds RECORD (and the fixture it followed)."""
+        self.last_odds_ts = ts
+        self.odds_records_seen += 1
+        if fixture_id is not None:
+            self.fixture_id = fixture_id
+
+    def record_heartbeat(self, ts: int) -> None:
+        """Record the receipt (wall) time of one HEARTBEAT frame (liveness, no market data)."""
+        self.last_heartbeat_ts = ts
+        self.heartbeats_seen += 1
+
+    def last_frame_ts(self) -> int | None:
+        """The most recent of the two channels' last-seen times (the staleness reference)."""
+        seen = [ts for ts in (self.last_odds_ts, self.last_heartbeat_ts) if ts is not None]
+        return max(seen) if seen else None
+
+    def feed_state(
+        self, *, source_mode: str, now_ts: int, stale_after_s: int = DEFAULT_STALE_AFTER_S
+    ) -> FeedState:
+        """Derive the honest :class:`FeedState` from this status via :func:`derive_live_feed_state`."""
+        return derive_live_feed_state(
+            source_mode=source_mode,
+            connected=self.connected,
+            connecting=self.connecting,
+            last_odds_ts=self.last_odds_ts,
+            last_heartbeat_ts=self.last_heartbeat_ts,
+            now_ts=now_ts,
+            stale_after_s=stale_after_s,
+        )
+
+    def report(
+        self,
+        *,
+        source_mode: str,
+        txline_configured: bool,
+        now_ts: int,
+        stale_after_s: int = DEFAULT_STALE_AFTER_S,
+    ) -> FeedHealthReport:
+        """Project the WD-4 :class:`FeedHealthReport` from this status (staleness view).
+
+        ``connected`` / ``last_tick_ts`` / ``ticks_seen`` / ``fixture_id`` come from the ACTIVE
+        stream's observed state — never from credential presence.
+        """
+        return feed_health(
+            source_mode=source_mode,
+            txline_configured=txline_configured,
+            connected=self.connected,
+            last_tick_ts=self.last_frame_ts(),
+            now_ts=now_ts,
+            ticks_seen=self.odds_records_seen,
+            fixture_id=self.fixture_id,
+            stale_after_s=stale_after_s,
+        )
 
 
 class FeedHealthReport(BaseModel):

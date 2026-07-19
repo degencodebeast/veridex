@@ -312,6 +312,10 @@ class FeedHealthResponse(BaseModel):
         fixture_id: The fixture being followed, or ``None``.
         staleness_s: Seconds since the last tick, or ``None`` when none seen.
         stale: Whether the feed has exceeded its staleness budget.
+        feed_state: III-3 honest connection-derived state (the ACTIVE stream's real last-seen, not
+            credential presence): one of ``"live"`` / ``"heartbeat_only"`` / ``"stale"`` /
+            ``"disconnected"`` / ``"recorded_replay"`` (also ``"connecting"`` transiently). Optional
+            + defaulted so the pinned contract fixture stays valid; the live endpoint always sets it.
     """
 
     source_mode: str
@@ -325,6 +329,7 @@ class FeedHealthResponse(BaseModel):
     fixture_id: int | None
     staleness_s: int | None
     stale: bool
+    feed_state: str | None = None
 
 
 class RuntimeEventsResponse(BaseModel):
