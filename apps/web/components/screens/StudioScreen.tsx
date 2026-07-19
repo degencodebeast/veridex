@@ -163,14 +163,15 @@ export function StudioScreen({
   const [runId, setRunId] = useState<string | null>(null);
   const [preflightFailure, setPreflightFailure] = useState<string[] | null>(null);
   const [deploying, setDeploying] = useState(false);
-  // The current submit's stable Idempotency-Key (I-3). Held OUTSIDE render state because it must be
-  // read/written synchronously within one submit and survive a retry without re-rendering. Cleared on
-  // any config edit (a genuinely NEW submit — reusing a key with a different config would 409) and on
-  // a successful deploy (the next submit is a new logical deploy); KEPT on failure so a retry reuses it.
-  const idempotencyKeyRef = useRef<string | null>(null);
-  function resetIdempotencyKey() {
-    idempotencyKeyRef.current = null;
-  }
+  // The current submit's stable Idempotency-Key (I-3), tagged with the config FINGERPRINT it was
+  // minted for. Held OUTSIDE render state because it must be read/written synchronously within one
+  // submit and survive a retry without re-rendering. The key is REUSED iff the deploy payload is
+  // byte-identical to when it was minted — so a retry after a timeout reconciles to the SAME instance,
+  // while a genuine config change mints a fresh key (honoring the backend's 409-on-different-config
+  // contract). Keying reuse off the actual payload — not off click events — means a NO-OP interaction
+  // (re-clicking the already-active segment, or a resolveMode snap-back) never disturbs the key.
+  // Cleared on a successful deploy (the next submit is a new logical deploy); KEPT on failure.
+  const idempotencyKeyRef = useRef<{ key: string; fingerprint: string } | null>(null);
 
   const modes = availableModes(archetype);
   // fu-ii5: the MM template is restricted to the fail-closed-safe modes — the source/exec selectors
@@ -179,26 +180,17 @@ export function StudioScreen({
 
   // AC-007 snap-back: whenever archetype changes, re-resolve the current mode. A manual archetype/
   // mode edit clears the selected template — the deploy reverts to the directional path (fu-ii5).
+  // Config edits don't touch the Idempotency-Key directly — key reuse is decided at submit time by the
+  // config fingerprint (see pin()). That makes a NO-OP interaction (re-clicking the active segment, a
+  // resolveMode snap-back) a true no-op for idempotency, while a genuine change still mints a fresh key.
   function onArchetype(next: Archetype) {
     setArchetype(next);
     setMode((m) => resolveMode(next, m));
     setTemplateId(null);
-    resetIdempotencyKey(); // config edit ⇒ a NEW submit gets a fresh key (never reuse across configs)
   }
   function onMode(next: StudioMode) {
     setMode(resolveMode(archetype, next));
     setTemplateId(null);
-    resetIdempotencyKey();
-  }
-  // Source/exec edits are also config changes — a retry must not reuse a key minted for a different
-  // config (the backend 409s a reused key with a different fingerprint), so each edit resets it.
-  function onSource(next: SourceMode) {
-    setSource(next);
-    resetIdempotencyKey();
-  }
-  function onExec(next: ExecutionMode) {
-    setExec(next);
-    resetIdempotencyKey();
   }
   // Selecting a BUILT template applies its archetype + default mode through the existing coupling
   // (snap-back preserved) and tracks the template id as the deploy discriminator. Locked heavy
@@ -208,7 +200,6 @@ export function StudioScreen({
     setArchetype(t.archetype);
     setMode(resolveMode(t.archetype, t.defaultMode));
     setTemplateId(t.id);
-    resetIdempotencyKey(); // selecting a template rewrites the config ⇒ a new submit / fresh key
     if (t.id === MM_TEMPLATE_ID) {
       setSource('replay');
       // Default the MM card to Dry Run: replay+paper mints OPS telemetry ONLY, while replay+dry_run
@@ -236,21 +227,23 @@ export function StudioScreen({
     setDeploying(true);
     setPreflightFailure(null);
     setRunId(null);
-    // ONE stable Idempotency-Key for this submit — minted once, then reused verbatim if the submit is
-    // retried after a timeout/error (kept in the ref on failure below). A config edit or a success
-    // clears it, so a retry of the SAME config reconciles to a single instance (I-3), never a duplicate.
-    if (!idempotencyKeyRef.current) idempotencyKeyRef.current = newIdempotencyKey();
-    const idempotencyKey = idempotencyKeyRef.current;
+    const payload = buildDeployPayload(archetype, mode, exec, source, templateId);
+    // ONE stable Idempotency-Key per logical submit (I-3). Reuse the held key IFF this payload is
+    // byte-identical to the one it was minted for — so a retry after a timeout reconciles to the SAME
+    // instance, while a genuine config change mints a fresh key (the backend 409s a reused key with a
+    // different config). Fingerprinting the payload (not click events) makes a no-op interaction inert.
+    const fingerprint = JSON.stringify(payload);
+    if (!idempotencyKeyRef.current || idempotencyKeyRef.current.fingerprint !== fingerprint) {
+      idempotencyKeyRef.current = { key: newIdempotencyKey(), fingerprint };
+    }
+    const idempotencyKey = idempotencyKeyRef.current.key;
     try {
-      const result = await deployAgent(
-        buildDeployPayload(archetype, mode, exec, source, templateId),
-        idempotencyKey,
-      );
+      const result = await deployAgent(payload, idempotencyKey);
       // SUCCESS: use the REAL result — surface the run_id AND hand the resolved instance to the
       // navigation callback so the page routes to /instances/{instance_id}. Clear the key: the next
       // submit is a new logical deploy.
       setRunId(result.run_id);
-      resetIdempotencyKey();
+      idempotencyKeyRef.current = null;
       onPin(result); // navigate ON SUCCESS ONLY, with the awaited result — never before it exists.
     } catch (err) {
       // FAILURE: STAY on Studio and surface the named fail-closed check in place (no navigation).
@@ -368,7 +361,7 @@ export function StudioScreen({
                 <span className="mono" data-testid="source-mode-ro">{source}</span>
               ) : (
                 <SegmentedControl<SourceMode>
-                  ariaLabel="Source mode" value={source} onChange={onSource}
+                  ariaLabel="Source mode" value={source} onChange={setSource}
                   options={isMM
                     ? [{ value: 'replay', label: 'Replay' }] // MM: replay only (backend rejects live)
                     : [{ value: 'replay', label: 'Replay' }, { value: 'live', label: 'Live' }]}
@@ -390,7 +383,7 @@ export function StudioScreen({
                 <span className="mono">{exec}</span>
               ) : (
                 <SegmentedControl<ExecutionMode>
-                  ariaLabel="Execution mode" value={exec} onChange={onExec}
+                  ariaLabel="Execution mode" value={exec} onChange={setExec}
                   options={isMM
                     ? [{ value: 'paper', label: 'Paper' }, { value: 'dry_run', label: 'Dry Run' }] // MM: no live_guarded
                     : [{ value: 'paper', label: 'Paper' }, { value: 'dry_run', label: 'Dry Run' }, { value: 'live_guarded', label: 'Live Guarded' }]}
@@ -481,8 +474,12 @@ export function StudioScreen({
               </button>
             )}
             {/* Honest pin affordance — NOT a fabricated hash (law_hash / Create-wizard ruling).
-                Real evidence/score/manifest hashes appear on the Proof Card after the sealed run. */}
-            {!running && pinned && diffEntries.length === 0 ? (
+                Real evidence/score/manifest hashes appear on the Proof Card after the sealed run.
+                SUPPRESSED while a preflight failure is showing: a fail-closed 422 pins NO instance
+                server-side, so surfacing "Config pinned ✓" (whose tooltip reads "frozen at create")
+                alongside the failure would falsely imply a successful create — the failure alert is
+                the operative outcome. */}
+            {!running && pinned && diffEntries.length === 0 && !preflightFailure ? (
               <p className={styles.pinnedOk} data-testid="config-pinned">
                 <span className="mono">Config pinned ✓</span>{' '}
                 <InfoTip label={GLOSSARY.config_pinned.label}>{GLOSSARY.config_pinned.definition}</InfoTip>

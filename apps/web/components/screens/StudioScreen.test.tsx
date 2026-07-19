@@ -450,6 +450,78 @@ describe('StudioScreen (REQ-018 / AC-007 / SEC-006/007/009)', () => {
       expect(firstKey).toBeTruthy();        // a stable client key IS sent (I-3 header contract)
       expect(secondKey).toBe(firstKey);     // retry reuses it — never a fresh key
     });
+
+    // ── Review fold · Item 1: a NO-OP config interaction must NOT reset the key ──
+    // SegmentedControl fires onChange even on a re-click of the ALREADY-ACTIVE option. If that reset
+    // the Idempotency-Key, this scenario mints a DUPLICATE instance: attempt 1 times out client-side
+    // but landed server-side (instance created under key K); the operator re-clicks the active segment
+    // (ZERO config change) and retries → a fresh key → the backend creates a SECOND instance.
+    it('preserves the Idempotency-Key across a no-op re-click of the already-active segment', async () => {
+      const user = userEvent.setup();
+      const fetchMock = vi.fn()
+        .mockRejectedValueOnce(new Error('network timeout')) // attempt 1: client times out (server may have landed)
+        .mockResolvedValueOnce(okDeploy());                  // retry: succeeds
+      vi.stubGlobal('fetch', fetchMock);
+      render(<StudioScreen />);
+
+      const pinBtn = screen.getByRole('button', { name: /pin config & queue run/i });
+      await user.click(pinBtn);
+      await screen.findByTestId('deploy-preflight-error');
+      // NO-OP: re-click the already-active execution segment (Paper is the default) — no config change.
+      await user.click(screen.getByRole('radio', { name: /^Paper$/i }));
+      await user.click(pinBtn);
+      await screen.findByTestId('deploy-run-id');
+
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      const headerOf = (call: unknown[]) => (call[1] as RequestInit).headers as Record<string, string>;
+      const firstKey = headerOf(fetchMock.mock.calls[0])['Idempotency-Key'];
+      const secondKey = headerOf(fetchMock.mock.calls[1])['Idempotency-Key'];
+      expect(firstKey).toBeTruthy();
+      expect(secondKey).toBe(firstKey); // a no-op re-click preserved the key — no duplicate instance
+    });
+
+    // Regression guard (Item 1): a REAL config change between attempts still mints a FRESH key —
+    // honoring the backend 409-on-different-config contract (never reuse a key across configs).
+    it('mints a fresh Idempotency-Key when the config genuinely changes before a retry', async () => {
+      const user = userEvent.setup();
+      const fetchMock = vi.fn()
+        .mockRejectedValueOnce(new Error('network timeout'))
+        .mockResolvedValueOnce(okDeploy());
+      vi.stubGlobal('fetch', fetchMock);
+      render(<StudioScreen />);
+
+      const pinBtn = screen.getByRole('button', { name: /pin config & queue run/i });
+      await user.click(pinBtn);
+      await screen.findByTestId('deploy-preflight-error');
+      // REAL change: switch execution Paper → Dry Run before retrying.
+      await user.click(screen.getByRole('radio', { name: /dry run/i }));
+      await user.click(pinBtn);
+      await screen.findByTestId('deploy-run-id');
+
+      const headerOf = (call: unknown[]) => (call[1] as RequestInit).headers as Record<string, string>;
+      const firstKey = headerOf(fetchMock.mock.calls[0])['Idempotency-Key'];
+      const secondKey = headerOf(fetchMock.mock.calls[1])['Idempotency-Key'];
+      expect(firstKey).toBeTruthy();
+      expect(secondKey).toBeTruthy();
+      expect(secondKey).not.toBe(firstKey); // different config ⇒ new logical deploy ⇒ new key
+    });
+
+    // ── Review fold · Item 2: no false "Config pinned ✓" success on a fail-closed 422 ──
+    // On a 422 the backend pins NO instance (deploy.py fails closed before any create), so the
+    // "Config pinned ✓" success affordance (and its "frozen at create" tooltip) must NOT render — the
+    // named failing checks are the operative outcome.
+    it('does NOT present "Config pinned ✓" as a success signal on a fail-closed 422', async () => {
+      const user = userEvent.setup();
+      vi.stubGlobal('fetch', vi.fn(async () => failClosedDeploy('feed_health')));
+      render(<StudioScreen />);
+
+      await user.click(screen.getByRole('button', { name: /pin config & queue run/i }));
+
+      // The named failing check is the operative outcome…
+      expect(await screen.findByTestId('deploy-preflight-error')).toHaveTextContent(/feed_health/);
+      // …and no "Config pinned ✓" success affordance is shown (nothing was created server-side).
+      expect(screen.queryByTestId('config-pinned')).toBeNull();
+    });
   });
 
   // ── PREFLIGHT PREVIEW — codex option 3 (TEETH) ─────────────────────────────
