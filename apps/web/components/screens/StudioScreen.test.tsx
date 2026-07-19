@@ -383,6 +383,73 @@ describe('StudioScreen (REQ-018 / AC-007 / SEC-006/007/009)', () => {
     });
   });
 
+  // ── F-2: await-before-navigate deploy correctness (Potemkin fix) ────────────
+  // The pin flow must AWAIT the real deploy BEFORE any navigation: on success it hands the
+  // RESOLVED instance_id/run_id to onPin (navigation happens on that result, only on success);
+  // on a fail-closed preflight (422) it STAYS on Studio and surfaces the named check — it never
+  // navigates on a failed deploy. Plus a stable Idempotency-Key reused across a retried submit.
+  describe('F-2 · await-before-navigate deploy correctness (Potemkin fix)', () => {
+    // RED-1: a fail-closed preflight (422) STAYS on Studio — it surfaces the NAMED failing check
+    // in place and NEVER navigates (onPin must not fire on a failed deploy).
+    it('preflight 422 surfaces the named check in place and NEVER navigates (no onPin)', async () => {
+      const user = userEvent.setup();
+      const onPin = vi.fn();
+      vi.stubGlobal('fetch', vi.fn(async () => failClosedDeploy('policy_bound')));
+      render(<StudioScreen onPin={onPin} />);
+
+      await user.click(screen.getByRole('button', { name: /pin config & queue run/i }));
+
+      // The named failing check is surfaced in the Studio outcome region…
+      const err = await screen.findByTestId('deploy-preflight-error');
+      expect(err).toHaveTextContent(/policy_bound/);
+      // …and navigation NEVER fires on a failed deploy (the anti-Potemkin invariant).
+      expect(onPin).not.toHaveBeenCalled();
+      expect(screen.queryByTestId('deploy-run-id')).toBeNull();
+    });
+
+    // RED-3: the resolved deploy result is USED — onPin receives the REAL instance_id/run_id
+    // (never called with no result, never before the deploy resolves).
+    it('hands the resolved instance_id/run_id to onPin on success (result used, not discarded)', async () => {
+      const user = userEvent.setup();
+      const onPin = vi.fn();
+      vi.stubGlobal('fetch', vi.fn(async () => okDeploy({
+        instance_id: 'inst_x', config_hash: 'c'.repeat(64), policy_hash: 'p'.repeat(64), run_id: 'run_y',
+      })));
+      render(<StudioScreen onPin={onPin} />);
+
+      await user.click(screen.getByRole('button', { name: /pin config & queue run/i }));
+
+      // The run_id is surfaced in the UI (the result drives the render, not discarded)…
+      expect(await screen.findByTestId('deploy-run-id')).toHaveTextContent('run_y');
+      // …and the SAME resolved result is handed to the navigation callback (instance_id drives the route).
+      expect(onPin).toHaveBeenCalledWith(expect.objectContaining({ instance_id: 'inst_x', run_id: 'run_y' }));
+    });
+
+    // RED-4: a retry of the SAME submit (after a transient error) reuses the SAME Idempotency-Key
+    // header — never a fresh key (a fresh key would mint a SECOND instance for one logical deploy).
+    it('reuses the SAME Idempotency-Key header when a failed submit is retried', async () => {
+      const user = userEvent.setup();
+      const fetchMock = vi.fn()
+        .mockRejectedValueOnce(new Error('network timeout')) // attempt 1 → transient failure
+        .mockResolvedValueOnce(okDeploy());                  // retry → succeeds
+      vi.stubGlobal('fetch', fetchMock);
+      render(<StudioScreen />);
+
+      const pinBtn = screen.getByRole('button', { name: /pin config & queue run/i });
+      await user.click(pinBtn);                            // attempt 1
+      await screen.findByTestId('deploy-preflight-error'); // failure surfaced (stays on Studio)
+      await user.click(pinBtn);                            // retry the SAME submit
+      await screen.findByTestId('deploy-run-id');          // retry succeeds
+
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      const headerOf = (call: unknown[]) => (call[1] as RequestInit).headers as Record<string, string>;
+      const firstKey = headerOf(fetchMock.mock.calls[0])['Idempotency-Key'];
+      const secondKey = headerOf(fetchMock.mock.calls[1])['Idempotency-Key'];
+      expect(firstKey).toBeTruthy();        // a stable client key IS sent (I-3 header contract)
+      expect(secondKey).toBe(firstKey);     // retry reuses it — never a fresh key
+    });
+  });
+
   // ── PREFLIGHT PREVIEW — codex option 3 (TEETH) ─────────────────────────────
   // These tests are the RED-PROOF gate: adding a computed edge number or "Recomputed edge"
   // label MUST cause this suite to fail. All assertions below are intentionally strict.
