@@ -71,6 +71,8 @@ from veridex.api.schemas import (
     KillSwitchResponse,
     LeaderboardResponse,
     LeaderboardRow,
+    ReplayPackInfo,
+    ReplayPackListResponse,
     RuntimeEventsResponse,
     VerifyResponse,
 )
@@ -112,6 +114,7 @@ from veridex.execution.models import ExecutionRecord, ExecutionStatus
 from veridex.execution.runner import resolve_approval
 from veridex.explainer import GLOSSARY_DEFINITIONS, explain_proof
 from veridex.ingest.feed_health import LiveFeedStatus
+from veridex.ingest.replay_catalog import CatalogEntry, ReplayCatalog, build_catalog
 from veridex.leaderboard import leaderboard as _build_leaderboard
 from veridex.runtime.arena_comparison import (
     DET_DRIFT_CONTESTANT,
@@ -351,12 +354,28 @@ def _build_execution_attachment(records: list[ExecutionRecord]) -> dict[str, Any
     }
 
 
+def _replay_pack_info(entry: CatalogEntry) -> ReplayPackInfo:
+    """Project a verified :class:`CatalogEntry` into the read-only ``/replay-packs`` view.
+
+    Surfaces the verified ``content_hash``, HONEST provenance, and catalogued fixtures — but NEVER the
+    internal ``pack_dir`` filesystem path (the browser addresses packs by ``pack_id`` only).
+    """
+    return ReplayPackInfo(
+        pack_id=entry.pack_id,
+        content_hash=entry.content_hash,
+        provenance=entry.provenance,
+        is_genuine=entry.is_genuine,
+        fixtures=list(entry.fixtures),
+    )
+
+
 def create_app(
     store: Store | None = None,
     settings: Settings | None = None,
     runtime_events: DurableRuntimeEventStore | None = None,
     deploy_deps: DeployDeps | None = None,
     arena_model_launcher: Any | None = None,
+    replay_catalog: ReplayCatalog | None = None,
 ) -> FastAPI:
     """Create the Veridex demo FastAPI application.
 
@@ -427,6 +446,21 @@ def create_app(
     # OPERATIONAL TELEMETRY — never scored, never in evidence. Exposed on app.state for the launcher.
     live_feed_status = LiveFeedStatus()
     app.state.live_feed_status = live_feed_status
+
+    # R-3: the AUTHORITATIVE, hash-verified R-2 ReplayPack catalog this app serves replay identity from.
+    # Injected in tests; otherwise built from the SAME read-only ``REPLAY_PACK_ROOT`` (+ optional writable
+    # ``REPLAY_CAPTURE_ROOT``) the server composition uses, so ``/replay-packs`` and the ``pack_id``-bound
+    # ``POST /backtests`` resolve packs SERVER-side against the verified catalog — never a client filesystem
+    # path. A blank/unset root yields an empty catalog (fail-closed: every pack_id is an unknown 404).
+    resolved_replay_catalog = (
+        replay_catalog
+        if replay_catalog is not None
+        else build_catalog(
+            os.environ.get("REPLAY_PACK_ROOT", ""),
+            capture_root=os.environ.get("REPLAY_CAPTURE_ROOT", "") or None,
+        )
+    )
+    app.state.replay_catalog = resolved_replay_catalog
 
     @app.get("/healthz")
     async def healthz() -> dict[str, str]:
@@ -600,25 +634,69 @@ def create_app(
         rows_data = _build_leaderboard(all_score_rows) if all_score_rows else []
         return LeaderboardResponse(rows=[LeaderboardRow(**r) for r in rows_data])
 
+    # --- GET /replay-packs (R-3 — the verified R-2 catalog, read-only) ----------
+
+    @app.get("/replay-packs", response_model=ReplayPackListResponse)
+    async def list_replay_packs() -> ReplayPackListResponse:
+        """List the AUTHORITATIVE, hash-verified R-2 ReplayPack catalog (read-only, deterministic).
+
+        A pure projection of ``app.state.replay_catalog`` — every entry's verified ``content_hash``,
+        HONEST ``provenance``, ``is_genuine`` marker, and catalogued ``fixtures``, sorted by ``pack_id``.
+        NOT a filesystem scan: it surfaces ONLY the packs the R-2 catalog already hash-verified and
+        allowlisted (a tampered/unverified pack was fail-closed excluded and is never listed). The
+        internal ``pack_dir`` filesystem path is DELIBERATELY not exposed — the browser addresses packs
+        by ``pack_id`` only.
+        """
+        catalog: ReplayCatalog = app.state.replay_catalog
+        snapshot = catalog.snapshot()
+        packs = [_replay_pack_info(snapshot[pack_id]) for pack_id in sorted(snapshot)]
+        return ReplayPackListResponse(packs=packs)
+
+    @app.get("/replay-packs/{pack_id}", response_model=ReplayPackInfo)
+    async def get_replay_pack(pack_id: str) -> ReplayPackInfo:
+        """Return one verified R-2 pack's hash + provenance + fixtures by ``pack_id`` (unknown -> 404)."""
+        entry = app.state.replay_catalog.get(pack_id)
+        if entry is None:
+            raise HTTPException(status_code=404, detail=f"unknown pack_id: {pack_id}")
+        return _replay_pack_info(entry)
+
     # --- POST /backtests (T15 — replay a ReplayPack → honest BacktestReport) ----
 
     @app.post("/backtests", response_model=BacktestRunResponse)
     async def create_backtest(body: BacktestRunRequest) -> BacktestRunResponse:
-        """Replay a ReplayPack fixture through the live core and store its BacktestReport.
+        """Replay a catalogued ReplayPack fixture through the live core and store its BacktestReport.
 
         Deterministic + offline: the run is driven over a single reproducible baseline agent (no
         LLM, no network). The report is a pure projection of the sealed run (SEC-003) and its mode
         label is always ``"Backtest"`` (REQ-2D-304 — a replay is never dressed up as live).
 
+        R-3 — pack-bound competition identity (trust boundary): the browser sends a ``pack_id`` (a
+        catalog KEY), never a filesystem path. The pack is resolved SERVER-side against the verified
+        R-2 catalog (``app.state.replay_catalog``); an unknown ``pack_id`` is a 404 and a ``fixture_id``
+        not catalogued for the pack is a 422 — a client can NEVER point the replay loader at an arbitrary
+        directory (the former ``pack_dir`` path-traversal surface is gone). The report's replay identity
+        is pinned to the catalog: the bound ``content_hash`` is SERVER-derived from the verified entry.
+
         Args:
-            body: The backtest request (pack path, fixture, window spec).
+            body: The backtest request (``pack_id``, ``fixture_id``, window spec).
 
         Returns:
             A :class:`~veridex.api.schemas.BacktestRunResponse` with the ``backtest_id`` to fetch.
 
         Raises:
-            HTTPException: 400 if the window spec is invalid or the pack cannot be loaded/verified.
+            HTTPException: 404 if ``pack_id`` is not in the verified catalog; 422 if the fixture is not
+                catalogued for the pack; 400 if the window spec is invalid or the pack fails to replay.
         """
+        catalog: ReplayCatalog = app.state.replay_catalog
+        entry = catalog.get(body.pack_id)
+        if entry is None:
+            # Unknown/unverified pack_id — never a filesystem read. Fail-closed 404.
+            raise HTTPException(status_code=404, detail=f"unknown pack_id: {body.pack_id}")
+        if body.fixture_id not in entry.fixtures:
+            raise HTTPException(
+                status_code=422,
+                detail=f"fixture_id {body.fixture_id} is not catalogued for pack {body.pack_id!r}",
+            )
         try:
             window = RunWindow(
                 window_id=body.window_id,
@@ -628,14 +706,24 @@ def create_app(
                 duration_s=body.duration_s,
                 min_clv_horizon_s=body.min_clv_horizon_s,
             )
+            # Resolve the pack SERVER-side from the verified catalog entry (its OWNED, immutable path) —
+            # never a client-provided directory. The report's bound content_hash is therefore derived
+            # from the R-2-verified bytes, pinning the run's replay identity to the catalogued pack.
             _, report = await run_backtest(
-                Path(body.pack_dir),
+                Path(entry.pack_dir),
                 body.fixture_id,
                 [deterministic_agent("baseline")],
                 window=window,
             )
         except (ValueError, FileNotFoundError) as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+        # Binding invariant (defense-in-depth): the sealed report's identity MUST be the catalog's
+        # verified identity, not anything client-influenced. This can only trip on a server-side
+        # catalog/pack inconsistency (the catalog admits only recompute-verified packs), so a mismatch
+        # is a 500 — never silently served.
+        if report.pack_id != body.pack_id or report.content_hash != entry.content_hash:
+            raise HTTPException(status_code=500, detail="replay identity did not match the verified catalog entry")
 
         _backtest_reports[report.run_id] = report
         return BacktestRunResponse(backtest_id=report.run_id, mode_label=report.mode_label, run_id=report.run_id)

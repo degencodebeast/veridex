@@ -14,7 +14,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 
 
 class ExplainRequest(BaseModel):
@@ -348,13 +348,18 @@ class RuntimeEventsResponse(BaseModel):
 class BacktestRunRequest(BaseModel):
     """Request body for ``POST /backtests`` — triggers a replay-sourced backtest run.
 
-    The run is driven over a deterministic, offline agent (no LLM, no network). ``pack_dir`` points
-    at a self-describing ReplayPack directory (containing ``pack.json``); the pack is verified
-    (content-hash) before replay.
+    The run is driven over a deterministic, offline agent (no LLM, no network). R-3: the browser
+    addresses a pack by its ``pack_id`` (the R-2 verified catalog key) — NEVER by a filesystem path.
+    The server resolves ``pack_id`` against the authoritative, hash-verified ReplayPack catalog
+    (``app.state.replay_catalog``) and binds the catalog-derived ``content_hash`` into the sealed
+    report; a client can never point the replay loader at an arbitrary filesystem directory.
+
+    ``extra="forbid"``: a legacy body carrying the removed ``pack_dir`` (or any unknown field) is
+    a hard 422 — the client-provided filesystem-path surface is GONE, not merely ignored.
 
     Attributes:
-        pack_dir: Filesystem path to the ReplayPack directory.
-        fixture_id: The fixture within the pack to replay.
+        pack_id: The R-2 catalog key of the ReplayPack to replay (resolved SERVER-side; unknown -> 404).
+        fixture_id: The fixture within the pack to replay (must be catalogued for the pack; else 422).
         window_id: Stable id for the coverage window (echoed onto the report).
         market_allowlist: Market-key prefixes the window scores (the report's ``market_universe``).
         end_rule: Window close rule — ``"pre_match"`` (default), ``"fixed_duration"``, or ``"manual_stop"``.
@@ -362,13 +367,44 @@ class BacktestRunRequest(BaseModel):
         min_clv_horizon_s: DEC-2D-2 pending-horizon guard (seconds); defaults to 60.
     """
 
-    pack_dir: str
+    model_config = ConfigDict(extra="forbid")
+
+    pack_id: str
     fixture_id: int
     window_id: str
     market_allowlist: list[str]
     end_rule: str = "pre_match"
     duration_s: int | None = None
     min_clv_horizon_s: int = 60
+
+
+class ReplayPackInfo(BaseModel):
+    """One hash-verified pack of the R-2 catalog, projected for the read-only ``/replay-packs`` API.
+
+    A pure projection of a :class:`~veridex.ingest.replay_catalog.CatalogEntry` — the verified
+    ``content_hash``, HONEST ``provenance`` (``is_genuine`` only for a coherent genuine pack), and the
+    catalogued ``fixtures``. The internal ``pack_dir`` filesystem path is DELIBERATELY not surfaced:
+    the browser addresses packs by ``pack_id`` only, so the server-side path never leaks to a client.
+
+    Attributes:
+        pack_id: The stable catalog key the browser addresses (never a filesystem path).
+        content_hash: The pack's verified (recompute-matched) ``content_hash``.
+        provenance: HONEST provenance label (``genuine-txline`` only for a coherent genuine pack).
+        is_genuine: ``True`` only for a hash-verified, coherent genuine TxLINE capture.
+        fixtures: The fixture ids the pack manifest declares (the replayable fixtures).
+    """
+
+    pack_id: str
+    content_hash: str
+    provenance: str
+    is_genuine: bool
+    fixtures: list[int]
+
+
+class ReplayPackListResponse(BaseModel):
+    """Envelope for ``GET /replay-packs`` — the verified R-2 catalog listing (single-field wrapper)."""
+
+    packs: list[ReplayPackInfo]
 
 
 class BacktestRunResponse(BaseModel):

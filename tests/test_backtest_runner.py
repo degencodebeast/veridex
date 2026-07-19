@@ -16,6 +16,7 @@ from veridex.api.router import create_app
 from veridex.backtest.report import BacktestReport
 from veridex.backtest.runner import run_backtest
 from veridex.ingest.recorder import SessionMeta, envelope_line
+from veridex.ingest.replay_catalog import build_catalog
 from veridex.ingest.replay_pack import pack_from_session
 from veridex.runtime.orchestrator import deterministic_agent
 from veridex.runtime.window import RunWindow
@@ -185,14 +186,19 @@ async def test_assumptions_block_is_explicit(tmp_path: Path) -> None:
 
 
 def test_api_backtest_run_and_fetch(tmp_path: Path) -> None:
-    """POST /backtests triggers a run + returns a ref; GET returns the labeled BacktestReport."""
+    """POST /backtests triggers a run + returns a ref; GET returns the labeled BacktestReport.
+
+    R-3: the browser addresses the pack by its R-2 catalog ``pack_id`` (resolved server-side against
+    the verified catalog), NEVER a filesystem ``pack_dir``.
+    """
     pack_dir = _build_pack(tmp_path, n_ticks=6)
-    client = TestClient(create_app(store=InMemoryStore()))
+    catalog = build_catalog(str(pack_dir))
+    client = TestClient(create_app(store=InMemoryStore(), replay_catalog=catalog))
 
     resp = client.post(
         "/backtests",
         json={
-            "pack_dir": str(pack_dir),
+            "pack_id": pack_dir.name,
             "fixture_id": _FIXTURE_ID,
             "window_id": "w_api",
             "market_allowlist": ["OU"],
