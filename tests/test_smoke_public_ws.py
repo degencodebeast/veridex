@@ -6,6 +6,7 @@ import asyncio
 import importlib.util
 import json
 import subprocess
+import sys
 from pathlib import Path
 from types import ModuleType
 from typing import Any
@@ -80,6 +81,23 @@ async def test_public_ws_smoke_reconnects_with_exact_exclusive_tail() -> None:
     ]
     assert result.first_seq == 1
     assert result.replayed_seqs == (2, 3)
+
+
+def test_default_transport_needs_no_undeclared_websocket_package(monkeypatch) -> None:
+    module = _load_client()
+    monkeypatch.setitem(sys.modules, "websockets", None)
+
+    connection = module._default_connect(
+        "ws://127.0.0.1:8000/competitions/c/arena?since_seq=0",
+        open_timeout=1,
+        close_timeout=1,
+        ping_timeout=1,
+        max_size=1024,
+        max_queue=1,
+    )
+
+    assert hasattr(connection, "__aenter__")
+    assert hasattr(connection, "__aexit__")
 
 
 def test_public_smoke_help_documents_websocket_acceptance_inputs() -> None:
