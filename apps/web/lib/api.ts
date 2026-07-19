@@ -711,7 +711,10 @@ export async function getInstances(): Promise<DeployedInstance[]> {
 // never a fabricated instance.
 export async function getInstance(instanceId: string): Promise<DeployedInstance> {
   if (isMockEnabled()) {
-    const found = MOCK_INSTANCES.find((i) => i.instance_id === instanceId) ?? MOCK_INSTANCES[0];
+    const found = MOCK_INSTANCES.find((i) => i.instance_id === instanceId);
+    // Honest 404 for an unknown id even in mock — never fabricate a first-demo success on the
+    // not-found surface (InstanceScreen renders the honest not-found state).
+    if (!found) throw new ApiError(404, `GET ${PATHS.agentInstance(instanceId)} failed: 404 (mock: unknown instance)`);
     return { ...found, source_mode: demote(found.source_mode) };
   }
   const res = await authedGet(PATHS.agentInstance(instanceId));

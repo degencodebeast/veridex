@@ -124,4 +124,16 @@ describe('getInstances — mock gate (follows the existing mock-vs-live gate exa
     // DEMO data is REPLAY, never rendered under a LIVE badge (doctrine).
     expect(list.every((i) => i.source_mode === 'replay')).toBe(true);
   });
+
+  it('mock ON: a KNOWN demo instance id resolves to that instance', async () => {
+    vi.stubEnv('NEXT_PUBLIC_VERIDEX_MOCK', '1');
+    const inst = await getInstance('inst_demo_value_clv');
+    expect(inst.instance_id).toBe('inst_demo_value_clv');
+    expect(inst.source_mode).toBe('replay');
+  });
+
+  it('mock ON: an UNKNOWN instance id throws ApiError(404) — never fabricates the first demo instance', async () => {
+    vi.stubEnv('NEXT_PUBLIC_VERIDEX_MOCK', '1');
+    await expect(getInstance('inst_does_not_exist')).rejects.toMatchObject({ status: 404 });
+  });
 });

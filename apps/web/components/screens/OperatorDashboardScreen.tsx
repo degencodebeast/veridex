@@ -77,11 +77,15 @@ export function OperatorDashboardScreen({
   onOpenRuntime = () => {},
   rewards = MY_REWARDS,
   loadInstances = getInstances,
+  onConnect,
 }: {
   connected?: boolean;
   onOpenRuntime?: (agentId: string) => void;
   rewards?: RewardSummary[];
   loadInstances?: () => Promise<DeployedInstance[]>;
+  // Fires the real login flow (usePrivy().login), wired from the page. Absent in builds where login
+  // is impossible (Privy unconfigured) — then the gate stays informative text, never a dead button.
+  onConnect?: () => void;
 }) {
   // SEC-008 fail-closed gate: operator-private data (agents/runs/rewards/alerts) is only
   // ever rendered when the operator session is authorized. When disconnected we render an
@@ -94,6 +98,9 @@ export function OperatorDashboardScreen({
         </header>
         <div className={styles.gate} data-testid="connect-gate">
           <p className={styles.gateMsg}>Connect your operator wallet to view your agents, runs, rewards, and alerts.</p>
+          {onConnect && (
+            <button type="button" className={styles.connectBtn} onClick={onConnect}>Connect wallet</button>
+          )}
         </div>
       </section>
     );

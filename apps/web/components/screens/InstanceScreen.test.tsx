@@ -72,6 +72,15 @@ describe('InstanceScreen (owner-scoped deployed-instance identity)', () => {
     expect(screen.getByText(/not found/i)).toBeInTheDocument();
   });
 
+  it('a FAILED instance renders the failure reason, never a rosy success/running treatment', async () => {
+    render(<InstanceScreen instanceId="inst_failed" load={async () => instance({ status: 'failed', last_failure_reason: 'seal_failed' })} />);
+    const fail = await screen.findByTestId('instance-failure');
+    expect(fail).toHaveTextContent('seal_failed');
+    // status is surfaced verbatim as failed — never coerced to a nicer state.
+    expect(screen.getByTestId('instance-status')).toHaveTextContent(/failed/i);
+    expect(screen.queryByTestId('instance-error')).toBeNull(); // it IS the instance, just failed
+  });
+
   it('shows a loading state before the fetch resolves', () => {
     render(<InstanceScreen instanceId="inst_mine" load={() => new Promise(() => {})} />);
     expect(screen.getByTestId('instance-loading')).toBeInTheDocument();

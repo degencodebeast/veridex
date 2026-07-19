@@ -58,6 +58,18 @@ describe('OperatorDashboardScreen (REQ-012 / SEC-008)', () => {
     expect(screen.getByText(/connect.*wallet/i)).toBeInTheDocument();
   });
 
+  it('connect-gate renders a WORKING login control that fires onConnect (dead-gate fix)', async () => {
+    const user = userEvent.setup();
+    const onConnect = vi.fn();
+    render(<OperatorDashboardScreen connected={false} onConnect={onConnect} loadInstances={NO_INSTANCES} />);
+    const gate = screen.getByTestId('connect-gate');
+    const btn = within(gate).getByRole('button', { name: /connect wallet|log in/i });
+    await user.click(btn);
+    expect(onConnect).toHaveBeenCalledTimes(1);
+    // SEC-008 still holds: private sections are ABSENT even with a login affordance present.
+    expect(screen.queryByRole('heading', { name: /your agents/i })).toBeNull();
+  });
+
   // ---- F-3: Your Agents renders REAL owned instances, never the MY_AGENTS fixture ----
 
   it('renders real owned instances (instance_id / template / status), NOT the MY_AGENTS fixture names', async () => {
