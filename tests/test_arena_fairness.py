@@ -473,7 +473,7 @@ async def test_scoreability_uses_per_market_close_not_final_global_row() -> None
     assert m_decisions, "det-Drift should emit at least one non-WAIT decision on market 'M'"
 
     e = m_decisions[0]
-    entry = arena._state_by_ts[e.checkpoint_ts]
+    entry = arena._state_by_coord[(e.fixture_id, e.tick_seq)]
     action = AgentAction(
         type=SportsActionType(e.action_type), params={"market_key": e.market_key, "side": e.side}
     )
@@ -486,6 +486,56 @@ async def test_scoreability_uses_per_market_close_not_final_global_row() -> None
     # Scoreability MUST use "M"'s per-market close → the decision is scoreable, not mis-rejected.
     assert arena._is_scoreable(e) is True
     assert arena.report().scoreable_decisions >= 1, "the per-market close keeps 'M' decisions scoreable"
+
+
+async def test_decision_binds_to_its_own_fixture_not_a_ts_aliased_one() -> None:
+    """MAJOR 3 (Codex 3rd re-gate) — two fixtures sharing a source ``ts`` must NOT alias each other's
+    entry snapshot. A valid decision on fixture 1's market ``M`` at ``ts=T`` must be scored against
+    FIXTURE 1's ``M`` entry+close, NOT mis-rejected because a LATER fixture 2 tick at the SAME ``ts``
+    (carrying a different market ``N``) overwrote the ts-keyed entry map.
+
+    Codex reproduced the defect: entry snapshots were stored ``dict[int(ts), MarketState]`` and the
+    checkpoint event carried only ``checkpoint_ts`` — so fixture 2's ``ts=100`` tick clobbered
+    fixture 1's ``ts=100`` entry, and the fixture-1 ``M`` action came back NOT scoreable. Binding each
+    decision to an immutable ``(fixture_id, tick_seq)`` coordinate fixes it.
+    """
+    from veridex.runtime.schemas import SportsActionType
+
+    # Fixture 1 (id 42): a rising "M" tape → det-Drift fires a valid non-WAIT "M" decision at some ts.
+    m_tape = _rising_tape()
+    probe = await run_arena_comparison(m_tape, model=FakeModelLauncher(), det_policy=_policy(), **_DET_KW)
+    m_decisions = [
+        e
+        for e in probe.events
+        if e.contestant == DET_DRIFT_CONTESTANT
+        and e.kind == "decision"
+        and e.action_type != SportsActionType.WAIT.value
+        and e.market_key == "M"
+    ]
+    assert m_decisions, "det-Drift should emit at least one non-WAIT decision on market 'M'"
+    collide_ts = m_decisions[0].checkpoint_ts
+
+    # Fixture 2 (id 99): a DIFFERENT market "N" at the EXACT SAME ts as the fixture-1 "M" decision.
+    # Under the ts-aliasing bug this overwrites _state_by_ts[collide_ts] with fixture 2's "N" state.
+    n_alias = _ms_key(collide_ts, 6000, market_key="N", fixture_id=99)
+    tape = [*m_tape, n_alias]
+
+    arena = await run_arena_comparison(tape, model=FakeModelLauncher(), det_policy=_policy(), **_DET_KW)
+
+    # The fixture-1 "M" decision at collide_ts must be bound to fixture 42 and scored against fixture
+    # 42's real "M" close — scoreable, NOT mis-rejected by fixture 99's same-ts overwrite.
+    e = next(
+        x
+        for x in arena.events
+        if x.contestant == DET_DRIFT_CONTESTANT
+        and x.kind == "decision"
+        and x.action_type != SportsActionType.WAIT.value
+        and x.market_key == "M"
+        and x.checkpoint_ts == collide_ts
+    )
+    assert e.fixture_id == 42, "the decision must carry its own fixture coordinate, not a ts-aliased one"
+    assert arena._is_scoreable(e) is True, "fixture-1 'M' must be scored against fixture 1, not fixture 2"
+    assert arena.report().scoreable_decisions >= 1
 
 
 # ---------------------------------------------------------------------------
@@ -542,6 +592,84 @@ async def test_replay_settles_async_model_call_and_drains_guard() -> None:
     llm = arena.report().contestants[LLM_DRIFT_CONTESTANT]
     assert llm["actions"] >= 1, "the async model task must complete and produce a decision (not all-WAIT)"
     assert arena.guard_busy is False, "end-of-tape drain must leave no call unobserved / in flight"
+
+
+async def test_mid_tape_llm_completion_binds_correct_coordinate_and_scores() -> None:
+    """MAJOR 3 (spec re-gate) — a model call that completes MID-TAPE (serviced by ``_step_llm`` on a
+    following tick, NOT via the end-of-tape ``drain``) must emit its decision bound to the CORRECT
+    ``(fixture_id, tick_seq, checkpoint_ts)`` coordinate, so a law-valid LLM decision is counted
+    scoreable — never silently zeroed by a scrambled argument order.
+
+    The mid-tape caller and ``drain`` share ``_emit_llm_decision``; a mismatched positional order at the
+    mid-tape call site scrambles ``fixture_id``/``tick_seq``/``ts`` (they are all ``int``, so it
+    type-checks), making the entry-coordinate lookup miss and ``_is_scoreable`` fail closed. Only a test
+    that resolves the call mid-tape (the fakes elsewhere settle via ``drain``) exercises this path.
+    """
+    import asyncio
+
+    from veridex.runtime.schemas import AgentAction, SportsActionType
+
+    class _MidTapeHandle:
+        """A handle whose backing task resolves after ONE event-loop yield → serviced on the NEXT tick."""
+
+        def __init__(self, raw: object) -> None:
+            async def _run() -> object:
+                await asyncio.sleep(0)
+                return raw
+
+            self._task = asyncio.ensure_future(_run())
+
+        def done(self) -> bool:
+            return self._task.done()
+
+        def cancel(self) -> None:
+            self._task.cancel()
+
+        def cancelled(self) -> bool:
+            return self._task.cancelled()
+
+        def exception(self) -> BaseException | None:
+            if self._task.done() and not self._task.cancelled():
+                return self._task.exception()
+            return None
+
+        def result(self) -> object:
+            return self._task.result()
+
+    class _MidTapeLauncher:
+        def __init__(self, raw: object) -> None:
+            self._raw = raw
+
+        def launch(self, prompt: str) -> _MidTapeHandle:
+            return _MidTapeHandle(self._raw)
+
+    # A rising "M"/home tape (fixture 42) — the LLM launches on the first checkpoint and completes a
+    # tick later (mid-tape), emitting a law-valid FOLLOW_MOMENTUM on the real market "M".
+    tape = _rising_tape()
+    last_ts = tape[-1].ts
+    action = AgentAction(type=SportsActionType.FOLLOW_MOMENTUM, params={"market_key": "M", "side": "home"})
+    arena = await run_arena_comparison(tape, model=_MidTapeLauncher(action), det_policy=_policy(), **_DET_KW)
+
+    llm_decisions = [
+        e
+        for e in arena.events
+        if e.contestant == LLM_DRIFT_CONTESTANT
+        and e.kind == "decision"
+        and e.action_type != SportsActionType.WAIT.value
+    ]
+    assert llm_decisions, "the mid-tape async call must produce an LLM decision"
+    e = llm_decisions[0]
+
+    # It resolved MID-TAPE (before the final tick) → serviced by _step_llm, NOT the end-of-tape drain.
+    assert e.checkpoint_ts < last_ts, "the decision must be serviced mid-tape (not via drain on the last tick)"
+    # The coordinate is CORRECT (not a scrambled ts-as-fixture_id): its own fixture 42 + a real tape ts.
+    assert e.fixture_id == 42, "mid-tape LLM decision must carry its own fixture_id, not a scrambled ts"
+    assert e.checkpoint_ts in {int(ms.ts) for ms in tape}, "checkpoint_ts must be a real tape ts, not a tick index"
+    assert arena._state_by_coord.get((e.fixture_id, e.tick_seq)) is not None, "coordinate must resolve to an entry"
+
+    # A law-valid mid-tape LLM decision is COUNTED scoreable — never silently zeroed by a bad coordinate.
+    assert arena._is_scoreable(e) is True
+    assert arena.report().contestants[LLM_DRIFT_CONTESTANT]["scoreable_decisions"] >= 1
 
 
 class _CancelResistantHandle:

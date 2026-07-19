@@ -121,6 +121,17 @@ class DeploymentAttemptTransitionError(Exception):
     """
 
 
+class CompetitionStatusClaimError(Exception):
+    """Raised when an atomic competition status compare-and-set (claim) cannot be applied.
+
+    The single, store-agnostic signal for a REFUSED competition-status claim — a compare-and-set whose
+    observed status did not equal the caller's ``expected`` (a concurrent request already claimed the
+    competition). Both :class:`InMemoryStore` and :class:`PostgresStore` raise it from the same
+    condition so the arena-start endpoint reconciles on ONE contract and NEVER launches two physical
+    comparisons for the same competition (mirrors :class:`DeploymentAttemptTransitionError`).
+    """
+
+
 class LeaseStatus(str, Enum):
     """Forward-only lifecycle of an :class:`InstanceLease` (crash-safe single-active-run exclusivity).
 
@@ -366,6 +377,30 @@ class Store(Protocol):
 
         Raises:
             KeyError: If no competition with ``competition_id`` exists.
+        """
+        ...
+
+    async def claim_competition_status(
+        self, competition_id: str, *, expected: CompetitionStatus, new: CompetitionStatus
+    ) -> None:
+        """Atomically set status ``expected`` -> ``new`` ONLY if it currently equals ``expected`` (CAS).
+
+        The compare-and-set the arena-start endpoint uses to CLAIM a competition before it drives the
+        model: it advances ``status`` only when the observed status equals ``expected`` (else refuses),
+        so two concurrent requests can never both pass the claim and both launch a physical comparison
+        (InMemory: no ``await`` between check and write; Postgres: ``... WHERE status = expected``). This
+        is a lifecycle CLAIM, not the monotonic ``advance_status`` table — the arena drives DRAFT ->
+        RUNNING directly, mirroring the existing blind ``update_competition_status`` write.
+
+        Args:
+            competition_id: The competition to claim.
+            expected: The status the caller believes is current (the compare half of the CAS).
+            new: The status to set (the swap half).
+
+        Raises:
+            KeyError: If no competition with ``competition_id`` exists.
+            CompetitionStatusClaimError: On a CAS conflict (``current != expected``) — a concurrent
+                request already claimed the competition.
         """
         ...
 
@@ -1021,6 +1056,25 @@ class InMemoryStore:
         if competition_id not in self._competitions:
             raise KeyError(f"no competition with competition_id={competition_id!r}")
         self._competitions[competition_id].status = status
+
+    async def claim_competition_status(
+        self, competition_id: str, *, expected: CompetitionStatus, new: CompetitionStatus
+    ) -> None:
+        """Atomically set status ``expected`` -> ``new`` iff currently ``expected`` (CAS; no await gap).
+
+        There is no ``await`` between the compare and the write, so under a single asyncio event loop
+        the check-and-set is atomic: two concurrent claims can never both observe ``expected`` and both
+        swap. The loser (``current != expected``) is refused with :class:`CompetitionStatusClaimError`.
+        """
+        if competition_id not in self._competitions:
+            raise KeyError(f"no competition with competition_id={competition_id!r}")
+        competition = self._competitions[competition_id]
+        if competition.status != expected:
+            raise CompetitionStatusClaimError(
+                f"CAS conflict for competition {competition_id!r}: expected {expected.value!r}, "
+                f"found {competition.status.value!r}"
+            )
+        competition.status = new
 
     async def update_competition_run_id(self, competition_id: str, run_id: str) -> None:
         """Store the run_id on the competition (deep-copy semantics preserved via direct field set).
@@ -2064,6 +2118,44 @@ class PostgresStore:
                 )
                 if cur.rowcount == 0:
                     raise KeyError(f"no competition persisted with competition_id={competition_id!r}")
+        finally:
+            await self._release(conn)
+
+    async def claim_competition_status(
+        self, competition_id: str, *, expected: CompetitionStatus, new: CompetitionStatus
+    ) -> None:
+        """Atomic CAS status claim via ``SELECT ... FOR UPDATE`` + a guarded ``UPDATE`` in one txn.
+
+        The row is locked ``FOR UPDATE`` so a concurrent request blocks until this claim commits; the
+        ``UPDATE`` additionally carries ``WHERE status = expected`` so the compare is enforced at the
+        database even under the lock. Mirrors :class:`InMemoryStore` — the loser is refused with
+        :class:`CompetitionStatusClaimError`.
+        """
+        conn = await self._connect()
+        try:
+            async with conn.transaction(), conn.cursor() as cur:
+                await cur.execute(
+                    "SELECT status FROM competitions WHERE competition_id = %s FOR UPDATE",
+                    (competition_id,),
+                )
+                row = await cur.fetchone()
+                if row is None:
+                    raise KeyError(f"no competition persisted with competition_id={competition_id!r}")
+                current = CompetitionStatus(row[0])
+                if current != expected:
+                    raise CompetitionStatusClaimError(
+                        f"CAS conflict for competition {competition_id!r}: expected {expected.value!r}, "
+                        f"found {current.value!r}"
+                    )
+                await cur.execute(
+                    "UPDATE competitions SET status = %s WHERE competition_id = %s AND status = %s",
+                    (new.value, competition_id, expected.value),
+                )
+                if cur.rowcount != 1:
+                    # The guarded UPDATE matched no row → a racing request claimed it past ``expected``.
+                    raise CompetitionStatusClaimError(
+                        f"CAS conflict for competition {competition_id!r}: status changed under the claim"
+                    )
         finally:
             await self._release(conn)
 

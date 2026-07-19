@@ -236,7 +236,14 @@ class ArenaCheckpointEvent:
 
     ``kind`` is one of ``"opportunity"`` (a checkpoint was OFFERED, evidence present),
     ``"launched"``/``"skipped_inflight"`` (LLM in-flight bookkeeping), or ``"decision"`` (a scored
-    action or WAIT was produced). ``checkpoint_ts`` + ``evidence_hash`` are the shared coordinate.
+    action or WAIT was produced). ``checkpoint_ts`` + ``evidence_hash`` are the shared evidence
+    coordinate used for the identical-opportunity comparison.
+
+    ``fixture_id`` + ``tick_seq`` are the IMMUTABLE entry coordinate: the fixture and the arena's own
+    monotonic tick index at which the emitting tick's snapshot was recorded. Scoreability binds each
+    decision to THIS coordinate (not the ts alone), so two fixtures sharing a source ``ts`` can never
+    alias each other's entry snapshot (Codex M3). ``tick_seq`` is the arena's monotonic per-run index
+    (NOT ``MarketState.tick_seq``, which is not unique across a multi-fixture tape).
     """
 
     contestant: str
@@ -246,6 +253,8 @@ class ArenaCheckpointEvent:
     action_type: str | None = None
     market_key: str | None = None
     side: str | None = None
+    fixture_id: int = 0
+    tick_seq: int = 0
 
 
 # ---------------------------------------------------------------------------
@@ -356,10 +365,15 @@ class ArenaComparison:
         self.events: list[ArenaCheckpointEvent] = []
         self._fixture_ids: set[int] = set()
         # Retain the replay tape so scoreability can be established through the DETERMINISTIC LAW
-        # (recompute) — a decision is bound to the entry snapshot at its checkpoint ts and the final
-        # closing snapshot, NOT judged by a bare truthy market_key/side (M2).
+        # (recompute) — a decision is bound to the entry snapshot at its checkpoint and the market's
+        # per-fixture close, NOT judged by a bare truthy market_key/side (M2).
         self._marketstates: list[MarketState] = []
-        self._state_by_ts: dict[int, MarketState] = {}
+        # Entry snapshots keyed by the IMMUTABLE (fixture_id, arena tick index) coordinate — NOT by ts
+        # alone. Two fixtures sharing a source ts get DISTINCT keys, so neither aliases the other's
+        # entry snapshot (Codex M3). ``_arena_tick_seq`` is the arena's own monotonic per-run index.
+        self._state_by_coord: dict[tuple[int, int], MarketState] = {}
+        self._arena_tick_seq = -1
+        self._last_coord: tuple[int, int] | None = None
 
     # --- per-tick drive ----------------------------------------------------
 
@@ -367,18 +381,30 @@ class ArenaComparison:
         """Advance BOTH contestants one tick from ONE shared projection (records audit events)."""
         ts = int(getattr(market_state, "ts", 0))
         self._clock.set(ts)
-        self._fixture_ids.add(int(getattr(market_state, "fixture_id", 0)))
-        # Record the tape for law-based scoreability (entry-by-ts + closing = last snapshot).
+        fixture_id = int(getattr(market_state, "fixture_id", 0))
+        self._fixture_ids.add(fixture_id)
+        # Record the tape (for the per-fixture close map) and pin the entry snapshot to its IMMUTABLE
+        # (fixture_id, arena tick index) coordinate — never a ts-aliased key (Codex M3).
         self._marketstates.append(market_state)
-        self._state_by_ts[ts] = market_state
+        self._arena_tick_seq += 1
+        coord = (fixture_id, self._arena_tick_seq)
+        self._state_by_coord[coord] = market_state
+        self._last_coord = coord
 
         proj = self.projector.project(market_state)  # THE ONE shared projection this tick
         snapshot = proj.snapshot if proj is not None else None
 
-        self._step_det(ts, proj, snapshot)
-        self._step_llm(ts, proj, snapshot)
+        self._step_det(ts, fixture_id, self._arena_tick_seq, proj, snapshot)
+        self._step_llm(ts, fixture_id, self._arena_tick_seq, proj, snapshot)
 
-    def _step_det(self, ts: int, proj: SharedProjection | None, snapshot: DriftFeatureSnapshot | None) -> None:
+    def _step_det(
+        self,
+        ts: int,
+        fixture_id: int,
+        tick_seq: int,
+        proj: SharedProjection | None,
+        snapshot: DriftFeatureSnapshot | None,
+    ) -> None:
         is_cp = self._det_policy.is_checkpoint(
             now=ts,
             last_checkpoint_at=self._det_last_cp_at,
@@ -396,7 +422,7 @@ class ArenaComparison:
         self.events.append(
             ArenaCheckpointEvent(
                 contestant=DET_DRIFT_CONTESTANT, kind="opportunity", checkpoint_ts=ts,
-                evidence_hash=snapshot.evidence_hash,
+                evidence_hash=snapshot.evidence_hash, fixture_id=fixture_id, tick_seq=tick_seq,
             )
         )
         action = _det_decide_from_snapshot(self._det_cfg, proj)
@@ -412,10 +438,18 @@ class ArenaComparison:
                 contestant=DET_DRIFT_CONTESTANT, kind="decision", checkpoint_ts=ts,
                 evidence_hash=snapshot.evidence_hash, action_type=action.type.value,
                 market_key=action.params.get("market_key"), side=action.params.get("side"),
+                fixture_id=fixture_id, tick_seq=tick_seq,
             )
         )
 
-    def _step_llm(self, ts: int, proj: SharedProjection | None, snapshot: DriftFeatureSnapshot | None) -> None:
+    def _step_llm(
+        self,
+        ts: int,
+        fixture_id: int,
+        tick_seq: int,
+        proj: SharedProjection | None,
+        snapshot: DriftFeatureSnapshot | None,
+    ) -> None:
         is_cp = self._llm_policy.is_checkpoint(
             now=ts,
             last_checkpoint_at=self._llm_last_cp_at,
@@ -429,7 +463,7 @@ class ArenaComparison:
                 self.events.append(
                     ArenaCheckpointEvent(
                         contestant=LLM_DRIFT_CONTESTANT, kind="opportunity", checkpoint_ts=ts,
-                        evidence_hash=snapshot.evidence_hash,
+                        evidence_hash=snapshot.evidence_hash, fixture_id=fixture_id, tick_seq=tick_seq,
                     )
                 )
 
@@ -437,7 +471,7 @@ class ArenaComparison:
         # then LAUNCH only if the slot is free AND this tick opens a checkpoint (the §3 order).
         outcome = self._guard.service()
         if outcome.status == COMPLETED_FRESH:
-            self._emit_llm_decision(ts, outcome)
+            self._emit_llm_decision(fixture_id=fixture_id, tick_seq=tick_seq, ts=ts, outcome=outcome)
             return
         if outcome.status in (IN_FLIGHT, AWAITING_CONFIRMATION):
             if is_cp and snapshot is not None:
@@ -445,6 +479,7 @@ class ArenaComparison:
                     ArenaCheckpointEvent(
                         contestant=LLM_DRIFT_CONTESTANT, kind="skipped_inflight",
                         checkpoint_ts=ts, evidence_hash=self._guard.evidence_coordinate() or "",
+                        fixture_id=fixture_id, tick_seq=tick_seq,
                     )
                 )
             return
@@ -462,15 +497,19 @@ class ArenaComparison:
                 ArenaCheckpointEvent(
                     contestant=LLM_DRIFT_CONTESTANT, kind="launched",
                     checkpoint_ts=ts, evidence_hash=snapshot.evidence_hash,
+                    fixture_id=fixture_id, tick_seq=tick_seq,
                 )
             )
 
-    def _emit_llm_decision(self, ts: int, outcome: ServiceOutcome) -> None:
+    def _emit_llm_decision(
+        self, fixture_id: int, tick_seq: int, ts: int, outcome: ServiceOutcome
+    ) -> None:
         """Emit the ONE scored LLM decision for a freshly-completed call (typed-revalidated, fail-closed).
 
         Shared by the per-tick service path (:meth:`_step_llm`) and the end-of-tape :meth:`drain`, so a
         call that completes fresh ON the final checkpoint is emitted with the SAME typed-revalidation
-        and fail-closed-WAIT discipline as one that completes mid-tape.
+        and fail-closed-WAIT discipline as one that completes mid-tape. The decision is bound to the
+        emitting tick's IMMUTABLE ``(fixture_id, tick_seq)`` entry coordinate (Codex M3).
         """
         try:
             action = _revalidate_action(outcome.raw)
@@ -482,6 +521,7 @@ class ArenaComparison:
                 checkpoint_ts=ts, evidence_hash=outcome.evidence_hash or "",
                 action_type=action.type.value,
                 market_key=action.params.get("market_key"), side=action.params.get("side"),
+                fixture_id=fixture_id, tick_seq=tick_seq,
             )
         )
 
@@ -506,12 +546,15 @@ class ArenaComparison:
         if not self._guard.busy:
             return
         ts = int(self._clock())
+        # The final in-flight call is bound to the LAST tick's entry coordinate (the tape is exhausted;
+        # no new snapshot is taken). ``_last_coord`` is set for any non-empty tape (guard busy ⇒ stepped).
+        fixture_id, tick_seq = self._last_coord if self._last_coord is not None else (0, 0)
         # Phase 1 — let a launched-but-unfinished task finish under the snapshot-ts clock.
         for _ in range(max_yields):
             await asyncio.sleep(0)
             outcome = self._guard.service()
             if outcome.status == COMPLETED_FRESH:
-                self._emit_llm_decision(ts, outcome)
+                self._emit_llm_decision(fixture_id=fixture_id, tick_seq=tick_seq, ts=ts, outcome=outcome)
                 return
             if outcome.status in (COMPLETED_STALE, FAILED, CONFIRMED_TERMINATED):
                 return  # terminal, non-fresh: audited, nothing to emit
@@ -586,10 +629,12 @@ class ArenaComparison:
         invented nonempty coordinates as authoritative, overstating a contestant's usable actions and
         collapsing the required actions-vs-scoreable distinction (addendum §3, Codex M2).
 
-        The decision is bound to the entry snapshot at its ``checkpoint_ts`` and to that market's
-        AUTHORITATIVE per-market close — the last tick carrying the action's market IN ITS FIXTURE
-        (``closing_by_market``), NOT the final GLOBAL row — then scored in ``replay`` mode. Using the
-        final global row would mis-reject any decision whose market is absent from the last tick,
+        The decision is bound to the entry snapshot at its IMMUTABLE ``(fixture_id, tick_seq)``
+        coordinate — NOT a ts-aliased key — and to that market's AUTHORITATIVE per-market close: the last
+        tick carrying the action's market IN ITS OWN FIXTURE (``closing_by_market``), NOT the final
+        GLOBAL row — then scored in ``replay`` mode. Binding by ts alone would let a second fixture
+        sharing that ts overwrite the entry snapshot and mis-reject the decision (Codex M3); using the
+        final global row would mis-reject a decision whose market is absent from the last tick,
         under-counting valid decisions on a multi-market/fixture tape (Codex M2). ``actions`` (the raw
         non-WAIT count) is tallied SEPARATELY and is unaffected by this check.
         """
@@ -597,12 +642,11 @@ class ArenaComparison:
             return False
         if closing_by_market is None:
             closing_by_market = self._closing_by_market()
-        entry = self._state_by_ts.get(e.checkpoint_ts)
+        entry = self._state_by_coord.get((e.fixture_id, e.tick_seq))
         if entry is None:
             # No entry evidence to score against → cannot establish law-validity → fail closed.
             return False
-        fixture_id = int(getattr(entry, "fixture_id", 0))
-        closing = closing_by_market.get((fixture_id, e.market_key)) if e.market_key is not None else None
+        closing = closing_by_market.get((e.fixture_id, e.market_key)) if e.market_key is not None else None
         # A market never carried by the tape (in this fixture) has no authoritative close → the law
         # returns closing_missing (replay) → not scoreable. Passing closing=None is the honest signal.
         try:

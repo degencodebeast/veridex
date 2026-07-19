@@ -124,6 +124,17 @@ class _OfflineArenaLauncher:
         return _DoneHandle(AgentAction(type=SportsActionType.WAIT))
 
 
+class _CountingArenaLauncher(_OfflineArenaLauncher):
+    """An offline arena launcher that COUNTS physical model launches (to prove double-execution)."""
+
+    def __init__(self) -> None:
+        self.launch_count = 0
+
+    def launch(self, prompt: str) -> _DoneHandle:
+        self.launch_count += 1
+        return super().launch(prompt)
+
+
 # --- request bodies --------------------------------------------------------------------------
 
 _COMPETITION_CONFIG: dict[str, Any] = {
@@ -340,5 +351,147 @@ async def test_owner_arena_run_is_observable_from_competition_state() -> None:
             persisted = arena_events[0]["payload"]["arena_comparison"]
             assert persisted["identical_opportunities"] == posted["identical_opportunities"]
             assert persisted["scoreable_decisions"] == posted["scoreable_decisions"]
+    finally:
+        await _drain(app)
+
+
+# ---------------------------------------------------------------------------
+# RED 8 (Codex 3rd re-gate M1) — two SIMULTANEOUS authenticated arena starts must be claimed
+# ATOMICALLY: exactly ONE runs (200, persists), the other returns a controlled 409 WITHOUT driving
+# the model — never two physical comparisons and never an unhandled 500 duplicate-seq leak.
+# ---------------------------------------------------------------------------
+
+
+async def test_concurrent_arena_starts_are_claimed_atomically() -> None:
+    # Baseline: a single arena run drives the model a fixed, deterministic number of times.
+    base_launcher = _CountingArenaLauncher()
+    base_store = InMemoryStore()
+    base_app = create_app(store=base_store, settings=_privy_settings(), arena_model_launcher=base_launcher)
+    try:
+        comp = await _seed_drift_roster(base_store, base_app, _DID_ALICE)
+        async with _transport(base_app) as client:
+            r = await client.post(f"/competitions/{comp}/arena", headers=_bearer(_DID_ALICE))
+            assert r.status_code == 200, r.text
+    finally:
+        await _drain(base_app)
+    baseline_launches = base_launcher.launch_count
+    assert baseline_launches >= 1, "the arena run must physically drive the model at least once"
+
+    # Concurrent: two SIMULTANEOUS authenticated POSTs to the SAME competition (asyncio.gather).
+    launcher = _CountingArenaLauncher()
+    store = InMemoryStore()
+    app = create_app(store=store, settings=_privy_settings(), arena_model_launcher=launcher)
+    try:
+        comp_id = await _seed_drift_roster(store, app, _DID_ALICE)
+        async with _transport(app) as client:
+            r1, r2 = await asyncio.gather(
+                client.post(f"/competitions/{comp_id}/arena", headers=_bearer(_DID_ALICE)),
+                client.post(f"/competitions/{comp_id}/arena", headers=_bearer(_DID_ALICE)),
+            )
+        codes = sorted((r1.status_code, r2.status_code))
+        # Exactly one winner (200) and one controlled loser (409) — NEVER an unhandled 500 duplicate-seq.
+        assert codes == [200, 409], (r1.status_code, r1.text, r2.status_code, r2.text)
+        # The loser NEVER drove the model: exactly ONE run's worth of launches, not two.
+        assert launcher.launch_count == baseline_launches, "the loser must not physically drive the model"
+
+        # Exactly ONE run persisted: the canonical event log is the single started+finalized pair.
+        async with _transport(app) as client:
+            state = await client.get(f"/competitions/{comp_id}")
+            assert state.status_code == 200, state.text
+            assert state.json()["run_id"] is not None
+            events = await client.get(f"/competitions/{comp_id}/events?since_seq=-1")
+            assert events.status_code == 200, events.text
+            assert len(events.json()) == 2, "exactly one run: seq=0 started + seq=1 finalized, no duplicates"
+    finally:
+        await _drain(app)
+
+
+# ---------------------------------------------------------------------------
+# RED 9 (Codex 3rd re-gate M2) — the started-event roster identity must EQUAL the run's contestant
+# identity (no substitution). A conforming roster runs; the COMPETITION_STARTED agent_ids are
+# BYTE-EQUAL to the report's contestant ids.
+# ---------------------------------------------------------------------------
+
+
+async def test_started_agent_ids_equal_report_contestant_ids() -> None:
+    store = InMemoryStore()
+    app = create_app(store=store, settings=_privy_settings(), arena_model_launcher=_OfflineArenaLauncher())
+    try:
+        comp_id = await _seed_drift_roster(store, app, _DID_ALICE)
+        async with _transport(app) as client:
+            post = await client.post(f"/competitions/{comp_id}/arena", headers=_bearer(_DID_ALICE))
+            assert post.status_code == 200, post.text
+            report = post.json()["arena_comparison"]
+
+            events = await client.get(f"/competitions/{comp_id}/events?since_seq=-1")
+            assert events.status_code == 200, events.text
+            started = next(e for e in events.json() if e["event_type"] == "competition_started")
+
+        # The started event's agent_ids are EXACTLY the run's actual contestant ids — no substitution.
+        assert started["payload"]["agent_ids"] == list(report["contestants"].keys())
+    finally:
+        await _drain(app)
+
+
+# ---------------------------------------------------------------------------
+# RED 10 (M2) — a roster declaring DIFFERENT contestant ids than the intrinsic arena contestants
+# (matching strategies, mismatched ids) must FAIL CLOSED: the run cannot claim a roster it does not
+# execute (Codex registered desk-rules-v7 / desk-reason-v9 and got det-drift / llm-drift back).
+# ---------------------------------------------------------------------------
+
+
+async def test_mismatched_id_roster_arena_run_fails_closed() -> None:
+    store = InMemoryStore()
+    app = create_app(store=store, settings=_privy_settings(), arena_model_launcher=_OfflineArenaLauncher())
+    try:
+        async with _transport(app) as client:
+            comp_id = await _create(client, _DID_ALICE)
+            # Correct strategies, but ids that are NOT the intrinsic det-drift / llm-drift contestants.
+            for agent_id, strategy in (("desk-rules-v7", "cumulative-drift"), ("desk-reason-v9", "llm")):
+                reg = await client.post(
+                    f"/competitions/{comp_id}/agents", json=_entry(agent_id, strategy), headers=_bearer(_DID_ALICE)
+                )
+                assert reg.status_code == 200, reg.text
+            resp = await client.post(f"/competitions/{comp_id}/arena", headers=_bearer(_DID_ALICE))
+            assert resp.status_code == 409, resp.text
+            assert "arena_comparison" not in resp.json()
+
+            # Nothing was persisted: no substituted run stamped on the competition.
+            state = await client.get(f"/competitions/{comp_id}")
+            assert state.json()["run_id"] is None
+            assert state.json()["status"] == "draft"
+    finally:
+        await _drain(app)
+
+
+# ---------------------------------------------------------------------------
+# RED 11 (M2) — a roster that declares the intrinsic contestants PLUS an extra third entry must FAIL
+# CLOSED: the contract requires EXACTLY the two intrinsic contestants, no extras.
+# ---------------------------------------------------------------------------
+
+
+async def test_extra_entry_roster_arena_run_fails_closed() -> None:
+    store = InMemoryStore()
+    app = create_app(store=store, settings=_privy_settings(), arena_model_launcher=_OfflineArenaLauncher())
+    try:
+        async with _transport(app) as client:
+            # A 3-slot roster so the extra entry can REGISTER — the arena contract must still reject it.
+            resp_c = await client.post(
+                "/competitions", json={**_COMPETITION_CONFIG, "roster_size": 3}, headers=_bearer(_DID_ALICE)
+            )
+            assert resp_c.status_code == 200, resp_c.text
+            comp_id = resp_c.json()["competition_id"]
+            for agent_id, strategy in (
+                ("det-drift", "cumulative-drift"),
+                ("llm-drift", "llm"),
+                ("extra-x", "cumulative-drift"),
+            ):
+                reg = await client.post(
+                    f"/competitions/{comp_id}/agents", json=_entry(agent_id, strategy), headers=_bearer(_DID_ALICE)
+                )
+                assert reg.status_code == 200, reg.text
+            resp = await client.post(f"/competitions/{comp_id}/arena", headers=_bearer(_DID_ALICE))
+            assert resp.status_code == 409, resp.text
+            assert "arena_comparison" not in resp.json()
     finally:
         await _drain(app)
