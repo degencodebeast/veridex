@@ -165,7 +165,7 @@ Edge gates action. CLV ranks performance.
 
 ## What strategy should Veridex build first?
 
-The first flagship strategy should be **fair-value dislocation**, not a deep sports prediction model.
+A strong first strategy is **fair-value dislocation**, not a deep sports prediction model. (It is one strategy among several — the product center is the provable Arena and trust core, not any single strategy.)
 
 The agent should compare TxLINE de-margined consensus fair value against an executable venue price:
 

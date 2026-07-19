@@ -70,7 +70,7 @@ We pulled real TxLINE history across **18 finished World Cup fixtures**, sealed 
 - **No real-money order has been placed yet.** The live_guarded surface is built, reviewed, and fail-closed; the first 1-share smoke is deliberately a human operator's decision ([operator runbook](operator-runbook.md)).
 - **No executable venue edge is claimed.** Run-001 is a *candidate* rung-1 CLV signal (not proven executable alpha); Run-002 did NOT demonstrate executable venue edge (rung-2 estimated mids, `real_executable_edge_bps = None`, no profit or fillability claim). The C/P2 falsification lane that follows is predeclared, not retro-fitted.
 - **Custody/payouts (Prize Vault)** are designed and visible in the UI but not wired — and the UI says so.
-- **Raw vendor odds are not redistributed** — the real-fixture ReplayPack stays local (licensed data); the pipeline, fixes, and sealed-proof discipline are what ship.
+- **The bounded curated genuine ReplayPack** (a 400-record prefix per fixture, ~0.6 MB) is included with TxODDS's confirmation; the full multi-GB raw capture stays local. The pipeline, fixes, and sealed-proof discipline are what ship.
 
 ## Stack
 
