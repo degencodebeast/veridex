@@ -321,6 +321,42 @@ async def _resolve_owned_instance(
     return instance
 
 
+#: The lifecycle statuses in which a competition's roster may still be mutated (I-7b). Once the arena
+#: (or start) claims the competition out of this window, ``add_agent_entry_guarded`` refuses any append,
+#: so a registration racing a start can never mutate a roster the run has already frozen (Codex M1).
+_ROSTER_MUTABLE_STATUSES: tuple[CompetitionStatus, ...] = (CompetitionStatus.DRAFT, CompetitionStatus.OPEN)
+
+
+def declared_config_hash(*, agent_id: str, strategy: str, model: str | None, proof_mode: str) -> str:
+    """Content hash of a DECLARED entry's identity (CON-207): ``{agent_id, strategy, model, proof_mode}``.
+
+    The single canonical serializer for a declared roster entry's identity commitment. ``proof_mode`` MUST
+    already be the normalized canonical value (``"reproducible"`` / ``"verified"``). The intrinsic arena's
+    strict config contract (Codex M2) recomputes an EXPECTED hash with this same helper and compares it to
+    each registered entry's pinned ``config_hash`` — so equal ids/strategy labels alone can never admit a
+    roster whose pinned model/proof identity differs from the contestant the arena actually runs.
+
+    Args:
+        agent_id: The declared agent identifier.
+        strategy: The declared strategy label.
+        model: The declared model slug (or ``None``).
+        proof_mode: The already-normalized proof mode.
+
+    Returns:
+        The hex SHA-256 identity hash.
+    """
+    return hashlib.sha256(
+        serialize_payload(
+            {
+                "agent_id": agent_id,
+                "strategy": strategy,
+                "model": model,
+                "proof_mode": proof_mode,
+            }
+        ).encode("utf-8")
+    ).hexdigest()
+
+
 async def register_agent(
     store: Store,
     competition_id: str,
@@ -377,18 +413,19 @@ async def register_agent(
             }
         )
     else:
-        config_hash = hashlib.sha256(
-            serialize_payload(
-                {
-                    "agent_id": entry.agent_id,
-                    "strategy": entry.strategy,
-                    "model": entry.model,
-                    "proof_mode": normalized_proof_mode,
-                }
-            ).encode("utf-8")
-        ).hexdigest()
+        config_hash = declared_config_hash(
+            agent_id=entry.agent_id,
+            strategy=entry.strategy,
+            model=entry.model,
+            proof_mode=normalized_proof_mode,
+        )
         finalized = entry.model_copy(update={"proof_mode": normalized_proof_mode, "config_hash": config_hash})
-    await store.add_agent_entry(competition_id, finalized)
+    # Atomic status-guarded admission (Codex M1): append ONLY IF the roster is still mutable, with the
+    # duplicate-id + capacity checks in the SAME write, so a registration racing an arena/start claim can
+    # never append after the run has frozen the roster. Raises RosterAdmissionError on any guard failure.
+    await store.add_agent_entry_guarded(
+        competition_id, finalized, mutable_statuses=_ROSTER_MUTABLE_STATUSES
+    )
     return finalized
 
 

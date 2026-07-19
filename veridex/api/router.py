@@ -103,6 +103,7 @@ from veridex.competition.service import (
     RosterInstanceNotFoundError,
     RosterInstanceNotOwnedError,
     _default_policy_envelope,
+    declared_config_hash,
     register_agent,
     start_competition,
 )
@@ -129,7 +130,7 @@ from veridex.runtime.runtime_events import RuntimeEvent, RuntimeEventType
 from veridex.runtime.runtime_store import DurableRuntimeEventStore
 from veridex.runtime.window import RunWindow
 from veridex.scoring import score_run
-from veridex.store import CompetitionStatusClaimError, InMemoryStore, Store
+from veridex.store import CompetitionStatusClaimError, InMemoryStore, RosterAdmissionError, Store
 from veridex.strategies.llm_drift import default_model_launcher
 from veridex.venues.sx_bet import FakeVenueAdapter, SXBetAdapter
 from veridex.verifier.proof_card import proof_card_from_run_result
@@ -171,6 +172,44 @@ _ARENA_CONTESTANT_CONTRACT: dict[str, str] = {
     DET_DRIFT_CONTESTANT: "cumulative-drift",
     LLM_DRIFT_CONTESTANT: "llm",
 }
+
+#: The intrinsic arena's canonical proof mode. The checkpointed det-Drift vs LLM-Drift comparison is a
+#: reproducible snapshot replay (no per-contestant proof anchoring), so both intrinsic contestants pin
+#: ``"reproducible"``. Folded into each contestant's EXPECTED ``config_hash`` so the strict contract binds
+#: proof_mode as well as model + id/strategy (Codex M2).
+_ARENA_PROOF_MODE = "reproducible"
+
+
+async def _recover_arena_claim(store: Store, competition_id: str) -> None:
+    """Fail-closed recovery after a post-claim arena failure (Codex M3).
+
+    A model/drain/persistence failure AFTER the atomic claim must never strand the competition in
+    ``RUNNING`` with a reserved run_id, zero events, and a permanent 409. This best-effort reconciliation:
+
+    - If NO canonical events were committed for the claimed run (the reproduced ``ArenaDrainError`` case,
+      where the failure precedes any append), CAS-roll the competition back ``RUNNING -> DRAFT`` and clear
+      the reserved run_id, so the run is RETRYABLE rather than a permanently dead competition.
+    - If events WERE committed (the append landed but a later step failed), finalize the competition as
+      terminal so it is completed-as-failed, never stranded mid-``RUNNING``.
+
+    All store calls are best-effort — recovery must never raise over the original failure being surfaced.
+
+    Args:
+        store: The async repository.
+        competition_id: The competition to reconcile.
+    """
+    try:
+        events = await store.list_competition_events(competition_id, since_seq=-1)
+    except Exception:
+        events = []
+    if events:
+        with contextlib.suppress(Exception):
+            await store.update_competition_status(competition_id, CompetitionStatus.FINALIZED)
+    else:
+        with contextlib.suppress(CompetitionStatusClaimError, KeyError):
+            await store.release_competition_run(
+                competition_id, expected=CompetitionStatus.RUNNING, new=CompetitionStatus.DRAFT
+            )
 
 
 def _derive_leaderboard(events: list[CompetitionEvent]) -> list[CompetitionLeaderboardRow]:
@@ -961,6 +1000,13 @@ def create_app(
 
         try:
             finalized = await register_agent(dep_store, competition_id, entry, principal_did=principal.did)
+        except RosterAdmissionError as exc:
+            # Atomic status-guarded admission refused the append (Codex M1): the roster left the mutable
+            # window (a racing arena/start claim froze it), a duplicate id, or the roster is full. The
+            # pre-checks above catch the common non-racing case; this catches the RACE (status changed
+            # between the pre-check read and the guarded write) — fail closed with 409, never a silent
+            # post-freeze mutation.
+            raise HTTPException(status_code=409, detail=str(exc)) from None
         except RosterInstanceNotOwnedError:
             # Instance-bound entry references a deployed instance owned by another principal — mirror I-2
             # (deploy.py GET /agents/instances/{id}): 403, and no config_hash was read/returned.
@@ -1164,6 +1210,46 @@ def create_app(
                 ),
             )
 
+        # BIND the pinned MODEL/CONFIG identity, not just id -> strategy (Codex M2). id/strategy labels
+        # ALONE are insufficient: the declared-entry ``config_hash`` folds ``model`` + ``proof_mode``, and
+        # an instance-bound entry pins an entire deployed ``effective_config`` the intrinsic arena does not
+        # run. The intrinsic arena runs det-Drift (no model) + LLM-Drift over the injected launcher whose
+        # model identity is ``arena_model_id``; each entry's pinned ``config_hash`` MUST equal the EXPECTED
+        # hash for that intrinsic identity, and no entry may carry an instance binding. A roster whose
+        # LLM entry pins a DIFFERENT model has a different config_hash and is refused 409 (fail-closed) —
+        # so two different-model rosters can never both be accepted and produce byte-identical reports.
+        arena_model_id = getattr(resolved_arena_model_launcher, "model_id", None)
+        expected_models: dict[str, str | None] = {DET_DRIFT_CONTESTANT: None, LLM_DRIFT_CONTESTANT: arena_model_id}
+        contestant_config: dict[str, dict[str, Any]] = {}
+        for entry in competition.entries:
+            strategy = _ARENA_CONTESTANT_CONTRACT[entry.agent_id]  # safe: declared == contract above
+            model = expected_models[entry.agent_id]
+            expected_hash = declared_config_hash(
+                agent_id=entry.agent_id, strategy=strategy, model=model, proof_mode=_ARENA_PROOF_MODE
+            )
+            if entry.instance_id is not None:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        f"roster entry {entry.agent_id!r} carries an incompatible instance binding; the "
+                        "intrinsic arena runs no deployed instance"
+                    ),
+                )
+            if entry.config_hash != expected_hash:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        f"roster entry {entry.agent_id!r} pins a model/config identity the intrinsic arena "
+                        f"does not run (expected config_hash {expected_hash}, got {entry.config_hash})"
+                    ),
+                )
+            contestant_config[entry.agent_id] = {
+                "strategy": strategy,
+                "model": model,
+                "proof_mode": _ARENA_PROOF_MODE,
+                "config_hash": expected_hash,
+            }
+
         # VALIDATE the declared roster through the SAME machinery start_competition uses — fail-closed on
         # an unknown strategy / a missing-or-drifted deployed instance (never a same-named reconstruction,
         # never a silent substitution). The strict contract above already pinned the ids + strategies.
@@ -1176,67 +1262,87 @@ def create_app(
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from None
 
-        # ATOMICALLY CLAIM the competition BEFORE the model runs (Codex M1). Reserve the run identity and
-        # compare-and-set DRAFT -> RUNNING in the store: two concurrent owner POSTs can never both pass
-        # the claim, so exactly ONE drives the physical comparison and the LOSER returns a controlled 409
-        # WITHOUT launching (no duplicate provider work, no unhandled duplicate-seq 500). The claim also
-        # freezes the roster against concurrent mutation for the duration of the run.
+        # ATOMICALLY CLAIM the competition BEFORE the model runs (Codex M1 + M3). ONE guarded write sets
+        # status DRAFT -> RUNNING AND reserves the run_id together (no crash window between the two writes,
+        # Codex M3). Two concurrent owner POSTs can never both pass the claim, so exactly ONE drives the
+        # physical comparison and the LOSER returns a controlled 409 WITHOUT launching. The claim also
+        # freezes the roster against concurrent mutation for the duration of the run (the register path's
+        # atomic status-guarded admission refuses any append once status left the mutable window).
         run_id = uuid4().hex
         try:
-            await dep_store.claim_competition_status(
-                competition_id, expected=CompetitionStatus.DRAFT, new=CompetitionStatus.RUNNING
+            await dep_store.claim_competition_run(
+                competition_id, expected=CompetitionStatus.DRAFT, new=CompetitionStatus.RUNNING, run_id=run_id
             )
         except CompetitionStatusClaimError:
             raise HTTPException(status_code=409, detail="competition already run") from None
-        await dep_store.update_competition_run_id(competition_id, run_id)
 
-        # Derive the tape from the competition's configured (offline) source — the SAME source
-        # start_competition drives the scored lifecycle over. Drive the checkpointed comparison HERE.
-        ticks = build_demo_ticks()
-        det_policy = CheckpointPolicy(cadence_s=1.0, evidence_age_limit_s=100_000.0)
-        arena = await run_arena_comparison(
-            ticks, model=resolved_arena_model_launcher, det_policy=det_policy
-        )
-        report = arena.report().to_payload()
+        # FAIL-CLOSED post-claim recovery (Codex M3): wrap model execution + report construction + event
+        # persistence so ANY failure (run_arena_comparison, ArenaDrainError, report/append error) RECOVERS
+        # instead of stranding the competition in RUNNING with a dead run_id, zero events, and a permanent
+        # 409. On failure ``_recover_arena_claim`` CAS-rolls RUNNING -> DRAFT and clears the run_id (when no
+        # events were committed) so the run is retryable, or finalizes as terminal (when events landed).
+        try:
+            # Derive the tape from the competition's configured (offline) source — the SAME source
+            # start_competition drives the scored lifecycle over. Drive the checkpointed comparison HERE.
+            ticks = build_demo_ticks()
+            det_policy = CheckpointPolicy(cadence_s=1.0, evidence_age_limit_s=100_000.0)
+            arena = await run_arena_comparison(
+                ticks, model=resolved_arena_model_launcher, det_policy=det_policy
+            )
+            report = arena.report().to_payload()
+            # REFLECT the ACTUAL verified model/config identity that ran (Codex M2) in the report payload.
+            report["contestant_config"] = contestant_config
 
-        # PERSIST the comparison through canonical competition state so it is OBSERVABLE from
-        # GET /competitions/{id} (a real run_id) and the canonical event stream — not ONLY this POST
-        # body. Mirror start_competition's finalize: emit the seq=0 COMPETITION_STARTED, append a derived
-        # event carrying the honest report, then FINALIZE. The arena comparison is checkpoint-based (not
-        # the scored orchestrator), so it produces no SCORE_UPDATE rows — the leaderboard stays empty,
-        # never a fabricated ranking. The started event's agent_ids ARE the run's ACTUAL contestant ids
-        # (the report's contestant identities) — BYTE-EQUAL, and (by the strict contract) exactly the
-        # declared roster ids: no identity substitution (Codex M2).
-        base_ts = int(ticks[0].ts) if ticks else 0
-        agent_ids = list(report["contestants"].keys())
-        started = build_competition_started_event(
-            competition_id=competition_id,
-            run_id=run_id,
-            source_mode=competition.config.source_mode,
-            agent_ids=agent_ids,
-            base_ts=base_ts,
-        )
-        arena_payload: dict[str, Any] = {
-            "competition_id": competition_id,
-            "run_id": run_id,
-            "agent_ids": agent_ids,
-            "arena_comparison": report,
-        }
-        arena_event = CompetitionEvent(
-            competition_id=competition_id,
-            run_id=run_id,
-            seq=1,
-            event_type=EventType.COMPETITION_FINALIZED,
-            event_ts=base_ts,
-            evidence=False,
-            source_sequence_no=None,
-            derived_from=[f"arena_comparison:{run_id}"],
-            payload=arena_payload,
-            payload_hash=event_payload_hash(arena_payload),
-        )
-        await dep_store.append_competition_events(competition_id, [started, arena_event])
-        # run_id was reserved+persisted at the atomic claim above; RUNNING -> FINALIZED seals the run.
-        await dep_store.update_competition_status(competition_id, CompetitionStatus.FINALIZED)
+            # PERSIST the comparison through canonical competition state so it is OBSERVABLE from
+            # GET /competitions/{id} (a real run_id) and the canonical event stream — not ONLY this POST
+            # body. Mirror start_competition's finalize: emit the seq=0 COMPETITION_STARTED, append a
+            # derived event carrying the honest report, then FINALIZE. The arena comparison is checkpoint-
+            # based (not the scored orchestrator), so it produces no SCORE_UPDATE rows — the leaderboard
+            # stays empty, never a fabricated ranking. The started event's agent_ids ARE the run's ACTUAL
+            # contestant ids (the report's contestant identities) — BYTE-EQUAL, and (by the strict
+            # contract) exactly the declared roster ids: no identity substitution (Codex M2).
+            base_ts = int(ticks[0].ts) if ticks else 0
+            agent_ids = list(report["contestants"].keys())
+            started = build_competition_started_event(
+                competition_id=competition_id,
+                run_id=run_id,
+                source_mode=competition.config.source_mode,
+                agent_ids=agent_ids,
+                base_ts=base_ts,
+            )
+            # Reflect the verified model/config identity in the started event too (Codex M2) — the started
+            # event now declares WHICH model/config each contestant ran, not just the ids.
+            started_payload = dict(started.payload)
+            started_payload["contestant_config"] = contestant_config
+            started = started.model_copy(
+                update={"payload": started_payload, "payload_hash": event_payload_hash(started_payload)}
+            )
+            arena_payload: dict[str, Any] = {
+                "competition_id": competition_id,
+                "run_id": run_id,
+                "agent_ids": agent_ids,
+                "arena_comparison": report,
+            }
+            arena_event = CompetitionEvent(
+                competition_id=competition_id,
+                run_id=run_id,
+                seq=1,
+                event_type=EventType.COMPETITION_FINALIZED,
+                event_ts=base_ts,
+                evidence=False,
+                source_sequence_no=None,
+                derived_from=[f"arena_comparison:{run_id}"],
+                payload=arena_payload,
+                payload_hash=event_payload_hash(arena_payload),
+            )
+            await dep_store.append_competition_events(competition_id, [started, arena_event])
+            # run_id was reserved+persisted at the atomic claim above; RUNNING -> FINALIZED seals the run.
+            await dep_store.update_competition_status(competition_id, CompetitionStatus.FINALIZED)
+        except Exception as exc:
+            await _recover_arena_claim(dep_store, competition_id)
+            raise HTTPException(
+                status_code=503, detail="arena run failed; competition rolled back and retryable"
+            ) from exc
 
         return {"competition_id": competition_id, "run_id": run_id, "arena_comparison": report}
 

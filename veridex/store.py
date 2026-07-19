@@ -132,6 +132,23 @@ class CompetitionStatusClaimError(Exception):
     """
 
 
+class RosterAdmissionError(Exception):
+    """Raised when an atomic status-guarded roster admission (``add_agent_entry_guarded``) is refused.
+
+    The single, store-agnostic signal for a REFUSED roster append — the append is admitted ONLY inside
+    the same atomic write that verifies (a) the competition is still in a roster-mutable status, (b) the
+    agent-id is not already registered, and (c) the roster is under ``config.roster_size``. A registration
+    racing an arena start therefore cannot append after the arena has claimed the competition out of the
+    mutable window. ``reason`` is one of ``"frozen"`` / ``"duplicate"`` / ``"capacity"``. Both
+    :class:`InMemoryStore` and :class:`PostgresStore` raise it from the same conditions so the register
+    endpoint reconciles on ONE contract (mirrors :class:`CompetitionStatusClaimError`).
+    """
+
+    def __init__(self, reason: str, message: str) -> None:
+        super().__init__(message)
+        self.reason = reason
+
+
 class LeaseStatus(str, Enum):
     """Forward-only lifecycle of an :class:`InstanceLease` (crash-safe single-active-run exclusivity).
 
@@ -368,6 +385,30 @@ class Store(Protocol):
         """
         ...
 
+    async def add_agent_entry_guarded(
+        self, competition_id: str, entry: AgentEntry, *, mutable_statuses: tuple[CompetitionStatus, ...]
+    ) -> None:
+        """Append ``entry`` ONLY IF the competition is still roster-mutable, atomically (roster freeze).
+
+        The atomic admission write the register path uses so a registration racing an arena start can
+        NEVER append after the arena claimed the competition out of the roster-mutable window. In ONE
+        atomic write it verifies, then appends: (a) ``status in mutable_statuses``, (b) no duplicate
+        ``agent_id``, and (c) the roster is under ``config.roster_size``. InMemory does the whole
+        check+append with no ``await`` gap; Postgres locks the row ``SELECT ... FOR UPDATE`` so a
+        concurrent claim blocks until this write commits.
+
+        Args:
+            competition_id: The owning competition.
+            entry: The finalized agent entry to append.
+            mutable_statuses: The statuses in which the roster may still be mutated (DRAFT/OPEN).
+
+        Raises:
+            KeyError: If no competition with ``competition_id`` exists.
+            RosterAdmissionError: If the status left the mutable window (``frozen``), the id is already
+                registered (``duplicate``), or the roster is full (``capacity``).
+        """
+        ...
+
     async def update_competition_status(self, competition_id: str, status: CompetitionStatus) -> None:
         """Overwrite the lifecycle status of a competition.
 
@@ -377,6 +418,50 @@ class Store(Protocol):
 
         Raises:
             KeyError: If no competition with ``competition_id`` exists.
+        """
+        ...
+
+    async def claim_competition_run(
+        self, competition_id: str, *, expected: CompetitionStatus, new: CompetitionStatus, run_id: str
+    ) -> None:
+        """Atomically CAS status ``expected`` -> ``new`` AND set ``run_id`` in ONE write (arena claim).
+
+        The single guarded write the arena start uses to CLAIM a competition: it advances ``status`` and
+        reserves ``run_id`` together, only when the observed status equals ``expected``. Binding both in
+        one write closes the crash window the old two-write sequence left (status claimed, run_id not yet
+        written). Two concurrent claims can never both pass (InMemory: no ``await`` between check and
+        write; Postgres: ``... WHERE status = expected``); the loser is refused.
+
+        Args:
+            competition_id: The competition to claim.
+            expected: The status the caller believes is current (the compare half of the CAS).
+            new: The status to set (the swap half).
+            run_id: The reserved run identifier to persist atomically with the status swap.
+
+        Raises:
+            KeyError: If no competition with ``competition_id`` exists.
+            CompetitionStatusClaimError: On a CAS conflict (a concurrent request already claimed it).
+        """
+        ...
+
+    async def release_competition_run(
+        self, competition_id: str, *, expected: CompetitionStatus, new: CompetitionStatus
+    ) -> None:
+        """Atomically CAS status ``expected`` -> ``new`` AND clear ``run_id`` (post-failure rollback).
+
+        The fail-closed rollback the arena uses when a post-claim run fails before any canonical event
+        was committed: it returns the competition to a retryable status and clears the reserved run_id,
+        so a stalled/failed run never permanently strands the competition in RUNNING with a dead run_id.
+        CAS-guarded on ``expected`` so it never clobbers a competition that moved on.
+
+        Args:
+            competition_id: The competition to roll back.
+            expected: The status the caller believes is current (the compare half of the CAS).
+            new: The status to set (the swap half; DRAFT to make the run retryable).
+
+        Raises:
+            KeyError: If no competition with ``competition_id`` exists.
+            CompetitionStatusClaimError: On a CAS conflict.
         """
         ...
 
@@ -1043,6 +1128,28 @@ class InMemoryStore:
             raise KeyError(f"no competition with competition_id={competition_id!r}")
         self._competitions[competition_id].entries.append(entry.model_copy(deep=True))
 
+    async def add_agent_entry_guarded(
+        self, competition_id: str, entry: AgentEntry, *, mutable_statuses: tuple[CompetitionStatus, ...]
+    ) -> None:
+        """Append IFF roster-mutable + no-dup + under-capacity, atomically (no ``await`` gap).
+
+        The whole check+append runs under a single asyncio step (no ``await``), so a registration
+        racing an arena claim can never observe a stale DRAFT and append after the claim advanced the
+        status — the check is re-evaluated at write time against the live status.
+        """
+        if competition_id not in self._competitions:
+            raise KeyError(f"no competition with competition_id={competition_id!r}")
+        competition = self._competitions[competition_id]
+        if competition.status not in mutable_statuses:
+            raise RosterAdmissionError(
+                "frozen", "roster is frozen: competition has already started"
+            )
+        if any(existing.agent_id == entry.agent_id for existing in competition.entries):
+            raise RosterAdmissionError("duplicate", f"agent {entry.agent_id!r} is already registered")
+        if len(competition.entries) >= competition.config.roster_size:
+            raise RosterAdmissionError("capacity", f"roster is full (cap {competition.config.roster_size})")
+        competition.entries.append(entry.model_copy(deep=True))
+
     async def update_competition_status(self, competition_id: str, status: CompetitionStatus) -> None:
         """Overwrite the stored competition's status.
 
@@ -1056,6 +1163,36 @@ class InMemoryStore:
         if competition_id not in self._competitions:
             raise KeyError(f"no competition with competition_id={competition_id!r}")
         self._competitions[competition_id].status = status
+
+    async def claim_competition_run(
+        self, competition_id: str, *, expected: CompetitionStatus, new: CompetitionStatus, run_id: str
+    ) -> None:
+        """Atomically CAS status + set run_id in one step (no ``await`` gap — see protocol)."""
+        if competition_id not in self._competitions:
+            raise KeyError(f"no competition with competition_id={competition_id!r}")
+        competition = self._competitions[competition_id]
+        if competition.status != expected:
+            raise CompetitionStatusClaimError(
+                f"CAS conflict for competition {competition_id!r}: expected {expected.value!r}, "
+                f"found {competition.status.value!r}"
+            )
+        competition.status = new
+        competition.run_id = run_id
+
+    async def release_competition_run(
+        self, competition_id: str, *, expected: CompetitionStatus, new: CompetitionStatus
+    ) -> None:
+        """Atomically CAS status + clear run_id (post-failure rollback — see protocol)."""
+        if competition_id not in self._competitions:
+            raise KeyError(f"no competition with competition_id={competition_id!r}")
+        competition = self._competitions[competition_id]
+        if competition.status != expected:
+            raise CompetitionStatusClaimError(
+                f"CAS conflict for competition {competition_id!r}: expected {expected.value!r}, "
+                f"found {competition.status.value!r}"
+            )
+        competition.status = new
+        competition.run_id = None
 
     async def claim_competition_status(
         self, competition_id: str, *, expected: CompetitionStatus, new: CompetitionStatus
@@ -2099,6 +2236,45 @@ class PostgresStore:
         finally:
             await self._release(conn)
 
+    async def add_agent_entry_guarded(
+        self, competition_id: str, entry: AgentEntry, *, mutable_statuses: tuple[CompetitionStatus, ...]
+    ) -> None:
+        """Read-verify-append under one ``SELECT ... FOR UPDATE`` transaction (status/dup/capacity).
+
+        The competition row is locked ``FOR UPDATE`` so a concurrent claim (which also locks the row)
+        blocks until this admission commits; the status/duplicate/capacity checks and the roster append
+        are therefore atomic against a racing arena start. Raising inside the transaction rolls it back,
+        so a refused admission never partially writes.
+        """
+        conn = await self._connect()
+        try:
+            async with conn.transaction(), conn.cursor() as cur:
+                await cur.execute(
+                    "SELECT status, config_json, entries_json FROM competitions WHERE competition_id = %s FOR UPDATE",
+                    (competition_id,),
+                )
+                row = await cur.fetchone()
+                if row is None:
+                    raise KeyError(f"no competition persisted with competition_id={competition_id!r}")
+                status = CompetitionStatus(row[0])
+                if status not in mutable_statuses:
+                    raise RosterAdmissionError("frozen", "roster is frozen: competition has already started")
+                config_data = json.loads(row[1])
+                config_data.pop("owner_id", None)  # I-7b rider is not a CompetitionConfig field
+                roster_size = CompetitionConfig.model_validate(config_data).roster_size
+                entries: list[dict[str, Any]] = json.loads(row[2])
+                if any(e.get("agent_id") == entry.agent_id for e in entries):
+                    raise RosterAdmissionError("duplicate", f"agent {entry.agent_id!r} is already registered")
+                if len(entries) >= roster_size:
+                    raise RosterAdmissionError("capacity", f"roster is full (cap {roster_size})")
+                entries.append(entry.model_dump(mode="json"))
+                await cur.execute(
+                    "UPDATE competitions SET entries_json = %s WHERE competition_id = %s",
+                    (serialize_payload(entries), competition_id),
+                )
+        finally:
+            await self._release(conn)
+
     async def update_competition_status(self, competition_id: str, status: CompetitionStatus) -> None:
         """Update the status column for a competition.
 
@@ -2155,6 +2331,68 @@ class PostgresStore:
                     # The guarded UPDATE matched no row → a racing request claimed it past ``expected``.
                     raise CompetitionStatusClaimError(
                         f"CAS conflict for competition {competition_id!r}: status changed under the claim"
+                    )
+        finally:
+            await self._release(conn)
+
+    async def claim_competition_run(
+        self, competition_id: str, *, expected: CompetitionStatus, new: CompetitionStatus, run_id: str
+    ) -> None:
+        """Atomic CAS status + run_id claim via ``SELECT ... FOR UPDATE`` + a guarded ``UPDATE`` (one txn)."""
+        conn = await self._connect()
+        try:
+            async with conn.transaction(), conn.cursor() as cur:
+                await cur.execute(
+                    "SELECT status FROM competitions WHERE competition_id = %s FOR UPDATE",
+                    (competition_id,),
+                )
+                row = await cur.fetchone()
+                if row is None:
+                    raise KeyError(f"no competition persisted with competition_id={competition_id!r}")
+                current = CompetitionStatus(row[0])
+                if current != expected:
+                    raise CompetitionStatusClaimError(
+                        f"CAS conflict for competition {competition_id!r}: expected {expected.value!r}, "
+                        f"found {current.value!r}"
+                    )
+                await cur.execute(
+                    "UPDATE competitions SET status = %s, run_id = %s WHERE competition_id = %s AND status = %s",
+                    (new.value, run_id, competition_id, expected.value),
+                )
+                if cur.rowcount != 1:
+                    raise CompetitionStatusClaimError(
+                        f"CAS conflict for competition {competition_id!r}: status changed under the claim"
+                    )
+        finally:
+            await self._release(conn)
+
+    async def release_competition_run(
+        self, competition_id: str, *, expected: CompetitionStatus, new: CompetitionStatus
+    ) -> None:
+        """Atomic CAS status + clear run_id (post-failure rollback) — guarded ``UPDATE`` in one txn."""
+        conn = await self._connect()
+        try:
+            async with conn.transaction(), conn.cursor() as cur:
+                await cur.execute(
+                    "SELECT status FROM competitions WHERE competition_id = %s FOR UPDATE",
+                    (competition_id,),
+                )
+                row = await cur.fetchone()
+                if row is None:
+                    raise KeyError(f"no competition persisted with competition_id={competition_id!r}")
+                current = CompetitionStatus(row[0])
+                if current != expected:
+                    raise CompetitionStatusClaimError(
+                        f"CAS conflict for competition {competition_id!r}: expected {expected.value!r}, "
+                        f"found {current.value!r}"
+                    )
+                await cur.execute(
+                    "UPDATE competitions SET status = %s, run_id = NULL WHERE competition_id = %s AND status = %s",
+                    (new.value, competition_id, expected.value),
+                )
+                if cur.rowcount != 1:
+                    raise CompetitionStatusClaimError(
+                        f"CAS conflict for competition {competition_id!r}: status changed under the rollback"
                     )
         finally:
             await self._release(conn)
