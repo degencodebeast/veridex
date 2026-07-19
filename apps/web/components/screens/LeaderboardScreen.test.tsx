@@ -33,7 +33,10 @@ describe('LeaderboardScreen (REQ-013 / AC-005 / WD-7)', () => {
     // it is BOTH not-eligible (partial proof) AND low-confidence (tiny sample).
     const rows: LeaderboardRow[] = [
       mk({ agent_id: 'lowclv', agent_name: 'Low CLV Eligible', avg_clv_bps: 4, proof_mode: 'reproducible', valid_count: 200, clv_confidence: 'high', low_sample: false }),
-      mk({ agent_id: 'topclv', agent_name: 'Top CLV Unproven', avg_clv_bps: 30, proof_mode: 'partial', valid_count: 3, clv_confidence: 'low', low_sample: true }),
+      // II-W defect 5: eligibility is the BACKEND value (anchor-derived), rendered verbatim — a
+      // partial-proof "unproven" agent carries eligibility_badge:'not-eligible' consistently (the
+      // screen no longer re-derives it from proof_mode).
+      mk({ agent_id: 'topclv', agent_name: 'Top CLV Unproven', avg_clv_bps: 30, proof_mode: 'partial', eligibility_badge: 'not-eligible', valid_count: 3, clv_confidence: 'low', low_sample: true }),
       mk({ agent_id: 'midclv', agent_name: 'Mid CLV Eligible', avg_clv_bps: 12, proof_mode: 'verified', valid_count: 80, clv_confidence: 'high', low_sample: false }),
     ];
     render(<LeaderboardScreen rows={rows} />);

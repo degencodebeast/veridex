@@ -1,8 +1,9 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { render, screen } from '@testing-library/react';
 import { InspectorScreen } from '@/components/screens/inspector/InspectorScreen';
-import { sampleInspectorRecord } from '@/__tests__/fixtures/contracts';
+import { adaptInspector } from '@/lib/api';
 import { GLOSSARY } from '@/lib/glossary';
+import type * as W from '@/lib/wire';
 
 beforeEach(() => {
   window.matchMedia = vi.fn().mockImplementation((q: string) => ({
@@ -12,51 +13,74 @@ beforeEach(() => {
   }));
 });
 
-// II-W defect 2 · A CLV in the PENDING state (backend emits the non-numeric "pending" sentinel for a
-// valid WAIT/abstention — veridex/api/router.py:796 `clv_bps = score_row.get("clv_bps", "pending")`;
-// InspectorRecord.clv_bps is typed `int | str` — veridex/api/schemas.py:290) must render a PENDING
-// affordance, NEVER a fabricated `0 bps`. This is DISTINCT from the F-5 / R-globalclv null/unscored
-// CLV → "—" fix: pending is "too little runway to score yet" (GLOSSARY.clv_pending), an honest
-// abstention, not an absent value. The pre-fix adapter coerced "pending" via `Number('pending') || 0`
-// → a fabricated 0.
-describe('II-W defect 2 · Inspector renders PENDING CLV honestly, never a fabricated 0 bps', () => {
-  it('a pending-CLV record shows the PENDING affordance and NO 0-bps score number', () => {
-    const pending = {
-      ...sampleInspectorRecord,
-      clv_explanation: {
-        ...sampleInspectorRecord.clv_explanation,
-        clv_bps: 0, clv_pending: true,
-      },
-    };
-    const clvSection = render(<InspectorScreen record={pending} />)
-      .container.querySelector('[aria-label="CLV explanation"]') as HTMLElement;
-    // The SCORE chip renders the honest PENDING affordance (single-sourced from the glossary), NEVER a
-    // fabricated bps number — the pre-fix code rendered fmtBps(0) = "SCORE = +0.0 bps" here.
-    const scoreChip = clvSection.querySelector('[class*="scoreChip"]') as HTMLElement;
+// BACKEND-SHAPED fixtures: a real wire-shaped InspectorRecord routed THROUGH adaptInspector, then
+// rendered — so each RED proves the backend value reaches the screen, not a hand-built view model.
+function wireInspector(over: Partial<W.InspectorRecord>): W.InspectorRecord {
+  return {
+    run_id: 'run_7f3a', agent_id: 'agt_x', tick_seq: 5,
+    market_state: {}, agent_action: { type: 'FLAG_VALUE', params: {} },
+    recompute: { recomputed_edge_bps: 22, clv_bps: 18, valid: true },
+    clv_bps: 18, untrusted_llm_metadata: {}, ...over,
+  } as W.InspectorRecord;
+}
+
+// II-W defect 2 (Minor fold) · PENDING must reach the screen THROUGH adaptInspector — the backend
+// "pending" sentinel (router.py:796; clv_bps: int|str, schemas.py:290) drives BOTH the headline
+// PENDING affordance and the recompute echo's honest null, never a fabricated 0.
+describe('II-W defect 2 · a pending wire clv_bps renders PENDING end-to-end (adapter → screen)', () => {
+  it('headline SCORE chip shows PENDING and the recompute echo shows null (never a 0)', () => {
+    const rec = adaptInspector(wireInspector({
+      clv_bps: 'pending', recompute: { recomputed_edge_bps: 0, clv_bps: 'pending', valid: true },
+    }));
+    const { container } = render(<InspectorScreen record={rec} />);
+    const scoreChip = container.querySelector('[class*="scoreChip"]') as HTMLElement;
     expect(scoreChip.textContent).toBe(`SCORE = ${GLOSSARY.clv_pending.label}`);
     expect(scoreChip.textContent).not.toMatch(/bps/);
-    // The CLV quantity cell (last-but-one dd — CLV sits above the always-"—" stake row) shows pending too.
-    const dds = Array.from(clvSection.querySelectorAll('dd')).map((d) => d.textContent);
-    expect(dds).toContain(GLOSSARY.clv_pending.label);
+    // the Deterministic Recompute JSON echo preserves the sentinel as null, never a fabricated 0
+    const recomputePanel = screen.getByText('Deterministic Recompute').parentElement as HTMLElement;
+    expect(recomputePanel.textContent).toMatch(/"clv_bps"\s*:\s*null/);
+    expect(recomputePanel.textContent).not.toMatch(/"clv_bps"\s*:\s*0/);
   });
 });
 
-// II-W defect 6 · The Inspector's decision story must DISTINGUISH a deterministic agent's proposal
-// from an LLM's — it must NOT always say "LLM proposed". The backend marks this by the presence of
-// `untrusted_llm_metadata` (reason/confidence/claimed_edge_bps): POPULATED for an LLM action, EMPTY
-// {} for a deterministic agent that emits none (veridex/api/router.py:803-805). The view-model
-// carries this as `untrusted_llm` (null ⇒ deterministic). Labeling a deterministic action "LLM
-// proposed" fabricates an LLM in the provenance story.
-describe('II-W defect 6 · Inspector distinguishes deterministic vs LLM proposer', () => {
-  it('a deterministic action (untrusted_llm=null) is NOT labeled "LLM proposed"', () => {
-    const deterministic = { ...sampleInspectorRecord, untrusted_llm: null };
-    render(<InspectorScreen record={deterministic} />);
+// II-W defect 6 (REWORKED per Codex) · The frontend has NO authoritative producer field. The backend
+// copies reason/confidence/claimed_edge from GENERIC action params (router.py:803-805); DETERMINISTIC
+// strategies emit that metadata (veridex/strategies/drift.py:180-183) while an LLM WAIT carries EMPTY
+// params (veridex/strategies/llm_drift.py:147-149). So metadata presence does NOT indicate producer —
+// inferring kind is unreliable/inverted. The honest resolution is a NEUTRAL label ("Agent proposed").
+// A real det-vs-LLM distinction needs a backend proposer_kind field (out of scope — follow-up).
+describe('II-W defect 6 · Inspector uses a NEUTRAL proposer label — never infers agent kind from metadata', () => {
+  it('a DETERMINISTIC action carrying reason/claimed_edge metadata is NOT labeled "LLM proposed"', () => {
+    // drift.py emits reason + claimed_edge_bps on FOLLOW_MOMENTUM — a deterministic producer.
+    const rec = adaptInspector(wireInspector({
+      agent_action: { type: 'FOLLOW_MOMENTUM', params: { market_key: 'm', side: 'FRA', reason: 'cumulative drift', claimed_edge_bps: 42 } },
+      untrusted_llm_metadata: { reason: 'cumulative drift', claimed_edge_bps: 42 },
+    }));
+    render(<InspectorScreen record={rec} />);
     expect(screen.queryByText(/LLM proposed/i)).toBeNull();
-    expect(screen.getByText(/Deterministic proposal/i)).toBeInTheDocument();
+    expect(screen.getByText(/Agent proposed/i)).toBeInTheDocument();
   });
 
-  it('an LLM action (untrusted_llm present) still reads "LLM proposed" (unchanged)', () => {
-    render(<InspectorScreen record={sampleInspectorRecord} />);
-    expect(screen.getByText(/LLM proposed/i)).toBeInTheDocument();
+  it('an LLM WAIT with EMPTY params is NOT labeled "Deterministic"', () => {
+    // llm_drift.py _wait() returns params={} — an LLM producer with no metadata.
+    const rec = adaptInspector(wireInspector({
+      agent_action: { type: 'WAIT', params: {} }, untrusted_llm_metadata: {},
+    }));
+    render(<InspectorScreen record={rec} />);
+    expect(screen.queryByText(/Deterministic proposal/i)).toBeNull();
+    expect(screen.getByText(/Agent proposed/i)).toBeInTheDocument();
+  });
+
+  it('the untrusted-metadata note renders ONLY when metadata is present, and is worded agent-supplied (not LLM)', () => {
+    const withMeta = adaptInspector(wireInspector({ untrusted_llm_metadata: { reason: 'r', claimed_edge_bps: 5 } }));
+    const withNone = adaptInspector(wireInspector({ untrusted_llm_metadata: {} }));
+    const a = render(<InspectorScreen record={withMeta} />);
+    // scope to the AgentAction NOTE text (the section header also carries "agent-supplied metadata")
+    expect(a.getByText(/params include untrusted agent-supplied metadata/i)).toBeInTheDocument();
+    expect(a.queryByText(/untrusted LLM claims/i)).toBeNull();
+    a.unmount();
+    const b = render(<InspectorScreen record={withNone} />);
+    // no agent-supplied metadata ⇒ the note is absent entirely (never printed unconditionally)
+    expect(b.queryByText(/params include untrusted agent-supplied metadata/i)).toBeNull();
   });
 });

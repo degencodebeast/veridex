@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { adaptLeaderboard, adaptExecutionReceipts, adaptInspector } from '@/lib/api';
+import { adaptLeaderboard, adaptExecutionReceipts, adaptInspector, adaptCompetitionState } from '@/lib/api';
 import type * as W from '@/lib/wire';
 
 // II-W · Wire-defect RED controls (adapter surface). Each `it` reproduces ONE distinct frontend↔
@@ -67,6 +67,20 @@ describe('II-W defect 5 · adaptLeaderboard: eligibility is the backend (anchor-
   it('an unproven row renders `not-eligible` (the backend value, not a proof_mode guess)', () => {
     const rows = adaptLeaderboard({ rows: [wireRow({ eligibility_badge: 'unproven', proof_mode: 'verified' })] });
     expect(rows[0].eligibility_badge).toBe('not-eligible');
+  });
+
+  it('the COMPETITION adapter never re-derives eligibility from proof_mode — it FAILS CLOSED (no authoritative field)', () => {
+    // CompetitionLeaderboardRow (veridex/api/schemas.py:152-172) carries NO eligibility field — only
+    // {rank, agent_id, total_clv_bps, mean_clv_bps, valid_count, proof_mode}. Deriving eligibility from
+    // proof_mode violates the II-W "UI never re-derives" contract, so a proof_mode="verified" row must
+    // render not-eligible (fail closed), NEVER a fabricated "eligible".
+    const s = adaptCompetitionState({
+      competition_id: 'comp-x', status: 'running',
+      config: { source_mode: 'replay', execution_mode: 'paper' }, roster: [],
+      leaderboard: [{ rank: 1, agent_id: 'a', total_clv_bps: 10, mean_clv_bps: 10, valid_count: 2, proof_mode: 'verified' }] as unknown as Record<string, unknown>[],
+      latest_seq: 5, anchor_status: 'pending', run_id: 'run-x', proof_card: null, execution: null,
+    } as unknown as W.CompetitionStateResponse);
+    expect(s.leaderboard[0].eligibility_badge).toBe('not-eligible');
   });
 });
 

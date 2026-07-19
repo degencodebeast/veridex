@@ -392,8 +392,13 @@ export function adaptCompetitionLeaderboard(
       total_clv_bps: r.total_clv_bps,
       sim_pnl: null, brier: null, max_drawdown: null, action_count: null, valid_pct: null, // ABSENT ⇒ "—"
       proof_mode,
-      // eligibility = proof completeness (REQ-006), NEVER a rank input (SEC-005). Derived, not fabricated.
-      eligibility_badge: proof_mode === 'reproducible' || proof_mode === 'verified' ? 'eligible' : 'not-eligible',
+      // II-W defect 5: the competition-scoped CompetitionLeaderboardRow (veridex/api/schemas.py:152-172)
+      // carries NO authoritative eligibility field — only {rank, agent_id, total/mean_clv_bps,
+      // valid_count, proof_mode}. Re-deriving eligibility from proof_mode violates the "UI never
+      // re-derives" contract, so FAIL CLOSED to not-eligible — never a fabricated "eligible" without an
+      // authoritative signal. (This surface is not rendered as an eligibility column today; ClvLeaderboard
+      // shows proof_mode + anchor only. A true per-agent competition eligibility field is a backend follow-up.)
+      eligibility_badge: 'not-eligible',
       anchor_status: anchorStatus,          // competition-level anchor status, applied verbatim
       source_mode: sourceMode,
       valid_count: r.valid_count,           // real count from the competition contract

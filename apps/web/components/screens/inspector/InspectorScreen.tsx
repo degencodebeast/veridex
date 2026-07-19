@@ -18,9 +18,13 @@ export function InspectorScreen({ record }: { record: InspectorRecord }) {
   // PENDING CLV (II-W defect 2): a valid WAIT/abstention with too little runway shows the honest
   // glossary affordance, NEVER a fabricated numeric score (fmtBps(0) would read "+0.0 bps").
   const clvText = clv.clv_pending ? GLOSSARY.clv_pending.label : fmtBps(clv.clv_bps);
-  // DETERMINISTIC vs LLM (II-W defect 6): the proposer step reflects the real provenance — a
-  // deterministic agent (no untrusted LLM metadata) is NEVER labeled "LLM proposed".
-  const proposerLabel = record.untrusted_llm ? 'LLM proposed' : 'Deterministic proposal';
+  // PROPOSER label (II-W defect 6): the frontend has NO authoritative producer field. The backend
+  // copies reason/confidence/claimed_edge from GENERIC action params (router.py:803-805); deterministic
+  // strategies emit that metadata (strategies/drift.py) while an LLM WAIT carries empty params
+  // (strategies/llm_drift.py) — so metadata presence does NOT indicate producer. Inferring kind is
+  // unreliable/inverted, so use a NEUTRAL label. A real det-vs-LLM distinction needs a backend
+  // proposer_kind field (follow-up) — never a frontend guess.
+  const proposerLabel = 'Agent proposed';
   // Honest-absence: the doctrine quantities are null when not in the proof artifact —
   // render "—", never a plausible 0.0%/0.000 (no-overclaim). CLV is the real score.
   const fairValueText = clv.fair_value_pct == null || clv.closing_fair_value_pct == null
@@ -65,12 +69,15 @@ export function InspectorScreen({ record }: { record: InspectorRecord }) {
         <JsonPanel title="MarketState" data={record.market_state} />
         <div className={styles.actionPanel}>
           <JsonPanel title="AgentAction" data={record.agent_action} />
-          {/* The action params include untrusted LLM claims (reason/confidence/
-              claimed_edge_bps) — recorded, never scored (SEC-007). Marked so the
-              claim never reads as authoritative on this trust screen. */}
-          <p className={styles.actionNote}>
-            ⚠ params include untrusted LLM claims (reason · confidence · claimed_edge_bps) — recorded, not scored
-          </p>
+          {/* The action params may include untrusted agent-supplied metadata (reason/confidence/
+              claimed_edge_bps) — recorded, never scored (SEC-007). Shown ONLY when the metadata is
+              actually present, and worded producer-neutrally (deterministic strategies emit it too),
+              so the claim never reads as authoritative on this trust screen. */}
+          {record.untrusted_llm ? (
+            <p className={styles.actionNote}>
+              ⚠ params include untrusted agent-supplied metadata (reason · confidence · claimed_edge_bps) — recorded, not scored
+            </p>
+          ) : null}
         </div>
         <JsonPanel title="Deterministic Recompute" data={record.recompute} accent />
         <section className={styles.clv} aria-label="CLV explanation">
@@ -90,8 +97,8 @@ export function InspectorScreen({ record }: { record: InspectorRecord }) {
       </div>
 
       {record.untrusted_llm ? (
-        <section className={styles.untrusted} aria-label="Untrusted LLM metadata">
-          <div className={styles.untrustedHead}>⚠ UNTRUSTED LLM METADATA · NOT AN INPUT TO SCORE</div>
+        <section className={styles.untrusted} aria-label="Untrusted agent metadata">
+          <div className={styles.untrustedHead}>⚠ UNTRUSTED AGENT-SUPPLIED METADATA · NOT AN INPUT TO SCORE</div>
           <JsonPanel data={{ model: record.untrusted_llm.model, confidence: record.untrusted_llm.confidence, claimed_edge_bps: record.untrusted_llm.claimed_edge_bps }} />
           <p className={styles.rationale}>{record.untrusted_llm.rationale}</p>
         </section>

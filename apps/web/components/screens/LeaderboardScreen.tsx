@@ -6,7 +6,7 @@ import { Num } from '@/components/ui/Num';
 import { ConfBar } from '@/components/ui/ConfBar';
 import { SegmentedControl } from '@/components/ui/SegmentedControl';
 import { InfoTip } from '@/components/ui/InfoTip';
-import { rankByAvgClv, isEligible } from '@/lib/derive';
+import { rankByAvgClv } from '@/lib/derive';
 import { LEADERBOARD_ROWS } from '@/lib/fixtures/catalog';
 import { MAKER_ARENA_RESULT, MAKER_AGENT_META } from '@/lib/fixtures/maker';
 import { deriveMakerVerdict } from '@/lib/makerVerdict';
@@ -104,7 +104,10 @@ export function LeaderboardScreen({
                     <td className={styles.num}>{r.valid_pct === null ? '—' : `${r.valid_pct.toFixed(1)}%`}</td>
                     <td><ConfBar validCount={r.valid_count} /></td>
                     <td><Badge variant={r.proof_mode} /></td>
-                    <td><Badge variant={isEligible(r.proof_mode) ? 'eligible' : 'not-eligible'} /></td>
+                    {/* II-W defect 5: render the BACKEND-authoritative eligibility_badge VERBATIM
+                        (anchor-derived server-side — veridex/leaderboard.py). NEVER re-derive it from
+                        proof_mode here; that reversed the adapter fix and disagreed with the backend. */}
+                    <td><Badge variant={r.eligibility_badge} /></td>
                     <td><Badge variant={r.anchor_status === 'anchored' ? 'anchored' : r.anchor_status === 'not-anchored' ? 'not-anchored' : 'pending'} /></td>
                     <td data-testid="lb-source">
                       {r.source_mode === 'live' ? <Badge variant="live" />
