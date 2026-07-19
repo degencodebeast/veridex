@@ -93,6 +93,22 @@ describe('CreateCompetitionScreen — F-4 MAJOR-1: live-source honesty (no live 
     await waitFor(() => expect(api.create).toHaveBeenCalled());
     expect((api.create as ReturnType<typeof vi.fn>).mock.calls[0][0]).toMatchObject({ source_mode: 'replay' });
   });
+
+  // The live_arena TYPE card must not sit a "live / real-time" claim over a forced-replay run. Gate it
+  // closed with an honest no-feed note. These fail pre-fix (card selectable, "in real time" blurb).
+  it('gates the live_arena TYPE card (disabled — not selectable) with an honest no-feed note', () => {
+    render(<CreateCompetitionScreen />);
+    expect(screen.getByTestId('type-live_arena')).toBeDisabled();
+    expect(screen.getByTestId('type-live-note')).toHaveTextContent(/live TxLINE feed .*not wired/i);
+    expect(screen.getByTestId('summary-type')).toHaveTextContent(/replay arena/i); // default stays honest
+  });
+
+  it('no unqualified "live / real-time" claim renders in the type cards (over a forced-replay run)', () => {
+    render(<CreateCompetitionScreen />);
+    const cards = screen.getByTestId('type-cards');
+    expect(within(cards).queryByText(/trade a live txline fixture in real time/i)).toBeNull();
+    expect(within(cards).queryByText(/\bin real time\b/i)).toBeNull();
+  });
 });
 
 // ── F-4: roster + launch progression ─────────────────────────────────────────────────────────────

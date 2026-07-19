@@ -26,9 +26,12 @@ function proofFor(type: CompetitionType, source: SourceMode): ProofMode {
 // therefore not listable (honest: never offered as a contestant that couldn't actually run).
 const ELIGIBLE_STATUS = new Set(['running', 'sealed']);
 
-// The 4 real competition_type enum values (veridex CompetitionConfig) as rich cards.
-const TYPE_CARDS: { type: CompetitionType; label: string; blurb: string }[] = [
-  { type: 'live_arena', label: 'Live Arena', blurb: 'Agents trade a live TxLINE fixture in real time.' },
+// The 4 real competition_type enum values (veridex CompetitionConfig) as rich cards. MAJOR-1: the
+// live_arena card is gated closed — a Live Arena needs a live TxLINE feed, which is not wired yet, and
+// the backend runs a recorded tape. Its blurb makes NO "live / real-time" claim (that would be
+// dishonest over a forced-replay run); the honest no-feed note replaces it and the card is disabled.
+const TYPE_CARDS: { type: CompetitionType; label: string; blurb: string; disabled?: boolean }[] = [
+  { type: 'live_arena', label: 'Live Arena', blurb: 'A live TxLINE feed is not wired yet, so a live arena is unavailable — runs use a recorded replay.', disabled: true },
   { type: 'replay_arena', label: 'Replay Arena', blurb: 'Deterministic replay of a recorded fixture window.' },
   { type: 'head_to_head', label: 'Head-to-Head', blurb: 'Two agents, identical evidence — CLV gap, no winner badge.' },
   { type: 'prize_vault_challenge', label: 'Prize-Vault Challenge', blurb: 'Designed prize target (Phase 2D · no funds move).' },
@@ -168,12 +171,13 @@ export function CreateCompetitionScreen({
                   key={c.type}
                   type="button"
                   data-testid={`type-${c.type}`}
-                  aria-pressed={type === c.type}
-                  className={`${styles.card} ${type === c.type ? styles.cardActive : ''}`}
-                  onClick={() => setType(c.type)}
+                  aria-pressed={c.disabled ? undefined : type === c.type}
+                  disabled={c.disabled}
+                  className={`${styles.card} ${type === c.type ? styles.cardActive : ''} ${c.disabled ? styles.cardLocked : ''}`}
+                  onClick={() => { if (!c.disabled) setType(c.type); }}
                 >
-                  <span className={styles.cardLabel}>{c.label}</span>
-                  <span className={styles.cardBlurb}>{c.blurb}</span>
+                  <span className={styles.cardLabel}>{c.label}{c.disabled ? ' 🔒' : ''}</span>
+                  <span className={styles.cardBlurb} data-testid={c.disabled ? 'type-live-note' : undefined}>{c.blurb}</span>
                 </button>
               ))}
             </div>

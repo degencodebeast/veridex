@@ -13,6 +13,9 @@
 .card { display: flex; flex-direction: column; gap: 4px; text-align: left; padding: var(--space-2); border: 1px solid var(--border-soft); border-radius: var(--radius-control); background: var(--panel-2); cursor: pointer; }
 .card:hover { border-color: var(--accent); }
 .cardActive { border-color: var(--accent); background: var(--panel); }
+/* MAJOR-1: gated live_arena type card — visibly locked, not selectable (no live feed wired). */
+.cardLocked { opacity: 0.5; cursor: not-allowed; }
+.cardLocked:hover { border-color: var(--border-soft); }
 .cardLabel { font-size: 12px; font-weight: 600; color: var(--text-1); }
 .cardBlurb { font-size: 10px; color: var(--text-3); line-height: 1.4; }
 
