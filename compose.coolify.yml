@@ -89,6 +89,9 @@ services:
       args:
         # Absolute API origin the browser + SSR fetch (fail-closed: a missing value aborts the build).
         NEXT_PUBLIC_API_BASE: ${NEXT_PUBLIC_API_BASE:?NEXT_PUBLIC_API_BASE is required (absolute API origin)}
+        # Privy app id inlined into the browser bundle at build time (public identifier, NOT a secret).
+        # Must equal the backend PRIVY_APP_ID (token aud). Fail-closed: a missing value aborts the build.
+        NEXT_PUBLIC_PRIVY_APP_ID: ${NEXT_PUBLIC_PRIVY_APP_ID:?NEXT_PUBLIC_PRIVY_APP_ID is required (Privy app id; must match backend PRIVY_APP_ID)}
     depends_on:
       api-runtime:
         condition: service_healthy
