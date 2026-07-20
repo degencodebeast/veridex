@@ -690,6 +690,30 @@ class Store(Protocol):
         """
         ...
 
+    async def list_runtime_events_for_run(
+        self, run_id: str, *, since: int = 0, limit: int | None = None
+    ) -> list[RuntimeEventRow]:
+        """Return ONE run's durable OPS events with ``id > since``, ascending commit order (I-4).
+
+        The owner-scoped read seam. Unlike :meth:`list_runtime_events` (keyed on the reusable,
+        template-constant ``agent_id``, e.g. ``studio-quoteguard_mm``, shared across every deploy of a
+        template and across owners), this filters on the server-minted, per-instance ``run_id`` — the
+        authoritative identity pinned on the owned :class:`~veridex.deploy.instance.AgentInstance`.
+        Scoping to ``run_id`` both (a) prevents a cross-run/cross-owner OPS disclosure and (b) still
+        spans the run's lifecycle events emitted under a DIFFERENT ``veridex-mm-{instance}`` agent_id,
+        so a security fix never truncates lifecycle evidence. The caller supplies no ``run_id``: the
+        route derives it from the owned instance after the ownership check.
+
+        Args:
+            run_id: The authoritative run whose OPS telemetry to read (server-derived, never client).
+            since: The last consumed ``id`` (exclusive lower bound); ``0`` returns from the start.
+            limit: When set, cap to the FIRST ``limit`` rows after ``since`` (forward paging).
+
+        Returns:
+            Matching :class:`RuntimeEventRow` objects, sorted by ``id`` ascending.
+        """
+        ...
+
     async def persist_agent_instance(self, instance: AgentInstance) -> None:
         """Persist a deployed :class:`~veridex.deploy.instance.AgentInstance` (source of truth).
 
@@ -1474,6 +1498,21 @@ class InMemoryStore:
             rows = rows[:limit]
         return rows
 
+    async def list_runtime_events_for_run(
+        self, run_id: str, *, since: int = 0, limit: int | None = None
+    ) -> list[RuntimeEventRow]:
+        """Return this RUN's durable OPS events with ``id > since``, ascending, capped at ``limit``.
+
+        The owner-scoped read seam (see :meth:`Store.list_runtime_events_for_run`): filters on the
+        authoritative ``run_id`` — spanning both composition (``studio-{template}``) and lifecycle
+        (``veridex-mm-{instance}``) agent_ids of the run — never the reusable template ``agent_id``.
+        """
+        rows = [row for row in self._runtime_events if row.run_id == run_id and row.id > since]
+        rows.sort(key=lambda r: r.id)
+        if limit is not None:
+            rows = rows[:limit]
+        return rows
+
     # --- agent-instance methods (Phase-2D deploy — REQ-2D-701A) ---
 
     async def persist_agent_instance(self, instance: AgentInstance) -> None:
@@ -1963,6 +2002,12 @@ class PostgresStore:
             )
             await cur.execute(
                 "CREATE INDEX IF NOT EXISTS idx_runtime_events_agent_id ON runtime_events(agent_id, id)"
+            )
+            # Owner-scoped run read (list_runtime_events_for_run): the instance-page / drawer polls
+            # WHERE run_id = %s AND id > %s ORDER BY id — index it so a poll never sequential-scans the
+            # growing spool (one maker run already emits ~900 rows). Mirrors the agent_id cursor index.
+            await cur.execute(
+                "CREATE INDEX IF NOT EXISTS idx_runtime_events_run_id ON runtime_events(run_id, id)"
             )
 
             # --- deployment-attempt ledger (I-3 — durable idempotency claim, INSERT-only) ---
@@ -2777,6 +2822,45 @@ class PostgresStore:
         if limit is not None:
             sql += " LIMIT %s"
             params = (agent_id, since, limit)
+        conn = await self._connect()
+        try:
+            async with conn.cursor() as cur:
+                await cur.execute(sql, params)
+                rows = await cur.fetchall()
+        finally:
+            await self._release(conn)
+        return [
+            RuntimeEventRow(
+                id=int(r[0]),
+                event_uuid=r[1],
+                agent_id=r[2],
+                run_id=r[3],
+                session_id=r[4],
+                event_type=r[5],
+                ts=int(r[6]),
+                channel=r[7],
+                payload=json.loads(r[8]),
+            )
+            for r in rows
+        ]
+
+    async def list_runtime_events_for_run(
+        self, run_id: str, *, since: int = 0, limit: int | None = None
+    ) -> list[RuntimeEventRow]:
+        """Return this RUN's durable OPS events with ``id > since``, ascending, capped at ``limit``.
+
+        The owner-scoped read seam (see :meth:`Store.list_runtime_events_for_run`): filters on the
+        authoritative ``run_id`` — spanning both composition (``studio-{template}``) and lifecycle
+        (``veridex-mm-{instance}``) agent_ids of the run — never the reusable template ``agent_id``.
+        """
+        sql = (
+            "SELECT id, event_uuid, agent_id, run_id, session_id, event_type, ts, channel, payload_json "
+            "FROM runtime_events WHERE run_id = %s AND id > %s ORDER BY id"
+        )
+        params: tuple[Any, ...] = (run_id, since)
+        if limit is not None:
+            sql += " LIMIT %s"
+            params = (run_id, since, limit)
         conn = await self._connect()
         try:
             async with conn.cursor() as cur:

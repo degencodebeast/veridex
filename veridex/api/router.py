@@ -1825,7 +1825,12 @@ def create_app(
             raise HTTPException(status_code=404, detail="agent instance not found")
         if instance.operator_id != principal.did:
             raise HTTPException(status_code=403, detail="principal does not own this agent instance")
-        rows = await dep_store.list_runtime_events(instance.agent_id, since=since, limit=limit)
+        # RUN-scoped, not agent_id-scoped: agent_id is a reusable template constant
+        # (studio-{template}) shared across deploys/owners, so reading by it would leak another
+        # run's/owner's OPS events. run_id is the server-minted per-instance authority (derived here
+        # from the OWNED instance, never the client) and also spans the run's lifecycle events emitted
+        # under a different veridex-mm-{instance} agent_id — so no lifecycle evidence is truncated.
+        rows = await dep_store.list_runtime_events_for_run(instance.run_id, since=since, limit=limit)
         events: list[dict[str, Any]] = []
         for row in rows:
             # Reconstruct through RuntimeEvent so the served shape is channel-pure by construction
