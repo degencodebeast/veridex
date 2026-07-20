@@ -17,7 +17,8 @@ Build and deploy sports-trading agents, compete them head-to-head on identical *
 </div>
 
 > `[Agent Studio → Arena leaderboard → Decision Inspector → Proof Card]`
-> ![alt text](image.png)
+> <img width="1512" height="499" alt="image" src="https://github.com/user-attachments/assets/a9ca095f-2bc8-4ab2-999a-7722de75e645" />
+
 
 ---
 
