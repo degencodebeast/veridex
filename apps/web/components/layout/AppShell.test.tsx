@@ -8,7 +8,9 @@ describe('AppShell', () => {
   it('renders the top nav, the wallet chip, and the page content region', () => {
     render(<AppShell><p>screen body</p></AppShell>);
     expect(screen.getByRole('navigation', { name: 'Primary' })).toBeInTheDocument();
-    expect(screen.getByRole('button', { name: /OP 9xQe/i })).toBeInTheDocument();
+    // Privy unconfigured in the test env → the chip renders its signed-out Connect-Wallet control
+    // (never a fabricated "connected" operator chip). Real session state is covered in WalletChip.test.
+    expect(screen.getByRole('button', { name: /connect wallet/i })).toBeInTheDocument();
     expect(screen.getByRole('main')).toBeInTheDocument();
     expect(screen.getByText('screen body')).toBeInTheDocument();
     // the shared run status bar is part of the app chrome (every app route)

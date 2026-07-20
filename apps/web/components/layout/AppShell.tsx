@@ -1,6 +1,6 @@
 import type { ReactNode } from 'react';
 import { TopNav } from './TopNav';
-import { WalletChip } from './WalletChip';
+import { SessionWalletChip } from './SessionWalletChip';
 import { DirectionRestore } from './DirectionRestore';
 import { MockBanner } from './MockBanner';
 import { StatusBar } from './StatusBar';
@@ -14,7 +14,7 @@ export function AppShell({ children }: { children: ReactNode }) {
       <header className={styles.header}>
         <TopNav />
         <div className={styles.right}>
-          <WalletChip />
+          <SessionWalletChip />
         </div>
       </header>
       <StatusBar />

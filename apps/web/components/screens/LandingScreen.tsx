@@ -2,6 +2,7 @@
 import Link from 'next/link';
 import { useReducedMotion } from '@/hooks/useReducedMotion';
 import { VERIFIER_VERSION } from '@/lib/status';
+import { shortHash } from '@/lib/format';
 import styles from './LandingScreen.module.css';
 
 type TraceTone = 'pos' | 'accent';
@@ -52,7 +53,16 @@ function Wordmark({ tag }: { tag?: boolean }) {
   );
 }
 
-export function LandingScreen() {
+// Session (`connected`/`address`/`onConnect`) is injected by the page, which reads Privy — the
+// screen never reads `usePrivy` itself (it throws outside <PrivyProvider>). When `onConnect` is
+// absent (unconfigured build) the Connect-Wallet CTAs are hidden rather than shown inert: a dead
+// button reads as broken, and no session is possible without Privy anyway. When `connected`, the
+// nav shows the real operator address (→ Dashboard) and the redundant Connect CTAs drop away.
+export function LandingScreen({
+  connected = false,
+  address,
+  onConnect,
+}: { connected?: boolean; address?: string; onConnect?: () => void } = {}) {
   const reduced = useReducedMotion();
   return (
     <main className={styles.landing} aria-label="Veridex landing">
@@ -66,7 +76,9 @@ export function LandingScreen() {
           <Link href="/why-veridex" className={styles.navLink}>Why Veridex</Link>
           <a href="#prizes" className={styles.navLink}>Prizes</a>
         </div>
-        <button type="button" className={styles.navWallet}>Connect Wallet</button>
+        {connected
+          ? <Link href="/dashboard" className={styles.navWallet}>OP {address ? shortHash(address) : 'wallet'}</Link>
+          : onConnect && <button type="button" className={styles.navWallet} onClick={onConnect}>Connect Wallet</button>}
         <Link href="/competitions" className={styles.navEnter}>Enter App →</Link>
       </nav>
 
@@ -78,7 +90,7 @@ export function LandingScreen() {
         </p>
         <div className={styles.ctas}>
           <Link href="/arena" className={styles.ctaPrimary}>Enter the Arena →</Link>
-          <button type="button" className={styles.ctaSecondary}>Connect Wallet</button>
+          {!connected && onConnect && <button type="button" className={styles.ctaSecondary} onClick={onConnect}>Connect Wallet</button>}
           <span className={styles.ctaCaption}>provable in-play trading edge —<br />not verified predictions</span>
         </div>
 
@@ -175,7 +187,7 @@ export function LandingScreen() {
           <p className={styles.prizeCopy}>Prize vaults are designed to settle to the agent the law ranks first — payout will follow the anchored score root, not the spectacle. <span className={styles.prizeHonest}>Settlement is design-ahead on devnet: no live payout and no Squads custody yet; payout state is always labeled honestly (Phase 2D).</span></p>
           <div className={styles.prizeCtas}>
             <Link href="/arena" className={styles.ctaPrimary}>Enter the Arena →</Link>
-            <button type="button" className={styles.ctaSecondary}>Connect Wallet</button>
+            {!connected && onConnect && <button type="button" className={styles.ctaSecondary} onClick={onConnect}>Connect Wallet</button>}
           </div>
         </div>
       </section>

@@ -1,14 +1,31 @@
 'use client';
 import { useEffect, useRef, useState } from 'react';
 import Link from 'next/link';
-import { CONTEXTUAL_ROUTES } from '@/lib/nav';
+import { shortHash } from '@/lib/format';
 import styles from './WalletChip.module.css';
-
-const ACCOUNT_ACTIONS = ['Network: Solana Devnet', 'Settings', 'Disconnect'];
 
 const MENU_ID = 'wallet-chip-disclosure';
 
-export function WalletChip({ address = '9xQe…7vT2' }: { address?: string }) {
+// Presentational only: the real session (connected/address/login/logout) is injected by
+// SessionWalletChip, which reads Privy. WalletChip NEVER touches Privy itself — that keeps it
+// trivially testable and lets the chrome render in builds where Privy is unconfigured.
+type WalletChipProps = {
+  connected?: boolean;
+  address?: string;
+  onConnect?: () => void;
+  onDisconnect?: () => void;
+  // Privy not yet initialized — render nothing rather than flash a Connect prompt at an operator
+  // whose persisted session is about to rehydrate to `connected` (same posture as AuthGate).
+  ready?: boolean;
+};
+
+export function WalletChip({
+  connected = false,
+  address,
+  onConnect,
+  onDisconnect,
+  ready = true,
+}: WalletChipProps = {}) {
   const [open, setOpen] = useState(false);
   const ref = useRef<HTMLDivElement>(null);
 
@@ -26,9 +43,24 @@ export function WalletChip({ address = '9xQe…7vT2' }: { address?: string }) {
     };
   }, [open]);
 
-  // Disclosure pattern (not an application menu): a toggle button revealing a
-  // plain container of links + action buttons. No role=menu/menuitem — we do
-  // not implement arrow-key roving focus, so advertising it would be a lie.
+  if (!ready) return null;
+
+  // Signed out: a real Connect-Wallet control that fires Privy `login` — NOT a fake operator chip.
+  // Disabled (no `onConnect`) only in an unconfigured build where no session is possible anyway.
+  if (!connected) {
+    return (
+      <button type="button" className={styles.connect} onClick={onConnect} disabled={!onConnect}>
+        Connect Wallet
+      </button>
+    );
+  }
+
+  // Signed in: the operator chip shows the REAL connected address (truncated), never a placeholder.
+  const label = address ? shortHash(address) : 'wallet';
+
+  // Disclosure pattern (not an application menu): a toggle button revealing a plain container of a
+  // link + action buttons. No role=menu/menuitem — we do not implement arrow-key roving focus, so
+  // advertising it would be a lie.
   return (
     <div className={styles.wrap} ref={ref}>
       <button
@@ -38,7 +70,7 @@ export function WalletChip({ address = '9xQe…7vT2' }: { address?: string }) {
         aria-controls={MENU_ID}
         onClick={() => setOpen((v) => !v)}
       >
-        <span className={`${styles.op} mono`}>OP {address}</span>
+        <span className={`${styles.op} mono`}>OP {label}</span>
         <span className={styles.sep}>·</span>
         <span className={styles.dash}>Dashboard</span>
       </button>
@@ -46,18 +78,9 @@ export function WalletChip({ address = '9xQe…7vT2' }: { address?: string }) {
         <div id={MENU_ID} className={styles.menu}>
           <Link href="/dashboard" className={styles.item}>Operator Dashboard</Link>
           <div className={styles.group} aria-label="Account">
-            {ACCOUNT_ACTIONS.map((label) => (
-              <button key={label} type="button" className={styles.item}>{label}</button>
-            ))}
-          </div>
-          <div className={styles.groupLabel}>Prototype Screens</div>
-          <div className={styles.group} aria-label="Prototype screens">
-            {/* Operator Dashboard has its own dedicated link above; exclude it
-                here so it is not listed twice (it stays in CONTEXTUAL_ROUTES as
-                the IA single source). */}
-            {CONTEXTUAL_ROUTES.filter((r) => r.href !== '/dashboard').map((r) => (
-              <Link key={r.href} href={r.href} className={styles.item}>{r.label}</Link>
-            ))}
+            <span className={styles.info}>Network: Solana Devnet</span>
+            <button type="button" className={styles.item}>Settings</button>
+            <button type="button" className={styles.item} onClick={onDisconnect}>Disconnect</button>
           </div>
         </div>
       )}
