@@ -113,8 +113,9 @@ LIVE_AB_ABLATION_LABELS: dict[str, str] = {
         "ordering / winner and is never conflated with the sealed historical maker leaderboard"
     ),
     "divergence_scope": (
-        "divergence is what the two arms actually did on this tape — expected on the pinned adversarial "
-        "trigger frame, may be empty on a quiescent stretch; never a promise the guard always diverges"
+        "divergence reports only the frames where the two matched arms actually differed on this tape; "
+        "it may be empty and is never promised — an observed behavior difference, not a guarantee the "
+        "guard always diverges"
     ),
 }
 
