@@ -1,4 +1,6 @@
-.screen { display: flex; flex-direction: column; gap: var(--space-3); max-width: 720px; }
+/* max-width caps the reading column; align-self+width center it inside the (wider) .main flex column
+   — without the self-centering a capped flex child pins to the cross-axis start (left), off-center. */
+.screen { display: flex; flex-direction: column; gap: var(--space-3); max-width: 720px; width: 100%; align-self: center; }
 .head { display: flex; flex-direction: column; gap: var(--space-1); }
 .back { color: var(--text-2); font-size: 11px; text-decoration: none; }
 .back:hover { color: var(--accent-hi); }
