@@ -69,15 +69,31 @@ export function InstanceScreen({
   }
 
   const inst = state.instance;
+  // A maker (quoteguard-mm) instance is signalled by a resolved maker tape_ref — the same signal that
+  // gates the Maker-tape section below. Makers have NO directional proof card at /proof/{run_id} (it
+  // 404s); their behavior evidence is the QuoteGuard Ablation, surfaced as an explicit header action.
+  const isMaker = Boolean(inst.maker_tape_ref);
   return (
     <section className={styles.screen} aria-label={`Deployed instance ${inst.instance_id}`}>
       <header className={styles.head}>
         <div className={styles.ident}>
           <span className={styles.eyebrow}>Deployed instance · owner-scoped</span>
           <h1 className={`${styles.title} mono`}>{inst.instance_id}</h1>
+          {inst.fixture_label && (
+            // CURATED human label — augments the raw ids, never replaces them (the raw fixture id
+            // stays visible in the Scope section below, in mono).
+            <span className={styles.sub} data-testid="instance-fixture-label">
+              {inst.fixture_label}{inst.market_label ? ` · ${inst.market_label}` : ''}
+            </span>
+          )}
           <span className={styles.sub}>{inst.template_id} · {inst.agent_id} · {inst.execution_mode}</span>
         </div>
         <div className={styles.headMeta}>
+          {isMaker && (
+            <Link href={`/proof/maker-ablation/${inst.instance_id}`} className={styles.ablationCta} data-testid="instance-ablation-link">
+              QuoteGuard Ablation →
+            </Link>
+          )}
           <span className={styles.status} data-status={inst.status} data-testid="instance-status">{inst.status}</span>
           <span className={styles.source} data-source={inst.source_mode}>{inst.source_mode}</span>
         </div>
@@ -87,11 +103,23 @@ export function InstanceScreen({
         <h2 className={styles.h2}>Evidence identity</h2>
         <div className={styles.kvRow}>
           <span className={styles.kvLabel}>Run</span>
-          <Link href={`/proof/${inst.run_id}`} className={`${styles.kvLink} mono`}>{inst.run_id} ›</Link>
+          {isMaker ? (
+            // Maker runs have no directional proof card — surface run_id as the plain evidence identity
+            // and route the judge to behavior evidence via the QuoteGuard Ablation action (header), never
+            // a link to /proof/{run_id} that would 404.
+            <span className={`${styles.kvVal} mono`} data-testid="instance-run-id">{inst.run_id}</span>
+          ) : (
+            <Link href={`/proof/${inst.run_id}`} className={`${styles.kvLink} mono`} data-testid="instance-run-link">{inst.run_id} ›</Link>
+          )}
         </div>
         <p className={styles.note}>
           <code className="mono">run_id</code> is the authoritative Veridex evidence identity — it names the sealed run and never changes.
         </p>
+        {isMaker && (
+          <p className={styles.note} data-testid="instance-maker-run-note">
+            This is a maker run — its behavior evidence is the <strong>QuoteGuard Ablation</strong> (the action above), not a directional proof card.
+          </p>
+        )}
         <div className={styles.kvRow}>
           <span className={styles.kvLabel}>Runtime session</span>
           <span className={`${styles.kvVal} mono`}>{inst.runtime_handle?.session_id ?? '—'}</span>
@@ -105,14 +133,44 @@ export function InstanceScreen({
         <h2 className={styles.h2}>Pinned configuration</h2>
         <div className={styles.kvRow}><span className={styles.kvLabel}>config_hash</span><span className={`${styles.kvVal} mono`}>{inst.config_hash}</span></div>
         <div className={styles.kvRow}><span className={styles.kvLabel}>policy_hash</span><span className={`${styles.kvVal} mono`}>{inst.policy_hash}</span></div>
+        {inst.replay_pack_content_hash && (
+          <div className={styles.kvRow} data-testid="instance-pack-hash"><span className={styles.kvLabel}>replay pack content_hash</span><span className={`${styles.kvVal} mono`}>{inst.replay_pack_content_hash}</span></div>
+        )}
+        {inst.replay_pack_id && (
+          <div className={styles.kvRow} data-testid="instance-pack-id"><span className={styles.kvLabel}>replay pack_id</span><span className={`${styles.kvVal} mono`}>{inst.replay_pack_id}</span></div>
+        )}
         <div className={styles.kvRow}><span className={styles.kvLabel}>Owner</span><span className={`${styles.kvVal} mono`}>{inst.operator_id ?? '—'}</span></div>
         <div className={styles.kvRow}><span className={styles.kvLabel}>Deployed</span><span className={`${styles.kvVal} mono`}>{inst.created_at}</span></div>
       </section>
+
+      {/* Maker tape — a DISTINCT identity from the replay pack. Kept OUT of "Pinned configuration"
+          because it is re-resolved + content-verified at READ time (not a pinned/sealed record field). */}
+      {inst.maker_tape_ref && (
+        <section className={styles.panel}>
+          <h2 className={styles.h2}>Maker tape</h2>
+          <div className={styles.kvRow} data-testid="instance-maker-tape-ref"><span className={styles.kvLabel}>maker tape_ref</span><span className={`${styles.kvVal} mono`}>{inst.maker_tape_ref}</span></div>
+          {inst.maker_tape_content_hash && (
+            <div className={styles.kvRow} data-testid="instance-maker-tape-hash"><span className={styles.kvLabel}>maker tape content_hash</span><span className={`${styles.kvVal} mono`}>{inst.maker_tape_content_hash}</span></div>
+          )}
+          <p className={styles.note}>
+            The maker tape hash is re-resolved from <code className="mono">tape_ref</code> and content-verified at read time — it is the tape the run resolves, not a pinned record field. When it cannot be verified against the tape events, the hash is omitted (never shown mismatched).
+          </p>
+        </section>
+      )}
 
       <ExecutionEvidenceSection instanceId={inst.instance_id} />
 
       <section className={styles.panel}>
         <h2 className={styles.h2}>Scope</h2>
+        {inst.fixture_label && (
+          <div className={styles.kvRow} data-testid="instance-fixture-row">
+            <span className={styles.kvLabel}>Fixture</span>
+            <span className={styles.kvVal}>
+              {inst.fixture_label}{inst.market_label ? ` · ${inst.market_label}` : ''}
+              {inst.fixture_id != null && <span className={`${styles.kvVal} mono`}> ({inst.fixture_id})</span>}
+            </span>
+          </div>
+        )}
         <div className={styles.kvRow}><span className={styles.kvLabel}>Markets</span><span className={styles.tags}>{inst.market_allowlist.length ? inst.market_allowlist.map((m) => <span key={m} className={styles.tag}>{m}</span>) : <span className={styles.kvVal}>—</span>}</span></div>
         <div className={styles.kvRow}><span className={styles.kvLabel}>Venues</span><span className={styles.tags}>{inst.venue_allowlist.length ? inst.venue_allowlist.map((v) => <span key={v} className={styles.tag}>{v}</span>) : <span className={styles.kvVal}>—</span>}</span></div>
       </section>

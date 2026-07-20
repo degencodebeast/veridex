@@ -1,8 +1,26 @@
 import { describe, it, expect, vi } from 'vitest';
-import { render, screen, within } from '@testing-library/react';
+import { render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { GuardAblationScreen } from '@/components/screens/proof/GuardAblationScreen';
+import GuardAblationPage from '@/app/(app)/proof/maker-ablation/[instanceId]/page';
+import type { DeployedInstance } from '@/lib/api';
 import type { GuardAblationView } from '@/lib/contracts';
+
+// A minimal DeployedInstance carrying the CURATED label fields the panel best-effort surfaces.
+function labeledInstance(over: Partial<DeployedInstance> = {}): DeployedInstance {
+  return {
+    instance_id: 'mm-inst-0f74a4', template_id: 'quoteguard-mm', agent_id: 'studio-mm',
+    run_id: 'run_mm_01', status: 'sealed', source_mode: 'replay', execution_mode: 'paper',
+    config_hash: 'c'.repeat(64), policy_hash: 'p'.repeat(64), operator_id: 'did:privy:owner-1',
+    runtime_handle: null, last_failure_reason: null,
+    market_allowlist: ['pmxt:18209181:home_win'], venue_allowlist: ['polymarket'],
+    created_at: '2026-07-17T00:00:00Z',
+    fixture_id: 18209181, fixture_label: 'France v Morocco', market_label: 'Home win',
+    replay_pack_content_hash: 'f16c3853pack', replay_pack_id: 'pmxt-txline-mm-18209181-v1',
+    maker_tape_ref: 'pmxt-txline-mm-18209181-v1', maker_tape_content_hash: '19b314abtape',
+    ...over,
+  };
+}
 
 function divergentView(over: Partial<GuardAblationView> = {}): GuardAblationView {
   return {
@@ -122,8 +140,57 @@ describe('GuardAblationScreen (F-8 · maker_live_ab.v1)', () => {
     expect(identity.textContent ?? '').not.toMatch(/\bLIVE\b/);
   });
 
-  it('back-link returns to the Maker Proof Card for the same identity', () => {
-    render(<GuardAblationScreen instanceId="mm-inst-0f74a4" backHref="/proof/maker/mm-inst-0f74a4" loadAblation={() => new Promise(() => {})} />);
-    expect(screen.getByRole('link', { name: /maker proof card/i })).toHaveAttribute('href', '/proof/maker/mm-inst-0f74a4');
+  it('back-link returns to the deployed-instance page (instance domain) and NEVER the public maker card', () => {
+    render(<GuardAblationScreen instanceId="mm-inst-0f74a4" backHref="/instances/mm-inst-0f74a4" loadAblation={() => new Promise(() => {})} />);
+    const back = screen.getByRole('link', { name: /deployed instance/i });
+    expect(back).toHaveAttribute('href', '/instances/mm-inst-0f74a4');
+    // must not label/route back to the PUBLIC historical (agent_id-keyed) maker proof card
+    expect(screen.queryByRole('link', { name: /maker proof card/i })).toBeNull();
+  });
+
+  it('renders the CURATED fixture label in the identity strip when the instance loader returns one', async () => {
+    render(<GuardAblationScreen
+      instanceId="mm-inst-0f74a4" backHref="/proof/maker/mm-inst-0f74a4"
+      loadAblation={vi.fn().mockResolvedValue(divergentView())}
+      loadInstance={vi.fn().mockResolvedValue(labeledInstance())}
+    />);
+    expect(await screen.findByTestId('ablation-fixture-label')).toHaveTextContent('France v Morocco · Home win');
+  });
+
+  it('omits the label (never blocks the panel) when the instance loader throws', async () => {
+    render(<GuardAblationScreen
+      instanceId="mm-inst-0f74a4" backHref="/proof/maker/mm-inst-0f74a4"
+      loadAblation={vi.fn().mockResolvedValue(divergentView())}
+      loadInstance={vi.fn().mockRejectedValue(new Error('403 not yours'))}
+    />);
+    // The panel still renders in full…
+    expect(await screen.findByTestId('ablation-timeline')).toBeInTheDocument();
+    // …and the label is simply absent, never a fabricated matchup.
+    await waitFor(() => expect(screen.getByTestId('ablation-identity')).toBeInTheDocument());
+    expect(screen.queryByTestId('ablation-fixture-label')).toBeNull();
+  });
+
+  it('omits the label when the instance carries no CURATED label', async () => {
+    render(<GuardAblationScreen
+      instanceId="mm-inst-0f74a4" backHref="/proof/maker/mm-inst-0f74a4"
+      loadAblation={vi.fn().mockResolvedValue(divergentView())}
+      loadInstance={vi.fn().mockResolvedValue(labeledInstance({ fixture_label: null, market_label: null }))}
+    />);
+    expect(await screen.findByTestId('ablation-timeline')).toBeInTheDocument();
+    expect(screen.queryByTestId('ablation-fixture-label')).toBeNull();
+  });
+});
+
+// Route-level identity-domain wiring (Codex gate): the ablation route is INSTANCE-keyed
+// (GET /maker/live-ab/{instanceId}), so its page must send the same instance_id back to the
+// deployed-instance page — NEVER to the public, agent_id-keyed /proof/maker/{id} historical card
+// (which would render unrelated MM-R1 evidence under this instance id).
+describe('GuardAblationPage route wiring (instance identity domain)', () => {
+  it('passes an /instances/{instance_id} backHref (instance domain), not /proof/maker/{id}', async () => {
+    const el = await GuardAblationPage({ params: Promise.resolve({ instanceId: 'inst_42086128' }) });
+    expect(el.type).toBe(GuardAblationScreen);
+    expect(el.props.instanceId).toBe('inst_42086128');
+    expect(el.props.backHref).toBe('/instances/inst_42086128');
+    expect(el.props.backHref).not.toContain('/proof/maker/');
   });
 });

@@ -24,6 +24,11 @@
 .status[data-status='failed'] { color: var(--negative); border-color: var(--negative); background: var(--negative-bg); }
 .source { font-size: 10px; text-transform: uppercase; letter-spacing: 0.04em; padding: 2px 8px; border-radius: var(--radius-badge); border: 1px solid var(--border); color: var(--text-3); }
 
+/* Maker-only action → the QuoteGuard Ablation (makers have no directional proof card). Accent-outlined
+   so it reads as the primary evidence action, distinct from the neutral status/source pills beside it. */
+.ablationCta { font-size: 10px; font-weight: 600; letter-spacing: 0.04em; text-decoration: none; padding: 3px 9px; border-radius: var(--radius-badge); border: 1px solid var(--accent); color: var(--accent-hi); background: var(--accent-bg-soft); white-space: nowrap; }
+.ablationCta:hover { background: var(--accent-bg); }
+
 .panel { display: flex; flex-direction: column; gap: var(--space-2); padding: var(--pad-panel); border: 1px solid var(--border); border-radius: var(--radius-panel); background: var(--panel); }
 .h2 { margin: 0; font-size: 11px; font-weight: 600; letter-spacing: 0.06em; text-transform: uppercase; color: var(--text-2); }
 

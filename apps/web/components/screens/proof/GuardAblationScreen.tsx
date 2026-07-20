@@ -4,7 +4,7 @@ import Link from 'next/link';
 import { Badge } from '@/components/ui/Badge';
 import { InfoTip } from '@/components/ui/InfoTip';
 import { GLOSSARY } from '@/lib/glossary';
-import { getMakerLiveAb } from '@/lib/api';
+import { getInstance, getMakerLiveAb, type DeployedInstance } from '@/lib/api';
 import type { GuardAblationArm, GuardAblationDecision, GuardAblationLeg, GuardAblationView } from '@/lib/contracts';
 import styles from './GuardAblationScreen.module.css';
 
@@ -25,13 +25,19 @@ export function GuardAblationScreen({
   instanceId,
   backHref,
   loadAblation = getMakerLiveAb,
+  loadInstance = getInstance,
 }: {
   instanceId: string;
   backHref: string;
   loadAblation?: (instanceId: string) => Promise<GuardAblationView | null>;
+  // Best-effort loader for the owner-scoped instance detail — ONLY to surface the CURATED fixture /
+  // market label. It NEVER blocks or fails the ablation panel: on 403/404/throw the label is simply
+  // omitted. It does NOT change the A/B wire response or its adapter.
+  loadInstance?: (instanceId: string) => Promise<DeployedInstance>;
 }) {
   const [state, setState] = useState<State>({ kind: 'loading' });
   const [attempt, setAttempt] = useState(0); // bumping re-runs the load (RETRY)
+  const [fixtureLabel, setFixtureLabel] = useState<string | null>(null);
 
   useEffect(() => {
     let active = true;
@@ -45,10 +51,28 @@ export function GuardAblationScreen({
     return () => { active = false; };
   }, [loadAblation, instanceId, attempt]);
 
+  // Best-effort, side-panel label fetch — decoupled from the ablation load so a failure here never
+  // touches the panel's own state. Omits the label on null/throw (never a fabricated matchup).
+  useEffect(() => {
+    let active = true;
+    setFixtureLabel(null);
+    loadInstance(instanceId)
+      .then((inst) => {
+        if (!active) return;
+        setFixtureLabel(
+          inst.fixture_label
+            ? `${inst.fixture_label}${inst.market_label ? ` · ${inst.market_label}` : ''}`
+            : null,
+        );
+      })
+      .catch(() => { /* best-effort: omit the label, never block or error the panel */ });
+    return () => { active = false; };
+  }, [loadInstance, instanceId]);
+
   return (
     <article className={styles.screen} aria-label="QuoteGuard Behavior Ablation">
       <header className={styles.header}>
-        <Link href={backHref} className={styles.back}>← Maker Proof Card</Link>
+        <Link href={backHref} className={styles.back}>← Deployed instance</Link>
         <div className={styles.titleRow}>
           <h1 className={styles.title}>QuoteGuard Behavior Ablation</h1>
           <Badge variant="behavior-ablation">BEHAVIOR ABLATION</Badge>
@@ -63,7 +87,7 @@ export function GuardAblationScreen({
       {state.kind === 'loading' && <LoadingBody />}
       {state.kind === 'unavailable' && <UnavailableBody instanceId={instanceId} />}
       {state.kind === 'error' && <ErrorBody onRetry={() => setAttempt((n) => n + 1)} />}
-      {state.kind === 'ready' && <ReadyBody view={state.view} />}
+      {state.kind === 'ready' && <ReadyBody view={state.view} fixtureLabel={fixtureLabel} />}
     </article>
   );
 }
@@ -107,10 +131,10 @@ function ErrorBody({ onRetry }: { onRetry: () => void }) {
 }
 
 // ── ready: identity strip + arms + divergence + (timeline | converged) + interpretation note ────
-function ReadyBody({ view }: { view: GuardAblationView }) {
+function ReadyBody({ view, fixtureLabel }: { view: GuardAblationView; fixtureLabel: string | null }) {
   return (
     <>
-      <IdentityStrip view={view} />
+      <IdentityStrip view={view} fixtureLabel={fixtureLabel} />
       <div className={styles.armGrid}>
         <ArmCard arm={view.guard_off} side="off" testid="ablation-arm-off" />
         <ArmCard arm={view.guard_on} side="on" testid="ablation-arm-on" />
@@ -123,7 +147,7 @@ function ReadyBody({ view }: { view: GuardAblationView }) {
   );
 }
 
-function IdentityStrip({ view }: { view: GuardAblationView }) {
+function IdentityStrip({ view, fixtureLabel }: { view: GuardAblationView; fixtureLabel: string | null }) {
   return (
     <div className={styles.identity} data-testid="ablation-identity">
       <div className={styles.idCell}>
@@ -134,6 +158,13 @@ function IdentityStrip({ view }: { view: GuardAblationView }) {
         <span className={styles.idLabel}>MODE</span>
         <span className={`${styles.idValue} mono`}>{view.mode}</span>
       </div>
+      {fixtureLabel && (
+        // CURATED label, best-effort from the owner-scoped instance detail — omitted when unavailable.
+        <div className={styles.idCell}>
+          <span className={styles.idLabel}>FIXTURE</span>
+          <span className={styles.idValue} data-testid="ablation-fixture-label">{fixtureLabel}</span>
+        </div>
+      )}
       <div className={styles.idCell}><Badge variant="recorded-replay">RECORDED TxLINE REPLAY</Badge></div>
       <div className={styles.idCell}><Badge variant="same-strategy-tape">SAME STRATEGY / SAME TAPE</Badge></div>
       {/* The ablation envelope carries no anchor; the honest render is the literal not_anchored — an

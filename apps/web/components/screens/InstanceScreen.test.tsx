@@ -96,4 +96,89 @@ describe('InstanceScreen (owner-scoped deployed-instance identity)', () => {
     render(<InstanceScreen instanceId="inst_mine" load={() => new Promise(() => {})} />);
     expect(screen.getByTestId('instance-loading')).toBeInTheDocument();
   });
+
+  it('renders the CURATED fixture + market label for a maker instance, without hiding the raw id', async () => {
+    render(<InstanceScreen instanceId="inst_maker" load={async () => instance({
+      instance_id: 'inst_maker',
+      market_allowlist: ['pmxt:18209181:home_win'],
+      fixture_id: 18209181, fixture_label: 'France v Morocco', market_label: 'Home win',
+      replay_pack_content_hash: 'f16c3853pack', replay_pack_id: 'pmxt-txline-mm-18209181-v1',
+      maker_tape_ref: 'pmxt-txline-mm-18209181-v1', maker_tape_content_hash: '19b314abtape',
+    })} />);
+    await screen.findByText('inst_maker');
+    // The human label reads prominently in the header…
+    expect(screen.getByTestId('instance-fixture-label')).toHaveTextContent('France v Morocco · Home win');
+    // …and the raw id remains visible in the Scope row (augment, never replace).
+    expect(screen.getByTestId('instance-fixture-row')).toHaveTextContent('18209181');
+    // The replay PACK hash and the maker TAPE hash are surfaced as DISTINCT identities, correctly
+    // labeled — the pack hash is never presented as the tape hash.
+    const packHash = screen.getByTestId('instance-pack-hash');
+    expect(packHash).toHaveTextContent('replay pack content_hash');
+    expect(packHash).toHaveTextContent('f16c3853pack');
+    expect(screen.getByTestId('instance-pack-id')).toHaveTextContent('pmxt-txline-mm-18209181-v1');
+    const tapeHash = screen.getByTestId('instance-maker-tape-hash');
+    expect(tapeHash).toHaveTextContent('maker tape content_hash');
+    expect(tapeHash).toHaveTextContent('19b314abtape');
+    expect(screen.getByTestId('instance-maker-tape-ref')).toHaveTextContent('pmxt-txline-mm-18209181-v1');
+  });
+
+  it('a non-MM instance shows the replay pack hash but NO maker tape rows', async () => {
+    render(<InstanceScreen instanceId="inst_dir" load={async () => instance({
+      instance_id: 'inst_dir',
+      fixture_id: 18209181, fixture_label: 'France v Morocco', market_label: 'Home win',
+      replay_pack_content_hash: 'f16c3853pack', replay_pack_id: 'pack-directional',
+      maker_tape_ref: null, maker_tape_content_hash: null,
+    })} />);
+    await screen.findByText('inst_dir');
+    expect(screen.getByTestId('instance-pack-hash')).toHaveTextContent('f16c3853pack');
+    expect(screen.queryByTestId('instance-maker-tape-hash')).toBeNull();
+    expect(screen.queryByTestId('instance-maker-tape-ref')).toBeNull();
+  });
+
+  it('renders the honest "Fixture {id}" fallback for an unmapped fixture', async () => {
+    render(<InstanceScreen instanceId="inst_unmapped" load={async () => instance({
+      instance_id: 'inst_unmapped',
+      market_allowlist: ['pmxt:999999:away_win'],
+      fixture_id: 999999, fixture_label: 'Fixture 999999', market_label: 'Away win',
+    })} />);
+    await screen.findByText('inst_unmapped');
+    expect(screen.getByTestId('instance-fixture-label')).toHaveTextContent('Fixture 999999 · Away win');
+  });
+
+  it('a MAKER instance links to the QuoteGuard Ablation and does NOT send run_id to the 404-ing directional proof card', async () => {
+    render(<InstanceScreen instanceId="inst_maker" load={async () => instance({
+      instance_id: 'inst_maker', template_id: 'quoteguard_mm',
+      maker_tape_ref: 'pmxt-txline-mm-18209181-v1', maker_tape_content_hash: '19b314abtape',
+    })} />);
+    await screen.findByText('inst_maker');
+    // The explicit behavior-evidence action points at the maker ablation, keyed by INSTANCE id.
+    const ablation = screen.getByTestId('instance-ablation-link');
+    expect(ablation).toHaveAttribute('href', '/proof/maker-ablation/inst_maker');
+    // run_id is shown as the plain evidence identity — NOT a directional /proof/{run_id} link (that 404s
+    // for a maker run). The honest note explains why.
+    expect(screen.getByTestId('instance-run-id')).toHaveTextContent('run_evidence_01');
+    expect(screen.queryByTestId('instance-run-link')).toBeNull();
+    expect(screen.getByTestId('instance-maker-run-note')).toBeInTheDocument();
+  });
+
+  it('a DIRECTIONAL instance keeps the working /proof/{run_id} link and shows NO maker ablation action', async () => {
+    render(<InstanceScreen instanceId="inst_dir" load={async () => instance({
+      instance_id: 'inst_dir', template_id: 'value_clv', maker_tape_ref: null,
+    })} />);
+    await screen.findByText('inst_dir');
+    const runLink = screen.getByTestId('instance-run-link');
+    expect(runLink).toHaveAttribute('href', '/proof/run_evidence_01');
+    expect(screen.queryByTestId('instance-ablation-link')).toBeNull();
+    expect(screen.queryByTestId('instance-run-id')).toBeNull();
+    expect(screen.queryByTestId('instance-maker-run-note')).toBeNull();
+  });
+
+  it('omits the label rows entirely when the instance carries no CURATED label (e.g. list/demo rows)', async () => {
+    render(<InstanceScreen instanceId="inst_mine" load={async () => instance()} />);
+    await screen.findByText('inst_mine');
+    expect(screen.queryByTestId('instance-fixture-label')).toBeNull();
+    expect(screen.queryByTestId('instance-fixture-row')).toBeNull();
+    expect(screen.queryByTestId('instance-pack-hash')).toBeNull();
+    expect(screen.queryByTestId('instance-maker-tape-hash')).toBeNull();
+  });
 });

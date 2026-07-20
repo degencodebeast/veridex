@@ -1,10 +1,11 @@
 import { GuardAblationScreen } from '@/components/screens/proof/GuardAblationScreen';
 
-// Deep-link only (mirrors the /proof/maker/[id] pattern) — reached from the Maker Proof Card's
-// "QuoteGuard behavior ablation → OPEN" entry point, never a top-level nav tab. The screen fetches
-// GET /maker/live-ab/{instanceId} client-side so it can render loading + retry states honestly; the
-// back-link returns to the Maker Proof Card for the same identity.
+// Deep-link only — reached from the OWNER-SCOPED deployed-instance page (`/instances/{id}`), the sole
+// valid origin: the ablation fetches the owner-scoped GET /maker/live-ab/{instanceId} keyed by
+// instance_id, so it lives in the INSTANCE identity domain. The back-link therefore returns to that
+// instance page — NEVER to /proof/maker/{id}, which is the PUBLIC historical (agent_id-keyed) card and
+// would render unrelated MM-R1 evidence under this instance id (cross-domain identity leak).
 export default async function GuardAblationPage({ params }: { params: Promise<{ instanceId: string }> }) {
   const { instanceId } = await params;
-  return <GuardAblationScreen instanceId={instanceId} backHref={`/proof/maker/${instanceId}`} />;
+  return <GuardAblationScreen instanceId={instanceId} backHref={`/instances/${instanceId}`} />;
 }

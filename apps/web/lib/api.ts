@@ -954,6 +954,19 @@ export interface AgentInstanceWire {
   runtime_handle: InstanceRuntimeHandle | null;
   created_at: string;
   updated_at: string; // durable last-write timestamp (present on the contract; not surfaced today)
+  // Additive server-derived labels (owner-scoped GET /agents/instances/{id} only). Optional so the
+  // list route + any older payload still validate. CURATED convenience labels (see backend
+  // veridex/api/fixture_labels.py) — they AUGMENT the raw ids, never replace them.
+  fixture_id?: number | null;
+  fixture_label?: string | null;
+  market_label?: string | null;
+  // Two DISTINCT hash identities (never conflated): the R-4 replay PACK selection hash vs the
+  // quoteguard-mm MakerReplayTape's OWN hash the maker run verifies. maker_tape_* are present only
+  // for an MM instance.
+  replay_pack_content_hash?: string | null;
+  replay_pack_id?: string | null;
+  maker_tape_ref?: string | null;
+  maker_tape_content_hash?: string | null;
 }
 
 /** View-model of a deployed instance (owner-scoped identity the instance page + dashboard render). */
@@ -973,6 +986,17 @@ export interface DeployedInstance {
   market_allowlist: string[];
   venue_allowlist: string[];
   created_at: string;
+  // CURATED, server-derived labels that AUGMENT the raw ids (present on the owner-scoped detail
+  // response; absent on the list route + demo rows). Optional + null-honest; never a "verified" claim.
+  fixture_id?: number | null;
+  fixture_label?: string | null;
+  market_label?: string | null;
+  // DISTINCT hashes: replay_pack_content_hash is the R-4 pack selection hash; maker_tape_content_hash
+  // is the quoteguard-mm MakerReplayTape's own hash (a different identity). Never present one as the other.
+  replay_pack_content_hash?: string | null;
+  replay_pack_id?: string | null;
+  maker_tape_ref?: string | null;
+  maker_tape_content_hash?: string | null;
 }
 
 export function adaptAgentInstance(w: AgentInstanceWire): DeployedInstance {
@@ -1000,6 +1024,14 @@ export function adaptAgentInstance(w: AgentInstanceWire): DeployedInstance {
     market_allowlist: w.market_allowlist ?? [],
     venue_allowlist: w.venue_allowlist ?? [],
     created_at: w.created_at,
+    // CURATED labels carried through null-honest — absent on the list route, so default to null.
+    fixture_id: w.fixture_id ?? null,
+    fixture_label: w.fixture_label ?? null,
+    market_label: w.market_label ?? null,
+    replay_pack_content_hash: w.replay_pack_content_hash ?? null,
+    replay_pack_id: w.replay_pack_id ?? null,
+    maker_tape_ref: w.maker_tape_ref ?? null,
+    maker_tape_content_hash: w.maker_tape_content_hash ?? null,
   };
 }
 
