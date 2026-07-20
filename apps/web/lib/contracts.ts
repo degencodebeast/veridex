@@ -77,13 +77,18 @@ export interface LeaderboardRow {
   agent_name: string;
   agent_kind: string;
   runs: number;
-  avg_clv_bps: number;
+  // The rank axis. null = UNSCORED (backend mean_clv_bps=None: no true-CLV scored actions) — render
+  // "—" ("unavailable"), never a fabricated 0 bps (F-5). The backend still supplies the authoritative
+  // rank, so a null-CLV agent keeps its server-assigned position without a fake number.
+  avg_clv_bps: number | null;
   total_clv_bps: number;
-  sim_pnl: number;
-  brier: number;
-  max_drawdown: number;
-  action_count: number;
-  valid_pct: number; // PERCENT 0-100 (1:1 from the wire LeaderboardRow)
+  // These proxy metrics are carried by the CROSS-RUN wire LeaderboardRow but are ABSENT from the
+  // competition-scoped CompetitionLeaderboardRow (F-5). null = honestly absent ("—"), never a fake 0.
+  sim_pnl: number | null;
+  brier: number | null;
+  max_drawdown: number | null;
+  action_count: number | null;
+  valid_pct: number | null; // PERCENT 0-100 from the cross-run row; null on a competition-scoped row
   proof_mode: ProofMode;
   eligibility_badge: 'eligible' | 'not-eligible';
   anchor_status: AnchorStatus;
@@ -135,6 +140,17 @@ export interface MakerProofCard {
   falsification: MakerFalsification;
 }
 
+// AC-30/AC-31 (Gate-B REQ-026/027/052/053) — a displayed historical entry/exit capacity claim. It is
+// ALWAYS a third-party print or a recomputed counterfactual ceiling: `capacity_usd` is BOUNDED by
+// `matched_observed_liquidity_usd` and can NEVER render as our own fill / receipt / PnL / rank /
+// Gate-B authority. Absent (undefined/null) on the sealed MM-R1 arena result — no such claim exists
+// there — so the maker surfaces render exactly as before unless a claim is explicitly present.
+export interface MakerCapacityClaim {
+  kind: 'observed_market_print' | 'counterfactual';
+  capacity_usd: number;                  // the raw wanted/printed size — a wish, not a fill
+  matched_observed_liquidity_usd: number; // the observed ceiling the display is bounded DOWN to
+}
+
 // The assembled MAKER snapshot the (future) maker screen would render — Maker-prefixed, never routed
 // through the taker/CLV LeaderboardRow adapter.
 export interface MakerArenaResultView {
@@ -160,6 +176,9 @@ export interface MakerArenaResultView {
     avg_toxicity_loss_bps_label: string;
     real_executable_edge_bps_label: string;
   };
+  // AC-30/AC-31: an OPTIONAL historical entry/exit capacity claim. Always a bounded, LABELED
+  // counterfactual — never our fill/PnL/rank. Null/absent on the sealed MM-R1 fixture.
+  historical_capacity?: MakerCapacityClaim | null;
 }
 
 // ── QuoteGuard Behavior Ablation (F-8 · maker_live_ab.v1) ───────────────────────────────────────
@@ -220,7 +239,12 @@ export interface ExecutionReceipt {
 
 // One row of the cockpit's canonical event stream (seq · type · payload_hash · evidence?).
 export interface CanonicalEvent {
-  seq: number;
+  seq: number; // transport competition-stream sequence (0-based, contiguous) — the LOG position, NOT the record key
+  // II-W defect 1: the sealed RunEvent.sequence_no for an evidence event (null for derived events) —
+  // veridex/competition/events.py:118. This, NOT the transport `seq`, is the key the Inspector
+  // endpoint GET /runs/{id}/actions/{seq} looks up (veridex/api/router.py:747,778), so the Inspector
+  // deep-link MUST open off `source_sequence_no` when present (fall back to `seq` only when absent).
+  source_sequence_no?: number | null;
   type: string; // AGENT_ACTION | law_recomputed | score_update | policy_result | execution_receipt | proof_anchor | ...
   payload_hash: string;
   evidence: boolean; // true = sealed evidence prefix; false = derived non-scoring tail
@@ -431,6 +455,10 @@ export interface ClvExplanation {
   // executable_edge render ONLY when this is true — fail-closed. Live wire carries no quote → false.
   real_venue_quote: boolean;
   clv_bps: number;                         // the proven skill metric (the real scored value)
+  // PENDING state (II-W defect 2): the backend emits the "pending" sentinel (clv_bps: int|str) for a
+  // valid WAIT/abstention with too little runway to score — DISTINCT from a null/unscored value ("—").
+  // When true, the screen shows an honest PENDING affordance and NEVER the (fabricated) numeric score.
+  clv_pending?: boolean;
   clv_low_sample?: boolean;                // WD-7 sample-size flag — shown (never hidden), never a score
   stake_fraction: number | null;          // Kelly/policy sizing
   plain: string;
@@ -449,7 +477,9 @@ export interface InspectorRecord {
   is_live: boolean;
   market_state: MarketState;
   agent_action: AgentAction;
-  recompute: { recomputed_edge_bps: number; clv_bps: number; valid: boolean };
+  // clv_bps is `number | null`: the deterministic recompute echo preserves the backend "pending"
+  // sentinel as null (an honest "not scored yet"), never a fabricated 0 — this echo is a trust surface.
+  recompute: { recomputed_edge_bps: number; clv_bps: number | null; valid: boolean };
   clv_explanation: ClvExplanation;
   untrusted_llm: UntrustedLlmMetadata | null;
 }

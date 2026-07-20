@@ -13,9 +13,11 @@ beforeEach(() => {
 });
 
 describe('InspectorScreen (REQ-019 / SEC-006/007 / AC-006/021)', () => {
-  it('tells the 3-step story: LLM proposed → law recomputed → score from evidence', () => {
+  it('tells the 3-step story: agent proposed → law recomputed → score from evidence', () => {
+    // II-W defect 6: the proposer step is producer-NEUTRAL ("Agent proposed") — the frontend has no
+    // authoritative producer field, so it never claims LLM vs deterministic.
     render(<InspectorScreen record={sampleInspectorRecord} />);
-    expect(screen.getByText(/LLM proposed/i)).toBeInTheDocument();
+    expect(screen.getByText(/Agent proposed/i)).toBeInTheDocument();
     expect(screen.getByText(/Law recomputed/i)).toBeInTheDocument();
     expect(screen.getByText(/Score from evidence/i)).toBeInTheDocument();
   });
@@ -36,8 +38,10 @@ describe('InspectorScreen (REQ-019 / SEC-006/007 / AC-006/021)', () => {
   });
 
   it('marks the AgentAction panel params as untrusted (claimed_edge_bps must not read as authoritative)', () => {
+    // II-W defect 6: worded producer-neutrally ("agent-supplied metadata") — deterministic strategies
+    // emit reason/claimed_edge too, so it never asserts "LLM".
     render(<InspectorScreen record={sampleInspectorRecord} />);
-    expect(screen.getByText(/params include untrusted LLM claims/i)).toBeInTheDocument();
+    expect(screen.getByText(/params include untrusted agent-supplied metadata/i)).toBeInTheDocument();
     expect(screen.getByText(/recorded, not scored/i)).toBeInTheDocument();
   });
 

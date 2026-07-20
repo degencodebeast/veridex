@@ -48,6 +48,17 @@ describe('InstanceScreen (owner-scoped deployed-instance identity)', () => {
     expect(screen.getByText(/replaceable AgentOS handle/i)).toBeInTheDocument();
   });
 
+  it('renders an honest absence when the replaceable AgentOS session_id is null', async () => {
+    render(<InstanceScreen instanceId="inst_mine" load={async () => instance({
+      runtime_handle: { runtime_kind: 'agentos', runtime_agent_id: 'aos_1', session_id: null, run_id: 'run_evidence_01' },
+    })} />);
+
+    await screen.findByText('inst_mine');
+    expect(screen.getByText('—')).toBeInTheDocument();
+    expect(screen.getByText(/replaceable AgentOS handle/i)).toBeInTheDocument();
+    expect(screen.getByText(/authoritative Veridex evidence identity/i)).toBeInTheDocument();
+  });
+
   it('403 (owned by another): renders an honest unauthorized state, NEVER a fabricated instance', async () => {
     render(
       <InstanceScreen

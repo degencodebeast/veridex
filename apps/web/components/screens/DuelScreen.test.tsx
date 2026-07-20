@@ -1,13 +1,21 @@
-import { describe, it, expect, afterEach } from 'vitest';
+import { describe, it, expect, afterEach, beforeEach, vi } from 'vitest';
 import { render, screen, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { DuelScreen } from '@/components/screens/DuelScreen';
+import { getMakerArenaResult } from '@/lib/api';
 import { AGENTS } from '@/lib/fixtures/catalog';
 import { MAKER_ARENA_RESULT } from '@/lib/fixtures/maker';
 import {
   MAKER_INCONCLUSIVE, MAKER_INVERTED, MAKER_UNKNOWN_VERDICT, makerResultWith,
 } from '../../__tests__/fixtures/makerVariants';
 import type { MakerArenaResultView } from '@/lib/contracts';
+
+vi.mock('@/lib/api', async (importOriginal) => ({
+  ...await importOriginal<typeof import('@/lib/api')>(),
+  getMakerArenaResult: vi.fn(),
+}));
+
+const getMakerArenaResultMock = vi.mocked(getMakerArenaResult);
 
 describe('DuelScreen (REQ-023)', () => {
   it('guards against fewer than two agents — honest empty, no crash', () => {
@@ -53,6 +61,11 @@ describe('DuelScreen (REQ-023)', () => {
 });
 
 describe('DuelScreen — Maker Arena lane (MM-R1)', () => {
+  beforeEach(() => {
+    getMakerArenaResultMock.mockReset();
+    getMakerArenaResultMock.mockResolvedValue(MAKER_ARENA_RESULT);
+  });
+
   afterEach(() => {
     window.history.replaceState(null, '', '/'); // reset any ?lane= query between tests
   });
@@ -111,6 +124,10 @@ describe('DuelScreen — Maker Arena lane (MM-R1)', () => {
 // I-R remediation (M1 / M2 / M4): the maker duel must render the REAL sealed verdict and the
 // REAL per-agent counts, and may never assert a proof state the data does not carry.
 describe('DuelScreen — Maker duel verdict/anchor/count honesty (I-R M1, M2, M4)', () => {
+  beforeEach(() => {
+    getMakerArenaResultMock.mockReset();
+  });
+
   afterEach(() => {
     window.history.replaceState(null, '', '/'); // reset any ?lane= query between tests
   });
@@ -184,5 +201,61 @@ describe('DuelScreen — Maker duel verdict/anchor/count honesty (I-R M1, M2, M4
     // whole-card textContent match would pass vacuously through the Quotes cell)
     const label = within(cardOf('txline-fair-mm')).getByText('Abstained · Scored');
     expect(label.nextElementSibling?.textContent).toBe(`${candidate.abstained} · ${candidate.scored.toLocaleString()}`);
+  });
+});
+
+describe('DuelScreen — live maker result loading (F-9)', () => {
+  beforeEach(() => {
+    getMakerArenaResultMock.mockReset();
+  });
+
+  afterEach(() => {
+    window.history.replaceState(null, '', '/');
+  });
+
+  it('loads the fixed maker comparison through the API only after Maker mode opens', async () => {
+    const liveResult = structuredClone(MAKER_ARENA_RESULT);
+    liveResult.leaderboard[0].avg_toxicity_loss_bps = 7;
+    getMakerArenaResultMock.mockResolvedValue(liveResult);
+    const user = userEvent.setup();
+
+    render(<DuelScreen />);
+    expect(getMakerArenaResultMock).not.toHaveBeenCalled();
+    await user.click(screen.getByRole('radio', { name: 'Maker' }));
+
+    expect(await screen.findByText('+7.0 bps')).toBeInTheDocument();
+    expect(getMakerArenaResultMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('renders an honest unavailable state with zero maker cards when the API rejects', async () => {
+    getMakerArenaResultMock.mockRejectedValue(new Error('maker endpoint offline'));
+    const user = userEvent.setup();
+
+    render(<DuelScreen />);
+    await user.click(screen.getByRole('radio', { name: 'Maker' }));
+
+    expect(await screen.findByTestId('maker-unavailable')).toHaveTextContent(/maker data unavailable/i);
+    expect(screen.queryAllByTestId('duel-maker-card')).toHaveLength(0);
+  });
+
+  it('renders an honest unavailable-comparison state for an empty maker leaderboard', async () => {
+    getMakerArenaResultMock.mockResolvedValue({ ...MAKER_ARENA_RESULT, leaderboard: [] });
+    const user = userEvent.setup();
+
+    render(<DuelScreen />);
+    await user.click(screen.getByRole('radio', { name: 'Maker' }));
+
+    expect(await screen.findByTestId('maker-empty')).toHaveTextContent(/maker comparison unavailable/i);
+    expect(screen.queryAllByTestId('duel-maker-card')).toHaveLength(0);
+  });
+
+  it('uses an explicitly injected maker result without making an API request', async () => {
+    const user = userEvent.setup();
+    render(<DuelScreen makerResult={MAKER_ARENA_RESULT} />);
+
+    await user.click(screen.getByRole('radio', { name: 'Maker' }));
+
+    expect(screen.getAllByTestId('duel-maker-card')).toHaveLength(2);
+    expect(getMakerArenaResultMock).not.toHaveBeenCalled();
   });
 });

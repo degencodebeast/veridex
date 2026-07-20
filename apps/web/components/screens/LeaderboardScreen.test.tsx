@@ -1,12 +1,20 @@
-import { describe, it, expect, afterEach } from 'vitest';
+import { describe, it, expect, afterEach, beforeEach, vi } from 'vitest';
 import { render, screen, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { LeaderboardScreen } from '@/components/screens/LeaderboardScreen';
+import { getMakerArenaResult } from '@/lib/api';
 import { LEADERBOARD_ROWS } from '@/lib/fixtures/catalog';
 import { MAKER_ARENA_RESULT } from '@/lib/fixtures/maker';
 import { MAKER_INCONCLUSIVE, MAKER_INVERTED } from '../../__tests__/fixtures/makerVariants';
 import type { MakerArenaResultView } from '@/lib/contracts';
 import type { LeaderboardRow } from '@/lib/catalog';
+
+vi.mock('@/lib/api', async (importOriginal) => ({
+  ...await importOriginal<typeof import('@/lib/api')>(),
+  getMakerArenaResult: vi.fn(),
+}));
+
+const getMakerArenaResultMock = vi.mocked(getMakerArenaResult);
 
 function mk(p: Partial<LeaderboardRow>): LeaderboardRow {
   return {
@@ -33,7 +41,10 @@ describe('LeaderboardScreen (REQ-013 / AC-005 / WD-7)', () => {
     // it is BOTH not-eligible (partial proof) AND low-confidence (tiny sample).
     const rows: LeaderboardRow[] = [
       mk({ agent_id: 'lowclv', agent_name: 'Low CLV Eligible', avg_clv_bps: 4, proof_mode: 'reproducible', valid_count: 200, clv_confidence: 'high', low_sample: false }),
-      mk({ agent_id: 'topclv', agent_name: 'Top CLV Unproven', avg_clv_bps: 30, proof_mode: 'partial', valid_count: 3, clv_confidence: 'low', low_sample: true }),
+      // II-W defect 5: eligibility is the BACKEND value (anchor-derived), rendered verbatim — a
+      // partial-proof "unproven" agent carries eligibility_badge:'not-eligible' consistently (the
+      // screen no longer re-derives it from proof_mode).
+      mk({ agent_id: 'topclv', agent_name: 'Top CLV Unproven', avg_clv_bps: 30, proof_mode: 'partial', eligibility_badge: 'not-eligible', valid_count: 3, clv_confidence: 'low', low_sample: true }),
       mk({ agent_id: 'midclv', agent_name: 'Mid CLV Eligible', avg_clv_bps: 12, proof_mode: 'verified', valid_count: 80, clv_confidence: 'high', low_sample: false }),
     ];
     render(<LeaderboardScreen rows={rows} />);
@@ -72,6 +83,32 @@ describe('LeaderboardScreen (REQ-013 / AC-005 / WD-7)', () => {
     expect(src).not.toHaveTextContent(/replay/i);
   });
 
+  it('renders an UNSCORED global row (avg_clv_bps=null) as "—", never a fabricated 0 bps (R-globalclv)', () => {
+    // The cross-run adapter now preserves the backend null (action_count==0). The board must show
+    // "—" (unavailable) for that agent's Avg CLV, never "0" — mirrors the F-5 competition-board fix.
+    render(<LeaderboardScreen rows={[mk({ agent_id: 'unscored', agent_name: 'Unscored Co', avg_clv_bps: null })]} />);
+    const clv = within(screen.getByTestId('lb-row')).getByTestId('lb-clv');
+    expect(clv).toHaveTextContent('—');
+    expect(clv).not.toHaveTextContent('0');
+  });
+
+  it('null-CLV (unscored) rows sort LAST and never crash the board — mirrors backend None → last (R-globalclv)', () => {
+    // A null-CLV agent keeps a real, rendered position at the bottom (None → -inf), and the scored
+    // rows keep their CLV-desc order — no fabricated 0 lets an unscored agent leapfrog a scored one.
+    const rows: LeaderboardRow[] = [
+      mk({ agent_id: 'mid', agent_name: 'Mid', avg_clv_bps: 5 }),
+      mk({ agent_id: 'unscored', agent_name: 'Unscored', avg_clv_bps: null }),
+      mk({ agent_id: 'top', agent_name: 'Top', avg_clv_bps: 20 }),
+    ];
+    render(<LeaderboardScreen rows={rows} />);
+    const order = screen.getAllByTestId('lb-row').map((r) => within(r).getByTestId('lb-agent').textContent);
+    expect(order[0]).toMatch(/Top/);
+    expect(order[1]).toMatch(/Mid/);
+    expect(order[2]).toMatch(/Unscored/);
+    // The unscored row is present with an em-dash CLV — a real position, not hidden, not a fake 0.
+    expect(within(screen.getAllByTestId('lb-row')[2]).getByTestId('lb-clv')).toHaveTextContent('—');
+  });
+
   it('filters by source without changing the CLV-only sort rule', async () => {
     const user = userEvent.setup();
     render(<LeaderboardScreen />);
@@ -85,6 +122,11 @@ describe('LeaderboardScreen (REQ-013 / AC-005 / WD-7)', () => {
 });
 
 describe('LeaderboardScreen — Maker Arena lane (MM-R1)', () => {
+  beforeEach(() => {
+    getMakerArenaResultMock.mockReset();
+    getMakerArenaResultMock.mockResolvedValue(MAKER_ARENA_RESULT);
+  });
+
   afterEach(() => {
     window.history.replaceState(null, '', '/'); // reset any ?lane= query between tests
   });
@@ -153,6 +195,10 @@ describe('LeaderboardScreen — Maker Arena lane (MM-R1)', () => {
 // I-R remediation (M1 / Min5): the falsification strip must derive its badge, headline, and CI
 // copy from the REAL verdict, and the visible PROOF affordance must be a working link.
 describe('LeaderboardScreen — Maker verdict honesty + proof links (I-R M1, Min5)', () => {
+  beforeEach(() => {
+    getMakerArenaResultMock.mockReset();
+  });
+
   afterEach(() => {
     window.history.replaceState(null, '', '/'); // reset any ?lane= query between tests
   });
@@ -189,5 +235,61 @@ describe('LeaderboardScreen — Maker verdict honesty + proof links (I-R M1, Min
       expect(link.getAttribute('href')).toMatch(/^\/proof\/maker\/(txline-fair-mm|naive-mm)$/);
       expect(link).toHaveTextContent(/proof/i);
     }
+  });
+});
+
+describe('LeaderboardScreen — live maker result loading (F-9)', () => {
+  beforeEach(() => {
+    getMakerArenaResultMock.mockReset();
+  });
+
+  afterEach(() => {
+    window.history.replaceState(null, '', '/');
+  });
+
+  it('loads the maker leaderboard through the API only after Maker mode opens', async () => {
+    const liveResult = structuredClone(MAKER_ARENA_RESULT);
+    liveResult.leaderboard[0].avg_toxicity_loss_bps = 7;
+    getMakerArenaResultMock.mockResolvedValue(liveResult);
+    const user = userEvent.setup();
+
+    render(<LeaderboardScreen />);
+    expect(getMakerArenaResultMock).not.toHaveBeenCalled();
+    await user.click(screen.getByRole('radio', { name: 'Maker' }));
+
+    expect(await screen.findByText('+7.0 bps')).toBeInTheDocument();
+    expect(getMakerArenaResultMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('renders an honest unavailable state with zero maker rows when the API rejects', async () => {
+    getMakerArenaResultMock.mockRejectedValue(new Error('maker endpoint offline'));
+    const user = userEvent.setup();
+
+    render(<LeaderboardScreen />);
+    await user.click(screen.getByRole('radio', { name: 'Maker' }));
+
+    expect(await screen.findByTestId('maker-unavailable')).toHaveTextContent(/maker data unavailable/i);
+    expect(screen.queryAllByTestId('lb-maker-row')).toHaveLength(0);
+  });
+
+  it('renders an honest empty state when the API leaderboard has no maker agents', async () => {
+    getMakerArenaResultMock.mockResolvedValue({ ...MAKER_ARENA_RESULT, leaderboard: [] });
+    const user = userEvent.setup();
+
+    render(<LeaderboardScreen />);
+    await user.click(screen.getByRole('radio', { name: 'Maker' }));
+
+    expect(await screen.findByTestId('maker-empty')).toHaveTextContent(/no maker results available/i);
+    expect(screen.queryAllByTestId('lb-maker-row')).toHaveLength(0);
+  });
+
+  it('uses an explicitly injected maker result without making an API request', async () => {
+    const user = userEvent.setup();
+    render(<LeaderboardScreen makerResult={MAKER_ARENA_RESULT} />);
+
+    await user.click(screen.getByRole('radio', { name: 'Maker' }));
+
+    expect(screen.getAllByTestId('lb-maker-row')).toHaveLength(2);
+    expect(getMakerArenaResultMock).not.toHaveBeenCalled();
   });
 });

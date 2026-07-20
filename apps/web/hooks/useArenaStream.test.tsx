@@ -56,6 +56,83 @@ describe('useArenaStream (cross-competition isolation)', () => {
     expect(result.current.state.competition_id).toBe('comp-b'); // reset, not stale comp-a
     expect(result.current.state.events).toEqual([]); // comp-a's events must not carry over
   });
+
+  it('resets leaderboard + receipts when competitionId changes (no stale board/receipt carry-over)', () => {
+    const a: CockpitState = {
+      ...stateFor('comp-a', []),
+      leaderboard: [{
+        rank: 1, agent_id: 'a', agent_name: 'A', agent_kind: '', runs: 0, avg_clv_bps: 9, total_clv_bps: 9,
+        sim_pnl: null, brier: null, max_drawdown: null, action_count: null, valid_pct: null,
+        proof_mode: 'reproducible', eligibility_badge: 'eligible', anchor_status: 'pending',
+        source_mode: 'live', valid_count: 2, clv_confidence: '', low_sample: false,
+      }],
+      receipts: [{
+        execution_id: 'e1', venue: 'sxbet', market_ref: '1X2:FRA', side: 'back', requested_size: 1,
+        filled_size: 1, price: 1.5, status: 'filled', venue_order_id: 'o1', mode: 'paper',
+        submitted_at: 1, settled_at: 2,
+      }],
+    };
+    const b: CockpitState = { ...stateFor('comp-b', []), leaderboard: [], receipts: [] }; // fresh competition
+    const { result, rerender } = renderHook(
+      ({ id, init }) => useArenaStream(id, init),
+      { initialProps: { id: 'comp-a', init: a } },
+    );
+    expect(result.current.state.leaderboard.length).toBe(1);
+    expect(result.current.state.receipts.length).toBe(1);
+
+    rerender({ id: 'comp-b', init: b });
+    expect(result.current.state.leaderboard).toEqual([]); // comp-a's board must not carry over
+    expect(result.current.state.receipts).toEqual([]);    // comp-a's receipts must not carry over
+  });
+});
+
+// F-5 RED-1/RED-4: a live SCORE_UPDATE must refetch the COMPETITION-SCOPED state and project the
+// backend-authoritative leaderboard + sealed receipts into the cockpit (blank → populated in live).
+describe('useArenaStream — SCORE_UPDATE refetches the competition-scoped leaderboard + receipts', () => {
+  const populatedRefetch = (id: string): Promise<CockpitState> => Promise.resolve({
+    ...stateFor(id, []),
+    leaderboard: [{
+      rank: 1, agent_id: 'alpha', agent_name: 'alpha', agent_kind: '', runs: 0, avg_clv_bps: 92, total_clv_bps: 184,
+      sim_pnl: null, brier: null, max_drawdown: null, action_count: null, valid_pct: null,
+      proof_mode: 'reproducible', eligibility_badge: 'eligible', anchor_status: 'pending',
+      source_mode: 'live', valid_count: 2, clv_confidence: '', low_sample: false,
+    }],
+    receipts: [{
+      execution_id: 'exec-1', venue: 'sxbet', market_ref: '1X2:FRA', side: 'back', requested_size: 100,
+      filled_size: 100, price: 1.472, status: 'filled', venue_order_id: 'ord-1', mode: 'paper',
+      submitted_at: 1782518396, settled_at: 1782518397,
+    }],
+  });
+
+  it('populates the blank live board + receipts from the refetch on a score_update event', async () => {
+    const initial: CockpitState = { ...stateFor('comp-a', []), leaderboard: [], receipts: [] };
+    const refetch = vi.fn(populatedRefetch);
+    const { result } = renderHook(() => useArenaStream('comp-a', initial, undefined, refetch));
+
+    expect(result.current.state.leaderboard).toEqual([]); // blank until the stream drives a score
+
+    await act(async () => {
+      lastOpts?.onEvent({ seq: 1, type: 'score_update', payload_hash: '0x', evidence: false, ts: 1 });
+    });
+
+    expect(refetch).toHaveBeenCalledWith('comp-a'); // competition-scoped refetch, by id
+    expect(result.current.state.leaderboard.length).toBe(1);
+    expect(result.current.state.leaderboard[0].agent_id).toBe('alpha');
+    expect(result.current.state.receipts.length).toBe(1);
+    expect(result.current.state.receipts[0].execution_id).toBe('exec-1');
+  });
+
+  it('does NOT refetch for a non-score event (only SCORE_UPDATE drives the board refetch)', async () => {
+    const initial: CockpitState = { ...stateFor('comp-a', []), leaderboard: [], receipts: [] };
+    const refetch = vi.fn(populatedRefetch);
+    renderHook(() => useArenaStream('comp-a', initial, undefined, refetch));
+
+    await act(async () => {
+      lastOpts?.onEvent({ seq: 1, type: 'AGENT_ACTION', payload_hash: '0x', evidence: true, ts: 1 });
+    });
+
+    expect(refetch).not.toHaveBeenCalled();
+  });
 });
 
 describe('applyEvent (pure projection helper)', () => {

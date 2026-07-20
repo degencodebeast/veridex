@@ -5,9 +5,10 @@ import { Num } from '@/components/ui/Num';
 import { SegmentedControl } from '@/components/ui/SegmentedControl';
 import { isEligible } from '@/lib/derive';
 import { AGENTS } from '@/lib/fixtures/catalog';
-import { MAKER_ARENA_RESULT, MAKER_AGENT_META } from '@/lib/fixtures/maker';
+import { MAKER_AGENT_META } from '@/lib/fixtures/maker';
 import { deriveMakerVerdict } from '@/lib/makerVerdict';
 import { useLane, type Lane } from '@/hooks/useLane';
+import { useMakerArenaResult } from '@/hooks/useMakerArenaResult';
 import type { AgentSummary } from '@/lib/catalog';
 import type { MakerArenaResultView, MakerLeaderboardRow } from '@/lib/contracts';
 import styles from './DuelScreen.module.css';
@@ -27,7 +28,7 @@ function DuelCard({ agent, side }: { agent: AgentSummary; side: string }) {
 
 export function DuelScreen({
   agents = AGENTS,
-  makerResult = MAKER_ARENA_RESULT,
+  makerResult,
 }: {
   agents?: AgentSummary[];
   makerResult?: MakerArenaResultView;
@@ -36,6 +37,7 @@ export function DuelScreen({
   // Hooks run unconditionally; default ids safely even when <2 agents are supplied.
   const [aId, setAId] = useState(agents[0]?.agent_id ?? '');
   const [bId, setBId] = useState(agents[1]?.agent_id ?? '');
+  const makerState = useMakerArenaResult(lane === 'maker', makerResult);
 
   // LANE SWITCH — a level above the directional agent picker (a different measurement).
   const laneSwitch = (
@@ -58,7 +60,15 @@ export function DuelScreen({
       <section className={styles.screen} aria-label="Head-to-Head Duel">
         <h1 className={styles.title}>Head-to-Head Duel</h1>
         {laneSwitch}
-        <MakerDuel result={makerResult} />
+        {makerState.status === 'loading' || makerState.status === 'idle' ? (
+          <p className={styles.empty} data-testid="maker-loading" aria-live="polite">Loading maker result…</p>
+        ) : makerState.status === 'unavailable' ? (
+          <p className={styles.empty} data-testid="maker-unavailable" role="alert">Maker data unavailable.</p>
+        ) : makerState.result.leaderboard.length < 2 ? (
+          <p className={styles.empty} data-testid="maker-empty">Maker comparison unavailable: the result does not contain both fixed maker agents.</p>
+        ) : (
+          <MakerDuel result={makerState.result} />
+        )}
       </section>
     );
   }

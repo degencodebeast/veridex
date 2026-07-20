@@ -26,8 +26,8 @@ import type * as W from '@/lib/wire';
 import type {
   AnchorInfo, AnchorStatus, CheckResult, CockpitState, ExecutionMode, FeedHealthState,
   GuardAblationArm, GuardAblationDecision, GuardAblationLeg, GuardAblationView,
-  InspectorRecord, LeaderboardRow, MakerArenaResultView, MakerLeaderboardRow, MatchState,
-  PerformanceMetrics, ProofArtifact, ProofMode, SourceMode, VerifyResult,
+  ExecutionReceipt, InspectorRecord, LeaderboardRow, MakerArenaResultView, MakerLeaderboardRow, MatchState,
+  PerformanceMetrics, ProofArtifact, ProofMode, ReceiptStatus, SourceMode, VerifyResult,
 } from '@/lib/contracts';
 
 export const API_BASE = process.env.NEXT_PUBLIC_API_BASE ?? '';
@@ -170,15 +170,55 @@ async function postJson<T>(path: string, body?: unknown): Promise<T> {
 }
 
 // ---- pure coercion helpers ----
+// Anchor status is BACKEND-AUTHORITATIVE (v2.10.10 §A6): render the backend's word verbatim, never
+// a fabricated anchor. Two backend vocabularies feed this one coercion: the canonical per-surface
+// vocabulary ("anchored" / "not_anchored" / "pending" / "not_applicable" — proof/feed/competition,
+// veridex/api/schemas.py:96,308) AND the cross-run leaderboard AGGREGATE vocabulary ("all-anchored" /
+// "some-pending" / "none-anchored" — schemas.py:53, veridex/leaderboard.py:66-82). Every "not / absent
+// / unverified / unknown" word FAILS CLOSED to `not-anchored` — an absent anchor is NEVER a green one.
 function toAnchorStatus(s: string): AnchorStatus {
-  if (s === 'anchored' || s === 'pending' || s === 'not_applicable') return s;
-  return 'not-anchored';
+  if (s === 'anchored' || s === 'all-anchored') return 'anchored';
+  if (s === 'pending' || s === 'some-pending') return 'pending';
+  if (s === 'not_applicable') return 'not_applicable';
+  return 'not-anchored'; // not_anchored | none-anchored | absent | unknown ⇒ never a fabricated anchor
 }
 function toProofMode(s: string): ProofMode {
   return s === 'verified' || s === 'partial' ? s : 'reproducible';
 }
 function toSourceMode(s: string): SourceMode {
   return s === 'live' ? 'live' : 'replay';
+}
+function toExecutionMode(s: string): ExecutionMode {
+  return s === 'dry_run' || s === 'live_guarded' ? s : 'paper';
+}
+// The backend ExecutionStatus enum (veridex/execution/models.py) is a SUPERSET of the frontend
+// ReceiptStatus lane. Map the seven lane values 1:1; fold the extras onto the CLOSEST lane stage
+// that never OVERSTATES progress (accepted/partial → submitted, settled → filled), route awaiting_human
+// to policy_approved, and treat expired/voided/unresolved as a terminal-negative (cancelled). Unknown
+// ⇒ the most conservative 'proposed' — never a fabricated later stage.
+function toReceiptStatus(s: string): ReceiptStatus {
+  switch (s) {
+    case 'proposed': case 'law_approved': case 'policy_approved':
+    case 'submitted': case 'filled': case 'rejected': case 'cancelled':
+      return s;
+    case 'accepted': case 'partial': return 'submitted';
+    case 'settled': return 'filled';
+    // awaiting_human is BLOCKED waiting for a human, strictly BEFORE policy_approved (models.py
+    // transition graph: law_approved → awaiting_human → policy_approved). Render its last provably-
+    // reached state, law_approved — NEVER policy_approved, which would claim an approval not yet given.
+    case 'awaiting_human': return 'law_approved';
+    case 'expired': case 'voided': case 'unresolved': return 'cancelled';
+    default: return 'proposed';
+  }
+}
+// Receipt timestamps arrive as ISO strings on the wire (backend ExecutionReceipt.submitted_at: str|None);
+// the view-model carries epoch seconds. Preserve null verbatim (honest "not yet"), parse an ISO string
+// faithfully, and fail an unparseable value to null — understating, never fabricating, progress.
+function toEpochSeconds(v: unknown): number | null {
+  if (v == null) return null;
+  if (typeof v === 'number') return v;
+  const ms = Date.parse(String(v));
+  return Number.isNaN(ms) ? null : Math.floor(ms / 1000);
 }
 
 // wire rules are arbitrary records (e.g. {all_metrics_match: true}); represent each
@@ -289,7 +329,10 @@ export function adaptLeaderboard(w: W.LeaderboardResponse): LeaderboardRow[] {
     agent_name: r.agent_id, // GAP: wire has no agent_name — fall back to id
     agent_kind: '', // GAP: wire has no agent_kind
     runs: r.runs,
-    avg_clv_bps: r.avg_clv_bps ?? 0,
+    // avg_clv_bps is the rank axis; the wire carries `number | null` (backend `float | None`, None
+    // when action_count == 0 — an UNSCORED agent). Preserve null verbatim ⇒ "—", NEVER a fabricated
+    // 0 bps (R-globalclv — mirrors the F-5 competition-board fix on this cross-run/global surface).
+    avg_clv_bps: r.avg_clv_bps,
     total_clv_bps: r.total_clv_bps,
     sim_pnl: r.sim_pnl,
     brier: r.brier ?? 0,
@@ -297,13 +340,92 @@ export function adaptLeaderboard(w: W.LeaderboardResponse): LeaderboardRow[] {
     action_count: r.action_count,
     valid_pct: r.valid_pct, // PERCENT 0-100, passed through 1:1 from the wire
     proof_mode: toProofMode(r.proof_mode),
-    eligibility_badge: r.eligibility_badge === 'eligible' ? 'eligible' : 'not-eligible',
+    // eligibility is BACKEND-AUTHORITATIVE (anchor-derived server-side: fully-proven iff every run is
+    // anchored — veridex/leaderboard.py:_eligibility_badge). Read the backend `eligibility_badge`
+    // ("fully-proven" | "partially-proven" | "unproven", schemas.py:52) — NEVER re-derive from
+    // proof_mode. Only a fully-proven agent is eligible; partial/unproven fail closed to not-eligible.
+    eligibility_badge: r.eligibility_badge === 'eligible' || r.eligibility_badge === 'fully-proven' ? 'eligible' : 'not-eligible',
     anchor_status: toAnchorStatus(r.anchor_status),
-    source_mode: r.source_mode === 'live' ? 'live' : r.source_mode === 'replay' ? 'replay' : 'mixed',
+    // source_mode is the backend cross-run AGGREGATE ("all-replay" | "all-live" | "mixed" | "unknown"
+    // — schemas.py:54, veridex/leaderboard.py:_summarize_source_mode). An all-replay board renders
+    // `replay` (never a spurious `mixed`); all-live renders `live`; anything else is honestly `mixed`.
+    // Plain "replay"/"live" are also accepted so single-run/fixture rows keep mapping 1:1.
+    source_mode:
+      r.source_mode === 'live' || r.source_mode === 'all-live' ? 'live'
+      : r.source_mode === 'replay' || r.source_mode === 'all-replay' ? 'replay'
+      : 'mixed',
     // WD-7 confidence preserved faithfully (display-only, never reorders — SEC-005).
     valid_count: r.valid_count,
     clv_confidence: r.clv_confidence,
     low_sample: r.low_sample,
+  }));
+}
+
+// The competition-scoped leaderboard row (backend CompetitionLeaderboardRow, GET /competitions/{id}).
+// SMALLER than the cross-run wire LeaderboardRow: it carries ONLY the CLV rank axis + identity, no
+// per-agent sim_pnl/brier/max_drawdown/action_count/valid_pct/agent_name.
+interface CompetitionLeaderboardRowWire {
+  rank: number;
+  agent_id: string;
+  total_clv_bps: number;
+  mean_clv_bps: number | null;
+  valid_count: number;
+  proof_mode: string | null;
+}
+
+// F-5: bind the BACKEND-AUTHORITATIVE competition leaderboard into the cockpit view-model. The rows
+// arrive already ranked + ordered by the server (CON-203, ranked by mean_clv_bps desc) — this maps
+// them 1:1 and NEVER re-sorts (a client CLV re-sort would silently disagree with the sealed board).
+// Metrics the competition contract does not carry are null (honest "—"), never a fabricated 0.
+export function adaptCompetitionLeaderboard(
+  rows: CompetitionLeaderboardRowWire[], sourceMode: SourceMode, anchorStatus: AnchorStatus,
+): LeaderboardRow[] {
+  return rows.map((r) => {
+    const proof_mode = toProofMode(r.proof_mode ?? '');
+    return {
+      rank: r.rank,                         // backend rank, verbatim
+      agent_id: r.agent_id,
+      agent_name: r.agent_id,               // GAP: competition row has no display name — fall back to id
+      agent_kind: '',                       // GAP: not in the competition contract
+      runs: 0,                              // GAP: single sealed run, not a cross-run count
+      avg_clv_bps: r.mean_clv_bps,          // mean_clv_bps → avg_clv_bps; null (UNSCORED) preserved ⇒ "—", never a fake 0
+      total_clv_bps: r.total_clv_bps,
+      sim_pnl: null, brier: null, max_drawdown: null, action_count: null, valid_pct: null, // ABSENT ⇒ "—"
+      proof_mode,
+      // II-W defect 5: the competition-scoped CompetitionLeaderboardRow (veridex/api/schemas.py:152-172)
+      // carries NO authoritative eligibility field — only {rank, agent_id, total/mean_clv_bps,
+      // valid_count, proof_mode}. Re-deriving eligibility from proof_mode violates the "UI never
+      // re-derives" contract, so FAIL CLOSED to not-eligible — never a fabricated "eligible" without an
+      // authoritative signal. (This surface is not rendered as an eligibility column today; ClvLeaderboard
+      // shows proof_mode + anchor only. A true per-agent competition eligibility field is a backend follow-up.)
+      eligibility_badge: 'not-eligible',
+      anchor_status: anchorStatus,          // competition-level anchor status, applied verbatim
+      source_mode: sourceMode,
+      valid_count: r.valid_count,           // real count from the competition contract
+      clv_confidence: '',                   // GAP: not classified per-agent in the competition contract
+      low_sample: false,                    // GAP: not classified — display-only, never a rank input (SEC-005)
+    };
+  });
+}
+
+// F-5: project the sealed decision receipts from the NON-SCORING execution attachment (REQ-2B-20 —
+// off-chain venue artifact, separate from the Phase-1 Memo anchor), field-for-field. Empty when the
+// competition has no execution records (honest-empty, never a fixture).
+export function adaptExecutionReceipts(execution: Record<string, unknown> | null | undefined): ExecutionReceipt[] {
+  const raw = (execution?.receipts as Array<Record<string, unknown>> | undefined) ?? [];
+  return raw.map((r) => ({
+    execution_id: String(r.execution_id ?? ''),
+    venue: String(r.venue ?? ''),
+    market_ref: String(r.market_ref ?? ''),
+    side: String(r.side ?? ''),
+    requested_size: Number(r.requested_size ?? 0),
+    filled_size: Number(r.filled_size ?? 0),
+    price: Number(r.price ?? 0),
+    status: toReceiptStatus(String(r.status ?? '')),
+    venue_order_id: r.venue_order_id == null ? null : String(r.venue_order_id),
+    mode: toExecutionMode(String(r.mode ?? 'paper')),
+    submitted_at: toEpochSeconds(r.submitted_at),
+    settled_at: toEpochSeconds(r.settled_at),
   }));
 }
 
@@ -395,23 +517,41 @@ export function adaptCompetitionState(w: W.CompetitionStateResponse): CockpitSta
       // Fall back to the canonical const only when the competition has no sealed run yet.
       verifier_version: w.proof_card?.verifier_version ?? VERIFIER_VERSION,
     },
-    // GAPs: the cockpit's trace/match/events/receipts/policy/kill_armed and the rich
-    // leaderboard are NOT in GET /competitions/{id}; the cockpit screen assembles them
-    // from the WS stream (useArenaStream) + GET /leaderboard.
+    // GAPs (WS-filled): trace/match/events/policy/kill_armed are NOT in GET /competitions/{id};
+    // useArenaStream projects them from the live canonical stream.
     trace: [],
     match: emptyMatch(),
-    leaderboard: [],
+    // F-5: the leaderboard + receipts ARE on the competition-scoped response — bind them here so the
+    // cockpit centerpiece populates from the real backend (backend-authoritative rank; sealed receipts),
+    // and a SCORE_UPDATE refetch keeps them live. NEVER the global cross-run /leaderboard.
+    leaderboard: adaptCompetitionLeaderboard(
+      (w.leaderboard as unknown as CompetitionLeaderboardRowWire[]) ?? [],
+      toSourceMode(String(cfg.source_mode ?? 'replay')),
+      toAnchorStatus(w.anchor_status),
+    ),
     events: [],
-    receipts: [],
+    receipts: adaptExecutionReceipts(w.execution),
     policy: [],
     kill_armed: false,
   };
 }
 
 export function adaptInspector(w: W.InspectorRecord): InspectorRecord {
-  const rec = w.recompute as { recomputed_edge_bps?: number; clv_bps?: number; valid?: boolean; real_venue_quote?: boolean };
+  const rec = w.recompute as { recomputed_edge_bps?: number; clv_bps?: number | string; valid?: boolean; real_venue_quote?: boolean };
   const llm = w.untrusted_llm_metadata as { reason?: string; confidence?: number; claimed_edge_bps?: number; model?: string };
+  // PENDING CLV (defect 2): the backend emits the non-numeric "pending" sentinel for a valid
+  // WAIT/abstention — clv_bps is typed `int | str` (veridex/api/schemas.py:290; router.py:796). This
+  // is DISTINCT from the F-5/R-globalclv null/unscored path (that renders "—"): pending is "too little
+  // runway to score yet". Flag it so the screen shows an honest PENDING affordance and NEVER a
+  // fabricated 0 — the pre-fix `Number('pending') || 0` silently coerced it to a scored-looking 0 bps.
+  const clvPending = w.clv_bps === 'pending' || rec.clv_bps === 'pending';
   const clv = typeof w.clv_bps === 'number' ? w.clv_bps : Number(w.clv_bps) || 0;
+  // DETERMINISTIC vs LLM (defect 6): the backend populates untrusted_llm_metadata ONLY from an LLM
+  // action's {reason, confidence, claimed_edge_bps} params — it is the EMPTY dict {} for a
+  // deterministic agent that emits none (router.py:803-805). An empty {} is truthy in JS, so key off
+  // its CONTENTS: no keys ⇒ null (deterministic — no LLM in the provenance story), never a fabricated
+  // zero-valued LLM record.
+  const hasLlm = llm != null && Object.keys(llm).length > 0;
   return {
     run_id: w.run_id,
     agent_id: w.agent_id,
@@ -420,7 +560,10 @@ export function adaptInspector(w: W.InspectorRecord): InspectorRecord {
     is_live: false, // GAP
     market_state: w.market_state as unknown as InspectorRecord['market_state'],
     agent_action: w.agent_action as unknown as InspectorRecord['agent_action'],
-    recompute: { recomputed_edge_bps: rec.recomputed_edge_bps ?? 0, clv_bps: rec.clv_bps ?? 0, valid: rec.valid ?? false },
+    // The recompute echo is a TRUST SURFACE (a judge verifies the deterministic recompute here): a
+    // non-numeric "pending" sentinel is preserved as null (honest "not scored yet"), NEVER the coerced
+    // 0 — consistent with the D2 headline PENDING treatment and F-5/R-globalclv's null-preservation.
+    recompute: { recomputed_edge_bps: rec.recomputed_edge_bps ?? 0, clv_bps: typeof rec.clv_bps === 'number' ? rec.clv_bps : null, valid: rec.valid ?? false },
     // GAP: the wire InspectorRecord carries no doctrine quantities (fair value,
     // executable edge, venue price, mispricing gap, stake) → null = honest "not in proof
     // artifact" (rendered as "—"), NOT a plausible 0. CLV (the real score) is carried through.
@@ -431,10 +574,10 @@ export function adaptInspector(w: W.InspectorRecord): InspectorRecord {
     clv_explanation: {
       fair_value_pct: null, closing_fair_value_pct: null, venue_decimal_price: null,
       mispricing_gap_bps: null, executable_edge_bps: null, real_venue_quote: rec.real_venue_quote === true,
-      clv_bps: clv, stake_fraction: null,
+      clv_bps: clv, clv_pending: clvPending, stake_fraction: null,
       plain: '',
     },
-    untrusted_llm: llm
+    untrusted_llm: hasLlm
       ? { model: llm.model ?? '', confidence: llm.confidence ?? 0, claimed_edge_bps: llm.claimed_edge_bps ?? 0, rationale: llm.reason ?? '' }
       : null,
   };

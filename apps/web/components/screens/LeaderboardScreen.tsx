@@ -6,12 +6,13 @@ import { Num } from '@/components/ui/Num';
 import { ConfBar } from '@/components/ui/ConfBar';
 import { SegmentedControl } from '@/components/ui/SegmentedControl';
 import { InfoTip } from '@/components/ui/InfoTip';
-import { rankByAvgClv, isEligible } from '@/lib/derive';
+import { rankByAvgClv } from '@/lib/derive';
 import { LEADERBOARD_ROWS } from '@/lib/fixtures/catalog';
-import { MAKER_ARENA_RESULT, MAKER_AGENT_META } from '@/lib/fixtures/maker';
+import { MAKER_AGENT_META } from '@/lib/fixtures/maker';
 import { deriveMakerVerdict } from '@/lib/makerVerdict';
 import { GLOSSARY } from '@/lib/glossary';
 import { useLane, type Lane } from '@/hooks/useLane';
+import { useMakerArenaResult } from '@/hooks/useMakerArenaResult';
 import type { LeaderboardRow } from '@/lib/catalog';
 import type { MakerArenaResultView, MakerLeaderboardRow } from '@/lib/contracts';
 import styles from './LeaderboardScreen.module.css';
@@ -20,13 +21,14 @@ type Filter = 'ALL' | 'REPLAY' | 'LIVE';
 
 export function LeaderboardScreen({
   rows = LEADERBOARD_ROWS,
-  makerResult = MAKER_ARENA_RESULT,
+  makerResult,
 }: {
   rows?: LeaderboardRow[];
   makerResult?: MakerArenaResultView;
 }) {
   const [lane, setLane] = useLane();
   const [filter, setFilter] = useState<Filter>('ALL');
+  const makerState = useMakerArenaResult(lane === 'maker', makerResult);
 
   const ranked = useMemo(() => {
     const scoped = filter === 'ALL'
@@ -93,16 +95,21 @@ export function LeaderboardScreen({
                       </Link>
                     </td>
                     <td className={styles.num}>{r.runs}</td>
-                    <td className={styles.num} data-testid="lb-clv"><Num value={r.avg_clv_bps} kind="bps" /></td>
+                    <td className={styles.num} data-testid="lb-clv">{r.avg_clv_bps === null ? '—' : <Num value={r.avg_clv_bps} kind="bps" />}</td>
                     <td className={styles.num}><Num value={r.total_clv_bps} kind="bps" /></td>
-                    <td className={styles.num}><Num value={r.sim_pnl} /></td>
-                    <td className={styles.num}>{r.brier.toFixed(2)}</td>
-                    <td className={styles.num}><Num value={r.max_drawdown} /></td>
-                    <td className={styles.num}>{r.action_count}</td>
-                    <td className={styles.num}>{r.valid_pct.toFixed(1)}%</td>
+                    {/* The cross-run board always carries these proxy metrics; the `— ` guards are
+                        defensive for the shared LeaderboardRow whose competition variant omits them. */}
+                    <td className={styles.num}>{r.sim_pnl === null ? '—' : <Num value={r.sim_pnl} />}</td>
+                    <td className={styles.num}>{r.brier === null ? '—' : r.brier.toFixed(2)}</td>
+                    <td className={styles.num}>{r.max_drawdown === null ? '—' : <Num value={r.max_drawdown} />}</td>
+                    <td className={styles.num}>{r.action_count === null ? '—' : r.action_count}</td>
+                    <td className={styles.num}>{r.valid_pct === null ? '—' : `${r.valid_pct.toFixed(1)}%`}</td>
                     <td><ConfBar validCount={r.valid_count} /></td>
                     <td><Badge variant={r.proof_mode} /></td>
-                    <td><Badge variant={isEligible(r.proof_mode) ? 'eligible' : 'not-eligible'} /></td>
+                    {/* II-W defect 5: render the BACKEND-authoritative eligibility_badge VERBATIM
+                        (anchor-derived server-side — veridex/leaderboard.py). NEVER re-derive it from
+                        proof_mode here; that reversed the adapter fix and disagreed with the backend. */}
+                    <td><Badge variant={r.eligibility_badge} /></td>
                     <td><Badge variant={r.anchor_status === 'anchored' ? 'anchored' : r.anchor_status === 'not-anchored' ? 'not-anchored' : 'pending'} /></td>
                     <td data-testid="lb-source">
                       {r.source_mode === 'live' ? <Badge variant="live" />
@@ -116,7 +123,15 @@ export function LeaderboardScreen({
           </div>
         </>
       ) : (
-        <MakerLeaderboard result={makerResult} />
+        makerState.status === 'loading' || makerState.status === 'idle' ? (
+          <p className={styles.empty} data-testid="maker-loading" aria-live="polite">Loading maker result…</p>
+        ) : makerState.status === 'unavailable' ? (
+          <p className={styles.empty} data-testid="maker-unavailable" role="alert">Maker data unavailable.</p>
+        ) : makerState.result.leaderboard.length === 0 ? (
+          <p className={styles.empty} data-testid="maker-empty">No maker results available.</p>
+        ) : (
+          <MakerLeaderboard result={makerState.result} />
+        )
       )}
     </section>
   );

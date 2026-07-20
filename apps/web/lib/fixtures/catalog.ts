@@ -1,33 +1,14 @@
 import type {
   LeaderboardRow, CompetitionSummary, AgentSummary, AgentProfileRecord, RunSummary,
   RewardSummary, OpsAlert, OddsUpdate, FixtureSummary, RuntimeOverview, CanonicalLogLine,
-  PolicyEnvelope, FeedHealthState,
+  FeedHealthState,
 } from '@/lib/catalog';
 
-export const DEFAULT_POLICY_ENVELOPE: PolicyEnvelope = {
-  max_stake: 100, max_orders_per_run: 5, max_orders_per_session: 20, max_orders_per_day: 50,
-  venue_allowlist: ['sxbet'], market_allowlist: ['1X2_PARTICIPANT_RESULT', 'OVERUNDER_PARTICIPANT_GOALS'],
-  min_edge_bps: 8, max_slippage_bps: 25, max_price: 4.5, max_quote_age_s: 30,
-  cooldown_s: 10, human_approval_threshold: 250, kill_switch: false,
-};
-
-// MM-specific deploy envelope for the QuoteGuard/MM (quoteguard-mm) family. It is DELIBERATELY
-// SEPARATE from DEFAULT_POLICY_ENVELOPE (the directional sxbet / 1X2 identity, shared with the
-// directional deploy path + its market chips) so neither path repurposes the other. The identity
-// here is coherent with the REAL-DATA PMXT/TxLINE maker tape `pmxt-txline-mm-18209181-v1`:
-//   - market_allowlist[0] is the REAL Polymarket HOME-win token the tape's order book quotes on
-//     (`pmxt:18209181:home_win` == veridex.mm_strategy.pmxt_tape.TOKEN_ID). The backend pins
-//     manifest.market = market_allowlist[0] (session_factory.build_maker_manifest), so an incoherent
-//     allowlist[0] would yield no ATTEMPTED leg.
-//   - venue is Polymarket (`poly`), the tape's book venue.
-// Only market_allowlist / venue_allowlist / min_edge_bps / max_stake are read by the MM deploy
-// branch; the remaining fields keep the envelope a well-formed PolicyEnvelope.
-export const MM_POLICY_ENVELOPE: PolicyEnvelope = {
-  max_stake: 5, max_orders_per_run: 3, max_orders_per_session: 10, max_orders_per_day: 20,
-  venue_allowlist: ['poly'], market_allowlist: ['pmxt:18209181:home_win'],
-  min_edge_bps: 10, max_slippage_bps: 100, max_price: 1000, max_quote_age_s: 60,
-  cooldown_s: 0, human_approval_threshold: 6, kill_switch: false,
-};
+// NOTE: the production policy-envelope defaults (DEFAULT_POLICY_ENVELOPE / MM_POLICY_ENVELOPE) used
+// to live here. They are shipped CONFIG, not demo entity fixtures, so they were relocated to
+// `lib/config/policy.ts` (T-2) — letting the demo-path fixture-prohibition scan ban every entity
+// fixture in this module without banning a legitimate production default. Import them from
+// `@/lib/config/policy`.
 
 // NOTE the highest avg_clv_bps belongs to a NOT-eligible agent on purpose (AC-005),
 // and `stale_scout` is a deliberately low-sample row (WD-7). clv_confidence/low_sample

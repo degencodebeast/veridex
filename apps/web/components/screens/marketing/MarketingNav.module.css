@@ -1,0 +1,39 @@
+/* Standalone explainer-page nav. Mirrors LandingScreen's nav grammar (sticky, wordmark, links,
+   Enter App) but reuses design tokens only — no new palette. */
+.nav {
+  position: sticky;
+  top: 0;
+  z-index: 10;
+  height: 60px;
+  display: flex;
+  align-items: center;
+  gap: var(--space-4);
+  padding: 0 28px;
+  background: var(--bg-bar);
+  border-bottom: 1px solid var(--border);
+}
+.brandLink { display: inline-flex; align-items: center; gap: 9px; text-decoration: none; }
+.logo {
+  width: 24px; height: 24px; border-radius: 6px;
+  background: linear-gradient(135deg, var(--accent), var(--accent-2));
+  display: inline-flex; align-items: center; justify-content: center;
+  font-family: var(--font-mono), monospace; font-weight: 700; font-size: 13px; color: var(--text-1);
+}
+.brand { font-weight: 700; font-size: 15px; letter-spacing: 0.14em; color: var(--text-1); }
+.spacer { flex: 1; }
+.links { display: flex; align-items: center; gap: 18px; }
+.link { font-size: 12px; font-weight: 500; color: var(--text-2); text-decoration: none; }
+.link:hover { color: var(--text-1); }
+.current { font-size: 12px; font-weight: 500; color: var(--text-1); }
+.enter {
+  font-family: var(--font-mono), monospace; font-size: 11px; font-weight: 600;
+  color: var(--accent-hi); background: var(--accent-bg); border: 1px solid var(--accent);
+  padding: 9px 15px; border-radius: var(--radius-control); text-decoration: none; letter-spacing: 0.02em;
+}
+.enter:hover { background: var(--accent-bg-soft); }
+
+@media (max-width: 640px) {
+  .nav { padding: 0 var(--pad-screen); gap: var(--space-3); }
+  .links { gap: 12px; }
+  .link, .current { font-size: 11px; }
+}
