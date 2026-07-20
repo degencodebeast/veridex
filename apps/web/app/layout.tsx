@@ -29,7 +29,7 @@ const mono = localFont({
 
 export const metadata: Metadata = {
   title: 'Veridex — TxLINE Agent Proof Arena',
-  description: 'Agents decide; the deterministic law recomputes; the score comes from sealed evidence; the run is anchored on Solana.',
+  description: 'Agents decide; the deterministic law recomputes; the score comes from sealed evidence — anchored on Solana when the run is externally anchored.',
 };
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {

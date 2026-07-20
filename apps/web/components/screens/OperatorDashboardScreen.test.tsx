@@ -2,7 +2,7 @@ import { describe, it, expect, vi } from 'vitest';
 import { render, screen, within, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { OperatorDashboardScreen } from '@/components/screens/OperatorDashboardScreen';
-import { MY_AGENTS } from '@/lib/fixtures/catalog';
+import { MY_AGENTS, MY_RUNS, MY_REWARDS, ALERTS, COMPETITIONS } from '@/lib/fixtures/catalog';
 import type { DeployedInstance } from '@/lib/api';
 
 // F-3: "Your Agents" is REBOUND off the MY_AGENTS fixture onto real owned instances (getInstances).
@@ -134,7 +134,9 @@ describe('OperatorDashboardScreen (REQ-012 / SEC-008)', () => {
   });
 
   it('labels rewards with honest payout states, never implying paid (SEC-008)', () => {
-    render(<OperatorDashboardScreen connected loadInstances={NO_INSTANCES} />);
+    // Rewards have no backend reader, so the demo fixture is injected by the page ONLY under the mock
+    // gate; here we inject it explicitly to exercise the payout-labeling logic (mock-on parity).
+    render(<OperatorDashboardScreen connected loadInstances={NO_INSTANCES} rewards={MY_REWARDS} />);
     const rewards = screen.getByTestId('your-rewards');
     expect(within(rewards).getByText(/design target/i)).toBeInTheDocument();
     expect(within(rewards).getAllByText(/pending/i).length).toBeGreaterThanOrEqual(1);
@@ -156,9 +158,58 @@ describe('OperatorDashboardScreen (REQ-012 / SEC-008)', () => {
   });
 
   it('shows the alerts rail with kill/deny/hold items', () => {
-    render(<OperatorDashboardScreen connected loadInstances={NO_INSTANCES} />);
+    // Alerts have no backend reader; inject the demo fixture (mock-on parity) to exercise the rail.
+    render(<OperatorDashboardScreen connected loadInstances={NO_INSTANCES} alerts={ALERTS} />);
     const rail = screen.getByTestId('alerts-rail');
     expect(within(rail).getByText('DENY')).toBeInTheDocument();
     expect(within(rail).getByText('HOLD')).toBeInTheDocument();
+  });
+
+  // ---- T-2 remediation: the four Potemkin panels honest-empty off-mock, never a fixture fallback ----
+
+  it('honest-empty (mock OFF / no injected panels): Runs, Competitions, Rewards, Alerts show honest-empty, NEVER the fixtures (T-2)', () => {
+    // No runs/comps/rewards/alerts injected — the off-mock reality. "Your Agents" stays honest via
+    // getInstances (NO_INSTANCES → its own empty state), independent of these four panels.
+    render(<OperatorDashboardScreen connected loadInstances={NO_INSTANCES} />);
+
+    expect(within(screen.getByTestId('your-runs')).getByText(/no runs yet/i)).toBeInTheDocument();
+    expect(within(screen.getByTestId('your-competitions')).getByText(/no competitions yet/i)).toBeInTheDocument();
+    expect(within(screen.getByTestId('your-rewards')).getByText(/no rewards yet/i)).toBeInTheDocument();
+    expect(within(screen.getByTestId('alerts-rail')).getByText(/no alerts/i)).toBeInTheDocument();
+
+    // NONE of the fixture entities may leak into the DOM off-mock (anti-Potemkin).
+    MY_RUNS.forEach((r) => expect(screen.queryByText(r.run_id)).toBeNull());
+    COMPETITIONS.forEach((c) => expect(screen.queryByText(c.title)).toBeNull());
+    MY_REWARDS.forEach((r) => expect(screen.queryByText(r.amount_label)).toBeNull());
+    ALERTS.forEach((a) => expect(screen.queryByText(a.message)).toBeNull());
+  });
+
+  it('mock ON (page injects fixtures): the four panels render the labeled DEMO fixtures, empty-states gone', () => {
+    render(
+      <OperatorDashboardScreen
+        connected
+        loadInstances={NO_INSTANCES}
+        runs={MY_RUNS}
+        comps={COMPETITIONS}
+        rewards={MY_REWARDS}
+        alerts={ALERTS}
+      />,
+    );
+    const runs = screen.getByTestId('your-runs');
+    expect(within(runs).getByText(MY_RUNS[0].agent_name)).toBeInTheDocument();
+    expect(within(runs).queryByText(/no runs yet/i)).toBeNull();
+
+    // 'World Cup · ARG v GER' is unique to COMPETITIONS (not in MY_REWARDS), so it isolates the panel.
+    const comps = screen.getByTestId('your-competitions');
+    expect(within(comps).getByText('World Cup · ARG v GER')).toBeInTheDocument();
+    expect(within(comps).queryByText(/no competitions yet/i)).toBeNull();
+
+    const rewards = screen.getByTestId('your-rewards');
+    expect(within(rewards).getByText(/design target/i)).toBeInTheDocument();
+    expect(within(rewards).queryByText(/no rewards yet/i)).toBeNull();
+
+    const rail = screen.getByTestId('alerts-rail');
+    expect(within(rail).getByText('DENY')).toBeInTheDocument();
+    expect(within(rail).queryByText(/no alerts/i)).toBeNull();
   });
 });

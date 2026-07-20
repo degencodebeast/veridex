@@ -3,9 +3,8 @@ import { useEffect, useState } from 'react';
 import Link from 'next/link';
 import { Badge } from '@/components/ui/Badge';
 import { Num } from '@/components/ui/Num';
-import { MY_RUNS, MY_REWARDS, ALERTS, COMPETITIONS } from '@/lib/fixtures/catalog';
 import { getInstances, type DeployedInstance } from '@/lib/api';
-import type { PayoutState, RewardSummary } from '@/lib/catalog';
+import type { CompetitionSummary, OpsAlert, PayoutState, RewardSummary, RunSummary } from '@/lib/catalog';
 import styles from './OperatorDashboardScreen.module.css';
 
 type AgentsState =
@@ -75,13 +74,23 @@ const PAYOUT_BADGE: Record<Exclude<PayoutState, 'failed'>, 'pending' | 'partial'
 export function OperatorDashboardScreen({
   connected = false,
   onOpenRuntime = () => {},
-  rewards = MY_REWARDS,
+  runs = [],
+  comps = [],
+  rewards = [],
+  alerts = [],
   loadInstances = getInstances,
   onConnect,
 }: {
   connected?: boolean;
   onOpenRuntime?: (agentId: string) => void;
+  // Runs / Competitions / Rewards / Alerts have NO backend reader (no GET exists), so they default to
+  // honest-EMPTY (T-2 anti-Potemkin): off-mock the panels render an honest "nothing yet" state, NEVER
+  // a fixture. The owning page injects the DEMO fixtures ONLY under the mock gate (isMockEnabled).
+  // Contrast "Your Agents", which is bound to REAL owned instances via getInstances (unchanged).
+  runs?: RunSummary[];
+  comps?: CompetitionSummary[];
   rewards?: RewardSummary[];
+  alerts?: OpsAlert[];
   loadInstances?: () => Promise<DeployedInstance[]>;
   // Fires the real login flow (usePrivy().login), wired from the page. Absent in builds where login
   // is impossible (Privy unconfigured) — then the gate stays informative text, never a dead button.
@@ -120,68 +129,84 @@ export function OperatorDashboardScreen({
         <div className={styles.col}>
           <YourAgents loadInstances={loadInstances} onOpenRuntime={onOpenRuntime} />
 
-          <section className={styles.panel}>
+          <section className={styles.panel} data-testid="your-runs">
             <h2 className={styles.h2}>Your Runs</h2>
-            <ul className={styles.list}>
-              {MY_RUNS.map((r) => (
-                <li key={r.run_id} className={styles.runRow}>
-                  <Link href={`/proof/${r.run_id}`} className={styles.rowMain}>
-                    <span>{r.agent_name}</span>
-                    <span className={styles.sub}>{r.run_id} ›</span>
-                  </Link>
-                  <span className={styles.rowMeta}>
-                    <Num value={r.avg_clv_bps} kind="bps" />
-                    <Badge variant={r.proof_mode} />
-                    <Badge variant={r.anchor_status === 'anchored' ? 'anchored' : 'pending'} />
-                  </span>
-                </li>
-              ))}
-            </ul>
+            {runs.length === 0 ? (
+              <p className={styles.hint} data-testid="runs-empty">No runs yet. <Link href="/studio" className={styles.inlineLink}>Deploy an agent to start a run →</Link></p>
+            ) : (
+              <ul className={styles.list}>
+                {runs.map((r) => (
+                  <li key={r.run_id} className={styles.runRow}>
+                    <Link href={`/proof/${r.run_id}`} className={styles.rowMain}>
+                      <span>{r.agent_name}</span>
+                      <span className={styles.sub}>{r.run_id} ›</span>
+                    </Link>
+                    <span className={styles.rowMeta}>
+                      <Num value={r.avg_clv_bps} kind="bps" />
+                      <Badge variant={r.proof_mode} />
+                      <Badge variant={r.anchor_status === 'anchored' ? 'anchored' : 'pending'} />
+                    </span>
+                  </li>
+                ))}
+              </ul>
+            )}
           </section>
         </div>
 
         <div className={styles.col}>
-          <section className={styles.panel}>
+          <section className={styles.panel} data-testid="your-competitions">
             <h2 className={styles.h2}>Competitions you&apos;re in</h2>
-            <ul className={styles.list}>
-              {COMPETITIONS.map((c) => (
-                <li key={c.competition_id} className={styles.runRow}>
-                  <Link href={c.lifecycle === 'live' ? `/arena/${c.competition_id}` : `/competitions`} className={styles.rowMain}>
-                    <span>{c.title}</span>
-                    <span className={styles.sub}>{c.competition_type} ›</span>
-                  </Link>
-                  <Badge variant={c.lifecycle === 'live' ? 'live' : c.lifecycle === 'settled' ? 'reproducible' : 'pending'} />
-                </li>
-              ))}
-            </ul>
+            {comps.length === 0 ? (
+              <p className={styles.hint} data-testid="competitions-empty">No competitions yet. <Link href="/competitions" className={styles.inlineLink}>Browse competitions →</Link></p>
+            ) : (
+              <ul className={styles.list}>
+                {comps.map((c) => (
+                  <li key={c.competition_id} className={styles.runRow}>
+                    <Link href={c.lifecycle === 'live' ? `/arena/${c.competition_id}` : `/competitions`} className={styles.rowMain}>
+                      <span>{c.title}</span>
+                      <span className={styles.sub}>{c.competition_type} ›</span>
+                    </Link>
+                    <Badge variant={c.lifecycle === 'live' ? 'live' : c.lifecycle === 'settled' ? 'reproducible' : 'pending'} />
+                  </li>
+                ))}
+              </ul>
+            )}
           </section>
 
           <section className={styles.panel} data-testid="your-rewards">
             <h2 className={styles.h2}>Your Rewards</h2>
-            <ul className={styles.list}>
-              {rewards.map((r) => (
-                <li key={r.competition_id} className={styles.runRow}>
-                  <span className={styles.rowMain}>{r.title}</span>
-                  <span className={styles.rowMeta}>
-                    <span className={`${styles.amount} mono`}>{r.amount_label}</span>
-                    {r.payout_state === 'failed'
-                      ? <span className={`${styles.failed} mono`} data-payout="failed">failed</span>
-                      : <Badge variant={PAYOUT_BADGE[r.payout_state]}>{r.payout_state}</Badge>}
-                  </span>
-                </li>
-              ))}
-            </ul>
+            {rewards.length === 0 ? (
+              <p className={styles.hint} data-testid="rewards-empty">No rewards yet.</p>
+            ) : (
+              <ul className={styles.list}>
+                {rewards.map((r) => (
+                  <li key={r.competition_id} className={styles.runRow}>
+                    <span className={styles.rowMain}>{r.title}</span>
+                    <span className={styles.rowMeta}>
+                      <span className={`${styles.amount} mono`}>{r.amount_label}</span>
+                      {r.payout_state === 'failed'
+                        ? <span className={`${styles.failed} mono`} data-payout="failed">failed</span>
+                        : <Badge variant={PAYOUT_BADGE[r.payout_state]}>{r.payout_state}</Badge>}
+                    </span>
+                  </li>
+                ))}
+              </ul>
+            )}
           </section>
 
           <section className={styles.panel} data-testid="alerts-rail">
             <h2 className={styles.h2}>Alerts</h2>
-            <ul className={styles.list}>
-              {ALERTS.map((a) => (
-                <li key={a.id} className={`${styles.alert} mono`}>
-                  <span className={styles[a.kind]}>{a.kind.toUpperCase()}</span> · {a.message}
-                </li>
-              ))}
-            </ul>
+            {alerts.length === 0 ? (
+              <p className={styles.hint} data-testid="alerts-empty">No alerts.</p>
+            ) : (
+              <ul className={styles.list}>
+                {alerts.map((a) => (
+                  <li key={a.id} className={`${styles.alert} mono`}>
+                    <span className={styles[a.kind]}>{a.kind.toUpperCase()}</span> · {a.message}
+                  </li>
+                ))}
+              </ul>
+            )}
           </section>
         </div>
       </div>
