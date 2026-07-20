@@ -770,9 +770,13 @@ const MOCK_GUARD_ABLATION: GuardAblationView = {
 // the DEMO ablation (recorded replay). The route is public (read-only), so a plain accept-JSON GET.
 export async function getMakerLiveAb(instanceId: string): Promise<GuardAblationView | null> {
   if (isMockEnabled()) return MOCK_GUARD_ABLATION;
-  const res = await fetch(resolveApiUrl(PATHS.makerLiveAb(instanceId)), { headers: { accept: 'application/json' } });
-  if (res.status === 404) return null; // honest "no recorded ablation for this instance"
-  if (!res.ok) throw new ApiError(res.status, `GET ${PATHS.makerLiveAb(instanceId)} failed: ${res.status}`);
+  // Owner-scoped (auth-contract@1): the route is now bearer-authed + ownership-checked server-side, so
+  // this MUST attach the Privy bearer (authedGet) — a plain fetch would 401. 404 is the honest "no
+  // recorded ablation for this instance" (unknown / directional / non-maker); other non-ok throws.
+  const path = PATHS.makerLiveAb(instanceId);
+  const res = await authedGet(path);
+  if (res.status === 404) return null;
+  if (!res.ok) throw new ApiError(res.status, `GET ${path} failed: ${res.status}`);
   return adaptGuardAblation((await res.json()) as GuardAblationResponseWire);
 }
 
