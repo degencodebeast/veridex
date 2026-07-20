@@ -29,6 +29,7 @@ from fastapi import Depends, FastAPI, Header, HTTPException
 from pydantic import BaseModel
 
 from veridex.api.auth_privy import PrivyPrincipal, make_require_principal
+from veridex.api.fixture_labels import fixture_label, market_label
 from veridex.chain.anchor import anchor_memo
 from veridex.config import require_privy_provisioning
 from veridex.deploy.attempt import AttemptStatus, DeploymentAttempt, DuplicateAttemptError
@@ -43,7 +44,13 @@ from veridex.ingest.replay_catalog import (
     load_resolved_marketstates,
     resolve_replay_source,
 )
-from veridex.mm_strategy.session_factory import build_maker_policy_envelope, reconstruct_mm_session
+from veridex.mm_strategy.session_factory import (
+    MMTapeNotFoundError,
+    build_maker_policy_envelope,
+    compute_tape_content_hash,
+    default_mm_tape_resolver,
+    reconstruct_mm_session,
+)
 from veridex.runtime.mm_agent_adapter import (
     OwnerMismatchError,
     VeridexAgentAdapter,
@@ -128,6 +135,47 @@ class DeployResponse(BaseModel):
     replay_binding: dict[str, Any] | None = None
 
 
+class AgentInstanceDetail(AgentInstance):
+    """The owner-scoped instance-detail view: an :class:`AgentInstance` PLUS server-derived labels.
+
+    Every added field is ADDITIVE and OPTIONAL — the inherited :class:`AgentInstance` contract is
+    unchanged, so existing readers keep working. The labels only AUGMENT the raw ids the record
+    already carries (they never replace them). ``fixture_label`` / ``market_label`` are CURATED
+    convenience strings (see :mod:`veridex.api.fixture_labels`), never re-verified at render time.
+
+    Two DISTINCT hash identities are surfaced (never conflated): ``replay_pack_content_hash`` is the
+    R-4 :class:`~veridex.ingest.replay_catalog.ReplayCatalog` PACK selection hash, while
+    ``maker_tape_content_hash`` is the ``quoteguard-mm`` MakerReplayTape's own content hash (a
+    DIFFERENT value the maker run actually verifies). Both are server-derived; the maker-tape fields
+    exist ONLY for an MM instance (a directional/non-MM instance has no maker tape → both are ``None``).
+
+    Attributes:
+        fixture_id: The pinned fixture id — the frozen ``replay_binding["fixture_id"]`` when present,
+            else parsed from the leading ``pmxt:{fixture}:...`` allowlist token, else ``None``.
+        fixture_label: The CURATED "Home v Away" label for ``fixture_id`` (``"Fixture {id}"`` for an
+            unmapped id), or ``None`` when no fixture id was derivable (the UI then omits the rows).
+        market_label: The humanized label for the FIRST pinned ``market_allowlist`` token, or ``None``
+            when the allowlist is empty. An unrecognized token passes through unchanged (honest).
+        replay_pack_content_hash: The frozen ``replay_binding["content_hash"]`` — the R-4 replay PACK
+            selection hash (NOT the maker tape's hash), or ``None`` for a live deploy / no binding.
+        replay_pack_id: The frozen ``replay_binding["pack_id"]`` (which verified pack the run
+            replays), or ``None`` for a live deploy / a record with no binding.
+        maker_tape_ref: The ``quoteguard-mm`` tape catalog key (``mm.tape_ref`` from the effective
+            config) for an MM instance, else ``None`` (no maker tape on a directional instance).
+        maker_tape_content_hash: The MakerReplayTape's OWN content hash, derived SERVER-SIDE via the
+            same :func:`~veridex.mm_strategy.session_factory.default_mm_tape_resolver` reconstruction
+            uses. ``None`` for a non-MM instance or when the tape_ref is not banked in the catalog.
+    """
+
+    fixture_id: int | None = None
+    fixture_label: str | None = None
+    market_label: str | None = None
+    replay_pack_content_hash: str | None = None
+    replay_pack_id: str | None = None
+    maker_tape_ref: str | None = None
+    maker_tape_content_hash: str | None = None
+
+
 class InstanceStatusResponse(BaseModel):
     """Owner-scoped run/lease status view for a deployed instance (II-6).
 
@@ -166,6 +214,109 @@ class KillResponse(BaseModel):
     run_id: str
     phase: str
     engaged: bool
+
+
+def _derive_fixture_id(instance: AgentInstance) -> int | None:
+    """Resolve the pinned fixture id from the durable record, fail-soft.
+
+    Priority: the FROZEN ``replay_binding["fixture_id"]`` (server-derived at deploy) → the digits of
+    the leading ``pmxt:{fixture}:...`` allowlist token → ``None``. Never guesses: a non-``pmxt`` /
+    non-numeric token yields ``None`` rather than a fabricated id.
+    """
+    binding = instance.replay_binding or {}
+    bound = binding.get("fixture_id")
+    if isinstance(bound, int):
+        return bound
+    if isinstance(bound, str) and bound.isdigit():
+        return int(bound)
+    for token in instance.market_allowlist:
+        parts = token.split(":")
+        if len(parts) >= 2 and parts[0] == "pmxt" and parts[1].isdigit():
+            return int(parts[1])
+    return None
+
+
+def _derive_maker_tape_identity(
+    instance: AgentInstance,
+    tape_resolver: Callable[[str], MakerReplayTape] | None = None,
+) -> tuple[str | None, str | None]:
+    """Derive ``(maker_tape_ref, maker_tape_content_hash)`` for a ``quoteguard-mm`` instance.
+
+    ONLY an MM-family instance (``submitted_config["strategy"] == "quoteguard-mm"``) has a maker
+    tape; a directional/non-MM instance returns ``(None, None)``. The tape_ref is the persisted
+    ``mm.tape_ref`` (the effective config IS the ``mm`` block for an MM instance).
+
+    The hash is derived SERVER-SIDE via the EFFECTIVE resolver — the SAME
+    ``DeployDeps.mm_tape_resolver`` the maker run itself resolves through (``None`` →
+    :func:`~veridex.mm_strategy.session_factory.default_mm_tape_resolver`), so the detail reports the
+    tape the run ACTUALLY used, never a hardcoded default that diverges from an injected tape. It is
+    NEVER a client-supplied value.
+
+    Self-verifying (mirrors ``reconstruct_mm_session`` at session_factory.py:395-403): the resolved
+    tape's events are re-hashed via :func:`~veridex.mm_strategy.session_factory.compute_tape_content_hash`
+    and REQUIRED to equal the resolver-returned ``tape.content_hash`` before the hash is surfaced. On a
+    MISMATCH (a tampered/broken tape the run would itself reject) it FAILS CLOSED — the hash is
+    ``None`` (never a value that doesn't match the events). A tape_ref not banked in the resolver's
+    catalog likewise yields a ``None`` hash. The ``tape_ref`` is surfaced regardless (honest).
+
+    NOTE: this identity is recomputed at READ time and is NOT persisted/immutable — it must never be
+    labeled "pinned"/"sealed"/"historical" anywhere.
+    """
+    if instance.submitted_config.get("strategy") != MM_STRATEGY_FAMILY:
+        return None, None
+    tape_ref = instance.effective_config.get("tape_ref")
+    if not isinstance(tape_ref, str):
+        return None, None
+    resolve = tape_resolver if tape_resolver is not None else default_mm_tape_resolver
+    try:
+        tape = resolve(tape_ref)
+        recomputed = compute_tape_content_hash(tape.events)
+    except MMTapeNotFoundError:
+        return tape_ref, None
+    except Exception:  # noqa: BLE001 - read-only projection must fail closed, never 500 the page
+        # This label sits on the PRIMARY (non-best-effort) detail path. A read-only projection must
+        # degrade to an omitted hash on ANY resolver/re-hash failure — never propagate a 500 that would
+        # take down the whole owner-scoped page (ownership, run_id, status). Same fail-closed outcome as
+        # a not-banked tape or a hash mismatch; the tape_ref still names the tape honestly.
+        return tape_ref, None
+    if recomputed != tape.content_hash:
+        # Fail closed: the tape's events don't match its claimed hash — the run would reject it, so
+        # the detail must not display a hash. Keep the ref so the surface still names the tape.
+        return tape_ref, None
+    return tape_ref, recomputed
+
+
+def build_instance_detail(
+    instance: AgentInstance,
+    tape_resolver: Callable[[str], MakerReplayTape] | None = None,
+) -> AgentInstanceDetail:
+    """Project an :class:`AgentInstance` onto the owner-scoped detail view + CURATED labels.
+
+    Purely additive server-side enrichment: derives the fixture id, its CURATED label, the first
+    market's humanized label, the frozen replay-PACK identity, and (for an MM instance) the DISTINCT,
+    self-verified maker-tape identity. ``tape_resolver`` is threaded from the route's effective
+    ``DeployDeps.mm_tape_resolver`` so the maker-tape hash reflects the tape the run actually resolves
+    (``None`` → the production default resolver). Never mutates the record; never re-verifies a CURATED
+    label against a live source (see :mod:`veridex.api.fixture_labels`). ``replay_pack_content_hash``
+    (the R-4 pack hash) and ``maker_tape_content_hash`` (the MakerReplayTape hash) are kept separate —
+    they are different identities and one is never presented as the other.
+    """
+    fixture_id = _derive_fixture_id(instance)
+    binding = instance.replay_binding or {}
+    first_market = instance.market_allowlist[0] if instance.market_allowlist else None
+    maker_tape_ref, maker_tape_content_hash = _derive_maker_tape_identity(instance, tape_resolver)
+    return AgentInstanceDetail(
+        **instance.model_dump(),
+        fixture_id=fixture_id,
+        # No derivable fixture id → no label at all (the UI omits the rows rather than showing a
+        # truthy "Fixture (unknown)" placeholder).
+        fixture_label=fixture_label(fixture_id) if fixture_id is not None else None,
+        market_label=market_label(first_market) if first_market is not None else None,
+        replay_pack_content_hash=binding.get("content_hash"),
+        replay_pack_id=binding.get("pack_id"),
+        maker_tape_ref=maker_tape_ref,
+        maker_tape_content_hash=maker_tape_content_hash,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -960,11 +1111,11 @@ def register_deploy_routes(
         instances = await store.list_agent_instances()
         return [inst for inst in instances if inst.operator_id is not None and inst.operator_id == principal.did]
 
-    @app.get("/agents/instances/{instance_id}", response_model=AgentInstance)
+    @app.get("/agents/instances/{instance_id}", response_model=AgentInstanceDetail)
     async def get_agent_instance(
         instance_id: str,
         principal: PrivyPrincipal = Depends(require_principal),  # noqa: B008
-    ) -> AgentInstance:
+    ) -> AgentInstanceDetail:
         """Fetch ONE deployed instance the caller owns (owner resolved server-side, fail-closed).
 
         Ownership is derived from the STORED ``operator_id`` (never the request): a missing instance,
@@ -992,7 +1143,9 @@ def register_deploy_routes(
             raise HTTPException(status_code=404, detail="agent instance not found")
         if instance.operator_id != principal.did:
             raise HTTPException(status_code=403, detail="principal does not own this agent instance")
-        return instance
+        # Thread the EFFECTIVE maker-tape resolver (the same one the run resolves through) so the
+        # surfaced maker-tape hash reflects the tape actually used — never a hardcoded default.
+        return build_instance_detail(instance, tape_resolver=deps.mm_tape_resolver)
 
     async def _load_owned_instance(instance_id: str, principal: PrivyPrincipal) -> AgentInstance:
         """Owner-gate an instance the SAME way :func:`get_agent_instance` does (fail-closed).
