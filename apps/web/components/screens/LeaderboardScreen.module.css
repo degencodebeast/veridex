@@ -14,6 +14,7 @@
 .agentLink:hover { color: var(--accent-hi); }
 .kind { color: var(--text-3); font-size: 10px; }
 .mixedSrc { font-size: 10px; text-transform: uppercase; letter-spacing: 0.04em; color: var(--text-2); border: 1px solid var(--border-soft); border-radius: var(--radius-badge); padding: 1px 6px; }
+.empty { margin: 0; padding: var(--space-4) var(--pad-panel); border: 1px solid var(--border); border-radius: var(--radius-panel); background: var(--panel); color: var(--text-3); font-size: 12px; }
 
 /* Maker Arena lane (MM-R1) */
 .laneRow { display: flex; align-items: center; gap: var(--space-3); flex-wrap: wrap; }

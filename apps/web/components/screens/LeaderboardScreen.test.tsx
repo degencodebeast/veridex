@@ -19,8 +19,17 @@ function mk(p: Partial<LeaderboardRow>): LeaderboardRow {
 }
 
 describe('LeaderboardScreen (REQ-013 / AC-005 / WD-7)', () => {
-  it('ranks by Avg CLV only — the not-eligible top-CLV agent is rank #1 (AC-005)', () => {
+  // T-2 remediation · With NO rows provided (the honest off-mock page passes []), the directional
+  // board must render an honest-empty state — never fall back to the LEADERBOARD_ROWS fixture.
+  it('renders honest-empty (no fixture fallback) when no directional rows are provided (T-2)', () => {
     render(<LeaderboardScreen />);
+    expect(screen.getByTestId('lb-empty')).toBeInTheDocument();
+    expect(screen.queryByTestId('lb-row')).toBeNull();
+    expect(screen.queryByText(/Momentum FR/)).toBeNull(); // the fixture signature agent must be absent
+  });
+
+  it('ranks by Avg CLV only — the not-eligible top-CLV agent is rank #1 (AC-005)', () => {
+    render(<LeaderboardScreen rows={LEADERBOARD_ROWS} />);
     const rows = screen.getAllByTestId('lb-row');
     const first = within(rows[0]);
     expect(first.getByTestId('lb-rank')).toHaveTextContent('1');
@@ -51,18 +60,18 @@ describe('LeaderboardScreen (REQ-013 / AC-005 / WD-7)', () => {
   });
 
   it('shows the rank-rule banner', () => {
-    render(<LeaderboardScreen />);
+    render(<LeaderboardScreen rows={LEADERBOARD_ROWS} />);
     expect(screen.getByText(/Rank is Avg CLV only/i)).toBeInTheDocument();
   });
 
   it('marks Sim PnL and Brier as proxies with ⓟ', () => {
-    render(<LeaderboardScreen />);
+    render(<LeaderboardScreen rows={LEADERBOARD_ROWS} />);
     expect(screen.getByText(/^SIM PNL/).textContent).toMatch(/ⓟ/);
     expect(screen.getByText(/^BRIER/).textContent).toMatch(/ⓟ/);
   });
 
   it('flags low-sample CLV but never hides the row (WD-7)', () => {
-    render(<LeaderboardScreen />);
+    render(<LeaderboardScreen rows={LEADERBOARD_ROWS} />);
     const rows = screen.getAllByTestId('lb-row');
     expect(rows.length).toBe(LEADERBOARD_ROWS.length); // nothing hidden
     expect(screen.getAllByText(/low sample/i).length).toBeGreaterThanOrEqual(1);
@@ -103,7 +112,7 @@ describe('LeaderboardScreen (REQ-013 / AC-005 / WD-7)', () => {
 
   it('filters by source without changing the CLV-only sort rule', async () => {
     const user = userEvent.setup();
-    render(<LeaderboardScreen />);
+    render(<LeaderboardScreen rows={LEADERBOARD_ROWS} />);
     await user.click(screen.getByRole('radio', { name: 'REPLAY' }));
     const rows = screen.getAllByTestId('lb-row');
     rows.forEach((r) => expect(within(r).getByTestId('lb-source')).toHaveTextContent(/replay/i));
@@ -119,7 +128,9 @@ describe('LeaderboardScreen — Maker Arena lane (MM-R1)', () => {
   });
 
   it('defaults to the Directional lane — the existing board is untouched', () => {
-    render(<LeaderboardScreen />);
+    // Directional rows are now supplied by the page (getLeaderboard); pass the fixture explicitly
+    // to assert the board renders — the removed fixture DEFAULT is covered by the honest-empty test.
+    render(<LeaderboardScreen rows={LEADERBOARD_ROWS} />);
     expect(screen.getByRole('radio', { name: 'Directional' })).toHaveAttribute('aria-checked', 'true');
     expect(screen.getAllByTestId('lb-row').length).toBe(LEADERBOARD_ROWS.length);
     expect(screen.queryByTestId('lb-maker-row')).toBeNull();
