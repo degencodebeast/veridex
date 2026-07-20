@@ -1,25 +1,35 @@
 import { describe, it, expect, vi, afterEach } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { renderHook } from '@testing-library/react';
-import { RUNTIME_OVERVIEW, RUNTIME_LOG } from '@/lib/fixtures/catalog';
+import { renderHook, render, screen, waitFor, within } from '@testing-library/react';
+import {
+  RUNTIME_OVERVIEW, RUNTIME_LOG,
+  FEED_HEALTH, LEADERBOARD_ROWS, COMPETITIONS, MY_RUNS, MY_REWARDS, ALERTS,
+} from '@/lib/fixtures/catalog';
 
 // ============================================================================
 // DEMO-PATH FIXTURE-PROHIBITION SCAN (T-2, scoped — anti-Potemkin core).
 //
 // COVERAGE (honest and explicit — this scan does NOT claim more than it locks):
-//   ✅ POSITIVE LOCK — the genuinely BACKEND-WIRED judge-path surfaces (below) do NOT import or
-//      fall back to catalog/maker ENTITY fixtures; with mock OFF their live path fetches, throws,
-//      or honest-empties. A planted entity-fixture import on any of them FAILS this scan.
-//   ✅ MOCK-GATED LOCK — `useAgentOps` (Agent Ops runtime) DOES import RUNTIME_* fixtures, but only
-//      for its demo path; the runtime test proves mock-OFF honest-empties (isDemo=false, log=[]),
-//      and the fixture is reachable ONLY under isMockEnabled().
-//   ⚠️ NOT COVERED (documented gap, deferred to T-2b) — the browse screens in KNOWN_GAP_BROWSE_SCREENS
-//      still render entity fixtures directly with mock OFF. This scan is TRANSPARENT about that gap
-//      (it does not pretend those screens are clean); mock-gating them is T-2b, tracked below.
+//   ✅ POSITIVE LOCK (wired judge-path) — the genuinely BACKEND-WIRED judge-path surfaces (below) do
+//      NOT import or fall back to catalog/maker ENTITY fixtures; with mock OFF their live path fetches,
+//      throws, or honest-empties. A planted entity-fixture import on any of them FAILS this scan.
+//   ✅ POSITIVE LOCK (remediated browse screens) — Markets / Competitions / OperatorDashboard /
+//      PrizeVault were remediated: the screen now imports NO entity fixture. Their demo data is
+//      PAGE-injected (or, for CreateCompetition, self-gated) ONLY under isMockEnabled(). A planted
+//      fixture import on any of them FAILS this scan (static lock, below).
+//   ✅ MOCK-GATED / RUNTIME LOCK — the demo-data guarantee for the remediated surfaces (and for
+//      `useAgentOps` + `CreateCompetitionScreen`, which DO import fixtures for their demo path) is a
+//      RUNTIME one: the runtime tests render the real surface with the mock flag OFF and assert it
+//      renders HONEST-EMPTY (never the entity fixture), with a mock-ON counterpart proving the fixture
+//      WOULD render — so the off-mock assertion is a live regression tripwire, not a vacuous pass.
+//   ⚠️ NOT COVERED (documented gap, F-9 maker — frozen aux lane) — Leaderboard / Agents / Duel still
+//      import MAKER_ARENA_RESULT for the F-9-owned maker toggle (frozen; fixed at F-9 integration).
+//      Their DIRECTIONAL tables are now honest; ONLY the maker table remains Potemkin. This scan is
+//      TRANSPARENT about that single remaining gap (KNOWN_GAP_BROWSE_SCREENS, source-verified below).
 //
-// The point is an HONEST scan that locks what is wired and names what is not — never a green that
-// passes by pretending the Potemkin browse screens do not exist.
+// The point is an HONEST scan that locks what is remediated and names the one gap that remains —
+// never a green that passes by pretending a Potemkin surface does not exist.
 // ============================================================================
 
 // Fabricated ENTITY-DATA fixtures (records rendered as if real). Banned on the wired judge path.
@@ -53,18 +63,27 @@ const WIRED_SURFACES: { label: string; file: string }[] = [
   { label: 'QuoteGuard ablation (page)', file: 'app/(app)/proof/maker-ablation/[instanceId]/page.tsx' },
 ];
 
-// KNOWN, DOCUMENTED GAP — browse screens that still render entity fixtures directly with mock OFF.
-// This scan does NOT cover these; each carries its owning follow-up. Tracked as T-2b (mock-gate to
-// honest-empty). Listing them here keeps the gap visible and un-droppable.
-const KNOWN_GAP_BROWSE_SCREENS: { screen: string; route: string; fixtures: string[]; owner: string }[] = [
-  { screen: 'OperatorDashboardScreen', route: '/dashboard', fixtures: ['MY_RUNS', 'COMPETITIONS', 'ALERTS'], owner: 'T-2b (unscoped)' },
-  { screen: 'CompetitionsScreen', route: '/competitions', fixtures: ['COMPETITIONS', 'MY_REWARDS'], owner: 'T-2b (F-4 residual)' },
-  { screen: 'AgentsScreen', route: '/agents', fixtures: ['AGENTS', 'MAKER_ARENA_RESULT'], owner: 'T-2b (F-9 maker table — frozen aux lane)' },
-  { screen: 'MarketsScreen', route: '/markets', fixtures: ['FIXTURES', 'ODDS_UPDATES', 'FEED_HEALTH', 'LEADERBOARD_ROWS'], owner: 'T-2b (unscoped)' },
-  { screen: 'LeaderboardScreen', route: '/leaderboard', fixtures: ['LEADERBOARD_ROWS', 'MAKER_ARENA_RESULT'], owner: 'T-2b (F-9 maker table — frozen aux lane)' },
-  { screen: 'DuelScreen', route: '/duel', fixtures: ['AGENTS', 'MAKER_ARENA_RESULT'], owner: 'T-2b (F-9 maker table — frozen aux lane)' },
-  { screen: 'AgentProfileScreen (agents/[agentId])', route: '/agents/:id', fixtures: ['AGENT_PROFILES'], owner: 'T-2b (unscoped)' },
-  { screen: 'ClonePreviewScreen (clone)', route: '/clone', fixtures: ['AGENT_PROFILES'], owner: 'T-2b (unscoped)' },
+// REMEDIATED browse screens (T-2) — these NO LONGER import any entity fixture. Their demo data is
+// PAGE-injected ONLY under isMockEnabled(); off-mock they render honest-empty. Static positive lock
+// below; the runtime lock proves the off-mock honest-empty (a planted import here FAILS the scan).
+const REMEDIATED_PAGEFED_SCREENS: { label: string; file: string }[] = [
+  { label: 'Markets (browse)', file: 'components/screens/MarketsScreen.tsx' },
+  { label: 'Competitions (browse)', file: 'components/screens/CompetitionsScreen.tsx' },
+  { label: 'Operator dashboard (browse)', file: 'components/screens/OperatorDashboardScreen.tsx' },
+  { label: 'Prize vault (browse)', file: 'components/screens/PrizeVaultScreen.tsx' },
+];
+
+// KNOWN, DOCUMENTED GAP — the ONLY surfaces that still render an entity fixture with mock OFF. After
+// the T-2 remediation this has shrunk to the F-9 maker table alone: Leaderboard / Agents / Duel are
+// now DIRECTIONAL-honest (their LEADERBOARD_ROWS / AGENTS tables are page-fed / honest-empty off-mock)
+// but STILL import MAKER_ARENA_RESULT for the F-9-owned maker toggle (frozen aux lane; fixed at F-9
+// integration). `file` ties each entry to source so the gap is SOURCE-VERIFIED (never stale): the
+// structural test asserts each screen still imports EXACTLY its declared fixtures. Listing them here
+// keeps the one remaining gap visible and un-droppable.
+const KNOWN_GAP_BROWSE_SCREENS: { screen: string; file: string; route: string; fixtures: string[]; owner: string }[] = [
+  { screen: 'AgentsScreen', file: 'components/screens/AgentsScreen.tsx', route: '/agents', fixtures: ['MAKER_ARENA_RESULT'], owner: 'T-2b (F-9 maker table — frozen aux lane)' },
+  { screen: 'LeaderboardScreen', file: 'components/screens/LeaderboardScreen.tsx', route: '/leaderboard', fixtures: ['MAKER_ARENA_RESULT'], owner: 'T-2b (F-9 maker table — frozen aux lane)' },
+  { screen: 'DuelScreen', file: 'components/screens/DuelScreen.tsx', route: '/duel', fixtures: ['MAKER_ARENA_RESULT'], owner: 'T-2b (F-9 maker table — frozen aux lane)' },
 ];
 
 const readSource = (rel: string) => readFileSync(join(process.cwd(), rel), 'utf8');
@@ -121,6 +140,16 @@ describe('demo-path fixture-prohibition scan (T-2)', () => {
     });
   });
 
+  // POSITIVE LOCK (T-2 remediation) — the remediated browse screens now import NO entity fixture.
+  // Their demo data is PAGE-injected only under isMockEnabled(); a planted fixture import on any of
+  // them FAILS this scan. This is the STATIC half; the RUNTIME lock (below) proves off-mock honesty.
+  describe('remediated browse screens no longer import entity fixtures (static lock)', () => {
+    it.each(REMEDIATED_PAGEFED_SCREENS)('$label ($file) imports no banned entity fixture', ({ file }) => {
+      const violations = bannedFixtureImports(readSource(file));
+      expect(violations, `${file} imports banned entity fixture(s): ${violations.join(', ')}`).toEqual([]);
+    });
+  });
+
   // MOCK-GATED LOCK — Agent Ops runtime honest-empties with mock OFF; fixture only under mock ON.
   describe('Agent Ops runtime (useAgentOps) is mock-gated, not a fixture fallback', () => {
     // useAgentOps IS listed as a wired surface via the drawer, but the hook itself imports RUNTIME_*
@@ -152,21 +181,160 @@ describe('demo-path fixture-prohibition scan (T-2)', () => {
     });
   });
 
-  // TRANSPARENT GAP — the browse-screen Potemkin surface this scan deliberately does NOT cover.
-  describe('known browse-screen gap is documented (deferred to T-2b, never silently dropped)', () => {
-    it('enumerates every known Potemkin browse screen with its fixtures and owning follow-up', () => {
-      expect(KNOWN_GAP_BROWSE_SCREENS.length).toBeGreaterThanOrEqual(8);
+  // TRANSPARENT GAP — the ONE Potemkin surface that remains (the F-9 maker table). The gap list is
+  // SOURCE-VERIFIED so it can never go stale: each entry must still import EXACTLY what it declares.
+  describe('known browse-screen gap is documented + source-verified (F-9 maker, never silently dropped)', () => {
+    it('names exactly the F-9 maker screens that still import their declared fixtures (never stale)', () => {
+      // Shrunk from 8 to the 3 F-9 maker screens after the T-2 remediation. Removing a still-Potemkin
+      // F-9 entry drops the count below 3 and fails here — the gap stays un-droppable while it is real.
+      expect(KNOWN_GAP_BROWSE_SCREENS.length).toBeGreaterThanOrEqual(3);
       for (const gap of KNOWN_GAP_BROWSE_SCREENS) {
         expect(gap.fixtures.length, `${gap.screen} must name the fixtures it still renders`).toBeGreaterThan(0);
-        expect(gap.owner, `${gap.screen} must carry an owning follow-up`).toMatch(/T-2b/);
+        expect(gap.owner, `${gap.screen} must carry the F-9 maker owner`).toMatch(/F-9/);
+        // The gap is only honest if the screen STILL imports exactly what the entry claims: if it were
+        // remediated (import gone) or regressed (extra fixtures), this equality fails and forces an update.
+        const actual = bannedFixtureImports(readSource(gap.file)).sort();
+        expect(actual, `${gap.screen} (${gap.file}) must still import exactly [${gap.fixtures.join(', ')}]`)
+          .toEqual([...gap.fixtures].sort());
       }
     });
-    it('does not claim any gap screen as a wired-and-locked surface', () => {
-      const wiredFiles = WIRED_SURFACES.map((s) => s.file.toLowerCase());
-      for (const gap of KNOWN_GAP_BROWSE_SCREENS) {
-        const base = gap.screen.split(' ')[0].toLowerCase();
-        expect(wiredFiles.some((f) => f.includes(base))).toBe(false);
+    it('the remaining gap is the F-9 maker table alone — only MAKER_ARENA_RESULT, no directional fixtures', () => {
+      const stillRendered = new Set(KNOWN_GAP_BROWSE_SCREENS.flatMap((g) => g.fixtures));
+      // The directional catalog tables are now honest — they must NOT appear in the gap anymore.
+      for (const directional of ['LEADERBOARD_ROWS', 'AGENTS', 'COMPETITIONS', 'MY_RUNS', 'MY_REWARDS', 'ALERTS', 'FIXTURES', 'ODDS_UPDATES', 'FEED_HEALTH', 'AGENT_PROFILES']) {
+        expect(stillRendered.has(directional), `${directional} is remediated and must not be a live gap`).toBe(false);
       }
+      expect([...stillRendered]).toEqual(['MAKER_ARENA_RESULT']);
+    });
+    it('does not claim any gap screen as a wired- or remediation-LOCKED surface', () => {
+      const lockedFiles = [...WIRED_SURFACES, ...REMEDIATED_PAGEFED_SCREENS].map((s) => s.file.toLowerCase());
+      for (const gap of KNOWN_GAP_BROWSE_SCREENS) {
+        // A gap screen still imports a fixture, so it must NOT appear in any positive (no-import) lock.
+        expect(lockedFiles).not.toContain(gap.file.toLowerCase());
+      }
+    });
+  });
+
+  // RUNTIME LOCK (T-2 remediation) — the anti-Potemkin proof that BITES. Each remediated surface
+  // page-injects (or self-gates) its demo fixture ONLY under isMockEnabled(); with the mock flag OFF
+  // it must render HONEST-EMPTY, never the entity fixture. Each lock renders the REAL surface off the
+  // mock and asserts the fixture is ABSENT; the mock-ON counterpart proves the fixture WOULD render,
+  // so the off-mock assertion is a live tripwire (a regression that renders the fixture off-mock fails
+  // the mock-OFF case exactly as the mock-ON render populates it).
+  describe('remediated surfaces render honest-empty with the mock flag OFF (runtime lock)', () => {
+    it('MarketsPage: mock OFF renders no odds/fixtures — never the ODDS_UPDATES/FIXTURES fixture', async () => {
+      vi.resetModules();
+      vi.doMock('@/lib/api', async (importOriginal) => {
+        const actual = await importOriginal<typeof import('@/lib/api')>();
+        return { ...actual, getFeedHealth: async () => null, getLeaderboard: async () => [] };
+      });
+      try {
+        const { default: MarketsPage } = await import('@/app/(app)/markets/page');
+        render(<MarketsPage />);
+        expect(await screen.findByText(/select a fixture/i)).toBeInTheDocument();
+        expect(screen.queryByTestId('fixture-18172280')).toBeNull(); // no demo fixture button
+        expect(screen.queryByText('1.472')).toBeNull(); // no decoded demo odds
+      } finally {
+        vi.doUnmock('@/lib/api');
+      }
+    });
+    it('MarketsPage: mock ON surfaces the demo fixture — proving the off-mock lock is live', async () => {
+      vi.stubEnv('NEXT_PUBLIC_VERIDEX_MOCK', '1');
+      vi.resetModules();
+      vi.doMock('@/lib/api', async (importOriginal) => {
+        const actual = await importOriginal<typeof import('@/lib/api')>();
+        return { ...actual, getFeedHealth: async () => FEED_HEALTH, getLeaderboard: async () => LEADERBOARD_ROWS };
+      });
+      try {
+        const { default: MarketsPage } = await import('@/app/(app)/markets/page');
+        render(<MarketsPage />);
+        expect(await screen.findByTestId('fixture-18172280')).toBeInTheDocument();
+      } finally {
+        vi.doUnmock('@/lib/api');
+      }
+    });
+
+    it('CompetitionsPage: mock OFF renders honest-empty — never the COMPETITIONS fixture', async () => {
+      vi.resetModules();
+      const { default: CompetitionsPage } = await import('@/app/(app)/competitions/page');
+      render(<CompetitionsPage />);
+      await waitFor(() => expect(screen.getByTestId('stat-total')).toHaveTextContent('0'));
+      expect(screen.queryAllByTestId(/^comp-/)).toHaveLength(0);
+      expect(screen.queryByText(/World Cup · FRA v BRA/)).toBeNull();
+      expect(screen.getByTestId('all-competitions-empty')).toBeInTheDocument();
+    });
+    it('CompetitionsPage: mock ON surfaces the COMPETITIONS fixture — off-mock lock is live', async () => {
+      vi.stubEnv('NEXT_PUBLIC_VERIDEX_MOCK', '1');
+      vi.resetModules();
+      const { default: CompetitionsPage } = await import('@/app/(app)/competitions/page');
+      render(<CompetitionsPage />);
+      await waitFor(() => expect(screen.getByTestId('stat-total')).toHaveTextContent(String(COMPETITIONS.length)));
+      expect(screen.getByTestId('comp-wc-fra-bra')).toBeInTheDocument();
+    });
+
+    it('PrizeVaultPage: mock OFF renders an honest-empty payout list — never the MY_REWARDS fixture', async () => {
+      vi.resetModules();
+      const { default: PrizeVaultPage } = await import('@/app/(app)/vault/page');
+      render(<PrizeVaultPage />);
+      expect(await screen.findByTestId('payout-empty')).toBeInTheDocument();
+      expect(screen.queryByTestId('payout-list')).toBeNull();
+      expect(screen.queryByText(/0xscore_8a31f2/i)).toBeNull(); // no fabricated demo root off-mock
+    });
+    it('PrizeVaultPage: mock ON surfaces the demo payouts — off-mock lock is live', async () => {
+      vi.stubEnv('NEXT_PUBLIC_VERIDEX_MOCK', '1');
+      vi.resetModules();
+      const { default: PrizeVaultPage } = await import('@/app/(app)/vault/page');
+      render(<PrizeVaultPage />);
+      expect(await screen.findByTestId('payout-list')).toBeInTheDocument();
+      expect(screen.queryByTestId('payout-empty')).toBeNull();
+    });
+
+    it('CreateCompetitionScreen: mock OFF renders an honest-empty fixture picker — never the FIXTURES fixture', async () => {
+      vi.resetModules();
+      const { CreateCompetitionScreen } = await import('@/components/screens/CreateCompetitionScreen');
+      render(<CreateCompetitionScreen />);
+      expect(await screen.findByTestId('fixture-empty')).toBeInTheDocument();
+      expect(screen.queryByTestId('fixture-select')).toBeNull();
+    });
+    it('CreateCompetitionScreen: mock ON seeds the demo picker — off-mock lock is live', async () => {
+      vi.stubEnv('NEXT_PUBLIC_VERIDEX_MOCK', '1');
+      vi.resetModules();
+      const { CreateCompetitionScreen } = await import('@/components/screens/CreateCompetitionScreen');
+      render(<CreateCompetitionScreen />);
+      expect(await screen.findByTestId('fixture-select')).toBeInTheDocument();
+      expect(screen.queryByTestId('fixture-empty')).toBeNull();
+    });
+
+    // The /dashboard PAGE render is auth-gated (usePrivy) so it cannot surface the demo panels without
+    // a session; the anti-Potemkin property is therefore locked at the SCREEN. The four operator panels
+    // default to HONEST-EMPTY and only render what they are PAGE-fed (under the mock gate) — a regression
+    // that defaulted them to the fixtures fails the empty case, and the fed case proves the lock is live.
+    it('OperatorDashboardScreen: default (unfed) panels are honest-empty — never the fixtures', async () => {
+      vi.resetModules();
+      const { OperatorDashboardScreen } = await import('@/components/screens/OperatorDashboardScreen');
+      render(<OperatorDashboardScreen connected loadInstances={async () => []} />);
+      expect(await screen.findByTestId('runs-empty')).toBeInTheDocument();
+      expect(screen.getByTestId('competitions-empty')).toBeInTheDocument();
+      expect(screen.getByTestId('rewards-empty')).toBeInTheDocument();
+      expect(screen.getByTestId('alerts-empty')).toBeInTheDocument();
+      expect(screen.queryByText(/World Cup · FRA v BRA/)).toBeNull();
+    });
+    it('OperatorDashboardScreen: page-fed panels surface the fixtures — off-mock lock is live', async () => {
+      vi.resetModules();
+      const { OperatorDashboardScreen } = await import('@/components/screens/OperatorDashboardScreen');
+      render(
+        <OperatorDashboardScreen
+          connected
+          loadInstances={async () => []}
+          runs={MY_RUNS}
+          comps={COMPETITIONS}
+          rewards={MY_REWARDS}
+          alerts={ALERTS}
+        />,
+      );
+      const comps = await screen.findByTestId('your-competitions');
+      expect(screen.queryByTestId('competitions-empty')).toBeNull();
+      expect(within(comps).getAllByText(/World Cup · FRA v BRA/).length).toBeGreaterThanOrEqual(1);
     });
   });
 });
