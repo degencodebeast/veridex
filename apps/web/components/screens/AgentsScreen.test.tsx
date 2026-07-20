@@ -2,6 +2,7 @@ import { describe, it, expect, afterEach } from 'vitest';
 import { render, screen, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { AgentsScreen } from '@/components/screens/AgentsScreen';
+import { AGENTS } from '@/lib/fixtures/catalog';
 import { MAKER_ARENA_RESULT } from '@/lib/fixtures/maker';
 
 describe('AgentsScreen (REQ-017)', () => {
@@ -12,13 +13,14 @@ describe('AgentsScreen (REQ-017)', () => {
   });
 
   it('links each agent row to its profile', () => {
-    render(<AgentsScreen />);
+    // Directional roster is supplied explicitly (the demo path the page mock-gates); no fixture default.
+    render(<AgentsScreen agents={AGENTS} />);
     expect(screen.getByRole('link', { name: /Value CLV/i })).toHaveAttribute('href', '/agents/value_clv');
   });
 
   it('filters by search text', async () => {
     const user = userEvent.setup();
-    render(<AgentsScreen />);
+    render(<AgentsScreen agents={AGENTS} />);
     await user.type(screen.getByRole('searchbox'), 'momentum');
     expect(screen.getByRole('link', { name: /Momentum FR/i })).toBeInTheDocument();
     expect(screen.queryByRole('link', { name: /Value CLV/i })).toBeNull();

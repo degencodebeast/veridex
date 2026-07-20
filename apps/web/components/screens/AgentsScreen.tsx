@@ -5,7 +5,6 @@ import { Badge } from '@/components/ui/Badge';
 import { Num } from '@/components/ui/Num';
 import { SegmentedControl } from '@/components/ui/SegmentedControl';
 import { InfoTip } from '@/components/ui/InfoTip';
-import { AGENTS } from '@/lib/fixtures/catalog';
 import { MAKER_ARENA_RESULT, MAKER_AGENT_META } from '@/lib/fixtures/maker';
 import { GLOSSARY } from '@/lib/glossary';
 import { useLane, type Lane } from '@/hooks/useLane';
@@ -16,7 +15,10 @@ import styles from './AgentsScreen.module.css';
 type Sort = 'clv' | 'runs';
 
 export function AgentsScreen({
-  agents = AGENTS,
+  // The DIRECTIONAL roster is supplied by the page, mock-gated (mock ON → the labeled DEMO AGENTS
+  // fixture; mock OFF → honest-empty []). No fixture DEFAULT here — an absent `agents` renders an
+  // honest-empty directional table, never a fabricated roster (T-2 fixture prohibition).
+  agents = [],
   makerResult = MAKER_ARENA_RESULT,
 }: {
   agents?: AgentSummary[];
@@ -67,7 +69,11 @@ export function AgentsScreen({
           </div>
 
           {shown.length === 0 ? (
-            <p className={styles.empty} data-testid="agents-empty">No agents match.</p>
+            // Honest-empty when the roster itself is empty (off-mock, no agents-list backend) vs. a
+            // filtered-out search over a non-empty roster — never a fabricated fallback either way.
+            <p className={styles.empty} data-testid="agents-empty">
+              {agents.length === 0 ? 'No agents yet.' : 'No agents match.'}
+            </p>
           ) : (
             <div className={styles.tableWrap}>
               <table className={styles.table}>
