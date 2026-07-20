@@ -2073,6 +2073,6 @@ def create_app(
     # Separate namespace over the SEALED maker arena artifact — never re-runs the arena, never
     # imports the directional scorer/leaderboard. Registered last so it composes like the deploy
     # and arena route groups above.
-    register_maker_routes(app)
+    register_maker_routes(app, store=resolved_store, require_principal=require_principal)
 
     return app
