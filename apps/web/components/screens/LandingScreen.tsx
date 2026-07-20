@@ -11,20 +11,20 @@ const TRACE: { step: string; sub: string; icon: string; tone: TraceTone; highlig
   { step: 'policy', sub: 'gated execution', icon: '✓', tone: 'pos' },
   { step: 'receipt', sub: 'dry-run fills', icon: '⇅', tone: 'accent' },
   { step: 'score', sub: 'CLV = skill', icon: '✓', tone: 'pos', highlightSub: true },
-  { step: 'anchor', sub: 'solana-devnet', icon: '◆', tone: 'accent' },
+  { step: 'anchor', sub: 'devnet · when anchored', icon: '◆', tone: 'accent' },
 ];
 
 const WHY = [
   { n: '01', title: 'Deterministic recompute', body: 'One law re-derives every score from evidence. Not a consensus vote, not a model grading a model.' },
   { n: '02', title: 'CLV as skill', body: 'Closing-line value is process-based and immediate — skill, not the luck of a single post-match outcome.' },
-  { n: '03', title: 'On-chain anchor', body: 'Each proof commits to a real Solana transaction you can open in an explorer — not a PDF in a hub.' },
+  { n: '03', title: 'On-chain anchor', body: 'When a run is externally anchored, its proof commits to a real Solana devnet transaction you can open in an explorer. Otherwise it is honestly marked not-anchored — never a PDF in a hub.' },
   { n: '04', title: 'Policy-gated execution', body: 'Agents place dry-run orders under a policy envelope (no live money) — actuation, separated from skill, never silently steered.' },
 ];
 
 const HOW = [
   { n: 'STEP 1', tone: 'warn', title: 'Build & pin an agent', body: 'In Studio, configure an LLM, numeric, or rule agent. Strategy, model and config-hash are frozen into the run manifest before scoring.' },
-  { n: 'STEP 2', tone: 'accent', title: 'Compete on TxLINE', body: 'Agents act in a live or replayed market window. Every event is sealed into one canonical log — the only source of truth.' },
-  { n: 'STEP 3', tone: 'pos', title: 'Get an anchored proof', body: 'The law recomputes CLV, runs proof checks, and anchors the result on Solana. Anyone can re-derive the score and open the tx.' },
+  { n: 'STEP 2', tone: 'accent', title: 'Compete on TxLINE', body: 'Agents act in a recorded/replayed market window — live ingestion is connected, but competition runs on replay. Every event is sealed into one canonical log — the only source of truth.' },
+  { n: 'STEP 3', tone: 'pos', title: 'Get a verifiable proof', body: 'The law recomputes CLV and runs proof checks; when the run is externally anchored, the result commits to a Solana devnet tx. Anyone can re-derive the score — and open the tx when one exists.' },
 ] as const;
 
 // Generic, honest comparison — NO named competitors (we cannot self-certify others' systems).
@@ -71,10 +71,10 @@ export function LandingScreen() {
       </nav>
 
       <section className={styles.hero}>
-        <span className={styles.badge}><span className={styles.badgeDot} aria-hidden />TxLINE AGENT PROOF ARENA · PROOFS ANCHORED ON SOLANA DEVNET</span>
+        <span className={styles.badge}><span className={styles.badgeDot} aria-hidden />TxLINE AGENT PROOF ARENA · SOLANA-DEVNET ANCHORING, HONESTLY LABELED</span>
         <h1 className={styles.h1}>Agents can trade.<br />They can&apos;t grade themselves.</h1>
         <p className={styles.tagline}>
-          Veridex is a live arena for sports-trading agents. They act on TxLINE markets — a <span className={styles.taglineStrong}>deterministic law</span> recomputes their closing-line value from sealed evidence, policy gates dry-run execution, and every run is an <span className={styles.taglineStrong}>on-chain-anchored proof</span>.
+          Veridex is a proof arena for sports-trading agents. They act on recorded TxLINE market windows — a <span className={styles.taglineStrong}>deterministic law</span> recomputes their closing-line value from sealed evidence, policy gates dry-run execution, and every run is a <span className={styles.taglineStrong}>verifiable proof</span>, anchored on Solana devnet when it is externally anchored.
         </p>
         <div className={styles.ctas}>
           <Link href="/arena" className={styles.ctaPrimary}>Enter the Arena →</Link>
@@ -85,7 +85,7 @@ export function LandingScreen() {
         <div className={styles.traceWrap}>
           <div className={styles.traceHead}>
             <span className={styles.traceTitle}>THE PROOF TRACE · every run, end to end</span>
-            <span className={styles.traceCaption}>one law, not a vote · CLV from sealed evidence · a real Solana tx, not a PDF</span>
+            <span className={styles.traceCaption}>one law, not a vote · CLV from sealed evidence · a Solana devnet tx when anchored, not a PDF</span>
           </div>
           <ol className={styles.trace} data-testid="proof-trace" data-reveal={reduced ? 'instant' : 'play'} aria-label="The proof trace, end to end">
             {TRACE.map((t) => (
@@ -170,9 +170,9 @@ export function LandingScreen() {
 
       <section id="prizes" className={styles.bandPlain} data-testid="prize-cta">
         <div className={`${styles.inner} ${styles.prizeInner}`}>
-          <span className={styles.prizeBadge}>◆ PRIZE-VAULT CHALLENGE · SQUADS ON SOLANA DEVNET</span>
-          <h2 className={styles.h2Center}>Prove the best CLV. Get paid on-chain.</h2>
-          <p className={styles.prizeCopy}>Prize vaults settle to the agent the law ranks first — payout follows the anchored score root, not the spectacle. <span className={styles.prizeHonest}>Settlement is design-ahead on devnet; payout state is always labeled honestly (Phase 2D).</span></p>
+          <span className={styles.prizeBadge}>◆ PRIZE-VAULT CHALLENGE · SQUADS-ON-DEVNET, DESIGN-AHEAD</span>
+          <h2 className={styles.h2Center}>Prove the best CLV. Designed to pay out on-chain.</h2>
+          <p className={styles.prizeCopy}>Prize vaults are designed to settle to the agent the law ranks first — payout will follow the anchored score root, not the spectacle. <span className={styles.prizeHonest}>Settlement is design-ahead on devnet: no live payout and no Squads custody yet; payout state is always labeled honestly (Phase 2D).</span></p>
           <div className={styles.prizeCtas}>
             <Link href="/arena" className={styles.ctaPrimary}>Enter the Arena →</Link>
             <button type="button" className={styles.ctaSecondary}>Connect Wallet</button>
@@ -184,7 +184,7 @@ export function LandingScreen() {
         <div className={styles.footerRow}>
           <span className={styles.footerBrand}>
             <Wordmark />
-            <span className={styles.footerMeta}>built on TxLINE · anchored on Solana · verifier {VERIFIER_VERSION}</span>
+            <span className={styles.footerMeta}>built on TxLINE · Solana-devnet anchoring · verifier {VERIFIER_VERSION}</span>
           </span>
           <div className={styles.footerLinks}>
             <span className={styles.footerLink}>Docs</span>
