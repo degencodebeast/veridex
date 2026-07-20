@@ -3,7 +3,6 @@ import { useEffect, useState } from 'react';
 import Link from 'next/link';
 import { Badge } from '@/components/ui/Badge';
 import { LiveDot } from '@/components/ui/LiveDot';
-import { COMPETITIONS, MY_REWARDS } from '@/lib/fixtures/catalog';
 import { isMockEnabled } from '@/lib/mock';
 import type { CompetitionSummary, CompetitionType, RewardSummary } from '@/lib/catalog';
 import styles from './CompetitionsScreen.module.css';
@@ -46,7 +45,10 @@ function LiveCard({ c }: { c: CompetitionSummary }) {
   );
 }
 
-export function CompetitionsScreen({ comps = COMPETITIONS, rewards = MY_REWARDS }: {
+// No fixture DEFAULT props (T-2): absent `comps`/`rewards` render an honest-empty screen, never the
+// COMPETITIONS / MY_REWARDS fixtures. The owning page injects fixtures ONLY under the mock gate; off
+// the gate it passes `[]`, so nothing fabricated can leak onto the "Enter App" landing tab.
+export function CompetitionsScreen({ comps = [], rewards = [] }: {
   comps?: CompetitionSummary[]; rewards?: RewardSummary[];
 }) {
   // Mock-gate (hydration-safe: default off on SSR/first render, then read after mount). Roadmappable
@@ -90,7 +92,13 @@ export function CompetitionsScreen({ comps = COMPETITIONS, rewards = MY_REWARDS 
             <tr><th scope="col">COMPETITION</th><th scope="col">TYPE</th><th scope="col">PROOF</th></tr>
           </thead>
           <tbody>
-            {settled.map((c) => (
+            {settled.length === 0 ? (
+              <tr>
+                <td className={styles.muted} colSpan={3} data-testid="recent-settled-empty">
+                  No settled competitions yet.
+                </td>
+              </tr>
+            ) : settled.map((c) => (
               <tr key={c.competition_id}>
                 <td><Link href={`/proof/${c.settled_run_id}`} className={styles.recentLink}>{c.title} ›</Link></td>
                 <td className="mono">{TYPE_LABEL[c.competition_type]}</td>
@@ -124,6 +132,13 @@ export function CompetitionsScreen({ comps = COMPETITIONS, rewards = MY_REWARDS 
             </tr>
           </thead>
           <tbody>
+            {comps.length === 0 && (
+              <tr>
+                <td className={styles.muted} colSpan={10} data-testid="all-competitions-empty">
+                  No competitions to show.
+                </td>
+              </tr>
+            )}
             {comps.map((c) => (
               <tr key={c.competition_id} data-testid={`comp-${c.competition_id}`}>
                 <td className={styles.compCell}>{c.lifecycle === 'live' && <LiveDot size={5} />}{c.title}</td>

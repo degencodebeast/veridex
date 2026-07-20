@@ -4,6 +4,7 @@ import { SegmentedControl } from '@/components/ui/SegmentedControl';
 import { Badge } from '@/components/ui/Badge';
 import { InfoTip } from '@/components/ui/InfoTip';
 import { FIXTURES } from '@/lib/fixtures/catalog';
+import { isMockEnabled } from '@/lib/mock';
 import { DEFAULT_POLICY_ENVELOPE } from '@/lib/config/policy';
 import { MARKET_FAMILY_KEYS } from '@/lib/catalog';
 import { GLOSSARY } from '@/lib/glossary';
@@ -96,9 +97,27 @@ export function CreateCompetitionScreen({
   const [type, setType] = useState<CompetitionType>('replay_arena');
   const [source, setSource] = useState<SourceMode>('replay');
   const [exec, setExec] = useState<ExecutionMode>('paper');
-  const [fixtureId, setFixtureId] = useState<number>(
-    FIXTURES.some((f) => f.fixture_id === initialFixtureId) ? (initialFixtureId as number) : (FIXTURES[0]?.fixture_id ?? 0),
-  );
+
+  // ── Fixture PICKER seed (T-2): the selectable-match list is mock-gated. There is NO fixtures-list
+  // backend endpoint, so off-mock the demo FIXTURES would be FABRICATED matches to pick from. The
+  // FIXTURES sample seeds the picker ONLY under the DEMO/mock gate (labeled demo by the MockBanner);
+  // off-mock the picker is honest-empty (no selectable matches). Hydration-safe: default off on
+  // SSR/first render, then read isMockEnabled() (per-tab `?mock=1` from window) after mount — the same
+  // client-resolved pattern the sibling `/leaderboard` screens use. The create POST + validation are
+  // unchanged; only the picker's DATA SOURCE gates.
+  const [mock, setMock] = useState(false);
+  useEffect(() => { setMock(isMockEnabled()); }, []);
+  const fixtures = mock ? FIXTURES : [];
+
+  const [fixtureId, setFixtureId] = useState<number>(initialFixtureId ?? 0);
+  // Once the mock gate resolves ON after mount, snap the selection to a valid demo fixture — the
+  // deep-linked initial one if present, else the first. Off-mock the picker is empty, so nothing is
+  // selected and it renders honest-empty (never a fabricated fixture). References the FIXTURES module
+  // constant directly (not the per-render `fixtures` array), so `mock` is the only reactive dependency.
+  useEffect(() => {
+    if (!mock) return;
+    setFixtureId((cur) => (FIXTURES.some((f) => f.fixture_id === cur) ? cur : (FIXTURES[0]?.fixture_id ?? 0)));
+  }, [mock]);
   const [markets, setMarkets] = useState<Set<MarketFamilyKey>>(new Set(MARKET_FAMILY_KEYS));
   const [scoringWindow, setScoringWindow] = useState('');
 
@@ -122,7 +141,8 @@ export function CreateCompetitionScreen({
   }, [connected, loadInstances]);
 
   const proof = proofFor(type, source);
-  const selectedFixture = FIXTURES.find((f) => f.fixture_id === fixtureId) ?? FIXTURES[0];
+  // Off-mock `fixtures` is empty ⇒ no selected fixture ⇒ market_scope carries no fabricated fixture.
+  const selectedFixture = fixtures.find((f) => f.fixture_id === fixtureId);
   const marketKeys = MARKET_FAMILY_KEYS.filter((k) => markets.has(k));
   const fixtureScope = selectedFixture ? `${selectedFixture.participant1} v ${selectedFixture.participant2}` : '';
   // market_scope is the single free-form selector POST accepts (e.g. "FRA v BRA · 1X2 / O/U / AH").
@@ -215,14 +235,22 @@ export function CreateCompetitionScreen({
             <div className={styles.controls}>
               <label className={styles.field}>
                 <span className={styles.label}>Fixture</span>
-                <select
-                  className={styles.select} aria-label="Fixture" data-testid="fixture-select"
-                  value={fixtureId} onChange={(e) => setFixtureId(Number(e.target.value))}
-                >
-                  {FIXTURES.map((f) => (
-                    <option key={f.fixture_id} value={f.fixture_id}>{f.participant1} v {f.participant2} · {f.competition}</option>
-                  ))}
-                </select>
+                {/* The picker is seeded from the DEMO FIXTURES sample ONLY under the mock gate (no
+                    fixtures-list backend). Off-mock it is honest-empty — never fabricated matches. */}
+                {fixtures.length > 0 ? (
+                  <select
+                    className={styles.select} aria-label="Fixture" data-testid="fixture-select"
+                    value={fixtureId} onChange={(e) => setFixtureId(Number(e.target.value))}
+                  >
+                    {fixtures.map((f) => (
+                      <option key={f.fixture_id} value={f.fixture_id}>{f.participant1} v {f.participant2} · {f.competition}</option>
+                    ))}
+                  </select>
+                ) : (
+                  <p className={styles.fixtureEmpty} data-testid="fixture-empty">
+                    No matches available — connect a fixtures source to pick a fixture.
+                  </p>
+                )}
               </label>
               <label className={styles.field}>
                 <span className={styles.label}>Scoring window (optional)</span>

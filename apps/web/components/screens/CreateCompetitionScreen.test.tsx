@@ -290,6 +290,9 @@ describe('CreateCompetitionScreen V5 (wizard density · honest pins)', () => {
   });
 
   it('composes market_scope from the selected fixture + real families; scoring window honest-empty when unset', async () => {
+    // The fixture picker is DEMO/mock-gated (T-2: no fixtures-list backend). With mock ON the FIXTURES
+    // sample seeds the picker, so market_scope composes the selected fixture + real families.
+    vi.stubEnv('NEXT_PUBLIC_VERIDEX_MOCK', '1');
     const user = userEvent.setup();
     const api = okApi();
     render(<CreateCompetitionScreen connected loadInstances={vi.fn().mockResolvedValue(TWO_INSTANCES)} launchApi={api} />);
@@ -301,6 +304,7 @@ describe('CreateCompetitionScreen V5 (wizard density · honest pins)', () => {
     await waitFor(() => expect(api.create).toHaveBeenCalledWith(expect.objectContaining({
       market_scope: expect.stringMatching(/FRA v BRA/i), scoring_window: null,
     })));
+    vi.unstubAllEnvs();
   });
 
   it('SUMMARY pins the real CompetitionConfig fields POST freezes; REPLAY source shows REPLAY, never LIVE', async () => {
@@ -335,5 +339,34 @@ describe('CreateCompetitionScreen V5 (wizard density · honest pins)', () => {
     expect(screen.getByText(GLOSSARY.execution_mode.definition)).toBeInTheDocument();
     expect(screen.getByText(GLOSSARY.proof_mode.definition)).toBeInTheDocument();
     expect(screen.getByText(GLOSSARY.config_pinned.definition)).toBeInTheDocument();
+  });
+});
+
+// ── T-2 remediation: the fixture PICKER seed is mock-gated ────────────────────────────────────────
+// The picker's list of selectable matches is seeded from the FIXTURES entity fixture, and there is NO
+// fixtures-list backend endpoint. Off-mock that seed would show FABRICATED matches to pick from, so it
+// must be honest-empty; the FIXTURES sample is offered ONLY under the DEMO/mock gate. (The create POST
+// flow + validation are unchanged — only the picker's DATA SOURCE gates.)
+describe('CreateCompetitionScreen — fixture picker is mock-gated (T-2, no fixtures backend)', () => {
+  it('mock OFF (default) → picker is honest-empty: NO fabricated fixture options, an honest note instead', () => {
+    render(<CreateCompetitionScreen />);
+    // No selectable-match dropdown seeded from the demo FIXTURES…
+    expect(screen.queryByTestId('fixture-select')).toBeNull();
+    expect(screen.queryByRole('option', { name: /FRA v BRA/i })).toBeNull();
+    expect(screen.queryByRole('option', { name: /ARG v GER/i })).toBeNull();
+    // …and an honest empty note in its place.
+    expect(screen.getByTestId('fixture-empty')).toHaveTextContent(/no matches available|connect a fixtures source/i);
+    // The pinned market_scope carries no fabricated fixture off-mock.
+    expect(within(screen.getByTestId('pinned-config')).getByTestId('summary-market-scope')).not.toHaveTextContent(/FRA v BRA/i);
+  });
+
+  it('mock ON → the DEMO FIXTURES sample seeds the picker (labeled demo data by the MockBanner)', () => {
+    vi.stubEnv('NEXT_PUBLIC_VERIDEX_MOCK', '1');
+    render(<CreateCompetitionScreen />);
+    const select = screen.getByTestId('fixture-select');
+    expect(within(select).getByRole('option', { name: /FRA v BRA/i })).toBeInTheDocument();
+    expect(within(select).getByRole('option', { name: /ARG v GER/i })).toBeInTheDocument();
+    expect(screen.queryByTestId('fixture-empty')).toBeNull();
+    vi.unstubAllEnvs();
   });
 });

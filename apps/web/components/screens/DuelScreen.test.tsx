@@ -25,14 +25,15 @@ describe('DuelScreen (REQ-023)', () => {
   });
 
   it('shows two agents on the SAME sealed evidence (one shared evidence hash)', () => {
-    render(<DuelScreen />);
+    // Directional roster supplied explicitly (the demo path the page mock-gates); no fixture default.
+    render(<DuelScreen agents={AGENTS} />);
     const evidence = screen.getAllByTestId('evidence-hash');
     expect(evidence.length).toBe(1);
     expect(evidence[0]).toHaveTextContent(/sealed evidence/i);
   });
 
   it('compares CLV and proof side-by-side for the two selected agents', () => {
-    render(<DuelScreen />);
+    render(<DuelScreen agents={AGENTS} />);
     const cards = screen.getAllByTestId('duel-card');
     expect(cards.length).toBe(2);
     cards.forEach((c) => {
@@ -43,7 +44,7 @@ describe('DuelScreen (REQ-023)', () => {
 
   it('lets the operator switch one side without copying the other agent CLV', async () => {
     const user = userEvent.setup();
-    render(<DuelScreen />);
+    render(<DuelScreen agents={AGENTS} />);
     const left = screen.getByLabelText(/agent a/i);
     await user.selectOptions(left, 'baseline');
     const cards = screen.getAllByTestId('duel-card');
@@ -53,7 +54,7 @@ describe('DuelScreen (REQ-023)', () => {
   });
 
   it('is an honest factual compare — no fabricated winner/edge, just the CLV gap on shared evidence', () => {
-    render(<DuelScreen />);
+    render(<DuelScreen agents={AGENTS} />);
     expect(screen.queryByText(/winner|\bwins\b|beats|champion|🏆/i)).toBeNull();
     expect(screen.getByText(/key divergence/i)).toBeInTheDocument();
     expect(screen.getByText(/identical sealed evidence/i)).toBeInTheDocument();
@@ -71,7 +72,7 @@ describe('DuelScreen — Maker Arena lane (MM-R1)', () => {
   });
 
   it('defaults to the Directional lane — the existing CLV duel (agent picker) is untouched', () => {
-    render(<DuelScreen />);
+    render(<DuelScreen agents={AGENTS} />);
     expect(screen.getByRole('radio', { name: 'Directional' })).toHaveAttribute('aria-checked', 'true');
     expect(screen.getByLabelText(/agent a/i)).toBeInTheDocument();
     expect(screen.queryAllByTestId('duel-maker-card')).toHaveLength(0);

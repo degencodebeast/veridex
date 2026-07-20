@@ -18,6 +18,25 @@ const OVERCLAIMS: { pattern: RegExp; why: string }[] = [
   { pattern: /real execution/i, why: 'execution is dry-run (no live money) — never real execution' },
 ];
 
+// CLASS-level overclaim guards (T-2 remediation). The 4-phrase denylist above only catches
+// phrasings we already thought of; these guard whole CLASSES of contradiction against the backend's
+// authoritative defaults. The competition finalize path sets anchor_status "not_anchored" BY DEFAULT
+// (a run is NOT anchored unless an external anchor actually happened), competition data is
+// RECORDED/REPLAYED (not source=live), and the hackathon scope has NO on-chain payout / no Squads
+// custody yet. So the landing DOM must never make an UNCONDITIONAL / universal / present-tense claim
+// that every run is anchored, that each proof commits to a real tx, that agents get paid on-chain
+// today, or that the arena is a live market. Honest CONDITIONAL / design-ahead copy (anchored WHEN
+// externally anchored, otherwise not-anchored; recorded/replayed windows; payout design-ahead on
+// devnet) must pass — that is exactly the RED→GREEN boundary these patterns encode.
+const CLASS_OVERCLAIMS: { pattern: RegExp; why: string }[] = [
+  { pattern: /every\s+(run|proof)\s+is\s+(an?\s+)?(on-chain[\s-]?)?anchored/i, why: 'universal anchor claim — anchor_status defaults to "not_anchored"; a run is anchored only WHEN externally anchored' },
+  { pattern: /each\s+proof\s+commits\s+to\s+a\s+real\s+solana/i, why: 'universal real-tx claim — a proof commits to a real Solana tx only WHEN the run is externally anchored, else it is honestly not-anchored' },
+  { pattern: /proofs?\s+anchored\s+on\s+solana/i, why: 'universal anchored-on-Solana claim — anchoring is conditional (default not_anchored), never every proof' },
+  { pattern: /get\s+paid\s+on-chain/i, why: 'unhedged payout promise — there is no on-chain payout yet; settlement is design-ahead on devnet (Phase 2D)' },
+  { pattern: /\blive\s+arena\b/i, why: 'unqualified "live arena" — competition runs on recorded/replayed market windows, not a live market' },
+  { pattern: /\blive\s+market\b/i, why: 'unqualified "live market" — competition data is recorded/replayed, not source=live' },
+];
+
 // Every primary-nav route → its screen source. The coverage test below asserts this map covers
 // EXACTLY the live nav (a new nav route with no entry here fails — no judge-nav route survives uncovered).
 const NAV_ROUTE_SCREEN: Record<string, string> = {
@@ -45,6 +64,14 @@ describe('Landing / nav copy-honesty (T-2 — no live-money / venue / on-chain-e
     const text = document.body.textContent ?? '';
     for (const { pattern, why } of OVERCLAIMS) {
       expect(text, `Landing overclaims — ${why} (matched ${pattern})`).not.toMatch(pattern);
+    }
+  });
+
+  it('the RENDERED landing page carries no UNCONDITIONAL anchor / live-market / on-chain-payout class overclaim', () => {
+    render(<LandingScreen />);
+    const text = document.body.textContent ?? '';
+    for (const { pattern, why } of CLASS_OVERCLAIMS) {
+      expect(text, `Landing class-overclaim — ${why} (matched ${pattern})`).not.toMatch(pattern);
     }
   });
 

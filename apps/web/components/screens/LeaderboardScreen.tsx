@@ -7,7 +7,6 @@ import { ConfBar } from '@/components/ui/ConfBar';
 import { SegmentedControl } from '@/components/ui/SegmentedControl';
 import { InfoTip } from '@/components/ui/InfoTip';
 import { rankByAvgClv } from '@/lib/derive';
-import { LEADERBOARD_ROWS } from '@/lib/fixtures/catalog';
 import { MAKER_AGENT_META } from '@/lib/fixtures/maker';
 import { deriveMakerVerdict } from '@/lib/makerVerdict';
 import { GLOSSARY } from '@/lib/glossary';
@@ -20,7 +19,12 @@ import styles from './LeaderboardScreen.module.css';
 type Filter = 'ALL' | 'REPLAY' | 'LIVE';
 
 export function LeaderboardScreen({
-  rows = LEADERBOARD_ROWS,
+  // Directional rows are supplied by the page via the self-gating getLeaderboard() reader (mock ON →
+  // fixture; mock OFF → real fetch, honest-empty on absence/error). No fixture DEFAULT here — an
+  // absent `rows` renders an honest-empty board, never fabricated rankings (T-2 fixture prohibition).
+  rows = [],
+  // Maker result is page-sourced via useMakerArenaResult (F-9). No sealed-fixture default here —
+  // an absent `makerResult` triggers the honest live-fetch/honest-empty maker path, never a fixture.
   makerResult,
 }: {
   rows?: LeaderboardRow[];
@@ -73,6 +77,13 @@ export function LeaderboardScreen({
             Rank is Avg CLV only. Proof completeness gates eligibility, never rank. ⓟ Sim PnL &amp; Brier are simulated proxies — not settled profit.
           </p>
 
+          {ranked.length === 0 ? (
+            // Honest-empty: no fabricated rows when the reader has nothing to show (mock OFF with no
+            // backend rows, or a fetch error). NEVER the LEADERBOARD_ROWS fixture (T-2).
+            <p className={styles.empty} data-testid="lb-empty">
+              No ranked agents yet.
+            </p>
+          ) : (
           <div className={styles.tableWrap}>
             <table className={styles.table}>
               <thead>
@@ -121,6 +132,7 @@ export function LeaderboardScreen({
               </tbody>
             </table>
           </div>
+          )}
         </>
       ) : (
         makerState.status === 'loading' || makerState.status === 'idle' ? (
