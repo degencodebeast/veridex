@@ -2,6 +2,7 @@
 import { useEffect, useState } from 'react';
 import Link from 'next/link';
 import { ApiError, getInstance, type DeployedInstance } from '@/lib/api';
+import { ExecutionEvidenceSection } from './ExecutionEvidenceSection';
 import styles from './InstanceScreen.module.css';
 
 // The OWNER-scoped deployed-instance identity. Distinct from the PUBLIC /agents strategy profile:
@@ -107,6 +108,8 @@ export function InstanceScreen({
         <div className={styles.kvRow}><span className={styles.kvLabel}>Owner</span><span className={`${styles.kvVal} mono`}>{inst.operator_id ?? '—'}</span></div>
         <div className={styles.kvRow}><span className={styles.kvLabel}>Deployed</span><span className={`${styles.kvVal} mono`}>{inst.created_at}</span></div>
       </section>
+
+      <ExecutionEvidenceSection instanceId={inst.instance_id} />
 
       <section className={styles.panel}>
         <h2 className={styles.h2}>Scope</h2>

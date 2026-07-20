@@ -41,6 +41,22 @@
 .failPanel { border-color: var(--negative); }
 .failReason { margin: 0; font-size: 12px; color: var(--negative); font-family: var(--font-mono), monospace; }
 
+/* Execution evidence — summary counts + the honest attempted-dry-run-leg receipt list. */
+.execSummary { display: flex; flex-wrap: wrap; gap: var(--space-2); }
+.execCell { display: flex; flex-direction: column; gap: 1px; padding: 6px 10px; border: 1px solid var(--border); border-radius: var(--radius-control); background: var(--panel-2); min-width: 84px; }
+.execCount { font-size: 16px; font-weight: 600; color: var(--text-1); font-family: var(--font-mono), monospace; }
+.execCellLabel { font-size: 9px; text-transform: uppercase; letter-spacing: 0.04em; color: var(--text-3); }
+.execHonest { margin: 0; font-size: 11px; line-height: 1.5; color: var(--text-2); }
+
+.execList { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 2px; max-height: 320px; overflow-y: auto; }
+.execRow { display: flex; align-items: baseline; gap: var(--space-2); padding: 4px 0; border-bottom: 1px solid var(--border-soft); flex-wrap: wrap; }
+.execRow:last-child { border-bottom: none; }
+.execKind { font-size: 11px; color: var(--text-1); flex-shrink: 0; min-width: 128px; }
+.execNoLeg { font-size: 10px; color: var(--text-3); }
+.execBadges { display: inline-flex; flex-wrap: wrap; gap: var(--space-2); }
+.execLeg { display: inline-flex; flex-wrap: wrap; gap: var(--space-1); }
+.execBadge { font-size: 9px; padding: 1px 6px; border-radius: var(--radius-badge); border: 1px solid var(--border); color: var(--text-2); }
+
 @media (max-width: 640px) {
   .head { flex-direction: column; align-items: stretch; }
   .headMeta { justify-content: flex-start; }

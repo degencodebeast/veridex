@@ -169,10 +169,11 @@ export function useRuntimeEvents(agentId: string | null): RuntimeOpsData {
     const cursors = new Map<string, number>();
     let instanceIds: string[] | null = null;
     // Accumulate by durable `id` (BIGSERIAL, globally unique). A single agent can have ≥2 deployed
-    // instances that share ONE agent_id (Studio deploys with a template-constant `studio-${archetype}`
-    // id), and the backend serves runtime-events keyed by agent_id — so both instances return the
-    // IDENTICAL list. Keying by id dedupes those, so multi-instance agents never double events (nor
-    // the Overview counters derived from them). "Dedup by construction" holds ACROSS instances here.
+    // instances sharing ONE template-constant agent_id (`studio-${archetype}`); the backend now serves
+    // runtime-events RUN-scoped per instance (ba65a72), so each instance returns its OWN run's events.
+    // This loop aggregates those distinct per-run feeds for the open agent; keying by the globally
+    // unique `id` dedupes any overlap, so multi-instance agents never double events (nor the Overview
+    // counters derived from them).
     const byId = new Map<number, RuntimeEventRecord>();
 
     setLoading(true);
