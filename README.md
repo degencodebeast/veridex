@@ -6,7 +6,7 @@
 
 Build and deploy sports-trading agents, compete them head-to-head on identical **[TxLINE](https://txline.txodds.com)** World Cup market data, and independently verify every leaderboard result. Approved agents can also use a guarded **Polymarket** execution path whose safety controls the agent itself cannot disable.
 
-**[Live App](#) · [Watch Demo](#) · [Documentation](#) · [Verify a Run](#) · [Solana Anchor](https://explorer.solana.com/tx/5xNkS5XWnpEqKyRDWDGsUUGyZRNg4Q6hH56M6dAesUsjMerSbXpSTT61xtG3Y7zLRyAiuStA3TDsxBJ9ea5BnCVy?cluster=devnet)**
+**[Live App](https://www.veridexapp.fun/) · [Watch Demo](https://www.loom.com/share/c285a39048414907b13f2e58f835ee16) · [Documentation](https://docs.veridexapp.fun) · [Verify a Run](https://www.veridexapp.fun/) · [Solana Anchor](https://explorer.solana.com/tx/5xNkS5XWnpEqKyRDWDGsUUGyZRNg4Q6hH56M6dAesUsjMerSbXpSTT61xtG3Y7zLRyAiuStA3TDsxBJ9ea5BnCVy?cluster=devnet)**
 
 ![Solana devnet](https://img.shields.io/badge/Solana-devnet-14F195?logo=solana&logoColor=white)
 ![Python 3.11](https://img.shields.io/badge/Python-3.11-3776AB?logo=python&logoColor=white)
@@ -34,9 +34,9 @@ Every *"my AI bot made 40%"* claim is unverifiable — the model could be cherry
 
 ## Try Veridex
 
-- **Live app** — `[Live App]` (replay mode runs end-to-end, no credentials)
-- **Demo video** — `[Watch Demo]`
-- **Verify a run yourself** — `[Verify a Run]`: re-runs the law over sealed bytes and returns a per-check verdict
+- **Live app** — [www.veridexapp.fun](https://www.veridexapp.fun/) (replay mode runs end-to-end, no credentials)
+- **Demo video** — [Loom walkthrough](https://www.loom.com/share/c285a39048414907b13f2e58f835ee16)
+- **Verify a run yourself** — [on the live app](https://www.veridexapp.fun/): re-runs the law over sealed bytes and returns a per-check verdict
 - **On-chain anchor (Solana devnet)** — [run-manifest Memo tx](https://explorer.solana.com/tx/5xNkS5XWnpEqKyRDWDGsUUGyZRNg4Q6hH56M6dAesUsjMerSbXpSTT61xtG3Y7zLRyAiuStA3TDsxBJ9ea5BnCVy?cluster=devnet) · [data subscription tx](https://explorer.solana.com/tx/2xmX2caWh3U8BGsLcCAatzV48N64x64Xnf2B43Eug5iUnBvGgvm6jnZuZnih6Rj8JTP1teLF8P8q7UJwGSXqjjYH?cluster=devnet)
 - **Offline & deterministic (no network):**
 
@@ -194,7 +194,7 @@ Depth-on-demand — the root README is the tour; the docs are the proof.
 | **[Operator runbook](docs/operator-runbook.md)** | The guarded, operator-only real-money path (fail-closed by construction) |
 | **[FAQ](docs/faq.md)** · **[Full submission writeup](docs/submission.md)** | Common questions · the complete submission narrative |
 
-Hosted docs: `[Documentation]` (Mintlify).
+Hosted docs: [docs.veridexapp.fun](https://docs.veridexapp.fun).
 
 ---
 
