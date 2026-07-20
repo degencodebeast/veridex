@@ -3,7 +3,6 @@ import { useEffect, useMemo, useState } from 'react';
 import Link from 'next/link';
 import { Badge } from '@/components/ui/Badge';
 import { SPORT_CATALOG, buildFamilies, oddsUpdatesPath } from '@/lib/txline/client';
-import { ODDS_UPDATES, FIXTURES, FEED_HEALTH, LEADERBOARD_ROWS } from '@/lib/fixtures/catalog';
 import { isMockEnabled } from '@/lib/mock';
 import type {
   FixtureSummary, OddsUpdate, SourceMode, FeedHealthState, LeaderboardRow, MarketFamilyKey,
@@ -27,17 +26,27 @@ const TABS: { id: TabId; label: string; disabled?: boolean; disabledReason?: str
   { id: 'ASIANHANDICAP_PARTICIPANT_GOALS', label: 'AH', testid: 'tab-ah' },
 ];
 
+// HONEST-EMPTY DEFAULTS (T-2): the screen is a PURE presentational component — it renders ONLY the
+// data it is handed. Off-mock the page supplies {} / [] / null (odds/fixtures have no backend reader;
+// feed-health/leaderboard resolve empty via their self-gating readers), so nothing fabricated shows.
+// Fixtures reach this screen ONLY under the page's isMockEnabled() gate. `feedHealth` is nullable:
+// null = "not loaded / unavailable" → the FEED-HEALTH rail states so honestly, never a fake LIVE/OFFLINE.
 export function MarketsScreen({
-  oddsByFixture = ODDS_UPDATES, fixtures = FIXTURES, sourceMode = 'replay',
-  feedHealth = FEED_HEALTH, leaderboard = LEADERBOARD_ROWS,
+  oddsByFixture = {}, fixtures = [], sourceMode = 'replay',
+  feedHealth = null, leaderboard = [],
 }: {
   oddsByFixture?: Record<number, OddsUpdate[]>; fixtures?: FixtureSummary[]; sourceMode?: SourceMode;
-  feedHealth?: FeedHealthState; leaderboard?: LeaderboardRow[];
+  feedHealth?: FeedHealthState | null; leaderboard?: LeaderboardRow[];
 }) {
   const [sportId, setSportId] = useState('soccer');
   // Default-select the first fixture so the dashboard populates on load (V5) — not an empty prompt.
   const [fixtureId, setFixtureId] = useState<number | null>(fixtures[0]?.fixture_id ?? null);
   const [tab, setTab] = useState<TabId>('all');
+  // Fixtures may arrive ASYNC (the page fetches/mock-gates after mount), so default-select the first
+  // one once they land — without clobbering a selection the user has already made.
+  useEffect(() => {
+    setFixtureId((prev) => (prev != null && fixtures.some((f) => f.fixture_id === prev) ? prev : fixtures[0]?.fixture_id ?? null));
+  }, [fixtures]);
 
   const updates = fixtureId != null ? oddsByFixture[fixtureId] ?? [] : [];
   const allFamilies = useMemo(() => buildFamilies(updates), [updates]);
@@ -202,16 +211,28 @@ export function MarketsScreen({
 
             <div className={styles.railPanel} data-testid="rail-feed-health">
               <h3 className={styles.railTitle}>FEED HEALTH</h3>
-              {/* ws_live drives the label honestly: not a live stream ⇒ OFFLINE, never a fake "live/healthy" */}
-              <div className={`${styles.phase} mono`}>{feedHealth.ws_live ? 'LIVE' : 'OFFLINE'}</div>
-              <div className={`${styles.railMeta} mono`}>staleness {feedHealth.staleness_s == null ? '—' : `${feedHealth.staleness_s}s`}{feedHealth.stale ? ' · STALE' : ''}</div>
-              <div className={`${styles.railMeta} mono`}>ticks {feedHealth.ticks_seen} · events/min {feedHealth.events_per_min ?? '—'}</div>
-              <div className={`${styles.railMeta} mono`}>{feedHealth.txline_configured ? 'TxLINE configured' : 'demo feed · TxLINE not configured'}</div>
+              {feedHealth == null ? (
+                // null = not loaded / no telemetry available. State that honestly — never a fabricated
+                // LIVE/OFFLINE label or invented staleness/tick counts over absent data.
+                <div className={`${styles.railMeta} mono`}>feed health unavailable</div>
+              ) : (
+                <>
+                  {/* ws_live drives the label honestly: not a live stream ⇒ OFFLINE, never a fake "live/healthy" */}
+                  <div className={`${styles.phase} mono`}>{feedHealth.ws_live ? 'LIVE' : 'OFFLINE'}</div>
+                  <div className={`${styles.railMeta} mono`}>staleness {feedHealth.staleness_s == null ? '—' : `${feedHealth.staleness_s}s`}{feedHealth.stale ? ' · STALE' : ''}</div>
+                  <div className={`${styles.railMeta} mono`}>ticks {feedHealth.ticks_seen} · events/min {feedHealth.events_per_min ?? '—'}</div>
+                  <div className={`${styles.railMeta} mono`}>{feedHealth.txline_configured ? 'TxLINE configured' : 'demo feed · TxLINE not configured'}</div>
+                </>
+              )}
             </div>
 
             <div className={styles.railPanel} data-testid="rail-eligible-agents">
               <h3 className={styles.railTitle}>ELIGIBLE AGENTS</h3>
               <div className={`${styles.railMeta} mono`}>eligible pool · fixture-level scoping pending</div>
+              {eligible.length === 0 && (
+                // Empty pool (leaderboard not loaded / no eligible agents) → honest note, never a fabricated row.
+                <div className={`${styles.railMeta} mono`}>no eligible agents yet</div>
+              )}
               <ul className={styles.eligibleList}>
                 {eligible.map((a) => (
                   <li key={a.agent_id} className={styles.eligibleRow}>
