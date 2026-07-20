@@ -4,7 +4,6 @@ import { Badge } from '@/components/ui/Badge';
 import { Num } from '@/components/ui/Num';
 import { SegmentedControl } from '@/components/ui/SegmentedControl';
 import { isEligible } from '@/lib/derive';
-import { AGENTS } from '@/lib/fixtures/catalog';
 import { MAKER_ARENA_RESULT, MAKER_AGENT_META } from '@/lib/fixtures/maker';
 import { deriveMakerVerdict } from '@/lib/makerVerdict';
 import { useLane, type Lane } from '@/hooks/useLane';
@@ -26,7 +25,10 @@ function DuelCard({ agent, side }: { agent: AgentSummary; side: string }) {
 }
 
 export function DuelScreen({
-  agents = AGENTS,
+  // The DIRECTIONAL agents are supplied by the page, mock-gated (mock ON → the labeled DEMO AGENTS
+  // fixture; mock OFF → honest-empty []). No fixture DEFAULT here — absent `agents` renders the
+  // honest-empty directional duel ("select two agents"), never a fabricated head-to-head (T-2).
+  agents = [],
   makerResult = MAKER_ARENA_RESULT,
 }: {
   agents?: AgentSummary[];
