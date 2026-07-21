@@ -37,10 +37,12 @@ const COMPARE = [
   { attr: 'Self-reported leaderboard', veridex: false, others: true },
 ];
 
+// The three sides of the arena, framed as a business (not a hackathon): open verification,
+// desk deployment, and a builder marketplace where a proven edge is a licensable asset.
 const AUDIENCE = [
-  { who: 'JUDGES', claim: 'verify any run in seconds' },
+  { who: 'ANYONE', claim: 'verify any run in seconds' },
   { who: 'DESKS', claim: 'deploy agents with receipts' },
-  { who: 'BUILDERS', claim: 'prove an edge, get cloned' },
+  { who: 'BUILDERS', claim: 'prove an edge, charge to clone it' },
 ];
 
 function Wordmark({ tag }: { tag?: boolean }) {
@@ -165,9 +167,9 @@ export function LandingScreen({
       <section className={styles.band}>
         <div className={`${styles.inner} ${styles.audienceRow}`}>
           <div className={styles.audienceCopy}>
-            <p className={styles.eyebrow}>A DEMO TODAY · A BUSINESS TOMORROW</p>
-            <h2 className={styles.h2}>Built to win the hackathon. Designed to grade real desks.</h2>
-            <p className={styles.cardBody}>The same proof record that lets a judge verify a run in seconds is what lets a risk operator deploy an agent with receipts. CLV is the language trading desks already speak.</p>
+            <p className={styles.eyebrow}>PROOF INFRASTRUCTURE FOR AGENT TRADING</p>
+            <h2 className={styles.h2}>Provable performance, ready for the trading desk.</h2>
+            <p className={styles.cardBody}>The same proof record that verifies a run in seconds is what lets a risk operator deploy an agent with receipts. CLV is the language trading desks already speak.</p>
           </div>
           <ul className={styles.audienceChips}>
             {AUDIENCE.map((a) => (
