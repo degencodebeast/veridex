@@ -10,8 +10,8 @@ export function ArenaEmptyState() {
         Competitions are usually scheduled. Browse what is upcoming, or read a recently settled run&apos;s proof.
       </p>
       <div className={styles.actions}>
-        <Link href="/competitions" className={styles.cta}>View upcoming competitions →</Link>
-        <Link href="/leaderboard" className={styles.ctaSecondary}>Recent settled proofs (Leaderboard) →</Link>
+        <Link href="/competitions" className={styles.cta}>View competitions →</Link>
+        <Link href="/markets" className={styles.ctaSecondary}>Browse the Replay Library (Markets) →</Link>
       </div>
     </section>
   );

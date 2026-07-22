@@ -93,6 +93,15 @@ export interface CompetitionStateResponse {
   execution: Record<string, unknown> | null;
 }
 
+// GET /competitions — the unfiltered list summary (CompetitionSummaryResponse). NO auth; optional
+// `status` query only. Carries the raw config dict + lifecycle status + run_id (null until start).
+export interface CompetitionSummaryWire {
+  competition_id: string;
+  status: string;
+  config: Record<string, unknown>;
+  run_id: string | null;
+}
+
 export interface InspectorRecord {
   run_id: string;
   agent_id: string;

@@ -817,6 +817,39 @@ export async function getReplayPacks(): Promise<ReplayPackView[]> {
   }));
 }
 
+export interface CompetitionRecordView {
+  competitionId: string;
+  status: string;
+  title: string;
+  // Surfaced ONLY from the server record's config. Absent → null (the caller renders "—"), NEVER a
+  // fabricated 'replay'/'paper' default — that would violate the absent-value honesty rule (spec §7).
+  sourceMode: string | null;
+  executionMode: string | null;
+  rosterSize: number | null;
+  runId: string | null;
+}
+
+// The real backend competition records (GET /competitions). Surfaces ONLY server-provided fields;
+// the title is derived from config.market_scope, else the raw competition_id (spec §6.1). Never
+// reproduces aspirational mock values (prize/TVL/live counts/anchor) and never fabricates an absent
+// source/exec/roster. Callers gate mock mode themselves.
+export async function getCompetitions(): Promise<CompetitionRecordView[]> {
+  const rows = await getJson<W.CompetitionSummaryWire[]>(PATHS.competitions());
+  return rows.map((r) => {
+    const cfg = (r.config ?? {}) as Record<string, unknown>;
+    const scope = typeof cfg.market_scope === 'string' && cfg.market_scope.trim() ? cfg.market_scope : r.competition_id;
+    return {
+      competitionId: r.competition_id,
+      status: r.status,
+      title: scope,
+      sourceMode: typeof cfg.source_mode === 'string' ? cfg.source_mode : null,
+      executionMode: typeof cfg.execution_mode === 'string' ? cfg.execution_mode : null,
+      rosterSize: typeof cfg.roster_size === 'number' ? cfg.roster_size : null,
+      runId: r.run_id,
+    };
+  });
+}
+
 export async function getCockpitState(competitionId: string): Promise<CockpitState> {
   if (isMockEnabled()) {
     // Fixture-seeded REPLAY projection: honest header (source demoted) + the populated demo body.

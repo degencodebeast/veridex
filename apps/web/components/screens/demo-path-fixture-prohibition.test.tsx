@@ -310,13 +310,23 @@ describe('demo-path fixture-prohibition scan (T-2)', () => {
     });
 
     it('CompetitionsPage: mock OFF renders honest-empty — never the COMPETITIONS fixture', async () => {
+      // Off-mock now reads REAL records (Task 8 coherence fix): an empty store renders the honest
+      // `competitions-empty` state and NEVER the synthetic COMPETITIONS fixture. The mock-derived
+      // stat band / all-competitions table only render under mock (records === undefined).
       vi.resetModules();
-      const { default: CompetitionsPage } = await import('@/app/(app)/competitions/page');
-      render(<CompetitionsPage />);
-      await waitFor(() => expect(screen.getByTestId('stat-total')).toHaveTextContent('0'));
-      expect(screen.queryAllByTestId(/^comp-/)).toHaveLength(0);
-      expect(screen.queryByText(/World Cup · FRA v BRA/)).toBeNull();
-      expect(screen.getByTestId('all-competitions-empty')).toBeInTheDocument();
+      vi.doMock('@/lib/api', async (importOriginal) => {
+        const actual = await importOriginal<typeof import('@/lib/api')>();
+        return { ...actual, getCompetitions: async () => [] };
+      });
+      try {
+        const { default: CompetitionsPage } = await import('@/app/(app)/competitions/page');
+        render(<CompetitionsPage />);
+        expect(await screen.findByTestId('competitions-empty')).toBeInTheDocument();
+        expect(screen.queryAllByTestId(/^comp-/)).toHaveLength(0);
+        expect(screen.queryByText(/World Cup · FRA v BRA/)).toBeNull();
+      } finally {
+        vi.doUnmock('@/lib/api');
+      }
     });
     it('CompetitionsPage: mock ON surfaces the COMPETITIONS fixture — off-mock lock is live', async () => {
       vi.stubEnv('NEXT_PUBLIC_VERIDEX_MOCK', '1');
