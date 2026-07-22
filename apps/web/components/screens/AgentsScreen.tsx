@@ -6,8 +6,6 @@ import { Num } from '@/components/ui/Num';
 import { SegmentedControl } from '@/components/ui/SegmentedControl';
 import { InfoTip } from '@/components/ui/InfoTip';
 import { MAKER_AGENT_META } from '@/lib/fixtures/maker';
-import { STRATEGY_TEMPLATES } from '@/lib/studio/templates';
-import { templateReadiness } from '@/lib/studio/readiness';
 import { GLOSSARY } from '@/lib/glossary';
 import { useLane, type Lane } from '@/hooks/useLane';
 import { useMakerArenaResult } from '@/hooks/useMakerArenaResult';
@@ -118,25 +116,6 @@ export function AgentsScreen({
           <MakerAgentsTable result={makerState.result} />
         )
       )}
-
-      {/* Strategy Templates — a SEPARATE section from the ranked/deployed rosters (§5.3). Templates are
-          concepts (label + archetype taxonomy + readiness + blurb), NEVER a performance surface: no bps,
-          no CLV value, no rank. Shown in BOTH lanes so the taxonomy is always visible. */}
-      <section data-testid="strategy-templates" aria-label="Strategy Templates">
-        <h2>Strategy Templates</h2>
-        <p>Concepts you can deploy or enter in the Arena. Templates show their archetype, never performance.</p>
-        <ul>
-          {STRATEGY_TEMPLATES.map((t) => (
-            <li key={t.id} data-testid={`template-${t.id}`}>
-              <span>{t.label}</span>
-              {/* Archetype = taxonomy (e.g. value_clv), not a performance value — honest to display (§5.3). */}
-              <span className="mono" data-testid={`archetype-${t.id}`}>{t.archetype}</span>
-              <span data-testid={`readiness-${t.id}`}>{templateReadiness(t)}</span>
-              <p>{t.blurb}</p>
-            </li>
-          ))}
-        </ul>
-      </section>
     </section>
   );
 }
