@@ -73,6 +73,8 @@ export const PATHS = {
   // F-8 QuoteGuard behavior ablation (maker_live_ab.v1). Read-only, public, per-instance. 404s
   // (honest "no ablation for this instance") until an ablation provider is wired for the instance.
   makerLiveAb: (instanceId: string) => `/maker/live-ab/${encodeURIComponent(instanceId)}`,
+  // R-3 verified ReplayPack catalog (read-only). Enriched with additive fixture_metadata.
+  replayPacks: () => `/replay-packs`,
   // F-4 competition lifecycle (owner-scoped POSTs): create → register roster entry → start.
   competitions: () => `/competitions`,
   competitionAgents: (id: string) => `/competitions/${id}/agents`,
@@ -788,6 +790,31 @@ export async function getMakerArenaResult(): Promise<MakerArenaResultView> {
     return { ...m, source_mode: demote(m.source_mode) };
   }
   return adaptMakerArenaResult(await getJson<W.MakerArenaResultResponseWire>(PATHS.makerArenaResult()));
+}
+
+export interface ReplayPackView {
+  packId: string;
+  contentHash: string;
+  provenance: string;
+  isGenuine: boolean;
+  fixtures: number[];
+  fixtureMetadata: W.ReplayPackFixtureMetaWire[];
+}
+
+// The deployed 1-pack/4-fixture Replay Library. Off-mock ⇒ the real /replay-packs fetch; mock ⇒ []
+// (there is NO replay-pack demo fixture — honest-empty, never fabricated). Raw fixture ids are
+// preserved; labels come SERVER-side (fixture_metadata), never a frontend-duplicated map (spec §5.2).
+export async function getReplayPacks(): Promise<ReplayPackView[]> {
+  if (isMockEnabled()) return [];
+  const res = await getJson<W.ReplayPackListResponseWire>(PATHS.replayPacks());
+  return res.packs.map((p) => ({
+    packId: p.pack_id,
+    contentHash: p.content_hash,
+    provenance: p.provenance,
+    isGenuine: p.is_genuine,
+    fixtures: p.fixtures,
+    fixtureMetadata: p.fixture_metadata ?? [],
+  }));
 }
 
 export async function getCockpitState(competitionId: string): Promise<CockpitState> {

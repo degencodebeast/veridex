@@ -1,7 +1,9 @@
 'use client';
 import { useEffect, useState } from 'react';
+import { useRouter } from 'next/navigation';
 import { MarketsScreen } from '@/components/screens/MarketsScreen';
-import { getFeedHealth, getLeaderboard } from '@/lib/api';
+import { ReplayLibrary } from '@/components/screens/ReplayLibrary';
+import { getFeedHealth, getLeaderboard, getReplayPacks, type ReplayPackView } from '@/lib/api';
 import { isMockEnabled } from '@/lib/mock';
 import { ODDS_UPDATES, FIXTURES } from '@/lib/fixtures/catalog';
 import type { FeedHealthState, FixtureSummary, LeaderboardRow, OddsUpdate } from '@/lib/catalog';
@@ -19,6 +21,8 @@ export default function MarketsPage() {
   const [fixtures, setFixtures] = useState<FixtureSummary[]>([]);
   const [feedHealth, setFeedHealth] = useState<FeedHealthState | null>(null);
   const [leaderboard, setLeaderboard] = useState<LeaderboardRow[]>([]);
+  const [replayPacks, setReplayPacks] = useState<ReplayPackView[]>([]);
+  const router = useRouter();
 
   useEffect(() => {
     let alive = true;
@@ -33,15 +37,31 @@ export default function MarketsPage() {
     getLeaderboard()
       .then((r) => { if (alive) setLeaderboard(r); })
       .catch(() => { if (alive) setLeaderboard([]); }); // honest-empty on error — never the fixture (T-2)
+    getReplayPacks()
+      .then((p) => { if (alive) setReplayPacks(p); })
+      .catch(() => { if (alive) setReplayPacks([]); }); // honest-empty on error — never a fake pack
     return () => { alive = false; };
   }, []);
 
   return (
-    <MarketsScreen
-      oddsByFixture={oddsByFixture}
-      fixtures={fixtures}
-      feedHealth={feedHealth}
-      leaderboard={leaderboard}
-    />
+    <>
+      <ReplayLibrary
+        packs={replayPacks}
+        onLaunch={(packId, fixtureId) =>
+          // The create flow lives at /competitions/create (NOT /competitions, which is the read-only
+          // list and parses no params). Carry BOTH authoritative catalog IDs as query params — the
+          // create page (Task 5) parses pack_id + fixture_id and threads them into the create payload.
+          router.push(
+            `/competitions/create?pack_id=${encodeURIComponent(packId)}&fixture_id=${fixtureId}`,
+          )
+        }
+      />
+      <MarketsScreen
+        oddsByFixture={oddsByFixture}
+        fixtures={fixtures}
+        feedHealth={feedHealth}
+        leaderboard={leaderboard}
+      />
+    </>
   );
 }

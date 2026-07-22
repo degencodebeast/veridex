@@ -235,3 +235,24 @@ export interface MakerArenaResultResponseWire {
   proof_card: MakerProofCardWire;
   diagnostics: MakerDiagnosticsWire;
 }
+
+export interface ReplayPackFixtureMetaWire {
+  fixture_id: number;
+  home_team: string | null;
+  away_team: string | null;
+  kickoff_ts: number | null;
+  label_source: string; // "captured" | "unavailable"
+}
+
+export interface ReplayPackInfoWire {
+  pack_id: string;
+  content_hash: string;
+  provenance: string;
+  is_genuine: boolean;
+  fixtures: number[];
+  fixture_metadata: ReplayPackFixtureMetaWire[];
+}
+
+export interface ReplayPackListResponseWire {
+  packs: ReplayPackInfoWire[];
+}
