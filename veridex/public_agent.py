@@ -15,11 +15,17 @@ from __future__ import annotations
 import re
 from enum import Enum
 
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 
 _BRAND_LABEL = "Veridex Labs"
 _DASH = "—"
 _WALLET_RE = re.compile(r"0x[0-9a-fA-F]{6,}")
+# Wallet truncation: keep the ``0x`` + 4 hex prefix and the trailing 5 hex chars.
+_LABEL_PREFIX = 6
+_LABEL_SUFFIX = 5
+# Only truncate when doing so actually elides characters; at <= prefix+suffix the
+# ellipsis form would be a no-op (or longer), so such wallets are returned as-is.
+_LABEL_MIN_TRUNCATE = _LABEL_PREFIX + _LABEL_SUFFIX
 
 
 class Visibility(str, Enum):
@@ -48,6 +54,10 @@ class Origin(str, Enum):
 class PublicAgent(BaseModel):
     """The immutable public identity of a deployed agent.
 
+    ``frozen=True`` enforces the "immutable" contract (mutation raises; versioning is
+    still done via ``model_copy(update=...)``). ``extra="forbid"`` makes a mistyped field
+    at a construction site fail loudly rather than silently drop — this is a trust surface.
+
     Attributes:
         public_agent_id: Stable public identifier for the agent.
         display_name: Human-facing name shown in the arena.
@@ -60,6 +70,8 @@ class PublicAgent(BaseModel):
         updated_at: ISO-8601 last-update timestamp.
         version: Monotonic identity version.
     """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
 
     public_agent_id: str
     display_name: str
@@ -89,6 +101,6 @@ def owner_public_label(agent: PublicAgent) -> str:
     if match is None:
         return _DASH
     wallet = match.group(0)
-    if len(wallet) > 11:
-        return f"{wallet[:6]}…{wallet[-5:]}"
+    if len(wallet) > _LABEL_MIN_TRUNCATE:
+        return f"{wallet[:_LABEL_PREFIX]}…{wallet[-_LABEL_SUFFIX:]}"
     return wallet

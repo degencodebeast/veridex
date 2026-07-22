@@ -7,6 +7,9 @@ wallet derived from the ref; anything else renders an em-dash.
 
 from __future__ import annotations
 
+import pytest
+from pydantic import ValidationError
+
 from veridex.public_agent import (
     OperatorClass,
     Origin,
@@ -59,3 +62,35 @@ def test_origin_has_unknown_for_honest_legacy() -> None:
 def test_unknown_owner_ref_renders_dash() -> None:
     agent = _agent(operator_class=OperatorClass.USER, owner_ref=None)
     assert owner_public_label(agent) == "—"
+
+
+def test_public_agent_is_immutable() -> None:
+    agent = _agent(operator_class=OperatorClass.USER, owner_ref="did:privy:x")
+    with pytest.raises(ValidationError):
+        agent.owner_ref = "LEAKED"  # type: ignore[misc]
+
+
+def test_owner_label_truncation_format() -> None:
+    agent = _agent(operator_class=OperatorClass.USER, owner_ref="0x" + "a" * 40)
+    assert owner_public_label(agent) == "0xaaaa…aaaaa"
+
+
+def test_owner_label_short_wallet_returned_as_is() -> None:
+    agent = _agent(operator_class=OperatorClass.USER, owner_ref="0x123456789")
+    assert owner_public_label(agent) == "0x123456789"
+
+
+def test_official_precedence_over_wallet_extraction() -> None:
+    agent = _agent(
+        operator_class=OperatorClass.OFFICIAL,
+        origin=Origin.OFFICIAL,
+        owner_ref="did:privy:0x9cc2aaaaaaaaaaaaaaaaaaaaaaaa16ee3",
+    )
+    assert owner_public_label(agent) == "Veridex Labs"
+
+
+def test_empty_and_too_short_hex_render_dash() -> None:
+    empty = _agent(operator_class=OperatorClass.USER, owner_ref="")
+    assert owner_public_label(empty) == "—"
+    short_hex = _agent(operator_class=OperatorClass.USER, owner_ref="0x123")
+    assert owner_public_label(short_hex) == "—"
