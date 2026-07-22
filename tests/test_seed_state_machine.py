@@ -24,6 +24,7 @@ The five load-bearing properties (one test each):
 from __future__ import annotations
 
 import asyncio
+import os
 from datetime import UTC, datetime
 from typing import Any
 
@@ -248,3 +249,55 @@ async def test_projection_bindings_reconstructable_from_store_state() -> None:
         # Both official contestants are reconstructed, keyed by their runtime agent id.
         assert len(rebuilt) == 2
         assert {b.public_agent_id for b in rebuilt.values()} == _OFFICIAL_IDS
+
+
+# =====================================================================================
+# Postgres parity — the seed-ledger store methods (persist_seed_state / get_seed_state)
+# must behave identically over Postgres, not just InMemoryStore (skipped unless
+# DATABASE_URL + psycopg present).
+# =====================================================================================
+
+
+def _psycopg_available() -> bool:
+    try:
+        import psycopg  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
+@pytest.mark.skipif(
+    not (os.getenv("DATABASE_URL") and _psycopg_available()),
+    reason="Postgres round-trip: set DATABASE_URL and install psycopg",
+)
+async def test_postgres_seed_state_ledger_round_trip() -> None:
+    import psycopg
+
+    from veridex.store import PostgresStore
+
+    dsn = os.environ["DATABASE_URL"]
+    store = PostgresStore(dsn=dsn)
+
+    revision = "pg_seed_ledger_rt_v1"
+
+    async with await psycopg.AsyncConnection.connect(dsn) as conn:
+        await store.init_db(conn)
+        # Clean slate: a prior run of this test leaves the revision behind (UPSERT is
+        # idempotent for the round-trip/overwrite assertions below, but the "missing key"
+        # assertion needs the row genuinely absent first).
+        async with conn.cursor() as cur:
+            await cur.execute("DELETE FROM seed_state WHERE seed_revision = %s", (revision,))
+        await conn.commit()
+
+    # Missing key -> None
+    assert await store.get_seed_state(revision) is None
+
+    # Round-trip
+    first_state = {"phase": "deploy", "instance_ids": ["i1", "i2"], "n": 1}
+    await store.persist_seed_state(revision, first_state)
+    assert await store.get_seed_state(revision) == first_state
+
+    # UPSERT last-write-wins (same revision, new snapshot replaces the old one)
+    second_state = {"phase": "sealed", "n": 2}
+    await store.persist_seed_state(revision, second_state)
+    assert await store.get_seed_state(revision) == second_state
