@@ -76,7 +76,7 @@ export function CompetitionsScreen({ comps = [], rewards = [], records }: {
       {records !== undefined && (
         <section className={styles.group} data-testid="real-competitions" aria-label="Your competitions">
           <div className={styles.h2Row}>
-            <h2 className={styles.h2}>Competitions</h2>
+            <h2 className={styles.h2}>All competitions</h2>
             {/* Coherent count DERIVED from the real records — never the empty mock aggregate. */}
             <span className={styles.count} data-testid="real-total">{records.length}</span>
           </div>
@@ -85,7 +85,7 @@ export function CompetitionsScreen({ comps = [], rewards = [], records }: {
               <p>No competitions yet.</p>
               <div>
                 <Link href="/competitions/create" className={styles.cta}>Create a competition →</Link>
-                <Link href="/markets" className={styles.ctaSecondary}>Browse the Replay Library (Markets) →</Link>
+                <Link href="/markets" className={styles.ctaSecondary}>Browse Markets →</Link>
               </div>
             </div>
           ) : (
