@@ -49,3 +49,11 @@ def test_replay_packs_response_carries_raw_fixtures_and_metadata() -> None:
     for m in pack["fixture_metadata"]:
         assert m["label_source"] in {"captured", "unavailable"}
         assert isinstance(m["fixture_id"], int)
+
+
+def test_curated_label_and_kickoff_maps_are_key_consistent() -> None:
+    """Integrity gate: every curated-labelled fixture also has a shipped kickoff_ts, so a
+    ``captured`` row can never carry a null ``kickoff_ts`` (an honest-metadata invariant)."""
+    from veridex.api.fixture_labels import FIXTURE_KICKOFF_TS, FIXTURE_LABELS
+
+    assert FIXTURE_LABELS.keys() == FIXTURE_KICKOFF_TS.keys()
