@@ -14,6 +14,7 @@ import {
   type DeployedInstance, type CompetitionConfigPayload, type RosterEntryPayload,
 } from '@/lib/api';
 import type { CompetitionType, ExecutionMode, ProofMode, MarketFamilyKey } from '@/lib/catalog';
+import { buildCompetitionConfig } from '@/lib/competition/config';
 import styles from './CreateCompetitionScreen.module.css';
 
 type SourceMode = 'replay' | 'live';
@@ -74,6 +75,7 @@ const DEFAULT_LAUNCH_API: LaunchApi = {
 export function CreateCompetitionScreen({
   onCommit = () => {},
   initialFixtureId,
+  packId,
   connected = false,
   onConnect,
   loadInstances = getInstances,
@@ -82,6 +84,9 @@ export function CreateCompetitionScreen({
 }: {
   onCommit?: (cfg: CreateCompetitionCommit) => void;
   initialFixtureId?: number;
+  // The authoritative Replay-Library pack id the Markets Launch carries via ?pack_id= (spec §5.2).
+  // Absent (manual create) → omitted from the payload, never fabricated.
+  packId?: string;
   // auth-contract@1: DERIVED from the real session by the page (usePrivy), never a literal. Owner-
   // scoped instance listing + the launch POSTs only fire authenticated (fail-closed).
   connected?: boolean;
@@ -173,10 +178,18 @@ export function CreateCompetitionScreen({
 
   // The exact CompetitionConfig POST /competitions freezes. roster_size = selected count (≥2 guarded
   // by the launch button). source_mode is the wizard's own axis — a replay-backed run reads `replay`.
-  const config: CompetitionConfigPayload = {
-    competition_type: type, source_mode: source, execution_mode: exec,
-    market_scope, scoring_window, roster_size: Math.max(2, selectedInstances.length),
-  };
+  const config: CompetitionConfigPayload = buildCompetitionConfig({
+    competitionType: type,
+    sourceMode: source,
+    executionMode: exec,
+    marketScope: market_scope,
+    scoringWindow: scoring_window,
+    rosterSize: selectedInstances.length,
+    packId: packId ?? null,
+    // `fixtureId` is the component's selection state (`:112`, seeded from `initialFixtureId`); 0 = no
+    // fixture selected → coerced to null so `buildCompetitionConfig` OMITS it (never a fabricated 0).
+    fixtureId: fixtureId || null,
+  });
 
   return (
     <section className={styles.screen} aria-label="Create Competition">

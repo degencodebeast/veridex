@@ -1224,6 +1224,11 @@ export interface CompetitionConfigPayload {
   market_scope: string;
   scoring_window: string | null;
   roster_size: number; // ge=2 (backend Field constraint) — the wizard guards this before firing
+  // The AUTHORITATIVE catalog identity the Replay Library establishes (spec §5.2). The backend
+  // competition model freezes a server-derived replay binding from these (models.py:83-84,106-127).
+  // A label-only prefill loses this identity and breaks the moment a second admitted pack appears.
+  pack_id?: string;
+  fixture_id?: number;
 }
 
 /** One instance-bound roster entry POST /competitions/{id}/agents registers (mirrors AgentEntry). */
