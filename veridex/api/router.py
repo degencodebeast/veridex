@@ -129,6 +129,7 @@ from veridex.ingest.replay_catalog import (
     resolve_replay_source,
 )
 from veridex.leaderboard import leaderboard as _build_leaderboard
+from veridex.public_projection import BoardKind, directional_board
 from veridex.runtime.arena_comparison import (
     DET_DRIFT_CONTESTANT,
     LLM_DRIFT_CONTESTANT,
@@ -720,6 +721,26 @@ def create_app(
         instances = await dep_store.list_agent_instances()
         ordered = sorted(instances, key=lambda inst: (inst.created_at, inst.instance_id))
         return AgentRosterResponse(agents=[_agent_roster_entry(inst) for inst in ordered])
+
+    # --- GET /leaderboard/directional (Official Replay League completion layer) --
+
+    @app.get("/leaderboard/directional")
+    async def get_directional_leaderboard(
+        board_kind: BoardKind = Query(...),  # noqa: B008
+        dep_store: Store = Depends(_get_store),  # noqa: B008
+    ) -> dict[str, Any]:
+        """Return the directional leaderboard for a closed ``board_kind``, visibility-joined at read time.
+
+        A thin HTTP shell over :func:`veridex.public_projection.directional_board`: it loads durable
+        projected rows, joins CURRENT public-agent visibility (and, for
+        :attr:`~veridex.public_projection.BoardKind.OFFICIAL_BENCHMARK`, ``operator_class``), and hands
+        the survivors to the pure aggregator. The route does NOT rank or aggregate — that is
+        ``directional_board``'s job; it only serializes the result. ``board_kind`` is the closed
+        :class:`~veridex.public_projection.BoardKind` enum, so an unknown value is a 422 (never a silent
+        default). No scored public rows -> ``rows: []`` (honest-empty, never fabricated).
+        """
+        rows = await directional_board(dep_store, board_kind=board_kind)
+        return {"board_kind": board_kind.value, "rows": rows}
 
     # --- POST /backtests (T15 — replay a ReplayPack → honest BacktestReport) ----
 
