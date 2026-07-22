@@ -1,0 +1,127 @@
+"""Official Replay League seed — pinned canonical DeployConfigs + a deterministic hash (D1).
+
+This module pins the COMPLETE canonical :class:`~veridex.deploy.preflight.DeployConfig` for the two
+OFFICIAL directional agents (``baseline``, ``momentum``) — the verified-runtime-scoreable set on the
+shipped ``demo_pack_real`` pack — plus a stable seed-definition hash that ties the pinned configs to
+a schema version so a reproducibility check can detect any drift in what the league seeds.
+
+HONESTY BOUNDARY (Gate-1): exactly TWO official agents. No ``momentum-sharp`` /
+``cumulative-drift`` (template-only on the shipped pack) / ``value-vs-venue`` (not runtime-viable) /
+``llm``. Each official agent carries BOTH a public identity (``public_agent_id``) and a distinct
+runtime id (``agent_id``); the public identity is attached by the seed, NOT by the DeployConfig
+(which has no ``public_agent_id`` field).
+
+The canonical config OVERRIDES ``source_mode`` to ``replay`` (off the live default) and pins the
+replay SELECTION (``replay_pack_id`` / ``replay_fixture_id``); every other field takes its model
+default, so ``config_hash()`` hashes the full default-expanded config exactly as the deploy route
+would pin it.
+"""
+
+from __future__ import annotations
+
+import hashlib
+from dataclasses import dataclass
+
+from veridex.deploy.preflight import DeployConfig
+from veridex.runtime.evidence import serialize_payload
+
+#: Schema version of the pinned canonical DeployConfig shape — bumped when the pinned config fields
+#: (or their canonical serialization) change, so the seed-definition hash detects drift.
+DEPLOYCONFIG_SCHEMA_VERSION = 1
+
+#: The two competitions' fixtures the Official Replay League covers.
+LEAGUE_FIXTURES = [18213979, 18222446]
+
+#: The verified R-2 replay pack the official agents replay (the literal catalog id).
+_REPLAY_PACK_ID = "demo_pack_real"
+
+#: The pinned replay fixture the canonical config selects (first league fixture).
+_REPLAY_FIXTURE_ID = 18213979
+
+
+@dataclass(frozen=True)
+class OfficialAgentDef:
+    """One official league agent's pinned identity + strategy.
+
+    Attributes:
+        public_agent_id: The stable PUBLIC identity attached by the seed (not a DeployConfig field).
+        template_id: The strategy-archetype template the instance is configured from.
+        agent_id: The distinct runtime identifier of the deployed agent.
+        strategy: The strategy family (``baseline`` | ``momentum``).
+        display_name: Human-facing league display name.
+        idempotency_key: The seed idempotency key (stable re-seed dedupe key).
+    """
+
+    public_agent_id: str
+    template_id: str
+    agent_id: str
+    strategy: str
+    display_name: str
+    idempotency_key: str
+
+
+#: The exactly-two official, verified-scoreable directional agents.
+OFFICIAL_AGENTS: list[OfficialAgentDef] = [
+    OfficialAgentDef(
+        public_agent_id="agt_official_baseline",
+        template_id="official-baseline",
+        agent_id="official-baseline-v1",
+        strategy="baseline",
+        display_name="Official Baseline Control",
+        idempotency_key="seed-official-baseline-v1",
+    ),
+    OfficialAgentDef(
+        public_agent_id="agt_official_momentum",
+        template_id="official-momentum",
+        agent_id="official-momentum-v1",
+        strategy="momentum",
+        display_name="Official Momentum",
+        idempotency_key="seed-official-momentum-v1",
+    ),
+]
+
+
+def canonical_deploy_config(defn: OfficialAgentDef) -> DeployConfig:
+    """Build the COMPLETE canonical :class:`DeployConfig` for an official agent.
+
+    Overrides ``source_mode`` to ``replay`` (off the live default) and pins the replay selection;
+    every other field takes its model default. ``public_agent_id`` is intentionally NOT set — it is
+    not a DeployConfig field (identity is attached by the seed).
+
+    Args:
+        defn: The official agent definition to pin a config for.
+
+    Returns:
+        A valid, default-expanded :class:`DeployConfig` for a ``replay`` deploy.
+    """
+    return DeployConfig(
+        template_id=defn.template_id,
+        agent_id=defn.agent_id,
+        strategy=defn.strategy,  # type: ignore[arg-type]
+        source_mode="replay",
+        execution_mode="paper",
+        replay_pack_id=_REPLAY_PACK_ID,
+        replay_fixture_id=_REPLAY_FIXTURE_ID,
+        market_allowlist=[],
+        venue_allowlist=[],
+        min_edge_bps=0,
+        max_stake=0.0,
+        mm=None,
+    )
+
+
+def seed_definition_hash() -> str:
+    """Deterministic reproducibility hash over the pinned seed definitions.
+
+    Hashes ``(DEPLOYCONFIG_SCHEMA_VERSION, sorted per-agent config hashes)`` via the ONE canonical
+    serializer, so the digest is byte-stable across processes and shifts iff a pinned config (or the
+    schema version) changes.
+
+    Returns:
+        The hex SHA-256 of the canonical serialization of the seed definitions.
+    """
+    payload = {
+        "schema_version": DEPLOYCONFIG_SCHEMA_VERSION,
+        "config_hashes": sorted(canonical_deploy_config(a).config_hash() for a in OFFICIAL_AGENTS),
+    }
+    return hashlib.sha256(serialize_payload(payload).encode("utf-8")).hexdigest()
