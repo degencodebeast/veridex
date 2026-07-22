@@ -97,3 +97,16 @@ def test_integrity_every_sealed_id_resolves_in_fixtures_json() -> None:
     assert unresolved == [], f"sealed IDs missing from cp1/fixtures.json: {unresolved}"
     rows = _build_fixture_metadata(result.fixtures, SEALED_FIXTURES_PATH)
     assert all(r["label_source"] == "captured" for r in rows)
+
+
+def test_structurally_incomplete_row_is_unavailable_not_captured(tmp_path: Path) -> None:
+    """A parsed-but-incomplete row (fixture_id present, label fields missing) must render
+    label_source='unavailable' with null labels — NEVER a false 'captured' claim carrying nulls."""
+    bad = tmp_path / "fixtures.json"
+    bad.write_text(json.dumps([{"fixture_id": 42}]), encoding="utf-8")
+    rows = _build_fixture_metadata((42,), bad)
+    assert rows[0]["fixture_id"] == 42
+    assert rows[0]["label_source"] == "unavailable"
+    assert rows[0]["home_team"] is None
+    assert rows[0]["away_team"] is None
+    assert rows[0]["kickoff_ts"] is None

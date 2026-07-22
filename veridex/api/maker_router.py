@@ -81,10 +81,22 @@ def _load_captured_labels(fixtures_path: Path) -> dict[int, dict[str, Any]]:
             fid = row.get("fixture_id")
             if not isinstance(fid, int):
                 continue
+            home = row.get("home_team")
+            away = row.get("away_team")
+            kickoff = row.get("kickoff_ts")
+            # A row is a CAPTURED label ONLY if it carries a complete, well-typed label. A
+            # structurally incomplete row (missing/blank teams or a non-int kickoff) is DROPPED so its
+            # fixture falls through to "unavailable" — never a false "captured" claim carrying nulls.
+            if not (
+                isinstance(home, str) and home
+                and isinstance(away, str) and away
+                and isinstance(kickoff, int)
+            ):
+                continue
             labels[fid] = {
-                "home_team": row.get("home_team"),
-                "away_team": row.get("away_team"),
-                "kickoff_ts": row.get("kickoff_ts"),
+                "home_team": home,
+                "away_team": away,
+                "kickoff_ts": kickoff,
                 "event_slug": row.get("event_slug"),
             }
     return labels
