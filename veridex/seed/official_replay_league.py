@@ -161,6 +161,30 @@ def seed_definition_hash() -> str:
     return hashlib.sha256(serialize_payload(payload).encode("utf-8")).hexdigest()
 
 
+def _seed_manifest() -> dict[str, Any]:
+    """The versioned reproducibility + identity MANIFEST persisted in the ledger and validated on resume.
+
+    Ties a ``seed_revision`` to (a) the config-only :func:`seed_definition_hash`, (b) the schema
+    version, and (c) the EXACT ordered public/runtime identity set plus each agent's pinned
+    ``config_hash``. A resume whose ledgered manifest differs from the freshly-computed one has drifted
+    (a changed pinned config default, or an added/renamed/re-ordered official identity) and MUST fail
+    closed — neither a config-default drift nor a public/runtime identity change can silently reuse or
+    extend an already-seeded revision (that is the reproducibility promise the seed makes).
+    """
+    return {
+        "seed_definition_hash": seed_definition_hash(),
+        "schema_version": DEPLOYCONFIG_SCHEMA_VERSION,
+        "identities": [
+            {
+                "public_agent_id": d.public_agent_id,
+                "runtime_agent_id": d.agent_id,
+                "config_hash": canonical_deploy_config(d).config_hash(),
+            }
+            for d in OFFICIAL_AGENTS
+        ],
+    }
+
+
 class ScoreabilityError(RuntimeError):
     """An admitted official agent produced ZERO scored actions on the shipped pack (fail-closed).
 
@@ -240,7 +264,8 @@ class SeedResult:
         seed_revision: The seed-run identity the ledger is keyed by.
         public_agent_ids: The two official ``PublicAgent`` ids (deterministic, PUBLIC + OFFICIAL).
         instance_ids: The two deployed instance ids (from the real deploy route), in official order.
-        competition_ids: The two finalized competition ids (non-deterministic; ledgered for re-use).
+        competition_ids: The two finalized competition ids in LEAGUE_FIXTURES order (non-deterministic;
+            fixture-keyed in the ledger for independent per-fixture crash recovery).
         run_ids: The two sealed run ids the competitions finalized under (projection provenance).
         projected_row_count: The total durable projected rows after this pass (idempotency witness).
     """
@@ -345,8 +370,21 @@ async def run_seed(
     """
     ledger = await store.get_seed_state(seed_revision) or {}
     instances_ledger: dict[str, str] = dict(ledger.get("instances", {}))
-    competition_ledger: list[str] = list(ledger.get("competitions", []))
+    # FIXTURE-KEYED competition ledger (MAJOR 1): str(fixture_id) -> competition_id, so a crash after
+    # the FIRST fixture is ledgered resumes by creating ONLY the missing fixture (never all-or-nothing).
+    competition_ledger: dict[str, str] = dict(ledger.get("competitions", {}))
     now = _now_iso()
+
+    # Resume drift gate (MAJOR 2): a NON-EMPTY ledger means this is a RESUME. Its persisted manifest MUST
+    # equal the current seed definition; otherwise the pinned configs or the official identity set have
+    # drifted, so relinking/reusing the ledgered state would silently seed a DIFFERENT league (or mint a
+    # third identity). Fail closed and require a NEW --seed-revision. This runs BEFORE any public-agent
+    # upsert (phase 4) or instance relink (phase 5), so no drifted identity ever reaches the board.
+    if ledger and ledger.get("manifest") != _seed_manifest():
+        raise SeedError(
+            f"seed definition drifted from the persisted manifest for revision {seed_revision!r} "
+            f"— use a NEW --seed-revision"
+        )
 
     # Phase 1 — assert_pack: the shipped image MUST carry demo_pack_real (catch a misaligned image early).
     catalog = build_catalog(os.environ.get("REPLAY_PACK_ROOT", "") or None)
@@ -397,6 +435,23 @@ async def run_seed(
                     )
                 instance_id = resp.json()["instance_id"]
                 instances_ledger[defn.public_agent_id] = instance_id
+            else:
+                # REUSE path (MAJOR 2): a ledgered instance must still match the CURRENT definition —
+                # its deployed config_hash and its existing public link cannot have drifted, or the
+                # relink/reuse would trust a stale/tampered instance. Fail closed on either mismatch.
+                reused = await store.get_agent_instance(instance_id)
+                if reused.config_hash != canonical_deploy_config(defn).config_hash():
+                    raise SeedError(
+                        f"ledgered instance {instance_id!r} config_hash {reused.config_hash!r} drifted "
+                        f"from the current canonical config for {defn.public_agent_id!r} — use a NEW "
+                        f"--seed-revision"
+                    )
+                linked = await store.get_instance_public_agent_id(instance_id)
+                if linked is not None and linked != defn.public_agent_id:
+                    raise SeedError(
+                        f"ledgered instance {instance_id!r} is linked to {linked!r}, not the expected "
+                        f"{defn.public_agent_id!r} — identity drift, use a NEW --seed-revision"
+                    )
             await store.link_instance_public_agent(instance_id, defn.public_agent_id)
         await _persist_ledger(store, seed_revision, instances_ledger, competition_ledger)
 
@@ -407,23 +462,32 @@ async def run_seed(
                 client, instance_id, timeout_s=wait_timeout_s, poll_interval_s=poll_interval_s
             )
 
-        # Phase 7 — create_competitions: one per league fixture, bound to demo_pack_real. Reuse ledgered
-        # ids. Persist the ledger PER-OBJECT (right after each id is appended) so a crash mid-loop leaves
-        # at most the single last-created (unledgered) id to be re-created — the same tiny crash window the
-        # instance path has via its deploy Idempotency-Key. (Fully closing it needs a deterministic
-        # competition id — out of scope here; this makes the crash-recovery window symmetric, not zero.)
-        if not competition_ledger:
-            for fixture_id in LEAGUE_FIXTURES:
+        # Phase 7 — create_competitions: one per league fixture, bound to demo_pack_real, FIXTURE-KEYED
+        # (MAJOR 1). Iterate the fixtures and create+persist ONLY the missing fixture keys (adopt any
+        # already-ledgered ones) so a crash after the FIRST fixture is durably ledgered resumes by
+        # creating ONLY the missing second fixture — never the old all-or-nothing skip that finalized a
+        # single competition. ORPHAN POLICY: a crash in the single-fixture window between the create POST
+        # returning and its ledger write leaves ONE unledgered DRAFT competition (never registered /
+        # started / projected — harmless); the resume creates the correct missing fixture, so the
+        # LEDGERED+FINALIZED topology is ALWAYS exactly the 2 intended fixture-bound competitions. (Fully
+        # closing that single-fixture window needs a deterministic/idempotency-keyed competition-create id
+        # — an out-of-scope route change.)
+        for fixture_id in LEAGUE_FIXTURES:
+            key = str(fixture_id)
+            if key not in competition_ledger:
                 resp = await client.post("/competitions", json=_competition_config(fixture_id))
                 if resp.status_code != 200:
                     raise SeedError(f"create competition failed: {resp.status_code} {resp.text}")
-                competition_ledger.append(resp.json()["competition_id"])
+                competition_ledger[key] = resp.json()["competition_id"]
                 await _persist_ledger(store, seed_revision, instances_ledger, competition_ledger)
+
+        # The fixture-ordered competition ids every downstream phase drives (register/start/verify/project).
+        competition_ids = [competition_ledger[str(f)] for f in LEAGUE_FIXTURES]
 
         # Phase 8 — register: bind BOTH deployed instances onto EACH competition (instance_id + pinned
         # config_hash) so the arena runs the ACTUAL deployed contestant. Idempotent: skip finalized
         # competitions and already-registered agents; a racing 409 is a benign no-op.
-        for cid in competition_ledger:
+        for cid in competition_ids:
             competition = await store.get_competition(cid)
             if competition.status is CompetitionStatus.FINALIZED:
                 continue
@@ -449,7 +513,7 @@ async def run_seed(
                     )
 
         # Phase 9 — start_finalize: run each competition offline/deterministically to a finalized state.
-        for cid in competition_ledger:
+        for cid in competition_ids:
             competition = await store.get_competition(cid)
             if competition.status is CompetitionStatus.FINALIZED:
                 if competition.run_id is None:
@@ -470,7 +534,7 @@ async def run_seed(
             run_ids.append(run_id)
 
     # Phase 10 — verify_score_rows: fail closed if a finalized competition sealed with NO score rows.
-    for cid, run_id in zip(competition_ledger, run_ids, strict=True):
+    for cid, run_id in zip(competition_ids, run_ids, strict=True):
         run_result = await store.load_run(run_id)
         if not run_result.score_rows:
             raise SeedError(f"competition {cid!r} run {run_id!r} sealed with NO score rows")
@@ -478,7 +542,7 @@ async def run_seed(
     # Phase 11 — project_and_aggregate: reconstruct each projection binding DURABLY FROM THE STORE
     # (instance pinned agent_id + entry config_hash + get_instance_public_agent_id) — no in-memory
     # side channel — then persist projected rows (UPSERT-idempotent, no double-count on a re-run).
-    for cid, run_id in zip(competition_ledger, run_ids, strict=True):
+    for cid, run_id in zip(competition_ids, run_ids, strict=True):
         competition = await store.get_competition(cid)
         run_result = await store.load_run(run_id)
         if run_result.source_mode != _SEED_SOURCE_MODE:
@@ -495,27 +559,93 @@ async def run_seed(
         )
         await store.persist_projected_rows(projected)
 
-    # Phase 12 — publish_gate: the officials are already visibility=PUBLIC (phase 4); now that projected
-    # rows exist the board join exposes them. Read it once to prove the publish surface is live.
-    await directional_board(store, board_kind=BoardKind.OFFICIAL_BENCHMARK)
+    # Phase 12 — publish_gate (MAJOR 1/3): a REAL fail-closed predicate over the finished board, not a
+    # discarded read. Enforces the exact official identity set, per-agent topology (runs == every league
+    # fixture), a nonzero scored-action count, a numeric pooled CLV, all-replay provenance, AND exactly
+    # the 2 fixture-bound ledgered+finalized competitions — so the seed can NEVER exit success on an
+    # incomplete or drifted Official Replay League (AC-1 can never be false while the seed reports 0).
+    await _assert_publish_gate(store, competition_ledger)
 
     projected_rows = await store.list_projected_rows()
     return SeedResult(
         seed_revision=seed_revision,
         public_agent_ids=[defn.public_agent_id for defn in OFFICIAL_AGENTS],
         instance_ids=[instances_ledger[defn.public_agent_id] for defn in OFFICIAL_AGENTS],
-        competition_ids=list(competition_ledger),
+        competition_ids=competition_ids,
         run_ids=run_ids,
         projected_row_count=len(projected_rows),
     )
 
 
 async def _persist_ledger(
-    store: Store, seed_revision: str, instances: dict[str, str], competitions: list[str]
+    store: Store, seed_revision: str, instances: dict[str, str], competitions: dict[str, str]
 ) -> None:
-    """Write the seed ledger (created ids) durably, keyed by ``seed_revision`` (re-run reuse source)."""
-    state: dict[str, Any] = {"instances": dict(instances), "competitions": list(competitions)}
+    """Write the seed ledger (created ids + reproducibility manifest) durably, keyed by ``seed_revision``.
+
+    ``competitions`` is FIXTURE-KEYED (``str(fixture_id) -> competition_id``) so each fixture slot is
+    independently recoverable (MAJOR 1). EVERY ledger write also carries the current :func:`_seed_manifest`
+    so a resume can validate the seed definition has not drifted (MAJOR 2).
+    """
+    state: dict[str, Any] = {
+        "instances": dict(instances),
+        "competitions": dict(competitions),
+        "manifest": _seed_manifest(),
+    }
     await store.persist_seed_state(seed_revision, state)
+
+
+async def _assert_publish_gate(store: Store, competitions: dict[str, str]) -> None:
+    """Fail-closed publish predicate (MAJOR 1/3): refuse an incomplete/drifted Official Replay League.
+
+    Reads the finished :attr:`BoardKind.OFFICIAL_BENCHMARK` board and enforces, raising
+    :class:`SeedError` on ANY violation:
+
+    * exactly the two ledgered+finalized fixture-bound competitions;
+    * the board's official id set equals the pinned official public ids;
+    * every row pooled ``runs == len(LEAGUE_FIXTURES)`` (both league runs present);
+    * every row's scored ``action_count`` is a positive int (the agent genuinely acted);
+    * every row's pooled ``avg_clv_bps`` is numeric (never a ``None`` hole); and
+    * every row's summarized ``source_mode`` is ``"all-replay"`` (replay provenance is load-bearing).
+
+    Args:
+        store: The durable store to read the board + competitions from.
+        competitions: The fixture-keyed competition ledger (``str(fixture_id) -> competition_id``).
+
+    Raises:
+        SeedError: On any incomplete/drifted publish surface (so F1 gets a nonzero exit).
+    """
+    expected_keys = {str(f) for f in LEAGUE_FIXTURES}
+    if set(competitions) != expected_keys:
+        raise SeedError(
+            f"publish gate: ledgered competition fixtures {sorted(competitions)} != league fixtures "
+            f"{sorted(expected_keys)}"
+        )
+    for fixture_id in LEAGUE_FIXTURES:
+        cid = competitions[str(fixture_id)]
+        competition = await store.get_competition(cid)
+        if competition.status is not CompetitionStatus.FINALIZED:
+            raise SeedError(
+                f"publish gate: competition {cid!r} for fixture {fixture_id} is {competition.status} "
+                f"(not FINALIZED)"
+            )
+
+    board = await directional_board(store, board_kind=BoardKind.OFFICIAL_BENCHMARK)
+    expected_ids = {defn.public_agent_id for defn in OFFICIAL_AGENTS}
+    got_ids = {row["public_agent_id"] for row in board}
+    if got_ids != expected_ids:
+        raise SeedError(f"publish gate: official board ids {sorted(got_ids)} != {sorted(expected_ids)}")
+    for row in board:
+        pid = row["public_agent_id"]
+        runs = row["runs"]
+        if runs != len(LEAGUE_FIXTURES):
+            raise SeedError(f"publish gate: {pid} runs={runs} != {len(LEAGUE_FIXTURES)}")
+        action_count = row.get("action_count")
+        if not (isinstance(action_count, int) and action_count > 0):
+            raise SeedError(f"publish gate: {pid} action_count={action_count} (must be a positive int)")
+        if not isinstance(row.get("avg_clv_bps"), (int, float)):
+            raise SeedError(f"publish gate: {pid} avg_clv_bps not numeric ({row.get('avg_clv_bps')})")
+        if row.get("source_mode") != "all-replay":
+            raise SeedError(f"publish gate: {pid} source_mode={row.get('source_mode')} != all-replay")
 
 
 async def _reconstruct_bindings(

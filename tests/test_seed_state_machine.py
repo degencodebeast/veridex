@@ -24,6 +24,7 @@ The five load-bearing properties (one test each):
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import os
 from datetime import UTC, datetime
 from typing import Any
@@ -38,6 +39,7 @@ from veridex.deploy.instance import AgentInstance, DeployStatus
 from veridex.public_agent import OperatorClass, Visibility
 from veridex.public_projection import BoardKind, PublicBinding, directional_board
 from veridex.seed.official_replay_league import (
+    LEAGUE_FIXTURES,
     OFFICIAL_AGENTS,
     SeedError,
     run_seed,
@@ -69,6 +71,35 @@ async def _drain(app: Any) -> None:
         task.cancel()
     if tasks:
         await asyncio.gather(*tasks, return_exceptions=True)
+
+
+def _app_on(store: InMemoryStore) -> Any:
+    """A FRESH app over the SAME store — the way a re-run/restart drives the durable seed ledger."""
+    return create_app(store=store, settings=_dev_settings())
+
+
+async def _assert_two_fixture_topology(
+    store: InMemoryStore, seed_revision: str, result: Any
+) -> None:
+    """The resumed league is EXACTLY the two fixture-bound, ledgered+finalized competitions."""
+    ledger = await store.get_seed_state(seed_revision)
+    assert ledger is not None
+    comps = ledger["competitions"]
+    assert set(comps) == {str(f) for f in LEAGUE_FIXTURES}  # fixture-keyed ledger, both slots present
+    assert result.competition_ids == [comps[str(f)] for f in LEAGUE_FIXTURES]  # fixture-ordered
+    assert len(result.competition_ids) == 2
+    for cid in comps.values():
+        competition = await store.get_competition(cid)
+        assert competition.status is CompetitionStatus.FINALIZED
+
+
+async def _assert_board_two_runs(store: InMemoryStore) -> None:
+    """Both official rows pool BOTH league runs (runs == 2) on the resumed board."""
+    board = await directional_board(store, board_kind=BoardKind.OFFICIAL_BENCHMARK)
+    mine = _officials_on_board(board)
+    assert set(mine) == _OFFICIAL_IDS
+    for row in mine.values():
+        assert row["runs"] == 2
 
 
 # =====================================================================================
@@ -253,52 +284,213 @@ async def test_projection_bindings_reconstructable_from_store_state() -> None:
 
 
 # =====================================================================================
-# Crash-recovery symmetry — a crash between the two competition creations must NOT
-# double-create on re-run (per-object ledger persist, symmetric with the instance path).
+# MAJOR 1 — fixture-keyed competition ledger: a crash between the two competition creations
+# resumes to EXACTLY the two fixture-bound finalized competitions (board runs == 2), never the
+# old all-or-nothing skip that finalized ONE. Two boundaries, each RED on the flat-list ledger.
 # =====================================================================================
 
 
-async def test_run_seed_recovers_after_crash_between_competition_creations() -> None:
-    """A crash after the first competition is durably ledgered (before the second is) must NOT
-    make a re-run re-create BOTH competitions — the ledger persists PER-OBJECT so exactly 2 exist.
+async def test_crash_recovery_boundary_a_resumes_two_fixture_topology(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Boundary A — crash AFTER the first fixture's competition is durably ledgered, BEFORE the
+    second is created.
 
-    Injection: wrap ``_persist_ledger`` so the ledger write for the state that carries BOTH
-    competition ids raises (simulating a crash right when the second competition would be durably
-    ledgered, AFTER the first is). Pre-fix (single persist AFTER the whole creation loop) the crash
-    leaves ``competitions == []`` durably, so a re-run re-creates BOTH → 4 total (RED). Post-fix
-    (per-object persist inside the loop) the first competition is durably ledgered before the crash,
-    so a re-run reuses it and does not re-create both → exactly 2 (GREEN).
+    Injection: wrap ``_persist_ledger`` so the FIRST fixture's write commits, THEN it raises — the
+    exact "first ledgered, second not yet created" window. Pre-fix (flat ``list`` ledger guarded by
+    ``if not competition_ledger``) the resume sees a NON-empty list, skips ALL creation, and finalizes
+    ONLY the first competition → board runs [1, 1] (RED). Post-fix (fixture-keyed) the resume creates
+    ONLY the missing second fixture → exactly 2 finalized fixture-bound competitions, board runs == 2.
     """
-    import pytest as _pytest
-
     app, store = _build()
-    original_persist = seed_mod._persist_ledger
+    original = seed_mod._persist_ledger
 
-    async def _crashing_persist(
-        store: Any, seed_revision: str, instances: Any, competitions: list[str]
+    async def _commit_then_crash(
+        store_: Any, seed_revision: str, instances: Any, competitions: Any
     ) -> None:
-        # Crash exactly when the ledger write carries BOTH competition ids — i.e. after the first
-        # competition has been (per-object) ledgered and the second has just been created.
-        if len(competitions) == 2:
-            raise RuntimeError("injected crash before the second competition is durably ledgered")
-        await original_persist(store, seed_revision, instances, competitions)
+        await original(store_, seed_revision, instances, competitions)
+        if len(competitions) == 1:  # first fixture durably ledgered — crash before the second create
+            raise RuntimeError("injected crash after the first fixture is ledgered")
 
+    monkeypatch.setattr(seed_mod, "_persist_ledger", _commit_then_crash)
     try:
-        seed_mod._persist_ledger = _crashing_persist  # type: ignore[assignment]
-        with _pytest.raises(RuntimeError):
-            await run_seed(app, store, seed_revision="rev-crash")
+        with pytest.raises(RuntimeError):
+            await run_seed(app, store, seed_revision="rev-a")
     finally:
-        seed_mod._persist_ledger = original_persist  # type: ignore[assignment]
+        monkeypatch.setattr(seed_mod, "_persist_ledger", original)
         await _drain(app)
 
-    # Re-run with the crash cleared and the SAME seed_revision → must NOT double-create.
+    app2 = _app_on(store)
     try:
-        await run_seed(app, store, seed_revision="rev-crash")
+        result = await run_seed(app2, store, seed_revision="rev-a")
+    finally:
+        await _drain(app2)
+
+    await _assert_two_fixture_topology(store, "rev-a", result)
+    await _assert_board_two_runs(store)
+
+
+async def test_crash_recovery_boundary_b_second_created_but_unledgered(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Boundary B — crash AFTER the second fixture's competition is CREATED (the create POST returned)
+    but BEFORE its ledger write.
+
+    Injection: wrap ``_persist_ledger`` so the two-fixture write raises BEFORE committing — the second
+    competition exists in the store but is never ledgered (an orphan DRAFT). Pre-fix the resume off the
+    one-entry flat list finalizes ONLY the first competition (RED). Post-fix the resume creates the
+    correct missing second fixture; the LEDGERED+FINALIZED set is EXACTLY the two fixtures (an orphan
+    DRAFT may remain, and is harmless), board runs == 2.
+    """
+    app, store = _build()
+    original = seed_mod._persist_ledger
+
+    async def _crash_before_second_write(
+        store_: Any, seed_revision: str, instances: Any, competitions: Any
+    ) -> None:
+        if len(competitions) == 2:  # second created, its ledger write about to happen — crash first
+            raise RuntimeError("injected crash before the second fixture's ledger write")
+        await original(store_, seed_revision, instances, competitions)
+
+    monkeypatch.setattr(seed_mod, "_persist_ledger", _crash_before_second_write)
+    try:
+        with pytest.raises(RuntimeError):
+            await run_seed(app, store, seed_revision="rev-b")
+    finally:
+        monkeypatch.setattr(seed_mod, "_persist_ledger", original)
+        await _drain(app)
+
+    app2 = _app_on(store)
+    try:
+        result = await run_seed(app2, store, seed_revision="rev-b")
+    finally:
+        await _drain(app2)
+
+    # The ledgered+finalized topology is EXACTLY the two fixture slots (an unledgered orphan DRAFT
+    # competition may also exist in the store — the orphan policy — but it is never in the ledger).
+    await _assert_two_fixture_topology(store, "rev-b", result)
+    await _assert_board_two_runs(store)
+    ledger = await store.get_seed_state("rev-b")
+    assert ledger is not None
+    assert set(ledger["competitions"]) == {str(f) for f in LEAGUE_FIXTURES}
+
+
+# =====================================================================================
+# MAJOR 2 — reproducibility/identity drift is ENFORCED on resume via a persisted manifest.
+# A same-seed_revision re-run whose pinned config or official identity set changed FAILS CLOSED.
+# =====================================================================================
+
+
+async def test_run_seed_fails_closed_on_config_drift(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A resume whose pinned canonical config drifted (config_hash changes) must FAIL CLOSED.
+
+    Pre-fix ``run_seed`` never persisted/validated a manifest, so it silently reused the old deployed
+    config (RED — no raise). Post-fix the ledgered manifest no longer matches the freshly-computed one
+    → :class:`SeedError` (require a NEW --seed-revision).
+    """
+    app, store = _build()
+    try:
+        await run_seed(app, store, seed_revision="drift-cfg")
     finally:
         await _drain(app)
 
-    competitions = await store.list_competitions()
-    assert len(competitions) == 2  # NOT 3-4: the first was ledgered+reused across the crash.
+    # Mutate the pinned replay fixture the canonical config selects → both agents' config_hash (and
+    # the seed_definition_hash) change → the persisted manifest no longer matches the current one.
+    monkeypatch.setattr(seed_mod, "_REPLAY_FIXTURE_ID", 90000001)
+
+    app2 = _app_on(store)
+    try:
+        with pytest.raises(SeedError):
+            await run_seed(app2, store, seed_revision="drift-cfg")
+    finally:
+        await _drain(app2)
+
+
+async def test_run_seed_fails_closed_on_identity_drift(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A resume whose official identity set changed must FAIL CLOSED and NOT mint a third identity.
+
+    Pre-fix ``run_seed`` relinked the old instance to the renamed public id while retaining the old
+    public/projected rows → a THIRD official board identity (Codex repro), no raise (RED). Post-fix the
+    ledgered identity manifest no longer matches → :class:`SeedError` BEFORE any public-agent upsert, so
+    the board never gains a third identity.
+    """
+    app, store = _build()
+    try:
+        await run_seed(app, store, seed_revision="drift-id")
+    finally:
+        await _drain(app)
+
+    # Rename one official public identity so the manifest's identity set differs.
+    drifted = list(OFFICIAL_AGENTS)
+    drifted[0] = dataclasses.replace(drifted[0], public_agent_id="agt_official_baseline_v2")
+    monkeypatch.setattr(seed_mod, "OFFICIAL_AGENTS", drifted)
+
+    app2 = _app_on(store)
+    try:
+        with pytest.raises(SeedError):
+            await run_seed(app2, store, seed_revision="drift-id")
+    finally:
+        await _drain(app2)
+
+    # Fail-closed BEFORE phase-4 upsert: the renamed identity never reaches the official board.
+    board = await directional_board(store, board_kind=BoardKind.OFFICIAL_BENCHMARK)
+    assert {row["public_agent_id"] for row in board} == _OFFICIAL_IDS
+
+
+# =====================================================================================
+# MAJOR 3 — publish_gate is a REAL fail-closed predicate: a broken publish surface RAISES.
+# =====================================================================================
+
+
+async def test_publish_gate_rejects_partial_projection() -> None:
+    """Dropping one official's projected rows (board loses that identity) makes the publish gate RAISE.
+
+    Pre-fix phase 12 discarded the board read, so ``run_seed`` returned success with a one-agent board
+    (RED — no predicate existed). Post-fix the predicate requires the exact official id set → raises.
+    """
+    app, store = _build()
+    try:
+        await run_seed(app, store, seed_revision="pg-partial")
+    finally:
+        await _drain(app)
+
+    ledger = await store.get_seed_state("pg-partial")
+    assert ledger is not None
+    competitions = ledger["competitions"]
+
+    baseline_pid = OFFICIAL_AGENTS[0].public_agent_id
+    # Drop ALL of one official's projected rows → the official board loses that identity entirely.
+    store._projected_rows = {
+        key: row for key, row in store._projected_rows.items() if key[1] != baseline_pid
+    }
+
+    with pytest.raises(SeedError):
+        await seed_mod._assert_publish_gate(store, competitions)
+
+
+async def test_publish_gate_rejects_missing_run() -> None:
+    """An official present on the board but with only ONE pooled run (runs != league fixtures) RAISES.
+
+    Post-fix the predicate requires ``runs == len(LEAGUE_FIXTURES)`` for every row; dropping one of an
+    agent's two per-run projected rows leaves it at runs == 1 → raise (a partial league must not ship).
+    """
+    app, store = _build()
+    try:
+        await run_seed(app, store, seed_revision="pg-missing")
+    finally:
+        await _drain(app)
+
+    ledger = await store.get_seed_state("pg-missing")
+    assert ledger is not None
+    competitions = ledger["competitions"]
+
+    baseline_pid = OFFICIAL_AGENTS[0].public_agent_id
+    # Drop exactly ONE of the two per-run rows for one official → runs == 1 (!= the 2 league fixtures).
+    drop_key = next(key for key in store._projected_rows if key[1] == baseline_pid)
+    del store._projected_rows[drop_key]
+
+    with pytest.raises(SeedError):
+        await seed_mod._assert_publish_gate(store, competitions)
 
 
 # =====================================================================================
