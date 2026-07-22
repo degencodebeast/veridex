@@ -106,17 +106,17 @@ export const ALERTS: OpsAlert[] = [
   { id: 'al2', kind: 'hold', agent_id: 'byoa_hermes', message: 'HUMAN APPROVAL HOLD · stake ≥ 250', ts: 1719655400000 },
 ];
 
-const fraBra: OddsUpdate[] = [
-  { fixture_id: 18172280, message_id: 'm1', ts: 1, in_running: false, market_family: '1X2_PARTICIPANT_RESULT', market_parameters: null, price_names: ['FRA', 'Draw', 'BRA'], prices: [1500, 3500, 6000], pct: ['66.667', '28.571', '16.667'] },
-  { fixture_id: 18172280, message_id: 'm2', ts: 2, in_running: false, market_family: '1X2_PARTICIPANT_RESULT', market_parameters: null, price_names: ['FRA', 'Draw', 'BRA'], prices: [1472, 3550, 6100], pct: ['67.935', '28.169', '16.393'] },
+const nldMar: OddsUpdate[] = [
+  { fixture_id: 18172280, message_id: 'm1', ts: 1, in_running: false, market_family: '1X2_PARTICIPANT_RESULT', market_parameters: null, price_names: ['NLD', 'Draw', 'MAR'], prices: [1500, 3500, 6000], pct: ['66.667', '28.571', '16.667'] },
+  { fixture_id: 18172280, message_id: 'm2', ts: 2, in_running: false, market_family: '1X2_PARTICIPANT_RESULT', market_parameters: null, price_names: ['NLD', 'Draw', 'MAR'], prices: [1472, 3550, 6100], pct: ['67.935', '28.169', '16.393'] },
   { fixture_id: 18172280, message_id: 'm3', ts: 3, in_running: false, market_family: 'OVERUNDER_PARTICIPANT_GOALS', market_parameters: 'line=2.5', price_names: ['Over', 'Under'], prices: [1910, 1980], pct: ['52.356', '50.505'] },
-  { fixture_id: 18172280, message_id: 'm4', ts: 4, in_running: false, market_family: 'ASIANHANDICAP_PARTICIPANT_GOALS', market_parameters: 'line=-0.25', price_names: ['FRA', 'BRA'], prices: [1880, 2010], pct: ['53.191', '49.751'] },
+  { fixture_id: 18172280, message_id: 'm4', ts: 4, in_running: false, market_family: 'ASIANHANDICAP_PARTICIPANT_GOALS', market_parameters: 'line=-0.25', price_names: ['NLD', 'MAR'], prices: [1880, 2010], pct: ['53.191', '49.751'] },
 ];
 
-export const ODDS_UPDATES: Record<number, OddsUpdate[]> = { 18172280: fraBra };
+export const ODDS_UPDATES: Record<number, OddsUpdate[]> = { 18172280: nldMar };
 
 export const FIXTURES: FixtureSummary[] = [
-  { fixture_id: 18172280, competition: 'World Cup', participant1: 'FRA', participant2: 'BRA', start_time: '2026-06-29T18:00:00Z', in_running: true },
+  { fixture_id: 18172280, competition: 'World Cup', participant1: 'NLD', participant2: 'MAR', start_time: '2026-06-29T18:00:00Z', in_running: true },
   { fixture_id: 18172281, competition: 'World Cup', participant1: 'ARG', participant2: 'GER', start_time: '2026-06-30T18:00:00Z', in_running: false },
 ];
 

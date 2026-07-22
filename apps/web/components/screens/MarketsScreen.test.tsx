@@ -28,9 +28,9 @@ function renderMarkets(props: Partial<ComponentProps<typeof MarketsScreen>> = {}
 // (the honest CON-040 branch). Covers all three soccer families.
 const IN_RUNNING: Record<number, OddsUpdate[]> = {
   18172280: [
-    { fixture_id: 18172280, message_id: 'a', ts: 1, in_running: true, market_family: '1X2_PARTICIPANT_RESULT', market_parameters: null, price_names: ['FRA', 'Draw', 'BRA'], prices: [1472, 3550, 6100], pct: ['67.935', '28.169', '16.393'] },
+    { fixture_id: 18172280, message_id: 'a', ts: 1, in_running: true, market_family: '1X2_PARTICIPANT_RESULT', market_parameters: null, price_names: ['NLD', 'Draw', 'MAR'], prices: [1472, 3550, 6100], pct: ['67.935', '28.169', '16.393'] },
     { fixture_id: 18172280, message_id: 'b', ts: 2, in_running: true, market_family: 'OVERUNDER_PARTICIPANT_GOALS', market_parameters: 'line=2.5', price_names: ['Over', 'Under'], prices: [1910, 1980], pct: ['52.356', '50.505'] },
-    { fixture_id: 18172280, message_id: 'c', ts: 3, in_running: true, market_family: 'ASIANHANDICAP_PARTICIPANT_GOALS', market_parameters: 'line=-0.25', price_names: ['FRA', 'BRA'], prices: [1880, 2010], pct: ['53.191', '49.751'] },
+    { fixture_id: 18172280, message_id: 'c', ts: 3, in_running: true, market_family: 'ASIANHANDICAP_PARTICIPANT_GOALS', market_parameters: 'line=-0.25', price_names: ['NLD', 'MAR'], prices: [1880, 2010], pct: ['53.191', '49.751'] },
   ],
 };
 
@@ -99,7 +99,7 @@ describe('MarketsScreen (REQ-016 / AC-010/011 / REQ-042 / CON-040)', () => {
     // pre-match update (in_running:false) → closing reconstructable to a decimal value.
     const preMatch: Record<number, OddsUpdate[]> = {
       18172280: [
-        { fixture_id: 18172280, message_id: 'p', ts: 1, in_running: false, market_family: '1X2_PARTICIPANT_RESULT', market_parameters: null, price_names: ['FRA', 'Draw', 'BRA'], prices: [1500, 3500, 6000], pct: ['66.667', '28.571', '16.667'] },
+        { fixture_id: 18172280, message_id: 'p', ts: 1, in_running: false, market_family: '1X2_PARTICIPANT_RESULT', market_parameters: null, price_names: ['NLD', 'Draw', 'MAR'], prices: [1500, 3500, 6000], pct: ['66.667', '28.571', '16.667'] },
       ],
     };
     renderMarkets({ oddsByFixture: preMatch });
@@ -124,9 +124,9 @@ describe('MarketsScreen V5 (default-select · right rail · EDGE/AGENTS honesty)
   });
 
   it('MATCH STATE rail shows the match-phase (IN-PLAY) — SEPARATE from source_mode, no source vocab', () => {
-    renderMarkets(); // default fixture FRA v BRA is in_running → IN-PLAY
+    renderMarkets(); // default fixture NLD v MAR is in_running → IN-PLAY
     const rail = screen.getByTestId('rail-match-state');
-    expect(rail).toHaveTextContent(/FRA/);
+    expect(rail).toHaveTextContent(/NLD/);
     expect(rail).toHaveTextContent(/World Cup/);
     expect(rail).toHaveTextContent(/in-play/i);   // match phase (the fixture axis)
     // match-phase is NOT a data-source claim — the source axis lives in the strip/status bar.

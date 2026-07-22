@@ -31,7 +31,7 @@ export const STRATEGY_TEMPLATES: StrategyTemplate[] = [
   { id: 'momentum', label: 'Momentum', archetype: 'momentum', defaultMode: 'llm', complexity: 'standard', blurb: 'Follow in-play momentum; LLM proposes, the law recomputes every action.' },
   { id: 'contrarian_fade', label: 'Contrarian/Fade', archetype: 'contrarian', defaultMode: 'llm', complexity: 'standard', blurb: 'Fade overreactions; the LLM proposes FADE/WIDEN actions, the law recomputes every action.' },
   { id: 'arb_spread', label: 'Arb/Spread', archetype: 'value_clv', defaultMode: 'numeric', complexity: 'heavy-extension', blurb: 'Cross-market consistency (1X2 vs O/U). Heavy extension — multi-market wiring is Phase-3.' },
-  { id: 'quoteguard_mm', label: 'QuoteGuard/MM', archetype: 'baseline', defaultMode: 'rule', complexity: 'heavy-extension', deployable: true, blurb: 'Market-making / quote-guard rules with inventory + two-sided quoting. Runs the quoteguard-mm family against a SIMULATED synthetic replay of a canned MM-mechanism fixture (not live TxLINE, not a real match) — dry-run only, live-money execution disabled.' },
+  { id: 'quoteguard_mm', label: 'QuoteGuard/MM', archetype: 'baseline', defaultMode: 'rule', complexity: 'heavy-extension', deployable: true, blurb: 'Market-making / quote-guard rules with inventory + two-sided quoting. Runs the quoteguard-mm family in replay + dry-run against a recorded MM tape — live-money execution disabled.' },
   // F-1: det-Drift is the real `cumulative-drift` detector — a DETERMINISTIC trend/drift strategy on
   // the de-vigged consensus (no LLM). It reuses the `momentum` archetype for mode coupling but its
   // strategy is fixed by the template id (mirrors how quoteguard_mm reuses `baseline`), so a manual

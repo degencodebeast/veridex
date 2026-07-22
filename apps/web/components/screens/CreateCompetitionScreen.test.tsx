@@ -297,12 +297,12 @@ describe('CreateCompetitionScreen V5 (wizard density · honest pins)', () => {
     const api = okApi();
     render(<CreateCompetitionScreen connected loadInstances={vi.fn().mockResolvedValue(TWO_INSTANCES)} launchApi={api} />);
     const summary = screen.getByTestId('pinned-config');
-    expect(within(summary).getByTestId('summary-market-scope')).toHaveTextContent(/FRA v BRA/i);
+    expect(within(summary).getByTestId('summary-market-scope')).toHaveTextContent(/NLD v MAR/i);
     expect(within(summary).getByTestId('summary-scoring-window')).toHaveTextContent(/full match/i);
     await selectBothInstances(user);
     await user.click(screen.getByTestId('launch-button'));
     await waitFor(() => expect(api.create).toHaveBeenCalledWith(expect.objectContaining({
-      market_scope: expect.stringMatching(/FRA v BRA/i), scoring_window: null,
+      market_scope: expect.stringMatching(/NLD v MAR/i), scoring_window: null,
     })));
     vi.unstubAllEnvs();
   });
@@ -352,19 +352,19 @@ describe('CreateCompetitionScreen — fixture picker is mock-gated (T-2, no fixt
     render(<CreateCompetitionScreen />);
     // No selectable-match dropdown seeded from the demo FIXTURES…
     expect(screen.queryByTestId('fixture-select')).toBeNull();
-    expect(screen.queryByRole('option', { name: /FRA v BRA/i })).toBeNull();
+    expect(screen.queryByRole('option', { name: /NLD v MAR/i })).toBeNull();
     expect(screen.queryByRole('option', { name: /ARG v GER/i })).toBeNull();
     // …and an honest empty note in its place.
     expect(screen.getByTestId('fixture-empty')).toHaveTextContent(/no matches available|connect a fixtures source/i);
     // The pinned market_scope carries no fabricated fixture off-mock.
-    expect(within(screen.getByTestId('pinned-config')).getByTestId('summary-market-scope')).not.toHaveTextContent(/FRA v BRA/i);
+    expect(within(screen.getByTestId('pinned-config')).getByTestId('summary-market-scope')).not.toHaveTextContent(/NLD v MAR/i);
   });
 
   it('mock ON → the DEMO FIXTURES sample seeds the picker (labeled demo data by the MockBanner)', () => {
     vi.stubEnv('NEXT_PUBLIC_VERIDEX_MOCK', '1');
     render(<CreateCompetitionScreen />);
     const select = screen.getByTestId('fixture-select');
-    expect(within(select).getByRole('option', { name: /FRA v BRA/i })).toBeInTheDocument();
+    expect(within(select).getByRole('option', { name: /NLD v MAR/i })).toBeInTheDocument();
     expect(within(select).getByRole('option', { name: /ARG v GER/i })).toBeInTheDocument();
     expect(screen.queryByTestId('fixture-empty')).toBeNull();
     vi.unstubAllEnvs();
