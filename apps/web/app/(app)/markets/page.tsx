@@ -49,13 +49,13 @@ export default function MarketsPage() {
           packs.flatMap((pack) =>
             pack.fixtureMetadata.map((m): FixtureSummary => ({
               fixture_id: m.fixture_id,
+              pack_id: pack.packId,
               competition: pack.packId,
               participant1: m.home_team ?? `id ${m.fixture_id}`,
               participant2: m.away_team ?? '—',
               // kickoff_ts is epoch SECONDS on the wire → ISO string; absent ⇒ '' (honest, never faked).
               start_time: m.kickoff_ts != null ? new Date(m.kickoff_ts * 1000).toISOString() : '',
               in_running: false, // replay catalog — never in-running
-              finished: true, // sealed replay of a COMPLETED match → renders FINAL, not PENDING
             })),
           ),
         );

@@ -116,8 +116,8 @@ const nldMar: OddsUpdate[] = [
 export const ODDS_UPDATES: Record<number, OddsUpdate[]> = { 18172280: nldMar };
 
 export const FIXTURES: FixtureSummary[] = [
-  { fixture_id: 18172280, competition: 'World Cup', participant1: 'NLD', participant2: 'MAR', start_time: '2026-06-29T18:00:00Z', in_running: true },
-  { fixture_id: 18172281, competition: 'World Cup', participant1: 'ARG', participant2: 'GER', start_time: '2026-06-30T18:00:00Z', in_running: false },
+  { fixture_id: 18172280, pack_id: 'demo_pack_real', competition: 'World Cup', participant1: 'NLD', participant2: 'MAR', start_time: '2026-06-29T18:00:00Z', in_running: true },
+  { fixture_id: 18172281, pack_id: 'demo_pack_real', competition: 'World Cup', participant1: 'ARG', participant2: 'GER', start_time: '2026-06-30T18:00:00Z', in_running: false },
 ];
 
 // WD-4 feed-health DEMO default for the Markets right rail — honest replay/not-live telemetry

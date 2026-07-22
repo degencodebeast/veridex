@@ -213,13 +213,12 @@ export interface MarketFamily {
 
 export interface FixtureSummary {
   fixture_id: number;
+  pack_id: string;
   competition: string;
   participant1: string;
   participant2: string;
   start_time: string;
   in_running: boolean;
-  // A completed match (e.g. a sealed replay recording of a finished fixture) → renders FINAL, not PENDING.
-  finished?: boolean;
 }
 
 export interface SportNode {

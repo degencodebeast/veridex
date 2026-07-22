@@ -93,7 +93,7 @@ export function MarketsScreen({
                         className={`${styles.fixture} ${f.fixture_id === fixtureId ? styles.activeFixture : ''}`}
                         onClick={() => setFixtureId(f.fixture_id)}
                       >
-                        {f.participant1} v {f.participant2} {f.finished ? <Badge variant="final" /> : f.in_running ? <Badge variant="live" /> : <Badge variant="pending" />}
+                        {f.participant1} v {f.participant2} {f.in_running ? <Badge variant="live" /> : <span className="mono">CAPTURED REPLAY</span>}
                       </button>
                     </li>
                   ))}
@@ -112,7 +112,7 @@ export function MarketsScreen({
                 <Badge variant={sourceMode === 'live' ? 'live' : 'replay'} />
                 <span className={`${styles.feed} mono`}>SOURCE {sourceMode} · TxLINE Stable Price consensus · de-margined</span>
                 <Link
-                  href={`/competitions/create?fixture=${fixtureId}`}
+                  href={`/competitions/create?pack_id=${selected?.pack_id ?? ''}&fixture_id=${fixtureId}`}
                   data-testid="launch-competition"
                   className={styles.launch}
                 >
@@ -203,7 +203,7 @@ export function MarketsScreen({
               <div className={styles.railRow}>{selected.participant1} v {selected.participant2}</div>
               <div className={`${styles.railMeta} mono`}>{selected.competition}</div>
               {/* match-phase (the fixture axis) — NOT a data-source claim (the source lives in the strip/bar) */}
-              <div className={`${styles.phase} mono`}>{selected.finished ? 'FINISHED' : selected.in_running ? 'IN-PLAY' : 'PRE-MATCH'}</div>
+              <div className={`${styles.phase} mono`}>{selected.in_running ? 'IN-PLAY' : 'CAPTURED REPLAY'}</div>
               <div className={`${styles.railMeta} mono`}>kickoff {selected.start_time.slice(0, 10)}</div>
               {/* in-play score/minute are only in the Cockpit WS stream → honest — here */}
               <div className={`${styles.railMeta} mono`}>score — · minute —</div>

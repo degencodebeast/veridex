@@ -226,9 +226,9 @@ describe('MarketsScreen V5 (default-select · right rail · EDGE/AGENTS honesty)
     expect(within(fam).queryByText(/Match Result/i)).toBeNull();
   });
 
-  it('LAUNCH COMPETITION pre-scopes the create flow to the selected fixture', () => {
+  it('LAUNCH COMPETITION pre-scopes the create flow to the selected fixture (pack_id + fixture_id)', () => {
     renderMarkets();
-    expect(screen.getByTestId('launch-competition')).toHaveAttribute('href', '/competitions/create?fixture=18172280');
+    expect(screen.getByTestId('launch-competition')).toHaveAttribute('href', '/competitions/create?pack_id=demo_pack_real&fixture_id=18172280');
   });
 });
 
