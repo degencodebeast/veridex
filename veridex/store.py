@@ -840,6 +840,29 @@ class Store(Protocol):
         """
         ...
 
+    # --- projected directional-board rows (Official Replay League B2) ---
+
+    async def persist_projected_rows(self, rows: list[dict[str, Any]]) -> None:
+        """UPSERT projected public leaderboard-input rows, keyed by ``(run_id, public_agent_id)``.
+
+        These are the DERIVED rows :func:`~veridex.public_projection.project_public_rows` emits (one
+        per agent per run). Re-persisting the same run's rows OVERWRITES, never duplicates, so the
+        pooled board can never double-count a re-projected run.
+
+        Args:
+            rows: Projected rows; each MUST carry ``run_id`` and ``public_agent_id`` plus the
+                score payload needed to reconstruct a leaderboard-input row.
+        """
+        ...
+
+    async def list_projected_rows(self) -> list[dict[str, Any]]:
+        """Return every stored projected row (each a leaderboard-input dict, any order).
+
+        Returns:
+            All persisted projected rows, with ``agent_id`` == the public id (as B1 emitted).
+        """
+        ...
+
     async def link_instance_public_agent(self, instance_id: str, public_agent_id: str) -> None:
         """Durably link a deployed instance to its public-agent identity.
 
@@ -1123,6 +1146,9 @@ class InMemoryStore:
         # link — the in-code mirror of the Postgres public_agents table + agent_instances FK column.
         self._public_agents: dict[str, PublicAgent] = {}
         self._instance_public_agent: dict[str, str] = {}
+        # Durable projected directional-board rows (B2), keyed by (run_id, public_agent_id) — the
+        # in-code mirror of the Postgres projected_rows UNIQUE(run_id, public_agent_id) UPSERT.
+        self._projected_rows: dict[tuple[str, str], dict[str, Any]] = {}
         # Append-only deployment-attempt ledger, keyed by (operator_id, idempotency_key) — the
         # in-code mirror of the Postgres UNIQUE(operator_id, idempotency_key) claim (I-3).
         self._deployment_attempts: dict[tuple[str, str], DeploymentAttempt] = {}
@@ -1724,6 +1750,22 @@ class InMemoryStore:
             update={"display_name": display_name, "updated_at": updated_at, "version": stored.version + 1}
         )
 
+    # --- projected directional-board rows (Official Replay League B2) ---
+
+    async def persist_projected_rows(self, rows: list[dict[str, Any]]) -> None:
+        """UPSERT deep copies of projected rows keyed by ``(run_id, public_agent_id)``.
+
+        Args:
+            rows: Projected rows, each carrying ``run_id`` and ``public_agent_id``.
+        """
+        for row in rows:
+            key = (row["run_id"], row["public_agent_id"])
+            self._projected_rows[key] = copy.deepcopy(row)
+
+    async def list_projected_rows(self) -> list[dict[str, Any]]:
+        """Return deep copies of every stored projected row (any order)."""
+        return [copy.deepcopy(row) for row in self._projected_rows.values()]
+
     async def link_instance_public_agent(self, instance_id: str, public_agent_id: str) -> None:
         """Record the durable instance→public-agent link.
 
@@ -2131,6 +2173,22 @@ class PostgresStore:
             await cur.execute(
                 "CREATE INDEX IF NOT EXISTS idx_agent_instances_public_agent_id "
                 "ON agent_instances(public_agent_id)"
+            )
+
+            # --- projected directional-board rows (Official Replay League B2) ---
+            # DERIVED rows (from project_public_rows), NOT authoritative identity — so the full
+            # leaderboard-input row is kept as a json blob. The (run_id, public_agent_id) PRIMARY KEY
+            # is a REAL uniqueness constraint: re-persisting a run's rows UPSERTs, never duplicates,
+            # so the pooled board can never double-count a re-projected run.
+            await cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS projected_rows (
+                    run_id TEXT NOT NULL,
+                    public_agent_id TEXT NOT NULL,
+                    payload TEXT NOT NULL,
+                    PRIMARY KEY (run_id, public_agent_id)
+                )
+                """
             )
 
             # --- realized-fill ledger (SAF-002b/c — durable, APPEND-ONLY, fee-inclusive) ---
@@ -3309,6 +3367,45 @@ class PostgresStore:
             updated_at=row[7],
             version=row[8],
         )
+
+    # --- projected directional-board rows (Official Replay League B2) ---
+
+    async def persist_projected_rows(self, rows: list[dict[str, Any]]) -> None:
+        """UPSERT each projected row as a json blob keyed by ``(run_id, public_agent_id)``.
+
+        ``ON CONFLICT (run_id, public_agent_id) DO UPDATE`` makes a re-persist idempotent — the
+        pooled board never double-counts a re-projected run. All SQL is parameterized; psycopg stays
+        lazy. The whole batch commits in one transaction.
+
+        Args:
+            rows: Projected rows, each carrying ``run_id`` and ``public_agent_id``.
+        """
+        conn = await self._connect()
+        try:
+            async with conn.transaction(), conn.cursor() as cur:
+                for row in rows:
+                    await cur.execute(
+                        """
+                        INSERT INTO projected_rows (run_id, public_agent_id, payload)
+                        VALUES (%s, %s, %s)
+                        ON CONFLICT (run_id, public_agent_id) DO UPDATE SET
+                            payload = EXCLUDED.payload
+                        """,
+                        (row["run_id"], row["public_agent_id"], json.dumps(row)),
+                    )
+        finally:
+            await self._release(conn)
+
+    async def list_projected_rows(self) -> list[dict[str, Any]]:
+        """Reconstruct every stored projected row from its json blob (any order)."""
+        conn = await self._connect()
+        try:
+            async with conn.cursor() as cur:
+                await cur.execute("SELECT payload FROM projected_rows")
+                raw = await cur.fetchall()
+        finally:
+            await self._release(conn)
+        return [json.loads(row[0]) for row in raw]
 
     async def set_public_agent_visibility(
         self, public_agent_id: str, visibility: Visibility, *, updated_at: str

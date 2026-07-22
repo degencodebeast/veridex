@@ -17,9 +17,16 @@ silently dropping or guessing the public identity.
 from __future__ import annotations
 
 import copy
-from typing import Any, Literal
+from enum import Enum
+from typing import TYPE_CHECKING, Any, Literal
 
 from pydantic import BaseModel
+
+from veridex.leaderboard import leaderboard
+from veridex.public_agent import OperatorClass, Visibility
+
+if TYPE_CHECKING:
+    from veridex.store import Store
 
 _VALID_SOURCE_MODES = ("replay", "live")
 
@@ -95,3 +102,47 @@ def project_public_rows(
         public_rows.append(public_row)
 
     return public_rows
+
+
+class BoardKind(str, Enum):
+    """Which directional board to read — the OFFICIAL benchmark, or all public agents.
+
+    ``OFFICIAL_BENCHMARK`` keeps only agents whose ``operator_class`` is
+    :attr:`~veridex.public_agent.OperatorClass.OFFICIAL`; ``PUBLIC_AGENTS`` keeps every
+    publicly-visible agent regardless of operator class. Both drop non-public agents.
+    """
+
+    OFFICIAL_BENCHMARK = "official_benchmark"
+    PUBLIC_AGENTS = "public_agents"
+
+
+async def directional_board(store: Store, *, board_kind: BoardKind) -> list[dict[str, Any]]:
+    """Read a directional leaderboard, joining CURRENT public-agent visibility at read time.
+
+    Loads every durable projected row (:meth:`~veridex.store.Store.list_projected_rows`) and, for
+    each, resolves its owning public agent by ``public_agent_id``. A row is DROPPED when its agent
+    is absent or not :attr:`~veridex.public_agent.Visibility.PUBLIC` — visibility is joined LIVE,
+    so flipping an agent private hides it WITHOUT deleting its stored rows. For
+    :attr:`BoardKind.OFFICIAL_BENCHMARK` a row is additionally kept only when its agent's
+    ``operator_class`` is :attr:`~veridex.public_agent.OperatorClass.OFFICIAL`.
+
+    The surviving rows are handed UNCHANGED to :func:`veridex.leaderboard.leaderboard`, which groups
+    on ``agent_id`` (== the public id, as B1 emits) and pools per-agent across runs.
+
+    Args:
+        store: The durable store to read projected rows and public-agent identities from.
+        board_kind: Which board to build — official benchmark only, or all public agents.
+
+    Returns:
+        The aggregated, ranked leaderboard rows for the kept agents (may be empty).
+    """
+    rows = await store.list_projected_rows()
+    kept: list[dict[str, Any]] = []
+    for row in rows:
+        agent = await store.get_public_agent(row["public_agent_id"])
+        if agent is None or agent.visibility is not Visibility.PUBLIC:
+            continue
+        if board_kind is BoardKind.OFFICIAL_BENCHMARK and agent.operator_class is not OperatorClass.OFFICIAL:
+            continue
+        kept.append(row)
+    return leaderboard(kept)
