@@ -1828,8 +1828,10 @@ class InMemoryStore:
     # --- seed-ledger methods (Official Replay League D3) ---
 
     async def persist_seed_state(self, seed_revision: str, state: dict[str, Any]) -> None:
-        """Store a deep copy of the seed ledger for ``seed_revision`` (last-write-wins UPSERT)."""
-        self._seed_state[seed_revision] = copy.deepcopy(state)
+        """Store the seed ledger for ``seed_revision`` (last-write-wins UPSERT), enforcing the SAME
+        JSON round-trip semantics Postgres applies (``json.dumps``/``json.loads``) so this in-memory
+        mirror rejects a non-JSON-safe payload exactly as PG would — a true parity oracle."""
+        self._seed_state[seed_revision] = json.loads(json.dumps(state))
 
     async def get_seed_state(self, seed_revision: str) -> dict[str, Any] | None:
         """Return a deep copy of the stored seed ledger for ``seed_revision``, or ``None``."""

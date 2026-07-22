@@ -331,8 +331,9 @@ async def run_seed(
         app: The composed FastAPI app (real deploy + competition routes) to drive.
         store: The SAME shared store the app was built with (the ledger + projection durability).
         seed_revision: The stable seed-run identity the ledger is keyed by.
-        operator_token: Accepted for parity; under ``AUTH_MODE=dev`` every request auto-resolves the
-            fixed principal, so no auth header is required (paper competitions need no operator token).
+        operator_token: Requests authenticate via ``AUTH_MODE=dev``'s fixed principal when
+            ``operator_token`` is None; when provided, ``operator_token`` is sent as a Bearer
+            ``Authorization`` header on every in-process client request.
         wait_timeout_s: Max seconds to await BOTH deployments reaching SEALED (fail closed on timeout).
         poll_interval_s: Delay between status polls (also yields so the background seal task progresses).
 
@@ -376,7 +377,10 @@ async def run_seed(
         )
 
     run_ids: list[str] = []
-    async with httpx.AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+    auth_headers = {"Authorization": f"Bearer {operator_token}"} if operator_token is not None else None
+    async with httpx.AsyncClient(
+        transport=ASGITransport(app=app), base_url="http://test", headers=auth_headers
+    ) as client:
         # Phase 5 — deploy_instances: POST the real deploy route (stable Idempotency-Key), then link the
         # instance to its official PUBLIC identity. Reuse the ledger id on a re-run (no duplicate deploy).
         for defn in OFFICIAL_AGENTS:
@@ -403,14 +407,18 @@ async def run_seed(
                 client, instance_id, timeout_s=wait_timeout_s, poll_interval_s=poll_interval_s
             )
 
-        # Phase 7 — create_competitions: one per league fixture, bound to demo_pack_real. Reuse ledgered ids.
+        # Phase 7 — create_competitions: one per league fixture, bound to demo_pack_real. Reuse ledgered
+        # ids. Persist the ledger PER-OBJECT (right after each id is appended) so a crash mid-loop leaves
+        # at most the single last-created (unledgered) id to be re-created — the same tiny crash window the
+        # instance path has via its deploy Idempotency-Key. (Fully closing it needs a deterministic
+        # competition id — out of scope here; this makes the crash-recovery window symmetric, not zero.)
         if not competition_ledger:
             for fixture_id in LEAGUE_FIXTURES:
                 resp = await client.post("/competitions", json=_competition_config(fixture_id))
                 if resp.status_code != 200:
                     raise SeedError(f"create competition failed: {resp.status_code} {resp.text}")
                 competition_ledger.append(resp.json()["competition_id"])
-            await _persist_ledger(store, seed_revision, instances_ledger, competition_ledger)
+                await _persist_ledger(store, seed_revision, instances_ledger, competition_ledger)
 
         # Phase 8 — register: bind BOTH deployed instances onto EACH competition (instance_id + pinned
         # config_hash) so the arena runs the ACTUAL deployed contestant. Idempotent: skip finalized

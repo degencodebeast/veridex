@@ -30,6 +30,7 @@ from typing import Any
 
 import pytest
 
+import veridex.seed.official_replay_league as seed_mod
 from veridex.api.router import create_app
 from veridex.competition.models import CompetitionStatus
 from veridex.config import Settings
@@ -249,6 +250,94 @@ async def test_projection_bindings_reconstructable_from_store_state() -> None:
         # Both official contestants are reconstructed, keyed by their runtime agent id.
         assert len(rebuilt) == 2
         assert {b.public_agent_id for b in rebuilt.values()} == _OFFICIAL_IDS
+
+
+# =====================================================================================
+# Crash-recovery symmetry — a crash between the two competition creations must NOT
+# double-create on re-run (per-object ledger persist, symmetric with the instance path).
+# =====================================================================================
+
+
+async def test_run_seed_recovers_after_crash_between_competition_creations() -> None:
+    """A crash after the first competition is durably ledgered (before the second is) must NOT
+    make a re-run re-create BOTH competitions — the ledger persists PER-OBJECT so exactly 2 exist.
+
+    Injection: wrap ``_persist_ledger`` so the ledger write for the state that carries BOTH
+    competition ids raises (simulating a crash right when the second competition would be durably
+    ledgered, AFTER the first is). Pre-fix (single persist AFTER the whole creation loop) the crash
+    leaves ``competitions == []`` durably, so a re-run re-creates BOTH → 4 total (RED). Post-fix
+    (per-object persist inside the loop) the first competition is durably ledgered before the crash,
+    so a re-run reuses it and does not re-create both → exactly 2 (GREEN).
+    """
+    import pytest as _pytest
+
+    app, store = _build()
+    original_persist = seed_mod._persist_ledger
+
+    async def _crashing_persist(
+        store: Any, seed_revision: str, instances: Any, competitions: list[str]
+    ) -> None:
+        # Crash exactly when the ledger write carries BOTH competition ids — i.e. after the first
+        # competition has been (per-object) ledgered and the second has just been created.
+        if len(competitions) == 2:
+            raise RuntimeError("injected crash before the second competition is durably ledgered")
+        await original_persist(store, seed_revision, instances, competitions)
+
+    try:
+        seed_mod._persist_ledger = _crashing_persist  # type: ignore[assignment]
+        with _pytest.raises(RuntimeError):
+            await run_seed(app, store, seed_revision="rev-crash")
+    finally:
+        seed_mod._persist_ledger = original_persist  # type: ignore[assignment]
+        await _drain(app)
+
+    # Re-run with the crash cleared and the SAME seed_revision → must NOT double-create.
+    try:
+        await run_seed(app, store, seed_revision="rev-crash")
+    finally:
+        await _drain(app)
+
+    competitions = await store.list_competitions()
+    assert len(competitions) == 2  # NOT 3-4: the first was ledgered+reused across the crash.
+
+
+# =====================================================================================
+# operator_token — when provided it is sent as a Bearer Authorization header (FIX 2).
+# =====================================================================================
+
+
+async def test_operator_token_sent_as_bearer_header_and_none_path_unchanged() -> None:
+    from httpx import ASGITransport, Request, Response
+
+    captured: dict[str, list[str | None]] = {"auth": []}
+
+    class _RecordingTransport(ASGITransport):
+        async def handle_async_request(self, request: Request) -> Response:
+            captured["auth"].append(request.headers.get("authorization"))
+            return await super().handle_async_request(request)
+
+    # When provided, EVERY outgoing request carries the Bearer header.
+    app, store = _build()
+    try:
+        seed_mod.ASGITransport = _RecordingTransport  # type: ignore[assignment,misc]
+        await run_seed(app, store, seed_revision="rev-tok", operator_token="tok-abc")
+    finally:
+        seed_mod.ASGITransport = ASGITransport  # type: ignore[assignment,misc]
+        await _drain(app)
+    assert captured["auth"]  # requests were actually observed
+    assert all(h == "Bearer tok-abc" for h in captured["auth"])
+
+    # None path unchanged: no Authorization header is attached.
+    captured["auth"].clear()
+    app2, store2 = _build()
+    try:
+        seed_mod.ASGITransport = _RecordingTransport  # type: ignore[assignment,misc]
+        await run_seed(app2, store2, seed_revision="rev-notok", operator_token=None)
+    finally:
+        seed_mod.ASGITransport = ASGITransport  # type: ignore[assignment,misc]
+        await _drain(app2)
+    assert captured["auth"]
+    assert all(h is None for h in captured["auth"])
 
 
 # =====================================================================================
