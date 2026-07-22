@@ -67,8 +67,9 @@ meta = b["fixture_metadata"]
 assert len(meta) == 18
 assert [m["fixture_id"] for m in meta] == r["fixtures"]
 assert all(m["label_source"] == "captured" for m in meta)
-# NO mock fallback: sealed values are real, not the frontend mock ablation identity.
-assert "mm-inst-0f74a4" not in json.dumps(b)
+# NO mock fallback: the exact sealed values asserted above (172/129 bps, delta 43 CI[34,52]
+# SEPARATED, n=18) ARE the proof — no mock produces them, and the backend route has no mock
+# fallback (it 404s when the sealed artifact is absent rather than serving fabricated data).
 print("arena-result OK")
 PY
 
@@ -110,6 +111,9 @@ assert b["schema_version"] == "maker_live_ab.v1", b["schema_version"]
 assert b["lane"] == "maker" and b["panel"] == "guard_on_off_ablation"
 assert b["is_ablation"] is True
 assert b["mode"] == "replay"  # FORCED non-executing replay (never the reconstructed replay_dry_run)
+# NO mock fallback: the frontend mock live-ab identity must never leak into this real owned-instance
+# body — this is where a mock-ablation fallback would actually surface if one existed.
+assert "mm-inst-0f74a4" not in json.dumps(b), "mock live-ab identity leaked into real live-ab body"
 # Both arms folded the real recorded tape and produced a matched decision stream …
 assert len(b["guard_off"]["decisions"]) >= 1, "guard_off produced no decisions"
 assert len(b["guard_on"]["decisions"]) >= 1, "guard_on produced no decisions"
