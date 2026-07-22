@@ -3,7 +3,8 @@ import Link from 'next/link';
 import { useMemo, useRef, useState, type ReactNode } from 'react';
 import { SegmentedControl } from '@/components/ui/SegmentedControl';
 import { InfoTip } from '@/components/ui/InfoTip';
-import { availableModes, resolveMode, type StudioMode } from '@/lib/studio/coupling';
+import { availableModes, resolveMode, resolveStrategy, MM_TEMPLATE_ID, DET_DRIFT_TEMPLATE_ID, type StudioMode } from '@/lib/studio/coupling';
+import { templateReadiness } from '@/lib/studio/readiness';
 import { ARCHETYPES, SPORTS_ACTION_TYPES, type Archetype, type ExecutionMode, type SourceMode } from '@/lib/catalog';
 import { STRATEGY_TEMPLATES, COMPLEXITY_LABEL, type StrategyTemplate } from '@/lib/studio/templates';
 import { buildPreflightPreview, PREFLIGHT_DISCLAIMER } from '@/lib/studio/preflight';
@@ -22,17 +23,6 @@ function newIdempotencyKey(): string {
   }
   return `idem_${Date.now().toString(36)}_${Math.random().toString(36).slice(2)}`;
 }
-
-// The QuoteGuard/MM template id — the deploy discriminator for the MM family (decision 2). Driving
-// the MM payload off the SELECTED TEMPLATE (not the archetype) is deliberate: quoteguard_mm reuses
-// the `baseline` archetype, so mapping by archetype alone would hijack every manual baseline pick.
-const MM_TEMPLATE_ID = 'quoteguard_mm';
-
-// F-1: the det-Drift template id — the deploy discriminator for the real `cumulative-drift` detector.
-// Like MM, the STRATEGY is driven off the selected TEMPLATE (not the archetype): det-Drift reuses the
-// `momentum` archetype for mode coupling, so a manual momentum pick still deploys momentum-sharp while
-// THIS template deploys cumulative-drift. (build_agent accepts `cumulative-drift`; config.py:183.)
-const DET_DRIFT_TEMPLATE_ID = 'det_drift';
 
 // The MM tape catalog KEY (NOT a path/fixture) resolved server-side via the mm_tape_resolver seam.
 // This is the REAL-DATA maker replay tape registered in the production catalog
@@ -60,39 +50,6 @@ const MM_CARD_BLURB =
 // execution_mode == 'live_guarded', so the MM card only ever emits paper | dry_run.
 function mmExecutionMode(exec: ExecutionMode): 'paper' | 'dry_run' {
   return exec === 'dry_run' ? 'dry_run' : 'paper';
-}
-
-// F-1: the honest, EXHAUSTIVE strategy resolution. The old `toStrategy` ended in a silent
-// `return 'momentum-sharp'`, so value_clv / contrarian / stale_line in a deterministic mode all deployed
-// an IDENTICAL momentum-sharp agent under three different card names — that is the dishonesty F-1 removes.
-// This resolver is bounded by what the deploy path actually supports (build_agent's Literal
-// baseline|momentum|momentum-sharp|cumulative-drift|llm, plus the separate quoteguard-mm MM seam) and has
-// NO default fallthrough: an unmapped combo returns a typed `unsupported` verdict so the UI can disable
-// deploy — a strategy the card does not name is NEVER emitted.
-export type StrategyResolution =
-  | { supported: true; strategy: string }
-  | { supported: false; reason: string };
-
-export function resolveStrategy(
-  templateId: string | null, archetype: Archetype, mode: StudioMode,
-): StrategyResolution {
-  // Template-driven overrides — the deploy discriminator is the SELECTED template, not the archetype
-  // (so a manual archetype pick never hijacks a template family; mirrors the MM carve-out).
-  if (templateId === MM_TEMPLATE_ID) return { supported: true, strategy: 'quoteguard-mm' };
-  if (templateId === DET_DRIFT_TEMPLATE_ID) return { supported: true, strategy: 'cumulative-drift' };
-  // Directional path — an honest map onto the build_agent Literal:
-  //   • any llm-capable archetype in LLM mode → the generic `llm` agent (value_clv/baseline are
-  //     LLM-locked in coupling.ts, so this branch only ever sees momentum/contrarian/stale_line).
-  //   • momentum (deterministic) → momentum-sharp; baseline (deterministic) → baseline.
-  if (mode === 'llm') return { supported: true, strategy: 'llm' };
-  if (archetype === 'momentum') return { supported: true, strategy: 'momentum-sharp' };
-  if (archetype === 'baseline') return { supported: true, strategy: 'baseline' };
-  // value_clv / contrarian / stale_line in a deterministic mode: NO distinct backend strategy exists.
-  // Return unsupported (never a silent momentum-sharp) — the deploy affordance is disabled for these.
-  return {
-    supported: false,
-    reason: `${archetype} has no deterministic backend strategy — switch to LLM mode (if available), or pick a supported template (Momentum, det-Drift, or QuoteGuard/MM)`,
-  };
 }
 
 // Thrown if a deploy payload is somehow built for an unsupported combo (defense-in-depth: the UI
@@ -375,11 +332,16 @@ export function StudioScreen({
           <Section n="01" title="Identity & archetype">
             <div className={styles.cards} data-testid="strategy-cards">
               {STRATEGY_TEMPLATES.map((t) => {
+                // §14: the ONE shared readiness predicate drives BOTH Agents AND Studio. Studio maps its
+                // three honest states onto the card: Arena-only → the Use-in-Arena card; Locked → a
+                // disabled card (heavy-extension Phase-3 OR a template with no deployable backend strategy,
+                // e.g. value_clv/stale_line); Deployable → a selectable deploy card.
+                const readiness = templateReadiness(t);
                 // F-1: LLM-Drift is an ARENA-ONLY contestant — `strategy:"llm-drift"` does NOT exist in
                 // the deploy path (it lives ONLY in veridex/runtime/arena_comparison.py). So it is NOT a
                 // selectable deploy card: it renders a "Use in Arena" affordance and NO deploy button,
                 // and it never sets a deploy template. (Operator reconciliation 2026-07-19.)
-                if (t.arenaOnly) {
+                if (readiness === 'Arena-only') {
                   return (
                     <div key={t.id} className={`${styles.card} ${styles.cardArena}`} data-testid="arena-only-card">
                       <span className={styles.cardLabel}>{t.label}</span>
@@ -389,9 +351,10 @@ export function StudioScreen({
                     </div>
                   );
                 }
-                // fu-ii5: a heavy extension is LOCKED unless it is per-template `deployable`. Only
-                // Arb/Spread stays Phase-3-locked; quoteguard_mm + det-Drift are deployable.
-                const locked = t.complexity === 'heavy-extension' && !t.deployable;
+                // §14: LOCKED = not deployable from Studio (the shared predicate folds in both the
+                // heavy-extension Phase-3 lock AND resolveStrategy's "no backend strategy" verdict). The
+                // per-card complexity LABEL is unchanged, so only Arb/Spread still reads "phase-3".
+                const locked = readiness === 'Locked';
                 // The MM card carries a SIMULATED-REPLAY provenance label + blurb (real recorded
                 // Polymarket/TxLINE data, dry-run, live-money disabled). Keyed off the MM id specifically
                 // (NOT `deployable`, which now also covers det-Drift) so det-Drift keeps its own copy.
