@@ -22,11 +22,18 @@ would pin it.
 from __future__ import annotations
 
 import hashlib
+import os
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Literal
 
+from veridex.api.deploy import _build_agent
 from veridex.deploy.preflight import DeployConfig
+from veridex.ingest.replay_catalog import build_catalog
+from veridex.ingest.replay_pack import load_pack_marketstates
 from veridex.runtime.evidence import serialize_payload
+from veridex.runtime.orchestrator import run_competition
+from veridex.scoring import score_run
 
 #: Schema version of the pinned canonical DeployConfig shape — bumped when the pinned config fields
 #: (or their canonical serialization) change, so the seed-definition hash detects drift.
@@ -135,3 +142,56 @@ def seed_definition_hash() -> str:
         "config_hashes": sorted(canonical_deploy_config(a).config_hash() for a in OFFICIAL_AGENTS),
     }
     return hashlib.sha256(serialize_payload(payload).encode("utf-8")).hexdigest()
+
+
+class ScoreabilityError(RuntimeError):
+    """An admitted official agent produced ZERO scored actions on the shipped pack (fail-closed).
+
+    Raised by :func:`assert_scoreable` when the real replay pipeline proves an agent that DEPLOYS
+    would silently never act — the honesty failure the guard exists to catch.
+    """
+
+
+async def assert_scoreable(
+    agents: Sequence[OfficialAgentDef] = OFFICIAL_AGENTS,
+    fixtures: Sequence[int] = LEAGUE_FIXTURES,
+) -> None:
+    """Run the real build→load→run→score pipeline for each agent on the shipped pack; fail closed.
+
+    Resolves the shipped ``demo_pack_real`` pack the SAME way production does (from the env-driven
+    replay catalog, never a hardcoded filesystem path), builds each agent through the ONE canonical
+    deploy config, and replays every requested fixture. If any agent's TOTAL ``action_count`` across
+    ``fixtures`` is 0, it deploys but silently never acts — a scoreability lie — so the guard raises
+    :class:`ScoreabilityError` naming that agent. Returns ``None`` when every agent genuinely acts.
+
+    Args:
+        agents: The official agent defs to prove scoreable (defaults to :data:`OFFICIAL_AGENTS`).
+        fixtures: The fixture ids to replay (defaults to :data:`LEAGUE_FIXTURES`).
+
+    Raises:
+        ScoreabilityError: If the shipped pack is absent, a requested fixture is not in the pack, or
+            any admitted agent scores 0 actions across ``fixtures``.
+    """
+    catalog = build_catalog(os.environ.get("REPLAY_PACK_ROOT", "") or None)
+    entry = catalog.get(_REPLAY_PACK_ID)
+    if entry is None:
+        raise ScoreabilityError(f"pack {_REPLAY_PACK_ID!r} not present in the replay catalog")
+    for fid in fixtures:
+        if fid not in entry.fixtures:
+            raise ScoreabilityError(
+                f"fixture {fid} not present in pack {_REPLAY_PACK_ID!r} (has {list(entry.fixtures)})"
+            )
+
+    built = [_build_agent(canonical_deploy_config(defn)) for defn in agents]
+    totals: dict[str, int] = {defn.agent_id: 0 for defn in agents}
+    for fid in fixtures:
+        marketstates = load_pack_marketstates(entry.pack_dir, fid)
+        run = await run_competition(marketstates, built, source_mode="replay")
+        for row in score_run(run):
+            totals[row["agent_id"]] += int(row["action_count"])
+
+    for agent_id, total in totals.items():
+        if total == 0:
+            raise ScoreabilityError(
+                f"agent {agent_id!r} scored 0 actions across fixtures {list(fixtures)} — not scoreable"
+            )
