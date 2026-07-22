@@ -1,20 +1,27 @@
 'use client';
 import { useEffect, useState } from 'react';
 import { AgentsScreen } from '@/components/screens/AgentsScreen';
+import { getAgentsRoster } from '@/lib/api';
 import { isMockEnabled } from '@/lib/mock';
 import { AGENTS } from '@/lib/fixtures/catalog';
 import type { AgentSummary } from '@/lib/catalog';
 
-// T-2 remediation · /agents must NOT show a fabricated DIRECTIONAL roster with the demo flag OFF.
-// There is NO agents-list backend reader/endpoint (lib/api.ts exposes none), so the directional roster
-// is sourced CLIENT-side purely on the mock gate: isMockEnabled() reads the per-tab `?mock=1` from
-// window (which a server render cannot see) — a judge toggling ?mock=1 gets the labeled DEMO fixture,
-// while an off-mock judge gets an honest-empty roster ([]), NEVER the AGENTS fixture. This is the same
-// mock-gated-fixture pattern as useAgentOps' RUNTIME_* demo path, not a fabricated static default.
+// The DIRECTIONAL roster is mock-gated. Mock ON (per-tab `?mock=1`, which a server render cannot see):
+// the labeled DEMO AGENTS fixture. Mock OFF: the REAL public roster of deployed instances via
+// getAgentsRoster() (GET /agents/roster) — honest performance columns ("—", never fabricated). Any
+// fetch failure falls back to honest-empty ([]) — NEVER the AGENTS fixture off-mock (T-2 prohibition).
 export default function AgentsPage() {
   const [agents, setAgents] = useState<AgentSummary[]>([]);
   useEffect(() => {
-    setAgents(isMockEnabled() ? AGENTS : []);
+    let alive = true;
+    if (isMockEnabled()) {
+      setAgents(AGENTS);
+      return;
+    }
+    getAgentsRoster()
+      .then((roster) => { if (alive) setAgents(roster); })
+      .catch(() => { if (alive) setAgents([]); }); // honest-empty on error — never a fabricated roster
+    return () => { alive = false; };
   }, []);
   return <AgentsScreen agents={agents} />;
 }

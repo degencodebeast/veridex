@@ -18,7 +18,7 @@ function DuelCard({ agent, side }: { agent: AgentSummary; side: string }) {
       <span className={styles.side}>{side}</span>
       <h2 className={styles.name}>{agent.agent_name}</h2>
       <div className={styles.kv}><span>Avg CLV</span><span data-testid="duel-clv"><Num value={agent.avg_clv_bps} kind="bps" /></span></div>
-      <div className={styles.kv}><span>Valid %</span><span className="mono">{agent.valid_pct.toFixed(1)}%</span></div>
+      <div className={styles.kv}><span>Valid %</span><span className="mono">{agent.valid_pct == null ? '—' : `${agent.valid_pct.toFixed(1)}%`}</span></div>
       <div className={styles.kv}><span>Proof</span><span data-testid="duel-proof"><Badge variant={agent.proof_mode} /></span></div>
       <div className={styles.kv}><span>Eligibility</span><Badge variant={isEligible(agent.proof_mode) ? 'eligible' : 'not-eligible'} /></div>
     </div>
@@ -90,7 +90,8 @@ export function DuelScreen({
 
   const a = agents.find((x) => x.agent_id === aId) ?? agents[0];
   const b = agents.find((x) => x.agent_id === bId) ?? agents[1];
-  const divergence = (a.avg_clv_bps - b.avg_clv_bps).toFixed(1);
+  // Honest "—" when either side lacks a scored CLV (an unscored roster agent): no fabricated gap.
+  const divergence = a.avg_clv_bps == null || b.avg_clv_bps == null ? '—' : (a.avg_clv_bps - b.avg_clv_bps).toFixed(1);
 
   return (
     <section className={styles.screen} aria-label="Head-to-Head Duel">

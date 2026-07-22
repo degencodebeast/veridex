@@ -22,6 +22,7 @@ import { INSPECTOR_DEMO_QUANTITIES } from '@/lib/fixtures/inspector';
 import { PROOF_DEMO_ROOTS, mapRootForest } from '@/lib/fixtures/proof';
 import { PROOF_EXPLAIN_DEMO, type ProofExplanation } from '@/lib/explainer';
 import { VERIFIER_VERSION, type StatusBarState } from '@/lib/status';
+import type { AgentSummary, Archetype } from '@/lib/catalog';
 import type * as W from '@/lib/wire';
 import type {
   AnchorInfo, AnchorStatus, CheckResult, CockpitState, ExecutionMode, FeedHealthState,
@@ -75,6 +76,9 @@ export const PATHS = {
   makerLiveAb: (instanceId: string) => `/maker/live-ab/${encodeURIComponent(instanceId)}`,
   // R-3 verified ReplayPack catalog (read-only). Enriched with additive fixture_metadata.
   replayPacks: () => `/replay-packs`,
+  // PUBLIC deployed-agent roster (read-only, unauth — mirrors /replay-packs). ALL owners, NOT
+  // owner-filtered (distinct from the owner-scoped /agents/instances). Perf columns are honest null.
+  agentsRoster: () => `/agents/roster`,
   // F-4 competition lifecycle (owner-scoped POSTs): create → register roster entry → start.
   competitions: () => `/competitions`,
   competitionAgents: (id: string) => `/competitions/${id}/agents`,
@@ -814,6 +818,62 @@ export async function getReplayPacks(): Promise<ReplayPackView[]> {
     isGenuine: p.is_genuine,
     fixtures: p.fixtures,
     fixtureMetadata: p.fixture_metadata ?? [],
+  }));
+}
+
+// ---- PUBLIC deployed-agent roster (GET /agents/roster) ----
+//
+// The unauthenticated public roster of ALL deployed instances across ALL owners (mirrors
+// /replay-packs — read-only, no bearer). Distinct from the OWNER-scoped getInstances()
+// (/agents/instances). The backend projects public-safe deployment identity only; the performance
+// columns are ALWAYS null (no scoring aggregation exists yet) — surfaced as null so the table
+// renders "—", NEVER fabricated.
+
+/** Wire shape of one public roster row (frozen backend AgentRosterEntry, veridex/api/schemas.py). */
+export interface AgentRosterEntryWire {
+  agent_id: string;
+  type: string; // template_id
+  owner: string | null; // operator_id; null == UNOWNED (honest)
+  source_mode: string; // replay | live
+  execution_mode: string;
+  status: string; // DeployStatus value, lowercased
+  config_hash_present: boolean; // REAL proof indicator (config_hash pinned) — not a score
+  avg_clv_bps: number | null; // always null (no aggregation) — never fabricated
+  runs: number | null;
+  valid_pct: number | null;
+}
+
+export interface AgentRosterResponseWire {
+  agents: AgentRosterEntryWire[];
+}
+
+// template_id is the deployed archetype label for the archetype path (StudioScreen sends
+// template_id=archetype); MM/drift templates carry their own id. The RAW template_id is preserved
+// VERBATIM as the archetype (rendered as-is in the ARCHETYPE column — the real deployment identity),
+// never remapped to a fabricated archetype. The cast is safe: the value is only rendered as text.
+function toArchetype(templateId: string): Archetype {
+  return templateId as Archetype;
+}
+
+// GET /agents/roster → AgentSummary[] for the AgentsScreen directional table. Mock ⇒ [] (the page
+// supplies the labeled DEMO fixture under the mock gate; this reader is the OFF-mock real-fetch path).
+// The performance fields map to null (honest "—"), NEVER fabricated; agent_name falls back to the real
+// agent_id (the roster carries no display name); proof_mode is derived from the REAL config_hash_present
+// indicator (a pinned config_hash ⇒ reproducible determinism, else partial).
+export async function getAgentsRoster(): Promise<AgentSummary[]> {
+  if (isMockEnabled()) return [];
+  const res = await getJson<AgentRosterResponseWire>(PATHS.agentsRoster());
+  return res.agents.map((e) => ({
+    agent_id: e.agent_id,
+    agent_name: e.agent_id, // no server-side display name — the real id IS the honest label
+    archetype: toArchetype(e.type),
+    mode: null, // the roster carries no strategy mode (llm|numeric|rule) — honest "—", never fabricated
+    avg_clv_bps: null, // no scoring aggregation yet — honest "—", never fabricated
+    runs: null, // no scoring aggregation yet — honest "—", never fabricated
+    proof_mode: e.config_hash_present ? 'reproducible' : 'partial', // derived from a REAL indicator
+    source_mode: toSourceMode(e.source_mode),
+    valid_pct: null, // no scoring aggregation yet — honest "—", never fabricated
+    source: 'STUDIO', // deployed via the Studio deploy path (not surfaced in the roster table)
   }));
 }
 

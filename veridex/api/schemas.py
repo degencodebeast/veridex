@@ -425,6 +425,51 @@ class ReplayPackListResponse(BaseModel):
     packs: list[ReplayPackInfo]
 
 
+class AgentRosterEntry(BaseModel):
+    """One PUBLIC roster row projected from a deployed :class:`~veridex.deploy.instance.AgentInstance`.
+
+    The read-only, UNAUTHENTICATED ``GET /agents/roster`` view (mirrors ``/replay-packs``): one row per
+    deployed instance across ALL owners. Unlike the owner-scoped ``/agents/instances``, this roster is
+    NOT owner-filtered — ``owner`` is EXPOSED intentionally (a public "who deployed what" directory, by
+    design). An UNOWNED / legacy row (``operator_id is None``) surfaces ``owner=None`` honestly.
+
+    The performance columns (``avg_clv_bps`` / ``runs`` / ``valid_pct``) are ALWAYS ``None`` here: there
+    is no cross-instance scoring aggregation yet, so they are honestly absent (the UI renders "—") —
+    NEVER fabricated as ``0`` or a placeholder number.
+
+    Attributes:
+        agent_id: The deployed agent's identifier.
+        type: The strategy-archetype template the instance was configured from (``template_id``).
+        owner: The SERVER-DERIVED operator identity (``operator_id``); ``None`` == UNOWNED/legacy (honest).
+        source_mode: ``replay`` | ``live`` (the instance's data source).
+        execution_mode: ``paper`` | ``dry_run`` | ``live_guarded``.
+        status: The :class:`~veridex.deploy.instance.DeployStatus` value, lowercased.
+        config_hash_present: A REAL proof indicator — ``True`` when the instance pinned a
+            ``config_hash`` (a determinism-pin the deploy path sets only AFTER preflight passes).
+            Not a score / performance claim.
+        avg_clv_bps: Always ``None`` — no scoring aggregation exists (honest, never fabricated).
+        runs: Always ``None`` — no scoring aggregation exists (honest, never fabricated).
+        valid_pct: Always ``None`` — no scoring aggregation exists (honest, never fabricated).
+    """
+
+    agent_id: str
+    type: str
+    owner: str | None
+    source_mode: str
+    execution_mode: str
+    status: str
+    config_hash_present: bool
+    avg_clv_bps: float | None = None
+    runs: int | None = None
+    valid_pct: float | None = None
+
+
+class AgentRosterResponse(BaseModel):
+    """Envelope for ``GET /agents/roster`` — the PUBLIC deployed-agent roster (single-field wrapper)."""
+
+    agents: list[AgentRosterEntry]
+
+
 class BacktestRunResponse(BaseModel):
     """Response envelope for ``POST /backtests``.
 

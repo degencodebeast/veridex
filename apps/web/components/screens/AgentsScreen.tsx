@@ -34,7 +34,12 @@ export function AgentsScreen({
 
   const shown = useMemo(() => {
     const filtered = agents.filter((a) => a.agent_name.toLowerCase().includes(q.toLowerCase()));
-    return [...filtered].sort((a, b) => (sort === 'clv' ? b.avg_clv_bps - a.avg_clv_bps : b.runs - a.runs));
+    // Null perf (an unscored /agents/roster row) sorts to the bottom — never coerced to 0 (a real 0
+    // would be a fabricated break-even claim that outranks the honest "—" rows).
+    const rank = (v: number | null) => v ?? Number.NEGATIVE_INFINITY;
+    return [...filtered].sort((a, b) =>
+      sort === 'clv' ? rank(b.avg_clv_bps) - rank(a.avg_clv_bps) : rank(b.runs) - rank(a.runs),
+    );
   }, [agents, q, sort]);
 
   return (
@@ -89,9 +94,9 @@ export function AgentsScreen({
                     <tr key={a.agent_id} className={styles.row}>
                       <td><Link href={`/agents/${a.agent_id}`} className={styles.link}>{a.agent_name} ›</Link></td>
                       <td className="mono">{a.archetype}</td>
-                      <td className="mono">{a.mode}</td>
+                      <td className="mono">{a.mode ?? '—'}</td>
                       <td className={styles.num}><Num value={a.avg_clv_bps} kind="bps" /></td>
-                      <td className={styles.num}>{a.runs}</td>
+                      <td className={styles.num}>{a.runs ?? '—'}</td>
                       <td><Badge variant={a.proof_mode} /></td>
                       <td>
                         {a.source_mode === 'live' ? <Badge variant="live" />

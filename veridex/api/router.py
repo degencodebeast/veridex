@@ -57,6 +57,8 @@ from veridex.api.maker_router import register_maker_routes
 from veridex.api.schemas import (
     AgentRegisterResponse,
     ApprovalResponse,
+    AgentRosterEntry,
+    AgentRosterResponse,
     BacktestRunRequest,
     BacktestRunResponse,
     CompetitionCreateResponse,
@@ -112,6 +114,7 @@ from veridex.competition.service import (
     start_competition,
 )
 from veridex.config import Settings, get_settings
+from veridex.deploy.instance import AgentInstance
 from veridex.execution.models import ExecutionRecord, ExecutionStatus
 from veridex.execution.runner import resolve_approval
 from veridex.explainer import GLOSSARY_DEFINITIONS, explain_proof
@@ -377,6 +380,28 @@ def _replay_pack_info(entry: CatalogEntry) -> ReplayPackInfo:
         is_genuine=entry.is_genuine,
         fixtures=list(entry.fixtures),
         fixture_metadata=[fixture_metadata_row(int(f)) for f in entry.fixtures],
+    )
+
+
+def _agent_roster_entry(instance: AgentInstance) -> AgentRosterEntry:
+    """Project a deployed :class:`AgentInstance` into the PUBLIC read-only ``/agents/roster`` row.
+
+    Surfaces ONLY public-safe deployment identity (agent / template / owner / modes / status) plus a
+    REAL ``config_hash_present`` proof indicator. The performance columns stay ``None`` — no scoring
+    aggregation exists yet, so they are honestly absent (never fabricated). ``owner`` is intentionally
+    exposed (public roster by design); an UNOWNED row (``operator_id is None``) surfaces ``owner=None``.
+    """
+    return AgentRosterEntry(
+        agent_id=instance.agent_id,
+        type=instance.template_id,
+        owner=instance.operator_id,
+        source_mode=instance.source_mode,
+        execution_mode=instance.execution_mode,
+        status=instance.status.value.lower(),
+        config_hash_present=bool(instance.config_hash),
+        avg_clv_bps=None,
+        runs=None,
+        valid_pct=None,
     )
 
 
@@ -674,6 +699,27 @@ def create_app(
         if entry is None:
             raise HTTPException(status_code=404, detail=f"unknown pack_id: {pack_id}")
         return _replay_pack_info(entry)
+
+    # --- GET /agents/roster (PUBLIC — the deployed-agent roster, read-only) -----
+
+    @app.get("/agents/roster", response_model=AgentRosterResponse)
+    async def list_agents_roster(
+        dep_store: Store = Depends(_get_store),  # noqa: B008
+    ) -> AgentRosterResponse:
+        """PUBLIC (unauthenticated) roster of ALL deployed agent instances across ALL owners.
+
+        Mirrors ``/replay-packs`` (read-only, NO auth). A pure projection of
+        ``store.list_agent_instances()`` — every instance's public-safe deployment identity (agent /
+        template / owner / modes / status) plus a REAL ``config_hash_present`` proof indicator, sorted
+        deterministically by ``(created_at, instance_id)``. Unlike the owner-scoped
+        ``/agents/instances`` (which fail-closed filters to the caller's own rows), this roster is NOT
+        owner-filtered: ``owner`` is exposed intentionally (a public "who deployed what" directory).
+        The performance columns are ``None`` — no cross-instance scoring aggregation exists yet, so they
+        are honestly absent (the UI renders "—"), NEVER fabricated.
+        """
+        instances = await dep_store.list_agent_instances()
+        ordered = sorted(instances, key=lambda inst: (inst.created_at, inst.instance_id))
+        return AgentRosterResponse(agents=[_agent_roster_entry(inst) for inst in ordered])
 
     # --- POST /backtests (T15 — replay a ReplayPack → honest BacktestReport) ----
 

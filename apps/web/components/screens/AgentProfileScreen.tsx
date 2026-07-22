@@ -27,7 +27,7 @@ export function AgentProfileScreen({
         <div className={styles.stat}><span className={styles.statLabel}>Avg CLV</span><Num value={profile.avg_clv_bps} kind="bps" /></div>
         <div className={styles.stat}><span className={styles.statLabel}>Total CLV</span><Num value={profile.total_clv_bps} kind="bps" /></div>
         <div className={styles.stat}><span className={styles.statLabel}>Runs</span><span className="mono">{profile.runs}</span></div>
-        <div className={styles.stat}><span className={styles.statLabel}>Valid %</span><span className="mono">{profile.valid_pct.toFixed(1)}%</span></div>
+        <div className={styles.stat}><span className={styles.statLabel}>Valid %</span><span className="mono">{profile.valid_pct == null ? '—' : `${profile.valid_pct.toFixed(1)}%`}</span></div>
         <div className={styles.stat}><span className={styles.statLabel}>Confidence</span><ConfBar validCount={profile.valid_count} /></div>
         <div className={styles.stat}><span className={styles.statLabel}>Proof / Eligibility</span><span className={styles.badges}><Badge variant={profile.proof_mode} /><Badge variant={isEligible(profile.proof_mode) ? 'eligible' : 'not-eligible'} /></span></div>
       </div>

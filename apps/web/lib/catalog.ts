@@ -104,12 +104,16 @@ export interface AgentSummary {
   agent_id: string;
   agent_name: string;
   archetype: Archetype;
-  mode: 'llm' | 'numeric' | 'rule';
-  avg_clv_bps: number;
-  runs: number;
+  // A scored agent has a real strategy mode; the PUBLIC deployed-agent roster (GET /agents/roster)
+  // carries no such label, so it is null there → the table renders "—" (honest, never fabricated).
+  mode: 'llm' | 'numeric' | 'rule' | null;
+  // Performance fields are null when there is no scoring aggregation for the row (e.g. every
+  // /agents/roster row). null → the table renders "—"; NEVER fabricated as 0 (a real 0 is a claim).
+  avg_clv_bps: number | null;
+  runs: number | null;
   proof_mode: ProofMode;
   source_mode: CatalogSourceMode;
-  valid_pct: number;
+  valid_pct: number | null;
   source: 'STUDIO' | 'BYOA';
 }
 
