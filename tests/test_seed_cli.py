@@ -21,8 +21,10 @@ from __future__ import annotations
 import importlib
 from typing import Any
 
+import pytest
+
 import scripts.seed_official_replay_league as cli
-from veridex.seed.official_replay_league import SeedResult
+from veridex.seed.official_replay_league import SeedError, SeedResult
 
 
 def _empty_result(seed_revision: str) -> SeedResult:
@@ -130,17 +132,103 @@ def test_import_has_no_side_effects(monkeypatch: Any) -> None:
     monkeypatch.delenv("DATABASE_URL", raising=False)
     monkeypatch.delenv("CORS_ORIGINS", raising=False)
 
-    called: list[bool] = []
+    seed_called: list[bool] = []
+    app_built: list[bool] = []
 
-    async def _tripwire(*_args: Any, **_kwargs: Any) -> SeedResult:
-        called.append(True)
+    async def _run_seed_tripwire(*_args: Any, **_kwargs: Any) -> SeedResult:
+        seed_called.append(True)
         return _empty_result("never")
 
-    monkeypatch.setattr(cli, "run_seed", _tripwire)
+    def _build_app_tripwire(*_args: Any, **_kwargs: Any) -> Any:
+        app_built.append(True)
+        raise AssertionError("create_server_app must not run at import time")
+
+    # `importlib.reload(cli)` RE-EXECUTES `from ... import run_seed` / `from ... import
+    # create_server_app`, which rebinds cli.run_seed / would rebind a patched cli-level name back
+    # to the real function -- patching cli.run_seed here would be silently discarded by the reload
+    # and the assertion below would pass vacuously even if import DID invoke the seed/app-builder.
+    # Patch the SOURCE attributes the `from` imports re-read instead, so the tripwire survives
+    # reload and genuinely observes an import-time call.
+    monkeypatch.setattr(
+        "veridex.seed.official_replay_league.run_seed", _run_seed_tripwire
+    )
+    monkeypatch.setattr(
+        "veridex.api.server.create_server_app", _build_app_tripwire
+    )
 
     # A fresh import must not build the app or run the seed (all real work is inside functions).
     module = importlib.reload(cli)
 
-    assert called == []
+    assert seed_called == []
+    assert app_built == []
     assert callable(module.main)
     assert callable(module.build_app_and_store)
+
+
+class _RecordingLifespan:
+    """A fake ``router.lifespan_context`` that records enter/exit order into a shared list."""
+
+    def __init__(self, order: list[str]) -> None:
+        self._order = order
+
+    def __call__(self, app: Any) -> _RecordingLifespan:
+        return self
+
+    async def __aenter__(self) -> None:
+        self._order.append("enter")
+
+    async def __aexit__(self, *_exc_info: Any) -> None:
+        self._order.append("exit")
+
+
+class _FakeRouter:
+    def __init__(self, lifespan_context: Any) -> None:
+        self.lifespan_context = lifespan_context
+
+
+class _FakeAppWithLifespan:
+    """Mirrors the attribute path ``_run`` reads: ``app.router.lifespan_context``."""
+
+    def __init__(self, router: Any) -> None:
+        self.router = router
+
+
+def test_run_enters_app_lifespan_around_run_seed(monkeypatch: Any) -> None:
+    order: list[str] = []
+    fake_app = _FakeAppWithLifespan(_FakeRouter(_RecordingLifespan(order)))
+    fake_store = object()
+    monkeypatch.setattr(
+        cli, "build_app_and_store", lambda: (fake_app, fake_store)
+    )
+
+    async def fake_run_seed(*_args: Any, **_kwargs: Any) -> SeedResult:
+        order.append("run")
+        return _empty_result("r1")
+
+    monkeypatch.setattr(cli, "run_seed", fake_run_seed)
+
+    cli.main(["--seed-revision", "r1"])
+
+    # The production lifespan branch (``async with lifespan(app):``) must wrap run_seed so the
+    # Postgres pool F1 relies on is open for the whole seed and closed only after it finishes.
+    assert order == ["enter", "run", "exit"]
+
+
+def test_seed_failure_exits_nonzero_with_message(monkeypatch: Any) -> None:
+    sentinel_app = object()
+    sentinel_store = object()
+    monkeypatch.setattr(
+        cli, "build_app_and_store", lambda: (sentinel_app, sentinel_store)
+    )
+
+    async def failing_run_seed(*_args: Any, **_kwargs: Any) -> SeedResult:
+        raise SeedError("boom")
+
+    monkeypatch.setattr(cli, "run_seed", failing_run_seed)
+
+    with pytest.raises(SystemExit) as exc_info:
+        cli.main(["--seed-revision", "r1"])
+
+    # Non-zero exit is preserved (SystemExit with a string code is fail-closed); the message is a
+    # clean one-liner rather than a full traceback, for tidy F1 operator logs.
+    assert "seed failed: boom" in str(exc_info.value)

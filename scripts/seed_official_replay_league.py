@@ -25,7 +25,7 @@ import os
 from typing import TYPE_CHECKING
 
 from veridex.api.server import create_server_app
-from veridex.seed.official_replay_league import run_seed
+from veridex.seed.official_replay_league import ScoreabilityError, SeedError, run_seed
 
 if TYPE_CHECKING:
     from fastapi import FastAPI
@@ -64,8 +64,10 @@ async def _run(args: argparse.Namespace) -> None:
 
     The app's lifespan is entered around the seed when present, so on the Postgres path the pool is
     OPEN (and ``init_db`` has run) for the duration of the seed — both the in-process routes AND the
-    durable rows are live. When ``build_app_and_store`` yields a bare sentinel (tests) or an app with
-    no lifespan, the seed runs directly.
+    durable rows are live. The ``is None`` branch below is only reachable for a bare test sentinel
+    with no ``.router`` — real Starlette/FastAPI apps always carry a non-None ``lifespan_context``
+    (``_DefaultLifespan`` when none was configured), so in production the seed always runs inside the
+    ``async with lifespan(app)`` branch.
     """
     app, store = build_app_and_store()
     lifespan = getattr(getattr(app, "router", None), "lifespan_context", None)
@@ -132,9 +134,18 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
 
 
 def main(argv: list[str] | None = None) -> None:
-    """Parse args and run the seed. The ONLY entrypoint that performs work (import stays side-effect-free)."""
+    """Parse args and run the seed. The ONLY entrypoint that performs work (import stays side-effect-free).
+
+    A seed failure (``SeedError``/``ScoreabilityError``) is re-raised as a one-line ``SystemExit`` so
+    F1 container logs show a clean message instead of a full traceback; the non-zero exit is preserved
+    either way. Any OTHER exception is left to propagate with its traceback — only the seed's own
+    error types get the clean treatment.
+    """
     args = _parse_args(argv)
-    asyncio.run(_run(args))
+    try:
+        asyncio.run(_run(args))
+    except (SeedError, ScoreabilityError) as e:
+        raise SystemExit(f"seed failed: {e}") from e
 
 
 if __name__ == "__main__":
