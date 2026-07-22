@@ -49,4 +49,28 @@ describe('CreateCompetitionScreen — Launch carries the authoritative pack_id +
       ),
     );
   });
+
+  it('preserves an EXPLICIT fixture_id=0 (a valid, presence-distinct id) rather than silently omitting it', async () => {
+    // 0 is a backend-valid fixture id distinct from "omitted" (None → server picks the pack minimum).
+    // An explicit deep-linked ?fixture_id=0 must reach launchApi.create as fixture_id:0, never dropped.
+    const user = userEvent.setup();
+    const api = okApi();
+    render(
+      <CreateCompetitionScreen
+        connected
+        initialFixtureId={0}
+        packId="curated"
+        loadInstances={vi.fn().mockResolvedValue(TWO_INSTANCES)}
+        launchApi={api}
+      />,
+    );
+    await user.click(await screen.findByTestId('roster-inst-a'));
+    await user.click(await screen.findByTestId('roster-inst-b'));
+    await user.click(screen.getByTestId('launch-button'));
+    await waitFor(() =>
+      expect(api.create).toHaveBeenCalledWith(
+        expect.objectContaining({ pack_id: 'curated', fixture_id: 0, roster_size: 2 }),
+      ),
+    );
+  });
 });

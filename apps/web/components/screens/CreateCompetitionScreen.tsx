@@ -114,14 +114,17 @@ export function CreateCompetitionScreen({
   useEffect(() => { setMock(isMockEnabled()); }, []);
   const fixtures = mock ? FIXTURES : [];
 
-  const [fixtureId, setFixtureId] = useState<number>(initialFixtureId ?? 0);
+  // Nullable selection sentinel: `null` = NOTHING selected (off-mock / empty picker); a number (incl.
+  // the backend-valid `0`) = an explicit selection. Never overload `0` as "unselected" — an explicit
+  // deep-linked `?fixture_id=0` must survive as a real selection, not collapse to omitted.
+  const [fixtureId, setFixtureId] = useState<number | null>(initialFixtureId ?? null);
   // Once the mock gate resolves ON after mount, snap the selection to a valid demo fixture — the
   // deep-linked initial one if present, else the first. Off-mock the picker is empty, so nothing is
   // selected and it renders honest-empty (never a fabricated fixture). References the FIXTURES module
   // constant directly (not the per-render `fixtures` array), so `mock` is the only reactive dependency.
   useEffect(() => {
     if (!mock) return;
-    setFixtureId((cur) => (FIXTURES.some((f) => f.fixture_id === cur) ? cur : (FIXTURES[0]?.fixture_id ?? 0)));
+    setFixtureId((cur) => (cur != null && FIXTURES.some((f) => f.fixture_id === cur) ? cur : (FIXTURES[0]?.fixture_id ?? null)));
   }, [mock]);
   const [markets, setMarkets] = useState<Set<MarketFamilyKey>>(new Set(MARKET_FAMILY_KEYS));
   const [scoringWindow, setScoringWindow] = useState('');
@@ -186,9 +189,10 @@ export function CreateCompetitionScreen({
     scoringWindow: scoring_window,
     rosterSize: selectedInstances.length,
     packId: packId ?? null,
-    // `fixtureId` is the component's selection state (`:112`, seeded from `initialFixtureId`); 0 = no
-    // fixture selected → coerced to null so `buildCompetitionConfig` OMITS it (never a fabricated 0).
-    fixtureId: fixtureId || null,
+    // `fixtureId` is the nullable selection state (`null` = nothing selected → helper OMITS it; a
+    // number, incl. an explicit `0`, is a real selection → helper SENDS it). Passed through
+    // presence-aware — never `|| null`, which would silently drop a valid `fixture_id: 0`.
+    fixtureId,
   });
 
   return (
@@ -253,7 +257,7 @@ export function CreateCompetitionScreen({
                 {fixtures.length > 0 ? (
                   <select
                     className={styles.select} aria-label="Fixture" data-testid="fixture-select"
-                    value={fixtureId} onChange={(e) => setFixtureId(Number(e.target.value))}
+                    value={fixtureId ?? ''} onChange={(e) => setFixtureId(Number(e.target.value))}
                   >
                     {fixtures.map((f) => (
                       <option key={f.fixture_id} value={f.fixture_id}>{f.participant1} v {f.participant2} · {f.competition}</option>
