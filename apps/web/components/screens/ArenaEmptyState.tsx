@@ -11,7 +11,7 @@ export function ArenaEmptyState() {
       </p>
       <div className={styles.actions}>
         <Link href="/competitions" className={styles.cta}>View competitions →</Link>
-        <Link href="/markets" className={styles.ctaSecondary}>Browse the Replay Library (Markets) →</Link>
+        <Link href="/markets" className={styles.ctaSecondary}>Browse Markets →</Link>
       </div>
     </section>
   );

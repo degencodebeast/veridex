@@ -27,8 +27,8 @@ describe('Arena landing discovery', () => {
     expect(screen.getByRole('link', { name: /Argentina v Croatia/ }).getAttribute('href')).toBe('/arena/c_fin');
     // draft is excluded from the Arena landing.
     expect(screen.queryByRole('link', { name: /Draft comp/ })).toBeNull();
-    // Maker Lab entry lives under Arena (spec §6.2).
-    expect(screen.getByRole('link', { name: /Maker Lab/i })).toBeTruthy();
+    // The sealed maker benchmark lives in the Leaderboard "Maker" lane — Arena no longer duplicates it.
+    expect(screen.queryByRole('link', { name: /Maker Lab/i })).toBeNull();
   });
 
   it('renders the honest empty state when nothing is running/finalized', async () => {

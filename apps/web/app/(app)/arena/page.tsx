@@ -26,18 +26,11 @@ export default function ArenaPage() {
     return () => { alive = false; };
   }, []);
 
-  // The sealed maker benchmark has NO /maker App Router page — its real surface is the contextual
-  // Maker Proof Card route (/proof/maker/[id]). Link the rank-1 maker agent (txline-fair-mm); the id
-  // is display context only (SEC-005: one sealed maker source, the id never changes which result shows).
-  const makerLab = <Link href="/proof/maker/txline-fair-mm">Maker Lab (sealed benchmark) →</Link>;
-
+  // The sealed maker benchmark's natural home is the Leaderboard "Maker" lane (ranked by
+  // adverse-selection toxicity), which live-fetches /maker/arena-result — so Arena does NOT
+  // duplicate it as a bare link here.
   if (comps.length === 0) {
-    return (
-      <>
-        <ArenaEmptyState />
-        <nav aria-label="Arena divisions">{makerLab}</nav>
-      </>
-    );
+    return <ArenaEmptyState />;
   }
   return (
     <section aria-label="Arena — discovered competitions">
@@ -50,7 +43,6 @@ export default function ArenaPage() {
           </li>
         ))}
       </ul>
-      <nav aria-label="Arena divisions">{makerLab}</nav>
     </section>
   );
 }

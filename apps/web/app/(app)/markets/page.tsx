@@ -55,6 +55,7 @@ export default function MarketsPage() {
               // kickoff_ts is epoch SECONDS on the wire → ISO string; absent ⇒ '' (honest, never faked).
               start_time: m.kickoff_ts != null ? new Date(m.kickoff_ts * 1000).toISOString() : '',
               in_running: false, // replay catalog — never in-running
+              finished: true, // sealed replay of a COMPLETED match → renders FINAL, not PENDING
             })),
           ),
         );

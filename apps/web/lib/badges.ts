@@ -1,7 +1,7 @@
 // Status vocabulary + glyphs, per the V4 Status Badges table (PAT-002).
 export const BADGE_VARIANTS = [
   'replay', 'live', 'reproducible', 'verified', 'anchored', 'pending',
-  'not-anchored', 'valid', 'invalid', 'partial', 'eligible', 'not-eligible', 'llm',
+  'not-anchored', 'valid', 'invalid', 'partial', 'eligible', 'not-eligible', 'llm', 'final',
   // Maker Arena lane (MM-R1) — falsification verdicts + rung/caveat chips (SEC-005: never
   // reused to imply a directional CLV claim; these back only the maker surfaces).
   'mm-r1', 'separated', 'inconclusive', 'inverted', 'uncalibrated', 'small-n', 'trades-not-fills',
@@ -29,6 +29,7 @@ export const BADGE_META: Record<BadgeVariant, { glyph: string; label: string }> 
   eligible: { glyph: '●', label: 'Eligible' },
   'not-eligible': { glyph: '⊘', label: 'Not Eligible' },
   llm: { glyph: '', label: 'LLM' },
+  final: { glyph: '■', label: 'Finished' },
   'mm-r1': { glyph: '◆', label: 'MM-R1' },
   separated: { glyph: '✓', label: 'Separated' },
   inconclusive: { glyph: '≈', label: 'Inconclusive' },
