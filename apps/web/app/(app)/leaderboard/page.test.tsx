@@ -40,9 +40,11 @@ describe('LeaderboardPage — directional rows sourced via getLeaderboard (T-2, 
   });
 
   it('mock ON path: renders exactly the rows getLeaderboard returns (fixture passed through, not defaulted)', async () => {
+    vi.stubEnv('NEXT_PUBLIC_VERIDEX_MOCK', '1'); // mock mode is UNCHANGED — the page still fetches under it
     getLeaderboardMock.mockResolvedValue(LEADERBOARD_ROWS);
     render(<LeaderboardPage />);
     await waitFor(() => expect(screen.getAllByTestId('lb-row').length).toBe(LEADERBOARD_ROWS.length));
     expect(screen.queryByTestId('lb-empty')).toBeNull();
+    vi.unstubAllEnvs();
   });
 });

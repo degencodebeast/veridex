@@ -34,9 +34,14 @@ export default function MarketsPage() {
     getFeedHealth()
       .then((h) => { if (alive) setFeedHealth(h); })
       .catch(() => { if (alive) setFeedHealth(null); }); // honest "unavailable" on error — never a fake feed
-    getLeaderboard()
-      .then((r) => { if (alive) setLeaderboard(r); })
-      .catch(() => { if (alive) setLeaderboard([]); }); // honest-empty on error — never the fixture (T-2)
+    // Quarantine (spec §6.3): the ELIGIBLE AGENTS rail is /leaderboard-derived, and /leaderboard holds
+    // ONLY synthetic /demo/run rows off-mock. Fetch it ONLY under mock; off-mock the rail stays empty so
+    // smoke-seeded synthetic agents can never surface as production data. Mock mode is UNCHANGED.
+    if (isMockEnabled()) {
+      getLeaderboard()
+        .then((r) => { if (alive) setLeaderboard(r); })
+        .catch(() => { if (alive) setLeaderboard([]); });
+    }
     getReplayPacks()
       .then((p) => { if (alive) setReplayPacks(p); })
       .catch(() => { if (alive) setReplayPacks([]); }); // honest-empty on error — never a fake pack

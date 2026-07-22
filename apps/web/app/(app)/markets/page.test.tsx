@@ -26,8 +26,9 @@ describe('MarketsPage — honest off-mock (T-2): odds/fixtures gated by the mock
     getFeedHealthMock.mockResolvedValue(null);
     getLeaderboardMock.mockResolvedValue([]);
     render(<MarketsPage />);
-    // the readers still fire (self-gating) — wait for the wiring to settle
-    await waitFor(() => expect(getLeaderboardMock).toHaveBeenCalled());
+    // Quarantine (spec §6.3): off-mock the leaderboard reader is NOT called; getFeedHealth still is.
+    await waitFor(() => expect(getFeedHealthMock).toHaveBeenCalled());
+    expect(getLeaderboardMock).not.toHaveBeenCalled();
     expect(screen.getByText(/select a fixture/i)).toBeInTheDocument();
     // the demo fixture must NOT leak off-mock: no fixture button, no decoded odds, no team names.
     expect(screen.queryByTestId('fixture-18172280')).toBeNull();
@@ -40,7 +41,8 @@ describe('MarketsPage — honest off-mock (T-2): odds/fixtures gated by the mock
     getFeedHealthMock.mockRejectedValue(new Error('backend unavailable'));
     getLeaderboardMock.mockRejectedValue(new Error('backend unavailable'));
     render(<MarketsPage />);
-    await waitFor(() => expect(getLeaderboardMock).toHaveBeenCalled());
+    await waitFor(() => expect(getFeedHealthMock).toHaveBeenCalled());
+    expect(getLeaderboardMock).not.toHaveBeenCalled();
     expect(screen.getByText(/select a fixture/i)).toBeInTheDocument();
     expect(screen.queryByTestId('fixture-18172280')).toBeNull();
     expect(screen.queryByText('1.472')).toBeNull();
@@ -55,5 +57,9 @@ describe('MarketsPage — honest off-mock (T-2): odds/fixtures gated by the mock
     await waitFor(() => expect(screen.getByTestId('fixture-18172280')).toBeInTheDocument());
     const fam = await screen.findByTestId('families');
     expect(within(fam).getAllByText('1.472').length).toBeGreaterThanOrEqual(1); // decoded decimal odds
+    // Quarantine (spec §6.3): mock mode is UNCHANGED — leaderboard IS fetched and the eligible rail populates.
+    await waitFor(() => expect(getLeaderboardMock).toHaveBeenCalled());
+    const rail = screen.getByTestId('rail-eligible-agents');
+    expect(within(rail).queryByText(/no eligible agents yet/i)).toBeNull(); // populated from the 3 eligible rows
   });
 });

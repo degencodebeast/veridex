@@ -2,6 +2,7 @@
 import { useEffect, useState } from 'react';
 import { LeaderboardScreen } from '@/components/screens/LeaderboardScreen';
 import { getLeaderboard } from '@/lib/api';
+import { isMockEnabled } from '@/lib/mock';
 import type { LeaderboardRow } from '@/lib/catalog';
 
 // The DIRECTIONAL leaderboard is sourced through the self-gating getLeaderboard() reader (lib/api.ts):
@@ -12,6 +13,10 @@ import type { LeaderboardRow } from '@/lib/catalog';
 export default function LeaderboardPage() {
   const [rows, setRows] = useState<LeaderboardRow[]>([]);
   useEffect(() => {
+    // Quarantine (spec §6.3): the global /leaderboard is populated ONLY by synthetic /demo/run rows,
+    // so no off-mock production surface consumes it. Mock mode is UNCHANGED (shows the wire fixture);
+    // off-mock renders the honest empty state (no durable directional source yet).
+    if (!isMockEnabled()) { setRows([]); return; }
     let alive = true;
     getLeaderboard()
       .then((r) => { if (alive) setRows(r); })
