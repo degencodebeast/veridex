@@ -90,5 +90,14 @@ def test_canonical_deploy_config_hash_matches_fresh_build() -> None:
     assert canonical_deploy_config(baseline).config_hash() == fresh.config_hash()
 
 
-def test_seed_definition_hash_deterministic() -> None:
+#: Golden digest of the pinned canonical DEPLOY CONFIGS (config-only, by design).
+#: Pinned from d19a0d8's shipped configs; a change to any pinned config (or the schema
+#: version) moves this digest and fails the test. A display_name / public_agent_id change
+#: does NOT move it (that drift is caught at the store/ledger layer, not this hash).
+_GOLDEN_SEED_DEFINITION_HASH = "107a86f680686214b672cf40d5b52ebffc042b5aeacc164144119e463564ccf7"
+
+
+def test_seed_definition_hash_matches_golden_pin() -> None:
+    # Determinism (byte-stable across calls) AND the golden config-only fingerprint.
     assert seed_definition_hash() == seed_definition_hash()
+    assert seed_definition_hash() == _GOLDEN_SEED_DEFINITION_HASH

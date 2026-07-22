@@ -2,8 +2,10 @@
 
 This module pins the COMPLETE canonical :class:`~veridex.deploy.preflight.DeployConfig` for the two
 OFFICIAL directional agents (``baseline``, ``momentum``) — the verified-runtime-scoreable set on the
-shipped ``demo_pack_real`` pack — plus a stable seed-definition hash that ties the pinned configs to
-a schema version so a reproducibility check can detect any drift in what the league seeds.
+shipped ``demo_pack_real`` pack — plus a stable hash that ties the pinned configs to a schema version
+so a reproducibility check can detect drift in the seeded DEPLOY CONFIGS. The hash is deliberately
+config-only (it equals each deployed instance's ``config_hash``); the public identity binding is
+tracked at the store/ledger layer, NOT in this hash (see :func:`seed_definition_hash`).
 
 HONESTY BOUNDARY (Gate-1): exactly TWO official agents. No ``momentum-sharp`` /
 ``cumulative-drift`` (template-only on the shipped pack) / ``value-vs-venue`` (not runtime-viable) /
@@ -21,6 +23,7 @@ from __future__ import annotations
 
 import hashlib
 from dataclasses import dataclass
+from typing import Literal
 
 from veridex.deploy.preflight import DeployConfig
 from veridex.runtime.evidence import serialize_payload
@@ -35,8 +38,9 @@ LEAGUE_FIXTURES = [18213979, 18222446]
 #: The verified R-2 replay pack the official agents replay (the literal catalog id).
 _REPLAY_PACK_ID = "demo_pack_real"
 
-#: The pinned replay fixture the canonical config selects (first league fixture).
-_REPLAY_FIXTURE_ID = 18213979
+#: The pinned replay fixture the canonical config selects (first league fixture); bound to
+#: ``LEAGUE_FIXTURES[0]`` so the two constants cannot drift.
+_REPLAY_FIXTURE_ID = LEAGUE_FIXTURES[0]
 
 
 @dataclass(frozen=True)
@@ -55,7 +59,7 @@ class OfficialAgentDef:
     public_agent_id: str
     template_id: str
     agent_id: str
-    strategy: str
+    strategy: Literal["baseline", "momentum"]
     display_name: str
     idempotency_key: str
 
@@ -97,7 +101,7 @@ def canonical_deploy_config(defn: OfficialAgentDef) -> DeployConfig:
     return DeployConfig(
         template_id=defn.template_id,
         agent_id=defn.agent_id,
-        strategy=defn.strategy,  # type: ignore[arg-type]
+        strategy=defn.strategy,
         source_mode="replay",
         execution_mode="paper",
         replay_pack_id=_REPLAY_PACK_ID,
@@ -111,14 +115,20 @@ def canonical_deploy_config(defn: OfficialAgentDef) -> DeployConfig:
 
 
 def seed_definition_hash() -> str:
-    """Deterministic reproducibility hash over the pinned seed definitions.
+    """Deterministic fingerprint of the pinned canonical DEPLOY CONFIGS.
 
-    Hashes ``(DEPLOYCONFIG_SCHEMA_VERSION, sorted per-agent config hashes)`` via the ONE canonical
-    serializer, so the digest is byte-stable across processes and shifts iff a pinned config (or the
-    schema version) changes.
+    Hashes ``(DEPLOYCONFIG_SCHEMA_VERSION, sorted per-agent config_hash())`` via the ONE canonical
+    serializer, so the digest is byte-stable across processes. Deliberately config-only: this equals
+    the ``config_hash`` the deploy route pins for each deployed instance, so a reproducibility check
+    can compare the shipped seed's configs against the live deployment.
+
+    The public identity binding (``public_agent_id`` ↔ instance) is intentionally NOT hashed here —
+    it is tracked in the store instance link + the seed ledger. A change to a pinned config
+    (strategy, pack, fixture, knobs) moves this digest; a change to a ``display_name`` /
+    ``public_agent_id`` does not (that drift is caught at the store/ledger layer).
 
     Returns:
-        The hex SHA-256 of the canonical serialization of the seed definitions.
+        The hex SHA-256 of the canonical serialization of the pinned deploy configs.
     """
     payload = {
         "schema_version": DEPLOYCONFIG_SCHEMA_VERSION,
