@@ -44,6 +44,7 @@ from veridex.deploy.attempt import AttemptStatus, DeploymentAttempt, DuplicateAt
 from veridex.deploy.instance import AgentInstance, DeployFailureReason, DeployStatus
 from veridex.dust_execution.provisioning_record import ExecutionWalletProvisioningRecord
 from veridex.execution.models import ExecutionRecord
+from veridex.public_agent import OperatorClass, Origin, PublicAgent, Visibility
 from veridex.runtime.evidence import serialize_payload
 
 if TYPE_CHECKING:  # avoid an import cycle (orchestrator type-hints Store)
@@ -780,6 +781,85 @@ class Store(Protocol):
         """
         ...
 
+    # --- public-agent identity methods (Official Replay League A2) ---
+
+    async def persist_public_agent(self, agent: PublicAgent) -> None:
+        """Upsert a :class:`~veridex.public_agent.PublicAgent` identity, keyed by ``public_agent_id``.
+
+        Args:
+            agent: The public identity to persist (a re-persist for the same id overwrites).
+        """
+        ...
+
+    async def get_public_agent(self, public_agent_id: str) -> PublicAgent | None:
+        """Load a public-agent identity by id.
+
+        Args:
+            public_agent_id: The id used at :meth:`persist_public_agent`.
+
+        Returns:
+            The reconstructed :class:`~veridex.public_agent.PublicAgent`, or ``None`` if absent.
+        """
+        ...
+
+    async def list_public_agents(self) -> list[PublicAgent]:
+        """Return every persisted public-agent identity (no filtering here).
+
+        Returns:
+            All :class:`~veridex.public_agent.PublicAgent` records (any order).
+        """
+        ...
+
+    async def set_public_agent_visibility(
+        self, public_agent_id: str, visibility: Visibility, *, updated_at: str
+    ) -> None:
+        """Update a public agent's visibility, store ``updated_at``, and bump ``version``.
+
+        Args:
+            public_agent_id: The identity to update.
+            visibility: The new two-state discoverability flag.
+            updated_at: ISO-8601 UTC timestamp of this write (caller owns the clock).
+
+        Raises:
+            KeyError: If no public agent with ``public_agent_id`` exists.
+        """
+        ...
+
+    async def set_public_agent_display_name(
+        self, public_agent_id: str, display_name: str, *, updated_at: str
+    ) -> None:
+        """Update a public agent's display name, store ``updated_at``, and bump ``version``.
+
+        Args:
+            public_agent_id: The identity to update.
+            display_name: The new human-facing name.
+            updated_at: ISO-8601 UTC timestamp of this write (caller owns the clock).
+
+        Raises:
+            KeyError: If no public agent with ``public_agent_id`` exists.
+        """
+        ...
+
+    async def link_instance_public_agent(self, instance_id: str, public_agent_id: str) -> None:
+        """Durably link a deployed instance to its public-agent identity.
+
+        Args:
+            instance_id: The deployed instance to link.
+            public_agent_id: The public identity the instance belongs to.
+        """
+        ...
+
+    async def get_instance_public_agent_id(self, instance_id: str) -> str | None:
+        """Return the ``public_agent_id`` linked to a deployed instance, or ``None`` if unlinked.
+
+        Args:
+            instance_id: The deployed instance to look up.
+
+        Returns:
+            The linked ``public_agent_id``, or ``None`` when no link exists.
+        """
+        ...
+
     async def persist_deployment_attempt(self, attempt: DeploymentAttempt) -> None:
         """INSERT a durable deployment-attempt claim (the deploy-saga idempotency backbone).
 
@@ -1039,6 +1119,10 @@ class InMemoryStore:
         self._competition_events: dict[str, list[CompetitionEvent]] = {}
         self._execution_records: dict[str, ExecutionRecord] = {}
         self._agent_instances: dict[str, AgentInstance] = {}
+        # Public-agent identities (A2), keyed by public_agent_id, + the durable instance→public-agent
+        # link — the in-code mirror of the Postgres public_agents table + agent_instances FK column.
+        self._public_agents: dict[str, PublicAgent] = {}
+        self._instance_public_agent: dict[str, str] = {}
         # Append-only deployment-attempt ledger, keyed by (operator_id, idempotency_key) — the
         # in-code mirror of the Postgres UNIQUE(operator_id, idempotency_key) claim (I-3).
         self._deployment_attempts: dict[tuple[str, str], DeploymentAttempt] = {}
@@ -1574,6 +1658,85 @@ class InMemoryStore:
         """
         return [inst.model_copy(deep=True) for inst in self._agent_instances.values()]
 
+    # --- public-agent identity methods (Official Replay League A2) ---
+
+    async def persist_public_agent(self, agent: PublicAgent) -> None:
+        """Upsert a copy of the public-agent identity keyed by ``public_agent_id``.
+
+        Args:
+            agent: The public identity to persist.
+        """
+        self._public_agents[agent.public_agent_id] = agent.model_copy(deep=True)
+
+    async def get_public_agent(self, public_agent_id: str) -> PublicAgent | None:
+        """Return a copy of the stored public-agent identity, or ``None`` if absent.
+
+        Args:
+            public_agent_id: The id used at :meth:`persist_public_agent`.
+
+        Returns:
+            A fresh copy of the stored :class:`~veridex.public_agent.PublicAgent`, or ``None``.
+        """
+        stored = self._public_agents.get(public_agent_id)
+        return stored.model_copy(deep=True) if stored is not None else None
+
+    async def list_public_agents(self) -> list[PublicAgent]:
+        """Return copies of every stored public-agent identity (any order)."""
+        return [agent.model_copy(deep=True) for agent in self._public_agents.values()]
+
+    async def set_public_agent_visibility(
+        self, public_agent_id: str, visibility: Visibility, *, updated_at: str
+    ) -> None:
+        """Set visibility, store ``updated_at``, and bump ``version`` on the immutable model.
+
+        Args:
+            public_agent_id: The identity to update.
+            visibility: The new discoverability flag.
+            updated_at: ISO-8601 UTC timestamp of this write.
+
+        Raises:
+            KeyError: If no public agent with ``public_agent_id`` exists.
+        """
+        stored = self._public_agents.get(public_agent_id)
+        if stored is None:
+            raise KeyError(f"no public agent with public_agent_id={public_agent_id!r}")
+        self._public_agents[public_agent_id] = stored.model_copy(
+            update={"visibility": visibility, "updated_at": updated_at, "version": stored.version + 1}
+        )
+
+    async def set_public_agent_display_name(
+        self, public_agent_id: str, display_name: str, *, updated_at: str
+    ) -> None:
+        """Set display name, store ``updated_at``, and bump ``version`` on the immutable model.
+
+        Args:
+            public_agent_id: The identity to update.
+            display_name: The new human-facing name.
+            updated_at: ISO-8601 UTC timestamp of this write.
+
+        Raises:
+            KeyError: If no public agent with ``public_agent_id`` exists.
+        """
+        stored = self._public_agents.get(public_agent_id)
+        if stored is None:
+            raise KeyError(f"no public agent with public_agent_id={public_agent_id!r}")
+        self._public_agents[public_agent_id] = stored.model_copy(
+            update={"display_name": display_name, "updated_at": updated_at, "version": stored.version + 1}
+        )
+
+    async def link_instance_public_agent(self, instance_id: str, public_agent_id: str) -> None:
+        """Record the durable instance→public-agent link.
+
+        Args:
+            instance_id: The deployed instance to link.
+            public_agent_id: The public identity the instance belongs to.
+        """
+        self._instance_public_agent[instance_id] = public_agent_id
+
+    async def get_instance_public_agent_id(self, instance_id: str) -> str | None:
+        """Return the linked ``public_agent_id`` for ``instance_id``, or ``None`` if unlinked."""
+        return self._instance_public_agent.get(instance_id)
+
     # --- deployment-attempt ledger methods (I-3 — write-once idempotency claim) ---
 
     async def persist_deployment_attempt(self, attempt: DeploymentAttempt) -> None:
@@ -1939,6 +2102,36 @@ class PostgresStore:
                 """
             )
             await cur.execute("CREATE INDEX IF NOT EXISTS idx_agent_instances_run_id ON agent_instances(run_id)")
+
+            # --- public-agent identity table + instance FK link (Official Replay League A2) ---
+            # Business columns are AUTHORITATIVE (queried directly) — NOT stuffed into a blob. The
+            # instance→public-agent link is a FK column ADDED to the existing agent_instances table.
+            await cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS public_agents (
+                    public_agent_id TEXT PRIMARY KEY,
+                    owner_ref TEXT,
+                    display_name TEXT NOT NULL,
+                    visibility TEXT NOT NULL,
+                    operator_class TEXT NOT NULL,
+                    origin TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    version INTEGER NOT NULL
+                )
+                """
+            )
+            await cur.execute(
+                "CREATE INDEX IF NOT EXISTS idx_public_agents_visibility ON public_agents(visibility)"
+            )
+            await cur.execute(
+                "ALTER TABLE agent_instances ADD COLUMN IF NOT EXISTS public_agent_id TEXT "
+                "REFERENCES public_agents(public_agent_id)"
+            )
+            await cur.execute(
+                "CREATE INDEX IF NOT EXISTS idx_agent_instances_public_agent_id "
+                "ON agent_instances(public_agent_id)"
+            )
 
             # --- realized-fill ledger (SAF-002b/c — durable, APPEND-ONLY, fee-inclusive) ---
             # BIGSERIAL PK gives a monotonic unique seq; INSERT-only (never UPDATE/DELETE),
@@ -3012,6 +3205,202 @@ class PostgresStore:
         finally:
             await self._release(conn)
         return [AgentInstance.model_validate(json.loads(row[0])) for row in rows]
+
+    # --- public-agent identity methods (Official Replay League A2) ---
+
+    async def persist_public_agent(self, agent: PublicAgent) -> None:
+        """Upsert one public-agent identity into explicit business columns (no blob).
+
+        Uses ``ON CONFLICT (public_agent_id) DO UPDATE`` so a re-persist is idempotent. All SQL is
+        parameterized; psycopg stays lazy.
+
+        Args:
+            agent: The public identity to persist.
+        """
+        conn = await self._connect()
+        try:
+            async with conn.transaction(), conn.cursor() as cur:
+                await cur.execute(
+                    """
+                    INSERT INTO public_agents
+                        (public_agent_id, owner_ref, display_name, visibility, operator_class,
+                         origin, created_at, updated_at, version)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (public_agent_id) DO UPDATE SET
+                        owner_ref      = EXCLUDED.owner_ref,
+                        display_name   = EXCLUDED.display_name,
+                        visibility     = EXCLUDED.visibility,
+                        operator_class = EXCLUDED.operator_class,
+                        origin         = EXCLUDED.origin,
+                        created_at     = EXCLUDED.created_at,
+                        updated_at     = EXCLUDED.updated_at,
+                        version        = EXCLUDED.version
+                    """,
+                    (
+                        agent.public_agent_id,
+                        agent.owner_ref,
+                        agent.display_name,
+                        agent.visibility.value,
+                        agent.operator_class.value,
+                        agent.origin.value,
+                        agent.created_at,
+                        agent.updated_at,
+                        agent.version,
+                    ),
+                )
+        finally:
+            await self._release(conn)
+
+    async def get_public_agent(self, public_agent_id: str) -> PublicAgent | None:
+        """Fetch and reconstruct a public-agent identity by id, or ``None`` if absent.
+
+        Args:
+            public_agent_id: The id used at :meth:`persist_public_agent`.
+
+        Returns:
+            The reconstructed :class:`~veridex.public_agent.PublicAgent`, or ``None``.
+        """
+        conn = await self._connect()
+        try:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    """
+                    SELECT public_agent_id, owner_ref, display_name, visibility, operator_class,
+                           origin, created_at, updated_at, version
+                    FROM public_agents WHERE public_agent_id = %s
+                    """,
+                    (public_agent_id,),
+                )
+                row = await cur.fetchone()
+        finally:
+            await self._release(conn)
+        if row is None:
+            return None
+        return self._row_to_public_agent(row)
+
+    async def list_public_agents(self) -> list[PublicAgent]:
+        """Reconstruct every public-agent identity from its business columns (any order)."""
+        conn = await self._connect()
+        try:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    """
+                    SELECT public_agent_id, owner_ref, display_name, visibility, operator_class,
+                           origin, created_at, updated_at, version
+                    FROM public_agents
+                    """
+                )
+                rows = await cur.fetchall()
+        finally:
+            await self._release(conn)
+        return [self._row_to_public_agent(row) for row in rows]
+
+    @staticmethod
+    def _row_to_public_agent(row: Any) -> PublicAgent:
+        """Reconstruct a :class:`~veridex.public_agent.PublicAgent` from a queried column row."""
+        return PublicAgent(
+            public_agent_id=row[0],
+            owner_ref=row[1],
+            display_name=row[2],
+            visibility=Visibility(row[3]),
+            operator_class=OperatorClass(row[4]),
+            origin=Origin(row[5]),
+            created_at=row[6],
+            updated_at=row[7],
+            version=row[8],
+        )
+
+    async def set_public_agent_visibility(
+        self, public_agent_id: str, visibility: Visibility, *, updated_at: str
+    ) -> None:
+        """Update the visibility column, store ``updated_at``, and bump ``version`` in one statement.
+
+        Args:
+            public_agent_id: The identity to update.
+            visibility: The new discoverability flag.
+            updated_at: ISO-8601 UTC timestamp of this write.
+
+        Raises:
+            KeyError: If no public agent with ``public_agent_id`` exists.
+        """
+        conn = await self._connect()
+        try:
+            async with conn.transaction(), conn.cursor() as cur:
+                await cur.execute(
+                    """
+                    UPDATE public_agents
+                    SET visibility = %s, updated_at = %s, version = version + 1
+                    WHERE public_agent_id = %s
+                    """,
+                    (visibility.value, updated_at, public_agent_id),
+                )
+                if cur.rowcount == 0:
+                    raise KeyError(f"no public agent with public_agent_id={public_agent_id!r}")
+        finally:
+            await self._release(conn)
+
+    async def set_public_agent_display_name(
+        self, public_agent_id: str, display_name: str, *, updated_at: str
+    ) -> None:
+        """Update the display_name column, store ``updated_at``, and bump ``version`` in one statement.
+
+        Args:
+            public_agent_id: The identity to update.
+            display_name: The new human-facing name.
+            updated_at: ISO-8601 UTC timestamp of this write.
+
+        Raises:
+            KeyError: If no public agent with ``public_agent_id`` exists.
+        """
+        conn = await self._connect()
+        try:
+            async with conn.transaction(), conn.cursor() as cur:
+                await cur.execute(
+                    """
+                    UPDATE public_agents
+                    SET display_name = %s, updated_at = %s, version = version + 1
+                    WHERE public_agent_id = %s
+                    """,
+                    (display_name, updated_at, public_agent_id),
+                )
+                if cur.rowcount == 0:
+                    raise KeyError(f"no public agent with public_agent_id={public_agent_id!r}")
+        finally:
+            await self._release(conn)
+
+    async def link_instance_public_agent(self, instance_id: str, public_agent_id: str) -> None:
+        """Set the ``agent_instances.public_agent_id`` FK column for one instance.
+
+        Args:
+            instance_id: The deployed instance to link.
+            public_agent_id: The public identity the instance belongs to.
+        """
+        conn = await self._connect()
+        try:
+            async with conn.transaction(), conn.cursor() as cur:
+                await cur.execute(
+                    "UPDATE agent_instances SET public_agent_id = %s WHERE instance_id = %s",
+                    (public_agent_id, instance_id),
+                )
+        finally:
+            await self._release(conn)
+
+    async def get_instance_public_agent_id(self, instance_id: str) -> str | None:
+        """Return the linked ``public_agent_id`` FK for ``instance_id``, or ``None`` if unlinked/absent."""
+        conn = await self._connect()
+        try:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "SELECT public_agent_id FROM agent_instances WHERE instance_id = %s",
+                    (instance_id,),
+                )
+                row = await cur.fetchone()
+        finally:
+            await self._release(conn)
+        if row is None:
+            return None
+        public_agent_id: str | None = row[0]
+        return public_agent_id
 
     # --- deployment-attempt ledger methods (I-3 — write-once idempotency claim) ---
 
