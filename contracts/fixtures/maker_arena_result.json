@@ -122,5 +122,133 @@
     "avg_toxicity_loss_bps_label": "rank_axis_lower_is_better",
     "real_executable_edge_bps_label": "always_null_no_fill_or_pnl_claim",
     "trade_aware_diagnostic_label": "report_only_no_fill_or_edge_claim"
-  }
+  },
+  "fixture_metadata": [
+    {
+      "fixture_id": 17588229,
+      "home_team": "Paraguay",
+      "away_team": "Australia",
+      "kickoff_ts": 1782439010,
+      "label_source": "captured"
+    },
+    {
+      "fixture_id": 17588234,
+      "home_team": "Norway",
+      "away_team": "France",
+      "kickoff_ts": 1782500409,
+      "label_source": "captured"
+    },
+    {
+      "fixture_id": 17588245,
+      "home_team": "Croatia",
+      "away_team": "Ghana",
+      "kickoff_ts": 1782593807,
+      "label_source": "captured"
+    },
+    {
+      "fixture_id": 17588325,
+      "home_team": "Jordan",
+      "away_team": "Argentina",
+      "kickoff_ts": 1782611759,
+      "label_source": "captured"
+    },
+    {
+      "fixture_id": 17588391,
+      "home_team": "Colombia",
+      "away_team": "Portugal",
+      "kickoff_ts": 1782602715,
+      "label_source": "captured"
+    },
+    {
+      "fixture_id": 17588404,
+      "home_team": "Uruguay",
+      "away_team": "Spain",
+      "kickoff_ts": 1782518218,
+      "label_source": "captured"
+    },
+    {
+      "fixture_id": 17926593,
+      "home_team": "Turkey",
+      "away_team": "USA",
+      "kickoff_ts": 1782438929,
+      "label_source": "captured"
+    },
+    {
+      "fixture_id": 18167317,
+      "home_team": "South Africa",
+      "away_team": "Canada",
+      "kickoff_ts": 1782672905,
+      "label_source": "captured"
+    },
+    {
+      "fixture_id": 18172280,
+      "home_team": "Netherlands",
+      "away_team": "Morocco",
+      "kickoff_ts": 1782781078,
+      "label_source": "captured"
+    },
+    {
+      "fixture_id": 18172469,
+      "home_team": "Brazil",
+      "away_team": "Japan",
+      "kickoff_ts": 1782752117,
+      "label_source": "captured"
+    },
+    {
+      "fixture_id": 18175918,
+      "home_team": "Argentina",
+      "away_team": "Cape Verde",
+      "kickoff_ts": 1783115725,
+      "label_source": "captured"
+    },
+    {
+      "fixture_id": 18175981,
+      "home_team": "France",
+      "away_team": "Sweden",
+      "kickoff_ts": 1782853001,
+      "label_source": "captured"
+    },
+    {
+      "fixture_id": 18175983,
+      "home_team": "Germany",
+      "away_team": "Paraguay",
+      "kickoff_ts": 1782764727,
+      "label_source": "captured"
+    },
+    {
+      "fixture_id": 18176123,
+      "home_team": "Australia",
+      "away_team": "Egypt",
+      "kickoff_ts": 1783101319,
+      "label_source": "captured"
+    },
+    {
+      "fixture_id": 18179550,
+      "home_team": "Belgium",
+      "away_team": "Senegal",
+      "kickoff_ts": 1782935707,
+      "label_source": "captured"
+    },
+    {
+      "fixture_id": 18179551,
+      "home_team": "Spain",
+      "away_team": "Austria",
+      "kickoff_ts": 1783018805,
+      "label_source": "captured"
+    },
+    {
+      "fixture_id": 18179759,
+      "home_team": "Mexico",
+      "away_team": "Ecuador",
+      "kickoff_ts": 1782867364,
+      "label_source": "captured"
+    },
+    {
+      "fixture_id": 18179763,
+      "home_team": "Portugal",
+      "away_team": "Croatia",
+      "kickoff_ts": 1783032980,
+      "label_source": "captured"
+    }
+  ]
 }

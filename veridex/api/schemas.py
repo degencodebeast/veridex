@@ -467,3 +467,8 @@ class MakerArenaResultResponse(BaseModel):
     result: dict[str, Any]
     proof_card: dict[str, Any]
     diagnostics: dict[str, Any]
+    #: ADDITIVE label join (never mutates the sealed ``result``). One row per raw ID in
+    #: ``result.fixtures`` order: ``{fixture_id (raw int, always), home_team, away_team,
+    #: kickoff_ts, label_source: "captured"|"unavailable"}``. Labels are captured/curated, never
+    #: "verified"; a missing/malformed source yields all-"unavailable" rows (raw IDs preserved).
+    fixture_metadata: list[dict[str, Any]] = []

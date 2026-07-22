@@ -48,6 +48,7 @@ if TYPE_CHECKING:
 # the maker scorer/tape machinery this read-only lane does not need).
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 SEALED_RESULT_PATH: Path = _REPO_ROOT / "scripts" / "txline_live" / "cp1" / "maker-arena-result.json"
+SEALED_FIXTURES_PATH: Path = _REPO_ROOT / "scripts" / "txline_live" / "cp1" / "fixtures.json"
 
 #: Axis-honesty labels: the ONE rank axis vs the diagnostics that must never be read as a rank.
 #: ``real_executable_edge_bps`` is pinned null everywhere — the maker lane claims no fill/PnL.
@@ -62,8 +63,72 @@ MAKER_DIAGNOSTICS: dict[str, str] = {
 }
 
 
+def _load_captured_labels(fixtures_path: Path) -> dict[int, dict[str, Any]]:
+    """Load ``cp1/fixtures.json`` into ``{fixture_id: {home_team, away_team, kickoff_ts, event_slug}}``.
+
+    WHOLE-FILE fallback: a missing or malformed file yields an EMPTY map (every label then renders
+    "unavailable"). It NEVER raises — the sealed benchmark must always be served.
+    """
+    try:
+        raw = json.loads(fixtures_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    labels: dict[int, dict[str, Any]] = {}
+    if isinstance(raw, list):
+        for row in raw:
+            if not isinstance(row, dict):
+                continue
+            fid = row.get("fixture_id")
+            if not isinstance(fid, int):
+                continue
+            labels[fid] = {
+                "home_team": row.get("home_team"),
+                "away_team": row.get("away_team"),
+                "kickoff_ts": row.get("kickoff_ts"),
+                "event_slug": row.get("event_slug"),
+            }
+    return labels
+
+
+def _build_fixture_metadata(
+    fixtures: tuple[int, ...], fixtures_path: Path
+) -> list[dict[str, Any]]:
+    """Join raw sealed fixture IDs against captured labels (ADDITIVE; never mutates ``fixtures``).
+
+    One row per raw ID, in ``fixtures`` order. A matched ID carries captured labels +
+    ``label_source="captured"``; an unmatched ID (or the whole-file fallback) carries null labels +
+    ``label_source="unavailable"``. The raw ``fixture_id`` int is ALWAYS present.
+    """
+    labels = _load_captured_labels(fixtures_path)
+    rows: list[dict[str, Any]] = []
+    for fid in fixtures:
+        label = labels.get(fid)
+        if label is None:
+            rows.append(
+                {
+                    "fixture_id": fid,
+                    "home_team": None,
+                    "away_team": None,
+                    "kickoff_ts": None,
+                    "label_source": "unavailable",
+                }
+            )
+        else:
+            rows.append(
+                {
+                    "fixture_id": fid,
+                    "home_team": label["home_team"],
+                    "away_team": label["away_team"],
+                    "kickoff_ts": label["kickoff_ts"],
+                    "label_source": "captured",
+                }
+            )
+    return rows
+
+
 def build_maker_arena_result_response(
     result_path: Path | None = None,
+    fixtures_path: Path | None = None,
 ) -> MakerArenaResultResponse:
     """Build the maker envelope from the sealed artifact (single source of truth).
 
@@ -86,6 +151,7 @@ def build_maker_arena_result_response(
         FileNotFoundError: When the sealed artifact is absent (the route maps this to 404).
     """
     path = result_path if result_path is not None else SEALED_RESULT_PATH
+    fpath = fixtures_path if fixtures_path is not None else SEALED_FIXTURES_PATH
     if not path.is_file():
         raise FileNotFoundError(f"sealed maker arena result not found: {path}")
 
@@ -97,6 +163,7 @@ def build_maker_arena_result_response(
         result=result.model_dump(mode="json"),
         proof_card=proof_card.model_dump(mode="json"),
         diagnostics=dict(MAKER_DIAGNOSTICS),
+        fixture_metadata=_build_fixture_metadata(result.fixtures, fpath),
     )
 
 

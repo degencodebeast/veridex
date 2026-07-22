@@ -32,6 +32,14 @@ RUN pip install --no-cache-dir ".[api,postgres,live,agent]"
 COPY scripts/fixtures/demo_pack_real /opt/veridex/replay-packs/curated
 ENV REPLAY_PACK_ROOT=/opt/veridex/replay-packs/curated
 
+# Quick-honest-enrichment: bake ONLY the two sealed maker cp1 files (NOT the rest of
+# scripts/txline_live/) so GET /maker/arena-result resolves in-image. maker_router._REPO_ROOT =
+# Path(__file__).resolve().parents[2]; `python -m veridex.api.server` runs from WORKDIR /app with
+# /app/veridex on sys.path[0], so the module resolves to /app/veridex/... → _REPO_ROOT=/app and the
+# sealed artifacts resolve under /app/scripts/txline_live/cp1/. Task 2 verifies this empirically.
+COPY scripts/txline_live/cp1/maker-arena-result.json /app/scripts/txline_live/cp1/maker-arena-result.json
+COPY scripts/txline_live/cp1/fixtures.json /app/scripts/txline_live/cp1/fixtures.json
+
 # Network binding (overridable). The process is the isolation boundary, so bind all interfaces.
 ENV HOST=0.0.0.0 \
     PORT=8000
