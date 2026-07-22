@@ -426,35 +426,46 @@ class ReplayPackListResponse(BaseModel):
 
 
 class AgentRosterEntry(BaseModel):
-    """One PUBLIC roster row projected from a deployed :class:`~veridex.deploy.instance.AgentInstance`.
+    """One row of the HONEST public agent directory, keyed on the immutable ``public_agent_id``.
 
-    The read-only, UNAUTHENTICATED ``GET /agents/roster`` view (mirrors ``/replay-packs``): one row per
-    deployed instance across ALL owners. Unlike the owner-scoped ``/agents/instances``, this roster is
-    NOT owner-filtered — ``owner`` is EXPOSED intentionally (a public "who deployed what" directory, by
-    design). An UNOWNED / legacy row (``operator_id is None``) surfaces ``owner=None`` honestly.
+    The read-only, UNAUTHENTICATED ``GET /agents/roster`` view (mirrors ``/replay-packs``). Unlike the
+    old leaky roster, this directory sources from ``store.list_public_agents()`` joined to deployment
+    state and admits an agent ONLY when its ``visibility == PUBLIC`` AND it has a linked instance whose
+    deploy status is ``SEALED``; private / pending / failed / running / unlinked agents are excluded.
 
-    The performance columns (``avg_clv_bps`` / ``runs`` / ``valid_pct``) are ALWAYS ``None`` here: there
-    is no cross-instance scoring aggregation yet, so they are honestly absent (the UI renders "—") —
-    NEVER fabricated as ``0`` or a placeholder number.
+    TRUST SURFACE: this row NEVER carries a raw ``operator_id`` / ``owner_ref`` (a Privy DID or internal
+    id). The only owner rendering is the SAFE ``owner_public_label`` — the legacy raw-shaped ``owner``
+    field is GONE.
+
+    The performance columns (``avg_clv_bps`` / ``runs`` / ``valid_pct``) are ``None`` and ``proof_state``
+    is ``"unscored"`` until the agent has scored board rows — honestly absent, NEVER fabricated. Once the
+    agent appears on the PUBLIC_AGENTS directional board they carry the REAL pooled values.
 
     Attributes:
-        agent_id: The deployed agent's identifier.
+        public_agent_id: The immutable public identifier the directory is keyed on.
+        display_name: Human-facing name from the public identity.
+        owner_public_label: SAFE public owner rendering (brand string / shortened wallet / em-dash) —
+            NEVER the raw ``operator_id`` / ``owner_ref``.
+        origin: The REAL :class:`~veridex.public_agent.Origin` value (honest ``unknown`` for legacy).
+        proof_state: ``"unscored"`` until scored; the REAL proof state once the agent has board rows.
+        agent_id: The deployed instance's identifier (informational; the directory keys on the public id).
         type: The strategy-archetype template the instance was configured from (``template_id``).
-        owner: The SERVER-DERIVED operator identity (``operator_id``); ``None`` == UNOWNED/legacy (honest).
-        source_mode: ``replay`` | ``live`` (the instance's data source).
+        source_mode: ``replay`` | ``live`` (the sealed instance's data source).
         execution_mode: ``paper`` | ``dry_run`` | ``live_guarded``.
-        status: The :class:`~veridex.deploy.instance.DeployStatus` value, lowercased.
-        config_hash_present: A REAL proof indicator — ``True`` when the instance pinned a
-            ``config_hash`` (a determinism-pin the deploy path sets only AFTER preflight passes).
-            Not a score / performance claim.
-        avg_clv_bps: Always ``None`` — no scoring aggregation exists (honest, never fabricated).
-        runs: Always ``None`` — no scoring aggregation exists (honest, never fabricated).
-        valid_pct: Always ``None`` — no scoring aggregation exists (honest, never fabricated).
+        status: The :class:`~veridex.deploy.instance.DeployStatus` value, lowercased (always ``sealed``).
+        config_hash_present: A REAL proof indicator — ``True`` when the instance pinned a ``config_hash``.
+        avg_clv_bps: ``None`` until scored, then the REAL pooled value (never fabricated).
+        runs: ``None`` until scored, then the REAL run count (never fabricated).
+        valid_pct: ``None`` until scored, then the REAL pooled value (never fabricated).
     """
 
+    public_agent_id: str
+    display_name: str
+    owner_public_label: str
+    origin: str
+    proof_state: str
     agent_id: str
     type: str
-    owner: str | None
     source_mode: str
     execution_mode: str
     status: str

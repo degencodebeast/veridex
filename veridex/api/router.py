@@ -53,12 +53,13 @@ from veridex.api.demo_fixtures import (
     contrarian_agent,
 )
 from veridex.api.deploy import DeployDeps, cancel_deploy_tasks, register_deploy_routes
+from veridex.api.fixture_labels import fixture_metadata_row
 from veridex.api.maker_router import register_maker_routes
 from veridex.api.schemas import (
     AgentRegisterResponse,
-    ApprovalResponse,
     AgentRosterEntry,
     AgentRosterResponse,
+    ApprovalResponse,
     BacktestRunRequest,
     BacktestRunResponse,
     CompetitionCreateResponse,
@@ -78,7 +79,6 @@ from veridex.api.schemas import (
     RuntimeEventsResponse,
     VerifyResponse,
 )
-from veridex.api.fixture_labels import fixture_metadata_row
 from veridex.api.ws import ArenaConnectionManager, register_arena_routes
 from veridex.backtest.report import BacktestReport
 from veridex.backtest.runner import run_backtest
@@ -114,7 +114,7 @@ from veridex.competition.service import (
     start_competition,
 )
 from veridex.config import Settings, get_settings
-from veridex.deploy.instance import AgentInstance
+from veridex.deploy.instance import AgentInstance, DeployStatus
 from veridex.execution.models import ExecutionRecord, ExecutionStatus
 from veridex.execution.runner import resolve_approval
 from veridex.explainer import GLOSSARY_DEFINITIONS, explain_proof
@@ -129,6 +129,7 @@ from veridex.ingest.replay_catalog import (
     resolve_replay_source,
 )
 from veridex.leaderboard import leaderboard as _build_leaderboard
+from veridex.public_agent import PublicAgent, Visibility, owner_public_label
 from veridex.public_projection import BoardKind, directional_board
 from veridex.runtime.arena_comparison import (
     DET_DRIFT_CONTESTANT,
@@ -384,25 +385,34 @@ def _replay_pack_info(entry: CatalogEntry) -> ReplayPackInfo:
     )
 
 
-def _agent_roster_entry(instance: AgentInstance) -> AgentRosterEntry:
-    """Project a deployed :class:`AgentInstance` into the PUBLIC read-only ``/agents/roster`` row.
+def _agent_roster_entry(
+    agent: PublicAgent,
+    instance: AgentInstance,
+    scored: dict[str, Any] | None,
+) -> AgentRosterEntry:
+    """Project one HONEST public-directory row keyed on the immutable ``public_agent_id``.
 
-    Surfaces ONLY public-safe deployment identity (agent / template / owner / modes / status) plus a
-    REAL ``config_hash_present`` proof indicator. The performance columns stay ``None`` — no scoring
-    aggregation exists yet, so they are honestly absent (never fabricated). ``owner`` is intentionally
-    exposed (public roster by design); an UNOWNED row (``operator_id is None``) surfaces ``owner=None``.
+    Joins the public identity (``agent``) to its SEALED deployment (``instance``) and, when present, the
+    agent's aggregated PUBLIC_AGENTS board row (``scored``). The owner is rendered ONLY via the safe
+    :func:`~veridex.public_agent.owner_public_label` — the raw ``operator_id`` / ``owner_ref`` NEVER
+    leaves the server. ``origin`` is the REAL identity value; performance columns and ``proof_state``
+    stay honestly absent (``None`` / ``"unscored"``) until the agent has scored rows, never fabricated.
     """
     return AgentRosterEntry(
+        public_agent_id=agent.public_agent_id,
+        display_name=agent.display_name,
+        owner_public_label=owner_public_label(agent),
+        origin=agent.origin.value,
+        proof_state=str(scored["proof_mode"]) if scored is not None else "unscored",
         agent_id=instance.agent_id,
         type=instance.template_id,
-        owner=instance.operator_id,
         source_mode=instance.source_mode,
         execution_mode=instance.execution_mode,
         status=instance.status.value.lower(),
         config_hash_present=bool(instance.config_hash),
-        avg_clv_bps=None,
-        runs=None,
-        valid_pct=None,
+        avg_clv_bps=scored["avg_clv_bps"] if scored is not None else None,
+        runs=scored["runs"] if scored is not None else None,
+        valid_pct=scored["valid_pct"] if scored is not None else None,
     )
 
 
@@ -707,20 +717,41 @@ def create_app(
     async def list_agents_roster(
         dep_store: Store = Depends(_get_store),  # noqa: B008
     ) -> AgentRosterResponse:
-        """PUBLIC (unauthenticated) roster of ALL deployed agent instances across ALL owners.
+        """PUBLIC (unauthenticated) HONEST agent directory, keyed on the immutable ``public_agent_id``.
 
-        Mirrors ``/replay-packs`` (read-only, NO auth). A pure projection of
-        ``store.list_agent_instances()`` — every instance's public-safe deployment identity (agent /
-        template / owner / modes / status) plus a REAL ``config_hash_present`` proof indicator, sorted
-        deterministically by ``(created_at, instance_id)``. Unlike the owner-scoped
-        ``/agents/instances`` (which fail-closed filters to the caller's own rows), this roster is NOT
-        owner-filtered: ``owner`` is exposed intentionally (a public "who deployed what" directory).
-        The performance columns are ``None`` — no cross-instance scoring aggregation exists yet, so they
-        are honestly absent (the UI renders "—"), NEVER fabricated.
+        Mirrors ``/replay-packs`` (read-only, NO auth). Sources from ``store.list_public_agents()``
+        joined to deployment state and admits an agent ONLY when its ``visibility == PUBLIC`` AND it has
+        a linked instance whose deploy status is ``SEALED`` — private / pending / failed / running /
+        unlinked agents are EXCLUDED. TRUST SURFACE: the owner is rendered ONLY via the safe
+        ``owner_public_label``; a raw ``operator_id`` / ``owner_ref`` NEVER appears. Performance columns
+        and ``proof_state`` are honestly absent (``None`` / ``"unscored"``) until the agent carries
+        scored PUBLIC_AGENTS board rows, then the REAL pooled values — never fabricated. No public+sealed
+        agents -> honest-empty. Rows are sorted deterministically by ``public_agent_id``.
         """
+        # Reverse the instance→public_agent_id link into {public_agent_id: sealed instance}. Only SEALED
+        # instances qualify; first sealed instance (by instance_id) wins deterministically per agent.
         instances = await dep_store.list_agent_instances()
-        ordered = sorted(instances, key=lambda inst: (inst.created_at, inst.instance_id))
-        return AgentRosterResponse(agents=[_agent_roster_entry(inst) for inst in ordered])
+        sealed_by_agent: dict[str, AgentInstance] = {}
+        for inst in sorted(instances, key=lambda i: i.instance_id):
+            if inst.status is not DeployStatus.SEALED:
+                continue
+            pub_id = await dep_store.get_instance_public_agent_id(inst.instance_id)
+            if pub_id is None or pub_id in sealed_by_agent:
+                continue
+            sealed_by_agent[pub_id] = inst
+
+        # Join the PUBLIC_AGENTS directional board (visibility-filtered, pooled) by public_agent_id.
+        board = await directional_board(dep_store, board_kind=BoardKind.PUBLIC_AGENTS)
+        scored_by_agent = {row["public_agent_id"]: row for row in board}
+
+        rows = [
+            _agent_roster_entry(agent, sealed_by_agent[agent.public_agent_id],
+                                scored_by_agent.get(agent.public_agent_id))
+            for agent in await dep_store.list_public_agents()
+            if agent.visibility is Visibility.PUBLIC and agent.public_agent_id in sealed_by_agent
+        ]
+        rows.sort(key=lambda r: r.public_agent_id)
+        return AgentRosterResponse(agents=rows)
 
     # --- GET /leaderboard/directional (Official Replay League completion layer) --
 
