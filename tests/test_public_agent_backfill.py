@@ -8,13 +8,12 @@ minted id is INJECTED (deterministic), and the pass is IDEMPOTENT: a second run 
 
 from __future__ import annotations
 
-import itertools
 from typing import Any
 
 import pytest
 
 from veridex.deploy.instance import AgentInstance
-from veridex.public_agent import OperatorClass, Origin, Visibility
+from veridex.public_agent import OperatorClass, Origin, PublicAgent, Visibility
 from veridex.public_agent_backfill import backfill_public_agents
 from veridex.store import InMemoryStore
 
@@ -49,10 +48,8 @@ async def store() -> InMemoryStore:
 
 
 async def test_backfill_mints_distinct_private_unknown_public_agents(store: InMemoryStore) -> None:
-    counter = itertools.count()
-
     minted = await backfill_public_agents(
-        store, now="2026-07-22T00:00:00Z", mint_id=lambda: f"agt_{next(counter)}"
+        store, now="2026-07-22T00:00:00Z", mint_id=lambda iid: f"agt_bf_{iid}"
     )
 
     assert minted == 2
@@ -78,8 +75,7 @@ async def test_backfill_mints_distinct_private_unknown_public_agents(store: InMe
 
 
 async def test_backfill_is_idempotent(store: InMemoryStore) -> None:
-    counter = itertools.count()
-    mint = lambda: f"agt_{next(counter)}"  # noqa: E731
+    mint = lambda iid: f"agt_bf_{iid}"  # noqa: E731
 
     first = await backfill_public_agents(store, now="2026-07-22T00:00:00Z", mint_id=mint)
     assert first == 2
@@ -89,3 +85,48 @@ async def test_backfill_is_idempotent(store: InMemoryStore) -> None:
     assert second == 0
     after = {a.public_agent_id for a in await store.list_public_agents()}
     assert after == before
+
+
+async def test_backfill_crash_between_persist_and_link_reuses_orphan(store: InMemoryStore) -> None:
+    """Fault injection: a crash AFTER persist but BEFORE link must not duplicate on retry.
+
+    Simulate the orphan a crash leaves behind — a PublicAgent persisted for ``inst_a`` under the
+    DETERMINISTIC id but NOT yet linked. On retry the deterministic minter re-derives the SAME id, so
+    ``persist_public_agent`` UPSERTs the same row (no second agent) and the link is completed. Net
+    after crash+retry: exactly ONE PublicAgent + ONE durable link, no orphan, no duplicate.
+    """
+    mint = lambda iid: f"agt_bf_{iid}"  # noqa: E731
+    orphan_pid = "agt_bf_inst_a"
+
+    # The orphan a crash-between-persist-and-link leaves: persisted, NOT linked.
+    await store.persist_public_agent(
+        PublicAgent(
+            public_agent_id=orphan_pid,
+            display_name="studio-agent-inst_a",
+            operator_class=OperatorClass.USER,
+            origin=Origin.UNKNOWN,
+            visibility=Visibility.PRIVATE,
+            owner_ref="did:privy:ALICE",
+            created_at="2026-07-22T00:00:00Z",
+            updated_at="2026-07-22T00:00:00Z",
+            version=1,
+        )
+    )
+    assert await store.get_instance_public_agent_id("inst_a") is None
+    agents_before = await store.list_public_agents()
+    assert len(agents_before) == 1
+
+    minted = await backfill_public_agents(store, now="2026-07-22T00:00:00Z", mint_id=mint)
+    assert minted == 2
+
+    # (a) the orphan was REUSED via UPSERT, not duplicated: exactly one agent for inst_a.
+    agents_after = await store.list_public_agents()
+    assert [a.public_agent_id for a in agents_after].count(orphan_pid) == 1
+    assert len(agents_after) == 2  # inst_a (reused) + inst_b (fresh), not 3
+
+    # (b) inst_a is now linked to the deterministic id.
+    assert await store.get_instance_public_agent_id("inst_a") == orphan_pid
+
+    # (c) a second backfill is idempotent.
+    second = await backfill_public_agents(store, now="2026-07-23T00:00:00Z", mint_id=mint)
+    assert second == 0
