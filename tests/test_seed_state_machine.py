@@ -493,6 +493,61 @@ async def test_publish_gate_rejects_missing_run() -> None:
         await seed_mod._assert_publish_gate(store, competitions)
 
 
+async def test_publish_gate_rejects_zero_action() -> None:
+    """An official whose pooled scored action_count is 0 makes the publish gate RAISE.
+
+    Zeroes ``action_count`` on BOTH of one official's per-run projected rows (runs stays == 2, so
+    the runs check does not fire first) so the pooled sum across the league is 0 — the predicate's
+    action_count branch fires (Codex MAJOR-3's "zero-action" enumerated case).
+    """
+    app, store = _build()
+    try:
+        await run_seed(app, store, seed_revision="pg-zero-action")
+    finally:
+        await _drain(app)
+
+    ledger = await store.get_seed_state("pg-zero-action")
+    assert ledger is not None
+    competitions = ledger["competitions"]
+
+    baseline_pid = OFFICIAL_AGENTS[0].public_agent_id
+    # Zero action_count on EVERY per-run row for this official (both league runs) so the pooled
+    # sum is genuinely 0 rather than merely reduced.
+    for key, row in store._projected_rows.items():
+        if key[1] == baseline_pid:
+            row["action_count"] = 0
+
+    with pytest.raises(SeedError, match="action_count"):
+        await seed_mod._assert_publish_gate(store, competitions)
+
+
+async def test_publish_gate_rejects_wrong_provenance() -> None:
+    """An official whose pooled source_mode is not uniformly replay makes the publish gate RAISE.
+
+    Flips ONE of one official's two per-run projected rows to ``source_mode="live"`` — the board's
+    ``_summarize_source_mode`` then reports ``"mixed"`` (never ``"all-replay"``) for that agent while
+    ``runs``/``action_count``/``avg_clv_bps`` stay intact — the predicate's source_mode branch fires
+    (Codex MAJOR-3's "wrong-provenance" enumerated case).
+    """
+    app, store = _build()
+    try:
+        await run_seed(app, store, seed_revision="pg-provenance")
+    finally:
+        await _drain(app)
+
+    ledger = await store.get_seed_state("pg-provenance")
+    assert ledger is not None
+    competitions = ledger["competitions"]
+
+    baseline_pid = OFFICIAL_AGENTS[0].public_agent_id
+    # Flip ONE of the two per-run rows' source_mode to "live" -> the pooled summary becomes "mixed".
+    flip_key = next(key for key in store._projected_rows if key[1] == baseline_pid)
+    store._projected_rows[flip_key]["source_mode"] = "live"
+
+    with pytest.raises(SeedError, match="source_mode"):
+        await seed_mod._assert_publish_gate(store, competitions)
+
+
 # =====================================================================================
 # operator_token — when provided it is sent as a Bearer Authorization header (FIX 2).
 # =====================================================================================
