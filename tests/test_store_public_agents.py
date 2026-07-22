@@ -144,3 +144,23 @@ async def test_link_instance_public_agent_roundtrip(store: Store) -> None:
     await store.link_instance_public_agent(instance_id, pid)
 
     assert await store.get_instance_public_agent_id(instance_id) == pid
+
+
+async def test_link_instance_public_agent_absent_instance_raises(store: Store) -> None:
+    """A wrong/stale instance id must fail loudly (fail-closed), not silently no-op/dangle."""
+    pid = f"pa_{_suffix()}"
+    await store.persist_public_agent(_make_public_agent(pid))
+
+    with pytest.raises(KeyError):
+        await store.link_instance_public_agent(f"inst_missing_{_suffix()}", pid)
+
+
+async def test_link_instance_public_agent_absent_public_agent_raises(store: Store) -> None:
+    """A wrong/stale public_agent_id must fail loudly (fail-closed), identically in both stores."""
+    instance_id = f"inst_{_suffix()}"
+    await store.persist_agent_instance(_make_agent_instance(instance_id))
+
+    with pytest.raises(KeyError):
+        await store.link_instance_public_agent(instance_id, f"pa_missing_{_suffix()}")
+
+    assert await store.get_instance_public_agent_id(instance_id) is None

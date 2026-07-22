@@ -869,6 +869,11 @@ class Store(Protocol):
         Args:
             instance_id: The deployed instance to link.
             public_agent_id: The public identity the instance belongs to.
+
+        Raises:
+            KeyError: If no instance with ``instance_id`` exists, or no public agent with
+                ``public_agent_id`` exists (fail-closed, identical in both stores — a
+                wrong/stale id must fail loudly, never silently no-op or record a dangling link).
         """
         ...
 
@@ -1767,12 +1772,20 @@ class InMemoryStore:
         return [copy.deepcopy(row) for row in self._projected_rows.values()]
 
     async def link_instance_public_agent(self, instance_id: str, public_agent_id: str) -> None:
-        """Record the durable instance→public-agent link.
+        """Record the durable instance→public-agent link (fail-closed on absent id).
 
         Args:
             instance_id: The deployed instance to link.
             public_agent_id: The public identity the instance belongs to.
+
+        Raises:
+            KeyError: If no instance with ``instance_id`` exists, or no public agent with
+                ``public_agent_id`` exists.
         """
+        if instance_id not in self._agent_instances:
+            raise KeyError(f"no agent instance with instance_id={instance_id!r}")
+        if public_agent_id not in self._public_agents:
+            raise KeyError(f"no public agent with public_agent_id={public_agent_id!r}")
         self._instance_public_agent[instance_id] = public_agent_id
 
     async def get_instance_public_agent_id(self, instance_id: str) -> str | None:
@@ -3466,19 +3479,37 @@ class PostgresStore:
             await self._release(conn)
 
     async def link_instance_public_agent(self, instance_id: str, public_agent_id: str) -> None:
-        """Set the ``agent_instances.public_agent_id`` FK column for one instance.
+        """Set the ``agent_instances.public_agent_id`` FK column for one instance (fail-closed).
 
         Args:
             instance_id: The deployed instance to link.
             public_agent_id: The public identity the instance belongs to.
+
+        Raises:
+            KeyError: If no instance with ``instance_id`` exists (``rowcount == 0``), or no public
+                agent with ``public_agent_id`` exists (FK violation) — translated to the SAME
+                ``KeyError`` as :class:`InMemoryStore` so a wrong/stale id fails loudly and
+                identically, never a silent no-op.
         """
         conn = await self._connect()
         try:
             async with conn.transaction(), conn.cursor() as cur:
-                await cur.execute(
-                    "UPDATE agent_instances SET public_agent_id = %s WHERE instance_id = %s",
-                    (public_agent_id, instance_id),
-                )
+                try:
+                    await cur.execute(
+                        "UPDATE agent_instances SET public_agent_id = %s WHERE instance_id = %s",
+                        (public_agent_id, instance_id),
+                    )
+                except Exception as exc:
+                    # psycopg is already in sys.modules (imported inside _connect).
+                    import psycopg.errors  # noqa: PLC0415 (lazy, not at module level)
+
+                    if isinstance(exc, psycopg.errors.ForeignKeyViolation):
+                        raise KeyError(
+                            f"no public agent with public_agent_id={public_agent_id!r}"
+                        ) from exc
+                    raise
+                if cur.rowcount == 0:
+                    raise KeyError(f"no agent instance with instance_id={instance_id!r}")
         finally:
             await self._release(conn)
 
