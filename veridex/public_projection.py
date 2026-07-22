@@ -26,6 +26,7 @@ from veridex.leaderboard import leaderboard
 from veridex.public_agent import OperatorClass, Visibility
 
 if TYPE_CHECKING:
+    from veridex.public_agent import PublicAgent
     from veridex.store import Store
 
 _VALID_SOURCE_MODES = ("replay", "live")
@@ -127,22 +128,41 @@ async def directional_board(store: Store, *, board_kind: BoardKind) -> list[dict
     ``operator_class`` is :attr:`~veridex.public_agent.OperatorClass.OFFICIAL`.
 
     The surviving rows are handed UNCHANGED to :func:`veridex.leaderboard.leaderboard`, which groups
-    on ``agent_id`` (== the public id, as B1 emits) and pools per-agent across runs.
+    on ``agent_id`` (== the public id, as B1 emits) and pools per-agent across runs. Each aggregated
+    row is then ENRICHED into a DirectionalRow: the explicit ``public_agent_id`` (== the aggregated
+    ``agent_id``) plus the ``display_name`` joined from the SAME visibility-resolved public agent, so a
+    frontend can render the human name instead of the opaque id. The public agent for each id is
+    resolved exactly ONCE (cached during the visibility pass), removing the former per-row N+1.
 
     Args:
         store: The durable store to read projected rows and public-agent identities from.
         board_kind: Which board to build — official benchmark only, or all public agents.
 
     Returns:
-        The aggregated, ranked leaderboard rows for the kept agents (may be empty).
+        The aggregated, ranked leaderboard rows for the kept agents, each enriched with
+        ``public_agent_id`` and ``display_name`` (may be empty).
     """
     rows = await store.list_projected_rows()
     kept: list[dict[str, Any]] = []
+    # Resolve each public agent ONCE (removes the former per-row N+1) and, for the survivors, build a
+    # {public_agent_id: display_name} map reused to enrich the aggregated rows below.
+    resolved: dict[str, PublicAgent | None] = {}
+    names: dict[str, str] = {}
     for row in rows:
-        agent = await store.get_public_agent(row["public_agent_id"])
+        public_agent_id: str = row["public_agent_id"]
+        if public_agent_id not in resolved:
+            resolved[public_agent_id] = await store.get_public_agent(public_agent_id)
+        agent = resolved[public_agent_id]
         if agent is None or agent.visibility is not Visibility.PUBLIC:
             continue
         if board_kind is BoardKind.OFFICIAL_BENCHMARK and agent.operator_class is not OperatorClass.OFFICIAL:
             continue
+        names[public_agent_id] = agent.display_name
         kept.append(row)
-    return leaderboard(kept)
+
+    board = leaderboard(kept)
+    for agg in board:
+        # leaderboard groups on agent_id, which == the public id (B1 sets agent_id=public_agent_id).
+        agg["public_agent_id"] = agg["agent_id"]
+        agg["display_name"] = names[agg["agent_id"]]
+    return board

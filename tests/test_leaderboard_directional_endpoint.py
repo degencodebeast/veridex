@@ -84,8 +84,8 @@ def test_directional_official_benchmark_returns_two_scored_agents() -> None:
     _seed(
         store,
         [
-            _make_public_agent("off_a"),
-            _make_public_agent("off_b"),
+            _make_public_agent("off_a", display_name="Alpha Bot"),
+            _make_public_agent("off_b", display_name="Beta Bot"),
         ],
         [
             _make_projected_row("off_a", run_id="r1", action_count=5),
@@ -101,6 +101,13 @@ def test_directional_official_benchmark_returns_two_scored_agents() -> None:
     assert body["board_kind"] == "official_benchmark"
     assert len(body["rows"]) == 2
     assert {row["agent_id"] for row in body["rows"]} == {"off_a", "off_b"}
+    # DirectionalRow contract: the endpoint surfaces display_name + explicit public_agent_id so the
+    # frontend renders the human name, not the opaque id. These flow through the thin route unchanged.
+    by_id = {row["agent_id"]: row for row in body["rows"]}
+    assert by_id["off_a"]["public_agent_id"] == "off_a"
+    assert by_id["off_a"]["display_name"] == "Alpha Bot"
+    assert by_id["off_b"]["public_agent_id"] == "off_b"
+    assert by_id["off_b"]["display_name"] == "Beta Bot"
 
 
 def test_directional_no_scored_rows_is_honest_empty() -> None:

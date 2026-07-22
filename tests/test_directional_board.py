@@ -190,8 +190,49 @@ async def test_user_agent_scoped_to_public_agents_board_only(store: Store) -> No
     assert pid not in _board_by_agent(official_board, {pid})
 
 
+async def test_directional_board_enriches_rows_with_display_name_and_public_agent_id(
+    store: Store,
+) -> None:
+    """Each aggregated row carries the DirectionalRow contract: display_name + explicit public_agent_id.
+
+    Enrichment is joined from the visibility-resolved PublicAgent, so a frontend can render the
+    human name instead of the opaque id. ``public_agent_id`` is the row's aggregated ``agent_id``.
+    """
+    suffix = _suffix()
+    pid_a = f"off_a_{suffix}"
+    pid_b = f"off_b_{suffix}"
+    await store.persist_public_agent(
+        _make_public_agent(pid_a, operator_class=OperatorClass.OFFICIAL, display_name="Alpha Bot")
+    )
+    await store.persist_public_agent(
+        _make_public_agent(pid_b, operator_class=OperatorClass.OFFICIAL, display_name="Beta Bot")
+    )
+    await store.persist_projected_rows(
+        [
+            _make_projected_row(pid_a, run_id="r1", action_count=5),
+            _make_projected_row(pid_a, run_id="r2", action_count=7),
+            _make_projected_row(pid_b, run_id="r1", action_count=3),
+        ]
+    )
+
+    board = await directional_board(store, board_kind=BoardKind.OFFICIAL_BENCHMARK)
+    mine = _board_by_agent(board, {pid_a, pid_b})
+
+    assert set(mine) == {pid_a, pid_b}
+    for pid, name in ((pid_a, "Alpha Bot"), (pid_b, "Beta Bot")):
+        # public_agent_id is explicit AND equals the aggregated agent_id (the public id).
+        assert mine[pid]["public_agent_id"] == pid
+        assert mine[pid]["public_agent_id"] == mine[pid]["agent_id"]
+        # display_name is the persisted PublicAgent's display_name for that public id.
+        assert mine[pid]["display_name"] == name
+
+
 async def test_directional_board_equals_leaderboard_of_kept_rows(store: Store) -> None:
-    """directional_board is exactly leaderboard(kept_rows) — a thin visibility/scope join."""
+    """directional_board is leaderboard(kept_rows) PLUS the DirectionalRow enrichment keys.
+
+    The aggregation itself must be byte-identical to the pure aggregator; the only additions are the
+    ``display_name`` + explicit ``public_agent_id`` enrichment keys and the whole-board ``rank``.
+    """
     suffix = _suffix()
     pid = f"off_{suffix}"
     await store.persist_public_agent(_make_public_agent(pid, operator_class=OperatorClass.OFFICIAL))
@@ -203,7 +244,9 @@ async def test_directional_board_equals_leaderboard_of_kept_rows(store: Store) -
     mine = _board_by_agent(board, {pid})[pid]
     expected = {r["agent_id"]: r for r in leaderboard([r1, r2])}[pid]
     # ``rank`` is a whole-board property (the durable Postgres board pools other tests' official
-    # agents too), so compare every aggregated field EXCEPT rank — the aggregation must be identical.
-    assert {k: v for k, v in mine.items() if k != "rank"} == {
-        k: v for k, v in expected.items() if k != "rank"
+    # agents too); ``display_name``/``public_agent_id`` are the new read-time enrichment. Compare every
+    # aggregated field EXCEPT those three — the underlying aggregation must be identical.
+    _enrichment = {"rank", "display_name", "public_agent_id"}
+    assert {k: v for k, v in mine.items() if k not in _enrichment} == {
+        k: v for k, v in expected.items() if k not in _enrichment
     }
