@@ -30,6 +30,21 @@ describe('ReplayLibrary', () => {
     expect(screen.getByText(/No replay packs/i)).toBeTruthy();
   });
 
+  it('degrades honestly for an unavailable label: raw id + "label unavailable", never fabricated', () => {
+    const unlabeled: ReplayPackView = {
+      ...PACK,
+      fixtures: [18209181, 99999999],
+      fixtureMetadata: [
+        { fixture_id: 18209181, home_team: 'France', away_team: 'Morocco', kickoff_ts: 1783627200, label_source: 'captured' },
+        { fixture_id: 99999999, home_team: null, away_team: null, kickoff_ts: null, label_source: 'unavailable' },
+      ],
+    };
+    render(<ReplayLibrary packs={[unlabeled]} onLaunch={() => {}} />);
+    const row = screen.getByTestId('replay-fixture-99999999');
+    expect(within(row).getByText(/label unavailable/i)).toBeTruthy();
+    expect(within(row).getByText(/99999999/)).toBeTruthy();
+  });
+
   it('fires onLaunch with the raw pack_id + fixture_id (identity, not label text)', () => {
     const onLaunch = vi.fn();
     render(<ReplayLibrary packs={[PACK]} onLaunch={onLaunch} />);
