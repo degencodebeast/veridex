@@ -412,6 +412,11 @@ class ReplayPackInfo(BaseModel):
     provenance: str
     is_genuine: bool
     fixtures: list[int]
+    #: ADDITIVE server-derived label join (``fixtures: list[int]`` stays unchanged — raw IDs, wire
+    #: type intact). One row per fixture id: ``{fixture_id (raw int), home_team, away_team,
+    #: kickoff_ts, label_source: "captured"|"unavailable"}``. A frontend-duplicated label map is
+    #: prohibited (authority chain, spec §2/§5.2).
+    fixture_metadata: list[dict[str, Any]] = []
 
 
 class ReplayPackListResponse(BaseModel):

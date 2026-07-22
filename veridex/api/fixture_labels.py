@@ -14,6 +14,8 @@ never assert a claim the id itself does not already carry.
 
 from __future__ import annotations
 
+from typing import Any
+
 #: CURATED (home, away) team pairs, transcribed from the committed WC-QF fixtures capture
 #: (``scripts/txline_live/wc-qf-fixtures.json``), the same source ``pmxt_tape.py`` cites. NOT
 #: re-verified against the live TxLINE fixtures API at render time — a curated convenience label,
@@ -24,6 +26,44 @@ FIXTURE_LABELS: dict[int, tuple[str, str]] = {
     18213979: ("Norway", "England"),
     18222446: ("Argentina", "Switzerland"),
 }
+
+#: CURATED kickoff unix timestamps (seconds) for the 4 pinned WC-QF fixtures, transcribed from the
+#: SAME committed capture (``scripts/txline_live/wc-qf-fixtures.json``). This module IS shipped by
+#: Dockerfile.api; the capture file is NOT — so the timestamp is read from here, NEVER re-read from
+#: ``scripts/`` at runtime. Curated, never re-verified against the live TxLINE fixtures API.
+FIXTURE_KICKOFF_TS: dict[int, int] = {
+    18209181: 1783627200,
+    18218149: 1783710000,
+    18213979: 1783803600,
+    18222446: 1783818000,
+}
+
+
+def fixture_metadata_row(fixture_id: int) -> dict[str, Any]:
+    """Return the ADDITIVE captured-label row for a pinned fixture (raw id ALWAYS present).
+
+    A mapped id carries its curated team pair + shipped ``kickoff_ts`` under
+    ``label_source="captured"``; an unmapped id carries null labels under
+    ``label_source="unavailable"``. Never fabricates a matchup or a time.
+    """
+    pair = FIXTURE_LABELS.get(fixture_id)
+    if pair is None:
+        return {
+            "fixture_id": fixture_id,
+            "home_team": None,
+            "away_team": None,
+            "kickoff_ts": None,
+            "label_source": "unavailable",
+        }
+    home, away = pair
+    return {
+        "fixture_id": fixture_id,
+        "home_team": home,
+        "away_team": away,
+        "kickoff_ts": FIXTURE_KICKOFF_TS.get(fixture_id),
+        "label_source": "captured",
+    }
+
 
 #: The pinned-market outcome suffixes (``pmxt:{fixture}:{suffix}`` tokens) → their human labels.
 _SUFFIX_LABELS: dict[str, str] = {

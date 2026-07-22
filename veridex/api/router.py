@@ -76,6 +76,7 @@ from veridex.api.schemas import (
     RuntimeEventsResponse,
     VerifyResponse,
 )
+from veridex.api.fixture_labels import fixture_metadata_row
 from veridex.api.ws import ArenaConnectionManager, register_arena_routes
 from veridex.backtest.report import BacktestReport
 from veridex.backtest.runner import run_backtest
@@ -375,6 +376,7 @@ def _replay_pack_info(entry: CatalogEntry) -> ReplayPackInfo:
         provenance=entry.provenance,
         is_genuine=entry.is_genuine,
         fixtures=list(entry.fixtures),
+        fixture_metadata=[fixture_metadata_row(int(f)) for f in entry.fixtures],
     )
 
 
