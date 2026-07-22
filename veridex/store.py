@@ -888,6 +888,35 @@ class Store(Protocol):
         """
         ...
 
+    # --- seed-ledger methods (Official Replay League D3) ---
+
+    async def persist_seed_state(self, seed_revision: str, state: dict[str, Any]) -> None:
+        """UPSERT the durable seed-run ledger for ``seed_revision`` (deterministic-id idempotency).
+
+        The Official Replay League seed drives the REAL routes to mint NON-deterministic ids (deployed
+        ``instance_id`` / created ``competition_id``). It writes each phase's created ids here, keyed by
+        ``seed_revision``; a re-run READS them back (:meth:`get_seed_state`) and REUSES them instead of
+        re-creating — so a re-seed mints no duplicate instance, competition, or projected row. A
+        re-persist for the same ``seed_revision`` OVERWRITES (last-write-wins), so the ledger always
+        reflects the latest phase progress.
+
+        Args:
+            seed_revision: The stable seed-run identity the created ids are scoped to.
+            state: The JSON-serialisable ledger payload (created ids + phase progress).
+        """
+        ...
+
+    async def get_seed_state(self, seed_revision: str) -> dict[str, Any] | None:
+        """Load the durable seed-run ledger for ``seed_revision``, or ``None`` if unseeded.
+
+        Args:
+            seed_revision: The seed-run identity used at :meth:`persist_seed_state`.
+
+        Returns:
+            The stored ledger payload, or ``None`` when no seed run has persisted state for it.
+        """
+        ...
+
     async def persist_deployment_attempt(self, attempt: DeploymentAttempt) -> None:
         """INSERT a durable deployment-attempt claim (the deploy-saga idempotency backbone).
 
@@ -1154,6 +1183,10 @@ class InMemoryStore:
         # Durable projected directional-board rows (B2), keyed by (run_id, public_agent_id) — the
         # in-code mirror of the Postgres projected_rows UNIQUE(run_id, public_agent_id) UPSERT.
         self._projected_rows: dict[tuple[str, str], dict[str, Any]] = {}
+        # Durable seed-run ledger (D3), keyed by seed_revision — the in-code mirror of the Postgres
+        # seed_state UPSERT. Holds the NON-deterministic ids each seed phase minted so a re-run reuses
+        # them (no duplicate instance/competition/projected row).
+        self._seed_state: dict[str, dict[str, Any]] = {}
         # Append-only deployment-attempt ledger, keyed by (operator_id, idempotency_key) — the
         # in-code mirror of the Postgres UNIQUE(operator_id, idempotency_key) claim (I-3).
         self._deployment_attempts: dict[tuple[str, str], DeploymentAttempt] = {}
@@ -1792,6 +1825,17 @@ class InMemoryStore:
         """Return the linked ``public_agent_id`` for ``instance_id``, or ``None`` if unlinked."""
         return self._instance_public_agent.get(instance_id)
 
+    # --- seed-ledger methods (Official Replay League D3) ---
+
+    async def persist_seed_state(self, seed_revision: str, state: dict[str, Any]) -> None:
+        """Store a deep copy of the seed ledger for ``seed_revision`` (last-write-wins UPSERT)."""
+        self._seed_state[seed_revision] = copy.deepcopy(state)
+
+    async def get_seed_state(self, seed_revision: str) -> dict[str, Any] | None:
+        """Return a deep copy of the stored seed ledger for ``seed_revision``, or ``None``."""
+        stored = self._seed_state.get(seed_revision)
+        return copy.deepcopy(stored) if stored is not None else None
+
     # --- deployment-attempt ledger methods (I-3 — write-once idempotency claim) ---
 
     async def persist_deployment_attempt(self, attempt: DeploymentAttempt) -> None:
@@ -2200,6 +2244,21 @@ class PostgresStore:
                     public_agent_id TEXT NOT NULL,
                     payload TEXT NOT NULL,
                     PRIMARY KEY (run_id, public_agent_id)
+                )
+                """
+            )
+
+            # --- seed-run ledger (Official Replay League D3 — deterministic-id idempotency) ---
+            # One row per seed_revision holding the NON-deterministic ids each seed phase minted
+            # (deployed instance_ids, created competition_ids, phase progress). A re-seed READS this
+            # and REUSES the ids instead of re-creating — no duplicate instance/competition/projected
+            # row. Mirrors the ``column + record_json blob`` pattern of provisioning_records /
+            # execution_records (the recovery state is the JSON blob, keyed by the primary column).
+            await cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS seed_state (
+                    seed_revision TEXT PRIMARY KEY,
+                    record_json TEXT NOT NULL
                 )
                 """
             )
@@ -3419,6 +3478,46 @@ class PostgresStore:
         finally:
             await self._release(conn)
         return [json.loads(row[0]) for row in raw]
+
+    # --- seed-ledger methods (Official Replay League D3) ---
+
+    async def persist_seed_state(self, seed_revision: str, state: dict[str, Any]) -> None:
+        """UPSERT the seed ledger as a json blob keyed by ``seed_revision`` (last-write-wins).
+
+        ``ON CONFLICT (seed_revision) DO UPDATE`` overwrites, so a re-seed's newest phase progress
+        replaces the prior snapshot. All SQL is parameterized; psycopg stays lazy.
+        """
+        conn = await self._connect()
+        try:
+            async with conn.transaction(), conn.cursor() as cur:
+                await cur.execute(
+                    """
+                    INSERT INTO seed_state (seed_revision, record_json)
+                    VALUES (%s, %s)
+                    ON CONFLICT (seed_revision) DO UPDATE SET
+                        record_json = EXCLUDED.record_json
+                    """,
+                    (seed_revision, json.dumps(state)),
+                )
+        finally:
+            await self._release(conn)
+
+    async def get_seed_state(self, seed_revision: str) -> dict[str, Any] | None:
+        """Reconstruct the seed ledger blob for ``seed_revision``, or ``None`` if absent."""
+        conn = await self._connect()
+        try:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "SELECT record_json FROM seed_state WHERE seed_revision = %s",
+                    (seed_revision,),
+                )
+                row = await cur.fetchone()
+        finally:
+            await self._release(conn)
+        if row is None:
+            return None
+        result: dict[str, Any] = json.loads(row[0])
+        return result
 
     async def set_public_agent_visibility(
         self, public_agent_id: str, visibility: Visibility, *, updated_at: str
