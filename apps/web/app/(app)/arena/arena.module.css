@@ -1,0 +1,5 @@
+.arena { display: flex; flex-direction: column; gap: var(--space-3); }
+.fixtureRow { display: flex; align-items: flex-end; gap: var(--space-2); }
+.label { font-family: var(--font-mono), monospace; font-size: 9px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--text-3); }
+.sel { display: flex; flex-direction: column; gap: var(--space-1); }
+.select { padding: 7px 9px; border: 1px solid var(--border-strong); border-radius: var(--radius-control); background: var(--panel-2); color: var(--text-1); font-size: 12px; }
