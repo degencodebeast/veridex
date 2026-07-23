@@ -110,9 +110,10 @@ class TestComposeSkeleton:
         assert not missing, f"api-runtime missing volume mounts: {sorted(missing)}"
 
     def test_curated_seed_packs_mounted_read_only(self) -> None:
-        # Not just "some :ro mount exists" — the curated seed-pack TARGET path
-        # (resolved via REPLAY_PACK_ROOT at D-1) must itself be the :ro mount.
-        curated_target = "/var/lib/veridex/replay-packs/curated"
+        # Not just "some :ro mount exists" — the seed-pack TARGET path (resolved via
+        # REPLAY_PACK_ROOT at D-1) must itself be the :ro mount. The leaf dir name IS the
+        # pack_id, so the target leaf is demo_pack_real (matches Dockerfile.api + the F1 seed).
+        curated_target = "/var/lib/veridex/replay-packs/demo_pack_real"
         svc = _load_compose()["services"]["api-runtime"]
         ro_targets = {
             str(v).rsplit(":", 1)[0].split(":", 1)[1]

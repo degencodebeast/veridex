@@ -16,21 +16,28 @@ COPY veridex ./veridex
 COPY veridex_agent ./veridex_agent
 RUN pip install --no-cache-dir ".[api,postgres,live,agent]"
 
-# R-2 — bake the pinned, GENUINE curated seed pack (demo_pack_real: the verified WC /odds/updates
-# backfill) into the image so the ReplayPack catalog is SELF-CONTAINED: a bare `docker run` (no compose
+# R-2 — bake the pinned, GENUINE seed pack (demo_pack_real: the verified WC /odds/updates backfill)
+# into the image so the ReplayPack catalog is SELF-CONTAINED: a bare `docker run` (no compose
 # bind-mount) still builds a hash-verified catalog and /readyz passes. COPY was chosen over relying on
 # the compose read-only mount alone: the image is then trustworthy on its own (no missing-mount failure
 # mode), and the packs are ~600KB — negligible bloat. NOTE: this COPYed layer is NOT a runtime read-only
 # boundary for the bare image — the container runs as root, so the overlay is writable at this path. The
-# ENFORCED read-only boundary is (a) the compose `:ro` curated bind mount below and (b) the catalog
-# module itself, which only READS the curated root and never writes it (`register_pack` publishes to the
+# ENFORCED read-only boundary is (a) the compose `:ro` seed-pack bind mount below and (b) the catalog
+# module itself, which only READS the seed root and never writes it (`register_pack` publishes to the
 # SEPARATE writable capture volume, never here). In compose, REPLAY_PACK_ROOT is overridden to the
-# operator's provisioned :ro curated mount.
-# NOTE: the catalog derives pack_id from the leaf dir name, so this seed catalogs as pack_id="curated".
-# That id is STABLE across both the image-bake path and the compose :ro mount (both leaf-named "curated"),
-# so R-3's pack-bound competition identity references the same id in either deployment.
-COPY scripts/fixtures/demo_pack_real /opt/veridex/replay-packs/curated
-ENV REPLAY_PACK_ROOT=/opt/veridex/replay-packs/curated
+# operator's provisioned :ro seed mount.
+# NOTE: the catalog derives pack_id from the leaf dir name, so this seed catalogs as pack_id="demo_pack_real".
+# That id is STABLE across both the image-bake path and the compose :ro mount (both leaf-named "demo_pack_real"),
+# so R-3's pack-bound competition identity references the same id in either deployment, and the F1 seed's
+# phase-1 assert_pack (which requires pack_id="demo_pack_real") resolves on the bare image and under compose.
+COPY scripts/fixtures/demo_pack_real /opt/veridex/replay-packs/demo_pack_real
+ENV REPLAY_PACK_ROOT=/opt/veridex/replay-packs/demo_pack_real
+
+# F1 — bake the Official Replay League seed ENTRYPOINT so the running container can seed itself: a
+# SEPARATE `docker run … python /opt/veridex/scripts/seed_official_replay_league.py --seed-revision <r>`
+# process drives the D3 run_seed state machine over the SAME durable Postgres the API serves. Importing
+# this module has NO side effects (all work is under the __main__ guard), so baking it is inert until run.
+COPY scripts/seed_official_replay_league.py /opt/veridex/scripts/
 
 # Quick-honest-enrichment: bake ONLY the two sealed maker cp1 files (NOT the rest of
 # scripts/txline_live/) so GET /maker/arena-result resolves in-image. maker_router._REPO_ROOT =

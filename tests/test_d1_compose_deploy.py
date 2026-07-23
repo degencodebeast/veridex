@@ -41,9 +41,11 @@ PINNED_PACK = ROOT / "scripts" / "fixtures" / "demo_pack_real"
 SMOKE = ROOT / "scripts" / "smoke_public.sh"
 RESTORE_DRILL = ROOT / "scripts" / "restore_drill.sh"
 
-# The curated seed-pack target the readiness catalog resolves via REPLAY_PACK_ROOT (I-10 pinned pack
-# is bind-mounted here for the LOCAL stack; the operator points it at /srv/... in production).
-CURATED_TARGET = "/var/lib/veridex/replay-packs/curated"
+# The seed-pack target the readiness catalog resolves via REPLAY_PACK_ROOT (I-10 pinned pack is
+# bind-mounted here for the LOCAL stack; the operator points it at /srv/... in production). The leaf dir
+# name IS the pack_id, so the mount target leaf is demo_pack_real (catalogs as pack_id="demo_pack_real",
+# the id the F1 Official-Replay-League seed's phase-1 assert_pack requires).
+CURATED_TARGET = "/var/lib/veridex/replay-packs/demo_pack_real"
 WAL_TARGET = "/data/wal"  # matches Dockerfile.api's ENV WAL_DIR default (frozen; consumed unchanged)
 
 # Required secrets that MUST carry a `:?` guard so a missing value fails the stack closed.
