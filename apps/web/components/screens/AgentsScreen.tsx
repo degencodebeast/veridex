@@ -36,9 +36,12 @@ export function AgentsScreen({
     const filtered = agents.filter((a) => a.display_name.toLowerCase().includes(q.toLowerCase()));
     // Null perf (an unscored /agents/roster row) sorts to the bottom — never coerced to 0 (a real 0
     // would be a fabricated break-even claim that outranks the honest "—" rows).
-    const rank = (v: number | null) => v ?? Number.NEGATIVE_INFINITY;
+    const rank = (v: number | null) => (v == null ? Number.NEGATIVE_INFINITY : v);
+    // Guard against NaN when both ranked values are -Infinity (all-unscored roster is now the
+    // normal off-mock path): equal ranks compare equal (stable), never subtract infinities.
+    const cmp = (rb: number, ra: number) => (rb === ra ? 0 : rb - ra);
     return [...filtered].sort((a, b) =>
-      sort === 'clv' ? rank(b.avg_clv_bps) - rank(a.avg_clv_bps) : rank(b.runs) - rank(a.runs),
+      sort === 'clv' ? cmp(rank(b.avg_clv_bps), rank(a.avg_clv_bps)) : cmp(rank(b.runs), rank(a.runs)),
     );
   }, [agents, q, sort]);
 
