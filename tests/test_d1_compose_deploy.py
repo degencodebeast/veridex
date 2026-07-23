@@ -438,9 +438,15 @@ def _write_env_file(tmp: Path, overrides: dict[str, str] | None = None, drop: se
     return path
 
 
-def _compose(*args: str, env_file: Path, check: bool = True, timeout: int = 900) -> subprocess.CompletedProcess:
+def _compose(
+    *args: str,
+    env_file: Path,
+    check: bool = True,
+    timeout: int = 900,
+    env: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess:
     cmd = ["docker", "compose", "-p", PROJECT, "-f", str(COMPOSE), "--env-file", str(env_file), *args]
-    return subprocess.run(cmd, cwd=str(ROOT), capture_output=True, text=True, check=check, timeout=timeout)
+    return subprocess.run(cmd, cwd=str(ROOT), capture_output=True, text=True, check=check, timeout=timeout, env=env)
 
 
 class TestRequiredEnvGuardConfig:
@@ -455,8 +461,17 @@ class TestRequiredEnvGuardConfig:
     @docker_required
     def test_config_fails_closed_when_required_secret_missing(self, tmp_path: Path) -> None:
         # Drop a required secret: the `:?` guard must abort interpolation (never a silent default).
-        env_file = _write_env_file(tmp_path, drop={"DATABASE_URL"})
-        proc = _compose("config", env_file=env_file, check=False, timeout=120)
+        dropped = {"DATABASE_URL"}
+        env_file = _write_env_file(tmp_path, drop=dropped)
+        # Isolate the subprocess env: `docker compose` interpolation prefers the SHELL env over
+        # --env-file, so an ambient DATABASE_URL in the invoking shell would silently satisfy the
+        # guard this test exists to prove fails closed. Start from a full os.environ copy (so PATH,
+        # HOME, DOCKER_HOST, etc. still let `docker` run) and explicitly delete the dropped secret(s)
+        # so the guarded var is deterministically absent regardless of the ambient shell.
+        isolated_env = dict(os.environ)
+        for key in dropped:
+            isolated_env.pop(key, None)
+        proc = _compose("config", env_file=env_file, check=False, timeout=120, env=isolated_env)
         assert proc.returncode != 0, "a missing required secret must fail compose closed (the :? guard fires)"
         assert "DATABASE_URL" in (proc.stderr + proc.stdout), "the guard must name the missing required var"
 
