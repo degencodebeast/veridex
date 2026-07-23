@@ -117,6 +117,38 @@ export interface AgentSummary {
   source: 'STUDIO' | 'BYOA';
 }
 
+// Roster-local proof-state: ProofMode PLUS the honest 'unscored' state a PUBLIC deployed agent carries
+// before it has scored board rows. This deliberately does NOT widen the shared ProofMode (which has
+// EXHAUSTIVE `Record<ProofMode, number>` uses in lib/contracts.ts + lib/api.ts) — 'unscored' lives ONLY
+// on this roster-local type, never on ProofMode.
+export type ProofState = ProofMode | 'unscored';
+
+// The PUBLIC deployed-agent roster row (GET /agents/roster) AND the shared identity contract the Duel
+// surface (E4) consumes. Honest identity (public_agent_id / display_name / owner_public_label / origin)
+// and honest proof_state ('unscored' until scored). Performance columns are null until the agent has
+// scored board rows → render "—", NEVER fabricated. Carries NO STUDIO/BYOA `source` field.
+export interface PublicAgentRow {
+  public_agent_id: string;
+  display_name: string;
+  owner_public_label: string;
+  origin: string;
+  proof_state: ProofState;
+  archetype: Archetype;
+  mode: 'llm' | 'numeric' | 'rule' | null;
+  avg_clv_bps: number | null;
+  runs: number | null;
+  valid_pct: number | null;
+}
+
+// The directional leaderboard row (GET /leaderboard/directional): the cross-run LeaderboardRow ENRICHED
+// with honest public identity (display_name + public_agent_id) so the board renders REAL display names,
+// never opaque ids. `extends LeaderboardRow` so a DirectionalRow[] is a valid LeaderboardRow[] for the
+// existing LeaderboardScreen.
+export interface DirectionalRow extends LeaderboardRow {
+  display_name: string;
+  public_agent_id: string;
+}
+
 export interface AgentProfileRecord extends AgentSummary {
   valid_count: number;
   config_hash: string;

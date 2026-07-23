@@ -18,6 +18,8 @@ describe('Badge (PAT-002: one component, full vocabulary)', () => {
         'anchored', 'eligible', 'final', 'invalid', 'live', 'llm', 'not-anchored',
         'not-eligible', 'partial', 'pending', 'replay', 'reproducible',
         'valid', 'verified',
+        // Roster proof-state (E3) — the honest "unscored" chip for a deployed-but-unscored public agent.
+        'unscored',
         // Maker Arena lane (MM-R1) — falsification verdicts + rung/caveat chips.
         'mm-r1', 'separated', 'inconclusive', 'inverted', 'uncalibrated', 'small-n', 'trades-not-fills',
         // QuoteGuard behavior ablation (F-8) — behavior-comparison labels, never a rank/winner.

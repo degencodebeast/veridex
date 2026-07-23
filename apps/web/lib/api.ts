@@ -22,7 +22,7 @@ import { INSPECTOR_DEMO_QUANTITIES } from '@/lib/fixtures/inspector';
 import { PROOF_DEMO_ROOTS, mapRootForest } from '@/lib/fixtures/proof';
 import { PROOF_EXPLAIN_DEMO, type ProofExplanation } from '@/lib/explainer';
 import { VERIFIER_VERSION, type StatusBarState } from '@/lib/status';
-import type { AgentSummary, Archetype, MarketFamilyKey, OddsUpdate } from '@/lib/catalog';
+import type { Archetype, DirectionalRow, MarketFamilyKey, OddsUpdate, ProofState, PublicAgentRow } from '@/lib/catalog';
 import type * as W from '@/lib/wire';
 import type {
   AnchorInfo, AnchorStatus, CheckResult, CockpitState, ExecutionMode, FeedHealthState,
@@ -83,6 +83,10 @@ export const PATHS = {
   // PUBLIC deployed-agent roster (read-only, unauth — mirrors /replay-packs). ALL owners, NOT
   // owner-filtered (distinct from the owner-scoped /agents/instances). Perf columns are honest null.
   agentsRoster: () => `/agents/roster`,
+  // B3 directional leaderboard completion layer (read-only). `board_kind` is a CLOSED backend enum
+  // (PUBLIC_AGENTS / OFFICIAL_BENCHMARK); the server visibility-joins + aggregates. Rows are enriched
+  // with honest public identity (display_name + public_agent_id).
+  directionalLeaderboard: (boardKind: string) => `/leaderboard/directional?board_kind=${boardKind}`,
   // F-4 competition lifecycle (owner-scoped POSTs): create → register roster entry → start.
   competitions: () => `/competitions`,
   competitionAgents: (id: string) => `/competitions/${id}/agents`,
@@ -901,16 +905,23 @@ export async function getReplayMarkets(packId: string, fixtureId: number): Promi
 // columns are ALWAYS null (no scoring aggregation exists yet) — surfaced as null so the table
 // renders "—", NEVER fabricated.
 
-/** Wire shape of one public roster row (frozen backend AgentRosterEntry, veridex/api/schemas.py). */
+/** Wire shape of one public roster row (frozen backend AgentRosterEntry, veridex/api/schemas.py:470).
+ * TRUST SURFACE: it carries the SAFE public identity only (public_agent_id / display_name /
+ * owner_public_label / origin) — NEVER a raw operator_id / owner_ref. Performance columns are None and
+ * proof_state is "unscored" until the agent has scored PUBLIC_AGENTS board rows. */
 export interface AgentRosterEntryWire {
-  agent_id: string;
-  type: string; // template_id
-  owner: string | null; // operator_id; null == UNOWNED (honest)
+  public_agent_id: string;
+  display_name: string;
+  owner_public_label: string; // SAFE public owner rendering (brand / shortened wallet / em-dash)
+  origin: string; // the real Origin value ("official" | "byoa" | "unknown" | ...)
+  proof_state: string; // "unscored" until scored, then the real proof mode
+  agent_id: string; // the deployed instance id (informational; the directory keys on public_agent_id)
+  type: string; // template_id (strategy archetype)
   source_mode: string; // replay | live
   execution_mode: string;
-  status: string; // DeployStatus value, lowercased
+  status: string; // DeployStatus value, lowercased (always "sealed")
   config_hash_present: boolean; // REAL proof indicator (config_hash pinned) — not a score
-  avg_clv_bps: number | null; // always null (no aggregation) — never fabricated
+  avg_clv_bps: number | null; // null until scored, then the REAL pooled value — never fabricated
   runs: number | null;
   valid_pct: number | null;
 }
@@ -927,26 +938,78 @@ function toArchetype(templateId: string): Archetype {
   return templateId as Archetype;
 }
 
-// GET /agents/roster → AgentSummary[] for the AgentsScreen directional table. Mock ⇒ [] (the page
-// supplies the labeled DEMO fixture under the mock gate; this reader is the OFF-mock real-fetch path).
-// The performance fields map to null (honest "—"), NEVER fabricated; agent_name falls back to the real
-// agent_id (the roster carries no display name); proof_mode is derived from the REAL config_hash_present
-// indicator (a pinned config_hash ⇒ reproducible determinism, else partial).
-export async function getAgentsRoster(): Promise<AgentSummary[]> {
+// The wire proof_state → the roster-local ProofState. "unscored" is preserved verbatim (the honest
+// pre-score state); anything else folds through toProofMode (verified/partial/reproducible). This does
+// NOT touch the shared ProofMode — 'unscored' lives ONLY on ProofState (roster-local).
+function toProofState(s: string): ProofState {
+  return s === 'unscored' ? 'unscored' : toProofMode(s);
+}
+
+// GET /agents/roster → PublicAgentRow[] for the AgentsScreen directional table. Mock ⇒ [] (the page
+// supplies the labeled DEMO fixture, mapped through the SHARED agentSummaryToPublicRow adapter, under
+// the mock gate; this reader is the OFF-mock real-fetch path). Honest identity is mapped verbatim
+// (public_agent_id / display_name / owner_public_label / origin); proof_state carries the REAL wire
+// value ("unscored" until scored); performance columns map to their honest null/number ("—", never
+// fabricated). Honest-empty [] on any fetch error — NEVER the AGENTS fixture off-mock (T-2).
+export async function getAgentsRoster(): Promise<PublicAgentRow[]> {
   if (isMockEnabled()) return [];
-  const res = await getJson<AgentRosterResponseWire>(PATHS.agentsRoster());
-  return res.agents.map((e) => ({
-    agent_id: e.agent_id,
-    agent_name: e.agent_id, // no server-side display name — the real id IS the honest label
-    archetype: toArchetype(e.type),
-    mode: null, // the roster carries no strategy mode (llm|numeric|rule) — honest "—", never fabricated
-    avg_clv_bps: null, // no scoring aggregation yet — honest "—", never fabricated
-    runs: null, // no scoring aggregation yet — honest "—", never fabricated
-    proof_mode: e.config_hash_present ? 'reproducible' : 'partial', // derived from a REAL indicator
-    source_mode: toSourceMode(e.source_mode),
-    valid_pct: null, // no scoring aggregation yet — honest "—", never fabricated
-    source: 'STUDIO', // deployed via the Studio deploy path (not surfaced in the roster table)
+  try {
+    const res = await getJson<AgentRosterResponseWire>(PATHS.agentsRoster());
+    return res.agents.map((e) => ({
+      public_agent_id: e.public_agent_id,
+      display_name: e.display_name,
+      owner_public_label: e.owner_public_label,
+      origin: e.origin,
+      proof_state: toProofState(e.proof_state),
+      archetype: toArchetype(e.type),
+      mode: null, // the roster carries no strategy mode (llm|numeric|rule) — honest "—", never fabricated
+      avg_clv_bps: e.avg_clv_bps, // null until scored — honest "—", never fabricated
+      runs: e.runs,
+      valid_pct: e.valid_pct,
+    }));
+  } catch {
+    return []; // honest-empty on error — NEVER the AGENTS fixture off-mock (T-2 fixture prohibition)
+  }
+}
+
+// ---- B3 directional leaderboard completion layer (GET /leaderboard/directional) ----
+//
+// The cross-run directional board ENRICHED with honest public identity. The wire row is a
+// LeaderboardRow PLUS { display_name, public_agent_id } (the DirectionalRow enrichment). The reader
+// runs each row through the SAME base leaderboard mapping (adaptLeaderboard) and then overrides the
+// opaque-id identity with the REAL public identity: agent_id = public_agent_id (the link/key) and
+// agent_name = display_name (the REAL display name, NEVER the opaque-id fallback). source_mode rides
+// the same aggregate mapping (all-replay → replay), so the board survives the REPLAY filter (M8).
+
+/** Wire shape of one directional row (backend LeaderboardRow + the display_name/public_agent_id join). */
+interface DirectionalRowWire extends W.LeaderboardRow {
+  display_name: string;
+  public_agent_id: string;
+}
+
+/** Wire shape of the GET /leaderboard/directional envelope. */
+interface DirectionalLeaderboardResponseWire {
+  board_kind: string;
+  rows: DirectionalRowWire[];
+}
+
+export function adaptDirectionalLeaderboard(w: DirectionalLeaderboardResponseWire): DirectionalRow[] {
+  return adaptLeaderboard({ rows: w.rows }).map((base, i) => ({
+    ...base,
+    agent_id: w.rows[i].public_agent_id, // key/link by the public id
+    agent_name: w.rows[i].display_name,  // the REAL display name, not the opaque-id fallback
+    public_agent_id: w.rows[i].public_agent_id,
+    display_name: w.rows[i].display_name,
   }));
+}
+
+// GET /leaderboard/directional?board_kind=PUBLIC_AGENTS → DirectionalRow[] (honest display names +
+// replay provenance). Mock ⇒ [] (the /leaderboard page keeps its mock-ON getLeaderboard() fixture
+// path). Off-mock the LeaderboardPage calls this and honest-empties on error (never a wire fixture).
+export async function getDirectionalLeaderboard(boardKind = 'PUBLIC_AGENTS'): Promise<DirectionalRow[]> {
+  if (isMockEnabled()) return [];
+  const res = await getJson<DirectionalLeaderboardResponseWire>(PATHS.directionalLeaderboard(boardKind));
+  return adaptDirectionalLeaderboard(res);
 }
 
 export interface CompetitionRecordView {

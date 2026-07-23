@@ -2,6 +2,8 @@
 export const BADGE_VARIANTS = [
   'replay', 'live', 'reproducible', 'verified', 'anchored', 'pending',
   'not-anchored', 'valid', 'invalid', 'partial', 'eligible', 'not-eligible', 'llm', 'final',
+  // Roster proof-state (E3) — the honest chip for a deployed-but-unscored public agent (ProofState).
+  'unscored',
   // Maker Arena lane (MM-R1) — falsification verdicts + rung/caveat chips (SEC-005: never
   // reused to imply a directional CLV claim; these back only the maker surfaces).
   'mm-r1', 'separated', 'inconclusive', 'inverted', 'uncalibrated', 'small-n', 'trades-not-fills',
@@ -26,6 +28,7 @@ export const BADGE_META: Record<BadgeVariant, { glyph: string; label: string }> 
   valid: { glyph: '', label: 'Valid' },
   invalid: { glyph: '', label: 'Invalid' },
   partial: { glyph: '', label: 'Partial' },
+  unscored: { glyph: '○', label: 'Unscored' },
   eligible: { glyph: '●', label: 'Eligible' },
   'not-eligible': { glyph: '⊘', label: 'Not Eligible' },
   llm: { glyph: '', label: 'LLM' },

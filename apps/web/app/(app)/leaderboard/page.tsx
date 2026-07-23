@@ -1,7 +1,7 @@
 'use client';
 import { useEffect, useState } from 'react';
 import { LeaderboardScreen } from '@/components/screens/LeaderboardScreen';
-import { getLeaderboard } from '@/lib/api';
+import { getLeaderboard, getDirectionalLeaderboard } from '@/lib/api';
 import { isMockEnabled } from '@/lib/mock';
 import type { LeaderboardRow } from '@/lib/catalog';
 
@@ -13,14 +13,20 @@ import type { LeaderboardRow } from '@/lib/catalog';
 export default function LeaderboardPage() {
   const [rows, setRows] = useState<LeaderboardRow[]>([]);
   useEffect(() => {
-    // Quarantine (spec §6.3): the global /leaderboard is populated ONLY by synthetic /demo/run rows,
-    // so no off-mock production surface consumes it. Mock mode is UNCHANGED (shows the wire fixture);
-    // off-mock renders the honest empty state (no durable directional source yet).
-    if (!isMockEnabled()) { setRows([]); return; }
     let alive = true;
-    getLeaderboard()
+    // Mock ON (?mock=1) — UNCHANGED: the canonical wire fixture via the self-gating getLeaderboard().
+    if (isMockEnabled()) {
+      getLeaderboard()
+        .then((r) => { if (alive) setRows(r); })
+        .catch(() => { if (alive) setRows([]); }); // honest-empty on error — never the fixture (T-2)
+      return () => { alive = false; };
+    }
+    // Off-mock — the REAL directional board (B3, GET /leaderboard/directional): honest DISPLAY NAMES +
+    // replay provenance. A DirectionalRow[] is a valid LeaderboardRow[] for the screen. A fetch error →
+    // honest-empty (NEVER a wire fixture, T-2 fixture prohibition).
+    getDirectionalLeaderboard()
       .then((r) => { if (alive) setRows(r); })
-      .catch(() => { if (alive) setRows([]); }); // honest-empty on error — never the fixture (T-2)
+      .catch(() => { if (alive) setRows([]); });
     return () => { alive = false; };
   }, []);
   return <LeaderboardScreen rows={rows} />;
