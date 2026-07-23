@@ -94,4 +94,26 @@ describe('MarketsScreen replay-market odds render (E2 / MAJOR-5 exact conversion
     expect(edge.length).toBeGreaterThan(0);
     expect(edge.every((c) => c.textContent === '—')).toBe(true);
   });
+
+  it('a market_key whose params segment contains a pipe keeps the FULL params (no truncation)', async () => {
+    // market_key = {SuperOddsType}|{MarketPeriod}|{MarketParameters}; a pipe inside MarketParameters
+    // must be preserved (index-2-onward), not silently dropped at the first split boundary.
+    stubFetch({
+      fixture_id: FIXTURE_ID,
+      label: 'CAPTURED REPLAY',
+      markets: [
+        {
+          market_key: 'OVERUNDER_PARTICIPANT_GOALS|FULLTIME|line=2.5|side=over',
+          in_running: false,
+          suspended: false,
+          ts: 100,
+          stable_prob_bps: { p1: 5000 },
+          stable_price: { p1: 2.08 },
+        },
+      ],
+    });
+    const [update] = await getReplayMarkets(PACK_ID, FIXTURE_ID);
+    expect(update.market_family).toBe('OVERUNDER_PARTICIPANT_GOALS');
+    expect(update.market_parameters).toBe('line=2.5|side=over');
+  });
 });

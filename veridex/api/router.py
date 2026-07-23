@@ -130,7 +130,7 @@ from veridex.ingest.replay_catalog import (
     load_resolved_marketstates,
     resolve_replay_source,
 )
-from veridex.ingest.replay_pack import PackIntegrityError, load_pack_fixture_states_bound
+from veridex.ingest.replay_pack import load_pack_fixture_states_bound
 from veridex.leaderboard import leaderboard as _build_leaderboard
 from veridex.public_agent import PublicAgent, Visibility, owner_public_label
 from veridex.public_projection import BoardKind, directional_board
@@ -744,10 +744,18 @@ def create_app(
             states = load_pack_fixture_states_bound(
                 entry.pack_dir, fixture_id, expected_content_hash=entry.content_hash
             )
-        except (PackIntegrityError, ValueError, FileNotFoundError) as exc:
-            # Fail closed: a tampered/corrupt pack (content_hash drift, fixture<->file swap) is a 4xx,
-            # never a silently-served partial projection.
-            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        except ValueError as exc:
+            # Fail closed: a tampered/corrupt pack (content_hash drift, fixture<->file swap) is a 422,
+            # never a silently-served partial projection. PackIntegrityError subclasses ValueError and the
+            # loader wraps every file read into a content_hash_drift PackIntegrityError, so no bare
+            # FileNotFoundError escapes — a single ``except ValueError`` fails closed on both.
+            #
+            # SECURITY: surface the STABLE machine reason code, NEVER str(exc). The raw message embeds the
+            # absolute internal pack_dir path, which per the invariant above is DELIBERATELY not exposed —
+            # the browser addresses packs by pack_id only. A bare ValueError with no .reason falls back to
+            # the generic code (still no path).
+            reason = getattr(exc, "reason", "pack_integrity_error")
+            raise HTTPException(status_code=422, detail=reason) from exc
 
         # M11 fold: LAST-SEEN value per market_key across ALL states (NOT just states[-1], which carries
         # only the markets present at the final tick). in_running is derived from the state's phase — at

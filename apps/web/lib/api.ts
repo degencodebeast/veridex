@@ -858,7 +858,11 @@ interface ReplayMarketsResponseWire {
 // THIRD segment or null. Only the 3 known MarketFamilyKeys render (buildFamilies filters the rest).
 function replayMarketToOddsUpdate(fixtureId: number, m: ReplayMarketRowWire): OddsUpdate {
   const outcomes = Object.keys(m.stable_price); // deterministic: the priced outcomes, stable order
-  const [superOddsType, , marketParameters] = m.market_key.split('|');
+  // market_key is {SuperOddsType}|{MarketPeriod}|{MarketParameters}. Take the params from index 2 ONWARD
+  // (join back any pipes) so a MarketParameters segment that itself contains '|' is preserved, not truncated.
+  const parts = m.market_key.split('|');
+  const superOddsType = parts[0];
+  const marketParameters = parts.slice(2).join('|') || null;
   return {
     fixture_id: fixtureId,
     message_id: m.market_key, // stable, deterministic id (the projection is one row per market_key)
@@ -867,7 +871,7 @@ function replayMarketToOddsUpdate(fixtureId: number, m: ReplayMarketRowWire): Od
     // The RAW SuperOddsType is preserved verbatim; buildFamilies renders ONLY the known families and
     // drops any other (the cast is safe — the value is only compared against MARKET_FAMILY_KEYS + text).
     market_family: superOddsType as MarketFamilyKey,
-    market_parameters: marketParameters ? marketParameters : null,
+    market_parameters: marketParameters,
     price_names: outcomes, // deterministic outcome order = the priced-outcome keys (stable)
     prices: outcomes.map((o) => Math.round(m.stable_price[o] * 1000)), // decimal → int ×1000
     // implied %: bps → 3dp string; ABSENT (suspended) ⇒ '' sentinel → render maps to '—', never a fake 0.

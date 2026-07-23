@@ -128,3 +128,25 @@ def test_tampered_pack_fails_closed_4xx(tmp_path: Path) -> None:
     odds.write_bytes(odds.read_bytes() + b'{"FixtureId":18213979,"Ts":1,"SuperOddsType":"X"}\n')
     resp = client.get(_markets_url(_PACK_ID, _FIXTURE_ID))
     assert 400 <= resp.status_code < 500, resp.status_code
+
+
+def test_tampered_pack_422_detail_leaks_no_filesystem_path(tmp_path: Path) -> None:
+    """SECURITY: the tamper 422 surfaces the STABLE reason code, never the internal pack_dir path.
+
+    ``PackIntegrityError`` carries a machine-usable ``.reason`` precisely so the handler can report a
+    stable code over HTTP without echoing the raw message (which embeds the ABSOLUTE server pack_dir).
+    The browser addresses packs by ``pack_id`` only — the filesystem path is DELIBERATELY never exposed.
+    """
+    dst = tmp_path / _PACK_ID
+    shutil.copytree(_SEED_PACK_DIR, dst)
+    client = _client_over(dst)
+    odds = dst / f"odds_{_FIXTURE_ID}.jsonl"
+    odds.write_bytes(odds.read_bytes() + b'{"FixtureId":18213979,"Ts":1,"SuperOddsType":"X"}\n')
+    resp = client.get(_markets_url(_PACK_ID, _FIXTURE_ID))
+    assert resp.status_code == 422, resp.status_code
+    detail = resp.json()["detail"]
+    # The stable reason code — appending bytes drifts the recomputed content_hash.
+    assert detail == "content_hash_drift", detail
+    # No filesystem path may leak: neither a path separator nor the abs pack_dir string.
+    assert "/" not in detail, detail
+    assert str(dst) not in detail, detail
