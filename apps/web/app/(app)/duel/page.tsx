@@ -3,21 +3,22 @@ import { useEffect, useState } from 'react';
 import { DuelScreen } from '@/components/screens/DuelScreen';
 import { isMockEnabled } from '@/lib/mock';
 import { AGENTS } from '@/lib/fixtures/catalog';
-import type { AgentSummary } from '@/lib/catalog';
+import { agentSummaryToPublicRow } from '@/lib/agent-roster';
+import type { PublicAgentRow } from '@/lib/catalog';
 
-// T-2 remediation · /duel must NOT show a fabricated DIRECTIONAL head-to-head with the demo flag OFF.
-// There is NO agents/duel backend reader/endpoint (lib/api.ts exposes none), so the directional agents are
-// sourced CLIENT-side purely on the mock gate: isMockEnabled() reads the per-tab `?mock=1` from window
-// (which a server render cannot see) — a judge toggling ?mock=1 gets the labeled DEMO fixture, while an
-// off-mock judge gets an honest-empty directional duel ([] → the "select two agents" empty state), NEVER
-// the AGENTS fixture. Mirrors the sibling /agents fix; not a fabricated static default.
+// E4 · The PAGE owns ONLY the mock gate for the Public-Agents lane, resolved in an EFFECT so it is
+// hydration-safe: the server render and the first client render both see `resolved: false` (an identical
+// unresolved shell — no agents, no fetch), and only after mount does isMockEnabled() (a per-tab `?mock=1`
+// read a server render can't see) decide the source. Mock ON → the labeled DEMO AGENTS fixture mapped
+// through the SHARED agentSummaryToPublicRow adapter; mock OFF → `agents: null`, and the SCREEN performs
+// the single real getAgentsRoster() read. The page does NOT own lane state and does NOT run the real
+// fetch. (AGENTS + the adapter imported HERE is fine — the fixture-prohibition scan targets the SCREEN.)
 //
-// The Maker lane (F-9) is a SEPARATE population sourced from its own fixture inside DuelScreen — untouched
-// here; this gate is strictly the directional agents prop.
+// The Maker lane is a SEPARATE population sourced inside DuelScreen (useMakerArenaResult) — untouched here.
 export default function DuelPage() {
-  const [agents, setAgents] = useState<AgentSummary[]>([]);
+  const [mock, setMock] = useState<{ resolved: boolean; agents: PublicAgentRow[] | null }>({ resolved: false, agents: null });
   useEffect(() => {
-    setAgents(isMockEnabled() ? AGENTS : []);
+    setMock({ resolved: true, agents: isMockEnabled() ? AGENTS.map(agentSummaryToPublicRow) : null });
   }, []);
-  return <DuelScreen agents={agents} />;
+  return <DuelScreen mockResolved={mock.resolved} mockAgents={mock.agents} />;
 }

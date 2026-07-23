@@ -3,61 +3,152 @@ import { render, screen, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { DuelScreen } from '@/components/screens/DuelScreen';
 import { getMakerArenaResult } from '@/lib/api';
-import { AGENTS } from '@/lib/fixtures/catalog';
 import { MAKER_ARENA_RESULT } from '@/lib/fixtures/maker';
 import {
   MAKER_INCONCLUSIVE, MAKER_INVERTED, MAKER_UNKNOWN_VERDICT, makerResultWith,
 } from '../../__tests__/fixtures/makerVariants';
 import type { MakerArenaResultView } from '@/lib/contracts';
+import type { PublicAgentRow } from '@/lib/catalog';
 
 vi.mock('@/lib/api', async (importOriginal) => ({
   ...await importOriginal<typeof import('@/lib/api')>(),
   getMakerArenaResult: vi.fn(),
+  getAgentsRoster: vi.fn(),
 }));
 
 const getMakerArenaResultMock = vi.mocked(getMakerArenaResult);
 
-describe('DuelScreen (REQ-023)', () => {
-  it('guards against fewer than two agents — honest empty, no crash', () => {
-    render(<DuelScreen agents={[AGENTS[0]]} />);
+// Explicit PublicAgentRow fixtures — the honest public identity contract the Public-Agents lane renders.
+// First two are numeric (default A/B) so the difference is a real number; the third is a null-perf,
+// UNSCORED public row (renders "—", never a fabricated 0). Origins avoid the 'official' token so the
+// "no official-or-verified claim" negative is a claim-scoped assertion, not a factual-field false-trip.
+const ROWS: PublicAgentRow[] = [
+  { public_agent_id: 'pa_val', display_name: 'Value CLV', owner_public_label: 'acme', origin: 'byoa', proof_state: 'reproducible', archetype: 'value_clv', mode: 'numeric', avg_clv_bps: 18.4, runs: 14, valid_pct: 95.0 },
+  { public_agent_id: 'pa_base', display_name: 'Baseline', owner_public_label: 'demo', origin: 'unknown', proof_state: 'verified', archetype: 'baseline', mode: 'numeric', avg_clv_bps: 6.2, runs: 14, valid_pct: 96.4 },
+  { public_agent_id: 'pa_mom', display_name: 'Momentum FR', owner_public_label: 'demo', origin: 'unknown', proof_state: 'unscored', archetype: 'momentum', mode: null, avg_clv_bps: null, runs: null, valid_pct: null },
+];
+
+afterEach(() => {
+  window.history.replaceState(null, '', '/'); // reset any ?lane= query between tests
+});
+
+describe('DuelScreen — Public Agents · Summary Comparison (off-mock, honest labels)', () => {
+  it('unresolved shell (mock gate not resolved): honest-empty, no cards, no selectors', () => {
+    render(<DuelScreen mockResolved={false} mockAgents={null} />);
+    expect(screen.getByTestId('duel-empty')).toBeInTheDocument();
+    expect(screen.queryAllByTestId('duel-card')).toHaveLength(0);
+    expect(screen.queryByLabelText(/agent a/i)).toBeNull();
+  });
+
+  it('fewer than two DISTINCT public agents → honest-empty, no crash', () => {
+    render(<DuelScreen mockResolved mockAgents={[ROWS[0]]} />);
     expect(screen.getByTestId('duel-empty')).toBeInTheDocument();
     expect(screen.queryAllByTestId('duel-card')).toHaveLength(0);
   });
 
-  it('shows two agents on the SAME sealed evidence (one shared evidence hash)', () => {
-    // Directional roster supplied explicitly (the demo path the page mock-gates); no fixture default.
-    render(<DuelScreen agents={AGENTS} />);
-    const evidence = screen.getAllByTestId('evidence-hash');
-    expect(evidence.length).toBe(1);
-    expect(evidence[0]).toHaveTextContent(/sealed evidence/i);
+  it('the VISIBLE segmented option reads "Public Agents", never "Directional"', () => {
+    render(<DuelScreen mockResolved mockAgents={ROWS} />);
+    expect(screen.getByRole('radio', { name: 'Public Agents' })).toBeInTheDocument();
+    expect(screen.queryByRole('radio', { name: 'Directional' })).toBeNull();
   });
 
-  it('compares CLV and proof side-by-side for the two selected agents', () => {
-    render(<DuelScreen agents={AGENTS} />);
+  it('heading is the factual summary title (not Official / Directional / a controlled head-to-head)', () => {
+    render(<DuelScreen mockResolved mockAgents={ROWS} />);
+    expect(screen.getByRole('heading', { name: 'Public Agents · Summary Comparison' })).toBeInTheDocument();
+  });
+
+  it('renders both display names + pooled Avg CLV + runs + valid % + proof state + origin + owner', () => {
+    render(<DuelScreen mockResolved mockAgents={ROWS} />);
     const cards = screen.getAllByTestId('duel-card');
-    expect(cards.length).toBe(2);
+    expect(cards).toHaveLength(2);
+    // default A = first numeric, B = second numeric
+    expect(within(cards[0]).getByText('Value CLV')).toBeInTheDocument();
+    expect(within(cards[1]).getByText('Baseline')).toBeInTheDocument();
     cards.forEach((c) => {
-      expect(within(c).getByText(/avg clv/i)).toBeInTheDocument();
+      expect(within(c).getByText(/pooled avg clv/i)).toBeInTheDocument();
+      expect(within(c).getByText(/runs/i)).toBeInTheDocument();
+      expect(within(c).getByText(/valid %/i)).toBeInTheDocument();
       expect(within(c).getByTestId('duel-proof')).toBeInTheDocument();
+      expect(within(c).getByText(/origin/i)).toBeInTheDocument();
+      expect(within(c).getByText(/owner/i)).toBeInTheDocument();
     });
   });
 
-  it('lets the operator switch one side without copying the other agent CLV', async () => {
+  it('public_agent_id drives identity — the selects carry the public ids, never operator identifiers', () => {
+    render(<DuelScreen mockResolved mockAgents={ROWS} />);
+    const a = screen.getByLabelText(/agent a/i) as HTMLSelectElement;
+    const b = screen.getByLabelText(/agent b/i) as HTMLSelectElement;
+    expect(a.value).toBe('pa_val');
+    expect(b.value).toBe('pa_base');
+    // options are keyed on public ids only
+    const optionValues = Array.from(a.querySelectorAll('option')).map((o) => (o as HTMLOptionElement).value);
+    expect(optionValues.every((v) => v.startsWith('pa_'))).toBe(true);
+  });
+
+  it('null pooled performance renders "—", never a fabricated 0', async () => {
     const user = userEvent.setup();
-    render(<DuelScreen agents={AGENTS} />);
-    const left = screen.getByLabelText(/agent a/i);
-    await user.selectOptions(left, 'baseline');
+    render(<DuelScreen mockResolved mockAgents={ROWS} />);
+    await user.selectOptions(screen.getByLabelText(/agent b/i), 'pa_mom');
+    const cards = screen.getAllByTestId('duel-card');
+    const bClv = within(cards[1]).getByTestId('duel-clv');
+    expect(bClv).toHaveTextContent('—');
+    expect(bClv).not.toHaveTextContent('0');
+  });
+
+  it('difference is labeled "Pooled Avg CLV difference" — a real number when both numeric, "—" when either null', async () => {
+    const user = userEvent.setup();
+    render(<DuelScreen mockResolved mockAgents={ROWS} />);
+    // default A=18.4, B=6.2 → 12.2
+    expect(screen.getByText(/pooled avg clv difference/i)).toHaveTextContent('12.2');
+    await user.selectOptions(screen.getByLabelText(/agent b/i), 'pa_mom');
+    expect(screen.getByText(/pooled avg clv difference/i)).toHaveTextContent('—');
+  });
+
+  it('switching one side never copies the other agent perf — independent recompute', async () => {
+    const user = userEvent.setup();
+    render(<DuelScreen mockResolved mockAgents={ROWS} />);
+    // default A=pa_val, B=pa_base; A's options exclude B's id, so pick a still-available distinct id
+    await user.selectOptions(screen.getByLabelText(/agent a/i), 'pa_mom');
     const cards = screen.getAllByTestId('duel-card');
     const leftClv = within(cards[0]).getByTestId('duel-clv').textContent;
     const rightClv = within(cards[1]).getByTestId('duel-clv').textContent;
-    expect(leftClv).not.toBe(rightClv); // independent recompute per agent
+    expect(leftClv).not.toBe(rightClv);
   });
 
-  it('is an honest factual compare — no fabricated winner/edge, just the CLV gap on shared evidence', () => {
-    render(<DuelScreen agents={AGENTS} />);
-    expect(screen.queryByText(/winner|\bwins\b|beats|champion|🏆/i)).toBeNull();
-    expect(screen.getByText(/key divergence/i)).toBeInTheDocument();
-    expect(screen.getByText(/identical sealed evidence/i)).toBeInTheDocument();
+  it('SAME agent both sides is prevented — each select excludes the other side\'s id', () => {
+    render(<DuelScreen mockResolved mockAgents={ROWS} />);
+    const a = screen.getByLabelText(/agent a/i) as HTMLSelectElement;
+    const b = screen.getByLabelText(/agent b/i) as HTMLSelectElement;
+    expect(a.value).not.toBe(b.value);
+    const aOptions = Array.from(a.querySelectorAll('option')).map((o) => (o as HTMLOptionElement).value);
+    const bOptions = Array.from(b.querySelectorAll('option')).map((o) => (o as HTMLOptionElement).value);
+    // B can never be set to A's id, nor A to B's id — the pair can never collapse to one agent.
+    expect(bOptions).not.toContain(a.value);
+    expect(aOptions).not.toContain(b.value);
+  });
+
+  it('duplicate public_agent_id rows are de-duplicated — one option per distinct id', () => {
+    const dup = [ROWS[0], ROWS[0], ROWS[1]];
+    render(<DuelScreen mockResolved mockAgents={dup} />);
+    const a = screen.getByLabelText(/agent a/i) as HTMLSelectElement;
+    const b = screen.getByLabelText(/agent b/i) as HTMLSelectElement;
+    expect(a.value).not.toBe(b.value);
+    const allValues = Array.from(a.querySelectorAll('option')).map((o) => (o as HTMLOptionElement).value);
+    expect(new Set(allValues).size).toBe(allValues.length); // no duplicate options
+  });
+
+  it('NO fabricated evidence / eligibility / directional-or-controlled claims (scoped to the Public-Agents render)', () => {
+    const { container } = render(<DuelScreen mockResolved mockAgents={ROWS} />);
+    // the whole render IS the Public-Agents lane (no maker content present) — container is the scope
+    expect(within(container).queryByTestId('evidence-hash')).toBeNull();
+    expect(container.textContent).not.toMatch(/SAME SEALED EVIDENCE|identical sealed evidence|evidence_hash|0xseal/i);
+    expect(container.textContent).not.toMatch(/controlled head-to-head/i);
+    expect(container.textContent).not.toMatch(/shared evidence|same sealed/i);
+    expect(within(container).queryByText(/eligibility/i)).toBeNull();
+    expect(within(container).queryByText(/winner|\bwins\b|beats|champion/i)).toBeNull();
+    expect(container.textContent).not.toMatch(/\bDirectional\b|\bOfficial\b|verified head-to-head/);
+    // no anchored badge on the public-agents card
+    expect(container.querySelector('[data-variant="anchored"]')).toBeNull();
   });
 });
 
@@ -71,9 +162,9 @@ describe('DuelScreen — Maker Arena lane (MM-R1)', () => {
     window.history.replaceState(null, '', '/'); // reset any ?lane= query between tests
   });
 
-  it('defaults to the Directional lane — the existing CLV duel (agent picker) is untouched', () => {
-    render(<DuelScreen agents={AGENTS} />);
-    expect(screen.getByRole('radio', { name: 'Directional' })).toHaveAttribute('aria-checked', 'true');
+  it('defaults to the Public Agents lane — the summary compare (agent picker) is untouched', () => {
+    render(<DuelScreen mockResolved mockAgents={ROWS} />);
+    expect(screen.getByRole('radio', { name: 'Public Agents' })).toHaveAttribute('aria-checked', 'true');
     expect(screen.getByLabelText(/agent a/i)).toBeInTheDocument();
     expect(screen.queryAllByTestId('duel-maker-card')).toHaveLength(0);
   });
