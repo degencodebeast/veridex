@@ -3,7 +3,6 @@ import Link from 'next/link';
 import { Badge } from '@/components/ui/Badge';
 import { Num } from '@/components/ui/Num';
 import { ConfBar } from '@/components/ui/ConfBar';
-import { isEligible } from '@/lib/derive';
 import type { AgentProfileRecord } from '@/lib/catalog';
 import styles from './AgentProfileScreen.module.css';
 
@@ -29,7 +28,7 @@ export function AgentProfileScreen({
         <div className={styles.stat}><span className={styles.statLabel}>Runs</span><span className="mono">{profile.runs}</span></div>
         <div className={styles.stat}><span className={styles.statLabel}>Valid %</span><span className="mono">{profile.valid_pct == null ? '—' : `${profile.valid_pct.toFixed(1)}%`}</span></div>
         <div className={styles.stat}><span className={styles.statLabel}>Confidence</span><ConfBar validCount={profile.valid_count} /></div>
-        <div className={styles.stat}><span className={styles.statLabel}>Proof / Eligibility</span><span className={styles.badges}><Badge variant={profile.proof_mode} /><Badge variant={isEligible(profile.proof_mode) ? 'eligible' : 'not-eligible'} /></span></div>
+        <div className={styles.stat}><span className={styles.statLabel}>Proof / Eligibility</span><span className={styles.badges}><Badge variant={profile.proof_mode} /><Badge variant={profile.eligibility_badge} /></span></div>
       </div>
 
       <section className={styles.panel}>
@@ -41,7 +40,14 @@ export function AgentProfileScreen({
       <section className={styles.panel}>
         <h2 className={styles.h2}>Completed competitions</h2>
         {profile.completed_competitions.length === 0 ? (
-          <p className={styles.empty}>No completed competitions yet.</p>
+          // Honesty guard: a leaner off-mock profile (breakdown_available === false) has runs>0 but no
+          // per-competition breakdown — implying "none yet" would be dishonest, so render an honest
+          // "not exposed" note. The mock AGENT_PROFILES fixtures omit the flag ⇒ keep today's copy.
+          <p className={styles.empty}>
+            {profile.breakdown_available === false
+              ? "Per-competition breakdown isn't exposed on the public profile."
+              : 'No completed competitions yet.'}
+          </p>
         ) : (
           <ul className={styles.list}>
             {profile.completed_competitions.map((c) => (

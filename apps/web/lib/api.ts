@@ -22,7 +22,8 @@ import { INSPECTOR_DEMO_QUANTITIES } from '@/lib/fixtures/inspector';
 import { PROOF_DEMO_ROOTS, mapRootForest } from '@/lib/fixtures/proof';
 import { PROOF_EXPLAIN_DEMO, type ProofExplanation } from '@/lib/explainer';
 import { VERIFIER_VERSION, type StatusBarState } from '@/lib/status';
-import type { Archetype, DirectionalRow, MarketFamilyKey, OddsUpdate, ProofState, PublicAgentRow } from '@/lib/catalog';
+import { AGENT_PROFILES } from '@/lib/fixtures/catalog';
+import type { AgentProfileRecord, Archetype, DirectionalRow, FixtureSummary, MarketFamilyKey, OddsUpdate, ProofState, PublicAgentRow } from '@/lib/catalog';
 import type * as W from '@/lib/wire';
 import type {
   AnchorInfo, AnchorStatus, CheckResult, CockpitState, ExecutionMode, FeedHealthState,
@@ -836,6 +837,26 @@ export async function getReplayPacks(): Promise<ReplayPackView[]> {
   }));
 }
 
+// The SHARED replay-pack → FixtureSummary mapper (spec §5.2). Each pack's server-side fixture_metadata
+// becomes a FixtureSummary carrying the COMPOSITE (pack_id, fixture_id) identity — two packs can share
+// an external fixture_id, so pack_id must ride through. Labels are SERVER-sourced with an honest
+// fallback when a team name is absent (never a fabricated name); kickoff_ts is epoch SECONDS on the
+// wire → ISO string, absent ⇒ '' (honest, never faked). Consumed by /markets AND the Create-Competition
+// fixture picker so their catalog view is byte-identical (single source of truth, no forked mapper).
+export function replayPacksToFixtures(packs: ReplayPackView[]): FixtureSummary[] {
+  return packs.flatMap((pack) =>
+    pack.fixtureMetadata.map((m): FixtureSummary => ({
+      fixture_id: m.fixture_id,
+      pack_id: pack.packId,
+      competition: pack.packId,
+      participant1: m.home_team ?? `id ${m.fixture_id}`,
+      participant2: m.away_team ?? '—',
+      start_time: m.kickoff_ts != null ? new Date(m.kickoff_ts * 1000).toISOString() : '',
+      in_running: false, // replay catalog — never in-running
+    })),
+  );
+}
+
 // ---- E2 replay-market projection (GET /replay-packs/{pack}/fixtures/{fixture}/markets) ----
 //
 // Maps the backend's LAST-KNOWN per-market projection to the screen's OddsUpdate view (buildFamilies
@@ -1030,6 +1051,72 @@ export async function getDirectionalLeaderboard(boardKind: BoardKindWire = 'publ
   if (isMockEnabled()) return [];
   const res = await getJson<DirectionalLeaderboardResponseWire>(PATHS.directionalLeaderboard(boardKind));
   return adaptDirectionalLeaderboard(res);
+}
+
+// ---- Quick honest enrichment: getAgentProfile (leaner REAL profile, NO new backend endpoint) ----
+//
+// Mock ⇒ the AGENT_PROFILES fixture UNCHANGED (preserves today's mock behavior EXACTLY). Off-mock ⇒ a
+// REAL (leaner) profile assembled from data we ALREADY serve: the directional public_agents board
+// (per-agent aggregates) + the public roster (identity). There is NO agent-profile endpoint, so fields
+// those two readers don't carry degrade HONESTLY (config_hash "—", empty competitions with
+// breakdown_available:false, empty anchors) — NEVER fabricated. Not-found / any transport error ⇒ null
+// (honest-unavailable, never a fixture off-mock — T-2 fixture prohibition).
+export async function getAgentProfile(publicAgentId: string): Promise<AgentProfileRecord | null> {
+  if (isMockEnabled()) return AGENT_PROFILES[publicAgentId] ?? null;
+  try {
+    const [board, roster] = await Promise.all([
+      getDirectionalLeaderboard('public_agents'),
+      getAgentsRoster(),
+    ]);
+    const row = board.find((r) => r.public_agent_id === publicAgentId);
+    if (!row) return null; // honest not-found — no such agent on the board
+    const identity = roster.find((r) => r.public_agent_id === publicAgentId);
+    // `source` CLASSIFIES real AUTHORSHIP from the roster's real `origin` — the only honest signal for
+    // first-party (STUDIO) vs third-party (BYOA). proof_mode is ORTHOGONAL to authorship (and
+    // toProofMode coerces mixed/unknown/unscored/'' → 'reproducible'), so it must NOT feed this — using
+    // it would falsely stamp STUDIO on BYOA agents. Roster-absent ⇒ BYOA (the least-claim, never a
+    // fabricated first-party claim).
+    const source: 'STUDIO' | 'BYOA' = identity?.origin === 'official' ? 'STUDIO' : 'BYOA';
+    return {
+      agent_id: row.public_agent_id,
+      agent_name: row.display_name,
+      // archetype comes from the roster identity. The shared `Archetype` union has no honest "unknown"
+      // member and widening it is out of scope, so for the roster-absent edge (e.g. the roster fetch
+      // failed → [] while the board succeeded) we store the em-dash absent-marker rather than SEEDING a
+      // specific strategy like 'baseline' — an unearned claim. The value is display-only text here
+      // (rendered verbatim in the header), and the cast follows this file's existing free-string
+      // `x as Archetype` convention (see toArchetype). Honest "—", never a fabricated archetype.
+      archetype: identity?.archetype ?? ('—' as Archetype),
+      mode: identity?.mode ?? null,
+      avg_clv_bps: row.avg_clv_bps,
+      runs: row.runs,
+      proof_mode: row.proof_mode,
+      source_mode: row.source_mode,
+      valid_pct: row.valid_pct,
+      source,
+      valid_count: row.valid_count,
+      // config_hash / policy_hash are not exposed by any endpoint — the standard absent marker.
+      config_hash: '—',
+      policy_hash: '—',
+      // Honest note: the strategy configuration is not surfaced here (NOT a fabricated strategy blurb).
+      strategy_caption: 'Strategy configuration is not exposed on the public agent profile.',
+      // No per-competition breakdown from these endpoints (honest-empty). breakdown_available:false makes
+      // the screen render an honest "not exposed" note instead of implying zero completed competitions.
+      completed_competitions: [],
+      // Honest-empty: neither the directional board nor the roster exposes any per-anchor
+      // tx_signature/slot, so there is no honest anchor entry to show (absent, independent of the
+      // board's aggregate anchor_status which this reader does not read).
+      anchors: [],
+      deployment_provenance: identity
+        ? `${identity.owner_public_label} · origin ${identity.origin}`
+        : 'Deployment provenance is not exposed on the public agent profile.',
+      total_clv_bps: row.total_clv_bps,
+      eligibility_badge: row.eligibility_badge,
+      breakdown_available: false,
+    };
+  } catch {
+    return null; // honest-unavailable on any transport error — NEVER a fabricated/fixture profile off-mock
+  }
 }
 
 export interface CompetitionRecordView {

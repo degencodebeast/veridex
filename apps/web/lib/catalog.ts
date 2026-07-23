@@ -168,6 +168,12 @@ export interface AgentProfileRecord extends AgentSummary {
   deployment_provenance: string;
   total_clv_bps: number;
   eligibility_badge: EligibilityBadge;
+  // OPTIONAL honesty flag for the leaner off-mock profile (no per-competition breakdown from the
+  // directional board + roster). When false, an EMPTY completed_competitions list must render an
+  // honest "not exposed" note instead of "No completed competitions yet." (the agent has runs>0, so
+  // implying zero completed competitions would be dishonest). Absent/undefined on the mock
+  // AGENT_PROFILES fixtures ⇒ they keep today's exact "none yet" copy.
+  breakdown_available?: boolean;
 }
 
 // --- Operator dashboard slices ------------------------------------------------
