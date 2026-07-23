@@ -58,19 +58,29 @@ export function DuelScreen({
   // lane NEVER reads the roster; a direct `?lane=maker` load resolves to maker before this can fire.
   const [rosterRows, setRosterRows] = useState<PublicAgentRow[] | null>(null);
   const fetchStartedRef = useRef(false);
+  // Cancellation is scoped to UNMOUNT only — never to a lane change. A `lane`-dependent cleanup would
+  // discard an in-flight read the instant the user toggles to Maker, and the once-guard would then
+  // block any retry, stranding Public Agents permanently empty (M5). This ref flips false solely on
+  // unmount, so a mid-flight lane toggle can never drop the single result.
+  const mountedRef = useRef(true);
+  useEffect(() => () => { mountedRef.current = false; }, []);
   useEffect(() => {
     if (!mockResolved) return;           // unresolved shell: no fetch
     if (mockAgents) return;              // mock path: injected rows, no reader
     if (!resolved) return;              // wait for the URL lane before deciding to read
     if (lane !== 'directional') return; // Maker lane never reads the roster
-    if (fetchStartedRef.current) return; // fire exactly once
+    if (fetchStartedRef.current) return; // fire exactly once (per successful/in-flight read)
     fetchStartedRef.current = true;
-    let cancelled = false;
+    // No lane-scoped cleanup: the read COMPLETES across any lane toggle; only unmount ignores it.
     getAgentsRoster().then(
-      (rows) => { if (!cancelled) setRosterRows(rows); },
-      () => { if (!cancelled) setRosterRows([]); },
+      (rows) => { if (mountedRef.current) setRosterRows(rows); },
+      () => {
+        // A genuine REJECT (getAgentsRoster normally catches → resolves []) may retry on next toggle:
+        // release the once-guard so a later lane change can re-attempt, but never loop (deps unchanged).
+        if (mountedRef.current) setRosterRows([]);
+        fetchStartedRef.current = false;
+      },
     );
-    return () => { cancelled = true; };
   }, [mockResolved, mockAgents, resolved, lane]);
 
   // The Public-Agents rows: injected mock rows, else the off-mock roster read (null until it lands).

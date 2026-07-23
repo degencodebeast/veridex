@@ -63,6 +63,35 @@ describe('E4 fetch ownership — the roster read is the SCREEN, gated correctly'
     expect(getAgentsRosterMock).toHaveBeenCalledTimes(1);
   });
 
+  it('a PENDING roster read survives Public→Maker→Public: it resolves and renders (exactly ONE read, never stranded empty)', async () => {
+    // Deferred read: it STAYS pending across the lane toggle, resolved only at the end. Regression
+    // guard for M5 — a `lane`-scoped cancel would discard this in-flight result and the once-guard
+    // would block any retry, leaving Public Agents permanently empty. Cancellation is unmount-only.
+    let resolveRoster!: (rows: PublicAgentRow[]) => void;
+    const deferred = new Promise<PublicAgentRow[]>((res) => { resolveRoster = res; });
+    getAgentsRosterMock.mockReturnValue(deferred);
+    const user = userEvent.setup();
+    render(<DuelScreen mockResolved mockAgents={null} />);
+
+    // Public Agents → the single read STARTS but stays pending (not resolved)
+    await user.click(screen.getByRole('radio', { name: 'Public Agents' }));
+    await waitFor(() => expect(getAgentsRosterMock).toHaveBeenCalledTimes(1));
+
+    // toggle away to Maker and back WHILE the read is in-flight
+    await user.click(screen.getByRole('radio', { name: 'Maker' }));
+    await user.click(screen.getByRole('radio', { name: 'Public Agents' }));
+
+    // resolve the deferred read only NOW, after the round-trip
+    await act(async () => { resolveRoster(ROWS); });
+
+    // the in-flight result lands: the compare populates, still exactly one read, not stuck empty
+    await waitFor(() => expect(screen.getByLabelText(/agent a/i)).toBeInTheDocument());
+    expect(screen.getAllByText('Alpha').length).toBeGreaterThan(0);
+    expect(screen.getAllByText('Bravo').length).toBeGreaterThan(0);
+    expect(getAgentsRosterMock).toHaveBeenCalledTimes(1);
+    expect(screen.queryByTestId('duel-empty')).toBeNull();
+  });
+
   it('mock ON (injected rows) → the real reader is NEVER called', () => {
     render(<DuelScreen mockResolved mockAgents={ROWS} />);
     expect(screen.getByLabelText(/agent a/i)).toBeInTheDocument();
