@@ -75,7 +75,10 @@ describe('MarketsScreen (REQ-016 / AC-010/011 / REQ-042 / CON-040)', () => {
 
   it('renders the three families with decimal odds + implied % and pending/— closings (REQ-042/CON-040)', async () => {
     const user = userEvent.setup();
-    renderMarkets({ oddsByFixture: IN_RUNNING });
+    // LIVE source: an in-play null closing is genuinely FORTHCOMING (prints once the pre-match window
+    // closes) → the honest "pending / —" label stays. (A hash-bound REPLAY null closing is absent, not
+    // forthcoming, and renders a plain — instead — asserted in markets-odds.test.tsx.)
+    renderMarkets({ oddsByFixture: IN_RUNNING, sourceMode: 'live' });
     await user.click(screen.getByTestId('fixture-18172280'));
     const fam = screen.getByTestId('families');
     expect(within(fam).getByText(/Match Result/i)).toBeInTheDocument();

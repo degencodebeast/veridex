@@ -90,15 +90,36 @@ describe('MarketsScreen replay-market odds render (E2 / MAJOR-5 exact conversion
     expect(/\d/.test(cells[2].textContent ?? '')).toBe(false); // never a fabricated "0.000"
   });
 
-  it('EVERY replay CLOSING cell renders — (no fabricated / cross-parameter closing)', async () => {
+  it('EVERY replay CLOSING cell renders EXACTLY — (absent, not "pending" — a hash-bound replay closing never arrives)', async () => {
     const fam = await renderFromWire();
-    // Both same-family O/U parameter lines (2.5 → 2.080, 3.5 → 1.930) must independently render an
-    // em-dash — proving no reconstruction and no cross-parameter borrowing between the two lines.
+    // Both same-family O/U parameter lines (2.5 → 2.080, 3.5 → 1.930) must independently render the
+    // PLAIN em-dash — proving no reconstruction, no cross-parameter borrowing, AND no "pending / —"
+    // overclaim: for a hash-bound CAPTURED REPLAY the closing is genuinely ABSENT and never forthcoming.
     for (const consensus of ['2.080', '1.930']) {
       const cells = rowCells(fam, consensus);
-      expect(cells[3].textContent).toContain('—');                 // honest em-dash, not a number
+      expect(cells[3].textContent).toBe('—');                      // EXACT plain em-dash — not "pending / —", not a number
       expect(/\d/.test(cells[3].textContent ?? '')).toBe(false);   // never a reconstructed/borrowed price
     }
+  });
+
+  it('a LIVE null closing MAY still render "pending / —" (a live in-play closing genuinely is forthcoming)', async () => {
+    // In-play (in_running:true) → no pre-match update exists, so reconstructClosing yields null. Under a
+    // LIVE source that null is honestly "pending / —" (a closing prints once the pre-match window closes),
+    // NOT the plain replay em-dash — the live path keeps the forthcoming label.
+    stubFetch({
+      fixture_id: FIXTURE_ID,
+      label: 'LIVE',
+      markets: [{
+        market_key: 'OVERUNDER_PARTICIPANT_GOALS||line=2.5',
+        in_running: true, suspended: false, ts: 100,
+        stable_prob_bps: { p1: 5000 }, stable_price: { p1: 2.08 },
+      }],
+    });
+    const updates = await getReplayMarkets(PACK_ID, FIXTURE_ID);
+    render(<MarketsScreen oddsByFixture={{ [`${PACK_ID}::${FIXTURE_ID}`]: updates }} fixtures={[fixture()]} sourceMode="live" feedHealth={null} leaderboard={[]} />);
+    const fam = screen.getByTestId('families');
+    const cells = rowCells(fam, '2.080');
+    expect(cells[3].textContent).toBe('pending / —');              // live null closing keeps the forthcoming label
   });
 
   it('the EDGE column renders an honest — (no fabricated executable edge)', async () => {

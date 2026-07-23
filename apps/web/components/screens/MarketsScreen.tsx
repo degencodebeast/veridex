@@ -194,7 +194,10 @@ export function MarketsScreen({
                               {/* implied %: a suspended outcome carries an EMPTY pct (no de-vigged prob) —
                                   render the honest em-dash, NEVER a fabricated "0.000%". */}
                               <td className={styles.num}>{o.impliedPct ? `${o.impliedPct}%` : <span className={styles.muted}>—</span>}</td>
-                              <td className={styles.num}>{o.closing == null ? (<span className={styles.pending}>pending / —</span>) : o.closing.toFixed(3)}</td>
+                              {/* closing: a null closing under a hash-bound REPLAY is genuinely ABSENT and
+                                  never forthcoming → honest plain —. A LIVE null closing IS forthcoming
+                                  (prints once the pre-match window closes) → the "pending / —" label stays. */}
+                              <td className={styles.num}>{o.closing == null ? (sourceMode === 'replay' ? <span className={styles.muted}>—</span> : <span className={styles.pending}>pending / —</span>) : o.closing.toFixed(3)}</td>
                               {/* EDGE: executable edge needs a venue price (not in this feed) — honest — */}
                               <td className={styles.num} data-testid="edge-cell"><span className={styles.muted}>—</span></td>
                               {/* AGENTS: no per-market agent mapping in the backend — honest — (never a count) */}
