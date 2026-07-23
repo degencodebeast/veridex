@@ -13,6 +13,39 @@ IMAGE="veridex-maker-acceptance:local"
 CONTAINER="veridex-maker-acceptance"
 PORT="${PORT:-18099}"
 
+# ==================================================================================================
+# F1 Step-4 BACKEND REGRESSION GATE — full pytest suite deselecting the known-failing baseline.
+# Reads .omc/artifacts/known-failing-tests.txt (untracked operational baseline) and builds ONE
+# `--deselect <id>` flag PER non-comment line, so the gate handles the FULL list (not just one id).
+# The list holds: (1) the order-dependent test_agent_loop flake (RUNNABLE — run ISOLATED below to
+# prove no new break), and (2) 4 parent-proven, INFRA-GATED D-1 web/compose-stack integration tests
+# that require a real `docker compose up` of the api+postgres stack (compose first interpolates the
+# whole compose.coolify.yml, incl. the web `:?`-guarded NEXT_PUBLIC_PRIVY_APP_ID build arg) — not
+# runnable in a plain backend test env. The 2 `docker compose config` guard tests are NOT deselected
+# (they are fixed by completing the test env matrix and MUST pass). Deselecting the 4 stack tests
+# keeps their module-scoped fixtures from booting, so this gate performs NO heavy container build.
+# ==================================================================================================
+KNOWN_FAILING="$ROOT/.omc/artifacts/known-failing-tests.txt"
+DESELECT=()
+if [ -f "$KNOWN_FAILING" ]; then
+  while IFS= read -r t || [ -n "$t" ]; do
+    [ -n "$t" ] || continue           # skip blank lines
+    [ "${t#\#}" = "$t" ] || continue  # skip comment lines (leading `#`)
+    DESELECT+=(--deselect "$t")
+  done < "$KNOWN_FAILING"
+fi
+
+echo "== F1 backend regression gate: pytest tests/ (deselecting ${#DESELECT[@]} known-failing flags) =="
+APP_ENV=development AUTH_MODE=dev "$ROOT/.venv/bin/python" -m pytest "$ROOT/tests/" -q \
+  ${DESELECT[@]+"${DESELECT[@]}"}
+
+# Prove no NEW break in the deselected RUNNABLE flake by running it ISOLATED. The 4 D-1 stack tests
+# are INFRA-GATED (they cannot run green without the docker-compose stack), so they are documented in
+# the baseline as pre-existing/infra-gated — NOT asserted green in isolation here.
+FLAKE="tests/test_agent_loop.py::test_agent_module_imports_without_agno_and_no_network"
+echo "== F1 backend regression gate: isolated runnable flake ($FLAKE) =="
+APP_ENV=development AUTH_MODE=dev "$ROOT/.venv/bin/python" -m pytest "$FLAKE" -q
+
 # F1 — the seeded Official-Replay-League running-container flow shares the SAME built $IMAGE but runs a
 # SECOND API container on the Task-0-owned veridex-net wired to the shared veridex-pg Postgres, plus a
 # SEPARATE seed process. F1 owns teardown of ONLY these (the two containers + the built image); Task 0

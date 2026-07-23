@@ -77,6 +77,9 @@ LOCAL_TEST_ENV: dict[str, str] = {
     "WAL_DIR": WAL_TARGET,
     "REPLAY_PACK_ROOT": CURATED_TARGET,
     "NEXT_PUBLIC_API_BASE": "http://localhost:8000",
+    # Required web build-arg (`:?`-guarded in compose.coolify.yml). Test-only placeholder so
+    # `docker compose config` interpolates cleanly; must match the backend PRIVY_APP_ID at build time.
+    "NEXT_PUBLIC_PRIVY_APP_ID": "test-privy-app-id",
     "API_HOST_PORT": "8000",
     "WEB_HOST_PORT": "3000",
     "CURATED_PACKS_HOST": "./scripts/fixtures/demo_pack_real",
