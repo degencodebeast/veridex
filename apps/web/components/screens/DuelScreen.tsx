@@ -60,10 +60,16 @@ export function DuelScreen({
   const fetchStartedRef = useRef(false);
   // Cancellation is scoped to UNMOUNT only — never to a lane change. A `lane`-dependent cleanup would
   // discard an in-flight read the instant the user toggles to Maker, and the once-guard would then
-  // block any retry, stranding Public Agents permanently empty (M5). This ref flips false solely on
-  // unmount, so a mid-flight lane toggle can never drop the single result.
+  // block any retry, stranding Public Agents permanently empty (M5). The guard must also be React
+  // Strict-Mode-safe: Strict double-invokes effects (setup→cleanup→setup) in dev, so a cleanup-only
+  // guard would end FALSE after the round-trip and discard the single deferred roster response. We
+  // set true in SETUP and false in CLEANUP, so setup→cleanup→setup ends TRUE — a mid-flight lane
+  // toggle (or Strict's remount) can never drop the single result.
   const mountedRef = useRef(true);
-  useEffect(() => () => { mountedRef.current = false; }, []);
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => { mountedRef.current = false; };
+  }, []);
   useEffect(() => {
     if (!mockResolved) return;           // unresolved shell: no fetch
     if (mockAgents) return;              // mock path: injected rows, no reader

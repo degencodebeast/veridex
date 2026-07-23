@@ -1,6 +1,7 @@
 // E4 · The Public-Agents lane: single fetch authority + single lane authority (DuelScreen), the real
 // off-mock roster read (getAgentsRoster), hydration-safety, and async two-agent selection. The MAKER
 // lane is a separate population — asserted untouched in duel-maker-regression.test.tsx.
+import React from 'react';
 import { describe, it, expect, vi, afterEach } from 'vitest';
 import { render, screen, waitFor, act } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
@@ -85,6 +86,35 @@ describe('E4 fetch ownership — the roster read is the SCREEN, gated correctly'
     await act(async () => { resolveRoster(ROWS); });
 
     // the in-flight result lands: the compare populates, still exactly one read, not stuck empty
+    await waitFor(() => expect(screen.getByLabelText(/agent a/i)).toBeInTheDocument());
+    expect(screen.getAllByText('Alpha').length).toBeGreaterThan(0);
+    expect(screen.getAllByText('Bravo').length).toBeGreaterThan(0);
+    expect(getAgentsRosterMock).toHaveBeenCalledTimes(1);
+    expect(screen.queryByTestId('duel-empty')).toBeNull();
+  });
+
+  it('under <React.StrictMode> a DEFERRED roster read still resolves and renders (exactly ONE read; the mount guard survives Strict setup→cleanup→setup)', async () => {
+    // Strict Mode double-invokes effects (setup→cleanup→setup). A mount guard that only flips
+    // false-on-cleanup ends up FALSE after the round-trip, so the single deferred roster response
+    // is discarded and Public Agents strands permanently empty (M5 residual). A Strict-safe guard
+    // must set true in SETUP so the read still lands. The once-guard must also survive the double
+    // setup — exactly ONE real read, never a duplicate.
+    let resolveRoster!: (rows: PublicAgentRow[]) => void;
+    const deferred = new Promise<PublicAgentRow[]>((res) => { resolveRoster = res; });
+    getAgentsRosterMock.mockReturnValue(deferred);
+    render(
+      <React.StrictMode>
+        <DuelScreen mockResolved mockAgents={null} />
+      </React.StrictMode>,
+    );
+
+    // the off-mock read STARTS on the Public-Agents lane, exactly once, and stays pending
+    await waitFor(() => expect(getAgentsRosterMock).toHaveBeenCalledTimes(1));
+
+    // resolve the deferred read AFTER Strict's setup→cleanup→setup has settled
+    await act(async () => { resolveRoster(ROWS); });
+
+    // the response lands: the compare populates (NOT stuck empty), still exactly one read
     await waitFor(() => expect(screen.getByLabelText(/agent a/i)).toBeInTheDocument());
     expect(screen.getAllByText('Alpha').length).toBeGreaterThan(0);
     expect(screen.getAllByText('Bravo').length).toBeGreaterThan(0);
