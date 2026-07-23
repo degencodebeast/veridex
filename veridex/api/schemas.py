@@ -425,6 +425,48 @@ class ReplayPackListResponse(BaseModel):
     packs: list[ReplayPackInfo]
 
 
+class ReplayMarketRow(BaseModel):
+    """One market's LAST-KNOWN projected state, folded across the WHOLE hash-bound replay tape (M11).
+
+    The projection keeps the LAST-SEEN value per ``market_key`` over ALL tape states (not just the
+    final tick — which alone carries only the markets present at that instant), plus the ``ts`` and
+    per-market ``in_running`` of the state it was last seen in.
+
+    HONESTY (M4): a SUSPENDED market keeps ``stable_prob_bps == {}`` (EMPTY — never back-filled from
+    the retained ``stable_price``); the last-known decimal odds in ``stable_price`` stay non-empty so
+    the browser can still render odds without fabricating an implied probability.
+
+    Attributes:
+        market_key: The stable ``{SuperOddsType}|{MarketPeriod}|{MarketParameters}`` key.
+        in_running: The match-phase of the state the market was last seen in. Derived HONESTLY from
+            that ``MarketState.phase`` (``1`` ⇒ in-running). At the runtime ``batch_size=1`` each state
+            is folded from a SINGLE native record, so its ``phase`` is exactly that record's
+            ``InRunning`` flag — the honest per-market source (MarketState carries no per-market flag).
+        suspended: ``True`` when the market had no priced (non-NA) probability outcomes at last sight.
+        ts: The ``ts`` (epoch seconds) of the state the market was last seen in.
+        stable_prob_bps: Outcome-keyed de-vigged probability in basis points. EMPTY ``{}`` for a
+            suspended market — PRESERVED empty, never filled.
+        stable_price: Outcome-keyed decimal odds (last-known). Non-empty even when suspended.
+    """
+
+    market_key: str
+    in_running: bool
+    suspended: bool
+    ts: int
+    stable_prob_bps: dict[str, int]
+    stable_price: dict[str, float]
+
+
+class ReplayMarketsResponse(BaseModel):
+    """Envelope for ``GET /replay-packs/{pack_id}/fixtures/{fixture_id}/markets`` — the last-known
+    per-market projection of one replay fixture (read-only). ``label`` is always ``"CAPTURED REPLAY"``
+    (a replay is never dressed up as live). NO ``finished`` / ``closing`` / ``edge`` keys."""
+
+    fixture_id: int
+    label: str = "CAPTURED REPLAY"
+    markets: list[ReplayMarketRow]
+
+
 class AgentRosterEntry(BaseModel):
     """One row of the HONEST public agent directory, keyed on the immutable ``public_agent_id``.
 

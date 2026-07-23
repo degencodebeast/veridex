@@ -22,7 +22,7 @@ import { INSPECTOR_DEMO_QUANTITIES } from '@/lib/fixtures/inspector';
 import { PROOF_DEMO_ROOTS, mapRootForest } from '@/lib/fixtures/proof';
 import { PROOF_EXPLAIN_DEMO, type ProofExplanation } from '@/lib/explainer';
 import { VERIFIER_VERSION, type StatusBarState } from '@/lib/status';
-import type { AgentSummary, Archetype } from '@/lib/catalog';
+import type { AgentSummary, Archetype, MarketFamilyKey, OddsUpdate } from '@/lib/catalog';
 import type * as W from '@/lib/wire';
 import type {
   AnchorInfo, AnchorStatus, CheckResult, CockpitState, ExecutionMode, FeedHealthState,
@@ -76,6 +76,10 @@ export const PATHS = {
   makerLiveAb: (instanceId: string) => `/maker/live-ab/${encodeURIComponent(instanceId)}`,
   // R-3 verified ReplayPack catalog (read-only). Enriched with additive fixture_metadata.
   replayPacks: () => `/replay-packs`,
+  // E2 read-only replay-market projection: one fixture's LAST-KNOWN odds per market (folded across
+  // the whole hash-bound tape). pack_id is a catalog KEY resolved server-side, never a filesystem path.
+  replayMarkets: (packId: string, fixtureId: number) =>
+    `/replay-packs/${encodeURIComponent(packId)}/fixtures/${fixtureId}/markets`,
   // PUBLIC deployed-agent roster (read-only, unauth — mirrors /replay-packs). ALL owners, NOT
   // owner-filtered (distinct from the owner-scoped /agents/instances). Perf columns are honest null.
   agentsRoster: () => `/agents/roster`,
@@ -819,6 +823,70 @@ export async function getReplayPacks(): Promise<ReplayPackView[]> {
     fixtures: p.fixtures,
     fixtureMetadata: p.fixture_metadata ?? [],
   }));
+}
+
+// ---- E2 replay-market projection (GET /replay-packs/{pack}/fixtures/{fixture}/markets) ----
+//
+// Maps the backend's LAST-KNOWN per-market projection to the screen's OddsUpdate view (buildFamilies
+// renders it). MAJOR-5 EXACT unit conversion (verified against wire semantics):
+//   • stable_price[outcome] = DECIMAL odds (e.g. 2.08) → prices[i] = round(x * 1000) (2.08 → 2080),
+//     which decodePrice() renders back to 2.08.
+//   • stable_prob_bps[outcome] = BPS (e.g. 5000 = 50%) → pct[i] = (bps / 100).toFixed(3) ("50.000").
+//   • an outcome ABSENT from stable_prob_bps (suspended) → pct[i] = '' (the honest MISSING sentinel);
+//     the render maps '' → '—', NEVER a fabricated "0.000". The retained stable_price still renders.
+
+/** Wire shape of one projected market (backend ReplayMarketRow, veridex/api/schemas.py). */
+interface ReplayMarketRowWire {
+  market_key: string;
+  in_running: boolean;
+  suspended: boolean;
+  ts: number;
+  stable_prob_bps: Record<string, number>;
+  stable_price: Record<string, number>;
+}
+
+/** Wire shape of the GET .../markets envelope (backend ReplayMarketsResponse). */
+interface ReplayMarketsResponseWire {
+  fixture_id: number;
+  label: string;
+  markets: ReplayMarketRowWire[];
+}
+
+// One wire market → one OddsUpdate. price_names is the DETERMINISTIC outcome order = the keys of the
+// wire stable_price map (every priced outcome, stable insertion order). market_family = the FIRST
+// segment of market_key ({SuperOddsType}|{MarketPeriod}|{MarketParameters}); market_parameters = the
+// THIRD segment or null. Only the 3 known MarketFamilyKeys render (buildFamilies filters the rest).
+function replayMarketToOddsUpdate(fixtureId: number, m: ReplayMarketRowWire): OddsUpdate {
+  const outcomes = Object.keys(m.stable_price); // deterministic: the priced outcomes, stable order
+  const [superOddsType, , marketParameters] = m.market_key.split('|');
+  return {
+    fixture_id: fixtureId,
+    message_id: m.market_key, // stable, deterministic id (the projection is one row per market_key)
+    ts: m.ts,
+    in_running: m.in_running,
+    // The RAW SuperOddsType is preserved verbatim; buildFamilies renders ONLY the known families and
+    // drops any other (the cast is safe — the value is only compared against MARKET_FAMILY_KEYS + text).
+    market_family: superOddsType as MarketFamilyKey,
+    market_parameters: marketParameters ? marketParameters : null,
+    price_names: outcomes, // deterministic outcome order = the priced-outcome keys (stable)
+    prices: outcomes.map((o) => Math.round(m.stable_price[o] * 1000)), // decimal → int ×1000
+    // implied %: bps → 3dp string; ABSENT (suspended) ⇒ '' sentinel → render maps to '—', never a fake 0.
+    pct: outcomes.map((o) =>
+      Object.prototype.hasOwnProperty.call(m.stable_prob_bps, o) ? (m.stable_prob_bps[o] / 100).toFixed(3) : '',
+    ),
+  };
+}
+
+// GET the E2 projection → OddsUpdate[] (buildFamilies-ready). Off-mock only — under mock the page keeps
+// its existing demo odds path (this reader is never called there). Honest-empty [] on any transport
+// error (never a fabricated market). Suspended markets carry retained prices with '' implied sentinels.
+export async function getReplayMarkets(packId: string, fixtureId: number): Promise<OddsUpdate[]> {
+  try {
+    const res = await getJson<ReplayMarketsResponseWire>(PATHS.replayMarkets(packId, fixtureId));
+    return res.markets.map((m) => replayMarketToOddsUpdate(fixtureId, m));
+  } catch {
+    return []; // honest-empty on error — the screen shows absence, never a fabricated market
+  }
 }
 
 // ---- PUBLIC deployed-agent roster (GET /agents/roster) ----

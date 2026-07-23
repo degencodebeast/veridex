@@ -74,6 +74,8 @@ from veridex.api.schemas import (
     KillSwitchResponse,
     LeaderboardResponse,
     LeaderboardRow,
+    ReplayMarketRow,
+    ReplayMarketsResponse,
     ReplayPackInfo,
     ReplayPackListResponse,
     RuntimeEventsResponse,
@@ -128,6 +130,7 @@ from veridex.ingest.replay_catalog import (
     load_resolved_marketstates,
     resolve_replay_source,
 )
+from veridex.ingest.replay_pack import PackIntegrityError, load_pack_fixture_states_bound
 from veridex.leaderboard import leaderboard as _build_leaderboard
 from veridex.public_agent import PublicAgent, Visibility, owner_public_label
 from veridex.public_projection import BoardKind, directional_board
@@ -710,6 +713,59 @@ def create_app(
         if entry is None:
             raise HTTPException(status_code=404, detail=f"unknown pack_id: {pack_id}")
         return _replay_pack_info(entry)
+
+    @app.get(
+        "/replay-packs/{pack_id}/fixtures/{fixture_id}/markets",
+        response_model=ReplayMarketsResponse,
+    )
+    async def get_replay_fixture_markets(pack_id: str, fixture_id: int) -> ReplayMarketsResponse:
+        """Project one replay fixture's LAST-KNOWN odds per market, folded across the WHOLE tape (M11).
+
+        Resolves the pack SERVER-side against the verified R-2 catalog (never a filesystem path): an
+        unknown ``pack_id`` or a fixture not catalogued for the pack is a 404. The fixture tape is loaded
+        via :func:`~veridex.ingest.replay_pack.load_pack_fixture_states_bound`, binding the replayed bytes
+        to the catalog's verified ``content_hash`` — a tampered pack (bytes swapped after admission) fails
+        closed with a 422.
+
+        The fold keeps the LAST-SEEN value per ``market_key`` over ALL tape states (the final tick alone
+        carries only the markets present at that instant — 1 of ~30 here), plus the ``ts`` and per-market
+        ``in_running`` of the state each market was last seen in. HONESTY (M4): a suspended market keeps
+        its EMPTY ``stable_prob_bps`` (never back-filled) while retaining last-known ``stable_price``.
+        """
+        entry = app.state.replay_catalog.get(pack_id)
+        if entry is None:
+            raise HTTPException(status_code=404, detail=f"unknown pack_id: {pack_id}")
+        if fixture_id not in entry.fixtures:
+            raise HTTPException(
+                status_code=404,
+                detail=f"fixture_id {fixture_id} is not catalogued for pack {pack_id!r}",
+            )
+        try:
+            states = load_pack_fixture_states_bound(
+                entry.pack_dir, fixture_id, expected_content_hash=entry.content_hash
+            )
+        except (PackIntegrityError, ValueError, FileNotFoundError) as exc:
+            # Fail closed: a tampered/corrupt pack (content_hash drift, fixture<->file swap) is a 4xx,
+            # never a silently-served partial projection.
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+        # M11 fold: LAST-SEEN value per market_key across ALL states (NOT just states[-1], which carries
+        # only the markets present at the final tick). in_running is derived from the state's phase — at
+        # batch_size=1 (the load default) each state is folded from ONE record, so its phase is exactly
+        # that record's InRunning; MarketState carries no per-market flag, so this is the honest source.
+        folded: dict[str, ReplayMarketRow] = {}
+        for state in states:
+            for key, market in state.markets.items():
+                folded[key] = ReplayMarketRow(
+                    market_key=key,
+                    in_running=bool(state.phase),
+                    suspended=bool(market["suspended"]),
+                    ts=int(state.ts),
+                    # PRESERVE the empty prob map for a suspended market — never fill it from the price.
+                    stable_prob_bps=dict(market["stable_prob_bps"]),
+                    stable_price=dict(market["stable_price"]),
+                )
+        return ReplayMarketsResponse(fixture_id=fixture_id, markets=list(folded.values()))
 
     # --- GET /agents/roster (PUBLIC — the deployed-agent roster, read-only) -----
 

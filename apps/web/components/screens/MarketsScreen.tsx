@@ -174,7 +174,9 @@ export function MarketsScreen({
                             <tr key={o.name}>
                               <td>{o.name}</td>
                               <td className={styles.num}>{o.decimal.toFixed(3)}</td>
-                              <td className={styles.num}>{o.impliedPct}%</td>
+                              {/* implied %: a suspended outcome carries an EMPTY pct (no de-vigged prob) —
+                                  render the honest em-dash, NEVER a fabricated "0.000%". */}
+                              <td className={styles.num}>{o.impliedPct ? `${o.impliedPct}%` : <span className={styles.muted}>—</span>}</td>
                               <td className={styles.num}>{o.closing == null ? (<span className={styles.pending}>pending / —</span>) : o.closing.toFixed(3)}</td>
                               {/* EDGE: executable edge needs a venue price (not in this feed) — honest — */}
                               <td className={styles.num} data-testid="edge-cell"><span className={styles.muted}>—</span></td>

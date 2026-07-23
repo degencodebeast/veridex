@@ -1,7 +1,7 @@
 'use client';
 import { useEffect, useState } from 'react';
 import { MarketsScreen } from '@/components/screens/MarketsScreen';
-import { getFeedHealth, getLeaderboard, getReplayPacks } from '@/lib/api';
+import { getFeedHealth, getLeaderboard, getReplayMarkets, getReplayPacks } from '@/lib/api';
 import { isMockEnabled } from '@/lib/mock';
 import { ODDS_UPDATES, FIXTURES } from '@/lib/fixtures/catalog';
 import type { FeedHealthState, FixtureSummary, LeaderboardRow, OddsUpdate } from '@/lib/catalog';
@@ -59,6 +59,16 @@ export default function MarketsPage() {
             })),
           ),
         );
+        // E2: off-mock the odds table is fed by the REAL replay-market projection. Fetch each catalogued
+        // (pack_id, fixture_id)'s LAST-KNOWN odds per market and populate oddsByFixture[fixture_id]. On
+        // error each fixture stays honest-empty (getReplayMarkets returns []) — never a fabricated market.
+        for (const pack of packs) {
+          for (const m of pack.fixtureMetadata) {
+            getReplayMarkets(pack.packId, m.fixture_id).then((updates) => {
+              if (alive && !isMockEnabled()) setOddsByFixture((prev) => ({ ...prev, [m.fixture_id]: updates }));
+            });
+          }
+        }
       })
       .catch(() => { /* honest-empty: fixtures stay [] off-mock on error — never a fabricated fixture */ });
     return () => { alive = false; };
