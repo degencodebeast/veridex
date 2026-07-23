@@ -151,6 +151,11 @@ export interface PublicAgentRow {
 export interface DirectionalRow extends LeaderboardRow {
   display_name: string;
   public_agent_id: string;
+  // The HONEST roster-local proof state for the board surface (Gate-3 M3). The shared
+  // LeaderboardRow.proof_mode coerces the backend's cross-run aggregate "mixed" → 'reproducible'
+  // (an unearned claim); this carries the honest 'mixed'/'unknown'/'unscored' so the board renders
+  // the real aggregate. Never widens the shared ProofMode — the honesty lives ONLY here.
+  proof_state: ProofState;
 }
 
 export interface AgentProfileRecord extends AgentSummary {

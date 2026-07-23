@@ -1014,6 +1014,10 @@ export function adaptDirectionalLeaderboard(w: DirectionalLeaderboardResponseWir
     agent_name: w.rows[i].display_name,  // the REAL display name, not the opaque-id fallback
     public_agent_id: w.rows[i].public_agent_id,
     display_name: w.rows[i].display_name,
+    // HONEST board proof state (Gate-3 M3): map the wire proof_mode via toProofState — the backend's
+    // cross-run aggregate "mixed" stays 'mixed' (never the unearned 'reproducible' that base.proof_mode
+    // coerces it to), and any unrecognized value fails CLOSED to 'unknown'.
+    proof_state: toProofState(w.rows[i].proof_mode),
   }));
 }
 
