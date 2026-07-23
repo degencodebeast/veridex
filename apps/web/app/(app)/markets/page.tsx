@@ -3,6 +3,7 @@ import { useEffect, useState } from 'react';
 import { MarketsScreen } from '@/components/screens/MarketsScreen';
 import { getFeedHealth, getLeaderboard, getReplayMarkets, getReplayPacks } from '@/lib/api';
 import { isMockEnabled } from '@/lib/mock';
+import { fixtureKey } from '@/lib/txline/client';
 import { ODDS_UPDATES, FIXTURES } from '@/lib/fixtures/catalog';
 import type { FeedHealthState, FixtureSummary, LeaderboardRow, OddsUpdate } from '@/lib/catalog';
 
@@ -15,7 +16,8 @@ import type { FeedHealthState, FixtureSummary, LeaderboardRow, OddsUpdate } from
 //   • feed-health    — getFeedHealth()  (self-gating: mock → fixture, off-mock → real fetch); null on error.
 //   • eligible-agents— getLeaderboard() (self-gating; the eligible rail is leaderboard-derived); [] on error.
 export default function MarketsPage() {
-  const [oddsByFixture, setOddsByFixture] = useState<Record<number, OddsUpdate[]>>({});
+  // Keyed by the COMPOSITE fixtureKey(pack_id, fixture_id) — two packs can share an external fixture_id.
+  const [oddsByFixture, setOddsByFixture] = useState<Record<string, OddsUpdate[]>>({});
   const [fixtures, setFixtures] = useState<FixtureSummary[]>([]);
   const [feedHealth, setFeedHealth] = useState<FeedHealthState | null>(null);
   const [leaderboard, setLeaderboard] = useState<LeaderboardRow[]>([]);
@@ -24,7 +26,13 @@ export default function MarketsPage() {
     let alive = true;
     // odds/fixtures have no endpoint — the mock flag is the ONLY thing that surfaces the demo fixture.
     if (isMockEnabled()) {
-      setOddsByFixture(ODDS_UPDATES);
+      // Re-key the demo odds by the composite (pack_id, fixture_id) — the screen now looks up by it.
+      const mockOdds: Record<string, OddsUpdate[]> = {};
+      for (const f of FIXTURES) {
+        const rows = ODDS_UPDATES[f.fixture_id];
+        if (rows) mockOdds[fixtureKey(f.pack_id, f.fixture_id)] = rows;
+      }
+      setOddsByFixture(mockOdds);
       setFixtures(FIXTURES);
     }
     getFeedHealth()
@@ -65,7 +73,7 @@ export default function MarketsPage() {
         for (const pack of packs) {
           for (const m of pack.fixtureMetadata) {
             getReplayMarkets(pack.packId, m.fixture_id).then((updates) => {
-              if (alive && !isMockEnabled()) setOddsByFixture((prev) => ({ ...prev, [m.fixture_id]: updates }));
+              if (alive && !isMockEnabled()) setOddsByFixture((prev) => ({ ...prev, [fixtureKey(pack.packId, m.fixture_id)]: updates }));
             });
           }
         }

@@ -3,10 +3,16 @@ import type { ComponentProps } from 'react';
 import { render, screen, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { MarketsScreen } from '@/components/screens/MarketsScreen';
+import { fixtureKey } from '@/lib/txline/client';
 import { ODDS_UPDATES, FIXTURES, FEED_HEALTH, LEADERBOARD_ROWS } from '@/lib/fixtures/catalog';
 import type { OddsUpdate } from '@/lib/catalog';
 
 afterEach(() => { vi.unstubAllEnvs(); });
+
+// Odds are keyed by the COMPOSITE (pack_id, fixture_id) identity (MAJOR-4). The default demo fixture is
+// pack demo_pack_real / fixture 18172280 — re-key the numeric demo map onto that composite for the screen.
+const KEY_280 = fixtureKey('demo_pack_real', 18172280);
+const DEMO_ODDS: Record<string, OddsUpdate[]> = { [KEY_280]: ODDS_UPDATES[18172280] };
 
 // The screen is now a PURE presentational component with honest-empty defaults (T-2): off-mock the
 // page supplies {} / [] / null (nothing renders), on-mock it supplies the demo fixtures. These
@@ -15,7 +21,7 @@ afterEach(() => { vi.unstubAllEnvs(); });
 function renderMarkets(props: Partial<ComponentProps<typeof MarketsScreen>> = {}) {
   return render(
     <MarketsScreen
-      oddsByFixture={ODDS_UPDATES}
+      oddsByFixture={DEMO_ODDS}
       fixtures={FIXTURES}
       feedHealth={FEED_HEALTH}
       leaderboard={LEADERBOARD_ROWS}
@@ -26,8 +32,8 @@ function renderMarkets(props: Partial<ComponentProps<typeof MarketsScreen>> = {}
 
 // In-running-only odds (no pre-match capture) → closings cannot be reconstructed → pending/—
 // (the honest CON-040 branch). Covers all three soccer families.
-const IN_RUNNING: Record<number, OddsUpdate[]> = {
-  18172280: [
+const IN_RUNNING: Record<string, OddsUpdate[]> = {
+  [KEY_280]: [
     { fixture_id: 18172280, message_id: 'a', ts: 1, in_running: true, market_family: '1X2_PARTICIPANT_RESULT', market_parameters: null, price_names: ['NLD', 'Draw', 'MAR'], prices: [1472, 3550, 6100], pct: ['67.935', '28.169', '16.393'] },
     { fixture_id: 18172280, message_id: 'b', ts: 2, in_running: true, market_family: 'OVERUNDER_PARTICIPANT_GOALS', market_parameters: 'line=2.5', price_names: ['Over', 'Under'], prices: [1910, 1980], pct: ['52.356', '50.505'] },
     { fixture_id: 18172280, message_id: 'c', ts: 3, in_running: true, market_family: 'ASIANHANDICAP_PARTICIPANT_GOALS', market_parameters: 'line=-0.25', price_names: ['NLD', 'MAR'], prices: [1880, 2010], pct: ['53.191', '49.751'] },
@@ -96,13 +102,14 @@ describe('MarketsScreen (REQ-016 / AC-010/011 / REQ-042 / CON-040)', () => {
 
   it('reconstructs a real closing value from pre-match updates (CON-040 value branch)', async () => {
     const user = userEvent.setup();
-    // pre-match update (in_running:false) → closing reconstructable to a decimal value.
-    const preMatch: Record<number, OddsUpdate[]> = {
-      18172280: [
+    // pre-match update (in_running:false) → closing reconstructable to a decimal value. Reconstruction is
+    // a LIVE-path feature (MAJOR-2): the replay projection OMITS closing, so exercise it under sourceMode 'live'.
+    const preMatch: Record<string, OddsUpdate[]> = {
+      [KEY_280]: [
         { fixture_id: 18172280, message_id: 'p', ts: 1, in_running: false, market_family: '1X2_PARTICIPANT_RESULT', market_parameters: null, price_names: ['NLD', 'Draw', 'MAR'], prices: [1500, 3500, 6000], pct: ['66.667', '28.571', '16.667'] },
       ],
     };
-    renderMarkets({ oddsByFixture: preMatch });
+    renderMarkets({ oddsByFixture: preMatch, sourceMode: 'live' });
     await user.click(screen.getByTestId('fixture-18172280'));
     const fam = screen.getByTestId('families');
     expect(within(fam).getAllByText('1.500').length).toBeGreaterThanOrEqual(1); // decimal AND closing both 1.500
@@ -253,7 +260,7 @@ describe('MarketsScreen honest-empty (T-2: no fabricated markets / feed / rankin
   it('renders an honest FEED-HEALTH "unavailable" state (not a fake LIVE/OFFLINE) when feedHealth is null but a fixture is selected', () => {
     // fixtures present (so a fixture selects and the rail mounts) but feedHealth not yet loaded (null)
     // — the rail must state "unavailable", never fabricate telemetry (no ticks/staleness numbers).
-    render(<MarketsScreen oddsByFixture={ODDS_UPDATES} fixtures={FIXTURES} feedHealth={null} leaderboard={[]} />);
+    render(<MarketsScreen oddsByFixture={DEMO_ODDS} fixtures={FIXTURES} feedHealth={null} leaderboard={[]} />);
     const rail = screen.getByTestId('rail-feed-health');
     expect(rail).toHaveTextContent(/unavailable/i);
     expect(rail).not.toHaveTextContent(/\blive\b/i);

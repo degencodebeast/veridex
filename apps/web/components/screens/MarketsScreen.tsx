@@ -2,7 +2,7 @@
 import { useEffect, useMemo, useState } from 'react';
 import Link from 'next/link';
 import { Badge } from '@/components/ui/Badge';
-import { SPORT_CATALOG, buildFamilies, oddsUpdatesPath } from '@/lib/txline/client';
+import { SPORT_CATALOG, buildFamilies, fixtureKey, oddsUpdatesPath } from '@/lib/txline/client';
 import { isMockEnabled } from '@/lib/mock';
 import type {
   FixtureSummary, OddsUpdate, SourceMode, FeedHealthState, LeaderboardRow, MarketFamilyKey,
@@ -35,25 +35,38 @@ export function MarketsScreen({
   oddsByFixture = {}, fixtures = [], sourceMode = 'replay',
   feedHealth = null, leaderboard = [],
 }: {
-  oddsByFixture?: Record<number, OddsUpdate[]>; fixtures?: FixtureSummary[]; sourceMode?: SourceMode;
+  // Odds are keyed by the COMPOSITE (pack_id, fixture_id) identity so two packs sharing an external
+  // fixture_id keep separate tables (see fixtureKey). Bare fixture_id would collide across packs.
+  oddsByFixture?: Record<string, OddsUpdate[]>; fixtures?: FixtureSummary[]; sourceMode?: SourceMode;
   feedHealth?: FeedHealthState | null; leaderboard?: LeaderboardRow[];
 }) {
   const [sportId, setSportId] = useState('soccer');
-  // Default-select the first fixture so the dashboard populates on load (V5) — not an empty prompt.
-  const [fixtureId, setFixtureId] = useState<number | null>(fixtures[0]?.fixture_id ?? null);
+  // Selection carries the composite (pack_id, fixture_id) key — NOT a bare fixture_id — so pack A and
+  // pack B fixtures with the same external id never both read as "selected". Default-select fixtures[0].
+  const [selectedKey, setSelectedKey] = useState<string | null>(
+    fixtures[0] ? fixtureKey(fixtures[0].pack_id, fixtures[0].fixture_id) : null,
+  );
   const [tab, setTab] = useState<TabId>('all');
   // Fixtures may arrive ASYNC (the page fetches/mock-gates after mount), so default-select the first
   // one once they land — without clobbering a selection the user has already made.
   useEffect(() => {
-    setFixtureId((prev) => (prev != null && fixtures.some((f) => f.fixture_id === prev) ? prev : fixtures[0]?.fixture_id ?? null));
+    setSelectedKey((prev) =>
+      prev != null && fixtures.some((f) => fixtureKey(f.pack_id, f.fixture_id) === prev)
+        ? prev
+        : fixtures[0] ? fixtureKey(fixtures[0].pack_id, fixtures[0].fixture_id) : null,
+    );
   }, [fixtures]);
 
-  const updates = fixtureId != null ? oddsByFixture[fixtureId] ?? [] : [];
-  const allFamilies = useMemo(() => buildFamilies(updates), [updates]);
+  const selected = fixtures.find((f) => fixtureKey(f.pack_id, f.fixture_id) === selectedKey) ?? null;
+  const updates = selectedKey != null ? oddsByFixture[selectedKey] ?? [] : [];
+  // Replay projections OMIT closing (source DTO has none) → don't reconstruct; the LIVE path still does.
+  const allFamilies = useMemo(
+    () => buildFamilies(updates, { reconstructClosing: sourceMode !== 'replay' }),
+    [updates, sourceMode],
+  );
   const families = tab === 'all' ? allFamilies : allFamilies.filter((f) => f.key === tab);
   // The active tab's element id — labels the shared tabpanel (ARIA tabs contract).
   const activeTabId = TABS.find((t) => t.id === tab)?.testid;
-  const selected = fixtures.find((f) => f.fixture_id === fixtureId) ?? null;
   // ELIGIBLE AGENTS rail = the eligible POOL (badge==='eligible'), NOT scoped to this fixture
   // (no fixture→agent mapping exists). Honest: not-eligible agents are excluded.
   const eligible = useMemo(() => leaderboard.filter((r) => r.eligibility_badge === 'eligible'), [leaderboard]);
@@ -85,18 +98,22 @@ export function MarketsScreen({
                   {s.competitions.map((c) => (
                     <li key={c.id} className={styles.comp}>{c.label}</li>
                   ))}
-                  {fixtures.map((f) => (
-                    <li key={f.fixture_id}>
-                      <button
-                        type="button"
-                        data-testid={`fixture-${f.fixture_id}`}
-                        className={`${styles.fixture} ${f.fixture_id === fixtureId ? styles.activeFixture : ''}`}
-                        onClick={() => setFixtureId(f.fixture_id)}
-                      >
-                        {f.participant1} v {f.participant2} {f.in_running ? <Badge variant="live" /> : <span className="mono">CAPTURED REPLAY</span>}
-                      </button>
-                    </li>
-                  ))}
+                  {fixtures.map((f) => {
+                    const key = fixtureKey(f.pack_id, f.fixture_id);
+                    return (
+                      <li key={key}>
+                        <button
+                          type="button"
+                          data-testid={`fixture-${f.fixture_id}`}
+                          data-fixture-key={key}
+                          className={`${styles.fixture} ${key === selectedKey ? styles.activeFixture : ''}`}
+                          onClick={() => setSelectedKey(key)}
+                        >
+                          {f.participant1} v {f.participant2} {f.in_running ? <Badge variant="live" /> : <span className="mono">CAPTURED REPLAY</span>}
+                        </button>
+                      </li>
+                    );
+                  })}
                 </ul>
               )}
             </div>
@@ -104,7 +121,7 @@ export function MarketsScreen({
         </aside>
 
         <div className={styles.detail}>
-          {fixtureId == null ? (
+          {selected == null ? (
             <p className={styles.empty}>Select a fixture to view consensus odds (decimal Prices + implied %).</p>
           ) : (
             <>
@@ -112,7 +129,7 @@ export function MarketsScreen({
                 <Badge variant={sourceMode === 'live' ? 'live' : 'replay'} />
                 <span className={`${styles.feed} mono`}>SOURCE {sourceMode} · TxLINE Stable Price consensus · de-margined</span>
                 <Link
-                  href={`/competitions/create?pack_id=${selected?.pack_id ?? ''}&fixture_id=${fixtureId}`}
+                  href={`/competitions/create?pack_id=${selected.pack_id}&fixture_id=${selected.fixture_id}`}
                   data-testid="launch-competition"
                   className={styles.launch}
                 >
@@ -149,7 +166,7 @@ export function MarketsScreen({
               <div
                 className={styles.families}
                 data-testid="families"
-                data-odds-path={oddsUpdatesPath(fixtureId)}
+                data-odds-path={oddsUpdatesPath(selected.fixture_id)}
                 role="tabpanel"
                 id={FAMILIES_PANEL_ID}
                 aria-labelledby={activeTabId}

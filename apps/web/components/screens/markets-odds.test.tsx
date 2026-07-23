@@ -58,13 +58,15 @@ function fixture(): FixtureSummary {
 async function renderFromWire(): Promise<HTMLElement> {
   stubFetch(WIRE);
   const updates: OddsUpdate[] = await getReplayMarkets(PACK_ID, FIXTURE_ID);
-  render(<MarketsScreen oddsByFixture={{ [FIXTURE_ID]: updates }} fixtures={[fixture()]} feedHealth={null} leaderboard={[]} />);
+  // Odds are keyed by the composite (pack_id, fixture_id) identity (MAJOR-4).
+  render(<MarketsScreen oddsByFixture={{ [`${PACK_ID}::${FIXTURE_ID}`]: updates }} fixtures={[fixture()]} feedHealth={null} leaderboard={[]} />);
   return screen.getByTestId('families');
 }
 
 // The six-column odds row: [selection, consensus(decimal), implied %, closing, edge, agents]. The
-// CONSENSUS cell (index 1) is the disambiguator — the CLOSING cell (index 3) reconstructs to the same
-// decimal for a pre-match capture, so match on the consensus cell only.
+// CONSENSUS cell (index 1) is the disambiguator; the CLOSING cell (index 3) MUST render an honest
+// em-dash for a replay projection — the source DTO deliberately OMITS closing, so no reconstructed or
+// cross-parameter number may appear there.
 function rowCells(fam: HTMLElement, consensusDecimal: string): HTMLElement[] {
   const rows = within(fam).getAllByRole('row').map((tr) => within(tr).queryAllByRole('cell'));
   const match = rows.find((cells) => cells.length === 6 && cells[1].textContent === consensusDecimal);
@@ -86,6 +88,17 @@ describe('MarketsScreen replay-market odds render (E2 / MAJOR-5 exact conversion
     expect(cells[1].textContent).toBe('1.930');       // last-known odds retained
     expect(cells[2].textContent).toBe('—');           // EMPTY prob → honest em-dash
     expect(/\d/.test(cells[2].textContent ?? '')).toBe(false); // never a fabricated "0.000"
+  });
+
+  it('EVERY replay CLOSING cell renders — (no fabricated / cross-parameter closing)', async () => {
+    const fam = await renderFromWire();
+    // Both same-family O/U parameter lines (2.5 → 2.080, 3.5 → 1.930) must independently render an
+    // em-dash — proving no reconstruction and no cross-parameter borrowing between the two lines.
+    for (const consensus of ['2.080', '1.930']) {
+      const cells = rowCells(fam, consensus);
+      expect(cells[3].textContent).toContain('—');                 // honest em-dash, not a number
+      expect(/\d/.test(cells[3].textContent ?? '')).toBe(false);   // never a reconstructed/borrowed price
+    }
   });
 
   it('the EDGE column renders an honest — (no fabricated executable edge)', async () => {

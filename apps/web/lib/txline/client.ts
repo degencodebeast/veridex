@@ -22,12 +22,20 @@ const FAMILY_LABELS: Record<MarketFamilyKey, string> = {
   'ASIANHANDICAP_PARTICIPANT_GOALS': 'Asian Handicap',
 };
 
+// Pack-scoped identity: a replay fixture is (pack_id, fixture_id), NOT fixture_id alone — two packs can
+// share an external fixture_id. This composite string keys odds storage / selection / React rows / launch.
+export function fixtureKey(packId: string, fixtureId: number): string {
+  return `${packId}::${fixtureId}`;
+}
+
 // CON-040: closing = decimal of the LAST update before in_running flips. null => pending/—.
+// `parameters` scopes the reconstruction to the SAME market line (e.g. line=2.5) so two O/U parameter
+// rows sharing an outcome name can never cross-borrow each other's price (defense-in-depth).
 export function reconstructClosing(
-  updates: OddsUpdate[], outcome: string, family: MarketFamilyKey,
+  updates: OddsUpdate[], outcome: string, family: MarketFamilyKey, parameters?: string | null,
 ): number | null {
   const preMatch = updates
-    .filter((x) => x.market_family === family && !x.in_running)
+    .filter((x) => x.market_family === family && (x.market_parameters ?? '') === (parameters ?? '') && !x.in_running)
     .sort((a, b) => a.ts - b.ts);
   for (let i = preMatch.length - 1; i >= 0; i -= 1) {
     const idx = preMatch[i].price_names.indexOf(outcome);
@@ -36,8 +44,13 @@ export function reconstructClosing(
   return null;
 }
 
-// Group the latest update per family into decimal odds + implied % rows.
-export function buildFamilies(updates: OddsUpdate[]): MarketFamily[] {
+// Group the latest update per family into decimal odds + implied % rows. `reconstructClosing` (default
+// true) preserves the LIVE path's reconstructed closing line; set false for the replay projection whose
+// source DTO deliberately OMITS closing → every closing renders null (—), never a fabricated number.
+export function buildFamilies(
+  updates: OddsUpdate[], opts?: { reconstructClosing?: boolean },
+): MarketFamily[] {
+  const doReconstruct = opts?.reconstructClosing ?? true;
   const families: MarketFamily[] = [];
   for (const key of MARKET_FAMILY_KEYS) {
     const familyUpdates = updates.filter((x) => x.market_family === key);
@@ -55,7 +68,7 @@ export function buildFamilies(updates: OddsUpdate[]): MarketFamily[] {
           name,
           decimal: decodePrice(upd.prices[i]),
           impliedPct: upd.pct[i],
-          closing: reconstructClosing(familyUpdates, name, key),
+          closing: doReconstruct ? reconstructClosing(familyUpdates, name, key, upd.market_parameters) : null,
         })),
       })),
     });
