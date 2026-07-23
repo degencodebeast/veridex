@@ -23,6 +23,28 @@ const SCORED_WIRE = {
   }],
 };
 
+// A MIXED-proof roster row: the backend's HONEST cross-run aggregate when an agent's runs carry
+// different proof modes (veridex/leaderboard.py:_summarize_proof_mode(['verified','partial']) → 'mixed').
+const MIXED_WIRE = {
+  agents: [{
+    public_agent_id: 'pa_mixed_01', display_name: 'Mixed Modes', owner_public_label: 'acme',
+    origin: 'byoa', proof_state: 'mixed', agent_id: 'inst_mix', type: 'value_clv',
+    source_mode: 'replay', execution_mode: 'paper', status: 'sealed', config_hash_present: true,
+    avg_clv_bps: 5.0, runs: 4, valid_pct: 60.0,
+  }],
+};
+
+// An UNEXPECTED proof_state string the frontend does not recognize — must fail CLOSED to 'unknown',
+// NEVER a fabricated/earned 'reproducible' proof claim.
+const UNEXPECTED_WIRE = {
+  agents: [{
+    public_agent_id: 'pa_weird_01', display_name: 'Weird', owner_public_label: 'acme',
+    origin: 'byoa', proof_state: 'totally_unexpected', agent_id: 'inst_weird', type: 'value_clv',
+    source_mode: 'replay', execution_mode: 'paper', status: 'sealed', config_hash_present: true,
+    avg_clv_bps: 1.0, runs: 1, valid_pct: 50.0,
+  }],
+};
+
 describe('getAgentsRoster → PublicAgentRow[] (honest identity + honest proof-state)', () => {
   it('maps an UNSCORED wire row → proof_state "unscored", origin preserved, perf null, NO source field', async () => {
     vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify(UNSCORED_WIRE), { status: 200 })));
@@ -51,6 +73,18 @@ describe('getAgentsRoster → PublicAgentRow[] (honest identity + honest proof-s
     expect(r.archetype).toBe('value_clv'); // template_id preserved as archetype
     expect(r.owner_public_label).toBe('acme');
     expect(r.origin).toBe('byoa');
+  });
+
+  it('maps a MIXED wire proof_state → "mixed" (honest aggregate, NEVER an unearned reproducible)', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify(MIXED_WIRE), { status: 200 })));
+    const rows = await getAgentsRoster();
+    expect(rows[0].proof_state).toBe('mixed');
+  });
+
+  it('maps an UNEXPECTED wire proof_state → "unknown" (fail-closed, NEVER an unearned reproducible)', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify(UNEXPECTED_WIRE), { status: 200 })));
+    const rows = await getAgentsRoster();
+    expect(rows[0].proof_state).toBe('unknown');
   });
 
   it('honest-empty [] on a fetch error — NEVER the AGENTS fixture off-mock (T-2)', async () => {

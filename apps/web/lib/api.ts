@@ -50,6 +50,12 @@ function resolveApiUrl(path: string): string {
   return path;
 }
 
+// The directional board_kind is a CLOSED wire enum whose values EXACTLY match the backend
+// (veridex/public_projection.py:108-117 — LOWERCASE 'official_benchmark' | 'public_agents'). An
+// UPPERCASE value is REJECTED with 422, so the frontend must never send one (probe: PUBLIC_AGENTS → 422,
+// public_agents → 200). This type pins the wire values so a stray uppercase literal cannot compile.
+export type BoardKindWire = 'official_benchmark' | 'public_agents';
+
 // Centralized path map — the C1 binding points. A route change is a one-line edit.
 export const PATHS = {
   // The backend serves the ProofArtifact at GET /runs/{id} (no /proof suffix — pinned by
@@ -84,9 +90,10 @@ export const PATHS = {
   // owner-filtered (distinct from the owner-scoped /agents/instances). Perf columns are honest null.
   agentsRoster: () => `/agents/roster`,
   // B3 directional leaderboard completion layer (read-only). `board_kind` is a CLOSED backend enum
-  // (PUBLIC_AGENTS / OFFICIAL_BENCHMARK); the server visibility-joins + aggregates. Rows are enriched
-  // with honest public identity (display_name + public_agent_id).
-  directionalLeaderboard: (boardKind: string) => `/leaderboard/directional?board_kind=${boardKind}`,
+  // (LOWERCASE 'official_benchmark' / 'public_agents' — an uppercase value 422s); the server
+  // visibility-joins + aggregates. Rows are enriched with honest public identity (display_name +
+  // public_agent_id).
+  directionalLeaderboard: (boardKind: BoardKindWire) => `/leaderboard/directional?board_kind=${boardKind}`,
   // F-4 competition lifecycle (owner-scoped POSTs): create → register roster entry → start.
   competitions: () => `/competitions`,
   competitionAgents: (id: string) => `/competitions/${id}/agents`,
@@ -938,11 +945,18 @@ function toArchetype(templateId: string): Archetype {
   return templateId as Archetype;
 }
 
-// The wire proof_state → the roster-local ProofState. "unscored" is preserved verbatim (the honest
-// pre-score state); anything else folds through toProofMode (verified/partial/reproducible). This does
-// NOT touch the shared ProofMode — 'unscored' lives ONLY on ProofState (roster-local).
+// The wire proof_state → the roster-local ProofState. An EARNED single-mode claim (verified / partial /
+// reproducible) is preserved verbatim; 'unscored' (the honest pre-score state) and 'mixed' (the backend's
+// honest cross-run aggregate for runs with different proof modes — veridex/leaderboard.py) are preserved
+// as their own honest states. ANY OTHER string fails CLOSED to 'unknown' — it is NEVER coerced up to an
+// unearned 'reproducible' proof claim (Gate-3 M3). This does NOT delegate to toProofMode (which would
+// overclaim unknown→reproducible) and does NOT touch the shared ProofMode — 'unscored'/'mixed'/'unknown'
+// live ONLY on ProofState (roster-local).
 function toProofState(s: string): ProofState {
-  return s === 'unscored' ? 'unscored' : toProofMode(s);
+  if (s === 'verified' || s === 'partial' || s === 'reproducible') return s;
+  if (s === 'mixed') return 'mixed';
+  if (s === 'unscored') return 'unscored';
+  return 'unknown'; // any unexpected string ⇒ honest 'unknown', NEVER a fabricated 'reproducible'
 }
 
 // GET /agents/roster → PublicAgentRow[] for the AgentsScreen directional table. Mock ⇒ [] (the page
@@ -1003,10 +1017,12 @@ export function adaptDirectionalLeaderboard(w: DirectionalLeaderboardResponseWir
   }));
 }
 
-// GET /leaderboard/directional?board_kind=PUBLIC_AGENTS → DirectionalRow[] (honest display names +
-// replay provenance). Mock ⇒ [] (the /leaderboard page keeps its mock-ON getLeaderboard() fixture
-// path). Off-mock the LeaderboardPage calls this and honest-empties on error (never a wire fixture).
-export async function getDirectionalLeaderboard(boardKind = 'PUBLIC_AGENTS'): Promise<DirectionalRow[]> {
+// GET /leaderboard/directional?board_kind=public_agents → DirectionalRow[] (honest display names +
+// replay provenance). board_kind is the LOWERCASE closed wire enum the backend accepts (an uppercase
+// value 422s → the board would render empty off-mock). Mock ⇒ [] (the /leaderboard page keeps its
+// mock-ON getLeaderboard() fixture path). Off-mock the LeaderboardPage calls this and honest-empties on
+// error (never a wire fixture).
+export async function getDirectionalLeaderboard(boardKind: BoardKindWire = 'public_agents'): Promise<DirectionalRow[]> {
   if (isMockEnabled()) return [];
   const res = await getJson<DirectionalLeaderboardResponseWire>(PATHS.directionalLeaderboard(boardKind));
   return adaptDirectionalLeaderboard(res);

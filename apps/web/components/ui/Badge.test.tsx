@@ -18,8 +18,10 @@ describe('Badge (PAT-002: one component, full vocabulary)', () => {
         'anchored', 'eligible', 'final', 'invalid', 'live', 'llm', 'not-anchored',
         'not-eligible', 'partial', 'pending', 'replay', 'reproducible',
         'valid', 'verified',
-        // Roster proof-state (E3) — the honest "unscored" chip for a deployed-but-unscored public agent.
-        'unscored',
+        // Roster proof-state (E3) — the honest chips for a public agent's ProofState that are NOT an
+        // earned single-mode proof claim: 'unscored' (not yet scored), 'mixed' (honest cross-run
+        // aggregate of different proof modes), 'unknown' (fail-closed fallback).
+        'unscored', 'mixed', 'unknown',
         // Maker Arena lane (MM-R1) — falsification verdicts + rung/caveat chips.
         'mm-r1', 'separated', 'inconclusive', 'inverted', 'uncalibrated', 'small-n', 'trades-not-fills',
         // QuoteGuard behavior ablation (F-8) — behavior-comparison labels, never a rank/winner.

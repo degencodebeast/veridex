@@ -117,11 +117,15 @@ export interface AgentSummary {
   source: 'STUDIO' | 'BYOA';
 }
 
-// Roster-local proof-state: ProofMode PLUS the honest 'unscored' state a PUBLIC deployed agent carries
-// before it has scored board rows. This deliberately does NOT widen the shared ProofMode (which has
-// EXHAUSTIVE `Record<ProofMode, number>` uses in lib/contracts.ts + lib/api.ts) — 'unscored' lives ONLY
-// on this roster-local type, never on ProofMode.
-export type ProofState = ProofMode | 'unscored';
+// Roster-local proof-state: ProofMode PLUS the honest states a PUBLIC deployed agent can carry that are
+// NOT an earned single-mode proof claim: 'unscored' (deployed but no scored board rows yet), 'mixed'
+// (the backend's honest cross-run aggregate when an agent's runs carry different proof modes —
+// veridex/leaderboard.py:_summarize_proof_mode), and 'unknown' (fail-closed fallback for any proof_state
+// string the frontend does not recognize — NEVER coerced to an unearned 'reproducible'). This
+// deliberately does NOT widen the shared ProofMode (which has EXHAUSTIVE `Record<ProofMode, number>`
+// uses in lib/contracts.ts + lib/api.ts) — 'unscored'/'mixed'/'unknown' live ONLY on this roster-local
+// type, never on ProofMode.
+export type ProofState = ProofMode | 'unscored' | 'mixed' | 'unknown';
 
 // The PUBLIC deployed-agent roster row (GET /agents/roster) AND the shared identity contract the Duel
 // surface (E4) consumes. Honest identity (public_agent_id / display_name / owner_public_label / origin)
