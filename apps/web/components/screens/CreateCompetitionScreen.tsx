@@ -10,10 +10,11 @@ import { MARKET_FAMILY_KEYS } from '@/lib/catalog';
 import { GLOSSARY } from '@/lib/glossary';
 import { shortHash } from '@/lib/format';
 import {
-  getInstances, createCompetition, registerRosterAgent, startCompetition,
-  type DeployedInstance, type CompetitionConfigPayload, type RosterEntryPayload,
+  getInstances, createCompetition, registerRosterAgent, startCompetition, getReplayPacks, replayPacksToFixtures,
+  type DeployedInstance, type CompetitionConfigPayload, type RosterEntryPayload, type ReplayPackView,
 } from '@/lib/api';
-import type { CompetitionType, ExecutionMode, ProofMode, MarketFamilyKey } from '@/lib/catalog';
+import type { CompetitionType, ExecutionMode, ProofMode, MarketFamilyKey, FixtureSummary } from '@/lib/catalog';
+import { fixtureKey } from '@/lib/txline/client';
 import { buildCompetitionConfig } from '@/lib/competition/config';
 import styles from './CreateCompetitionScreen.module.css';
 
@@ -34,7 +35,7 @@ const ELIGIBLE_STATUS = new Set(['running', 'sealed']);
 // the backend runs a recorded tape. Its blurb makes NO "live / real-time" claim (that would be
 // dishonest over a forced-replay run); the honest no-feed note replaces it and the card is disabled.
 const TYPE_CARDS: { type: CompetitionType; label: string; blurb: string; disabled?: boolean }[] = [
-  { type: 'live_arena', label: 'Live Arena', blurb: 'A live TxLINE feed is not wired yet, so a live arena is unavailable — runs use a recorded replay.', disabled: true },
+  { type: 'live_arena', label: 'Live Arena', blurb: 'No live feed at the moment, so a live arena is unavailable — runs use a recorded replay.', disabled: true },
   { type: 'replay_arena', label: 'Replay Arena', blurb: 'Deterministic replay of a recorded fixture window.' },
   { type: 'head_to_head', label: 'Head-to-Head', blurb: 'Two agents, identical evidence — CLV gap, no winner badge.' },
   { type: 'prize_vault_challenge', label: 'Prize-Vault Challenge', blurb: 'Designed prize target (Phase 2D · no funds move).' },
@@ -79,6 +80,7 @@ export function CreateCompetitionScreen({
   connected = false,
   onConnect,
   loadInstances = getInstances,
+  loadReplayPacks = getReplayPacks,
   launchApi = DEFAULT_LAUNCH_API,
   onLaunched,
 }: {
@@ -92,6 +94,9 @@ export function CreateCompetitionScreen({
   connected?: boolean;
   onConnect?: () => void;
   loadInstances?: () => Promise<DeployedInstance[]>;
+  // Injectable seam (defaults to the real /replay-packs reader) — one door so tests drive the picker
+  // offline, mirroring loadInstances. Off-mock the picker is seeded from this catalog.
+  loadReplayPacks?: () => Promise<ReplayPackView[]>;
   launchApi?: LaunchApi;
   onLaunched?: (competitionId: string) => void;
 }) {
@@ -103,29 +108,41 @@ export function CreateCompetitionScreen({
   const [source, setSource] = useState<SourceMode>('replay');
   const [exec, setExec] = useState<ExecutionMode>('paper');
 
-  // ── Fixture PICKER seed (T-2): the selectable-match list is mock-gated. There is NO fixtures-list
-  // backend endpoint, so off-mock the demo FIXTURES would be FABRICATED matches to pick from. The
-  // FIXTURES sample seeds the picker ONLY under the DEMO/mock gate (labeled demo by the MockBanner);
-  // off-mock the picker is honest-empty (no selectable matches). Hydration-safe: default off on
-  // SSR/first render, then read isMockEnabled() (per-tab `?mock=1` from window) after mount — the same
-  // client-resolved pattern the sibling `/leaderboard` screens use. The create POST + validation are
-  // unchanged; only the picker's DATA SOURCE gates.
-  const [mock, setMock] = useState(false);
-  useEffect(() => { setMock(isMockEnabled()); }, []);
-  const fixtures = mock ? FIXTURES : [];
-
-  // Nullable selection sentinel: `null` = NOTHING selected (off-mock / empty picker); a number (incl.
-  // the backend-valid `0`) = an explicit selection. Never overload `0` as "unselected" — an explicit
-  // deep-linked `?fixture_id=0` must survive as a real selection, not collapse to omitted.
-  const [fixtureId, setFixtureId] = useState<number | null>(initialFixtureId ?? null);
-  // Once the mock gate resolves ON after mount, snap the selection to a valid demo fixture — the
-  // deep-linked initial one if present, else the first. Off-mock the picker is empty, so nothing is
-  // selected and it renders honest-empty (never a fabricated fixture). References the FIXTURES module
-  // constant directly (not the per-render `fixtures` array), so `mock` is the only reactive dependency.
+  // ── Fixture PICKER: mock → the demo FIXTURES sample (no catalog request); off-mock → the REAL
+  // verified /replay-packs catalog via the shared replayPacksToFixtures mapper (the SAME view /markets
+  // uses). There is no separate fixtures-list endpoint, so the demo FIXTURES stay strictly DEMO-gated —
+  // off-mock they are NEVER a fallback (T-2). Each fixture carries its COMPOSITE (pack_id, fixture_id)
+  // identity, so ids that collide across packs never cross-wire a label onto the wrong submitted pair.
+  // Hydration-safe: default empty on SSR/first render, then resolve after mount by reading isMockEnabled()
+  // (per-tab `?mock=1` from window) — the same client-resolved gate the sibling screens use. Off-mock an
+  // empty/failed catalog stays honest-empty; the async load is guarded by `alive` against a late resolve.
+  const [fixtures, setFixtures] = useState<FixtureSummary[]>([]);
   useEffect(() => {
-    if (!mock) return;
-    setFixtureId((cur) => (cur != null && FIXTURES.some((f) => f.fixture_id === cur) ? cur : (FIXTURES[0]?.fixture_id ?? null)));
-  }, [mock]);
+    if (isMockEnabled()) { setFixtures(FIXTURES); return; }
+    let alive = true;
+    loadReplayPacks()
+      .then((packs) => { if (alive) setFixtures(replayPacksToFixtures(packs)); })
+      .catch(() => { /* honest-empty: fixtures stay [] off-mock on error — never the demo FIXTURES */ });
+    return () => { alive = false; };
+  }, [loadReplayPacks]);
+
+  // Selection carries the COMPOSITE fixtureKey(pack_id, fixture_id) — NOT a bare fixture_id — so pack A
+  // and pack B fixtures sharing an external id never both read as "selected", and the payload can never
+  // show one pack's label while submitting another pack's id. `null` = nothing selected (honest-empty).
+  const [selectedKey, setSelectedKey] = useState<string | null>(null);
+  // Fixtures arrive ASYNC (fetched/mock-gated after mount). Once they land: keep an already-valid
+  // selection; else preselect the EXACT deep-linked (packId, initialFixtureId) pair IFF it exists in the
+  // fetched list; else fall back to the first valid composite (or null when empty). This guarantees the
+  // visible selection and the outgoing payload always match — an invalid deep link never submits a stale
+  // pair with no visible selection. An explicit fixture_id `0` is a real id (composite-keyed), not "unset".
+  useEffect(() => {
+    const deepKey = packId != null && initialFixtureId != null ? fixtureKey(packId, initialFixtureId) : null;
+    setSelectedKey((prev) => {
+      if (prev != null && fixtures.some((f) => fixtureKey(f.pack_id, f.fixture_id) === prev)) return prev;
+      if (deepKey != null && fixtures.some((f) => fixtureKey(f.pack_id, f.fixture_id) === deepKey)) return deepKey;
+      return fixtures[0] ? fixtureKey(fixtures[0].pack_id, fixtures[0].fixture_id) : null;
+    });
+  }, [fixtures, packId, initialFixtureId]);
   const [markets, setMarkets] = useState<Set<MarketFamilyKey>>(new Set(MARKET_FAMILY_KEYS));
   const [scoringWindow, setScoringWindow] = useState('');
 
@@ -149,8 +166,9 @@ export function CreateCompetitionScreen({
   }, [connected, loadInstances]);
 
   const proof = proofFor(type, source);
-  // Off-mock `fixtures` is empty ⇒ no selected fixture ⇒ market_scope carries no fabricated fixture.
-  const selectedFixture = fixtures.find((f) => f.fixture_id === fixtureId);
+  // The COMPOSITE-matched selected row — never a bare-id match (which would collide across packs). Empty
+  // picker / no valid selection ⇒ undefined ⇒ market_scope carries no fabricated fixture.
+  const selectedFixture = fixtures.find((f) => fixtureKey(f.pack_id, f.fixture_id) === selectedKey);
   const marketKeys = MARKET_FAMILY_KEYS.filter((k) => markets.has(k));
   const fixtureScope = selectedFixture ? `${selectedFixture.participant1} v ${selectedFixture.participant2}` : '';
   // market_scope is the single free-form selector POST accepts (e.g. "FRA v BRA · 1X2 / O/U / AH").
@@ -188,11 +206,14 @@ export function CreateCompetitionScreen({
     marketScope: market_scope,
     scoringWindow: scoring_window,
     rosterSize: selectedInstances.length,
-    packId: packId ?? null,
-    // `fixtureId` is the nullable selection state (`null` = nothing selected → helper OMITS it; a
-    // number, incl. an explicit `0`, is a real selection → helper SENDS it). Passed through
-    // presence-aware — never `|| null`, which would silently drop a valid `fixture_id: 0`.
-    fixtureId,
+    // pack_id + fixture_id come from the SELECTED composite row (the visible selection), so the payload
+    // always matches what the picker shows — never the immutable deep-link prop over a different row.
+    // Nothing selected (off-mock empty / no valid deep link) ⇒ fall back to the deep-linked packId prop
+    // with fixture_id OMITTED — never a stale fixtureId with no visible selection.
+    packId: selectedFixture?.pack_id ?? packId ?? null,
+    // Presence-aware: a selected row's `fixture_id` (incl. an explicit `0`) is a real id → helper SENDS
+    // it; `null` (no selection) → helper OMITS it. Never `|| null`, which would drop a valid `0`.
+    fixtureId: selectedFixture != null ? selectedFixture.fixture_id : null,
   });
 
   return (
@@ -233,7 +254,7 @@ export function CreateCompetitionScreen({
                     live TxLINE feed wired, so every run is a recorded replay. Never offer a selectable
                     "live" source that silently runs the demo tape. */}
                 <span className={styles.sourceNote} data-testid="source-live-note">
-                  Live is unavailable — no live TxLINE feed is wired yet, so every run uses a recorded replay.
+                  Live is unavailable — no live feed at the moment, so every run uses a recorded replay.
                 </span>
               </div>
               <label className={styles.field}>
@@ -252,16 +273,20 @@ export function CreateCompetitionScreen({
             <div className={styles.controls}>
               <label className={styles.field}>
                 <span className={styles.label}>Fixture</span>
-                {/* The picker is seeded from the DEMO FIXTURES sample ONLY under the mock gate (no
-                    fixtures-list backend). Off-mock it is honest-empty — never fabricated matches. */}
+                {/* Off-mock the picker is seeded from the REAL /replay-packs catalog; under mock, the demo
+                    FIXTURES. Option value/key = the COMPOSITE fixtureKey so ids colliding across packs stay
+                    distinct. Empty catalog ⇒ honest-empty note — never fabricated matches. */}
                 {fixtures.length > 0 ? (
                   <select
                     className={styles.select} aria-label="Fixture" data-testid="fixture-select"
-                    value={fixtureId ?? ''} onChange={(e) => setFixtureId(Number(e.target.value))}
+                    value={selectedKey ?? ''} onChange={(e) => setSelectedKey(e.target.value)}
                   >
-                    {fixtures.map((f) => (
-                      <option key={f.fixture_id} value={f.fixture_id}>{f.participant1} v {f.participant2} · {f.competition}</option>
-                    ))}
+                    {fixtures.map((f) => {
+                      const key = fixtureKey(f.pack_id, f.fixture_id);
+                      return (
+                        <option key={key} value={key}>{f.participant1} v {f.participant2} · {f.competition}</option>
+                      );
+                    })}
                   </select>
                 ) : (
                   <p className={styles.fixtureEmpty} data-testid="fixture-empty">

@@ -2,7 +2,18 @@ import { describe, it, expect, vi } from 'vitest';
 import { render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { CreateCompetitionScreen, type LaunchApi } from '@/components/screens/CreateCompetitionScreen';
-import type { DeployedInstance } from '@/lib/api';
+import type { DeployedInstance, ReplayPackView } from '@/lib/api';
+
+// One real ReplayPackView carrying the deep-linked (pack_id, fixture_id) — off-mock the picker seeds
+// from the /replay-packs catalog, so the deep-linked pair must EXIST in it to be selected + submitted
+// (composite honesty: the payload matches the visible selection, never a stale id over an empty picker).
+function mkPack(packId: string, fixtureId: number): ReplayPackView {
+  return {
+    packId, contentHash: 'c'.repeat(64), provenance: 'captured', isGenuine: true,
+    fixtures: [fixtureId],
+    fixtureMetadata: [{ fixture_id: fixtureId, home_team: 'Home', away_team: 'Away', kickoff_ts: null, label_source: 'captured' }],
+  };
+}
 
 function mkInstance(over: Partial<DeployedInstance> & { instance_id: string; agent_id: string }): DeployedInstance {
   return {
@@ -27,8 +38,8 @@ function okApi(): LaunchApi {
 
 describe('CreateCompetitionScreen — Launch carries the authoritative pack_id + fixture_id', () => {
   it('clicking Launch fires launchApi.create with the deep-linked pack_id + fixture_id', async () => {
-    // Mock OFF (default): the fixture-picker snap effect is skipped, so the deep-linked fixtureId is
-    // preserved verbatim (18209181 is not one of the demo FIXTURES). Roster load is independent of mock.
+    // Mock OFF (default): the off-mock picker is seeded from the /replay-packs catalog. The deep-linked
+    // (curated, 18209181) pair is present, so it preselects and the launch submits that exact composite.
     const user = userEvent.setup();
     const api = okApi();
     render(
@@ -37,6 +48,7 @@ describe('CreateCompetitionScreen — Launch carries the authoritative pack_id +
         initialFixtureId={18209181}
         packId="curated"
         loadInstances={vi.fn().mockResolvedValue(TWO_INSTANCES)}
+        loadReplayPacks={vi.fn().mockResolvedValue([mkPack('curated', 18209181)])}
         launchApi={api}
       />,
     );
@@ -52,7 +64,7 @@ describe('CreateCompetitionScreen — Launch carries the authoritative pack_id +
 
   it('preserves an EXPLICIT fixture_id=0 (a valid, presence-distinct id) rather than silently omitting it', async () => {
     // 0 is a backend-valid fixture id distinct from "omitted" (None → server picks the pack minimum).
-    // An explicit deep-linked ?fixture_id=0 must reach launchApi.create as fixture_id:0, never dropped.
+    // An explicit deep-linked ?fixture_id=0 present in the catalog must reach create as fixture_id:0.
     const user = userEvent.setup();
     const api = okApi();
     render(
@@ -61,6 +73,7 @@ describe('CreateCompetitionScreen — Launch carries the authoritative pack_id +
         initialFixtureId={0}
         packId="curated"
         loadInstances={vi.fn().mockResolvedValue(TWO_INSTANCES)}
+        loadReplayPacks={vi.fn().mockResolvedValue([mkPack('curated', 0)])}
         launchApi={api}
       />,
     );

@@ -1,7 +1,7 @@
 'use client';
 import { useEffect, useState } from 'react';
 import { MarketsScreen } from '@/components/screens/MarketsScreen';
-import { getFeedHealth, getLeaderboard, getReplayMarkets, getReplayPacks } from '@/lib/api';
+import { getFeedHealth, getLeaderboard, getReplayMarkets, getReplayPacks, replayPacksToFixtures } from '@/lib/api';
 import { isMockEnabled } from '@/lib/mock';
 import { fixtureKey } from '@/lib/txline/client';
 import { ODDS_UPDATES, FIXTURES } from '@/lib/fixtures/catalog';
@@ -53,20 +53,8 @@ export default function MarketsPage() {
     getReplayPacks()
       .then((packs) => {
         if (!alive || isMockEnabled()) return;
-        setFixtures(
-          packs.flatMap((pack) =>
-            pack.fixtureMetadata.map((m): FixtureSummary => ({
-              fixture_id: m.fixture_id,
-              pack_id: pack.packId,
-              competition: pack.packId,
-              participant1: m.home_team ?? `id ${m.fixture_id}`,
-              participant2: m.away_team ?? '—',
-              // kickoff_ts is epoch SECONDS on the wire → ISO string; absent ⇒ '' (honest, never faked).
-              start_time: m.kickoff_ts != null ? new Date(m.kickoff_ts * 1000).toISOString() : '',
-              in_running: false, // replay catalog — never in-running
-            })),
-          ),
-        );
+        // Shared mapper (lib/api) — the SAME (pack_id, fixture_id) view the Create-Competition picker uses.
+        setFixtures(replayPacksToFixtures(packs));
         // E2: off-mock the odds table is fed by the REAL replay-market projection. Fetch each catalogued
         // (pack_id, fixture_id)'s LAST-KNOWN odds per market and populate oddsByFixture[fixture_id]. On
         // error each fixture stays honest-empty (getReplayMarkets returns []) — never a fabricated market.

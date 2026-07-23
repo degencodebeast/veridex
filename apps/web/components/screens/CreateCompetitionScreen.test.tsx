@@ -4,7 +4,7 @@ import userEvent from '@testing-library/user-event';
 import { CreateCompetitionScreen, type LaunchApi } from '@/components/screens/CreateCompetitionScreen';
 import { MARKET_FAMILY_KEYS } from '@/lib/catalog';
 import { GLOSSARY } from '@/lib/glossary';
-import type { DeployedInstance } from '@/lib/api';
+import type { DeployedInstance, ReplayPackView } from '@/lib/api';
 
 // ── test helpers ────────────────────────────────────────────────────────────────────────────────
 function mkInstance(over: Partial<DeployedInstance> & { instance_id: string; agent_id: string }): DeployedInstance {
@@ -21,6 +21,25 @@ const TWO_INSTANCES: DeployedInstance[] = [
   mkInstance({ instance_id: 'inst-a', agent_id: 'clv-hunter', template_id: 'deterministic' }),
   mkInstance({ instance_id: 'inst-b', agent_id: 'momentum-v3', template_id: 'momentum', source_mode: 'live' }),
 ];
+
+// Build a real ReplayPackView (off-mock catalog seed) — mirrors getReplayPacks()'s view shape so the
+// picker exercises the SAME composite (pack_id, fixture_id) path the Markets screen proved out.
+function mkPack(
+  packId: string,
+  metas: Array<{ fixture_id: number; home_team?: string | null; away_team?: string | null; kickoff_ts?: number | null }>,
+): ReplayPackView {
+  return {
+    packId, contentHash: 'c'.repeat(64), provenance: 'captured', isGenuine: true,
+    fixtures: metas.map((m) => m.fixture_id),
+    fixtureMetadata: metas.map((m) => ({
+      fixture_id: m.fixture_id,
+      home_team: m.home_team ?? 'Home',
+      away_team: m.away_team ?? 'Away',
+      kickoff_ts: m.kickoff_ts ?? null,
+      label_source: 'captured',
+    })),
+  };
+}
 
 function okApi(): LaunchApi {
   return {
@@ -99,7 +118,7 @@ describe('CreateCompetitionScreen — F-4 MAJOR-1: live-source honesty (no live 
   it('gates the live_arena TYPE card (disabled — not selectable) with an honest no-feed note', () => {
     render(<CreateCompetitionScreen />);
     expect(screen.getByTestId('type-live_arena')).toBeDisabled();
-    expect(screen.getByTestId('type-live-note')).toHaveTextContent(/live TxLINE feed .*not wired/i);
+    expect(screen.getByTestId('type-live-note')).toHaveTextContent(/no live feed .*recorded replay/i);
     expect(screen.getByTestId('summary-type')).toHaveTextContent(/replay arena/i); // default stays honest
   });
 
@@ -342,31 +361,160 @@ describe('CreateCompetitionScreen V5 (wizard density · honest pins)', () => {
   });
 });
 
-// ── T-2 remediation: the fixture PICKER seed is mock-gated ────────────────────────────────────────
-// The picker's list of selectable matches is seeded from the FIXTURES entity fixture, and there is NO
-// fixtures-list backend endpoint. Off-mock that seed would show FABRICATED matches to pick from, so it
-// must be honest-empty; the FIXTURES sample is offered ONLY under the DEMO/mock gate. (The create POST
-// flow + validation are unchanged — only the picker's DATA SOURCE gates.)
-describe('CreateCompetitionScreen — fixture picker is mock-gated (T-2, no fixtures backend)', () => {
-  it('mock OFF (default) → picker is honest-empty: NO fabricated fixture options, an honest note instead', () => {
-    render(<CreateCompetitionScreen />);
-    // No selectable-match dropdown seeded from the demo FIXTURES…
-    expect(screen.queryByTestId('fixture-select')).toBeNull();
-    expect(screen.queryByRole('option', { name: /NLD v MAR/i })).toBeNull();
-    expect(screen.queryByRole('option', { name: /ARG v GER/i })).toBeNull();
-    // …and an honest empty note in its place.
-    expect(screen.getByTestId('fixture-empty')).toHaveTextContent(/no matches available|connect a fixtures source/i);
-    // The pinned market_scope carries no fabricated fixture off-mock.
-    expect(within(screen.getByTestId('pinned-config')).getByTestId('summary-market-scope')).not.toHaveTextContent(/NLD v MAR/i);
+// ── Fixture PICKER wired to the REAL replay-pack catalog (off-mock) ───────────────────────────────
+// Off-mock the picker is seeded from the verified /replay-packs catalog (getReplayPacks → the shared
+// replayPacksToFixtures mapper), preserving the COMPOSITE (pack_id, fixture_id) identity end-to-end so
+// fixture ids that COLLIDE across packs never cross-wire a label onto the wrong submitted pair. Mock
+// mode is UNCHANGED (FIXTURES, no catalog request). A failed/empty catalog stays honest-empty — the
+// off-mock FIXTURES fallback remains prohibited (T-2).
+describe('CreateCompetitionScreen — fixture picker (real replay-pack catalog, composite identity)', () => {
+  it('mock OFF: the REAL replay-pack catalog seeds the picker — real labels, never the demo FIXTURES', async () => {
+    const packs = [mkPack('curated', [{ fixture_id: 18209181, home_team: 'FRA', away_team: 'BRA' }])];
+    const loadReplayPacks = vi.fn().mockResolvedValue(packs);
+    render(<CreateCompetitionScreen loadReplayPacks={loadReplayPacks} />);
+    const select = await screen.findByTestId('fixture-select');
+    expect(within(select).getByRole('option', { name: /FRA v BRA/i })).toBeInTheDocument();
+    // NONE of the demo FIXTURES leak off-mock.
+    expect(within(select).queryByRole('option', { name: /NLD v MAR/i })).toBeNull();
+    expect(within(select).queryByRole('option', { name: /ARG v GER/i })).toBeNull();
+    expect(screen.queryByTestId('fixture-empty')).toBeNull();
+    expect(loadReplayPacks).toHaveBeenCalled();
   });
 
-  it('mock ON → the DEMO FIXTURES sample seeds the picker (labeled demo data by the MockBanner)', () => {
+  it('mock OFF: empty catalog → picker stays honestly empty, never the demo FIXTURES', async () => {
+    const loadReplayPacks = vi.fn().mockResolvedValue([]);
+    render(<CreateCompetitionScreen loadReplayPacks={loadReplayPacks} />);
+    await waitFor(() => expect(loadReplayPacks).toHaveBeenCalled());
+    expect(await screen.findByTestId('fixture-empty')).toHaveTextContent(/no matches available|connect a fixtures source/i);
+    expect(screen.queryByTestId('fixture-select')).toBeNull();
+    expect(screen.queryByRole('option', { name: /NLD v MAR/i })).toBeNull();
+  });
+
+  it('mock OFF: catalog reader error → picker stays honestly empty, never the demo FIXTURES (fail-closed)', async () => {
+    const loadReplayPacks = vi.fn().mockRejectedValue(new Error('backend unavailable'));
+    render(<CreateCompetitionScreen loadReplayPacks={loadReplayPacks} />);
+    await waitFor(() => expect(loadReplayPacks).toHaveBeenCalled());
+    expect(await screen.findByTestId('fixture-empty')).toBeInTheDocument();
+    expect(screen.queryByTestId('fixture-select')).toBeNull();
+    expect(screen.queryByRole('option', { name: /NLD v MAR/i })).toBeNull();
+  });
+
+  it('mock ON: seeds the DEMO FIXTURES and makes NO real catalog request', async () => {
     vi.stubEnv('NEXT_PUBLIC_VERIDEX_MOCK', '1');
-    render(<CreateCompetitionScreen />);
-    const select = screen.getByTestId('fixture-select');
+    const loadReplayPacks = vi.fn().mockResolvedValue([mkPack('curated', [{ fixture_id: 1, home_team: 'X', away_team: 'Y' }])]);
+    render(<CreateCompetitionScreen loadReplayPacks={loadReplayPacks} />);
+    const select = await screen.findByTestId('fixture-select');
     expect(within(select).getByRole('option', { name: /NLD v MAR/i })).toBeInTheDocument();
     expect(within(select).getByRole('option', { name: /ARG v GER/i })).toBeInTheDocument();
     expect(screen.queryByTestId('fixture-empty')).toBeNull();
+    // No fabricated catalog request in mock mode.
+    expect(loadReplayPacks).not.toHaveBeenCalled();
     vi.unstubAllEnvs();
+  });
+
+  it('mock OFF: an exact composite deep link (packId, initialFixtureId) is preselected', async () => {
+    const packs = [mkPack('curated', [
+      { fixture_id: 100, home_team: 'AAA', away_team: 'BBB' },
+      { fixture_id: 18209181, home_team: 'FRA', away_team: 'BRA' },
+    ])];
+    render(<CreateCompetitionScreen packId="curated" initialFixtureId={18209181} loadReplayPacks={vi.fn().mockResolvedValue(packs)} />);
+    const select = (await screen.findByTestId('fixture-select')) as HTMLSelectElement;
+    await waitFor(() => expect(select.value).toBe('curated::18209181'));
+    expect(within(screen.getByTestId('pinned-config')).getByTestId('summary-market-scope')).toHaveTextContent(/FRA v BRA/i);
+  });
+
+  it('mock OFF: two packs sharing a fixture_id stay distinct — the default (first) submits its OWN pair', async () => {
+    const user = userEvent.setup();
+    const api = okApi();
+    const SHARED = 18213979;
+    const packs = [
+      mkPack('pack_alpha', [{ fixture_id: SHARED, home_team: 'Alpha', away_team: 'Away' }]),
+      mkPack('pack_beta', [{ fixture_id: SHARED, home_team: 'Beta', away_team: 'Away' }]),
+    ];
+    render(<CreateCompetitionScreen connected loadInstances={vi.fn().mockResolvedValue(TWO_INSTANCES)} launchApi={api} loadReplayPacks={vi.fn().mockResolvedValue(packs)} />);
+    const select = (await screen.findByTestId('fixture-select')) as HTMLSelectElement;
+    // Both composite options are present and carry DISTINCT composite values despite the shared fixture id.
+    expect(within(select).getByRole('option', { name: /Alpha v Away/i })).toHaveValue(`pack_alpha::${SHARED}`);
+    expect(within(select).getByRole('option', { name: /Beta v Away/i })).toHaveValue(`pack_beta::${SHARED}`);
+    await selectBothInstances(user); // leave the default (first = pack_alpha) selected
+    await user.click(screen.getByTestId('launch-button'));
+    await waitFor(() => expect(api.create).toHaveBeenCalled());
+    expect((api.create as ReturnType<typeof vi.fn>).mock.calls[0][0]).toMatchObject({ pack_id: 'pack_alpha', fixture_id: SHARED });
+  });
+
+  it('mock OFF: two packs sharing a fixture_id — selecting pack_beta submits (pack_beta, id), never pack_alpha', async () => {
+    const user = userEvent.setup();
+    const api = okApi();
+    const SHARED = 18213979;
+    const packs = [
+      mkPack('pack_alpha', [{ fixture_id: SHARED, home_team: 'Alpha', away_team: 'Away' }]),
+      mkPack('pack_beta', [{ fixture_id: SHARED, home_team: 'Beta', away_team: 'Away' }]),
+    ];
+    render(<CreateCompetitionScreen connected loadInstances={vi.fn().mockResolvedValue(TWO_INSTANCES)} launchApi={api} loadReplayPacks={vi.fn().mockResolvedValue(packs)} />);
+    const select = (await screen.findByTestId('fixture-select')) as HTMLSelectElement;
+    await user.selectOptions(select, `pack_beta::${SHARED}`);
+    await selectBothInstances(user);
+    await user.click(screen.getByTestId('launch-button'));
+    await waitFor(() => expect(api.create).toHaveBeenCalled());
+    expect((api.create as ReturnType<typeof vi.fn>).mock.calls[0][0]).toMatchObject({ pack_id: 'pack_beta', fixture_id: SHARED });
+  });
+
+  it('mock OFF: an INVALID deep link never submits a stale pair — payload matches the visible selection', async () => {
+    const user = userEvent.setup();
+    const api = okApi();
+    const packs = [mkPack('curated', [{ fixture_id: 100, home_team: 'AAA', away_team: 'BBB' }])];
+    render(<CreateCompetitionScreen connected packId="curated" initialFixtureId={999} loadInstances={vi.fn().mockResolvedValue(TWO_INSTANCES)} launchApi={api} loadReplayPacks={vi.fn().mockResolvedValue(packs)} />);
+    const select = (await screen.findByTestId('fixture-select')) as HTMLSelectElement;
+    await waitFor(() => expect(select.value).toBe('curated::100')); // fell back to the first VALID composite
+    // The visible market scope reflects the SELECTED fixture, never the stale deep link.
+    expect(within(screen.getByTestId('pinned-config')).getByTestId('summary-market-scope')).toHaveTextContent(/AAA v BBB/i);
+    await selectBothInstances(user);
+    await user.click(screen.getByTestId('launch-button'));
+    await waitFor(() => expect(api.create).toHaveBeenCalled());
+    const payload = (api.create as ReturnType<typeof vi.fn>).mock.calls[0][0];
+    expect(payload).toMatchObject({ pack_id: 'curated', fixture_id: 100 });
+    expect(payload.fixture_id).not.toBe(999); // never the stale/invalid deep-linked id
+  });
+
+  it('mock OFF: an explicit fixture_id:0 survives composite selection AND payload construction', async () => {
+    const user = userEvent.setup();
+    const api = okApi();
+    const packs = [mkPack('curated', [{ fixture_id: 0, home_team: 'ZER', away_team: 'OHH' }])];
+    render(<CreateCompetitionScreen connected packId="curated" initialFixtureId={0} loadInstances={vi.fn().mockResolvedValue(TWO_INSTANCES)} launchApi={api} loadReplayPacks={vi.fn().mockResolvedValue(packs)} />);
+    const select = (await screen.findByTestId('fixture-select')) as HTMLSelectElement;
+    await waitFor(() => expect(select.value).toBe('curated::0'));
+    await selectBothInstances(user);
+    await user.click(screen.getByTestId('launch-button'));
+    await waitFor(() => expect(api.create).toHaveBeenCalled());
+    expect((api.create as ReturnType<typeof vi.fn>).mock.calls[0][0]).toMatchObject({ pack_id: 'curated', fixture_id: 0 });
+  });
+
+  it('mock OFF: market_scope derives from the SELECTED composite row (participant1 v participant2)', async () => {
+    const user = userEvent.setup();
+    const packs = [
+      mkPack('pack_alpha', [{ fixture_id: 42, home_team: 'Alpha', away_team: 'Away' }]),
+      mkPack('pack_beta', [{ fixture_id: 42, home_team: 'Beta', away_team: 'Away' }]),
+    ];
+    render(<CreateCompetitionScreen loadReplayPacks={vi.fn().mockResolvedValue(packs)} />);
+    const select = (await screen.findByTestId('fixture-select')) as HTMLSelectElement;
+    const scope = within(screen.getByTestId('pinned-config')).getByTestId('summary-market-scope');
+    await waitFor(() => expect(scope).toHaveTextContent(/Alpha v Away/i)); // default first = pack_alpha
+    await user.selectOptions(select, 'pack_beta::42');
+    expect(scope).toHaveTextContent(/Beta v Away/i);
+    expect(scope).not.toHaveTextContent(/Alpha v Away/i);
+  });
+
+  it('mock OFF: a getReplayPacks promise resolving AFTER unmount does not mutate state (no act leak)', async () => {
+    let resolve!: (v: ReplayPackView[]) => void;
+    const pending = new Promise<ReplayPackView[]>((r) => { resolve = r; });
+    const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const { unmount } = render(<CreateCompetitionScreen loadReplayPacks={() => pending} />);
+    unmount();
+    resolve([mkPack('curated', [{ fixture_id: 1, home_team: 'X', away_team: 'Y' }])]);
+    await pending;
+    await Promise.resolve();
+    const actWarnings = errSpy.mock.calls.filter((c) => String(c[0]).includes('act('));
+    expect(actWarnings).toEqual([]);
+    errSpy.mockRestore();
   });
 });

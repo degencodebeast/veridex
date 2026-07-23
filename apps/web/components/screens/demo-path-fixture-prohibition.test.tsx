@@ -357,7 +357,9 @@ describe('demo-path fixture-prohibition scan (T-2)', () => {
     it('CreateCompetitionScreen: mock OFF renders an honest-empty fixture picker — never the FIXTURES fixture', async () => {
       vi.resetModules();
       const { CreateCompetitionScreen } = await import('@/components/screens/CreateCompetitionScreen');
-      render(<CreateCompetitionScreen />);
+      // Off-mock the picker reads the real /replay-packs catalog; an empty catalog stays honest-empty
+      // (never the demo FIXTURES fallback). Inject an empty catalog so the assertion is deterministic.
+      render(<CreateCompetitionScreen loadReplayPacks={async () => []} />);
       expect(await screen.findByTestId('fixture-empty')).toBeInTheDocument();
       expect(screen.queryByTestId('fixture-select')).toBeNull();
     });
