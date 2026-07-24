@@ -46,7 +46,7 @@ describe('WalletChip (REQ-002, disclosure pattern — session-driven)', () => {
     it('keeps the disclosure collapsed until clicked', () => {
       connected();
       expect(chip()).toHaveAttribute('aria-expanded', 'false');
-      expect(screen.queryByRole('link', { name: 'Operator Dashboard' })).toBeNull();
+      expect(screen.queryByRole('link', { name: 'My Agents' })).toBeNull();
     });
 
     it('opens a disclosure with account actions only — no prototype routes (judge-nav hygiene)', async () => {
@@ -54,7 +54,12 @@ describe('WalletChip (REQ-002, disclosure pattern — session-driven)', () => {
       connected();
       await user.click(chip());
       expect(chip()).toHaveAttribute('aria-expanded', 'true');
-      expect(screen.getByRole('link', { name: 'Operator Dashboard' })).toBeInTheDocument();
+      const myAgents = screen.getByRole('link', { name: 'My Agents' });
+      expect(myAgents).toBeInTheDocument();
+      // Renamed link still targets the same owner destination.
+      expect(myAgents).toHaveAttribute('href', '/dashboard');
+      // The unused decorative network row was removed.
+      expect(screen.queryByText(/Network: Solana Devnet/i)).toBeNull();
       expect(screen.getByRole('button', { name: 'Disconnect' })).toBeInTheDocument();
       // Prototype/incomplete routes are hidden from judge navigation.
       expect(screen.queryByRole('link', { name: 'Design System' })).toBeNull();
@@ -75,9 +80,9 @@ describe('WalletChip (REQ-002, disclosure pattern — session-driven)', () => {
       const user = userEvent.setup();
       connected();
       await user.click(chip());
-      expect(screen.getByRole('link', { name: 'Operator Dashboard' })).toBeInTheDocument();
+      expect(screen.getByRole('link', { name: 'My Agents' })).toBeInTheDocument();
       await user.keyboard('{Escape}');
-      expect(screen.queryByRole('link', { name: 'Operator Dashboard' })).toBeNull();
+      expect(screen.queryByRole('link', { name: 'My Agents' })).toBeNull();
       expect(chip()).toHaveAttribute('aria-expanded', 'false');
     });
 
@@ -90,9 +95,9 @@ describe('WalletChip (REQ-002, disclosure pattern — session-driven)', () => {
         </div>,
       );
       await user.click(chip());
-      expect(screen.getByRole('link', { name: 'Operator Dashboard' })).toBeInTheDocument();
+      expect(screen.getByRole('link', { name: 'My Agents' })).toBeInTheDocument();
       await user.click(screen.getByRole('button', { name: 'outside' }));
-      expect(screen.queryByRole('link', { name: 'Operator Dashboard' })).toBeNull();
+      expect(screen.queryByRole('link', { name: 'My Agents' })).toBeNull();
       expect(chip()).toHaveAttribute('aria-expanded', 'false');
     });
   });

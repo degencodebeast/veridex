@@ -62,7 +62,7 @@ export function InstanceScreen({
         <div className={styles.error} data-testid="instance-error" role="alert">
           <h1 className={styles.errorTitle}>{title}</h1>
           <p className={styles.errorBody}>{body}</p>
-          <Link href="/dashboard" className={styles.back}>Back to Operator Dashboard</Link>
+          <Link href="/dashboard" className={styles.back}>Back to My Agents</Link>
         </div>
       </section>
     );

@@ -101,9 +101,9 @@ export function OperatorDashboardScreen({
   // honest prompt and NOTHING private — not hidden-but-present, genuinely absent from the DOM.
   if (!connected) {
     return (
-      <section className={styles.screen} aria-label="Operator Dashboard">
+      <section className={styles.screen} aria-label="My Agents">
         <header className={styles.head}>
-          <h1 className={styles.title}>Operator Dashboard</h1>
+          <h1 className={styles.title}>My Agents</h1>
         </header>
         <div className={styles.gate} data-testid="connect-gate">
           <p className={styles.gateMsg}>Connect your operator wallet to view your agents, runs, rewards, and alerts.</p>
@@ -116,9 +116,9 @@ export function OperatorDashboardScreen({
   }
 
   return (
-    <section className={styles.screen} aria-label="Operator Dashboard">
+    <section className={styles.screen} aria-label="My Agents">
       <header className={styles.head}>
-        <h1 className={styles.title}>Operator Dashboard</h1>
+        <h1 className={styles.title}>My Agents</h1>
         <div className={styles.actions}>
           <Link href="/studio" className={styles.primary}>+ New Agent</Link>
           <Link href="/competitions" className={styles.secondary}>Join Competition</Link>

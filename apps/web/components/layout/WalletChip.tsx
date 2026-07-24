@@ -76,9 +76,8 @@ export function WalletChip({
       </button>
       {open && (
         <div id={MENU_ID} className={styles.menu}>
-          <Link href="/dashboard" className={styles.item}>Operator Dashboard</Link>
+          <Link href="/dashboard" className={styles.item}>My Agents</Link>
           <div className={styles.group} aria-label="Account">
-            <span className={styles.info}>Network: Solana Devnet</span>
             <button type="button" className={styles.item}>Settings</button>
             <button type="button" className={styles.item} onClick={onDisconnect}>Disconnect</button>
           </div>

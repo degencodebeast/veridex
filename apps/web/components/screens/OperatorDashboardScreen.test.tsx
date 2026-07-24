@@ -45,6 +45,16 @@ describe('OperatorDashboardScreen (REQ-012 / SEC-008)', () => {
     expect(screen.getByRole('link', { name: /join competition/i })).toHaveAttribute('href', '/competitions');
   });
 
+  it('titles the page "My Agents" (renamed from Operator Dashboard) in both connected and gated states', () => {
+    const { rerender } = render(<OperatorDashboardScreen connected loadInstances={NO_INSTANCES} />);
+    expect(screen.getByRole('heading', { level: 1, name: /my agents/i })).toBeInTheDocument();
+    expect(screen.queryByRole('heading', { name: /operator dashboard/i })).toBeNull();
+    // The renamed page identity holds on the disconnected connect-gate too.
+    rerender(<OperatorDashboardScreen connected={false} loadInstances={NO_INSTANCES} />);
+    expect(screen.getByRole('heading', { level: 1, name: /my agents/i })).toBeInTheDocument();
+    expect(screen.queryByRole('heading', { name: /operator dashboard/i })).toBeNull();
+  });
+
   it('does NOT leak operator-private data when disconnected — fail-closed, ABSENT from DOM (#6 / SEC-008)', () => {
     render(<OperatorDashboardScreen connected={false} loadInstances={NO_INSTANCES} />);
     // Private sections are not in the DOM at all (not merely visually hidden).
