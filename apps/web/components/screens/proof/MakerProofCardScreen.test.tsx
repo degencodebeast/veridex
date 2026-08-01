@@ -37,12 +37,15 @@ describe('MakerProofCardScreen (Maker Arena MM-R1)', () => {
     expect(screen.getByRole('link', { name: /maker leaderboard/i })).toHaveAttribute('href', '/leaderboard?lane=maker');
   });
 
-  it('F-8: offers a QuoteGuard behavior-ablation entry point (deep-link, keyed by identity, not a rank)', () => {
+  it('identity-domain guard: the PUBLIC (agent_id-keyed) card renders NO link into the owner-scoped, instance-keyed live-ab ablation', () => {
+    // Regression for the cross-domain leak: this card is reached by a public leaderboard agent_id
+    // (display-only), NOT an owned instance_id. It must never pipe that agent_id into
+    // /proof/maker-ablation/{instanceId} (GET /maker/live-ab/{instanceId}), which would 404 or surface
+    // the wrong identity. The ablation is reachable only from the owner's deployed-instance page.
     render(<MakerProofCardScreen result={MAKER_ARENA_RESULT} agentId="txline-fair-mm" />);
-    const entry = screen.getByTestId('maker-proof-ablation-entry');
-    expect(entry).toHaveAttribute('href', '/proof/maker-ablation/txline-fair-mm');
-    expect(entry).toHaveTextContent(/behavior ablation/i);
-    expect(entry).toHaveTextContent(/not rank or profit/i);
+    expect(screen.queryByTestId('maker-proof-ablation-entry')).toBeNull();
+    const abLinks = screen.queryAllByRole('link').filter((a) => a.getAttribute('href')?.includes('/proof/maker-ablation/'));
+    expect(abLinks).toHaveLength(0);
   });
 
   it('SEC-005: never imports/reuses the directional CLV ProofArtifact type', () => {

@@ -53,9 +53,12 @@ from veridex.api.demo_fixtures import (
     contrarian_agent,
 )
 from veridex.api.deploy import DeployDeps, cancel_deploy_tasks, register_deploy_routes
+from veridex.api.fixture_labels import fixture_metadata_row
 from veridex.api.maker_router import register_maker_routes
 from veridex.api.schemas import (
     AgentRegisterResponse,
+    AgentRosterEntry,
+    AgentRosterResponse,
     ApprovalResponse,
     BacktestRunRequest,
     BacktestRunResponse,
@@ -71,6 +74,8 @@ from veridex.api.schemas import (
     KillSwitchResponse,
     LeaderboardResponse,
     LeaderboardRow,
+    ReplayMarketRow,
+    ReplayMarketsResponse,
     ReplayPackInfo,
     ReplayPackListResponse,
     RuntimeEventsResponse,
@@ -111,6 +116,7 @@ from veridex.competition.service import (
     start_competition,
 )
 from veridex.config import Settings, get_settings
+from veridex.deploy.instance import AgentInstance, DeployStatus
 from veridex.execution.models import ExecutionRecord, ExecutionStatus
 from veridex.execution.runner import resolve_approval
 from veridex.explainer import GLOSSARY_DEFINITIONS, explain_proof
@@ -124,7 +130,10 @@ from veridex.ingest.replay_catalog import (
     load_resolved_marketstates,
     resolve_replay_source,
 )
+from veridex.ingest.replay_pack import load_pack_fixture_states_bound
 from veridex.leaderboard import leaderboard as _build_leaderboard
+from veridex.public_agent import PublicAgent, Visibility, owner_public_label
+from veridex.public_projection import BoardKind, directional_board
 from veridex.runtime.arena_comparison import (
     DET_DRIFT_CONTESTANT,
     LLM_DRIFT_CONTESTANT,
@@ -375,6 +384,38 @@ def _replay_pack_info(entry: CatalogEntry) -> ReplayPackInfo:
         provenance=entry.provenance,
         is_genuine=entry.is_genuine,
         fixtures=list(entry.fixtures),
+        fixture_metadata=[fixture_metadata_row(int(f)) for f in entry.fixtures],
+    )
+
+
+def _agent_roster_entry(
+    agent: PublicAgent,
+    instance: AgentInstance,
+    scored: dict[str, Any] | None,
+) -> AgentRosterEntry:
+    """Project one HONEST public-directory row keyed on the immutable ``public_agent_id``.
+
+    Joins the public identity (``agent``) to its SEALED deployment (``instance``) and, when present, the
+    agent's aggregated PUBLIC_AGENTS board row (``scored``). The owner is rendered ONLY via the safe
+    :func:`~veridex.public_agent.owner_public_label` — the raw ``operator_id`` / ``owner_ref`` NEVER
+    leaves the server. ``origin`` is the REAL identity value; performance columns and ``proof_state``
+    stay honestly absent (``None`` / ``"unscored"``) until the agent has scored rows, never fabricated.
+    """
+    return AgentRosterEntry(
+        public_agent_id=agent.public_agent_id,
+        display_name=agent.display_name,
+        owner_public_label=owner_public_label(agent),
+        origin=agent.origin.value,
+        proof_state=str(scored["proof_mode"]) if scored is not None else "unscored",
+        agent_id=instance.agent_id,
+        type=instance.template_id,
+        source_mode=instance.source_mode,
+        execution_mode=instance.execution_mode,
+        status=instance.status.value.lower(),
+        config_hash_present=bool(instance.config_hash),
+        avg_clv_bps=scored["avg_clv_bps"] if scored is not None else None,
+        runs=scored["runs"] if scored is not None else None,
+        valid_pct=scored["valid_pct"] if scored is not None else None,
     )
 
 
@@ -672,6 +713,129 @@ def create_app(
         if entry is None:
             raise HTTPException(status_code=404, detail=f"unknown pack_id: {pack_id}")
         return _replay_pack_info(entry)
+
+    @app.get(
+        "/replay-packs/{pack_id}/fixtures/{fixture_id}/markets",
+        response_model=ReplayMarketsResponse,
+    )
+    async def get_replay_fixture_markets(pack_id: str, fixture_id: int) -> ReplayMarketsResponse:
+        """Project one replay fixture's LAST-KNOWN odds per market, folded across the WHOLE tape (M11).
+
+        Resolves the pack SERVER-side against the verified R-2 catalog (never a filesystem path): an
+        unknown ``pack_id`` or a fixture not catalogued for the pack is a 404. The fixture tape is loaded
+        via :func:`~veridex.ingest.replay_pack.load_pack_fixture_states_bound`, binding the replayed bytes
+        to the catalog's verified ``content_hash`` — a tampered pack (bytes swapped after admission) fails
+        closed with a 422.
+
+        The fold keeps the LAST-SEEN value per ``market_key`` over ALL tape states (the final tick alone
+        carries only the markets present at that instant — 1 of ~30 here), plus the ``ts`` and per-market
+        ``in_running`` of the state each market was last seen in. HONESTY (M4): a suspended market keeps
+        its EMPTY ``stable_prob_bps`` (never back-filled) while retaining last-known ``stable_price``.
+        """
+        entry = app.state.replay_catalog.get(pack_id)
+        if entry is None:
+            raise HTTPException(status_code=404, detail=f"unknown pack_id: {pack_id}")
+        if fixture_id not in entry.fixtures:
+            raise HTTPException(
+                status_code=404,
+                detail=f"fixture_id {fixture_id} is not catalogued for pack {pack_id!r}",
+            )
+        try:
+            states = load_pack_fixture_states_bound(
+                entry.pack_dir, fixture_id, expected_content_hash=entry.content_hash
+            )
+        except ValueError as exc:
+            # Fail closed: a tampered/corrupt pack (content_hash drift, fixture<->file swap) is a 422,
+            # never a silently-served partial projection. PackIntegrityError subclasses ValueError and the
+            # loader wraps every file read into a content_hash_drift PackIntegrityError, so no bare
+            # FileNotFoundError escapes — a single ``except ValueError`` fails closed on both.
+            #
+            # SECURITY: surface the STABLE machine reason code, NEVER str(exc). The raw message embeds the
+            # absolute internal pack_dir path, which per the invariant above is DELIBERATELY not exposed —
+            # the browser addresses packs by pack_id only. A bare ValueError with no .reason falls back to
+            # the generic code (still no path).
+            reason = getattr(exc, "reason", "pack_integrity_error")
+            raise HTTPException(status_code=422, detail=reason) from exc
+
+        # M11 fold: LAST-SEEN value per market_key across ALL states (NOT just states[-1], which carries
+        # only the markets present at the final tick). in_running is derived from the state's phase — at
+        # batch_size=1 (the load default) each state is folded from ONE record, so its phase is exactly
+        # that record's InRunning; MarketState carries no per-market flag, so this is the honest source.
+        folded: dict[str, ReplayMarketRow] = {}
+        for state in states:
+            for key, market in state.markets.items():
+                folded[key] = ReplayMarketRow(
+                    market_key=key,
+                    in_running=bool(state.phase),
+                    suspended=bool(market["suspended"]),
+                    ts=int(state.ts),
+                    # PRESERVE the empty prob map for a suspended market — never fill it from the price.
+                    stable_prob_bps=dict(market["stable_prob_bps"]),
+                    stable_price=dict(market["stable_price"]),
+                )
+        return ReplayMarketsResponse(fixture_id=fixture_id, markets=list(folded.values()))
+
+    # --- GET /agents/roster (PUBLIC — the deployed-agent roster, read-only) -----
+
+    @app.get("/agents/roster", response_model=AgentRosterResponse)
+    async def list_agents_roster(
+        dep_store: Store = Depends(_get_store),  # noqa: B008
+    ) -> AgentRosterResponse:
+        """PUBLIC (unauthenticated) HONEST agent directory, keyed on the immutable ``public_agent_id``.
+
+        Mirrors ``/replay-packs`` (read-only, NO auth). Sources from ``store.list_public_agents()``
+        joined to deployment state and admits an agent ONLY when its ``visibility == PUBLIC`` AND it has
+        a linked instance whose deploy status is ``SEALED`` — private / pending / failed / running /
+        unlinked agents are EXCLUDED. TRUST SURFACE: the owner is rendered ONLY via the safe
+        ``owner_public_label``; a raw ``operator_id`` / ``owner_ref`` NEVER appears. Performance columns
+        and ``proof_state`` are honestly absent (``None`` / ``"unscored"``) until the agent carries
+        scored PUBLIC_AGENTS board rows, then the REAL pooled values — never fabricated. No public+sealed
+        agents -> honest-empty. Rows are sorted deterministically by ``public_agent_id``.
+        """
+        # Reverse the instance→public_agent_id link into {public_agent_id: sealed instance}. Only SEALED
+        # instances qualify; first sealed instance (by instance_id) wins deterministically per agent.
+        instances = await dep_store.list_agent_instances()
+        sealed_by_agent: dict[str, AgentInstance] = {}
+        for inst in sorted(instances, key=lambda i: i.instance_id):
+            if inst.status is not DeployStatus.SEALED:
+                continue
+            pub_id = await dep_store.get_instance_public_agent_id(inst.instance_id)
+            if pub_id is None or pub_id in sealed_by_agent:
+                continue
+            sealed_by_agent[pub_id] = inst
+
+        # Join the PUBLIC_AGENTS directional board (visibility-filtered, pooled) by public_agent_id.
+        board = await directional_board(dep_store, board_kind=BoardKind.PUBLIC_AGENTS)
+        scored_by_agent = {row["public_agent_id"]: row for row in board}
+
+        rows = [
+            _agent_roster_entry(agent, sealed_by_agent[agent.public_agent_id],
+                                scored_by_agent.get(agent.public_agent_id))
+            for agent in await dep_store.list_public_agents()
+            if agent.visibility is Visibility.PUBLIC and agent.public_agent_id in sealed_by_agent
+        ]
+        rows.sort(key=lambda r: r.public_agent_id)
+        return AgentRosterResponse(agents=rows)
+
+    # --- GET /leaderboard/directional (Official Replay League completion layer) --
+
+    @app.get("/leaderboard/directional")
+    async def get_directional_leaderboard(
+        board_kind: BoardKind = Query(...),  # noqa: B008
+        dep_store: Store = Depends(_get_store),  # noqa: B008
+    ) -> dict[str, Any]:
+        """Return the directional leaderboard for a closed ``board_kind``, visibility-joined at read time.
+
+        A thin HTTP shell over :func:`veridex.public_projection.directional_board`: it loads durable
+        projected rows, joins CURRENT public-agent visibility (and, for
+        :attr:`~veridex.public_projection.BoardKind.OFFICIAL_BENCHMARK`, ``operator_class``), and hands
+        the survivors to the pure aggregator. The route does NOT rank or aggregate — that is
+        ``directional_board``'s job; it only serializes the result. ``board_kind`` is the closed
+        :class:`~veridex.public_projection.BoardKind` enum, so an unknown value is a 422 (never a silent
+        default). No scored public rows -> ``rows: []`` (honest-empty, never fabricated).
+        """
+        rows = await directional_board(dep_store, board_kind=board_kind)
+        return {"board_kind": board_kind.value, "rows": rows}
 
     # --- POST /backtests (T15 — replay a ReplayPack → honest BacktestReport) ----
 
@@ -1825,7 +1989,12 @@ def create_app(
             raise HTTPException(status_code=404, detail="agent instance not found")
         if instance.operator_id != principal.did:
             raise HTTPException(status_code=403, detail="principal does not own this agent instance")
-        rows = await dep_store.list_runtime_events(instance.agent_id, since=since, limit=limit)
+        # RUN-scoped, not agent_id-scoped: agent_id is a reusable template constant
+        # (studio-{template}) shared across deploys/owners, so reading by it would leak another
+        # run's/owner's OPS events. run_id is the server-minted per-instance authority (derived here
+        # from the OWNED instance, never the client) and also spans the run's lifecycle events emitted
+        # under a different veridex-mm-{instance} agent_id — so no lifecycle evidence is truncated.
+        rows = await dep_store.list_runtime_events_for_run(instance.run_id, since=since, limit=limit)
         events: list[dict[str, Any]] = []
         for row in rows:
             # Reconstruct through RuntimeEvent so the served shape is channel-pure by construction
@@ -2068,6 +2237,6 @@ def create_app(
     # Separate namespace over the SEALED maker arena artifact — never re-runs the arena, never
     # imports the directional scorer/leaderboard. Registered last so it composes like the deploy
     # and arena route groups above.
-    register_maker_routes(app)
+    register_maker_routes(app, store=resolved_store, require_principal=require_principal)
 
     return app

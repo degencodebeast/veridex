@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { render, screen, within } from '@testing-library/react';
+import userEvent from '@testing-library/user-event';
 import { LandingScreen } from '@/components/screens/LandingScreen';
 
 function stubMatchMedia(reduced: boolean) {
@@ -85,5 +86,32 @@ describe('LandingScreen (V4 fidelity)', () => {
     render(<LandingScreen />);
     expect(screen.getByText(/self-reported bots/i)).toBeInTheDocument();
     expect(screen.queryByText(/Recall|OddsFlow|ClawSportBot/)).toBeNull();
+  });
+
+  describe('Connect-Wallet CTAs (auth-contract@1: login injected by the page, never usePrivy here)', () => {
+    it('hides every Connect-Wallet CTA when no onConnect is supplied (unconfigured Privy — no dead buttons)', () => {
+      render(<LandingScreen />);
+      expect(screen.queryByRole('button', { name: /connect wallet/i })).toBeNull();
+    });
+
+    it('renders all three Connect-Wallet CTAs and fires onConnect (real Privy login) on click', async () => {
+      const user = userEvent.setup();
+      const onConnect = vi.fn();
+      render(<LandingScreen onConnect={onConnect} />);
+      const buttons = screen.getAllByRole('button', { name: /connect wallet/i });
+      expect(buttons).toHaveLength(3); // nav + hero + prize CTA
+      await user.click(buttons[0]);
+      await user.click(buttons[1]);
+      await user.click(buttons[2]);
+      expect(onConnect).toHaveBeenCalledTimes(3);
+    });
+
+    it('when connected, the nav shows the real operator address (→ Dashboard) and drops the Connect CTAs', () => {
+      render(<LandingScreen connected address="0x2eE447430b19016391A20369F0430846e18Fa177" onConnect={vi.fn()} />);
+      const chip = screen.getByRole('link', { name: /OP 0x2eE4…a177/i });
+      expect(chip).toHaveAttribute('href', '/dashboard');
+      // No redundant Connect-Wallet buttons once a session exists.
+      expect(screen.queryByRole('button', { name: /connect wallet/i })).toBeNull();
+    });
   });
 });

@@ -15,6 +15,15 @@ describe('AgentProfileScreen (REQ-021)', () => {
     expect(screen.getByText(new RegExp(profile.config_hash))).toBeInTheDocument();
   });
 
+  // Cross-surface honesty: eligibility must come from the AUTHORITATIVE eligibility_badge, NOT be
+  // re-derived from proof_mode. Re-deriving would contradict the Leaderboard for the same agent (a
+  // proof_mode 'reproducible' unproven agent is not-eligible on the board but would derive eligible).
+  it('renders the authoritative eligibility_badge, never one re-derived from proof_mode', () => {
+    render(<AgentProfileScreen profile={{ ...profile, proof_mode: 'reproducible', eligibility_badge: 'not-eligible' }} />);
+    expect(screen.getByText('Not Eligible')).toBeInTheDocument();
+    expect(screen.queryByText('Eligible')).toBeNull(); // never the re-derived eligible badge
+  });
+
   it('is CLV-native: shows Avg CLV + confidence, not ROI/trophies', () => {
     render(<AgentProfileScreen profile={profile} />);
     expect(screen.getByText(/avg clv/i)).toBeInTheDocument();
@@ -44,5 +53,20 @@ describe('AgentProfileScreen (REQ-021)', () => {
   it('links completed-competition rows to their proof', () => {
     render(<AgentProfileScreen profile={profile} />);
     expect(screen.getByRole('link', { name: /ESP v NED/i })).toHaveAttribute('href', '/proof/run_esp_ned_01');
+  });
+
+  // Quick honest enrichment: an off-mock REAL profile has runs>0 but no per-competition breakdown from
+  // the leaner endpoints. Implying "No completed competitions yet." would be dishonest — the guard flips
+  // the empty-state copy to an honest "not exposed" note when breakdown_available === false.
+  it('empty competitions with breakdown_available:false shows the honest "not exposed" note, NOT "none yet"', () => {
+    render(<AgentProfileScreen profile={{ ...profile, completed_competitions: [], breakdown_available: false }} />);
+    expect(screen.getByText(/exposed on the public profile/i)).toBeInTheDocument();
+    expect(screen.queryByText(/No completed competitions yet/i)).toBeNull();
+  });
+
+  it('empty competitions with the flag ABSENT keeps the original "none yet" copy (mock-path regression)', () => {
+    render(<AgentProfileScreen profile={{ ...profile, completed_competitions: [] }} />);
+    expect(screen.getByText(/No completed competitions yet/i)).toBeInTheDocument();
+    expect(screen.queryByText(/exposed on the public profile/i)).toBeNull();
   });
 });

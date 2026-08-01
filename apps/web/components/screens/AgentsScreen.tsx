@@ -5,22 +5,26 @@ import { Badge } from '@/components/ui/Badge';
 import { Num } from '@/components/ui/Num';
 import { SegmentedControl } from '@/components/ui/SegmentedControl';
 import { InfoTip } from '@/components/ui/InfoTip';
-import { AGENTS } from '@/lib/fixtures/catalog';
 import { MAKER_AGENT_META } from '@/lib/fixtures/maker';
 import { GLOSSARY } from '@/lib/glossary';
 import { useLane, type Lane } from '@/hooks/useLane';
 import { useMakerArenaResult } from '@/hooks/useMakerArenaResult';
-import type { AgentSummary } from '@/lib/catalog';
+import type { PublicAgentRow } from '@/lib/catalog';
 import type { MakerArenaResultView, MakerLeaderboardRow } from '@/lib/contracts';
 import styles from './AgentsScreen.module.css';
 
 type Sort = 'clv' | 'runs';
 
 export function AgentsScreen({
-  agents = AGENTS,
+  // The DIRECTIONAL roster is supplied by the page, mock-gated (mock ON → the labeled DEMO AGENTS
+  // fixture; mock OFF → honest-empty []). No fixture DEFAULT here — an absent `agents` renders an
+  // honest-empty directional table, never a fabricated roster (T-2 fixture prohibition).
+  agents = [],
+  // Maker result is page-sourced via useMakerArenaResult (F-9). No sealed-fixture default here —
+  // an absent `makerResult` triggers the honest live-fetch/honest-empty maker path, never a fixture.
   makerResult,
 }: {
-  agents?: AgentSummary[];
+  agents?: PublicAgentRow[];
   makerResult?: MakerArenaResultView;
 }) {
   const [lane, setLane] = useLane();
@@ -29,8 +33,16 @@ export function AgentsScreen({
   const makerState = useMakerArenaResult(lane === 'maker', makerResult);
 
   const shown = useMemo(() => {
-    const filtered = agents.filter((a) => a.agent_name.toLowerCase().includes(q.toLowerCase()));
-    return [...filtered].sort((a, b) => (sort === 'clv' ? b.avg_clv_bps - a.avg_clv_bps : b.runs - a.runs));
+    const filtered = agents.filter((a) => a.display_name.toLowerCase().includes(q.toLowerCase()));
+    // Null perf (an unscored /agents/roster row) sorts to the bottom — never coerced to 0 (a real 0
+    // would be a fabricated break-even claim that outranks the honest "—" rows).
+    const rank = (v: number | null) => (v == null ? Number.NEGATIVE_INFINITY : v);
+    // Guard against NaN when both ranked values are -Infinity (all-unscored roster is now the
+    // normal off-mock path): equal ranks compare equal (stable), never subtract infinities.
+    const cmp = (rb: number, ra: number) => (rb === ra ? 0 : rb - ra);
+    return [...filtered].sort((a, b) =>
+      sort === 'clv' ? cmp(rank(b.avg_clv_bps), rank(a.avg_clv_bps)) : cmp(rank(b.runs), rank(a.runs)),
+    );
   }, [agents, q, sort]);
 
   return (
@@ -69,27 +81,29 @@ export function AgentsScreen({
           </div>
 
           {shown.length === 0 ? (
-            <p className={styles.empty} data-testid="agents-empty">No agents match.</p>
+            // Honest-empty when the roster itself is empty (off-mock, no agents-list backend) vs. a
+            // filtered-out search over a non-empty roster — never a fabricated fallback either way.
+            <p className={styles.empty} data-testid="agents-empty">
+              {agents.length === 0 ? 'No agents yet.' : 'No agents match.'}
+            </p>
           ) : (
             <div className={styles.tableWrap}>
               <table className={styles.table}>
                 <thead>
-                  <tr><th>AGENT</th><th>ARCHETYPE</th><th>MODE</th><th className={styles.r}>AVG CLV</th><th className={styles.r}>RUNS</th><th>PROOF</th><th>SOURCE</th></tr>
+                  <tr><th>AGENT</th><th>ARCHETYPE</th><th>MODE</th><th className={styles.r}>AVG CLV</th><th className={styles.r}>RUNS</th><th>PROOF</th><th>OWNER</th><th>ORIGIN</th></tr>
                 </thead>
                 <tbody>
                   {shown.map((a) => (
-                    <tr key={a.agent_id} className={styles.row}>
-                      <td><Link href={`/agents/${a.agent_id}`} className={styles.link}>{a.agent_name} ›</Link></td>
+                    <tr key={a.public_agent_id} className={styles.row}>
+                      <td><Link href={`/agents/${a.public_agent_id}`} className={styles.link}>{a.display_name} ›</Link></td>
                       <td className="mono">{a.archetype}</td>
-                      <td className="mono">{a.mode}</td>
+                      <td className="mono">{a.mode ?? '—'}</td>
                       <td className={styles.num}><Num value={a.avg_clv_bps} kind="bps" /></td>
-                      <td className={styles.num}>{a.runs}</td>
-                      <td><Badge variant={a.proof_mode} /></td>
-                      <td>
-                        {a.source_mode === 'live' ? <Badge variant="live" />
-                          : a.source_mode === 'replay' ? <Badge variant="replay" />
-                            : <span className={`${styles.mixedSrc} mono`}>mixed</span>}
-                      </td>
+                      <td className={styles.num}>{a.runs ?? '—'}</td>
+                      {/* Honest proof-state: 'unscored' until the agent has scored board rows. */}
+                      <td><Badge variant={a.proof_state} /></td>
+                      <td className="mono">{a.owner_public_label}</td>
+                      <td className="mono">{a.origin}</td>
                     </tr>
                   ))}
                 </tbody>

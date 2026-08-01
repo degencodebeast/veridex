@@ -115,6 +115,21 @@ def _normalize_path(path: str) -> str:
     return path.rstrip("/") or "/"
 
 
+def _is_cors_preflight(scope: dict[str, Any]) -> bool:
+    """Whether ``scope`` is a CORS preflight — an ``OPTIONS`` carrying ``Access-Control-Request-Method``.
+
+    Per the Fetch/CORS spec a preflight is issued by the browser BEFORE the real request, is
+    mandatorily credential-less (no cookies/Authorization), and performs no side effect — it only
+    asks whether the real request's method+headers are allowed. It MUST NOT be auth-gated: a 401 here
+    fails the *real* request as an opaque CORS error (``net::ERR_FAILED``) in the browser, even though
+    the real request is properly authenticated. Exempting it preserves deny-by-default for every
+    non-preflight request; the app's ``CORSMiddleware`` answers the preflight downstream.
+    """
+    if scope.get("type") != "http" or scope.get("method", "").upper() != "OPTIONS":
+        return False
+    return any(key == b"access-control-request-method" for key, _ in scope.get("headers", []))
+
+
 @dataclass(frozen=True)
 class _RouteMatcher:
     """A compiled (method-set, path-regex) matcher for one route template."""
@@ -260,6 +275,15 @@ class DenyByDefaultGuard:
         is_websocket = scope_type == "websocket"
         path = _normalize_path(scope.get("path", ""))
         method = None if is_websocket else scope.get("method", "GET")
+
+        # 0) CORS preflight -> pass through UNAUTHENTICATED so the app's CORSMiddleware answers it.
+        # A preflight is OPTIONS + Access-Control-Request-Method; the route matchers are method-exact
+        # (e.g. only POST for /agents/deploy), so a preflight would otherwise fall through to the
+        # deny-by-default 401 below and break the *real* authenticated request as a browser CORS error.
+        # This is spec-safe: preflights are credential-less and perform no action (see _is_cors_preflight).
+        if _is_cors_preflight(scope):
+            await self.app(scope, receive, send)
+            return
 
         # 1) Veridex-owned route -> pass through; its own FastAPI Depends is authoritative.
         if self._is_veridex(method, path, is_websocket):

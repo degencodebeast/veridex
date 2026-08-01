@@ -15,6 +15,12 @@
 
 .main {
   flex: 1;
+  /* Centered content column: cap the width and auto-center so the page doesn't stretch edge-to-edge
+     on wide monitors. `align-self` overrides the shell's column-flex stretch; width:100% keeps it
+     fluid below the cap. The full-width top bar / status bar are intentionally left uncapped. */
+  align-self: center;
+  width: 100%;
+  max-width: 1440px;
   padding: var(--pad-screen);
   display: flex;
   flex-direction: column;

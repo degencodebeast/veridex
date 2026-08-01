@@ -408,3 +408,62 @@ async def test_studio_guard_on_payload_produces_ops_and_attempted_receipt() -> N
 def test_unknown_ref_still_fails_closed() -> None:
     with pytest.raises(sf.MMTapeNotFoundError):
         sf.default_mm_tape_resolver("not-a-real-tape-ref")
+
+
+@pytest.mark.asyncio
+async def test_run_guard_ablation_diverges_on_real_pmxt_tape(tmp_path: Path) -> None:
+    """Step-1 gate, PRODUCTION path: ``run_guard_ablation`` diverges on the GENUINE 18209181 tape.
+
+    The decide-layer divergence is already pinned by ``test_matched_guard_off_on_behavior``; this closes
+    the remaining gap by driving the SAME chain the ``/maker/live-ab`` provider will use — seal a Studio
+    quoteguard deploy, reconstruct the session from server-owned state, resolve the REAL tape through the
+    production catalog, run the guard OFF/ON ablation, and project it via ``build_live_ab_projection``.
+    Behavior-ablation only: no R4-A, no rank/edge/profit claim.
+    """
+    from veridex.api.maker_router import build_live_ab_projection
+    from veridex.mm_strategy.composition import run_guard_ablation
+    from veridex.runtime.mm_agent_adapter import RunContext
+    from veridex.store import InMemoryStore
+
+    store = InMemoryStore()
+    app = FastAPI()
+    deps = DeployDeps(
+        anchor_fn=None, mm_tape_resolver=None, mm_proposer=OfflineRecordingProposer(), mm_seed_state=None
+    )
+    register_deploy_routes(
+        app, store=store, settings=Settings(AUTH_MODE="dev"), deploy_deps=deps, runtime_event_sink=[].append
+    )
+    async with _transport(app) as client:
+        resp = await client.post("/agents/deploy", json=_mm_payload())
+    assert resp.status_code == 200, resp.text
+    instance_id = resp.json()["instance_id"]
+    await _drain(app)
+
+    instance = await store.get_agent_instance(instance_id)
+    assert instance.status == DeployStatus.SEALED, instance.last_failure_reason
+
+    # Reconstruct ONLY from server-owned state (the provider's contract) and resolve the REAL tape.
+    ctx = RunContext(
+        run_id=instance.run_id,
+        session_id="sess-ab",
+        runtime_agent_id="ra-ab",
+        owner_did=instance.operator_id or "did:privy:dev",
+    )
+    cfg, tape, mode, _guard = sf.reconstruct_mm_session(
+        instance, ctx, tape_resolver=None, proposer=OfflineRecordingProposer(), session_dir=tmp_path
+    )
+    assert tape.identity.fixture_id == pmxt_tape.FIXTURE_ID  # the genuine 18209181 tape
+
+    result = await run_guard_ablation(cfg, tape, mode=mode, event_sink=[].append)
+
+    # PASS-FOR-FLAGSHIP: the guard flip changes >= 1 substantive decision on the GENUINE tape.
+    # (Observed on this real 18209181 window: 8 divergent frames, the first flipping a two-sided
+    # quote to a no-quote when the real TxLINE FV is stale — behavior ablation, not a ranked result.)
+    assert result.diverges, "guard OFF/ON did NOT diverge on the real pmxt tape"
+    assert len(result.divergent_frame_indices) >= 1
+    # Both arms folded the SAME evidence (the honest ablation invariant).
+    assert len(result.guard_off.decisions) == len(result.guard_on.decisions)
+    # The provider's projection reports the divergence honestly (same source of truth).
+    proj = build_live_ab_projection(result, instance_id=instance_id)
+    assert proj.diverges is True
+    assert proj.divergent_frame_indices == list(result.divergent_frame_indices)

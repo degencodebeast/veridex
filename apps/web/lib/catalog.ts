@@ -104,13 +104,58 @@ export interface AgentSummary {
   agent_id: string;
   agent_name: string;
   archetype: Archetype;
-  mode: 'llm' | 'numeric' | 'rule';
-  avg_clv_bps: number;
-  runs: number;
+  // A scored agent has a real strategy mode; the PUBLIC deployed-agent roster (GET /agents/roster)
+  // carries no such label, so it is null there → the table renders "—" (honest, never fabricated).
+  mode: 'llm' | 'numeric' | 'rule' | null;
+  // Performance fields are null when there is no scoring aggregation for the row (e.g. every
+  // /agents/roster row). null → the table renders "—"; NEVER fabricated as 0 (a real 0 is a claim).
+  avg_clv_bps: number | null;
+  runs: number | null;
   proof_mode: ProofMode;
   source_mode: CatalogSourceMode;
-  valid_pct: number;
+  valid_pct: number | null;
   source: 'STUDIO' | 'BYOA';
+}
+
+// Roster-local proof-state: ProofMode PLUS the honest states a PUBLIC deployed agent can carry that are
+// NOT an earned single-mode proof claim: 'unscored' (deployed but no scored board rows yet), 'mixed'
+// (the backend's honest cross-run aggregate when an agent's runs carry different proof modes —
+// veridex/leaderboard.py:_summarize_proof_mode), and 'unknown' (fail-closed fallback for any proof_state
+// string the frontend does not recognize — NEVER coerced to an unearned 'reproducible'). This
+// deliberately does NOT widen the shared ProofMode (which has EXHAUSTIVE `Record<ProofMode, number>`
+// uses in lib/contracts.ts + lib/api.ts) — 'unscored'/'mixed'/'unknown' live ONLY on this roster-local
+// type, never on ProofMode.
+export type ProofState = ProofMode | 'unscored' | 'mixed' | 'unknown';
+
+// The PUBLIC deployed-agent roster row (GET /agents/roster) AND the shared identity contract the Duel
+// surface (E4) consumes. Honest identity (public_agent_id / display_name / owner_public_label / origin)
+// and honest proof_state ('unscored' until scored). Performance columns are null until the agent has
+// scored board rows → render "—", NEVER fabricated. Carries NO STUDIO/BYOA `source` field.
+export interface PublicAgentRow {
+  public_agent_id: string;
+  display_name: string;
+  owner_public_label: string;
+  origin: string;
+  proof_state: ProofState;
+  archetype: Archetype;
+  mode: 'llm' | 'numeric' | 'rule' | null;
+  avg_clv_bps: number | null;
+  runs: number | null;
+  valid_pct: number | null;
+}
+
+// The directional leaderboard row (GET /leaderboard/directional): the cross-run LeaderboardRow ENRICHED
+// with honest public identity (display_name + public_agent_id) so the board renders REAL display names,
+// never opaque ids. `extends LeaderboardRow` so a DirectionalRow[] is a valid LeaderboardRow[] for the
+// existing LeaderboardScreen.
+export interface DirectionalRow extends LeaderboardRow {
+  display_name: string;
+  public_agent_id: string;
+  // The HONEST roster-local proof state for the board surface (Gate-3 M3). The shared
+  // LeaderboardRow.proof_mode coerces the backend's cross-run aggregate "mixed" → 'reproducible'
+  // (an unearned claim); this carries the honest 'mixed'/'unknown'/'unscored' so the board renders
+  // the real aggregate. Never widens the shared ProofMode — the honesty lives ONLY here.
+  proof_state: ProofState;
 }
 
 export interface AgentProfileRecord extends AgentSummary {
@@ -123,6 +168,12 @@ export interface AgentProfileRecord extends AgentSummary {
   deployment_provenance: string;
   total_clv_bps: number;
   eligibility_badge: EligibilityBadge;
+  // OPTIONAL honesty flag for the leaner off-mock profile (no per-competition breakdown from the
+  // directional board + roster). When false, an EMPTY completed_competitions list must render an
+  // honest "not exposed" note instead of "No completed competitions yet." (the agent has runs>0, so
+  // implying zero completed competitions would be dishonest). Absent/undefined on the mock
+  // AGENT_PROFILES fixtures ⇒ they keep today's exact "none yet" copy.
+  breakdown_available?: boolean;
 }
 
 // --- Operator dashboard slices ------------------------------------------------
@@ -209,6 +260,7 @@ export interface MarketFamily {
 
 export interface FixtureSummary {
   fixture_id: number;
+  pack_id: string;
   competition: string;
   participant1: string;
   participant2: string;

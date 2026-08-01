@@ -16,7 +16,6 @@
 .num { text-align: right; font-variant-numeric: tabular-nums; }
 .link { color: var(--text-1); text-decoration: none; }
 .link:hover { color: var(--accent-hi); }
-.mixedSrc { font-size: 10px; text-transform: uppercase; letter-spacing: 0.04em; color: var(--text-2); border: 1px solid var(--border-soft); border-radius: var(--radius-badge); padding: 1px 6px; }
 
 /* Maker Arena lane (MM-R1) */
 .laneRow { display: flex; align-items: center; gap: var(--space-3); flex-wrap: wrap; }

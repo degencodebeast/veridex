@@ -421,6 +421,52 @@ def test_red1_anonymous_websocket_denied(owned_setup) -> None:
         pass
 
 
+# --- CORS preflight: exempt from the deny-by-default gate (credential-less browser probe) -------
+# The route matchers are method-exact (a route is registered for POST, not OPTIONS), so a browser
+# CORS preflight (OPTIONS + Access-Control-Request-Method) would otherwise miss every matcher, fall
+# through to the anonymous-deny branch, and 401 — which fails the *real* authenticated request as an
+# opaque `net::ERR_FAILED` in the browser. The guard must pass a preflight through so downstream CORS
+# answers it. The exemption is NARROW: only genuine preflights, never all OPTIONS.
+
+
+def _preflight_headers() -> dict[str, str]:
+    return {
+        "Origin": "http://localhost:3000",
+        "Access-Control-Request-Method": "POST",
+        "Access-Control-Request-Headers": "authorization,idempotency-key,content-type",
+    }
+
+
+def test_cors_preflight_on_native_route_is_not_auth_gated(owned_setup) -> None:
+    """A CORS preflight on an agno-native route (whose POST is 401-anonymous) must NOT be 401/403 —
+    the guard passes it through instead of gating it (regression: deploy POST broke with ERR_FAILED)."""
+    _store, _adapter, _calls, client = owned_setup
+    resp = client.options("/agents/veridex-market-maker/runs", headers=_preflight_headers())
+    assert resp.status_code not in (401, 403), resp.status_code
+
+
+def test_bare_options_without_preflight_header_stays_denied(owned_setup) -> None:
+    """The exemption is narrow: a bare OPTIONS WITHOUT Access-Control-Request-Method is not a CORS
+    preflight, so it stays deny-by-default (401 anonymous) — we did not blanket-open all OPTIONS."""
+    _store, _adapter, _calls, client = owned_setup
+    resp = client.options(
+        "/agents/veridex-market-maker/runs", headers={"Origin": "http://localhost:3000"}
+    )
+    assert resp.status_code == 401, resp.status_code
+
+
+def test_is_cors_preflight_recognizes_only_real_preflights() -> None:
+    """Unit: _is_cors_preflight is true ONLY for http OPTIONS carrying Access-Control-Request-Method."""
+    acrm = [(b"access-control-request-method", b"POST")]
+    assert svc._is_cors_preflight({"type": "http", "method": "OPTIONS", "headers": acrm}) is True
+    # wrong method, right header -> not a preflight
+    assert svc._is_cors_preflight({"type": "http", "method": "POST", "headers": acrm}) is False
+    # OPTIONS but missing the preflight header -> not a preflight (stays gated)
+    assert svc._is_cors_preflight({"type": "http", "method": "OPTIONS", "headers": []}) is False
+    # non-http scope -> never a preflight
+    assert svc._is_cors_preflight({"type": "websocket", "headers": acrm}) is False
+
+
 # --- RED#2: authenticated NON-OWNER -> no data + no side effect ---------------
 
 

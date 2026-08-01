@@ -39,6 +39,7 @@ from veridex.deploy.instance import AgentInstance
 from veridex.deploy.preflight import DeployConfig
 from veridex.ingest.feed_health import FeedHealthReport
 from veridex.ingest.marketstate import MarketState
+from veridex.mm_strategy.session_factory import MakerReplayTape, compute_tape_content_hash
 from veridex.store import InMemoryStore
 
 _APP_ID = "test-privy-app-id"
@@ -110,19 +111,25 @@ def _make_instance(
     operator_id: str | None,
     runtime_handle: dict[str, Any] | None = None,
     run_id: str = "run-x",
+    market_allowlist: list[str] | None = None,
+    replay_binding: dict[str, Any] | None = None,
+    submitted_config: dict[str, Any] | None = None,
+    effective_config: dict[str, Any] | None = None,
 ) -> AgentInstance:
     """Build a minimal valid :class:`AgentInstance` for persistence tests."""
     return AgentInstance(
         instance_id=instance_id,
         template_id="sharp-momentum-v2",
         agent_id="studio-agent",
-        submitted_config={"strategy": "momentum-sharp"},
-        effective_config={"strategy": "momentum-sharp"},
+        submitted_config=submitted_config if submitted_config is not None else {"strategy": "momentum-sharp"},
+        effective_config=effective_config if effective_config is not None else {"strategy": "momentum-sharp"},
         config_hash="cfg-hash",
         policy_hash="pol-hash",
         source_mode="replay",
         execution_mode="paper",
         run_id=run_id,
+        market_allowlist=market_allowlist if market_allowlist is not None else [],
+        replay_binding=replay_binding,
         operator_id=operator_id,
         runtime_handle=runtime_handle,
         created_at="2026-01-01T00:00:00+00:00",
@@ -347,3 +354,246 @@ async def test_deploy_persists_server_derived_owner_and_ignores_body_owner() -> 
         assert persisted.operator_id != "did:privy:ATTACKER"
     finally:
         await _drain(app)
+
+
+# ---------------------------------------------------------------------------
+# CURATED fixture + market labels on the owner-scoped instance-detail response
+# ---------------------------------------------------------------------------
+
+
+#: The R-4 replay PACK selection hash (curated demo pack) — a DIFFERENT identity than the maker tape.
+_PACK_CONTENT_HASH = "f16c3853a80f000000000000000000000000000000000000000000000000abcd"
+#: The banked ``pmxt-txline-mm-18209181-v1`` MakerReplayTape's OWN content hash (server-derived).
+_MAKER_TAPE_REF = "pmxt-txline-mm-18209181-v1"
+_MAKER_TAPE_CONTENT_HASH = "19b314ab0170239bb63fa9b7efd2cf6c459e128f4841a6fd11ffc92c7acd2050"
+
+
+async def test_instance_detail_surfaces_curated_fixture_and_market_labels() -> None:
+    store = InMemoryStore()
+    binding = {"pack_id": _MAKER_TAPE_REF, "fixture_id": 18209181, "content_hash": _PACK_CONTENT_HASH}
+    await store.persist_agent_instance(
+        _make_instance(
+            instance_id="inst_maker",
+            operator_id=_DID_ALICE,
+            market_allowlist=["pmxt:18209181:home_win"],
+            replay_binding=binding,
+            # An MM (quoteguard-mm) instance: the effective config IS the mm block (carries tape_ref).
+            submitted_config={"strategy": "quoteguard-mm"},
+            effective_config={"tape_ref": _MAKER_TAPE_REF},
+        )
+    )
+    app = create_app(store=store, settings=_privy_settings())
+    try:
+        async with _transport(app) as client:
+            resp = await client.get("/agents/instances/inst_maker", headers=_bearer(_DID_ALICE))
+            assert resp.status_code == 200, resp.text
+            body = resp.json()
+            # Server-derived, additive label fields — the raw ids/fields remain unchanged alongside.
+            assert body["fixture_id"] == 18209181
+            assert body["fixture_label"] == "France v Morocco"
+            assert body["market_label"] == "Home win"
+            assert body["replay_pack_id"] == _MAKER_TAPE_REF
+            # MAJOR: the two hash identities are DISTINCT and never conflated. The replay-PACK hash is
+            # the R-4 catalog selection; the maker-tape hash is the MakerReplayTape's own hash the run
+            # verifies — a DIFFERENT value, derived server-side via the same resolver.
+            assert body["replay_pack_content_hash"] == _PACK_CONTENT_HASH
+            assert body["maker_tape_ref"] == _MAKER_TAPE_REF
+            assert body["maker_tape_content_hash"] == _MAKER_TAPE_CONTENT_HASH
+            assert body["maker_tape_content_hash"] != body["replay_pack_content_hash"]
+            # The old (misleading) field name is GONE — the pack hash is never labeled "tape".
+            assert "tape_content_hash" not in body
+            # The existing contract is untouched: raw id + allowlist still present verbatim.
+            assert body["instance_id"] == "inst_maker"
+            assert body["market_allowlist"] == ["pmxt:18209181:home_win"]
+    finally:
+        await _drain(app)
+
+
+async def test_instance_detail_non_mm_instance_has_no_maker_tape_fields() -> None:
+    # A directional (non-MM) instance has NO maker tape — the maker-tape fields must be absent/null,
+    # while the replay-PACK identity may still be present from its binding.
+    store = InMemoryStore()
+    binding = {"pack_id": "pack-directional", "fixture_id": 18209181, "content_hash": _PACK_CONTENT_HASH}
+    await store.persist_agent_instance(
+        _make_instance(
+            instance_id="inst_directional",
+            operator_id=_DID_ALICE,
+            market_allowlist=["pmxt:18209181:home_win"],
+            replay_binding=binding,
+            submitted_config={"strategy": "momentum-sharp"},
+        )
+    )
+    app = create_app(store=store, settings=_privy_settings())
+    try:
+        async with _transport(app) as client:
+            resp = await client.get("/agents/instances/inst_directional", headers=_bearer(_DID_ALICE))
+            assert resp.status_code == 200, resp.text
+            body = resp.json()
+            assert body["replay_pack_content_hash"] == _PACK_CONTENT_HASH
+            assert body["maker_tape_ref"] is None
+            assert body["maker_tape_content_hash"] is None
+    finally:
+        await _drain(app)
+
+
+def _mm_instance(instance_id: str, tape_ref: str) -> AgentInstance:
+    """A ``quoteguard-mm`` instance whose effective config carries ``tape_ref`` (the mm block)."""
+    return _make_instance(
+        instance_id=instance_id,
+        operator_id=_DID_ALICE,
+        market_allowlist=["pmxt:18209181:home_win"],
+        submitted_config={"strategy": "quoteguard-mm"},
+        effective_config={"tape_ref": tape_ref},
+    )
+
+
+async def test_instance_detail_maker_hash_reflects_the_injected_effective_resolver() -> None:
+    # MAJOR (a): the detail must report the hash of the tape the RUN would use — i.e. the EFFECTIVE
+    # (injected) resolver's tape — NOT a hardcoded default. Inject a DIFFERENT valid tape (different
+    # events, self-consistent hash) → the detail surfaces THAT tape's recomputed hash.
+    alt_events: tuple[Any, ...] = ("alt-event-1", "alt-event-2", "alt-event-3")
+    alt_hash = compute_tape_content_hash(alt_events)
+    assert alt_hash != _MAKER_TAPE_CONTENT_HASH  # genuinely a different tape than the default pmxt one
+    alt_tape = MakerReplayTape(
+        tape_ref=_MAKER_TAPE_REF, identity=None, venue_market_ref="alt", events=alt_events, content_hash=alt_hash
+    )
+
+    store = InMemoryStore()
+    await store.persist_agent_instance(_mm_instance("inst_injected", _MAKER_TAPE_REF))
+    app = create_app(store=store, settings=_privy_settings(), deploy_deps=DeployDeps(mm_tape_resolver=lambda _ref: alt_tape))
+    try:
+        async with _transport(app) as client:
+            resp = await client.get("/agents/instances/inst_injected", headers=_bearer(_DID_ALICE))
+            assert resp.status_code == 200, resp.text
+            body = resp.json()
+            assert body["maker_tape_ref"] == _MAKER_TAPE_REF
+            # The surfaced hash is the INJECTED tape's recomputed hash, not the default pmxt hash.
+            assert body["maker_tape_content_hash"] == alt_hash
+            assert body["maker_tape_content_hash"] != _MAKER_TAPE_CONTENT_HASH
+    finally:
+        await _drain(app)
+
+
+async def test_instance_detail_maker_hash_fails_closed_on_unexpected_resolver_error() -> None:
+    # MINOR hardening: the maker-tape hash sits on the PRIMARY (non-best-effort) detail path. If the
+    # resolver raises anything OTHER than MMTapeNotFoundError (e.g. a banked-but-corrupt tape blowing up
+    # during reconstruction), the detail must FAIL CLOSED — surface NO hash but STILL render the page
+    # (200 with ownership/run_id/status intact), never 500 the whole owner-scoped instance.
+    def _boom(_ref: str) -> MakerReplayTape:
+        raise ValueError("corrupt banked tape")
+
+    store = InMemoryStore()
+    await store.persist_agent_instance(_mm_instance("inst_boom", _MAKER_TAPE_REF))
+    app = create_app(store=store, settings=_privy_settings(), deploy_deps=DeployDeps(mm_tape_resolver=_boom))
+    try:
+        async with _transport(app) as client:
+            resp = await client.get("/agents/instances/inst_boom", headers=_bearer(_DID_ALICE))
+            assert resp.status_code == 200, resp.text  # page still loads; the resolver error did NOT 500 it
+            body = resp.json()
+            assert body["maker_tape_ref"] == _MAKER_TAPE_REF  # ref still named
+            assert body["maker_tape_content_hash"] is None  # fail-closed: no hash on an unexpected error
+            assert body["run_id"]  # the authoritative identity still renders (page not 500'd)
+    finally:
+        await _drain(app)
+
+
+async def test_instance_detail_maker_hash_fails_closed_on_tampered_tape() -> None:
+    # MAJOR (b): a tape whose events do NOT match its claimed content_hash (a tampered/broken tape the
+    # run itself would REJECT at reconstruction) must FAIL CLOSED — the detail surfaces NO hash
+    # (maker_tape_content_hash is None), never a value that doesn't match the events. The ref remains.
+    tampered_tape = MakerReplayTape(
+        tape_ref=_MAKER_TAPE_REF, identity=None, venue_market_ref="x",
+        events=("real-event",), content_hash="0" * 64,  # claimed hash does NOT match the events
+    )
+    store = InMemoryStore()
+    await store.persist_agent_instance(_mm_instance("inst_tampered", _MAKER_TAPE_REF))
+    app = create_app(store=store, settings=_privy_settings(), deploy_deps=DeployDeps(mm_tape_resolver=lambda _ref: tampered_tape))
+    try:
+        async with _transport(app) as client:
+            resp = await client.get("/agents/instances/inst_tampered", headers=_bearer(_DID_ALICE))
+            assert resp.status_code == 200, resp.text
+            body = resp.json()
+            assert body["maker_tape_ref"] == _MAKER_TAPE_REF  # ref still named
+            assert body["maker_tape_content_hash"] is None  # fail-closed: never a mismatched hash
+    finally:
+        await _drain(app)
+
+
+async def test_instance_detail_no_fixture_yields_null_label() -> None:
+    # MINOR 1: an instance with no derivable fixture id must project fixture_label=None (so the UI
+    # genuinely omits the fixture rows) — never a truthy "Fixture (unknown)" placeholder.
+    store = InMemoryStore()
+    await store.persist_agent_instance(
+        _make_instance(instance_id="inst_nofixture", operator_id=_DID_ALICE, market_allowlist=[])
+    )
+    app = create_app(store=store, settings=_privy_settings())
+    try:
+        async with _transport(app) as client:
+            resp = await client.get("/agents/instances/inst_nofixture", headers=_bearer(_DID_ALICE))
+            assert resp.status_code == 200, resp.text
+            body = resp.json()
+            assert body["fixture_id"] is None
+            assert body["fixture_label"] is None
+            assert body["market_label"] is None
+    finally:
+        await _drain(app)
+
+
+async def test_instance_detail_unmapped_fixture_falls_back_honestly() -> None:
+    store = InMemoryStore()
+    # No replay_binding: the fixture id is parsed from the leading pmxt allowlist token, and an
+    # UNMAPPED id must fall back to "Fixture {id}" (never a guessed matchup).
+    await store.persist_agent_instance(
+        _make_instance(
+            instance_id="inst_unmapped",
+            operator_id=_DID_ALICE,
+            market_allowlist=["pmxt:999999:away_win"],
+        )
+    )
+    app = create_app(store=store, settings=_privy_settings())
+    try:
+        async with _transport(app) as client:
+            resp = await client.get("/agents/instances/inst_unmapped", headers=_bearer(_DID_ALICE))
+            assert resp.status_code == 200, resp.text
+            body = resp.json()
+            assert body["fixture_id"] == 999999
+            assert body["fixture_label"] == "Fixture 999999"
+            assert body["market_label"] == "Away win"
+            # No replay binding → the pack identity fields are honestly null.
+            assert body["replay_pack_content_hash"] is None
+            assert body["replay_pack_id"] is None
+    finally:
+        await _drain(app)
+
+
+def test_fixture_label_maps_curated_ids_and_falls_back() -> None:
+    from veridex.api.fixture_labels import fixture_label
+
+    assert fixture_label(18209181) == "France v Morocco"
+    assert fixture_label(18218149) == "Spain v Belgium"
+    assert fixture_label(18213979) == "Norway v England"
+    assert fixture_label(18222446) == "Argentina v Switzerland"
+    assert fixture_label(999999) == "Fixture 999999"
+    assert fixture_label(None) == "Fixture (unknown)"
+
+
+def test_market_label_humanizes_known_token_forms_and_passes_unknown_through() -> None:
+    from veridex.api.fixture_labels import market_label
+
+    # pmxt outcome tokens → the humanized suffix
+    assert market_label("pmxt:18209181:home_win") == "Home win"
+    assert market_label("pmxt:18209181:draw") == "Draw"
+    assert market_label("pmxt:18209181:away_win") == "Away win"
+    assert market_label("pmxt:18209181:over") == "Over"
+    assert market_label("pmxt:18209181:under") == "Under"
+    # directional market keys → their human labels
+    assert market_label("1X2_PARTICIPANT_RESULT") == "Match result (1X2)"
+    assert market_label("OVERUNDER_PARTICIPANT_GOALS") == "Total goals (O/U)"
+    # unknown token → returned VERBATIM (honest, never a guess)
+    assert market_label("pmxt:18209181:mystery") == "pmxt:18209181:mystery"
+    assert market_label("SOME_UNKNOWN_MARKET") == "SOME_UNKNOWN_MARKET"
+    # MINOR 2: only the EXACT pmxt:{numeric}:{suffix} shape is humanized — a bogus string that merely
+    # ENDS in a known suffix is NOT a pinned market token and passes through unchanged.
+    assert market_label("bogus:home_win") == "bogus:home_win"
+    assert market_label("pmxt:notanumber:home_win") == "pmxt:notanumber:home_win"
+    assert market_label("home_win") == "home_win"

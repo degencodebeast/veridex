@@ -93,6 +93,15 @@ export interface CompetitionStateResponse {
   execution: Record<string, unknown> | null;
 }
 
+// GET /competitions — the unfiltered list summary (CompetitionSummaryResponse). NO auth; optional
+// `status` query only. Carries the raw config dict + lifecycle status + run_id (null until start).
+export interface CompetitionSummaryWire {
+  competition_id: string;
+  status: string;
+  config: Record<string, unknown>;
+  run_id: string | null;
+}
+
 export interface InspectorRecord {
   run_id: string;
   agent_id: string;
@@ -234,4 +243,25 @@ export interface MakerArenaResultResponseWire {
   result: MakerArenaResultWire;
   proof_card: MakerProofCardWire;
   diagnostics: MakerDiagnosticsWire;
+}
+
+export interface ReplayPackFixtureMetaWire {
+  fixture_id: number;
+  home_team: string | null;
+  away_team: string | null;
+  kickoff_ts: number | null;
+  label_source: string; // "captured" | "unavailable"
+}
+
+export interface ReplayPackInfoWire {
+  pack_id: string;
+  content_hash: string;
+  provenance: string;
+  is_genuine: boolean;
+  fixtures: number[];
+  fixture_metadata: ReplayPackFixtureMetaWire[];
+}
+
+export interface ReplayPackListResponseWire {
+  packs: ReplayPackInfoWire[];
 }

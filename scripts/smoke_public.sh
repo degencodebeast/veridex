@@ -256,6 +256,27 @@ else
   fail replay-run "POST /demo/run expected 200, got $HTTP_CODE"
 fi
 
+# 4b) Public Maker benchmark reachable — the sealed maker envelope must be served 200 with real
+#     values (spec §8.7). This is the post-deploy proof that the Dockerfile.api cp1 packaging fix
+#     landed (the defect this whole change repairs was GET /maker/arena-result -> 404 on deploy).
+req GET /maker/arena-result || abort "cannot reach ${BASE_URL} for maker-arena-result check"
+if [ "$HTTP_CODE" = "200" ]; then
+  maker_ok="$(jq -r '
+    (.schema_version=="maker_arena_result.v1")
+    and (.result.fixture_universe_n==18)
+    and ((.result.fixtures|length)==18)
+    and ((.fixture_metadata|length)==18)
+    and (.result.falsification.verdict=="SEPARATED")
+  ' "$BODY_FILE" 2>/dev/null || echo false)"
+  if [ "$maker_ok" = "true" ]; then
+    pass maker-arena "GET /maker/arena-result -> 200 (schema + 18 raw ids + fixture_metadata + SEPARATED)"
+  else
+    fail maker-arena "GET /maker/arena-result 200 but schema/values check failed (packaging or enrichment regression)"
+  fi
+else
+  fail maker-arena "GET /maker/arena-result expected 200, got $HTTP_CODE (cp1 packaging likely missing from the image)"
+fi
+
 # 5) Public WebSocket Upgrade + reconnect replay. A competition id is intentionally explicit:
 #    /demo/run does not create a competition-scoped canonical event log, and this smoke never uses
 #    or prints production credentials to create one. CI without a deployed target reports pending.

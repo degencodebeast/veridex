@@ -22,6 +22,8 @@ import { INSPECTOR_DEMO_QUANTITIES } from '@/lib/fixtures/inspector';
 import { PROOF_DEMO_ROOTS, mapRootForest } from '@/lib/fixtures/proof';
 import { PROOF_EXPLAIN_DEMO, type ProofExplanation } from '@/lib/explainer';
 import { VERIFIER_VERSION, type StatusBarState } from '@/lib/status';
+import { AGENT_PROFILES } from '@/lib/fixtures/catalog';
+import type { AgentProfileRecord, Archetype, DirectionalRow, FixtureSummary, MarketFamilyKey, OddsUpdate, ProofState, PublicAgentRow } from '@/lib/catalog';
 import type * as W from '@/lib/wire';
 import type {
   AnchorInfo, AnchorStatus, CheckResult, CockpitState, ExecutionMode, FeedHealthState,
@@ -49,6 +51,12 @@ function resolveApiUrl(path: string): string {
   return path;
 }
 
+// The directional board_kind is a CLOSED wire enum whose values EXACTLY match the backend
+// (veridex/public_projection.py:108-117 — LOWERCASE 'official_benchmark' | 'public_agents'). An
+// UPPERCASE value is REJECTED with 422, so the frontend must never send one (probe: PUBLIC_AGENTS → 422,
+// public_agents → 200). This type pins the wire values so a stray uppercase literal cannot compile.
+export type BoardKindWire = 'official_benchmark' | 'public_agents';
+
 // Centralized path map — the C1 binding points. A route change is a one-line edit.
 export const PATHS = {
   // The backend serves the ProofArtifact at GET /runs/{id} (no /proof suffix — pinned by
@@ -73,6 +81,20 @@ export const PATHS = {
   // F-8 QuoteGuard behavior ablation (maker_live_ab.v1). Read-only, public, per-instance. 404s
   // (honest "no ablation for this instance") until an ablation provider is wired for the instance.
   makerLiveAb: (instanceId: string) => `/maker/live-ab/${encodeURIComponent(instanceId)}`,
+  // R-3 verified ReplayPack catalog (read-only). Enriched with additive fixture_metadata.
+  replayPacks: () => `/replay-packs`,
+  // E2 read-only replay-market projection: one fixture's LAST-KNOWN odds per market (folded across
+  // the whole hash-bound tape). pack_id is a catalog KEY resolved server-side, never a filesystem path.
+  replayMarkets: (packId: string, fixtureId: number) =>
+    `/replay-packs/${encodeURIComponent(packId)}/fixtures/${fixtureId}/markets`,
+  // PUBLIC deployed-agent roster (read-only, unauth — mirrors /replay-packs). ALL owners, NOT
+  // owner-filtered (distinct from the owner-scoped /agents/instances). Perf columns are honest null.
+  agentsRoster: () => `/agents/roster`,
+  // B3 directional leaderboard completion layer (read-only). `board_kind` is a CLOSED backend enum
+  // (LOWERCASE 'official_benchmark' / 'public_agents' — an uppercase value 422s); the server
+  // visibility-joins + aggregates. Rows are enriched with honest public identity (display_name +
+  // public_agent_id).
+  directionalLeaderboard: (boardKind: BoardKindWire) => `/leaderboard/directional?board_kind=${boardKind}`,
   // F-4 competition lifecycle (owner-scoped POSTs): create → register roster entry → start.
   competitions: () => `/competitions`,
   competitionAgents: (id: string) => `/competitions/${id}/agents`,
@@ -770,9 +792,13 @@ const MOCK_GUARD_ABLATION: GuardAblationView = {
 // the DEMO ablation (recorded replay). The route is public (read-only), so a plain accept-JSON GET.
 export async function getMakerLiveAb(instanceId: string): Promise<GuardAblationView | null> {
   if (isMockEnabled()) return MOCK_GUARD_ABLATION;
-  const res = await fetch(resolveApiUrl(PATHS.makerLiveAb(instanceId)), { headers: { accept: 'application/json' } });
-  if (res.status === 404) return null; // honest "no recorded ablation for this instance"
-  if (!res.ok) throw new ApiError(res.status, `GET ${PATHS.makerLiveAb(instanceId)} failed: ${res.status}`);
+  // Owner-scoped (auth-contract@1): the route is now bearer-authed + ownership-checked server-side, so
+  // this MUST attach the Privy bearer (authedGet) — a plain fetch would 401. 404 is the honest "no
+  // recorded ablation for this instance" (unknown / directional / non-maker); other non-ok throws.
+  const path = PATHS.makerLiveAb(instanceId);
+  const res = await authedGet(path);
+  if (res.status === 404) return null;
+  if (!res.ok) throw new ApiError(res.status, `GET ${path} failed: ${res.status}`);
   return adaptGuardAblation((await res.json()) as GuardAblationResponseWire);
 }
 
@@ -784,6 +810,346 @@ export async function getMakerArenaResult(): Promise<MakerArenaResultView> {
     return { ...m, source_mode: demote(m.source_mode) };
   }
   return adaptMakerArenaResult(await getJson<W.MakerArenaResultResponseWire>(PATHS.makerArenaResult()));
+}
+
+export interface ReplayPackView {
+  packId: string;
+  contentHash: string;
+  provenance: string;
+  isGenuine: boolean;
+  fixtures: number[];
+  fixtureMetadata: W.ReplayPackFixtureMetaWire[];
+}
+
+// The deployed 1-pack/4-fixture Replay Library. Off-mock ⇒ the real /replay-packs fetch; mock ⇒ []
+// (there is NO replay-pack demo fixture — honest-empty, never fabricated). Raw fixture ids are
+// preserved; labels come SERVER-side (fixture_metadata), never a frontend-duplicated map (spec §5.2).
+export async function getReplayPacks(): Promise<ReplayPackView[]> {
+  if (isMockEnabled()) return [];
+  const res = await getJson<W.ReplayPackListResponseWire>(PATHS.replayPacks());
+  return res.packs.map((p) => ({
+    packId: p.pack_id,
+    contentHash: p.content_hash,
+    provenance: p.provenance,
+    isGenuine: p.is_genuine,
+    fixtures: p.fixtures,
+    fixtureMetadata: p.fixture_metadata ?? [],
+  }));
+}
+
+// The SHARED replay-pack → FixtureSummary mapper (spec §5.2). Each pack's server-side fixture_metadata
+// becomes a FixtureSummary carrying the COMPOSITE (pack_id, fixture_id) identity — two packs can share
+// an external fixture_id, so pack_id must ride through. Labels are SERVER-sourced with an honest
+// fallback when a team name is absent (never a fabricated name); kickoff_ts is epoch SECONDS on the
+// wire → ISO string, absent ⇒ '' (honest, never faked). Consumed by /markets AND the Create-Competition
+// fixture picker so their catalog view is byte-identical (single source of truth, no forked mapper).
+export function replayPacksToFixtures(packs: ReplayPackView[]): FixtureSummary[] {
+  return packs.flatMap((pack) =>
+    pack.fixtureMetadata.map((m): FixtureSummary => ({
+      fixture_id: m.fixture_id,
+      pack_id: pack.packId,
+      competition: pack.packId,
+      participant1: m.home_team ?? `id ${m.fixture_id}`,
+      participant2: m.away_team ?? '—',
+      start_time: m.kickoff_ts != null ? new Date(m.kickoff_ts * 1000).toISOString() : '',
+      in_running: false, // replay catalog — never in-running
+    })),
+  );
+}
+
+// ---- E2 replay-market projection (GET /replay-packs/{pack}/fixtures/{fixture}/markets) ----
+//
+// Maps the backend's LAST-KNOWN per-market projection to the screen's OddsUpdate view (buildFamilies
+// renders it). MAJOR-5 EXACT unit conversion (verified against wire semantics):
+//   • stable_price[outcome] = DECIMAL odds (e.g. 2.08) → prices[i] = round(x * 1000) (2.08 → 2080),
+//     which decodePrice() renders back to 2.08.
+//   • stable_prob_bps[outcome] = BPS (e.g. 5000 = 50%) → pct[i] = (bps / 100).toFixed(3) ("50.000").
+//   • an outcome ABSENT from stable_prob_bps (suspended) → pct[i] = '' (the honest MISSING sentinel);
+//     the render maps '' → '—', NEVER a fabricated "0.000". The retained stable_price still renders.
+
+/** Wire shape of one projected market (backend ReplayMarketRow, veridex/api/schemas.py). */
+interface ReplayMarketRowWire {
+  market_key: string;
+  in_running: boolean;
+  suspended: boolean;
+  ts: number;
+  stable_prob_bps: Record<string, number>;
+  stable_price: Record<string, number>;
+}
+
+/** Wire shape of the GET .../markets envelope (backend ReplayMarketsResponse). */
+interface ReplayMarketsResponseWire {
+  fixture_id: number;
+  label: string;
+  markets: ReplayMarketRowWire[];
+}
+
+// One wire market → one OddsUpdate. price_names is the DETERMINISTIC outcome order = the keys of the
+// wire stable_price map (every priced outcome, stable insertion order). market_family = the FIRST
+// segment of market_key ({SuperOddsType}|{MarketPeriod}|{MarketParameters}); market_parameters = the
+// THIRD segment or null. Only the 3 known MarketFamilyKeys render (buildFamilies filters the rest).
+function replayMarketToOddsUpdate(fixtureId: number, m: ReplayMarketRowWire): OddsUpdate {
+  const outcomes = Object.keys(m.stable_price); // deterministic: the priced outcomes, stable order
+  // market_key is {SuperOddsType}|{MarketPeriod}|{MarketParameters}. Take the params from index 2 ONWARD
+  // (join back any pipes) so a MarketParameters segment that itself contains '|' is preserved, not truncated.
+  const parts = m.market_key.split('|');
+  const superOddsType = parts[0];
+  const marketParameters = parts.slice(2).join('|') || null;
+  return {
+    fixture_id: fixtureId,
+    message_id: m.market_key, // stable, deterministic id (the projection is one row per market_key)
+    ts: m.ts,
+    in_running: m.in_running,
+    // The RAW SuperOddsType is preserved verbatim; buildFamilies renders ONLY the known families and
+    // drops any other (the cast is safe — the value is only compared against MARKET_FAMILY_KEYS + text).
+    market_family: superOddsType as MarketFamilyKey,
+    market_parameters: marketParameters,
+    price_names: outcomes, // deterministic outcome order = the priced-outcome keys (stable)
+    prices: outcomes.map((o) => Math.round(m.stable_price[o] * 1000)), // decimal → int ×1000
+    // implied %: bps → 3dp string; ABSENT (suspended) ⇒ '' sentinel → render maps to '—', never a fake 0.
+    pct: outcomes.map((o) =>
+      Object.prototype.hasOwnProperty.call(m.stable_prob_bps, o) ? (m.stable_prob_bps[o] / 100).toFixed(3) : '',
+    ),
+  };
+}
+
+// GET the E2 projection → OddsUpdate[] (buildFamilies-ready). Off-mock only — under mock the page keeps
+// its existing demo odds path (this reader is never called there). Honest-empty [] on any transport
+// error (never a fabricated market). Suspended markets carry retained prices with '' implied sentinels.
+export async function getReplayMarkets(packId: string, fixtureId: number): Promise<OddsUpdate[]> {
+  try {
+    const res = await getJson<ReplayMarketsResponseWire>(PATHS.replayMarkets(packId, fixtureId));
+    return res.markets.map((m) => replayMarketToOddsUpdate(fixtureId, m));
+  } catch {
+    return []; // honest-empty on error — the screen shows absence, never a fabricated market
+  }
+}
+
+// ---- PUBLIC deployed-agent roster (GET /agents/roster) ----
+//
+// The unauthenticated public roster of ALL deployed instances across ALL owners (mirrors
+// /replay-packs — read-only, no bearer). Distinct from the OWNER-scoped getInstances()
+// (/agents/instances). The backend projects public-safe deployment identity only; the performance
+// columns are ALWAYS null (no scoring aggregation exists yet) — surfaced as null so the table
+// renders "—", NEVER fabricated.
+
+/** Wire shape of one public roster row (frozen backend AgentRosterEntry, veridex/api/schemas.py:470).
+ * TRUST SURFACE: it carries the SAFE public identity only (public_agent_id / display_name /
+ * owner_public_label / origin) — NEVER a raw operator_id / owner_ref. Performance columns are None and
+ * proof_state is "unscored" until the agent has scored PUBLIC_AGENTS board rows. */
+export interface AgentRosterEntryWire {
+  public_agent_id: string;
+  display_name: string;
+  owner_public_label: string; // SAFE public owner rendering (brand / shortened wallet / em-dash)
+  origin: string; // the real Origin value ("official" | "byoa" | "unknown" | ...)
+  proof_state: string; // "unscored" until scored, then the real proof mode
+  agent_id: string; // the deployed instance id (informational; the directory keys on public_agent_id)
+  type: string; // template_id (strategy archetype)
+  source_mode: string; // replay | live
+  execution_mode: string;
+  status: string; // DeployStatus value, lowercased (always "sealed")
+  config_hash_present: boolean; // REAL proof indicator (config_hash pinned) — not a score
+  avg_clv_bps: number | null; // null until scored, then the REAL pooled value — never fabricated
+  runs: number | null;
+  valid_pct: number | null;
+}
+
+export interface AgentRosterResponseWire {
+  agents: AgentRosterEntryWire[];
+}
+
+// template_id is the deployed archetype label for the archetype path (StudioScreen sends
+// template_id=archetype); MM/drift templates carry their own id. The RAW template_id is preserved
+// VERBATIM as the archetype (rendered as-is in the ARCHETYPE column — the real deployment identity),
+// never remapped to a fabricated archetype. The cast is safe: the value is only rendered as text.
+function toArchetype(templateId: string): Archetype {
+  return templateId as Archetype;
+}
+
+// The wire proof_state → the roster-local ProofState. An EARNED single-mode claim (verified / partial /
+// reproducible) is preserved verbatim; 'unscored' (the honest pre-score state) and 'mixed' (the backend's
+// honest cross-run aggregate for runs with different proof modes — veridex/leaderboard.py) are preserved
+// as their own honest states. ANY OTHER string fails CLOSED to 'unknown' — it is NEVER coerced up to an
+// unearned 'reproducible' proof claim (Gate-3 M3). This does NOT delegate to toProofMode (which would
+// overclaim unknown→reproducible) and does NOT touch the shared ProofMode — 'unscored'/'mixed'/'unknown'
+// live ONLY on ProofState (roster-local).
+function toProofState(s: string): ProofState {
+  if (s === 'verified' || s === 'partial' || s === 'reproducible') return s;
+  if (s === 'mixed') return 'mixed';
+  if (s === 'unscored') return 'unscored';
+  return 'unknown'; // any unexpected string ⇒ honest 'unknown', NEVER a fabricated 'reproducible'
+}
+
+// GET /agents/roster → PublicAgentRow[] for the AgentsScreen directional table. Mock ⇒ [] (the page
+// supplies the labeled DEMO fixture, mapped through the SHARED agentSummaryToPublicRow adapter, under
+// the mock gate; this reader is the OFF-mock real-fetch path). Honest identity is mapped verbatim
+// (public_agent_id / display_name / owner_public_label / origin); proof_state carries the REAL wire
+// value ("unscored" until scored); performance columns map to their honest null/number ("—", never
+// fabricated). Honest-empty [] on any fetch error — NEVER the AGENTS fixture off-mock (T-2).
+export async function getAgentsRoster(): Promise<PublicAgentRow[]> {
+  if (isMockEnabled()) return [];
+  try {
+    const res = await getJson<AgentRosterResponseWire>(PATHS.agentsRoster());
+    return res.agents.map((e) => ({
+      public_agent_id: e.public_agent_id,
+      display_name: e.display_name,
+      owner_public_label: e.owner_public_label,
+      origin: e.origin,
+      proof_state: toProofState(e.proof_state),
+      archetype: toArchetype(e.type),
+      mode: null, // the roster carries no strategy mode (llm|numeric|rule) — honest "—", never fabricated
+      avg_clv_bps: e.avg_clv_bps, // null until scored — honest "—", never fabricated
+      runs: e.runs,
+      valid_pct: e.valid_pct,
+    }));
+  } catch {
+    return []; // honest-empty on error — NEVER the AGENTS fixture off-mock (T-2 fixture prohibition)
+  }
+}
+
+// ---- B3 directional leaderboard completion layer (GET /leaderboard/directional) ----
+//
+// The cross-run directional board ENRICHED with honest public identity. The wire row is a
+// LeaderboardRow PLUS { display_name, public_agent_id } (the DirectionalRow enrichment). The reader
+// runs each row through the SAME base leaderboard mapping (adaptLeaderboard) and then overrides the
+// opaque-id identity with the REAL public identity: agent_id = public_agent_id (the link/key) and
+// agent_name = display_name (the REAL display name, NEVER the opaque-id fallback). source_mode rides
+// the same aggregate mapping (all-replay → replay), so the board survives the REPLAY filter (M8).
+
+/** Wire shape of one directional row (backend LeaderboardRow + the display_name/public_agent_id join). */
+interface DirectionalRowWire extends W.LeaderboardRow {
+  display_name: string;
+  public_agent_id: string;
+}
+
+/** Wire shape of the GET /leaderboard/directional envelope. */
+interface DirectionalLeaderboardResponseWire {
+  board_kind: string;
+  rows: DirectionalRowWire[];
+}
+
+export function adaptDirectionalLeaderboard(w: DirectionalLeaderboardResponseWire): DirectionalRow[] {
+  return adaptLeaderboard({ rows: w.rows }).map((base, i) => ({
+    ...base,
+    agent_id: w.rows[i].public_agent_id, // key/link by the public id
+    agent_name: w.rows[i].display_name,  // the REAL display name, not the opaque-id fallback
+    public_agent_id: w.rows[i].public_agent_id,
+    display_name: w.rows[i].display_name,
+    // HONEST board proof state (Gate-3 M3): map the wire proof_mode via toProofState — the backend's
+    // cross-run aggregate "mixed" stays 'mixed' (never the unearned 'reproducible' that base.proof_mode
+    // coerces it to), and any unrecognized value fails CLOSED to 'unknown'.
+    proof_state: toProofState(w.rows[i].proof_mode),
+  }));
+}
+
+// GET /leaderboard/directional?board_kind=public_agents → DirectionalRow[] (honest display names +
+// replay provenance). board_kind is the LOWERCASE closed wire enum the backend accepts (an uppercase
+// value 422s → the board would render empty off-mock). Mock ⇒ [] (the /leaderboard page keeps its
+// mock-ON getLeaderboard() fixture path). Off-mock the LeaderboardPage calls this and honest-empties on
+// error (never a wire fixture).
+export async function getDirectionalLeaderboard(boardKind: BoardKindWire = 'public_agents'): Promise<DirectionalRow[]> {
+  if (isMockEnabled()) return [];
+  const res = await getJson<DirectionalLeaderboardResponseWire>(PATHS.directionalLeaderboard(boardKind));
+  return adaptDirectionalLeaderboard(res);
+}
+
+// ---- Quick honest enrichment: getAgentProfile (leaner REAL profile, NO new backend endpoint) ----
+//
+// Mock ⇒ the AGENT_PROFILES fixture UNCHANGED (preserves today's mock behavior EXACTLY). Off-mock ⇒ a
+// REAL (leaner) profile assembled from data we ALREADY serve: the directional public_agents board
+// (per-agent aggregates) + the public roster (identity). There is NO agent-profile endpoint, so fields
+// those two readers don't carry degrade HONESTLY (config_hash "—", empty competitions with
+// breakdown_available:false, empty anchors) — NEVER fabricated. Not-found / any transport error ⇒ null
+// (honest-unavailable, never a fixture off-mock — T-2 fixture prohibition).
+export async function getAgentProfile(publicAgentId: string): Promise<AgentProfileRecord | null> {
+  if (isMockEnabled()) return AGENT_PROFILES[publicAgentId] ?? null;
+  try {
+    const [board, roster] = await Promise.all([
+      getDirectionalLeaderboard('public_agents'),
+      getAgentsRoster(),
+    ]);
+    const row = board.find((r) => r.public_agent_id === publicAgentId);
+    if (!row) return null; // honest not-found — no such agent on the board
+    const identity = roster.find((r) => r.public_agent_id === publicAgentId);
+    // `source` CLASSIFIES real AUTHORSHIP from the roster's real `origin` — the only honest signal for
+    // first-party (STUDIO) vs third-party (BYOA). proof_mode is ORTHOGONAL to authorship (and
+    // toProofMode coerces mixed/unknown/unscored/'' → 'reproducible'), so it must NOT feed this — using
+    // it would falsely stamp STUDIO on BYOA agents. Roster-absent ⇒ BYOA (the least-claim, never a
+    // fabricated first-party claim).
+    const source: 'STUDIO' | 'BYOA' = identity?.origin === 'official' ? 'STUDIO' : 'BYOA';
+    return {
+      agent_id: row.public_agent_id,
+      agent_name: row.display_name,
+      // archetype comes from the roster identity. The shared `Archetype` union has no honest "unknown"
+      // member and widening it is out of scope, so for the roster-absent edge (e.g. the roster fetch
+      // failed → [] while the board succeeded) we store the em-dash absent-marker rather than SEEDING a
+      // specific strategy like 'baseline' — an unearned claim. The value is display-only text here
+      // (rendered verbatim in the header), and the cast follows this file's existing free-string
+      // `x as Archetype` convention (see toArchetype). Honest "—", never a fabricated archetype.
+      archetype: identity?.archetype ?? ('—' as Archetype),
+      mode: identity?.mode ?? null,
+      avg_clv_bps: row.avg_clv_bps,
+      runs: row.runs,
+      proof_mode: row.proof_mode,
+      source_mode: row.source_mode,
+      valid_pct: row.valid_pct,
+      source,
+      valid_count: row.valid_count,
+      // config_hash / policy_hash are not exposed by any endpoint — the standard absent marker.
+      config_hash: '—',
+      policy_hash: '—',
+      // Honest note: the strategy configuration is not surfaced here (NOT a fabricated strategy blurb).
+      strategy_caption: 'Strategy configuration is not exposed on the public agent profile.',
+      // No per-competition breakdown from these endpoints (honest-empty). breakdown_available:false makes
+      // the screen render an honest "not exposed" note instead of implying zero completed competitions.
+      completed_competitions: [],
+      // Honest-empty: neither the directional board nor the roster exposes any per-anchor
+      // tx_signature/slot, so there is no honest anchor entry to show (absent, independent of the
+      // board's aggregate anchor_status which this reader does not read).
+      anchors: [],
+      deployment_provenance: identity
+        ? `${identity.owner_public_label} · origin ${identity.origin}`
+        : 'Deployment provenance is not exposed on the public agent profile.',
+      total_clv_bps: row.total_clv_bps,
+      eligibility_badge: row.eligibility_badge,
+      breakdown_available: false,
+    };
+  } catch {
+    return null; // honest-unavailable on any transport error — NEVER a fabricated/fixture profile off-mock
+  }
+}
+
+export interface CompetitionRecordView {
+  competitionId: string;
+  status: string;
+  title: string;
+  // Surfaced ONLY from the server record's config. Absent → null (the caller renders "—"), NEVER a
+  // fabricated 'replay'/'paper' default — that would violate the absent-value honesty rule (spec §7).
+  sourceMode: string | null;
+  executionMode: string | null;
+  rosterSize: number | null;
+  runId: string | null;
+}
+
+// The real backend competition records (GET /competitions). Surfaces ONLY server-provided fields;
+// the title is derived from config.market_scope, else the raw competition_id (spec §6.1). Never
+// reproduces aspirational mock values (prize/TVL/live counts/anchor) and never fabricates an absent
+// source/exec/roster. Callers gate mock mode themselves.
+export async function getCompetitions(): Promise<CompetitionRecordView[]> {
+  const rows = await getJson<W.CompetitionSummaryWire[]>(PATHS.competitions());
+  return rows.map((r) => {
+    const cfg = (r.config ?? {}) as Record<string, unknown>;
+    const scope = typeof cfg.market_scope === 'string' && cfg.market_scope.trim() ? cfg.market_scope : r.competition_id;
+    return {
+      competitionId: r.competition_id,
+      status: r.status,
+      title: scope,
+      sourceMode: typeof cfg.source_mode === 'string' ? cfg.source_mode : null,
+      executionMode: typeof cfg.execution_mode === 'string' ? cfg.execution_mode : null,
+      rosterSize: typeof cfg.roster_size === 'number' ? cfg.roster_size : null,
+      runId: r.run_id,
+    };
+  });
 }
 
 export async function getCockpitState(competitionId: string): Promise<CockpitState> {
@@ -950,6 +1316,19 @@ export interface AgentInstanceWire {
   runtime_handle: InstanceRuntimeHandle | null;
   created_at: string;
   updated_at: string; // durable last-write timestamp (present on the contract; not surfaced today)
+  // Additive server-derived labels (owner-scoped GET /agents/instances/{id} only). Optional so the
+  // list route + any older payload still validate. CURATED convenience labels (see backend
+  // veridex/api/fixture_labels.py) — they AUGMENT the raw ids, never replace them.
+  fixture_id?: number | null;
+  fixture_label?: string | null;
+  market_label?: string | null;
+  // Two DISTINCT hash identities (never conflated): the R-4 replay PACK selection hash vs the
+  // quoteguard-mm MakerReplayTape's OWN hash the maker run verifies. maker_tape_* are present only
+  // for an MM instance.
+  replay_pack_content_hash?: string | null;
+  replay_pack_id?: string | null;
+  maker_tape_ref?: string | null;
+  maker_tape_content_hash?: string | null;
 }
 
 /** View-model of a deployed instance (owner-scoped identity the instance page + dashboard render). */
@@ -969,6 +1348,17 @@ export interface DeployedInstance {
   market_allowlist: string[];
   venue_allowlist: string[];
   created_at: string;
+  // CURATED, server-derived labels that AUGMENT the raw ids (present on the owner-scoped detail
+  // response; absent on the list route + demo rows). Optional + null-honest; never a "verified" claim.
+  fixture_id?: number | null;
+  fixture_label?: string | null;
+  market_label?: string | null;
+  // DISTINCT hashes: replay_pack_content_hash is the R-4 pack selection hash; maker_tape_content_hash
+  // is the quoteguard-mm MakerReplayTape's own hash (a different identity). Never present one as the other.
+  replay_pack_content_hash?: string | null;
+  replay_pack_id?: string | null;
+  maker_tape_ref?: string | null;
+  maker_tape_content_hash?: string | null;
 }
 
 export function adaptAgentInstance(w: AgentInstanceWire): DeployedInstance {
@@ -996,6 +1386,14 @@ export function adaptAgentInstance(w: AgentInstanceWire): DeployedInstance {
     market_allowlist: w.market_allowlist ?? [],
     venue_allowlist: w.venue_allowlist ?? [],
     created_at: w.created_at,
+    // CURATED labels carried through null-honest — absent on the list route, so default to null.
+    fixture_id: w.fixture_id ?? null,
+    fixture_label: w.fixture_label ?? null,
+    market_label: w.market_label ?? null,
+    replay_pack_content_hash: w.replay_pack_content_hash ?? null,
+    replay_pack_id: w.replay_pack_id ?? null,
+    maker_tape_ref: w.maker_tape_ref ?? null,
+    maker_tape_content_hash: w.maker_tape_content_hash ?? null,
   };
 }
 
@@ -1161,6 +1559,11 @@ export interface CompetitionConfigPayload {
   market_scope: string;
   scoring_window: string | null;
   roster_size: number; // ge=2 (backend Field constraint) — the wizard guards this before firing
+  // The AUTHORITATIVE catalog identity the Replay Library establishes (spec §5.2). The backend
+  // competition model freezes a server-derived replay binding from these (models.py:83-84,106-127).
+  // A label-only prefill loses this identity and breaks the moment a second admitted pack appears.
+  pack_id?: string;
+  fixture_id?: number;
 }
 
 /** One instance-bound roster entry POST /competitions/{id}/agents registers (mirrors AgentEntry). */

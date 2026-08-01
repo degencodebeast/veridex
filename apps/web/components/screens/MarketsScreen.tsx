@@ -2,8 +2,7 @@
 import { useEffect, useMemo, useState } from 'react';
 import Link from 'next/link';
 import { Badge } from '@/components/ui/Badge';
-import { SPORT_CATALOG, buildFamilies, oddsUpdatesPath } from '@/lib/txline/client';
-import { ODDS_UPDATES, FIXTURES, FEED_HEALTH, LEADERBOARD_ROWS } from '@/lib/fixtures/catalog';
+import { SPORT_CATALOG, buildFamilies, fixtureKey, oddsUpdatesPath } from '@/lib/txline/client';
 import { isMockEnabled } from '@/lib/mock';
 import type {
   FixtureSummary, OddsUpdate, SourceMode, FeedHealthState, LeaderboardRow, MarketFamilyKey,
@@ -27,24 +26,47 @@ const TABS: { id: TabId; label: string; disabled?: boolean; disabledReason?: str
   { id: 'ASIANHANDICAP_PARTICIPANT_GOALS', label: 'AH', testid: 'tab-ah' },
 ];
 
+// HONEST-EMPTY DEFAULTS (T-2): the screen is a PURE presentational component — it renders ONLY the
+// data it is handed. Off-mock the page supplies {} / [] / null (odds/fixtures have no backend reader;
+// feed-health/leaderboard resolve empty via their self-gating readers), so nothing fabricated shows.
+// Fixtures reach this screen ONLY under the page's isMockEnabled() gate. `feedHealth` is nullable:
+// null = "not loaded / unavailable" → the FEED-HEALTH rail states so honestly, never a fake LIVE/OFFLINE.
 export function MarketsScreen({
-  oddsByFixture = ODDS_UPDATES, fixtures = FIXTURES, sourceMode = 'replay',
-  feedHealth = FEED_HEALTH, leaderboard = LEADERBOARD_ROWS,
+  oddsByFixture = {}, fixtures = [], sourceMode = 'replay',
+  feedHealth = null, leaderboard = [],
 }: {
-  oddsByFixture?: Record<number, OddsUpdate[]>; fixtures?: FixtureSummary[]; sourceMode?: SourceMode;
-  feedHealth?: FeedHealthState; leaderboard?: LeaderboardRow[];
+  // Odds are keyed by the COMPOSITE (pack_id, fixture_id) identity so two packs sharing an external
+  // fixture_id keep separate tables (see fixtureKey). Bare fixture_id would collide across packs.
+  oddsByFixture?: Record<string, OddsUpdate[]>; fixtures?: FixtureSummary[]; sourceMode?: SourceMode;
+  feedHealth?: FeedHealthState | null; leaderboard?: LeaderboardRow[];
 }) {
   const [sportId, setSportId] = useState('soccer');
-  // Default-select the first fixture so the dashboard populates on load (V5) — not an empty prompt.
-  const [fixtureId, setFixtureId] = useState<number | null>(fixtures[0]?.fixture_id ?? null);
+  // Selection carries the composite (pack_id, fixture_id) key — NOT a bare fixture_id — so pack A and
+  // pack B fixtures with the same external id never both read as "selected". Default-select fixtures[0].
+  const [selectedKey, setSelectedKey] = useState<string | null>(
+    fixtures[0] ? fixtureKey(fixtures[0].pack_id, fixtures[0].fixture_id) : null,
+  );
   const [tab, setTab] = useState<TabId>('all');
+  // Fixtures may arrive ASYNC (the page fetches/mock-gates after mount), so default-select the first
+  // one once they land — without clobbering a selection the user has already made.
+  useEffect(() => {
+    setSelectedKey((prev) =>
+      prev != null && fixtures.some((f) => fixtureKey(f.pack_id, f.fixture_id) === prev)
+        ? prev
+        : fixtures[0] ? fixtureKey(fixtures[0].pack_id, fixtures[0].fixture_id) : null,
+    );
+  }, [fixtures]);
 
-  const updates = fixtureId != null ? oddsByFixture[fixtureId] ?? [] : [];
-  const allFamilies = useMemo(() => buildFamilies(updates), [updates]);
+  const selected = fixtures.find((f) => fixtureKey(f.pack_id, f.fixture_id) === selectedKey) ?? null;
+  const updates = selectedKey != null ? oddsByFixture[selectedKey] ?? [] : [];
+  // Replay projections OMIT closing (source DTO has none) → don't reconstruct; the LIVE path still does.
+  const allFamilies = useMemo(
+    () => buildFamilies(updates, { reconstructClosing: sourceMode !== 'replay' }),
+    [updates, sourceMode],
+  );
   const families = tab === 'all' ? allFamilies : allFamilies.filter((f) => f.key === tab);
   // The active tab's element id — labels the shared tabpanel (ARIA tabs contract).
   const activeTabId = TABS.find((t) => t.id === tab)?.testid;
-  const selected = fixtures.find((f) => f.fixture_id === fixtureId) ?? null;
   // ELIGIBLE AGENTS rail = the eligible POOL (badge==='eligible'), NOT scoped to this fixture
   // (no fixture→agent mapping exists). Honest: not-eligible agents are excluded.
   const eligible = useMemo(() => leaderboard.filter((r) => r.eligibility_badge === 'eligible'), [leaderboard]);
@@ -76,18 +98,22 @@ export function MarketsScreen({
                   {s.competitions.map((c) => (
                     <li key={c.id} className={styles.comp}>{c.label}</li>
                   ))}
-                  {fixtures.map((f) => (
-                    <li key={f.fixture_id}>
-                      <button
-                        type="button"
-                        data-testid={`fixture-${f.fixture_id}`}
-                        className={`${styles.fixture} ${f.fixture_id === fixtureId ? styles.activeFixture : ''}`}
-                        onClick={() => setFixtureId(f.fixture_id)}
-                      >
-                        {f.participant1} v {f.participant2} {f.in_running ? <Badge variant="live" /> : <Badge variant="pending" />}
-                      </button>
-                    </li>
-                  ))}
+                  {fixtures.map((f) => {
+                    const key = fixtureKey(f.pack_id, f.fixture_id);
+                    return (
+                      <li key={key}>
+                        <button
+                          type="button"
+                          data-testid={`fixture-${f.fixture_id}`}
+                          data-fixture-key={key}
+                          className={`${styles.fixture} ${key === selectedKey ? styles.activeFixture : ''}`}
+                          onClick={() => setSelectedKey(key)}
+                        >
+                          {f.participant1} v {f.participant2} {f.in_running ? <Badge variant="live" /> : <span className="mono">CAPTURED REPLAY</span>}
+                        </button>
+                      </li>
+                    );
+                  })}
                 </ul>
               )}
             </div>
@@ -95,7 +121,7 @@ export function MarketsScreen({
         </aside>
 
         <div className={styles.detail}>
-          {fixtureId == null ? (
+          {selected == null ? (
             <p className={styles.empty}>Select a fixture to view consensus odds (decimal Prices + implied %).</p>
           ) : (
             <>
@@ -103,7 +129,7 @@ export function MarketsScreen({
                 <Badge variant={sourceMode === 'live' ? 'live' : 'replay'} />
                 <span className={`${styles.feed} mono`}>SOURCE {sourceMode} · TxLINE Stable Price consensus · de-margined</span>
                 <Link
-                  href={`/competitions/create?fixture=${fixtureId}`}
+                  href={`/competitions/create?pack_id=${selected.pack_id}&fixture_id=${selected.fixture_id}`}
                   data-testid="launch-competition"
                   className={styles.launch}
                 >
@@ -140,7 +166,7 @@ export function MarketsScreen({
               <div
                 className={styles.families}
                 data-testid="families"
-                data-odds-path={oddsUpdatesPath(fixtureId)}
+                data-odds-path={oddsUpdatesPath(selected.fixture_id)}
                 role="tabpanel"
                 id={FAMILIES_PANEL_ID}
                 aria-labelledby={activeTabId}
@@ -165,8 +191,13 @@ export function MarketsScreen({
                             <tr key={o.name}>
                               <td>{o.name}</td>
                               <td className={styles.num}>{o.decimal.toFixed(3)}</td>
-                              <td className={styles.num}>{o.impliedPct}%</td>
-                              <td className={styles.num}>{o.closing == null ? (<span className={styles.pending}>pending / —</span>) : o.closing.toFixed(3)}</td>
+                              {/* implied %: a suspended outcome carries an EMPTY pct (no de-vigged prob) —
+                                  render the honest em-dash, NEVER a fabricated "0.000%". */}
+                              <td className={styles.num}>{o.impliedPct ? `${o.impliedPct}%` : <span className={styles.muted}>—</span>}</td>
+                              {/* closing: a null closing under a hash-bound REPLAY is genuinely ABSENT and
+                                  never forthcoming → honest plain —. A LIVE null closing IS forthcoming
+                                  (prints once the pre-match window closes) → the "pending / —" label stays. */}
+                              <td className={styles.num}>{o.closing == null ? (sourceMode === 'replay' ? <span className={styles.muted}>—</span> : <span className={styles.pending}>pending / —</span>) : o.closing.toFixed(3)}</td>
                               {/* EDGE: executable edge needs a venue price (not in this feed) — honest — */}
                               <td className={styles.num} data-testid="edge-cell"><span className={styles.muted}>—</span></td>
                               {/* AGENTS: no per-market agent mapping in the backend — honest — (never a count) */}
@@ -194,7 +225,7 @@ export function MarketsScreen({
               <div className={styles.railRow}>{selected.participant1} v {selected.participant2}</div>
               <div className={`${styles.railMeta} mono`}>{selected.competition}</div>
               {/* match-phase (the fixture axis) — NOT a data-source claim (the source lives in the strip/bar) */}
-              <div className={`${styles.phase} mono`}>{selected.in_running ? 'IN-PLAY' : 'PRE-MATCH'}</div>
+              <div className={`${styles.phase} mono`}>{selected.in_running ? 'IN-PLAY' : 'CAPTURED REPLAY'}</div>
               <div className={`${styles.railMeta} mono`}>kickoff {selected.start_time.slice(0, 10)}</div>
               {/* in-play score/minute are only in the Cockpit WS stream → honest — here */}
               <div className={`${styles.railMeta} mono`}>score — · minute —</div>
@@ -202,16 +233,28 @@ export function MarketsScreen({
 
             <div className={styles.railPanel} data-testid="rail-feed-health">
               <h3 className={styles.railTitle}>FEED HEALTH</h3>
-              {/* ws_live drives the label honestly: not a live stream ⇒ OFFLINE, never a fake "live/healthy" */}
-              <div className={`${styles.phase} mono`}>{feedHealth.ws_live ? 'LIVE' : 'OFFLINE'}</div>
-              <div className={`${styles.railMeta} mono`}>staleness {feedHealth.staleness_s == null ? '—' : `${feedHealth.staleness_s}s`}{feedHealth.stale ? ' · STALE' : ''}</div>
-              <div className={`${styles.railMeta} mono`}>ticks {feedHealth.ticks_seen} · events/min {feedHealth.events_per_min ?? '—'}</div>
-              <div className={`${styles.railMeta} mono`}>{feedHealth.txline_configured ? 'TxLINE configured' : 'demo feed · TxLINE not configured'}</div>
+              {feedHealth == null ? (
+                // null = not loaded / no telemetry available. State that honestly — never a fabricated
+                // LIVE/OFFLINE label or invented staleness/tick counts over absent data.
+                <div className={`${styles.railMeta} mono`}>feed health unavailable</div>
+              ) : (
+                <>
+                  {/* ws_live drives the label honestly: not a live stream ⇒ OFFLINE, never a fake "live/healthy" */}
+                  <div className={`${styles.phase} mono`}>{feedHealth.ws_live ? 'LIVE' : 'OFFLINE'}</div>
+                  <div className={`${styles.railMeta} mono`}>staleness {feedHealth.staleness_s == null ? '—' : `${feedHealth.staleness_s}s`}{feedHealth.stale ? ' · STALE' : ''}</div>
+                  <div className={`${styles.railMeta} mono`}>ticks {feedHealth.ticks_seen} · events/min {feedHealth.events_per_min ?? '—'}</div>
+                  <div className={`${styles.railMeta} mono`}>{feedHealth.txline_configured ? 'TxLINE configured' : 'demo feed · TxLINE not configured'}</div>
+                </>
+              )}
             </div>
 
             <div className={styles.railPanel} data-testid="rail-eligible-agents">
               <h3 className={styles.railTitle}>ELIGIBLE AGENTS</h3>
               <div className={`${styles.railMeta} mono`}>eligible pool · fixture-level scoping pending</div>
+              {eligible.length === 0 && (
+                // Empty pool (leaderboard not loaded / no eligible agents) → honest note, never a fabricated row.
+                <div className={`${styles.railMeta} mono`}>no eligible agents yet</div>
+              )}
               <ul className={styles.eligibleList}>
                 {eligible.map((a) => (
                   <li key={a.agent_id} className={styles.eligibleRow}>

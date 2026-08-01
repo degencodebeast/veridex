@@ -1,7 +1,11 @@
 // Status vocabulary + glyphs, per the V4 Status Badges table (PAT-002).
 export const BADGE_VARIANTS = [
   'replay', 'live', 'reproducible', 'verified', 'anchored', 'pending',
-  'not-anchored', 'valid', 'invalid', 'partial', 'eligible', 'not-eligible', 'llm',
+  'not-anchored', 'valid', 'invalid', 'partial', 'eligible', 'not-eligible', 'llm', 'final',
+  // Roster proof-state (E3) — the honest chips for a public agent's ProofState that are NOT an earned
+  // single-mode proof claim: 'unscored' (deployed, not yet scored), 'mixed' (honest cross-run aggregate
+  // of different proof modes), 'unknown' (fail-closed fallback). Neutral — NEVER a proof/rank claim.
+  'unscored', 'mixed', 'unknown',
   // Maker Arena lane (MM-R1) — falsification verdicts + rung/caveat chips (SEC-005: never
   // reused to imply a directional CLV claim; these back only the maker surfaces).
   'mm-r1', 'separated', 'inconclusive', 'inverted', 'uncalibrated', 'small-n', 'trades-not-fills',
@@ -26,9 +30,15 @@ export const BADGE_META: Record<BadgeVariant, { glyph: string; label: string }> 
   valid: { glyph: '', label: 'Valid' },
   invalid: { glyph: '', label: 'Invalid' },
   partial: { glyph: '', label: 'Partial' },
+  unscored: { glyph: '○', label: 'Unscored' },
+  // Neutral honesty chips — NOT a proof claim. 'mixed' = runs carry different proof modes; 'unknown' =
+  // an unrecognized proof_state string (fail-closed, never rendered as an earned proof).
+  mixed: { glyph: '◐', label: 'Mixed' },
+  unknown: { glyph: '?', label: 'Unknown' },
   eligible: { glyph: '●', label: 'Eligible' },
   'not-eligible': { glyph: '⊘', label: 'Not Eligible' },
   llm: { glyph: '', label: 'LLM' },
+  final: { glyph: '■', label: 'Finished' },
   'mm-r1': { glyph: '◆', label: 'MM-R1' },
   separated: { glyph: '✓', label: 'Separated' },
   inconclusive: { glyph: '≈', label: 'Inconclusive' },

@@ -5,7 +5,14 @@ import { render, screen, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { AgentsScreen } from '@/components/screens/AgentsScreen';
 import { getMakerArenaResult } from '@/lib/api';
+import { AGENTS } from '@/lib/fixtures/catalog';
+import { agentSummaryToPublicRow } from '@/lib/agent-roster';
 import { MAKER_ARENA_RESULT } from '@/lib/fixtures/maker';
+
+// E3: AgentsScreen now consumes PublicAgentRow[]. The demo AGENTS (AgentSummary[]) are mapped through
+// the SHARED adapter — display_name == agent_name and public_agent_id == agent_id, so the existing
+// identity/link/search assertions hold unchanged.
+const PUBLIC_AGENTS = AGENTS.map(agentSummaryToPublicRow);
 
 vi.mock('@/lib/api', async (importOriginal) => ({
   ...await importOriginal<typeof import('@/lib/api')>(),
@@ -22,13 +29,14 @@ describe('AgentsScreen (REQ-017)', () => {
   });
 
   it('links each agent row to its profile', () => {
-    render(<AgentsScreen />);
+    // Directional roster is supplied explicitly (the demo path the page mock-gates); no fixture default.
+    render(<AgentsScreen agents={PUBLIC_AGENTS} />);
     expect(screen.getByRole('link', { name: /Value CLV/i })).toHaveAttribute('href', '/agents/value_clv');
   });
 
   it('filters by search text', async () => {
     const user = userEvent.setup();
-    render(<AgentsScreen />);
+    render(<AgentsScreen agents={PUBLIC_AGENTS} />);
     await user.type(screen.getByRole('searchbox'), 'momentum');
     expect(screen.getByRole('link', { name: /Momentum FR/i })).toBeInTheDocument();
     expect(screen.queryByRole('link', { name: /Value CLV/i })).toBeNull();

@@ -348,23 +348,32 @@ async def test_standalone_run_emits_durable_events_readable_owner_scoped(tmp_pat
     durable = DurableRuntimeEventStore(store=store, wal_dir=tmp_path)
 
     # A REAL directional run over a fixture tape, threading the durable sink (no network, no anchor).
+    # `run_id` is threaded exactly as the deploy path does (deploy.py launches standalone_run with the
+    # instance's authoritative run_id), so the emitted OPS events carry it and are run-scoped-readable.
     ticks = replay_marketstates(_FIXTURE)
     agent = momentum_agent("studio-agent")
+    run_id = "run-directional-1"
     await standalone_run(
         ticks,
         agent,
         source_mode="replay",
         anchor_fn=None,
+        run_id=run_id,
         runtime_event_sink=durable.sink(),
     )
     await durable.drain()
 
     produced = await store.list_runtime_events("studio-agent")
     assert len(produced) >= 1, "the sink is orphaned — standalone_run wrote NO durable RuntimeEvents"
+    # The durable OPS events carry the run's id — the property the owner-scoped run read relies on.
+    assert all(r.run_id == run_id for r in produced)
 
-    # The owner-scoped route resolves instance -> owner server-side and reads the durable feed.
+    # The owner-scoped route reads by the instance's authoritative run_id (NOT the reusable agent_id),
+    # so pin the persisted instance to the run these directional events were emitted under.
     await store.persist_agent_instance(
-        _make_instance(instance_id="inst_studio", agent_id="studio-agent", operator_id=_DID_ALICE)
+        _make_instance(
+            instance_id="inst_studio", agent_id="studio-agent", operator_id=_DID_ALICE
+        ).model_copy(update={"run_id": run_id})
     )
     app = create_app(store=store, settings=_privy_settings())
     async with _transport(app) as client:
@@ -491,3 +500,122 @@ async def test_cursor_fsync_failure_surfaces_and_persists_degraded(tmp_path: Pat
     await dstore.flush_once()
     assert dstore.degraded is False
     assert dstore.pending == 0
+
+
+# ---------------------------------------------------------------------------
+# RED — the owner-scoped runtime-events read must be RUN-scoped, not agent_id-scoped.
+# `agent_id` is a TEMPLATE constant (e.g. `studio-quoteguard_mm`), shared across every deploy of a
+# template and across owners, so filtering the owner-scoped read by it leaks another run's/owner's
+# OPS events. `run_id` is the server-minted, per-instance authority pinned on the owned instance; it
+# ALSO spans the run's lifecycle events emitted under a DIFFERENT (`veridex-mm-{instance}`) agent_id,
+# so run scoping must not truncate them.
+# ---------------------------------------------------------------------------
+
+_SHARED_AGENT = "studio-quoteguard_mm"  # the template-constant agent_id every quoteguard deploy shares
+
+
+def _row(*, agent_id: str, run_id: str, uuid: str, etype: str = "action_emitted") -> RuntimeEventRow:
+    return RuntimeEventRow(
+        id=0, event_uuid=uuid, agent_id=agent_id, run_id=run_id, session_id=None,
+        event_type=etype, ts=1, channel="OPS", payload={"tag": uuid},
+    )
+
+
+async def _persist_shared_instance(
+    store: InMemoryStore, *, instance_id: str, run_id: str, operator_id: str
+) -> None:
+    """Persist an instance on the SHARED template agent_id but a distinct authoritative run_id."""
+    inst = _make_instance(instance_id=instance_id, agent_id=_SHARED_AGENT, operator_id=operator_id)
+    await store.persist_agent_instance(inst.model_copy(update={"run_id": run_id}))
+
+
+async def test_runtime_events_are_run_scoped_no_cross_owner_leak() -> None:
+    """Control 1: two owners' instances share the template agent_id; each owner sees ONLY its own run."""
+    store = InMemoryStore()
+    await _persist_shared_instance(store, instance_id="inst_alice", run_id="run-A", operator_id=_DID_ALICE)
+    await _persist_shared_instance(store, instance_id="inst_bob", run_id="run-B", operator_id=_DID_BOB)
+    await store.append_runtime_events([
+        _row(agent_id=_SHARED_AGENT, run_id="run-A", uuid="a1"),
+        _row(agent_id=_SHARED_AGENT, run_id="run-B", uuid="b1"),
+    ])
+    app = create_app(store=store, settings=_privy_settings())
+    async with _transport(app) as client:
+        resp = await client.get("/agents/instances/inst_alice/runtime-events", headers=_bearer(_DID_ALICE))
+    assert resp.status_code == 200, resp.text
+    events = resp.json()["events"]
+    assert [e["payload"]["tag"] for e in events] == ["a1"], "cross-owner OPS leak (saw run-B's events)"
+    assert all(e["run_id"] == "run-A" for e in events)
+
+
+async def test_runtime_events_run_scope_same_owner_two_instances() -> None:
+    """Control 2: one owner, two instances on the shared template agent_id; each route sees only its run."""
+    store = InMemoryStore()
+    await _persist_shared_instance(store, instance_id="inst_1", run_id="run-1", operator_id=_DID_ALICE)
+    await _persist_shared_instance(store, instance_id="inst_2", run_id="run-2", operator_id=_DID_ALICE)
+    await store.append_runtime_events([
+        _row(agent_id=_SHARED_AGENT, run_id="run-1", uuid="one"),
+        _row(agent_id=_SHARED_AGENT, run_id="run-2", uuid="two"),
+    ])
+    app = create_app(store=store, settings=_privy_settings())
+    async with _transport(app) as client:
+        r1 = await client.get("/agents/instances/inst_1/runtime-events", headers=_bearer(_DID_ALICE))
+    assert [e["payload"]["tag"] for e in r1.json()["events"]] == ["one"]
+
+
+async def test_runtime_events_run_scope_spans_lifecycle_agent_id() -> None:
+    """Control 3: the run's lifecycle event (a DIFFERENT `veridex-mm-{id}` agent_id) is NOT truncated."""
+    store = InMemoryStore()
+    await _persist_shared_instance(store, instance_id="inst_x", run_id="run-x1", operator_id=_DID_ALICE)
+    await store.append_runtime_events([
+        _row(agent_id=_SHARED_AGENT, run_id="run-x1", uuid="comp"),  # composition telemetry
+        _row(agent_id="veridex-mm-inst_x", run_id="run-x1", uuid="life", etype="status_changed"),  # lifecycle
+    ])
+    app = create_app(store=store, settings=_privy_settings())
+    async with _transport(app) as client:
+        resp = await client.get("/agents/instances/inst_x/runtime-events", headers=_bearer(_DID_ALICE))
+    assert sorted(e["payload"]["tag"] for e in resp.json()["events"]) == ["comp", "life"]
+
+
+async def test_runtime_events_run_scope_cursor_and_limit() -> None:
+    """Control 5: since/limit paging applies AFTER run filtering — stable ascending id, no gap/dup/leak."""
+    store = InMemoryStore()
+    await _persist_shared_instance(store, instance_id="inst_p", run_id="run-p", operator_id=_DID_ALICE)
+    await store.append_runtime_events([
+        _row(agent_id=_SHARED_AGENT, run_id="run-p", uuid="p1"),
+        _row(agent_id=_SHARED_AGENT, run_id="run-OTHER", uuid="x"),  # a foreign run interleaved by id
+        _row(agent_id=_SHARED_AGENT, run_id="run-p", uuid="p2"),
+        _row(agent_id=_SHARED_AGENT, run_id="run-p", uuid="p3"),
+    ])
+    app = create_app(store=store, settings=_privy_settings())
+    async with _transport(app) as client:
+        page1 = await client.get(
+            "/agents/instances/inst_p/runtime-events?limit=2", headers=_bearer(_DID_ALICE)
+        )
+        evs1 = page1.json()["events"]
+        assert [e["payload"]["tag"] for e in evs1] == ["p1", "p2"]  # foreign 'x' never enters the page
+        cursor = evs1[-1]["id"]
+        page2 = await client.get(
+            f"/agents/instances/inst_p/runtime-events?since={cursor}&limit=2", headers=_bearer(_DID_ALICE)
+        )
+        assert [e["payload"]["tag"] for e in page2.json()["events"]] == ["p3"]
+
+
+async def test_runtime_events_run_scope_excludes_unbound_none_run_id() -> None:
+    """An unbound same-agent OPS row (run_id=None) is structurally unreachable from the owned-run route.
+
+    The owned instance's run_id is a required string; `row.run_id == run_id` (InMemory) / `run_id = %s`
+    (Postgres) both exclude None/NULL — so orphan agent-scoped telemetry can never cross this boundary.
+    """
+    store = InMemoryStore()
+    await _persist_shared_instance(store, instance_id="inst_z", run_id="run-Z", operator_id=_DID_ALICE)
+    await store.append_runtime_events([
+        _row(agent_id=_SHARED_AGENT, run_id="run-Z", uuid="z1"),
+        RuntimeEventRow(
+            id=0, event_uuid="unbound", agent_id=_SHARED_AGENT, run_id=None, session_id=None,
+            event_type="action_emitted", ts=1, channel="OPS", payload={"tag": "unbound"},
+        ),
+    ])
+    app = create_app(store=store, settings=_privy_settings())
+    async with _transport(app) as client:
+        resp = await client.get("/agents/instances/inst_z/runtime-events", headers=_bearer(_DID_ALICE))
+    assert [e["payload"]["tag"] for e in resp.json()["events"]] == ["z1"]  # the run_id=None row is excluded

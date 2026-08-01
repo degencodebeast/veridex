@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import contextlib
 import os
+import re
 from collections.abc import AsyncIterator, Callable, Mapping
 from typing import TYPE_CHECKING, Any
 
@@ -64,13 +65,26 @@ def _require_cors_origins(env: Mapping[str, str]) -> list[str]:
     return origins
 
 
+def _normalize_pg_dsn(dsn: str) -> str:
+    """Strip a SQLAlchemy-style ``+driver`` from a Postgres DSN scheme so libpq/psycopg accepts it.
+
+    ``psycopg``/``psycopg_pool`` speak libpq and only understand ``postgresql://`` (or ``postgres://``);
+    a SQLAlchemy DSN like ``postgresql+psycopg://…`` makes libpq raise ``missing "=" after …`` and the
+    pool never opens. Both forms are ubiquitous in ``.env`` files (SQLAlchemy uses the ``+driver``
+    dialect), so we accept either and hand libpq the plain form — instead of depending on every operator
+    remembering to drop ``+psycopg``. Only the scheme prefix is rewritten; credentials/host/db are
+    untouched. A DSN with no ``+driver`` (or a non-URL ``key=value`` conninfo) passes through unchanged.
+    """
+    return re.sub(r"^(postgres(?:ql)?)\+[a-z0-9]+://", r"\1://", dsn, count=1, flags=re.IGNORECASE)
+
+
 def _default_pool_factory(dsn: str, env: Mapping[str, str]) -> Any:
     """Create an un-opened ``AsyncConnectionPool`` (opened + reachability-checked in the lifespan)."""
     from psycopg_pool import AsyncConnectionPool  # lazy: only needed on the real serving path
 
     min_size = int(env.get("DB_POOL_MIN_SIZE", _DEFAULT_POOL_MIN_SIZE))
     max_size = int(env.get("DB_POOL_MAX_SIZE", _DEFAULT_POOL_MAX_SIZE))
-    return AsyncConnectionPool(dsn, open=False, min_size=min_size, max_size=max_size)
+    return AsyncConnectionPool(_normalize_pg_dsn(dsn), open=False, min_size=min_size, max_size=max_size)
 
 
 def _install_pg_lifecycle(app: FastAPI, *, pool: Any, store: PostgresStore, timeout: float) -> None:

@@ -10,7 +10,7 @@ describe('TopNav (REQ-001)', () => {
     for (const label of ['Competitions', 'Arena', 'Markets', 'Leaderboard', 'Agents']) {
       expect(screen.getByRole('link', { name: label })).toBeInTheDocument();
     }
-    expect(screen.queryByRole('link', { name: 'Operator Dashboard' })).toBeNull();
+    expect(screen.queryByRole('link', { name: 'My Agents' })).toBeNull();
   });
 
   it('marks the active section with aria-current', () => {

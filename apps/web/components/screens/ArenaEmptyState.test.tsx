@@ -7,6 +7,6 @@ describe('ArenaEmptyState (REQ-005 / AC-022)', () => {
     render(<ArenaEmptyState />);
     expect(screen.getByText(/no live competition/i)).toBeInTheDocument();
     expect(screen.getByRole('link', { name: /competitions/i })).toHaveAttribute('href', '/competitions');
-    expect(screen.getByRole('link', { name: /leaderboard/i })).toHaveAttribute('href', '/leaderboard');
+    expect(screen.getByRole('link', { name: /markets/i })).toHaveAttribute('href', '/markets');
   });
 });

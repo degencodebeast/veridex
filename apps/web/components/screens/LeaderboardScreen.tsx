@@ -7,23 +7,31 @@ import { ConfBar } from '@/components/ui/ConfBar';
 import { SegmentedControl } from '@/components/ui/SegmentedControl';
 import { InfoTip } from '@/components/ui/InfoTip';
 import { rankByAvgClv } from '@/lib/derive';
-import { LEADERBOARD_ROWS } from '@/lib/fixtures/catalog';
 import { MAKER_AGENT_META } from '@/lib/fixtures/maker';
 import { deriveMakerVerdict } from '@/lib/makerVerdict';
 import { GLOSSARY } from '@/lib/glossary';
 import { useLane, type Lane } from '@/hooks/useLane';
 import { useMakerArenaResult } from '@/hooks/useMakerArenaResult';
-import type { LeaderboardRow } from '@/lib/catalog';
+import type { LeaderboardRow, ProofState } from '@/lib/catalog';
 import type { MakerArenaResultView, MakerLeaderboardRow } from '@/lib/contracts';
 import styles from './LeaderboardScreen.module.css';
 
 type Filter = 'ALL' | 'REPLAY' | 'LIVE';
 
 export function LeaderboardScreen({
-  rows = LEADERBOARD_ROWS,
+  // Directional rows are supplied by the page via the self-gating getLeaderboard() reader (mock ON →
+  // fixture; mock OFF → real fetch, honest-empty on absence/error). No fixture DEFAULT here — an
+  // absent `rows` renders an honest-empty board, never fabricated rankings (T-2 fixture prohibition).
+  rows = [],
+  // Maker result is page-sourced via useMakerArenaResult (F-9). No sealed-fixture default here —
+  // an absent `makerResult` triggers the honest live-fetch/honest-empty maker path, never a fixture.
   makerResult,
 }: {
-  rows?: LeaderboardRow[];
+  // The off-mock DIRECTIONAL board supplies DirectionalRow[] (LeaderboardRow + an honest roster-local
+  // proof_state); the mock/global path supplies plain LeaderboardRow[] (proof_state absent). Accept both
+  // via an optional proof_state so the PROOF badge can render the HONEST 'mixed'/'unknown' when present
+  // (Gate-3 M3) and fall back to the shared proof_mode on the mock path.
+  rows?: Array<LeaderboardRow & { proof_state?: ProofState }>;
   makerResult?: MakerArenaResultView;
 }) {
   const [lane, setLane] = useLane();
@@ -34,7 +42,10 @@ export function LeaderboardScreen({
     const scoped = filter === 'ALL'
       ? rows
       : rows.filter((r) => r.source_mode === filter.toLowerCase());
-    return rankByAvgClv(scoped); // sort key is ALWAYS avg_clv_bps (SEC-005)
+    // rankByAvgClv sorts by avg_clv_bps (SEC-005) and only spreads + stamps `rank`, so the honest
+    // roster-local proof_state rides through untouched at runtime; its LeaderboardRow[] return type
+    // just omits the optional field, so re-assert the input row type (same objects, sound).
+    return rankByAvgClv(scoped) as Array<LeaderboardRow & { proof_state?: ProofState }>;
   }, [rows, filter]);
 
   return (
@@ -73,6 +84,13 @@ export function LeaderboardScreen({
             Rank is Avg CLV only. Proof completeness gates eligibility, never rank. ⓟ Sim PnL &amp; Brier are simulated proxies — not settled profit.
           </p>
 
+          {ranked.length === 0 ? (
+            // Honest-empty: no fabricated rows when the reader has nothing to show (mock OFF with no
+            // backend rows, or a fetch error). NEVER the LEADERBOARD_ROWS fixture (T-2).
+            <p className={styles.empty} data-testid="lb-empty">
+              No ranked agents yet.
+            </p>
+          ) : (
           <div className={styles.tableWrap}>
             <table className={styles.table}>
               <thead>
@@ -105,7 +123,11 @@ export function LeaderboardScreen({
                     <td className={styles.num}>{r.action_count === null ? '—' : r.action_count}</td>
                     <td className={styles.num}>{r.valid_pct === null ? '—' : `${r.valid_pct.toFixed(1)}%`}</td>
                     <td><ConfBar validCount={r.valid_count} /></td>
-                    <td><Badge variant={r.proof_mode} /></td>
+                    {/* HONEST proof surface (Gate-3 M3): the off-mock DirectionalRow carries a
+                        roster-local proof_state that preserves the backend's 'mixed'/'unknown'
+                        aggregate; render it when present, else the mock/global path's proof_mode.
+                        NEVER coerce 'mixed' up to an unearned 'reproducible' on the board. */}
+                    <td><Badge variant={r.proof_state ?? r.proof_mode} /></td>
                     {/* II-W defect 5: render the BACKEND-authoritative eligibility_badge VERBATIM
                         (anchor-derived server-side — veridex/leaderboard.py). NEVER re-derive it from
                         proof_mode here; that reversed the adapter fix and disagreed with the backend. */}
@@ -121,6 +143,7 @@ export function LeaderboardScreen({
               </tbody>
             </table>
           </div>
+          )}
         </>
       ) : (
         makerState.status === 'loading' || makerState.status === 'idle' ? (

@@ -41,9 +41,11 @@ PINNED_PACK = ROOT / "scripts" / "fixtures" / "demo_pack_real"
 SMOKE = ROOT / "scripts" / "smoke_public.sh"
 RESTORE_DRILL = ROOT / "scripts" / "restore_drill.sh"
 
-# The curated seed-pack target the readiness catalog resolves via REPLAY_PACK_ROOT (I-10 pinned pack
-# is bind-mounted here for the LOCAL stack; the operator points it at /srv/... in production).
-CURATED_TARGET = "/var/lib/veridex/replay-packs/curated"
+# The seed-pack target the readiness catalog resolves via REPLAY_PACK_ROOT (I-10 pinned pack is
+# bind-mounted here for the LOCAL stack; the operator points it at /srv/... in production). The leaf dir
+# name IS the pack_id, so the mount target leaf is demo_pack_real (catalogs as pack_id="demo_pack_real",
+# the id the F1 Official-Replay-League seed's phase-1 assert_pack requires).
+CURATED_TARGET = "/var/lib/veridex/replay-packs/demo_pack_real"
 WAL_TARGET = "/data/wal"  # matches Dockerfile.api's ENV WAL_DIR default (frozen; consumed unchanged)
 
 # Required secrets that MUST carry a `:?` guard so a missing value fails the stack closed.
@@ -75,6 +77,9 @@ LOCAL_TEST_ENV: dict[str, str] = {
     "WAL_DIR": WAL_TARGET,
     "REPLAY_PACK_ROOT": CURATED_TARGET,
     "NEXT_PUBLIC_API_BASE": "http://localhost:8000",
+    # Required web build-arg (`:?`-guarded in compose.coolify.yml). Test-only placeholder so
+    # `docker compose config` interpolates cleanly; must match the backend PRIVY_APP_ID at build time.
+    "NEXT_PUBLIC_PRIVY_APP_ID": "test-privy-app-id",
     "API_HOST_PORT": "8000",
     "WEB_HOST_PORT": "3000",
     "CURATED_PACKS_HOST": "./scripts/fixtures/demo_pack_real",
@@ -433,9 +438,15 @@ def _write_env_file(tmp: Path, overrides: dict[str, str] | None = None, drop: se
     return path
 
 
-def _compose(*args: str, env_file: Path, check: bool = True, timeout: int = 900) -> subprocess.CompletedProcess:
+def _compose(
+    *args: str,
+    env_file: Path,
+    check: bool = True,
+    timeout: int = 900,
+    env: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess:
     cmd = ["docker", "compose", "-p", PROJECT, "-f", str(COMPOSE), "--env-file", str(env_file), *args]
-    return subprocess.run(cmd, cwd=str(ROOT), capture_output=True, text=True, check=check, timeout=timeout)
+    return subprocess.run(cmd, cwd=str(ROOT), capture_output=True, text=True, check=check, timeout=timeout, env=env)
 
 
 class TestRequiredEnvGuardConfig:
@@ -450,8 +461,17 @@ class TestRequiredEnvGuardConfig:
     @docker_required
     def test_config_fails_closed_when_required_secret_missing(self, tmp_path: Path) -> None:
         # Drop a required secret: the `:?` guard must abort interpolation (never a silent default).
-        env_file = _write_env_file(tmp_path, drop={"DATABASE_URL"})
-        proc = _compose("config", env_file=env_file, check=False, timeout=120)
+        dropped = {"DATABASE_URL"}
+        env_file = _write_env_file(tmp_path, drop=dropped)
+        # Isolate the subprocess env: `docker compose` interpolation prefers the SHELL env over
+        # --env-file, so an ambient DATABASE_URL in the invoking shell would silently satisfy the
+        # guard this test exists to prove fails closed. Start from a full os.environ copy (so PATH,
+        # HOME, DOCKER_HOST, etc. still let `docker` run) and explicitly delete the dropped secret(s)
+        # so the guarded var is deterministically absent regardless of the ambient shell.
+        isolated_env = dict(os.environ)
+        for key in dropped:
+            isolated_env.pop(key, None)
+        proc = _compose("config", env_file=env_file, check=False, timeout=120, env=isolated_env)
         assert proc.returncode != 0, "a missing required secret must fail compose closed (the :? guard fires)"
         assert "DATABASE_URL" in (proc.stderr + proc.stdout), "the guard must name the missing required var"
 

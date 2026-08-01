@@ -32,8 +32,20 @@ FROM base AS build
 COPY --from=deps /app/node_modules ./node_modules
 COPY . .
 ENV NEXT_TELEMETRY_DISABLED=1
-# .next/cache is build-machine cache — dead weight in the runtime image.
-RUN pnpm build && rm -rf .next/cache
+# NEXT_PUBLIC_* are inlined into the browser bundle at BUILD time (never runtime), so they must be
+# ARG-declared HERE to reach `pnpm build` — a Compose/Coolify build arg is invisible to the stage
+# otherwise. Promote to ENV so `next build` reads them from process.env. These are PUBLIC identifiers
+# (an API origin + a Privy app id), never secrets.
+ARG NEXT_PUBLIC_API_BASE
+ARG NEXT_PUBLIC_PRIVY_APP_ID
+ENV NEXT_PUBLIC_API_BASE=${NEXT_PUBLIC_API_BASE}
+ENV NEXT_PUBLIC_PRIVY_APP_ID=${NEXT_PUBLIC_PRIVY_APP_ID}
+# Fail CLOSED on an empty value: the live Coolify build path bypasses Compose's ${VAR:?} guard, so a
+# missing var would otherwise silently bake a broken image (empty API base → SSR throws; empty Privy id
+# → no login). .next/cache is build-machine cache — dead weight in the runtime image.
+RUN : "${NEXT_PUBLIC_API_BASE:?required — set it as a Coolify Build Variable (empty bakes a broken image)}" \
+ && : "${NEXT_PUBLIC_PRIVY_APP_ID:?required — set it as a Coolify Build Variable (empty disables login)}" \
+ && pnpm build && rm -rf .next/cache
 
 # ── runner: production-only artifacts, non-root ──────────────────────────
 FROM base AS runner

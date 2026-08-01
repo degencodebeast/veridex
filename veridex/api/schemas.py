@@ -412,12 +412,115 @@ class ReplayPackInfo(BaseModel):
     provenance: str
     is_genuine: bool
     fixtures: list[int]
+    #: ADDITIVE server-derived label join (``fixtures: list[int]`` stays unchanged — raw IDs, wire
+    #: type intact). One row per fixture id: ``{fixture_id (raw int), home_team, away_team,
+    #: kickoff_ts, label_source: "captured"|"unavailable"}``. A frontend-duplicated label map is
+    #: prohibited (authority chain, spec §2/§5.2).
+    fixture_metadata: list[dict[str, Any]] = []
 
 
 class ReplayPackListResponse(BaseModel):
     """Envelope for ``GET /replay-packs`` — the verified R-2 catalog listing (single-field wrapper)."""
 
     packs: list[ReplayPackInfo]
+
+
+class ReplayMarketRow(BaseModel):
+    """One market's LAST-KNOWN projected state, folded across the WHOLE hash-bound replay tape (M11).
+
+    The projection keeps the LAST-SEEN value per ``market_key`` over ALL tape states (not just the
+    final tick — which alone carries only the markets present at that instant), plus the ``ts`` and
+    per-market ``in_running`` of the state it was last seen in.
+
+    HONESTY (M4): a SUSPENDED market keeps ``stable_prob_bps == {}`` (EMPTY — never back-filled from
+    the retained ``stable_price``); the last-known decimal odds in ``stable_price`` stay non-empty so
+    the browser can still render odds without fabricating an implied probability.
+
+    Attributes:
+        market_key: The stable ``{SuperOddsType}|{MarketPeriod}|{MarketParameters}`` key.
+        in_running: The match-phase of the state the market was last seen in. Derived HONESTLY from
+            that ``MarketState.phase`` (``1`` ⇒ in-running). At the runtime ``batch_size=1`` each state
+            is folded from a SINGLE native record, so its ``phase`` is exactly that record's
+            ``InRunning`` flag — the honest per-market source (MarketState carries no per-market flag).
+        suspended: ``True`` when the market had no priced (non-NA) probability outcomes at last sight.
+        ts: The ``ts`` (epoch seconds) of the state the market was last seen in.
+        stable_prob_bps: Outcome-keyed de-vigged probability in basis points. EMPTY ``{}`` for a
+            suspended market — PRESERVED empty, never filled.
+        stable_price: Outcome-keyed decimal odds (last-known). Non-empty even when suspended.
+    """
+
+    market_key: str
+    in_running: bool
+    suspended: bool
+    ts: int
+    stable_prob_bps: dict[str, int]
+    stable_price: dict[str, float]
+
+
+class ReplayMarketsResponse(BaseModel):
+    """Envelope for ``GET /replay-packs/{pack_id}/fixtures/{fixture_id}/markets`` — the last-known
+    per-market projection of one replay fixture (read-only). ``label`` is always ``"CAPTURED REPLAY"``
+    (a replay is never dressed up as live). NO ``finished`` / ``closing`` / ``edge`` keys."""
+
+    fixture_id: int
+    label: str = "CAPTURED REPLAY"
+    markets: list[ReplayMarketRow]
+
+
+class AgentRosterEntry(BaseModel):
+    """One row of the HONEST public agent directory, keyed on the immutable ``public_agent_id``.
+
+    The read-only, UNAUTHENTICATED ``GET /agents/roster`` view (mirrors ``/replay-packs``). Unlike the
+    old leaky roster, this directory sources from ``store.list_public_agents()`` joined to deployment
+    state and admits an agent ONLY when its ``visibility == PUBLIC`` AND it has a linked instance whose
+    deploy status is ``SEALED``; private / pending / failed / running / unlinked agents are excluded.
+
+    TRUST SURFACE: this row NEVER carries a raw ``operator_id`` / ``owner_ref`` (a Privy DID or internal
+    id). The only owner rendering is the SAFE ``owner_public_label`` — the legacy raw-shaped ``owner``
+    field is GONE.
+
+    The performance columns (``avg_clv_bps`` / ``runs`` / ``valid_pct``) are ``None`` and ``proof_state``
+    is ``"unscored"`` until the agent has scored board rows — honestly absent, NEVER fabricated. Once the
+    agent appears on the PUBLIC_AGENTS directional board they carry the REAL pooled values.
+
+    Attributes:
+        public_agent_id: The immutable public identifier the directory is keyed on.
+        display_name: Human-facing name from the public identity.
+        owner_public_label: SAFE public owner rendering (brand string / shortened wallet / em-dash) —
+            NEVER the raw ``operator_id`` / ``owner_ref``.
+        origin: The REAL :class:`~veridex.public_agent.Origin` value (honest ``unknown`` for legacy).
+        proof_state: ``"unscored"`` until scored; the REAL proof state once the agent has board rows.
+        agent_id: The deployed instance's identifier (informational; the directory keys on the public id).
+        type: The strategy-archetype template the instance was configured from (``template_id``).
+        source_mode: ``replay`` | ``live`` (the sealed instance's data source).
+        execution_mode: ``paper`` | ``dry_run`` | ``live_guarded``.
+        status: The :class:`~veridex.deploy.instance.DeployStatus` value, lowercased (always ``sealed``).
+        config_hash_present: A REAL proof indicator — ``True`` when the instance pinned a ``config_hash``.
+        avg_clv_bps: ``None`` until scored, then the REAL pooled value (never fabricated).
+        runs: ``None`` until scored, then the REAL run count (never fabricated).
+        valid_pct: ``None`` until scored, then the REAL pooled value (never fabricated).
+    """
+
+    public_agent_id: str
+    display_name: str
+    owner_public_label: str
+    origin: str
+    proof_state: str
+    agent_id: str
+    type: str
+    source_mode: str
+    execution_mode: str
+    status: str
+    config_hash_present: bool
+    avg_clv_bps: float | None = None
+    runs: int | None = None
+    valid_pct: float | None = None
+
+
+class AgentRosterResponse(BaseModel):
+    """Envelope for ``GET /agents/roster`` — the PUBLIC deployed-agent roster (single-field wrapper)."""
+
+    agents: list[AgentRosterEntry]
 
 
 class BacktestRunResponse(BaseModel):
@@ -467,3 +570,8 @@ class MakerArenaResultResponse(BaseModel):
     result: dict[str, Any]
     proof_card: dict[str, Any]
     diagnostics: dict[str, Any]
+    #: ADDITIVE label join (never mutates the sealed ``result``). One row per raw ID in
+    #: ``result.fixtures`` order: ``{fixture_id (raw int, always), home_team, away_team,
+    #: kickoff_ts, label_source: "captured"|"unavailable"}``. Labels are captured/curated, never
+    #: "verified"; a missing/malformed source yields all-"unavailable" rows (raw IDs preserved).
+    fixture_metadata: list[dict[str, Any]] = []

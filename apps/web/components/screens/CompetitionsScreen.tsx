@@ -3,8 +3,8 @@ import { useEffect, useState } from 'react';
 import Link from 'next/link';
 import { Badge } from '@/components/ui/Badge';
 import { LiveDot } from '@/components/ui/LiveDot';
-import { COMPETITIONS, MY_REWARDS } from '@/lib/fixtures/catalog';
 import { isMockEnabled } from '@/lib/mock';
+import type { CompetitionRecordView } from '@/lib/api';
 import type { CompetitionSummary, CompetitionType, RewardSummary } from '@/lib/catalog';
 import styles from './CompetitionsScreen.module.css';
 
@@ -46,8 +46,14 @@ function LiveCard({ c }: { c: CompetitionSummary }) {
   );
 }
 
-export function CompetitionsScreen({ comps = COMPETITIONS, rewards = MY_REWARDS }: {
+// No fixture DEFAULT props (T-2): absent `comps`/`rewards` render an honest-empty screen, never the
+// COMPETITIONS / MY_REWARDS fixtures. The owning page injects fixtures ONLY under the mock gate; off
+// the gate it passes `[]`, so nothing fabricated can leak onto the "Enter App" landing tab.
+export function CompetitionsScreen({ comps = [], rewards = [], records }: {
   comps?: CompetitionSummary[]; rewards?: RewardSummary[];
+  // Off-mock REAL competition records (GET /competitions, spec §6.1). `undefined` = mock path (the
+  // fixture `comps`/`rewards` render instead); an empty array = off-mock honest empty state.
+  records?: CompetitionRecordView[];
 }) {
   // Mock-gate (hydration-safe: default off on SSR/first render, then read after mount). Roadmappable
   // demo fields (LEADER CLV) populate ONLY under mock; live shows honest "—" until backend-wired.
@@ -67,6 +73,48 @@ export function CompetitionsScreen({ comps = COMPETITIONS, rewards = MY_REWARDS 
     <section className={styles.screen} aria-label="Competitions">
       <h1 className={styles.title}>Competitions</h1>
 
+      {records !== undefined && (
+        <section className={styles.group} data-testid="real-competitions" aria-label="Your competitions">
+          <div className={styles.h2Row}>
+            <h2 className={styles.h2}>All competitions</h2>
+            {/* Coherent count DERIVED from the real records — never the empty mock aggregate. */}
+            <span className={styles.count} data-testid="real-total">{records.length}</span>
+          </div>
+          {records.length === 0 ? (
+            <div data-testid="competitions-empty">
+              <p>No competitions yet.</p>
+              <div>
+                <Link href="/competitions/create" className={styles.cta}>Create a competition →</Link>
+                <Link href="/markets" className={styles.ctaSecondary}>Browse Markets →</Link>
+              </div>
+            </div>
+          ) : (
+            <table className={styles.table} data-testid="real-competitions-table">
+              <thead>
+                <tr><th scope="col">COMPETITION</th><th scope="col">STATUS</th><th scope="col">SOURCE</th><th scope="col">EXEC</th><th scope="col">AGENTS</th></tr>
+              </thead>
+              <tbody>
+                {records.map((r) => (
+                  <tr key={r.competitionId} data-testid={`record-${r.competitionId}`}>
+                    <td><Link href={`/arena/${r.competitionId}`} className={styles.recentLink}>{r.title} ›</Link></td>
+                    <td className="mono" data-testid={`record-status-${r.competitionId}`}>{r.status}</td>
+                    {/* absent server fields render "—", NEVER a fabricated replay/paper/roster value */}
+                    <td className="mono">{r.sourceMode ?? '—'}</td>
+                    <td className="mono">{r.executionMode ?? '—'}</td>
+                    <td className="mono">{r.rosterSize ?? '—'}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          )}
+        </section>
+      )}
+
+      {/* MOCK-PATH surfaces only (records === undefined). Off-mock the real-records section above is the
+          single source of truth, so these never render alongside a real record → no TOTAL 0 / "No
+          competitions to show." contradiction (finding 6.2). */}
+      {records === undefined && (
+       <>
       {/* Stat cards — DERIVED counts from the real list, not a fabricated aggregate band. */}
       <div className={styles.statCards} data-testid="stat-cards">
         <div className={styles.statCard}><span className={styles.statNum} data-testid="stat-live">{live.length}</span><span className={styles.statLabel}>LIVE</span></div>
@@ -90,7 +138,13 @@ export function CompetitionsScreen({ comps = COMPETITIONS, rewards = MY_REWARDS 
             <tr><th scope="col">COMPETITION</th><th scope="col">TYPE</th><th scope="col">PROOF</th></tr>
           </thead>
           <tbody>
-            {settled.map((c) => (
+            {settled.length === 0 ? (
+              <tr>
+                <td className={styles.muted} colSpan={3} data-testid="recent-settled-empty">
+                  No settled competitions yet.
+                </td>
+              </tr>
+            ) : settled.map((c) => (
               <tr key={c.competition_id}>
                 <td><Link href={`/proof/${c.settled_run_id}`} className={styles.recentLink}>{c.title} ›</Link></td>
                 <td className="mono">{TYPE_LABEL[c.competition_type]}</td>
@@ -124,6 +178,13 @@ export function CompetitionsScreen({ comps = COMPETITIONS, rewards = MY_REWARDS 
             </tr>
           </thead>
           <tbody>
+            {comps.length === 0 && (
+              <tr>
+                <td className={styles.muted} colSpan={10} data-testid="all-competitions-empty">
+                  No competitions to show.
+                </td>
+              </tr>
+            )}
             {comps.map((c) => (
               <tr key={c.competition_id} data-testid={`comp-${c.competition_id}`}>
                 <td className={styles.compCell}>{c.lifecycle === 'live' && <LiveDot size={5} />}{c.title}</td>
@@ -148,6 +209,8 @@ export function CompetitionsScreen({ comps = COMPETITIONS, rewards = MY_REWARDS 
           per-competition top-CLV mapping is wired — never a fabricated leader. Rank stays CLV-only.
         </p>
       </section>
+       </>
+      )}
     </section>
   );
 }

@@ -14,6 +14,22 @@
 }
 .chip:hover { border-color: var(--accent); }
 
+/* Signed-out control: same footprint as the chip, accent-forward as the primary connect CTA. */
+.connect {
+  display: inline-flex;
+  align-items: center;
+  padding: 6px 12px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-control);
+  background: var(--panel-2);
+  color: var(--text-1);
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+}
+.connect:hover { border-color: var(--accent); }
+.connect:disabled { opacity: 0.5; cursor: not-allowed; }
+
 .op { color: var(--accent-hi); font-size: 11px; }
 .sep { color: var(--text-3); }
 .dash { color: var(--text-2); font-weight: 600; }
@@ -31,6 +47,9 @@
 }
 
 .group { display: flex; flex-direction: column; border-top: 1px solid var(--border-soft); margin-top: var(--space-1); padding-top: var(--space-1); }
+
+/* Non-interactive account info (e.g. current network) — a label, not a button. */
+.info { padding: 7px 10px; color: var(--text-3); font-size: 12px; }
 
 .groupLabel {
   margin-top: var(--space-2);

@@ -1,4 +1,6 @@
-.screen { display: flex; flex-direction: column; gap: var(--space-3); max-width: 1080px; }
+/* max-width caps the reading column; align-self+width center it inside the (wider) .main flex column
+   — without the self-centering a capped flex child pins to the cross-axis start (left), off-center. */
+.screen { display: flex; flex-direction: column; gap: var(--space-3); max-width: 1080px; width: 100%; align-self: center; }
 
 /* header */
 .header { display: flex; flex-direction: column; gap: 7px; }
@@ -9,13 +11,18 @@
 .subMeta { color: var(--text-3); font-size: 11px; }
 
 /* identity strip */
-.identity { display: grid; grid-template-columns: repeat(5, auto); justify-content: start; align-items: stretch; background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius-panel); }
+/* Auto-flow column fits ANY number of cells (5 without a fixture label, 6 with) on one desktop row
+   — no wrapping to a stray second row when the optional FIXTURE cell is present. */
+/* grid-auto-flow: column does NOT wrap — it overflows. Between the desktop row and the ≤720px 2-col
+   fallback, the 6-cell (with-fixture) strip can exceed the container on tablet widths, so allow it to
+   scroll horizontally rather than push the page wide. */
+.identity { display: grid; grid-auto-flow: column; grid-auto-columns: auto; justify-content: start; align-items: stretch; background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius-panel); overflow-x: auto; }
 .idCell { display: flex; align-items: center; gap: 7px; padding: 13px 18px; }
 .idCell + .idCell { box-shadow: inset 1px 0 0 var(--border-strong); }
 .idLabel { font-family: var(--font-mono), monospace; font-size: 8px; font-weight: 600; letter-spacing: 0.1em; color: var(--text-3); }
 .idValue { font-size: 11px; font-weight: 600; color: var(--text-1); }
 .idAnchor { font-size: 10px; font-weight: 600; color: var(--text-3); }
-@media (max-width: 720px) { .identity { grid-template-columns: 1fr 1fr; } .idCell + .idCell { box-shadow: none; border-top: 1px solid var(--border-soft); } }
+@media (max-width: 720px) { .identity { grid-auto-flow: row; grid-template-columns: 1fr 1fr; } .idCell + .idCell { box-shadow: none; border-top: 1px solid var(--border-soft); } }
 
 /* arm summary cards */
 .armGrid { display: grid; grid-template-columns: 1fr 1fr; gap: var(--space-3); }
